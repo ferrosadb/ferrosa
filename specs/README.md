@@ -11,6 +11,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [Overview](overview.md) | High-level system overview and design principles | Approved |
 | [Components](components.md) | Crate architecture, dependency graph, responsibilities | Approved |
 | [Data Flow](data-flow.md) | Write path, read path, compaction, S3 lifecycle | Approved |
+| [SSTable](sstable.md) | BTI format, trie encoding, I/O traits, compression, public API | Approved |
 | [Testing](testing.md) | Test infrastructure, suites, performance regression detection | Approved |
 
 ## Architecture Decision Records

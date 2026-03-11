@@ -43,7 +43,7 @@ graph BT
 - **Purpose**: Shared low-level types used across all crates
 - **Location**: `ferrosa-common/`
 - **Dependencies**: None (leaf crate)
-- **Key types**: `Token` (i64, Murmur3), `PartitionKey`, `DecoratedKey`, `ByteBuffer`, `CellValue` (bytes + timestamp + TTL), error types, config types
+- **Key types**: `Token` (i64, Murmur3), `PartitionKey`, `DecoratedKey`, `CellValue` (bytes + timestamp + TTL), `Timestamp`, error types (`Error`, `Result`)
 - **Boundary**: CQL-level type definitions (text, int, collections, UDTs) live in `ferrosa-cql`, not here
 
 ### ferrosa-sstable
@@ -131,7 +131,7 @@ gantt
 
     section Foundation
     ferrosa-common          :done, 0, 1
-    ferrosa-sstable         :done, 1, 3
+    ferrosa-sstable         :active, 1, 3
 
     section Engine
     ferrosa-storage         :active, 3, 5
