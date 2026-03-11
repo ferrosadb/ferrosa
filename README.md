@@ -37,44 +37,38 @@ implementation that takes advantage of modern hardware and cloud infrastructure.
 
 ## Architecture
 
-```
-                        ┌─────────────────────┐
-                        │   CQL Clients       │
-                        │ (drivers, cqlsh)    │
-                        └────────┬────────────┘
-                                 │ CQL Native Protocol v5
-                        ┌────────▼────────────┐
-                        │   ferrosa-cql       │
-                        │   Query processing  │
-                        └────────┬────────────┘
-                                 │
-              ┌──────────────────┼──────────────────┐
-              │                  │                  │
-    ┌─────────▼──────┐ ┌────────▼────────┐ ┌──────▼──────────┐
-    │ ferrosa-cluster │ │ ferrosa-schema  │ │                 │
-    │ Raft metadata  ─┼─▶ DDL, system KS │ │                 │
-    │ Tunable CL      │ └────────────────┘ │                 │
-    │ Routing         │                     │                 │
-    └──┬──────────────┘                     │                 │
-       │          ┌─────────────────────────┘                 │
-       │          │                                           │
-    ┌──▼──────────▼──┐                                        │
-    │ ferrosa-storage │◀───────────────────────────────────────┘
-    │ Write-behind S3 │
-    │ Memtable, cache │
-    │ Compaction      │
-    └──┬──────────────┘
-       │
-    ┌──▼──────────────┐ ┌────────────────┐
-    │ ferrosa-sstable │ │ ferrosa-net    │
-    │ Big + BTI read  │ │ Internode msgs │
-    │ BTI write       │ │ TLS, framing   │
-    └──┬──────────────┘ └────────────────┘
-       │
-    ┌──▼──────────────────────┐
-    │  S3 (durable storage)  │
-    │  Ephemeral NVMe (cache) │
-    └─────────────────────────┘
+```mermaid
+graph TB
+    subgraph Clients
+        D1[CQL Drivers]
+        D2[cqlsh]
+    end
+
+    subgraph "Ferrosa Node"
+        CQL[ferrosa-cql<br/>CQL Protocol v5]
+        Schema[ferrosa-schema<br/>DDL, System KS]
+        Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
+        Storage[ferrosa-storage<br/>Memtable, Cache, Compaction]
+        SST[ferrosa-sstable<br/>Big + BTI Read, BTI Write]
+        Net[ferrosa-net<br/>Internode Protocol]
+    end
+
+    subgraph "Persistence"
+        NVMe[Ephemeral NVMe<br/>Local Cache]
+        S3[S3-Compatible Store<br/>Durable Storage]
+    end
+
+    D1 & D2 -->|CQL Native Protocol v5| CQL
+    CQL --> Schema
+    CQL --> Storage
+    CQL --> Cluster
+    Cluster --> Storage
+    Cluster --> Net
+    Storage --> SST
+    SST --> NVMe
+    SST -.->|async upload| S3
+    Storage --> NVMe
+    Storage -.->|write-behind| S3
 ```
 
 ### Storage Model: Write-Behind Async S3
@@ -159,8 +153,7 @@ Test infrastructure runs on [Sprites](https://docs.sprites.dev/) (Firecracker VM
 ## Project Status
 
 Ferrosa is in the design and early implementation phase. See the
-[architecture design document](docs/superpowers/specs/2026-03-11-ferrosa-architecture-design.md)
-for the full specification.
+[architecture specs](specs/README.md) for the full specification.
 
 ## License
 
