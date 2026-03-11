@@ -33,6 +33,7 @@ repos:
       - id: trailing-whitespace
       - id: mixed-line-ending
       - id: no-commit-to-branch
+        stages: [pre-commit]
         args:
           - --pattern
           - '^(?!((ci|chore|docs|feature|fix|refactor|test)\/[a-zA-Z0-9\-]+)$).*'
