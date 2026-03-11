@@ -116,7 +116,7 @@ stateDiagram-v2
     [*] --> Active: New segment opened
     Active --> Active: Writes appended
     Active --> Closed: Segment full (32MB)
-    Active --> Shipped: Timer fires (5s) — partial upload
+    Active --> Shipped: Timer fires — partial upload
     Closed --> Shipped: Upload to S3
     Shipped --> Retained: SSTable flush not yet durable
     Retained --> Deletable: Corresponding SSTables confirmed in S3
@@ -138,7 +138,7 @@ Segments are fixed-size files (default 32MB). A segment is closed and a new one 
 
 ### S3 Shipping
 
-Closed segments are uploaded to S3 immediately. The active (not yet full) segment is uploaded on a timer (default 5 seconds) as a partial segment. The `checkpoint.json` per node tracks:
+Closed segments are uploaded to S3 immediately. The active (not yet full) segment is uploaded on a configurable timer (`commitlog_ship_interval`, default TBD — candidate values: 1-10 seconds, trading durability window for upload overhead) as a partial segment. The `checkpoint.json` per node tracks:
 
 - The latest segment ID and offset confirmed durable in S3
 - The latest SSTable generation confirmed durable in S3
@@ -203,7 +203,7 @@ sequenceDiagram
 | Layer | Mechanism | Window Covered |
 |-------|-----------|---------------|
 | 1. Quorum writes | Data on >= 2 nodes before ACK (RF=3, CL=QUORUM) | Node death before S3 upload |
-| 2. Commit log shipping | S3 upload every 5s (configurable) | Node death before SSTable flush |
+| 2. Commit log shipping | Async S3 upload on configurable interval (`commitlog_ship_interval`) | Node death before SSTable flush |
 | 3. SSTable upload priority | Fresh flushes before compaction output | Node death between flush and upload |
 | 4. Replica coordination | Track S3 upload confirmation per replica | Multi-node failure before any upload |
 | 5. Increased quorum (optional) | CL=ALL or higher RF | Catastrophic multi-node failure |

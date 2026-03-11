@@ -120,34 +120,27 @@ Sprites are ideal — Firecracker VMs with fast spin-up/kill.
 
 Required before declaring production readiness:
 
-```mermaid
-mindmap
-  root((Pre-1.0))
-    Data Model
-      Tombstone & TTL handling
-      Large partition handling
-      Counter correctness
-      Timestamp conflict resolution
-    Distributed
-      Hinted handoff
-      Read repair verification
-      Anti-entropy repair
-      Range queries & pagination
-    S3 Failure Modes
-      Throttling / 429
-      LIST eventual consistency
-      Partial upload failure
-      Cost profiling
-    Operational
-      Rolling upgrade
-      Schema evolution under load
-      Compaction under heavy writes
-      Backup/restore from S3
-      Soak test 24-72hr
-      Memory pressure / OOM
-    Migration
-      SSTable import correctness
-```
+| Category | Test | Details |
+|----------|------|---------|
+| **Data Model** | Tombstone & TTL handling | Expiration, gc_grace_seconds, accumulation degrading reads |
+| | Large partition handling | Partitions exceeding memory, wide rows |
+| | Counter correctness | Merge semantics, concurrent increments across replicas |
+| | Timestamp conflict resolution | Last-write-wins, out-of-order writes, clock skew |
+| **Distributed** | Hinted handoff | Accumulation during downtime, replay on return, storage limits |
+| | Read repair verification | Intentional divergence, verify repair corrects it |
+| | Anti-entropy repair | Full and incremental repair under load |
+| | Range queries & pagination | Token range scans, paging, coordinator changes mid-page |
+| **S3 Failure Modes** | Throttling (HTTP 429) | Backpressure, exponential retry, local writes continue |
+| | LIST eventual consistency | Manifest-based tracking must not depend on LIST |
+| | Partial upload failure | Cleanup, retry, no orphaned S3 objects |
+| | Cost profiling | Track PUT/GET/LIST call volume |
+| **Operational** | Rolling upgrade | Version N and N+1 coexist, no data loss or downtime |
+| | Schema evolution under load | ALTER TABLE while writes active |
+| | Compaction under heavy writes | L0 accumulation, read amplification |
+| | Backup/restore from S3 | Point-in-time recovery, snapshot consistency |
+| | Soak test (24-72hr) | Memory leaks, fd leaks, S3 queue growth |
+| | Memory pressure / OOM | Backpressure, graceful degradation |
+| **Migration** | SSTable import correctness | Every row from Big + BTI reads correctly in Ferrosa |
 
 Sprites' small memory footprint naturally triggers memory pressure issues that would take deliberate effort to reproduce on larger instances.
 

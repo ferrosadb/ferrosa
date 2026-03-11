@@ -76,7 +76,7 @@ graph TB
 Writes go to a local commit log and memtable, then acknowledge to the client based on
 the configured consistency level. SSTables are flushed to local ephemeral storage and
 asynchronously uploaded to S3. The commit log is also shipped to S3 on a short interval
-(default 5 seconds) for crash recovery.
+(configurable interval) for crash recovery.
 
 Data durability during the async upload window is protected by:
 1. **Quorum writes** — data exists on multiple replicas before acknowledgment
