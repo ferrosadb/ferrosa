@@ -119,7 +119,7 @@ The data file stores serialized partitions in token order. Each partition contai
 2. **Rows**: ordered by clustering key, each containing cells
 3. **Partition footer**: end-of-partition marker
 
-Data is stored in compressed chunks (default 64KB uncompressed). The compression info file maps chunk index to file offset and compressed size.
+Data is stored in compressed chunks (default 16KB uncompressed). The compression info file maps chunk index to file offset and compressed size.
 
 ### Partition Index (Partitions.db)
 
@@ -144,7 +144,7 @@ The footer (last 3 `i64` values) is read first to locate the root, key bounds, a
 
 - If `pb` == 0: no payload (non-leaf node)
 - If `pb` < 8: `idxpos` is a sign-extended integer of `pb` bytes at `ppos`
-- If `pb` >= 8: `hash` is the byte at `ppos` (lowest-order byte of the key's Murmur3 hash), then `idxpos` is a sign-extended integer of `pb - 7` bytes at `ppos + 1`
+- If `pb` >= 8: `hash` is the byte at `ppos` (lowest-order byte of h2, the second 64-bit word from `murmur3_x64_128`), then `idxpos` is a sign-extended integer of `pb - 7` bytes at `ppos + 1`
 
 The `hash` byte enables early rejection of false-positive trie matches without reading the data file. In Cassandra 5.x, `pb` >= 8 is always used (hash is always stored).
 
@@ -209,10 +209,10 @@ Maps compressed data chunks to their file positions. Cassandra stores chunk offs
 
 | Field | Type | Description |
 |-------|------|-------------|
-| Compressor name | Java UTF-8 | 2-byte big-endian length prefix + modified UTF-8 bytes (e.g., `"LZ4"`, `"ZstdCompressor"`) |
+| Compressor name | Java UTF-8 | 2-byte big-endian length prefix + modified UTF-8 bytes (e.g., `"LZ4Compressor"`, `"ZstdCompressor"`) |
 | Option count | i32 | Number of key-value option pairs |
 | Options | (UTF-8, UTF-8)[] | Key-value pairs for compressor options |
-| Chunk length | i32 | Uncompressed chunk size (default 65536) |
+| Chunk length | i32 | Uncompressed chunk size (default 16384) |
 | Max compressed size | i32 | Maximum compressed chunk size (always present in BTI format) |
 | Data length | i64 | Uncompressed data length |
 | Chunk count | i32 | Number of compressed chunks |
@@ -352,7 +352,7 @@ pub struct SSTableComponents<IO> {
 pub struct WriteOptions {
     pub compression: Compression,
     pub bloom_fp_rate: f64,         // Default: 0.01
-    pub chunk_size: usize,          // Default: 65536
+    pub chunk_size: usize,          // Default: 16384
     pub row_index_granularity: usize, // Default: 16384
 }
 
@@ -367,12 +367,31 @@ pub enum Compression {
 
 The BTI partition index stores keys in their **byte-comparable** (byte-ordered) representation, not their raw serialization. For Murmur3-partitioned tables, the byte-comparable form starts with the token bytes, ensuring trie traversal follows token order.
 
-Ferrosa must implement the byte-comparable encoding from `ByteComparable.java` (CASSANDRA-6936). For the initial implementation targeting Murmur3 partitioned tables, this is:
+Ferrosa must implement the byte-comparable encoding from `ByteComparable.java` (CASSANDRA-6936), version OSS50. For Murmur3-partitioned tables, the encoding is a multi-component sequence with escape encoding:
 
-1. Token bytes (8 bytes, XOR with sign bit to make unsigned comparison correct)
-2. Separator byte (0x00)
-3. Raw partition key bytes
-4. Terminator (0x00 0x00)
+1. `0x40` (`NEXT_COMPONENT` separator)
+1. Token bytes (8 bytes, big-endian, XOR with `0x8000000000000000` to flip sign bit)
+1. `0x00` (`ESCAPE` — end of token component)
+1. `0x40` (`NEXT_COMPONENT` separator)
+1. Partition key bytes with null-escape encoding (see below)
+1. `0x00` (`ESCAPE` — end of key component)
+1. `0x38` (`TERMINATOR`)
+
+**Null-escape encoding** for key bytes: any `0x00` byte in the key is escaped as `0x00 0xFF`. A sequence of `n` consecutive zeros becomes `0x00` followed by `n-1` `0xFE` bytes and a final `0xFF`. The component ends with a bare `0x00` (the `ESCAPE` byte), which is unambiguous because real zeros are always followed by `0xFE` or `0xFF`.
+
+**Example**: token `1`, key `0x4142` ("AB"):
+
+```
+40                          NEXT_COMPONENT
+80 00 00 00 00 00 00 01     token (1 XOR sign bit)
+00                          ESCAPE (end of token)
+40                          NEXT_COMPONENT
+41 42                       key bytes (no escaping needed)
+00                          ESCAPE (end of key)
+38                          TERMINATOR
+```
+
+**Key constants** (from `ByteSource.java`): `ESCAPE = 0x00`, `NEXT_COMPONENT = 0x40`, `TERMINATOR = 0x38`, `ESCAPED_0_CONT = 0xFE`, `ESCAPED_0_DONE = 0xFF`.
 
 ## Phasing
 
