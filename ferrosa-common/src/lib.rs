@@ -8,3 +8,6 @@
 //! graph work with raw bytes and cell values, not CQL-typed values.
 
 pub mod murmur3;
+pub mod token;
+
+pub use token::Token;
