@@ -1,0 +1,7 @@
+[package]
+name = "ferrosa-common"
+description = "Shared types for the Ferrosa distributed database"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
