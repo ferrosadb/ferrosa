@@ -63,7 +63,11 @@ graph BT
 - **Location**: `ferrosa-storage/`
 - **Dependencies**: `ferrosa-common`, `ferrosa-sstable`
 - **Key interfaces**: Memtable, commit log, flush, compaction, S3 upload manager, local cache (LRU)
-- **Concurrency**: Partition-level locking for writes, atomic memtable swap on flush, `Arc`-based refcounting for SSTable reads during compaction
+- **Concurrency**:
+  - *Memtable writes*: Concurrent skip list (or lock-free trie). Different partitions written in parallel; same-partition writes serialize on a per-partition lock.
+  - *Memtable flush*: Atomic swap — current memtable replaced with a fresh one; old memtable flushed to SSTable in background. Reads check both active and flushing memtable.
+  - *SSTable reads during compaction*: `Arc`-based refcounting. Compaction creates new SSTables and atomically swaps the active set. In-flight reads hold references to old SSTables, cleaned up when last reference drops.
+  - *S3 upload concurrency*: Independent async task observes new SSTables via channel, uploads without holding storage engine locks. Local files retained until S3 upload confirms.
 - **Compaction strategies**: Size-Tiered, Leveled, Time-Window
 - **External deps**: `aws-sdk-s3`, `tokio`, `crossbeam`
 

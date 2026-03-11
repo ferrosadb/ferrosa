@@ -25,5 +25,4 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 
 ## Related Documents
 
-- [Full Design Spec](../docs/superpowers/specs/2026-03-11-ferrosa-architecture-design.md) — comprehensive design document with all details
 - [README](../README.md) — project introduction

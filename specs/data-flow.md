@@ -93,13 +93,21 @@ stateDiagram-v2
     GracePeriod --> Deleted: Grace period expires (1hr)
 ```
 
-### Manifest Update Protocol
+### Manifest
+
+Each table has a `manifest.json` in S3 that lists the current set of active SSTable generations. The manifest is the source of truth for what SSTables are live. It is a complete document (not a diff) — each update writes a new version. Since S3 PUT is atomic for a single object, the manifest transitions atomically from one consistent state to another. A generation counter detects stale writes.
+
+### Safe Deletion Protocol
 
 1. Compaction completes: new SSTables uploaded, confirmed durable in S3
 1. Updated `manifest.json` written (atomic S3 PUT — new generations in, old out)
-1. Old SSTables marked for deletion with 1-hour grace period
-1. Background GC deletes expired S3 objects
-1. Periodic orphan sweep catches objects not in any manifest
+1. Old SSTables marked for deletion with grace period (default 1 hour)
+1. Background GC deletes S3 objects whose grace period has expired
+1. Grace period ensures nodes reading old SSTables from S3 (cache miss during transition) have time to complete
+
+### Orphan Cleanup
+
+A periodic sweep compares SSTable objects in S3 against all known manifests. Objects not referenced by any manifest and older than the grace period are deleted. This catches orphans from partial upload failures or interrupted compactions.
 
 ## Commit Log Lifecycle
 
@@ -115,9 +123,37 @@ stateDiagram-v2
     Deletable --> [*]: Cleanup
 ```
 
-**Commit log entry format**: 4-byte length + 8-byte logical timestamp + CQL mutation payload + 4-byte CRC32.
+### Commit Log Entry Format
 
-**Recovery**: New node reads `checkpoint.json` from S3, determines replay starting point, downloads and replays segments newer than the latest durable SSTable.
+Self-describing binary records:
+
+| Field | Size | Description |
+|-------|------|-------------|
+| Length prefix | 4 bytes | Record length |
+| Logical timestamp | 8 bytes | Monotonic per node |
+| Mutation payload | Variable | Serialized CQL partition update |
+| Checksum | 4 bytes | CRC32 |
+
+Segments are fixed-size files (default 32MB). A segment is closed and a new one opened when it reaches capacity.
+
+### S3 Shipping
+
+Closed segments are uploaded to S3 immediately. The active (not yet full) segment is uploaded on a timer (default 5 seconds) as a partial segment. The `checkpoint.json` per node tracks:
+
+- The latest segment ID and offset confirmed durable in S3
+- The latest SSTable generation confirmed durable in S3
+- A mapping of segment IDs to their S3 object keys
+
+### Replay Protocol
+
+1. Read `checkpoint.json` from S3 to find the replay starting point
+1. Determine which commit log segments contain data newer than the latest durable SSTable
+1. Download and replay those segments in order, applying mutations to the memtable
+1. Once replay is complete, the node is current and can begin serving
+
+### Commit Log Cleanup
+
+Segments in S3 are deleted once the data they contain has been flushed to SSTables and those SSTables are confirmed durable in S3. The checkpoint tracks this boundary.
 
 ## S3 Upload Backpressure
 
@@ -133,6 +169,13 @@ flowchart TD
     F -->|Above 80%| H[Backpressure: WriteTimeout to clients]
     E --> F
 ```
+
+### Backpressure Details
+
+1. **Queue depth monitoring**: Track pending uploads by count and total bytes.
+1. **Priority shedding**: Drop compaction output uploads first — they can be re-compacted. Freshly-flushed SSTables always get priority.
+1. **Disk space threshold**: When local ephemeral disk usage exceeds a configurable threshold (default 80%), begin rejecting writes with backpressure (return `WriteTimeout` to clients). This prevents the node from filling its ephemeral storage.
+1. **S3 outage behavior**: Writes continue locally as long as disk space permits. Uploads queue and retry with exponential backoff. When S3 returns, the queue drains in priority order.
 
 ## Node Recovery
 
@@ -179,6 +222,20 @@ s3://ferrosa-data/{cluster_id}/
     schema.json
     topology.json
 ```
+
+## S3 Object Metadata (per SSTable component)
+
+| Key | Value | Purpose |
+|-----|-------|---------|
+| `x-amz-meta-ferrosa-table` | `keyspace.table_name` | Quick identification |
+| `x-amz-meta-ferrosa-generation` | `42` | SSTable generation |
+| `x-amz-meta-ferrosa-format` | `bti-1.0` | Format version |
+| `x-amz-meta-ferrosa-min-token` | `-9223372036854775808` | Partition range start (cache warming) |
+| `x-amz-meta-ferrosa-max-token` | `3074457345618258602` | Partition range end |
+| `x-amz-meta-ferrosa-level` | `0` | Compaction level |
+| `x-amz-meta-ferrosa-checksum` | `sha256:abc123...` | Integrity verification |
+| `x-amz-meta-ferrosa-uploaded-by` | `node-3` | Source node |
+| `x-amz-meta-ferrosa-created-at` | `2026-03-11T...` | Lifecycle policies |
 
 ## Related Specs
 

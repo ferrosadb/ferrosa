@@ -98,6 +98,36 @@ Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analys
 | Consensus | Raft metadata, tunable CL | Proven Rust libs + Cassandra semantics |
 | Partitioner | Murmur3Partitioner | Cassandra SSTable compatibility |
 
+## AWS Lock-in Flags
+
+Ferrosa is AWS-first but must remain portable to S3-compatible stores (MinIO, etc.):
+
+- **S3 object metadata** (`x-amz-meta-*`): Standard across S3-compatible stores. No lock-in.
+- **S3 client library**: Start with `aws-sdk-s3` (works with MinIO via endpoint override). Add trait abstraction for `object_store` crate (Apache Arrow) if broader backend support needed.
+- **S3 conditional writes** (`If-None-Match`, Nov 2024): Not required for write-behind model. If used in future native format, flag as portability concern — MinIO supports them, other S3-compat stores may not.
+
+## Research Items
+
+Deferred but tracked for future investigation:
+
+| Area | Options | Notes |
+|------|---------|-------|
+| Distributed transactions | Accord, Tempo, Janus, EPaxos | Evaluate when core is stable |
+| Clock synchronization | HLC, TrueTime-like | Needed for cross-DC consistency |
+| Transport protocol | QUIC (`quinn` crate) | Better for multi-DC, built-in multiplexing |
+| Native SSTable format | S3-optimized: larger blocks, content-addressed, embedded metadata | Behind feature flag, after BTI is solid |
+| Object store abstraction | `object_store` crate (Apache Arrow) | For GCS/Azure/MinIO portability |
+| S3 conditional writes | `If-None-Match` for consistency | Portability concern |
+
+## References
+
+- Fleming et al., "Hunter: Using Change Point Detection to Hunt for Performance Regressions," ICPE '23. [Paper](https://dl.acm.org/doi/10.1145/3578244.3583719) | [Code](https://github.com/datastax-labs/hunter)
+- DeCandia et al., "Dynamo: Amazon's Highly Available Key-value Store," SOSP '07. [Paper](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf)
+- [Apache Cassandra Source](https://github.com/apache/cassandra)
+- [AWS S3 Object Metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html)
+- [Sprites Documentation](https://docs.sprites.dev/)
+- [fly.io Documentation](https://fly.io/docs/)
+
 ## Related Specs
 
 - [Components](components.md) — crate architecture details
