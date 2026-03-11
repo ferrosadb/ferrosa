@@ -8,10 +8,12 @@
 //! graph work with raw bytes and cell values, not CQL-typed values.
 
 pub mod cell;
+pub mod error;
 pub mod key;
 pub mod murmur3;
 pub mod token;
 
 pub use cell::{CellValue, Timestamp, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
+pub use error::{Error, Result};
 pub use key::{DecoratedKey, PartitionKey};
 pub use token::Token;
