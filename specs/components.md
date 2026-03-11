@@ -48,14 +48,20 @@ graph BT
 
 ### ferrosa-sstable
 
-- **Purpose**: Read and write Cassandra-compatible SSTable formats
+- **Purpose**: Read and write Cassandra-compatible SSTable files (BTI format)
 - **Location**: `ferrosa-sstable/`
-- **Dependencies**: `ferrosa-common`
-- **Key interfaces**: `SSTableReader` trait, `SSTableWriter` trait
-- **Formats**: Read Big (legacy) + BTI (trie-based). Write BTI. Future native format behind feature flag.
-- **Components handled**: Data.db, Partitions.db, Rows.db, Filter.db, Statistics.db, CompressionInfo.db, TOC
-- **Compression**: LZ4, Zstd, Snappy
-- **Standalone tools**: `ferrosa-sstable-dump`, `ferrosa-sstable-import`
+- **Dependencies**: `ferrosa-common`, `lz4_flex`, `zstd`
+- **Detailed spec**: [SSTable Format Specification](sstable.md)
+- **Key interfaces**:
+  - `ReadAt` / `WriteAt` — abstract positional I/O traits (file-system impl here, S3 impl in ferrosa-storage)
+  - `SSTableReader` — open and query BTI SSTables
+  - `SSTableWriter` — write new BTI SSTables from sorted input
+- **Formats**: Phase 1: BTI (trie-based, Cassandra 5.x default) read + write. Phase 2: Big (legacy) read for migration. Phase 3: native Ferrosa format behind feature flag.
+- **Components handled**: Data.db, Partitions.db (trie partition index), Rows.db (trie row index), Filter.db (Bloom filter), Statistics.db, CompressionInfo.db, TOC.txt
+- **On-disk trie**: 16 node types with page-aware packing (4096-byte pages), bottom-up incremental construction, used by both partition and row indices
+- **Compression**: LZ4 (default, `lz4_flex`), Zstd (`zstd`). Snappy/Deflate deferred to post-1.0.
+- **Bloom filter**: Cassandra-compatible double-hashing using Murmur3 h1 + h2 from ferrosa-common
+- **Standalone tools** (Phase 2): `ferrosa-sstable-dump`, `ferrosa-sstable-import`
 
 ### ferrosa-storage
 

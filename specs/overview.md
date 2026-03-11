@@ -21,7 +21,7 @@ graph TB
         Schema[ferrosa-schema<br/>DDL, System KS]
         Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
         Storage[ferrosa-storage<br/>Memtable, Cache, Compaction]
-        SST[ferrosa-sstable<br/>Big + BTI Read, BTI Write]
+        SST[ferrosa-sstable<br/>BTI Read + Write]
         Net[ferrosa-net<br/>Internode Protocol]
     end
 
@@ -93,7 +93,7 @@ Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analys
 |----------|--------|-----------|
 | Deployment | AWS-first, flag lock-in | Start concrete, stay portable |
 | Storage | Write-behind async S3 | Minimal write latency, quorum mitigates loss window |
-| SSTable | Layered: read Big+BTI, write BTI | Migration path + room to innovate |
+| SSTable | Phased: BTI read+write first, Big read later | Focus on modern format, migration path preserved |
 | Protocol | CQL client compat, own internode | Apps work unchanged, clean internal design |
 | Consensus | Raft metadata, tunable CL | Proven Rust libs + Cassandra semantics |
 | Partitioner | Murmur3Partitioner | Cassandra SSTable compatibility |
@@ -131,5 +131,6 @@ Deferred but tracked for future investigation:
 ## Related Specs
 
 - [Components](components.md) — crate architecture details
+- [SSTable](sstable.md) — BTI format, trie encoding, I/O traits, compression
 - [Data Flow](data-flow.md) — write/read paths and S3 lifecycle
 - [Testing](testing.md) — test infrastructure and suites

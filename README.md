@@ -49,7 +49,7 @@ graph TB
         Schema[ferrosa-schema<br/>DDL, System KS]
         Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
         Storage[ferrosa-storage<br/>Memtable, Cache, Compaction]
-        SST[ferrosa-sstable<br/>Big + BTI Read, BTI Write]
+        SST[ferrosa-sstable<br/>BTI Read + Write]
         Net[ferrosa-net<br/>Internode Protocol]
     end
 
@@ -91,13 +91,14 @@ Bloom filters and partition indices are always cached locally.
 
 ### SSTable Compatibility
 
-Ferrosa reads both Cassandra SSTable formats:
+Ferrosa implements Cassandra's SSTable formats in phases:
 
-- **Big format** (legacy) — for migrating older Cassandra deployments
-- **BTI format** (trie-based, Cassandra 5.x default) — primary read/write format
+- **BTI format** (trie-based, Cassandra 5.x default) — primary read/write format, implemented first
+- **Big format** (legacy) — read support planned for migrating older Cassandra deployments
 
-A future native Ferrosa format optimized for S3 access patterns is planned behind a
-feature flag, with BTI remaining supported for compatibility.
+Storage I/O is abstracted behind `ReadAt`/`WriteAt` traits, enabling the same SSTable code to
+read from local files or S3. A future native Ferrosa format optimized for S3 access patterns
+is planned behind a feature flag.
 
 ### Cluster Coordination
 
@@ -117,7 +118,7 @@ Distributed transactions (Accord-style) are a research item, not yet implemented
 | `ferrosa-cql` | CQL native protocol v5, query parsing, execution |
 | `ferrosa-storage` | Memtable, commit log, compaction, S3 write-behind, cache management |
 | `ferrosa-schema` | Table/keyspace definitions, schema evolution, validation |
-| `ferrosa-sstable` | Read Big+BTI SSTables, write BTI, format abstraction |
+| `ferrosa-sstable` | Read/write BTI SSTables, trie indices, Bloom filter, compression |
 | `ferrosa-net` | Internode protocol, connection management, TLS |
 | `ferrosa-common` | Shared types: Token, PartitionKey, DecoratedKey, CQL types |
 
