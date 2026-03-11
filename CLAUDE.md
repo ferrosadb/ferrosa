@@ -42,6 +42,7 @@ cargo fmt --check
 ## Cassandra Submodule (Track 1 — Analysis Reference)
 
 The `cassandra/` directory is a git submodule of Apache Cassandra (`git@github.com:apache/cassandra.git`). It exists for:
+
 - DSM (Dependency Structure Matrix) analysis
 - Behavioral characterization
 - SSTable format reverse engineering

@@ -79,6 +79,7 @@ asynchronously uploaded to S3. The commit log is also shipped to S3 on a short i
 (configurable interval) for crash recovery.
 
 Data durability during the async upload window is protected by:
+
 1. **Quorum writes** — data exists on multiple replicas before acknowledgment
 2. **Commit log shipping** — small, frequent uploads to S3 (seconds, not minutes)
 3. **Upload priority** — freshly-flushed SSTables upload before compaction output
@@ -91,6 +92,7 @@ Bloom filters and partition indices are always cached locally.
 ### SSTable Compatibility
 
 Ferrosa reads both Cassandra SSTable formats:
+
 - **Big format** (legacy) — for migrating older Cassandra deployments
 - **BTI format** (trie-based, Cassandra 5.x default) — primary read/write format
 
