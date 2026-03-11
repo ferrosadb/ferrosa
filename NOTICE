@@ -1,0 +1,34 @@
+Ferrosa
+Copyright 2026 Ferrosa, Inc.
+
+This product includes software developed at Ferrosa, Inc.
+(https://ferrosadb.com/).
+
+================================================================================
+Third-party attributions
+================================================================================
+
+This product includes software developed by The Apache Software Foundation
+(http://www.apache.org/).
+
+  - Apache Cassandra (https://cassandra.apache.org/)
+    Ferrosa's SSTable read path is wire-compatible with the Apache Cassandra
+    "Big" and "BTI" on-disk formats. Format-compatibility code in the
+    `ferrosa-sstable` crate is derived from the Apache Cassandra project,
+    licensed under the Apache License, Version 2.0.
+
+  - openraft (https://github.com/databendlabs/openraft)
+    Ferrosa uses openraft for cluster metadata consensus. openraft is
+    licensed under the Apache License, Version 2.0.
+
+  - Apache Accord (https://github.com/apache/cassandra-accord)
+    Ferrosa's strict-serializable transaction layer is modeled on the Accord
+    protocol. Accord is part of the Apache Cassandra project and licensed
+    under the Apache License, Version 2.0.
+
+  - Tokio (https://tokio.rs/)
+    Ferrosa uses the Tokio async runtime, dual-licensed under MIT and
+    Apache License 2.0.
+
+The full set of third-party Rust dependencies, with their licenses, is
+enumerated in THIRD_PARTY_LICENSES.md (generated via cargo-about).
