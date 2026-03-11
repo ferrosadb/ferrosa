@@ -4,85 +4,87 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Ferrosa is a wrapper repository containing Apache Cassandra as a git submodule (`cassandra/` → `git@github.com:apache/cassandra.git`). The actual source code lives inside the `cassandra/` directory.
+Ferrosa is a Rust reimplementation of Apache Cassandra with S3-backed storage. The repository has two tracks:
 
-- **Cassandra version**: 5.1
-- **Language**: Java
-- **Supported JDKs**: 11, 17, 21 (11 is default)
-- **Build tool**: Apache Ant 1.10+
+- **Rust workspace** (primary): Independent crates that compose into a distributed database
+- **Cassandra submodule** (`cassandra/`): Apache Cassandra 5.1 source as a behavioral reference/oracle for Track 1 analysis
 
-## Common Commands
+See `docs/superpowers/specs/2026-03-11-ferrosa-architecture-design.md` for the full architecture spec.
 
-All commands run from `cassandra/`:
+## Rust Workspace (Track 2 — Primary)
+
+Cargo workspace with these crates (in build order):
+
+| Crate | Purpose |
+|-------|---------|
+| `ferrosa-common` | Shared types: Token, PartitionKey, DecoratedKey, CellValue |
+| `ferrosa-sstable` | Read Cassandra Big+BTI SSTables, write BTI format |
+| `ferrosa-storage` | Memtable, commit log, compaction, S3 write-behind, cache |
+| `ferrosa-schema` | Table/keyspace definitions, system keyspaces, schema evolution |
+| `ferrosa-cql` | CQL native protocol v5, query parsing/execution |
+| `ferrosa-net` | Custom internode protocol, TLS, connection management |
+| `ferrosa-cluster` | Raft metadata, tunable CL, routing, repair, hinted handoff |
+| `ferrosa` | Binary — composes all crates into the running database |
+
+```bash
+# Build
+cargo build
+
+# Test
+cargo test                           # All crates
+cargo test -p ferrosa-sstable        # Single crate
+
+# Lint
+cargo clippy --all-targets
+cargo fmt --check
+```
+
+## Cassandra Submodule (Track 1 — Analysis Reference)
+
+The `cassandra/` directory is a git submodule of Apache Cassandra (`git@github.com:apache/cassandra.git`). It exists for:
+- DSM (Dependency Structure Matrix) analysis
+- Behavioral characterization
+- SSTable format reverse engineering
+- CQL protocol documentation
+
+Commands run from `cassandra/`:
 
 ```bash
 cd cassandra
-
-# Build
-ant build                    # Compile classes
-ant jar                      # Create JAR
-
-# Tests
-ant test                     # Run unit tests
-ant testsome -Dtest.name=org.apache.cassandra.service.StorageServiceServerTest  # Single test class
-ant testsome -Dtest.name=MyTest -Dtest.methods=testFoo,testBar  # Specific methods
-ant test-jvm-dtest           # JVM-based distributed tests
-ant long-test                # Long-running tests
-
-# Code quality
-ant check                    # Verify source code (pre-commit)
-.build/check-code.sh         # Full code checks (checkstyle, RAT, OWASP)
-
-# Clean
-ant clean                    # Remove build artifacts
-ant realclean                # Remove entire build directory
+ant build                    # Compile
+ant test                     # Unit tests
+ant testsome -Dtest.name=MyTest  # Single test
+ant check                    # Code checks
 ```
 
-## Architecture
+### Cassandra Architecture Reference
 
-Source is under `cassandra/src/java/org/apache/cassandra/`:
+Source under `cassandra/src/java/org/apache/cassandra/`:
 
 | Package | Purpose |
 |---------|---------|
-| `cql3/` | CQL query language implementation |
-| `db/` | Storage engine core |
-| `config/` | Configuration management |
-| `dht/` | Distributed hash table / partitioning |
-| `gms/` | Gossip protocol (cluster membership) |
-| `net/` | Networking / internode messaging |
-| `service/` | Core services (StorageService, etc.) |
+| `cql3/` | CQL query language |
+| `db/` | Storage engine, memtable, compaction |
+| `io/sstable/` | SSTable formats (Big + BTI) |
+| `gms/` | Gossip protocol |
+| `service/` | StorageService, StorageProxy |
+| `service/accord/` | Accord consensus (5.x) |
+| `tcm/` | Cluster metadata service |
+| `db/commitlog/` | Commit log |
+| `cache/` | Row, key, chunk caches |
 | `repair/` | Anti-entropy repair |
-| `auth/` | Authentication & authorization |
-| `schema/` | Schema management |
 
-Tests mirror this structure under `cassandra/test/`:
-- `unit/` — JUnit unit tests
-- `distributed/` — JVM-based distributed tests (mocked clusters)
-- `burn/` — Stress tests
-- `long/` — Long-running tests
-- `microbench/` — JMH benchmarks
-- `harry/` — Property-based testing
+### Checkstyle Rules (Cassandra)
 
-Cassandra also has an `accord` submodule under `cassandra/modules/accord/` for distributed transaction consensus.
+- **Clock**: Use `Clock.Global`, not `System.currentTimeMillis()`
+- **Executors**: Use `ExecutorFactory.Global`, not `java.util.concurrent.Executors`
+- Suppress with: `// checkstyle: permit this import`
 
-## Checkstyle Rules
+## Key Design Decisions
 
-Key enforced conventions (`.build/checkstyle.xml`):
-
-- **Clock**: Use `org.apache.cassandra.utils.Clock.Global`, not `System.currentTimeMillis()` / `System.nanoTime()` / `Instant.now()`
-- **Executors**: Use `org.apache.cassandra.concurrent.ExecutorFactory.Global`, not `java.util.concurrent.Executors` directly
-- Suppressible with inline comments: `// checkstyle: permit this import`, `// checkstyle: permit this instantiation`, `// checkstyle: permit this invocation`
-
-## Branch Naming Convention
-
-Feature branches: `your-name/CASSANDRA-#####/base-branch`
-
-## Commit Message Format
-
-```
-<One sentence description>
-
-<Optional longer description>
-
-patch by <Authors>; reviewed by <Reviewers> for CASSANDRA-#####
-```
+- **Storage**: Write-behind async S3 — local ephemeral disk as cache, S3 as durable store
+- **SSTable**: Read Big+BTI, write BTI, future native format behind feature flag
+- **Protocol**: CQL client compatible, own internode protocol (not Cassandra wire compat)
+- **Consensus**: Raft for metadata (openraft), tunable consistency for data, transactions deferred
+- **Partitioner**: Murmur3Partitioner (Cassandra compatible)
+- **Target**: AWS-first, flag any lock-in for S3-compatible portability

@@ -51,22 +51,30 @@ implementation that takes advantage of modern hardware and cloud infrastructure.
               ┌──────────────────┼──────────────────┐
               │                  │                  │
     ┌─────────▼──────┐ ┌────────▼────────┐ ┌──────▼──────────┐
-    │ ferrosa-cluster │ │ ferrosa-storage │ │ ferrosa-schema  │
-    │ Raft metadata   │ │ Write-behind S3 │ │ DDL, validation │
-    │ Tunable CL      │ │ Memtable, cache │ │                 │
-    │ Routing         │ │ Compaction      │ │                 │
-    └─────────┬──────┘ └────────┬────────┘ └─────────────────┘
-              │                  │
-    ┌─────────▼──────┐ ┌────────▼────────┐
-    │ ferrosa-net    │ │ ferrosa-sstable │
-    │ Internode msgs │ │ Big + BTI read  │
-    │ TLS, framing   │ │ BTI write       │
-    └────────────────┘ └────────┬────────┘
-                                 │
-                    ┌────────────▼────────────┐
-                    │  S3 (durable storage)  │
-                    │  Ephemeral NVMe (cache) │
-                    └─────────────────────────┘
+    │ ferrosa-cluster │ │ ferrosa-schema  │ │                 │
+    │ Raft metadata  ─┼─▶ DDL, system KS │ │                 │
+    │ Tunable CL      │ └────────────────┘ │                 │
+    │ Routing         │                     │                 │
+    └──┬──────────────┘                     │                 │
+       │          ┌─────────────────────────┘                 │
+       │          │                                           │
+    ┌──▼──────────▼──┐                                        │
+    │ ferrosa-storage │◀───────────────────────────────────────┘
+    │ Write-behind S3 │
+    │ Memtable, cache │
+    │ Compaction      │
+    └──┬──────────────┘
+       │
+    ┌──▼──────────────┐ ┌────────────────┐
+    │ ferrosa-sstable │ │ ferrosa-net    │
+    │ Big + BTI read  │ │ Internode msgs │
+    │ BTI write       │ │ TLS, framing   │
+    └──┬──────────────┘ └────────────────┘
+       │
+    ┌──▼──────────────────────┐
+    │  S3 (durable storage)  │
+    │  Ephemeral NVMe (cache) │
+    └─────────────────────────┘
 ```
 
 ### Storage Model: Write-Behind Async S3
@@ -81,6 +89,7 @@ Data durability during the async upload window is protected by:
 2. **Commit log shipping** — small, frequent uploads to S3 (seconds, not minutes)
 3. **Upload priority** — freshly-flushed SSTables upload before compaction output
 4. **Replica coordination** — at least one replica confirming S3 upload marks data fully durable
+5. **Increased quorum (optional)** — users can set write CL=ALL or higher RF for maximum durability during migration
 
 Reads check memtable first, then local SSTable cache, falling back to S3 on cache miss.
 Bloom filters and partition indices are always cached locally.

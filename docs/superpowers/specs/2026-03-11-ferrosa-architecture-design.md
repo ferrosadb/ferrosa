@@ -49,7 +49,7 @@ Build order with testable milestone at each step:
 | 1 | ferrosa-common | Shared types needed by all crates | Type definitions compile |
 | 2 | ferrosa-sstable | No dependencies, immediately useful | Read real Cassandra SSTables, round-trip BTI write/read |
 | 3 | ferrosa-storage | Builds on sstable, core engine | Single-node writes + reads with S3 backend |
-| 4 | ferrosa-schema | Needed before CQL can execute | Parse CREATE TABLE, validate schemas |
+| 4 | ferrosa-schema | Needed before CQL can execute | Parse CREATE TABLE, validate schemas, system keyspaces queryable |
 | 5 | ferrosa-cql | Client-facing protocol | cqlsh connects and runs basic queries |
 | 6 | ferrosa-net | Needed for multi-node | Two nodes exchange messages |
 | 7 | ferrosa-cluster | Distributed coordination | 3-node cluster handles reads/writes at QUORUM |
@@ -92,6 +92,24 @@ The write-behind model has a window between local write and S3 upload. Five laye
 | 4. Replica upload coordination | Track which replicas have confirmed S3 upload per SSTable generation. At least one confirming marks data "fully durable." | Multi-node failure before any replica uploads |
 | 5. Increased quorum (optional) | Users can set write CL=ALL or use higher RF during migration. Trades write latency for durability. | Catastrophic multi-node failure |
 
+### Concurrency Model
+
+Write and read concurrency within a single node follows Cassandra's proven approach, adapted for Rust's ownership model:
+
+- **Memtable writes**: Concurrent writes to the same partition use partition-level locking. The memtable is a concurrent skip list (or lock-free trie) where different partitions can be written in parallel without contention. Writes to the same partition serialize on a per-partition lock.
+- **Memtable flush**: Atomic swap — the current memtable is replaced with a fresh one while the old memtable is flushed to an SSTable in the background. Reads during flush check both the new active memtable and the flushing memtable.
+- **SSTable reads during compaction**: Reference counting. Each SSTable has an `Arc`-based reference count. Compaction creates new SSTables and atomically swaps the active SSTable set. In-flight reads hold references to old SSTables, which are cleaned up when the last reference is dropped.
+- **S3 upload concurrency**: The upload manager runs as an independent async task. It observes new SSTables via a channel and uploads them without holding any locks on the storage engine. Local SSTable files are retained until S3 upload confirms.
+
+### S3 Upload Backpressure
+
+When the S3 upload queue grows (write throughput exceeds upload bandwidth or S3 is degraded):
+
+1. **Queue depth monitoring**: Track pending uploads by count and total bytes.
+2. **Priority shedding**: Drop compaction output uploads first — they can be re-compacted. Freshly-flushed SSTables always get priority.
+3. **Disk space threshold**: When local ephemeral disk usage exceeds a configurable threshold (default 80%), begin rejecting writes with backpressure (return `WriteTimeout` to clients). This prevents the node from filling its ephemeral storage.
+4. **S3 outage behavior**: Writes continue locally as long as disk space permits. Uploads queue and retry with exponential backoff. When S3 returns, the queue drains in priority order.
+
 ### Read Path
 
 ```
@@ -119,6 +137,46 @@ New/replacement nodes can serve reads within seconds:
 6. Background: warm cache from S3 as traffic arrives
 
 No hours-long streaming from other nodes required.
+
+### SSTable Lifecycle and Garbage Collection in S3
+
+After compaction, input SSTables are superseded by output SSTables. Obsolete SSTables in S3 must be cleaned up safely.
+
+**Manifest**: Each table has a `manifest.json` in S3 that lists the current set of active SSTable generations. The manifest is the source of truth for what SSTables are live. It is a complete document (not a diff) — each update writes a new version of the file.
+
+**Manifest updates**: The node that completes compaction writes an updated manifest listing the new SSTable generations and removing the old ones. Since S3 PUT is atomic for a single object, the manifest transitions atomically from one consistent state to another. There is no read-modify-write race because compaction is coordinated per-node and the manifest includes a generation counter to detect stale writes.
+
+**Safe deletion protocol**:
+1. Compaction completes: new SSTables uploaded to S3, confirmed durable.
+2. Updated manifest written to S3 (new SSTables in, old SSTables out).
+3. Old SSTables marked for deletion with a grace period (default 1 hour).
+4. A background GC process deletes S3 objects whose grace period has expired.
+5. The grace period ensures that any node currently reading an old SSTable from S3 (cache miss during the transition) has time to complete its read.
+
+**Orphan cleanup**: A periodic sweep compares SSTable objects in S3 against all known manifests. Objects not referenced by any manifest and older than the grace period are deleted. This catches orphans from partial upload failures or interrupted compactions.
+
+### Commit Log Format and Recovery
+
+**Format**: Commit log entries are self-describing binary records:
+- 4-byte length prefix
+- 8-byte logical timestamp (monotonic per node)
+- CQL mutation payload (serialized partition update)
+- 4-byte CRC32 checksum
+
+Commit log segments are fixed-size files (default 32MB). A segment is closed and a new one opened when it reaches capacity.
+
+**S3 shipping**: Closed segments are uploaded to S3 immediately. The active (not yet full) segment is uploaded on a timer (default 5 seconds) as a partial segment. The `checkpoint.json` per node tracks:
+- The latest segment ID and offset confirmed durable in S3
+- The latest SSTable generation confirmed durable in S3
+- A mapping of segment IDs to their S3 object keys
+
+**Replay protocol** (new/replacement node):
+1. Read `checkpoint.json` from S3 to find the replay starting point.
+2. Determine which commit log segments contain data newer than the latest durable SSTable.
+3. Download and replay those segments in order, applying mutations to the memtable.
+4. Once replay is complete, the node is current and can begin serving.
+
+**Cleanup**: Commit log segments in S3 are deleted once the data they contain has been flushed to SSTables and those SSTables are confirmed durable in S3. The checkpoint tracks this boundary.
 
 ### S3 Object Layout
 
@@ -225,6 +283,20 @@ Key dependencies:
 - `tokio` — async runtime
 - `crossbeam` — concurrent data structures
 
+### ferrosa-schema (schema management)
+
+Responsibilities:
+- Table, keyspace, and type definitions (CREATE/ALTER/DROP)
+- Schema validation and evolution rules
+- System keyspaces (`system`, `system_schema`, `system_distributed`, etc.) — CQL drivers query these on connection, so they must be present and correct
+- Schema versioning — each schema change produces a new version UUID
+
+**Schema persistence**: Schema is stored as Raft-committed metadata. Schema changes are proposed to the Raft leader, committed through consensus, and applied on all nodes. This replaces Cassandra's gossip-based schema propagation with a strongly consistent model — schema disagreements between nodes cannot occur.
+
+**Schema agreement**: Since schema is Raft-committed, all nodes that have applied the same log index have identical schemas. Schema agreement is checked by comparing Raft applied index, not schema version UUIDs (though UUIDs are maintained for CQL driver compatibility).
+
+**Schema evolution during rolling upgrades**: When Ferrosa nodes are at different binary versions, the Raft log may contain schema operations from a newer version. Older nodes that don't understand a new schema operation will fail to apply it and must be upgraded. Rolling upgrades must therefore be schema-compatible (no breaking schema operations during a rolling upgrade window).
+
 ### ferrosa-cql (CQL protocol compatibility)
 
 Responsibilities:
@@ -232,7 +304,14 @@ Responsibilities:
 - CQL parser (SELECT, INSERT, UPDATE, DELETE, batch, prepared statements)
 - Query planner + optimizer
 - Result set serialization
-- Authentication/authorization hooks
+- Authentication/authorization — initially password-only authenticator (PasswordAuthenticator equivalent), with pluggable auth provider trait for future expansion. The CQL AUTHENTICATE handshake is implemented from the start since drivers require it.
+
+**Minimum viable CQL subset** (initial milestone — cqlsh connects):
+- STARTUP, OPTIONS, QUERY, PREPARE, EXECUTE, REGISTER, RESULT messages
+- Basic types: text, int, bigint, boolean, blob, uuid, timestamp, double, float
+- System keyspace queries (`system.local`, `system.peers`, `system_schema.*`)
+
+Full CQL v5 coverage (collections, UDTs, tuples, counters, paging, event notifications, custom payloads) is built incrementally after the initial milestone.
 
 Compatibility target: all standard CQL drivers (DataStax Java/Python/Go, gocql, scylla-rust-driver) connect without modification.
 
@@ -241,12 +320,18 @@ Compatibility target: all standard CQL drivers (DataStax Java/Python/Go, gocql, 
 Responsibilities:
 - Raft-based metadata consensus (schema, topology, token assignment) via `openraft`
 - Node membership + failure detection
-- Token ring management + virtual nodes
+- Token ring management + virtual nodes (Murmur3Partitioner — required for Cassandra SSTable compatibility)
 - Request routing (coordinator pattern)
 - Tunable consistency level enforcement
 - Read repair
 - Hinted handoff
 - Anti-entropy repair
+
+**Raft group design**:
+- Single cluster-wide Raft group for metadata (schema, topology, token assignment). Metadata changes are infrequent relative to data operations, so a single group is sufficient and avoids multi-group coordination complexity.
+- Raft log is persisted to local ephemeral disk for performance, with the committed log entries also shipped to S3 asynchronously (same write-behind pattern as the commit log). On leader death, a new leader is elected from surviving nodes that have the most recent committed state. If a node loses its local Raft log (ephemeral disk gone), it bootstraps from the latest Raft snapshot in S3 and catches up from the current leader.
+- The `openraft::RaftStorage` trait implementation writes to local disk first (fast), with an async S3 backup of Raft snapshots. Snapshots contain the full metadata state, so recovery does not require replaying the entire log.
+- Node join/leave: Adding or removing a node is a Raft-committed metadata change. The Raft membership (voters) is a subset of cluster nodes — typically 3 or 5 nodes act as Raft voters, while remaining nodes are learners that receive metadata updates. Token ring changes are also committed through Raft, ensuring all nodes agree on the token assignment.
 
 Research items (deferred):
 - Accord or similar for distributed transactions
@@ -265,6 +350,20 @@ Responsibilities:
 - Backpressure + flow control
 
 Start with TCP + length-prefixed framing. QUIC is a research item.
+
+**Protocol versioning**: Each internode connection begins with a version negotiation handshake. The initiating node sends its supported protocol version range; the receiving node responds with the highest mutually supported version. This allows rolling upgrades where nodes temporarily speak different protocol versions. Breaking changes increment the major version; backward-compatible additions increment the minor version. Minimum supported version is configurable to allow dropping old protocol versions.
+
+### ferrosa-common (shared types)
+
+Contains low-level types shared across all crates:
+- `Token` — position on the hash ring (i64, Murmur3)
+- `PartitionKey`, `DecoratedKey` — key types with token association
+- `ByteBuffer` — owned byte slice wrapper
+- `CellValue` — raw cell value (bytes + timestamp + TTL)
+- Error types and result types
+- Configuration types
+
+CQL-level type definitions (text, int, collections, UDTs, tuples, type serialization/deserialization) live in `ferrosa-cql`, not `ferrosa-common`. Crates below `ferrosa-cql` in the dependency graph (like `ferrosa-sstable`) work with raw bytes and cell values, not CQL-typed values. This keeps `ferrosa-sstable` independent of CQL protocol concerns.
 
 ---
 
