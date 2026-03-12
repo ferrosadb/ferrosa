@@ -19,8 +19,8 @@ pub use audit::{
     LogAuditSink, SystemTableAuditSink, TestAuditSink,
 };
 pub use auth::{
-    AuthContext, AuthRateLimiter, GrantEntry, PasswordHasher, PasswordPolicy, Permission,
-    RateLimitConfig, Resource, RoleMetadata, RoleUpdates,
+    check_permission, AuthContext, AuthRateLimiter, GrantEntry, PasswordHasher, PasswordPolicy,
+    Permission, RateLimitConfig, Resource, RoleMetadata, RoleUpdates,
 };
 pub use convert::cql_to_marshal_type;
 pub use error::{Result, SchemaError};
