@@ -19,6 +19,7 @@
 //!
 //! [bti]: https://cassandra.apache.org/doc/latest/cassandra/architecture/storage-engine.html
 
+pub mod bloom;
 pub mod compression;
 pub mod io;
 pub mod types;
