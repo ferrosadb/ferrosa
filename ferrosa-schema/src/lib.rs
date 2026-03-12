@@ -4,6 +4,7 @@
 //! Every mutating operation requires an `AuthContext` (ADR-006).
 //! Every mutation emits an audit event (ADR-008).
 
+pub mod audit;
 pub mod auth;
 pub mod error;
 pub mod metadata;
