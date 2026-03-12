@@ -9,6 +9,10 @@ pub mod auth;
 pub mod error;
 pub mod metadata;
 
+pub use audit::{
+    AuditContext, AuditEvent, AuditEventKind, AuditLogEntry, AuditSink, CompositeSink,
+    LogAuditSink, SystemTableAuditSink, TestAuditSink,
+};
 pub use auth::{
     AuthContext, AuthRateLimiter, GrantEntry, PasswordHasher, PasswordPolicy, Permission,
     RateLimitConfig, Resource, RoleMetadata, RoleUpdates,

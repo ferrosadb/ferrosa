@@ -1,10 +1,14 @@
 //! Audit subsystem for tracking schema and authentication events.
 
 pub mod event;
+pub mod log_sink;
+pub mod table_sink;
 
 use std::sync::{Arc, Mutex};
 
 pub use event::{AuditContext, AuditEvent, AuditEventKind};
+pub use log_sink::LogAuditSink;
+pub use table_sink::{AuditLogEntry, SystemTableAuditSink};
 
 /// A sink that receives audit events for logging, storage, or forwarding.
 pub trait AuditSink: Send + Sync {
