@@ -1,24 +1,12 @@
 //! Single-node storage engine for Ferrosa.
 //!
-//! Accepts writes into an in-memory buffer (memtable), flushes to SSTables,
-//! and merges reads across all sources. The read path is entirely wait-free
-//! via lock-free atomic pointer swaps.
+//! # Components
 //!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────┐
-//! │ TableStore (ArcSwap<StoreView>)             │
-//! │ ┌─────────────┐  ┌──────────┐  ┌─────────┐ │
-//! │ │   Active    │  │ Flushing │  │ SSTables│ │
-//! │ │  Memtable   │  │ Memtable │  │ (Vec)   │ │
-//! │ └─────────────┘  └──────────┘  └─────────┘ │
-//! └─────────────────────────────────────────────┘
-//! ```
-//!
-//! - **Write path**: `ArcSwap::load()` (wait-free) → memtable `put()` (one shard lock)
-//! - **Read path**: `ArcSwap::load()` (wait-free) → check all sources → `merge_partitions()`
-//! - **Flush path**: `Mutex` serializes flushes; two brief `ArcSwap::store()` calls
+//! - **Memtable**: in-memory write buffer (Part A)
+//! - **Flush**: memtable → SSTable (Part A)
+//! - **Merge**: read-path merge across sources (Part A)
+//! - **TableStore**: lock-free composition (Part A)
+//! - **CommitLog**: write-ahead log for durability (Part B)
 
 pub mod commitlog;
 pub mod flush;
