@@ -255,6 +255,19 @@ impl Schema {
         })
     }
 
+    /// Check whether `auth` has `perm` on `resource`.
+    ///
+    /// Delegates to the free function in `auth::permission`, passing the
+    /// current snapshot.
+    pub fn check_permission(
+        &self,
+        auth: &AuthContext,
+        perm: crate::auth::permission::Permission,
+        resource: &crate::auth::permission::Resource,
+    ) -> crate::Result<()> {
+        crate::auth::permission::check_permission(&self.snapshot(), auth, perm, resource)
+    }
+
     /// Emit an audit event through the configured sink.
     fn emit_audit(&self, kind: AuditEventKind) {
         self.audit_sink.emit(&AuditEvent {
