@@ -16,7 +16,8 @@ use crate::audit::AuditSink;
 use crate::auth::password::{PasswordHasher, PasswordPolicy};
 use crate::auth::permission::GrantEntry;
 use crate::auth::rate_limit::{AuthRateLimiter, RateLimitConfig};
-use crate::auth::role::RoleMetadata;
+use crate::auth::role::{AuthContext, RoleMetadata};
+use crate::error::SchemaError;
 use crate::metadata::keyspace::KeyspaceMetadata;
 use crate::metadata::table::TableMetadata;
 use crate::secrets::SecretsProvider;
@@ -96,7 +97,6 @@ pub struct SchemaConfig {
 ///
 /// Holds the current `SchemaSnapshot` behind an `ArcSwap` for lock-free reads.
 /// Mutations acquire `write_lock`, clone-and-swap the snapshot, and emit audit events.
-#[allow(dead_code)] // Fields used by authenticate() and check_permission() added in next commits
 pub struct Schema {
     /// Lock-free swappable snapshot.
     inner: ArcSwap<SchemaSnapshot>,
@@ -104,7 +104,8 @@ pub struct Schema {
     write_lock: Mutex<()>,
     /// Password hashing configuration.
     hasher_config: PasswordHasher,
-    /// Password strength policy.
+    /// Password strength policy (used by create_role/alter_role in CRUD operations).
+    #[allow(dead_code)]
     password_policy: PasswordPolicy,
     /// Authentication rate limiter.
     rate_limiter: AuthRateLimiter,
@@ -176,6 +177,82 @@ impl Schema {
     /// Return a lock-free snapshot of the current schema state.
     pub fn snapshot(&self) -> Arc<SchemaSnapshot> {
         self.inner.load_full()
+    }
+
+    /// Authenticate a user with username and password.
+    ///
+    /// Checks the rate limiter, verifies the password, optionally upgrades
+    /// the hash algorithm, and returns an `AuthContext` on success.
+    pub fn authenticate(&self, username: &str, password: &str) -> crate::Result<AuthContext> {
+        // 1. Check rate limiter BEFORE hashing (prevent CPU-based DoS)
+        self.rate_limiter.check_rate_limit(username)?;
+
+        // 2. Look up role in snapshot
+        let snap = self.snapshot();
+        let role = snap.roles.get(username);
+
+        // 3. Verify password
+        let (verified, role_data) = match role {
+            Some(r) if r.can_login => match &r.salted_hash {
+                Some(hash) => (
+                    PasswordHasher::verify_password_any(password, hash).unwrap_or(false),
+                    Some(r),
+                ),
+                None => (false, Some(r)),
+            },
+            _ => {
+                // Hash anyway to prevent timing side-channel
+                let _ = self.hasher_config.hash_password(password);
+                (false, None)
+            }
+        };
+
+        if !verified {
+            self.rate_limiter.record_failure(username);
+            self.emit_audit(AuditEventKind::AuthFailed {
+                role: username.to_string(),
+            });
+            return Err(SchemaError::AuthenticationFailed);
+        }
+
+        self.rate_limiter.record_success(username);
+
+        // 4. Auto-upgrade hash if algorithm differs
+        let role_data = role_data.unwrap();
+        if let Some(hash) = &role_data.salted_hash {
+            if self.hasher_config.needs_rehash(hash) {
+                let _guard = self.write_lock.lock().unwrap();
+                let mut new_snap = (*self.snapshot()).clone();
+                if let Some(r) = new_snap.roles.get_mut(username) {
+                    if let Ok(new_hash) = self.hasher_config.hash_password(password) {
+                        r.salted_hash = Some(new_hash);
+                        new_snap.version = Uuid::new_v4();
+                        self.inner.store(Arc::new(new_snap));
+                        self.emit_audit(AuditEventKind::PasswordChanged {
+                            role: username.to_string(),
+                            upgraded_algorithm: true,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 5. Check must_change_password
+        let must_change = self
+            .default_password_roles
+            .lock()
+            .unwrap()
+            .contains(username);
+
+        self.emit_audit(AuditEventKind::AuthSuccess {
+            role: username.to_string(),
+        });
+
+        Ok(AuthContext {
+            role: username.to_string(),
+            is_superuser: role_data.is_superuser,
+            must_change_password: must_change,
+        })
     }
 
     /// Emit an audit event through the configured sink.
@@ -348,5 +425,101 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(&e.event, AuditEventKind::SuperuserPasswordMustChange)));
+    }
+
+    // ---- Task 18 tests ----
+
+    #[test]
+    fn authenticate_valid_credentials() {
+        let schema = test_schema();
+        // Default password is "cassandra"
+        let ctx = schema.authenticate("cassandra", "cassandra").unwrap();
+        assert_eq!(ctx.role, "cassandra");
+        assert!(ctx.is_superuser);
+        assert!(ctx.must_change_password); // default password
+    }
+
+    #[test]
+    fn authenticate_wrong_password() {
+        let schema = test_schema();
+        let result = schema.authenticate("cassandra", "wrong_password");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SchemaError::AuthenticationFailed => {}
+            other => panic!("expected AuthenticationFailed, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn authenticate_nonexistent_role() {
+        let schema = test_schema();
+        // Should return AuthenticationFailed, NOT RoleNotFound (security)
+        let result = schema.authenticate("ghost_user", "any_password");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SchemaError::AuthenticationFailed => {}
+            other => panic!("expected AuthenticationFailed, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn authenticate_emits_success_audit() {
+        let sink = Arc::new(TestAuditSink::new());
+        let schema = test_schema_with_sink(sink.clone());
+
+        sink.clear(); // Clear bootstrap events
+        let _ctx = schema.authenticate("cassandra", "cassandra").unwrap();
+
+        let events = sink.events();
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            AuditEventKind::AuthSuccess { role } if role == "cassandra"
+        )));
+    }
+
+    #[test]
+    fn authenticate_emits_failed_audit() {
+        let sink = Arc::new(TestAuditSink::new());
+        let schema = test_schema_with_sink(sink.clone());
+
+        sink.clear(); // Clear bootstrap events
+        let _ = schema.authenticate("cassandra", "bad");
+
+        let events = sink.events();
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            AuditEventKind::AuthFailed { role } if role == "cassandra"
+        )));
+    }
+
+    #[test]
+    fn authenticate_rate_limited_after_failures() {
+        use std::time::Duration;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
+        }
+        let schema = Schema::new(SchemaConfig {
+            rate_limit: RateLimitConfig {
+                max_attempts: 2,
+                base_backoff: Duration::from_secs(60), // long backoff
+                max_backoff: Duration::from_secs(60),
+                lockout_duration: Duration::from_secs(60),
+                window: Duration::from_secs(60),
+            },
+            ..test_config()
+        })
+        .unwrap();
+
+        // Two failed attempts should trigger lockout
+        let _ = schema.authenticate("cassandra", "wrong1");
+        let _ = schema.authenticate("cassandra", "wrong2");
+        let result = schema.authenticate("cassandra", "cassandra");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SchemaError::AuthenticationThrottled => {}
+            other => panic!("expected AuthenticationThrottled, got: {other}"),
+        }
     }
 }
