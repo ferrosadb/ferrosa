@@ -1,9 +1,12 @@
 //! Integration tests for ferrosa-schema: full workflow, permissions, audit.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ferrosa_schema::*;
+
+/// Mutex to serialize tests that manipulate the FERROSA_SUPERUSER_PASSWORD env var.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn test_config() -> SchemaConfig {
     SchemaConfig {
@@ -18,7 +21,8 @@ fn test_config() -> SchemaConfig {
 }
 
 fn test_schema() -> Schema {
-    // Safety: env var mutation is not thread-safe, but acceptable in sequential tests.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Safety: env var mutation is not thread-safe; protected by ENV_LOCK.
     unsafe {
         std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
     }
@@ -26,7 +30,8 @@ fn test_schema() -> Schema {
 }
 
 fn test_schema_with_sink(sink: Arc<TestAuditSink>) -> Schema {
-    // Safety: env var mutation is not thread-safe, but acceptable in sequential tests.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Safety: env var mutation is not thread-safe; protected by ENV_LOCK.
     unsafe {
         std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
     }
@@ -143,7 +148,8 @@ fn non_superuser_cannot_create_keyspace_without_grant() {
 #[test]
 fn rate_limiting_blocks_after_failures() {
     use std::time::Duration;
-    // Safety: env var mutation is not thread-safe, but acceptable in sequential tests.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Safety: env var mutation is not thread-safe; protected by ENV_LOCK.
     unsafe {
         std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
     }
