@@ -3,6 +3,8 @@
 //! Provides `NodeConfig` for node configuration and `LocalInfo` as the
 //! result of `query_local()`.
 
+use std::net::{IpAddr, Ipv4Addr};
+
 use uuid::Uuid;
 
 use crate::registry::Schema;
@@ -20,6 +22,18 @@ pub struct NodeConfig {
     pub rpc_port: u16,
     /// Unique identifier for this node.
     pub host_id: Uuid,
+    /// Address this node listens on for inter-node communication.
+    pub listen_address: IpAddr,
+    /// Port this node listens on for inter-node communication.
+    pub listen_port: u16,
+    /// Address to broadcast to other nodes for inter-node communication.
+    pub broadcast_address: IpAddr,
+    /// Port to broadcast to other nodes for inter-node communication.
+    pub broadcast_port: u16,
+    /// Address for CQL native transport connections.
+    pub rpc_address: IpAddr,
+    /// Token ranges assigned to this node.
+    pub tokens: Vec<String>,
 }
 
 impl Default for NodeConfig {
@@ -30,6 +44,12 @@ impl Default for NodeConfig {
             rack: "rack1".to_string(),
             rpc_port: 9042,
             host_id: Uuid::new_v4(),
+            listen_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            listen_port: 7000,
+            broadcast_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            broadcast_port: 7000,
+            rpc_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            tokens: Vec::new(),
         }
     }
 }
@@ -59,6 +79,20 @@ pub struct LocalInfo {
     pub schema_version: Uuid,
     /// CQL native transport port.
     pub rpc_port: u16,
+    /// Address this node listens on for inter-node communication.
+    pub listen_address: IpAddr,
+    /// Port this node listens on for inter-node communication.
+    pub listen_port: u16,
+    /// Address broadcast to other nodes for inter-node communication.
+    pub broadcast_address: IpAddr,
+    /// Port broadcast to other nodes for inter-node communication.
+    pub broadcast_port: u16,
+    /// Address for CQL native transport connections.
+    pub rpc_address: IpAddr,
+    /// Token ranges assigned to this node.
+    pub tokens: Vec<String>,
+    /// Bootstrap state (always "COMPLETED").
+    pub bootstrapped: String,
 }
 
 /// Query `system.local` for this node's information.
@@ -79,6 +113,13 @@ pub fn query_local(schema: &Schema, node_config: &NodeConfig) -> LocalInfo {
         release_version: "5.1.0-ferrosa".to_string(),
         schema_version: snap.version,
         rpc_port: node_config.rpc_port,
+        listen_address: node_config.listen_address,
+        listen_port: node_config.listen_port,
+        broadcast_address: node_config.broadcast_address,
+        broadcast_port: node_config.broadcast_port,
+        rpc_address: node_config.rpc_address,
+        tokens: node_config.tokens.clone(),
+        bootstrapped: "COMPLETED".to_string(),
     }
 }
 

@@ -34,6 +34,8 @@ pub struct PeerInfo {
     pub schema_version: Uuid,
     /// Token ranges owned by this peer.
     pub tokens: Vec<String>,
+    /// Release version the peer is running.
+    pub release_version: String,
 }
 
 /// Trait for retrieving cluster peer information.
@@ -115,6 +117,7 @@ mod tests {
                     native_transport_port: 9042,
                     schema_version: Uuid::nil(), // will be overwritten
                     tokens: vec!["-9223372036854775808".to_string()],
+                    release_version: "5.1.0-ferrosa".to_string(),
                 }]
             }
         }
