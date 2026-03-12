@@ -1,5 +1,7 @@
 //! Schema metadata types: keyspaces, columns, tables.
 
+pub mod column;
 pub mod keyspace;
 
+pub use column::{ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata};
 pub use keyspace::{KeyspaceMetadata, ReplicationParams};
