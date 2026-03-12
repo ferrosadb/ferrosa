@@ -1,7 +1,7 @@
 # ferrosa-sstable Design
 
 > **Date:** 2026-03-11
-> **Status:** Approved — Phase 1 leaf components (Part A) complete, Part B pending
+> **Status:** Approved — Part A complete, Part B complete (all Tasks 13–24 done)
 > **Approach:** Bottom-up by component, strict TDD (red-green-refactor)
 > **Methodology:** Literate programming (swdev) — module docs, doc-tests, property tests
 
@@ -188,29 +188,19 @@ Fixture generation scripts live in `tools/` alongside existing `generate_murmur3
 
 ## Public API
 
-Matches `specs/sstable.md` exactly:
+See `specs/sstable.md` for full API signatures and the BTI format specification.
 
 ```rust
-/// Positional read — read bytes at an offset without seeking.
-pub trait ReadAt {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize>;
-    fn len(&self) -> Result<u64>;
-}
-
-/// Positional write — write bytes at an offset.
-pub trait WriteAt {
-    fn write_at(&mut self, buf: &[u8], offset: u64) -> Result<usize>;
-    fn flush(&mut self) -> Result<()>;
-}
+pub trait ReadAt { /* positional read */ }
+pub trait WriteAt { /* positional write */ }
 
 pub struct SSTableReader<R: ReadAt> { /* ... */ }
-pub struct SSTableWriter<W: WriteAt> { /* ... */ }
-pub struct SSTableComponents<IO> { /* 7 component handles */ }
-pub struct WriteOptions { /* compression, bloom_fp_rate, chunk_size, row_index_granularity */ }
+pub struct SSTableWriter { /* no generic — produces SSTableOutput in-memory */ }
+pub struct SSTableComponents<R> { /* mixed: R for data/partitions/rows, Vec<u8> for filter/stats */ }
+pub struct SSTableOutput { /* all 7 components as Vec<u8> */ }
+pub struct WriteOptions { /* compression: Option<Compression>, bloom_fp_chance, chunk_size */ }
 pub enum Compression { None, Lz4, Zstd { level: i32 } }
 ```
-
-See `specs/sstable.md` for full API signatures, type definitions, and the BTI format specification.
 
 ## Literate Programming (swdev compliance)
 
