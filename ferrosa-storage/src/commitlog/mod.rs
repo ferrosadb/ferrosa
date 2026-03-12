@@ -5,5 +5,6 @@
 //! files to restore memtable state.
 
 pub(crate) mod config;
+pub(crate) mod descriptor;
 
 pub use config::{CommitLogConfig, CommitLogPosition, SyncStrategyConfig, TableId};
