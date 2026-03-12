@@ -621,66 +621,87 @@ This matches Cassandra's `IncrementalDeepTrieWriterPageAware` algorithm.
 ### Reading
 
 ```rust
-/// Open an SSTable for reading from a directory.
+/// Composes all SSTable component readers into a single read interface.
 pub struct SSTableReader<R: ReadAt> { /* ... */ }
 
 impl<R: ReadAt> SSTableReader<R> {
-    /// Open an SSTable given ReadAt handles for each component.
+    /// Open an SSTable from its component file handles.
     pub fn open(components: SSTableComponents<R>) -> Result<Self>;
 
     /// Look up a partition by decorated key.
     /// Returns None if the partition doesn't exist in this SSTable.
     pub fn get_partition(&self, key: &DecoratedKey) -> Result<Option<Partition>>;
 
-    /// Iterate all partitions in token order.
-    pub fn partitions(&self) -> Result<PartitionIterator<'_, R>>;
+    /// Returns the number of partitions in this SSTable.
+    pub fn key_count(&self) -> u64;
 
-    /// Iterate partitions within a token range.
-    pub fn range(&self, start: Token, end: Token) -> Result<PartitionIterator<'_, R>>;
+    /// Returns a reference to the bloom filter.
+    pub fn bloom_filter(&self) -> &BloomFilter;
 
-    /// SSTable-level statistics.
-    pub fn statistics(&self) -> &SSTableStatistics;
+    /// Returns a reference to the serialization header.
+    pub fn header(&self) -> &SerializationHeader;
+
+    /// Returns a reference to the compression info, if present.
+    pub fn compression_info(&self) -> Option<&CompressionInfo>;
 }
 ```
+
+**Deferred to Phase 2:**
+
+- `partitions(&self) -> PartitionIterator` — full partition iteration in token order
+- `range(start, end) -> PartitionIterator` — range iteration
+- `statistics(&self) -> &SSTableStatistics` — aggregate statistics accessor
 
 ### Writing
 
 ```rust
-/// Write a new SSTable in BTI format.
-pub struct SSTableWriter<W: WriteAt> { /* ... */ }
+/// SSTable writer that accumulates partitions and produces all component files.
+pub struct SSTableWriter { /* ... */ }
 
-impl<W: WriteAt> SSTableWriter<W> {
-    /// Create a writer for a new SSTable.
-    pub fn new(components: SSTableComponents<W>, options: WriteOptions) -> Result<Self>;
+impl SSTableWriter {
+    /// Create a new SSTableWriter with the given options and serialization header.
+    pub fn new(options: WriteOptions, header: SerializationHeader) -> Self;
 
     /// Add a partition (must be called in token order).
-    pub fn add_partition(&mut self, key: &DecoratedKey, rows: &[Row]) -> Result<()>;
+    pub fn add_partition(&mut self, partition: &Partition) -> Result<()>;
 
-    /// Finalize the SSTable: write indices, filter, statistics, TOC.
-    pub fn finish(self) -> Result<SSTableStatistics>;
+    /// Finalize the SSTable and produce all component files.
+    pub fn finish(self) -> Result<SSTableOutput>;
 }
 ```
 
 ### Types
 
 ```rust
-/// Handles to all component files for an SSTable.
-pub struct SSTableComponents<IO> {
-    pub data: IO,
-    pub partitions: IO,
-    pub rows: IO,
-    pub filter: IO,
-    pub compression_info: IO,
-    pub statistics: IO,
-    pub toc: IO,
+/// Handles to all component files for reading an SSTable.
+/// Some components (filter, compression_info, statistics) are read fully
+/// into memory, while data/partitions/rows use the ReadAt trait for
+/// positional access.
+pub struct SSTableComponents<R> {
+    pub data: R,
+    pub partitions: R,
+    pub rows: R,
+    pub filter: Vec<u8>,
+    pub compression_info: Option<Vec<u8>>,
+    pub statistics: Vec<u8>,
+}
+
+/// Result of writing an SSTable — the raw bytes for each component file.
+pub struct SSTableOutput {
+    pub data: Vec<u8>,
+    pub partitions: Vec<u8>,
+    pub rows: Vec<u8>,
+    pub filter: Vec<u8>,
+    pub compression_info: Option<Vec<u8>>,
+    pub statistics: Vec<u8>,
+    pub toc: Vec<u8>,
 }
 
 /// Configuration for SSTable writing.
 pub struct WriteOptions {
-    pub compression: Compression,
-    pub bloom_fp_rate: f64,         // Default: 0.01
-    pub chunk_size: usize,          // Default: 16384
-    pub row_index_granularity: usize, // Default: 16384
+    pub compression: Option<Compression>,  // None = no compression
+    pub bloom_fp_chance: f64,              // Default: 0.01
+    pub chunk_size: usize,                 // Default: 65536
 }
 
 pub enum Compression {
@@ -722,15 +743,24 @@ Ferrosa must implement the byte-comparable encoding from `ByteComparable.java` (
 
 ## Phasing
 
-### Phase 1 (this spec)
+### Phase 1 (implemented)
 
-- BTI format reader: all component files
-- BTI format writer: all component files
+- BTI format reader: all component files (Data.db, Partitions.db, Rows.db, Filter.db, CompressionInfo.db, Statistics.db, TOC.txt)
+- BTI format writer: all component files (produces `SSTableOutput` in-memory byte buffers)
 - On-disk trie: walker (reader) and page-aware builder
 - Bloom filter: read and write, Cassandra-compatible
 - Compression: LZ4 and Zstd
 - File-system `ReadAt`/`WriteAt` implementations
+- Byte-comparable key encoding (OSS50)
+- Varint encoding/decoding with property tests
+- Unit tests and round-trip tests
+
+### Phase 1b (in progress)
+
 - Round-trip tests against Cassandra-generated fixtures
+- `SSTableReader` partition iteration (`partitions()`, `range()`)
+- `SSTableStatistics` aggregate type
+- Row index granularity configuration
 
 ### Phase 2 (deferred)
 

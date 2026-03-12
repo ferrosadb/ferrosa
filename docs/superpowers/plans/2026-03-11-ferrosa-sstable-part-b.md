@@ -23,7 +23,7 @@
 - Create: `ferrosa-sstable/src/trie/node.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Create trie module**
+- [x] **Step 1: Create trie module**
 
 Create `ferrosa-sstable/src/trie/mod.rs`:
 
@@ -59,7 +59,7 @@ pub mod walker;
 pub mod builder;
 ```
 
-- [ ] **Step 2: Write node types and encoding/decoding**
+- [x] **Step 2: Write node types and encoding/decoding**
 
 Create `ferrosa-sstable/src/trie/node.rs`:
 
@@ -542,7 +542,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Complete remaining node type decoders**
+- [x] **Step 3: Complete remaining node type decoders**
 
 Add the remaining decode cases in `read_node_header` for Sparse12, Sparse40, Dense12, Dense16, Dense24, Dense32, Dense40, and LongDense. Each follows the pattern in the spec — read transitions, compute pointer sizes, extract pointers. The `node_size()` formulas give exact byte counts.
 
@@ -554,7 +554,7 @@ Implementation approach for each:
 
 Use the same test pattern: construct a byte sequence by hand, decode it, verify fields.
 
-- [ ] **Step 4: Register trie module in lib.rs**
+- [x] **Step 4: Register trie module in lib.rs**
 
 Add to `ferrosa-sstable/src/lib.rs`:
 
@@ -562,12 +562,12 @@ Add to `ferrosa-sstable/src/lib.rs`:
 pub mod trie;
 ```
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run: `cargo test -p ferrosa-sstable trie::node`
 Expected: All tests PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add ferrosa-sstable/src/trie/ ferrosa-sstable/src/lib.rs
@@ -580,7 +580,7 @@ git commit -m "feat(sstable): add trie node types, encoding/decoding"
 
 - Create: `ferrosa-sstable/src/trie/walker.rs`
 
-- [ ] **Step 1: Write trie walker with tests**
+- [x] **Step 1: Write trie walker with tests**
 
 Create `ferrosa-sstable/src/trie/walker.rs`:
 
@@ -770,12 +770,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests**
+- [x] **Step 2: Run tests**
 
 Run: `cargo test -p ferrosa-sstable trie::walker`
 Expected: All tests PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add ferrosa-sstable/src/trie/walker.rs
@@ -790,7 +790,7 @@ git commit -m "feat(sstable): add trie walker with lookup"
 
 This is the most complex component. The builder constructs a trie incrementally from sorted input, packing nodes into 4096-byte pages (no node crosses a page boundary).
 
-- [ ] **Step 1: Write builder skeleton with core tests**
+- [x] **Step 1: Write builder skeleton with core tests**
 
 Create `ferrosa-sstable/src/trie/builder.rs`:
 
@@ -1229,12 +1229,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests**
+- [x] **Step 2: Run tests**
 
 Run: `cargo test -p ferrosa-sstable trie::builder`
 Expected: All tests PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add ferrosa-sstable/src/trie/builder.rs
@@ -1252,7 +1252,7 @@ git commit -m "feat(sstable): add page-aware incremental trie builder"
 - Create: `ferrosa-sstable/src/toc.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write TOC module with tests**
+- [x] **Step 1: Write TOC module with tests**
 
 Create `ferrosa-sstable/src/toc.rs`:
 
@@ -1371,14 +1371,14 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Register module and run tests**
+- [x] **Step 2: Register module and run tests**
 
 Add `pub mod toc;` to lib.rs.
 
 Run: `cargo test -p ferrosa-sstable toc`
 Expected: All tests PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add ferrosa-sstable/src/toc.rs ferrosa-sstable/src/lib.rs
@@ -1394,7 +1394,7 @@ git commit -m "feat(sstable): add TOC.txt reader/writer"
 
 This is a complex file format with 4 CRC32-checksummed components and 27 fields in StatsMetadata. Implementation approach:
 
-- [ ] **Step 1: Write Statistics.db framing (component count, TOC, CRC)**
+- [x] **Step 1: Write Statistics.db framing (component count, TOC, CRC)**
 
 The outer framing reads the component count, TOC (ordinal/offset pairs), and CRC checksums. Each component's data is extracted by offset differences.
 
@@ -1429,11 +1429,11 @@ pub struct SerializationHeader {
 
 Write the reader/writer for the full file format including all 4 components. Focus on getting the framing and SerializationHeader correct first (needed by Data.db), with StatsMetadata fields readable but round-trippable.
 
-- [ ] **Step 2: Write tests for round-trip of a minimal Statistics.db**
+- [x] **Step 2: Write tests for round-trip of a minimal Statistics.db**
 
 Test: construct a Statistics.db with known values, write it, read it back, verify all fields match.
 
-- [ ] **Step 3: Run tests and commit**
+- [x] **Step 3: Run tests and commit**
 
 Run: `cargo test -p ferrosa-sstable statistics`
 
@@ -1449,7 +1449,7 @@ git commit -m "feat(sstable): add Statistics.db reader/writer with Serialization
 - Create: `ferrosa-sstable/src/partition_index.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write partition index reader**
+- [x] **Step 1: Write partition index reader**
 
 The reader:
 
@@ -1492,7 +1492,7 @@ pub enum PartitionLookup {
 }
 ```
 
-- [ ] **Step 2: Implement open() and lookup()**
+- [x] **Step 2: Implement open() and lookup()**
 
 ```rust
 impl<R: ReadAt> PartitionIndex<R> {
@@ -1551,7 +1551,7 @@ impl<R: ReadAt> PartitionIndex<R> {
 }
 ```
 
-- [ ] **Step 3: Write tests using hand-built index, run and commit**
+- [x] **Step 3: Write tests using hand-built index, run and commit**
 
 Run: `cargo test -p ferrosa-sstable partition_index`
 
@@ -1567,11 +1567,11 @@ git commit -m "feat(sstable): add Partitions.db reader with trie lookup"
 - Create: `ferrosa-sstable/src/row_index.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write row index reader**
+- [x] **Step 1: Write row index reader**
 
 Per-partition trie with metadata footer. Read the metadata (partition key, data position, root offset, block count, deletion time), then use the trie walker for clustering key lookups.
 
-- [ ] **Step 2: Write tests, run, commit**
+- [x] **Step 2: Write tests, run, commit**
 
 ```bash
 git add ferrosa-sstable/src/row_index.rs ferrosa-sstable/src/lib.rs
@@ -1585,7 +1585,7 @@ git commit -m "feat(sstable): add Rows.db reader"
 - Create: `ferrosa-sstable/src/data.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write Data.db deserializer**
+- [x] **Step 1: Write Data.db deserializer**
 
 Reads partitions from the data file using the SerializationHeader for delta decoding. Key structures:
 
@@ -1600,7 +1600,7 @@ This is the most complex reader. Implementation approach:
 3. Then: cell reading with delta decoding
 4. Defer: range tombstone markers, complex columns (collections/UDTs)
 
-- [ ] **Step 2: Write tests with hand-crafted data, run, commit**
+- [x] **Step 2: Write tests with hand-crafted data, run, commit**
 
 ```bash
 git add ferrosa-sstable/src/data.rs ferrosa-sstable/src/lib.rs
@@ -1618,7 +1618,7 @@ git commit -m "feat(sstable): add Data.db partition deserializer"
 - Create: `ferrosa-sstable/src/reader.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write SSTableReader composing all components**
+- [x] **Step 1: Write SSTableReader composing all components**
 
 ```rust
 //! SSTableReader — compose all components into a single read interface.
@@ -1656,11 +1656,11 @@ pub struct SSTableReader<R: ReadAt> {
 }
 ```
 
-- [ ] **Step 2: Implement open(), get_partition(), partitions()**
+- [x] **Step 2: Implement open(), get_partition(), partitions()**
 
-- [ ] **Step 3: Write integration test with hand-built SSTable components**
+- [x] **Step 3: Write integration test with hand-built SSTable components**
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add ferrosa-sstable/src/reader.rs ferrosa-sstable/src/lib.rs
@@ -1674,7 +1674,7 @@ git commit -m "feat(sstable): add SSTableReader composing all components"
 - Create: `ferrosa-sstable/src/writer.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write SSTableWriter**
+- [x] **Step 1: Write SSTableWriter**
 
 The writer accepts partitions in token order and produces all component files:
 
@@ -1686,7 +1686,7 @@ The writer accepts partitions in token order and produces all component files:
 6. Accumulate statistics (Statistics.db)
 7. Write TOC (TOC.txt)
 
-- [ ] **Step 2: Write round-trip test: write then read back**
+- [x] **Step 2: Write round-trip test: write then read back**
 
 ```rust
 #[test]
@@ -1698,7 +1698,7 @@ fn write_then_read_round_trip() {
 }
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add ferrosa-sstable/src/writer.rs ferrosa-sstable/src/lib.rs
@@ -1713,7 +1713,7 @@ git commit -m "feat(sstable): add SSTableWriter for BTI format"
 - Create: `ferrosa-sstable/tests/fixtures/` (generated files)
 - Create: `ferrosa-sstable/tests/cassandra_compat.rs`
 
-- [ ] **Step 1: Write fixture generation script**
+- [x] **Step 1: Write fixture generation script**
 
 Uses Cassandra's internal APIs to write BTI SSTables with known data:
 
@@ -1722,7 +1722,7 @@ Uses Cassandra's internal APIs to write BTI SSTables with known data:
 - Wide partition (many clustering keys)
 - Empty table
 
-- [ ] **Step 2: Generate fixtures and commit**
+- [x] **Step 2: Generate fixtures and commit**
 
 ```bash
 cd cassandra && ant build
@@ -1730,11 +1730,11 @@ javac -cp build/classes/main ../tools/generate_sstable_fixtures.java -d ../tools
 java -cp build/classes/main:../tools generate_sstable_fixtures
 ```
 
-- [ ] **Step 3: Write compatibility tests**
+- [x] **Step 3: Write compatibility tests**
 
 Read Cassandra-generated SSTables with ferrosa's SSTableReader, verify partition data matches expected values.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tools/generate_sstable_fixtures.java ferrosa-sstable/tests/
@@ -1743,22 +1743,22 @@ git commit -m "test(sstable): add Cassandra fixture generation and compatibility
 
 ### Task 24: Final Verification
 
-- [ ] **Step 1: Run full test suite**
+- [x] **Step 1: Run full test suite**
 
 Run: `cargo test`
 Expected: All tests PASS across both crates
 
-- [ ] **Step 2: Run clippy and fmt**
+- [x] **Step 2: Run clippy and fmt**
 
 Run: `cargo clippy --all-targets -- -D warnings && cargo fmt --check`
 Expected: No warnings, no formatting issues
 
-- [ ] **Step 3: Run cargo doc**
+- [x] **Step 3: Run cargo doc**
 
 Run: `cargo doc --no-deps -D warnings`
 Expected: Docs build cleanly
 
-- [ ] **Step 4: Verify lib.rs re-exports**
+- [x] **Step 4: Verify lib.rs re-exports**
 
 Final `ferrosa-sstable/src/lib.rs`:
 

@@ -50,7 +50,7 @@ graph BT
 
 - **Purpose**: Read and write Cassandra-compatible SSTable files (BTI format)
 - **Location**: `ferrosa-sstable/`
-- **Dependencies**: `ferrosa-common`, `lz4_flex`, `zstd`
+- **Dependencies**: `ferrosa-common`, `lz4_flex`, `zstd`, `crc32fast`
 - **Detailed spec**: [SSTable Format Specification](sstable.md)
 - **Key interfaces**:
   - `ReadAt` / `WriteAt` — abstract positional I/O traits (file-system impl here, S3 impl in ferrosa-storage)
