@@ -9,7 +9,7 @@
 **Reference documents:**
 
 - [SSTable Format Specification](../../../specs/sstable.md) — byte-level BTI format
-- [Design Doc](../specs/2026-03-11-ferrosa-sstable-design.md) — module structure, build order
+- [Design Doc](../specs/2026-03-11-ferrosa-sstable-design.md) — module structure, dependencies, test strategy
 
 ---
 

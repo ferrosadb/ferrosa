@@ -5,7 +5,7 @@
 
 ## Overview
 
-`ferrosa-sstable` is the second crate in the Ferrosa build order. It reads and writes Cassandra-compatible SSTable files, providing the on-disk data layer for the storage engine.
+`ferrosa-sstable` reads and writes Cassandra-compatible SSTable files, providing the on-disk data layer for the storage engine.
 
 The initial implementation targets the **BTI (Big Trie-Indexed)** format — Cassandra 5.x's default — for both reading and writing. Big format reading is deferred to a later phase (see [ADR-004](decisions/004-layered-sstable.md)).
 
@@ -119,7 +119,9 @@ Cassandra uses a leading-ones prefix encoding (NOT protobuf-style). The number o
 | `11111110` | 8 | 0 | 72,057,594,037,927,935 |
 | `11111111` | 9 | 0 (8 raw bytes follow) | `i64::MAX` |
 
-Decoding: `extra_bytes = count_leading_ones(first_byte)`. Mask first byte with `0xFF >> extra_bytes` to get value bits. Read `extra_bytes` more bytes in big-endian order.
+Decoding: `extra_bytes = count_leading_ones(first_byte)`. For 1–7 byte encodings (`extra_bytes` 0–6), mask first byte with `0xFF >> (extra_bytes + 1)` to get value bits. For 8-byte encoding (`extra_bytes` = 7, first byte `0xFE`), the first byte has no value bits — read 7 trailing bytes. For 9-byte encoding (`extra_bytes` = 8, first byte `0xFF`), the first byte has no value bits — read 8 trailing bytes. Read remaining bytes in big-endian order.
+
+**Implementation note:** A naive `0xFF >> (extra_bytes + 1)` overflows when `extra_bytes >= 7` on an 8-bit type. Guard this with a range check (`extra_bytes <= 6`) or use a wider intermediate.
 
 **Signed varint** (`signed_vint`): Standard zigzag encoding applied before unsigned encoding:
 

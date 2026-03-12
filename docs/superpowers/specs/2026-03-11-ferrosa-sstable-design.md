@@ -1,15 +1,15 @@
 # ferrosa-sstable Design
 
 > **Date:** 2026-03-11
-> **Status:** Approved
+> **Status:** Approved — Phase 1 leaf components (Part A) complete, Part B pending
 > **Approach:** Bottom-up by component, strict TDD (red-green-refactor)
 > **Methodology:** Literate programming (swdev) — module docs, doc-tests, property tests
 
 ## Goal
 
-Implement the `ferrosa-sstable` crate: read and write Cassandra-compatible BTI (Big Trie-Indexed) SSTables. This is the second crate in the Ferrosa build order, depending only on `ferrosa-common`.
+Implement the `ferrosa-sstable` crate: read and write Cassandra-compatible BTI (Big Trie-Indexed) SSTables.
 
-The formal format specification lives at `specs/sstable.md`. This document covers implementation design — module structure, build order, dependencies, test strategy, and fixture generation.
+The formal format specification lives at `specs/sstable.md`. This document covers implementation design — module structure, dependencies, test strategy, and fixture generation.
 
 ## Crate Structure
 
@@ -219,20 +219,20 @@ Every module follows the swdev template:
 1. `//!` module docs: purpose, constraints/invariants, edge cases, rationale, test pointers
 1. `///` docs on all public types and methods with doc-tests
 1. Narrative explains algorithmic elements (especially trie encoding, byte-comparable keys)
-1. `cargo doc --no-deps -D warnings` in CI
+1. `cargo doc --no-deps` with `RUSTDOCFLAGS="-D warnings"` in CI
 1. Intra-doc links for cross-references between modules
 
 ## ferrosa-common Improvements
 
-The swdev evaluation identified gaps in ferrosa-common. These should be addressed before or during ferrosa-sstable work:
+The swdev evaluation identified gaps in ferrosa-common. High-priority items (H1-H4) were completed during Part A.
 
-| Priority | Action |
-|----------|--------|
-| H1 | Add `//!` module docs to `murmur3.rs`, `token.rs`, `key.rs`, `cell.rs`, `error.rs` |
-| H2 | Add doc-tests to `Token::from_key`, `CellValue::live`/`tombstone`, `DecoratedKey::new`, `hash3_x64_128` |
-| H3 | Add `cargo doc --no-deps -D warnings` to CI |
-| H4 | Add `proptest` dev-dep; property tests for murmur3 determinism, DecoratedKey ordering |
-| M1-M4 | Rationale docs, edge case docs, undocumented public methods, module ordering |
+| Priority | Action | Status |
+|----------|--------|--------|
+| H1 | Add `//!` module docs to `murmur3.rs`, `token.rs`, `key.rs`, `cell.rs`, `error.rs` | Done |
+| H2 | Add doc-tests to `Token::from_key`, `CellValue::live`/`tombstone`, `DecoratedKey::new`, `hash3_x64_128` | Done |
+| H3 | Add `cargo doc --no-deps` with `RUSTDOCFLAGS="-D warnings"` to CI | Done |
+| H4 | Add `proptest` dev-dep; property tests for murmur3 determinism, DecoratedKey ordering | Done |
+| M1-M4 | Rationale docs, edge case docs, undocumented public methods, module ordering | Deferred |
 
 ## Related Documents
 

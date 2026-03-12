@@ -1,6 +1,8 @@
 # ferrosa-sstable Implementation Plan — Part A
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status:** COMPLETED (2026-03-11). All 12 tasks executed successfully. 107 tests passing across workspace. See [Implementation Notes](#implementation-notes) for deviations from plan.
+>
+> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Implement the `ferrosa-sstable` crate: read and write Cassandra-compatible BTI (Big Trie-Indexed) SSTables.
 
@@ -16,7 +18,7 @@
 **Reference documents:**
 
 - [SSTable Format Specification](../../../specs/sstable.md) — byte-level BTI format
-- [Design Doc](../specs/2026-03-11-ferrosa-sstable-design.md) — module structure, build order, test strategy
+- [Design Doc](../specs/2026-03-11-ferrosa-sstable-design.md) — module structure, dependencies, test strategy
 
 ---
 
@@ -30,7 +32,7 @@
 - Create: `ferrosa-sstable/src/lib.rs`
 - Modify: `Cargo.toml` (workspace members)
 
-- [ ] **Step 1: Create crate Cargo.toml**
+- [x] **Step 1: Create crate Cargo.toml**
 
 ```toml
 [package]
@@ -51,7 +53,7 @@ proptest = "1"
 tempfile = "3"
 ```
 
-- [ ] **Step 2: Create lib.rs stub**
+- [x] **Step 2: Create lib.rs stub**
 
 ```rust
 //! Cassandra-compatible BTI SSTable reader and writer.
@@ -78,7 +80,7 @@ tempfile = "3"
 pub mod io;
 ```
 
-- [ ] **Step 3: Add ferrosa-sstable to workspace members**
+- [x] **Step 3: Add ferrosa-sstable to workspace members**
 
 In the root `Cargo.toml`, add `"ferrosa-sstable"` to the members list:
 
@@ -91,12 +93,12 @@ members = [
 ]
 ```
 
-- [ ] **Step 4: Verify workspace builds**
+- [x] **Step 4: Verify workspace builds**
 
 Run: `cargo build`
 Expected: Compiles with 0 errors
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Cargo.toml ferrosa-sstable/
@@ -109,7 +111,7 @@ git commit -m "feat(sstable): scaffold ferrosa-sstable crate"
 
 - Modify: `.github/workflows/ci.yml`
 
-- [ ] **Step 1: Add cargo doc step to CI**
+- [x] **Step 1: Add cargo doc step to CI**
 
 Add after the `cargo test` line:
 
@@ -117,7 +119,7 @@ Add after the `cargo test` line:
       - run: cargo doc --no-deps -D warnings
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add .github/workflows/ci.yml
@@ -134,7 +136,7 @@ git commit -m "ci: add cargo doc --no-deps -D warnings to CI"
 - Modify: `ferrosa-common/src/cell.rs`
 - Modify: `ferrosa-common/src/error.rs`
 
-- [ ] **Step 1: Add `//!` module doc to murmur3.rs**
+- [x] **Step 1: Add `//!` module doc to murmur3.rs**
 
 Add at the top of `ferrosa-common/src/murmur3.rs` (before the existing `///` doc):
 
@@ -158,7 +160,7 @@ Add at the top of `ferrosa-common/src/murmur3.rs` (before the existing `///` doc
 //! compatibility. See [`tests`](mod@tests) and `tools/generate_murmur3_vectors.java`.
 ```
 
-- [ ] **Step 2: Add `//!` module doc to token.rs**
+- [x] **Step 2: Add `//!` module doc to token.rs**
 
 Add at the top of `ferrosa-common/src/token.rs`:
 
@@ -171,7 +173,7 @@ Add at the top of `ferrosa-common/src/token.rs`:
 //! appears in SSTables.
 ```
 
-- [ ] **Step 3: Add `//!` module doc to key.rs**
+- [x] **Step 3: Add `//!` module doc to key.rs**
 
 Add at the top of `ferrosa-common/src/key.rs`:
 
@@ -190,7 +192,7 @@ Add at the top of `ferrosa-common/src/key.rs`:
 //! Bloom filter double-hashing in `ferrosa-sstable`.
 ```
 
-- [ ] **Step 4: Add `//!` module doc to cell.rs**
+- [x] **Step 4: Add `//!` module doc to cell.rs**
 
 Add at the top of `ferrosa-common/src/cell.rs`:
 
@@ -209,7 +211,7 @@ Add at the top of `ferrosa-common/src/cell.rs`:
 //! Sentinel constants: [`NO_TIMESTAMP`], [`NO_TTL`], [`NO_DELETION_TIME`].
 ```
 
-- [ ] **Step 5: Add `//!` module doc to error.rs**
+- [x] **Step 5: Add `//!` module doc to error.rs**
 
 Add at the top of `ferrosa-common/src/error.rs`:
 
@@ -226,12 +228,12 @@ Add at the top of `ferrosa-common/src/error.rs`:
 //! - [`Error::UnsupportedCompression`] — algorithm not yet implemented
 ```
 
-- [ ] **Step 6: Verify cargo doc builds cleanly**
+- [x] **Step 6: Verify cargo doc builds cleanly**
 
 Run: `cargo doc --no-deps -D warnings`
 Expected: No warnings, docs build successfully
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add ferrosa-common/src/
@@ -247,7 +249,7 @@ git commit -m "docs(common): add module-level docs to all modules (swdev complia
 - Modify: `ferrosa-common/src/cell.rs`
 - Modify: `ferrosa-common/src/murmur3.rs`
 
-- [ ] **Step 1: Add doc-test to `Token::from_key`**
+- [x] **Step 1: Add doc-test to `Token::from_key`**
 
 Replace the existing `///` doc on `Token::from_key` with:
 
@@ -263,7 +265,7 @@ Replace the existing `///` doc on `Token::from_key` with:
     /// ```
 ```
 
-- [ ] **Step 2: Add doc-test to `DecoratedKey::new`**
+- [x] **Step 2: Add doc-test to `DecoratedKey::new`**
 
 Replace the existing `///` doc on `DecoratedKey::new` with:
 
@@ -278,7 +280,7 @@ Replace the existing `///` doc on `DecoratedKey::new` with:
     /// ```
 ```
 
-- [ ] **Step 3: Add doc-test to `CellValue::live`**
+- [x] **Step 3: Add doc-test to `CellValue::live`**
 
 Replace the existing `///` doc on `CellValue::live` with:
 
@@ -294,7 +296,7 @@ Replace the existing `///` doc on `CellValue::live` with:
     /// ```
 ```
 
-- [ ] **Step 4: Add doc-test to `CellValue::tombstone`**
+- [x] **Step 4: Add doc-test to `CellValue::tombstone`**
 
 Replace the existing `///` doc on `CellValue::tombstone` with:
 
@@ -310,7 +312,7 @@ Replace the existing `///` doc on `CellValue::tombstone` with:
     /// ```
 ```
 
-- [ ] **Step 5: Add doc-test to `hash3_x64_128`**
+- [x] **Step 5: Add doc-test to `hash3_x64_128`**
 
 Replace the existing `///` doc on `hash3_x64_128` with:
 
@@ -332,12 +334,12 @@ Replace the existing `///` doc on `hash3_x64_128` with:
 /// ```
 ```
 
-- [ ] **Step 6: Run doc-tests**
+- [x] **Step 6: Run doc-tests**
 
 Run: `cargo test --doc -p ferrosa-common`
 Expected: All doc-tests PASS
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add ferrosa-common/src/
@@ -351,7 +353,7 @@ git commit -m "docs(common): add doc-tests to key public methods (swdev complian
 - Modify: `ferrosa-common/Cargo.toml`
 - Create: `ferrosa-common/tests/property_tests.rs`
 
-- [ ] **Step 1: Add proptest dev-dependency**
+- [x] **Step 1: Add proptest dev-dependency**
 
 Add to `ferrosa-common/Cargo.toml`:
 
@@ -360,7 +362,7 @@ Add to `ferrosa-common/Cargo.toml`:
 proptest = "1"
 ```
 
-- [ ] **Step 2: Write property tests**
+- [x] **Step 2: Write property tests**
 
 Create `ferrosa-common/tests/property_tests.rs`:
 
@@ -418,12 +420,12 @@ proptest! {
 }
 ```
 
-- [ ] **Step 3: Run property tests**
+- [x] **Step 3: Run property tests**
 
 Run: `cargo test -p ferrosa-common --test property_tests`
 Expected: All property tests PASS
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add ferrosa-common/
@@ -441,7 +443,7 @@ git commit -m "test(common): add proptest property tests (swdev compliance)"
 - Create: `ferrosa-sstable/src/io.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Create `ferrosa-sstable/src/io.rs`:
 
@@ -739,21 +741,21 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Register module in lib.rs**
+- [x] **Step 2: Register module in lib.rs**
 
 Already done in Task 1 (`pub mod io;`).
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cargo test -p ferrosa-sstable`
 Expected: All tests PASS
 
-- [ ] **Step 4: Run clippy**
+- [x] **Step 4: Run clippy**
 
 Run: `cargo clippy -p ferrosa-sstable -- -D warnings`
 Expected: No warnings
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ferrosa-sstable/src/io.rs
@@ -767,7 +769,7 @@ git commit -m "feat(sstable): add ReadAt/WriteAt traits + file and slice impls"
 - Create: `ferrosa-sstable/src/varint.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write tests and implementation**
+- [x] **Step 1: Write tests and implementation**
 
 Create `ferrosa-sstable/src/varint.rs`:
 
@@ -1116,7 +1118,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Register module in lib.rs**
+- [x] **Step 2: Register module in lib.rs**
 
 Add to `ferrosa-sstable/src/lib.rs`:
 
@@ -1124,12 +1126,12 @@ Add to `ferrosa-sstable/src/lib.rs`:
 pub mod varint;
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cargo test -p ferrosa-sstable varint`
 Expected: All tests PASS
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add ferrosa-sstable/src/varint.rs ferrosa-sstable/src/lib.rs
@@ -1143,7 +1145,7 @@ git commit -m "feat(sstable): add VInt encoding/decoding (Cassandra-compatible)"
 - Create: `ferrosa-sstable/src/types.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write types with tests**
+- [x] **Step 1: Write types with tests**
 
 Create `ferrosa-sstable/src/types.rs`:
 
@@ -1385,7 +1387,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Register module in lib.rs**
+- [x] **Step 2: Register module in lib.rs**
 
 Add to `ferrosa-sstable/src/lib.rs`:
 
@@ -1393,12 +1395,12 @@ Add to `ferrosa-sstable/src/lib.rs`:
 pub mod types;
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cargo test -p ferrosa-sstable types`
 Expected: All tests PASS
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add ferrosa-sstable/src/types.rs ferrosa-sstable/src/lib.rs
@@ -1416,7 +1418,7 @@ git commit -m "feat(sstable): add DeletionTime, LivenessInfo, Row, Partition typ
 - Create: `ferrosa-sstable/src/compression.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write compression module with tests**
+- [x] **Step 1: Write compression module with tests**
 
 Create `ferrosa-sstable/src/compression.rs`:
 
@@ -1748,7 +1750,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Register module in lib.rs**
+- [x] **Step 2: Register module in lib.rs**
 
 Add to `ferrosa-sstable/src/lib.rs`:
 
@@ -1756,12 +1758,12 @@ Add to `ferrosa-sstable/src/lib.rs`:
 pub mod compression;
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cargo test -p ferrosa-sstable compression`
 Expected: All tests PASS
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add ferrosa-sstable/src/compression.rs ferrosa-sstable/src/lib.rs
@@ -1775,7 +1777,7 @@ git commit -m "feat(sstable): add LZ4/Zstd compression + CompressionInfo read/wr
 - Create: `ferrosa-sstable/src/bloom.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write bloom filter module with tests**
+- [x] **Step 1: Write bloom filter module with tests**
 
 Create `ferrosa-sstable/src/bloom.rs`:
 
@@ -2004,7 +2006,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Register module in lib.rs**
+- [x] **Step 2: Register module in lib.rs**
 
 Add to `ferrosa-sstable/src/lib.rs`:
 
@@ -2012,12 +2014,12 @@ Add to `ferrosa-sstable/src/lib.rs`:
 pub mod bloom;
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cargo test -p ferrosa-sstable bloom`
 Expected: All tests PASS
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add ferrosa-sstable/src/bloom.rs ferrosa-sstable/src/lib.rs
@@ -2031,7 +2033,7 @@ git commit -m "feat(sstable): add Cassandra-compatible Bloom filter read/write"
 - Create: `ferrosa-sstable/src/byte_comparable.rs`
 - Modify: `ferrosa-sstable/src/lib.rs`
 
-- [ ] **Step 1: Write byte-comparable encoding module with tests**
+- [x] **Step 1: Write byte-comparable encoding module with tests**
 
 Create `ferrosa-sstable/src/byte_comparable.rs`:
 
@@ -2366,7 +2368,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Register module in lib.rs**
+- [x] **Step 2: Register module in lib.rs**
 
 Add to `ferrosa-sstable/src/lib.rs`:
 
@@ -2374,12 +2376,12 @@ Add to `ferrosa-sstable/src/lib.rs`:
 pub mod byte_comparable;
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cargo test -p ferrosa-sstable byte_comparable`
 Expected: All tests PASS
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add ferrosa-sstable/src/byte_comparable.rs ferrosa-sstable/src/lib.rs
@@ -2392,7 +2394,7 @@ git commit -m "feat(sstable): add OSS50 byte-comparable key encoding/decoding"
 
 - Create: `ferrosa-sstable/tests/property_tests.rs`
 
-- [ ] **Step 1: Write property tests for varint, compression, bloom, byte_comparable**
+- [x] **Step 1: Write property tests for varint, compression, bloom, byte_comparable**
 
 Create `ferrosa-sstable/tests/property_tests.rs`:
 
@@ -2500,12 +2502,12 @@ proptest! {
 }
 ```
 
-- [ ] **Step 2: Run property tests**
+- [x] **Step 2: Run property tests**
 
 Run: `cargo test -p ferrosa-sstable --test property_tests`
 Expected: All property tests PASS
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add ferrosa-sstable/tests/
@@ -2546,3 +2548,78 @@ Plus ferrosa-common improvements:
 - File format readers/writers (statistics, toc, partition index, row index, data)
 - Public API (SSTableReader, SSTableWriter)
 - Cassandra fixture generation
+
+---
+
+## Implementation Notes
+
+Deviations from the plan discovered during execution. All issues were resolved; this section records what changed and why.
+
+### Task 2: CI cargo doc syntax
+
+**Plan said:** `cargo doc --no-deps -D warnings`
+
+**Actual:** `cargo doc` doesn't accept `-D` directly. The correct approach is to set the environment variable:
+
+```yaml
+- run: cargo doc --no-deps
+  env:
+    RUSTDOCFLAGS: "-D warnings"
+```
+
+### Task 3: murmur3.rs `mod@tests` link
+
+**Plan said:** Include `[`tests`](mod@tests)` intra-doc link.
+
+**Actual:** `cfg(test)` modules are not visible to rustdoc, so `mod@tests` is a broken link under `-D warnings`. Changed to plain text "tests".
+
+### Task 6: `self.len()` ambiguity in ReadAt impls
+
+**Problem:** In `impl ReadAt for &[u8]` and `impl ReadAt for Vec<u8>`, `self.len()` is ambiguous between the inherent `<[u8]>::len()` (returns `usize`) and `ReadAt::len()` (returns `Result<u64>`).
+
+**Fix:** Used explicit UFCS: `<[u8]>::len(self)` and `Vec::len(self)`.
+
+### Task 7: CRITICAL — VInt 8-byte encoding overflow (proptest discovery)
+
+**Bug:** `read_unsigned_vint` at plan line 862 had `extra_bytes < 8` which allowed `extra_bytes=7` to reach `0xFF >> (7+1)` = `0xFF >> 8`. This panics on `u8` (shift amount exceeds type width). Values with 50–56 significant bits (8-byte encoding, first byte `0xFE`) triggered this.
+
+**Discovery:** proptest found this — hand-written boundary tests did not cover the 8-byte encoding boundary.
+
+**Fix:** Changed condition from `extra_bytes < 8` to `extra_bytes <= 6`. The 8-byte encoding (`extra_bytes=7`) has no value bits in the first byte, same as the 9-byte case.
+
+**Regression tests added:**
+
+- `unsigned_8_byte_round_trip` — value `562949953421312` (50 significant bits)
+- `signed_8_byte_round_trip` — value `281474976710656` (zigzag-encodes to 8-byte varint)
+
+### Task 10: clippy `manual_div_ceil`
+
+**Plan said:** `(num_bits + 63) / 64`
+
+**Actual:** clippy recommended `num_bits.div_ceil(64)`. Applied.
+
+### Task 11: byte_comparable doc-test length
+
+**Plan said:** `assert_eq!(encoded.len(), 14)`
+
+**Actual:** Correct length is 15 bytes: `NEXT_COMPONENT(1) + token(8) + ESCAPE(1) + NEXT_COMPONENT(1) + key(2) + ESCAPE(1) + TERMINATOR(1) = 15`. Fixed to `assert_eq!(encoded.len(), 15)`.
+
+### lib.rs doc links
+
+**Plan said:** `[`ReadAt`]`, `[`WriteAt`]`, `[`SSTableReader`]`, `[`SSTableWriter`]`
+
+**Actual:** `ReadAt`/`WriteAt` needed path qualification: `[`io::ReadAt`]`/`[`io::WriteAt`]`. `SSTableReader`/`SSTableWriter` don't exist yet, so used plain text (not links) to avoid `-D warnings` failure.
+
+### Additional clippy fixes applied across modules
+
+- `needless_range_loop`: `for i in 1..total { ... buf[i] ... }` → `for &byte in &buf[1..total]`
+- `redundant_closure`: `|e| Error::Io(e)` → `Error::Io`
+- `useless_conversion`: `Error::Io(e.into())` where `e` is already `std::io::Error` → `Error::Io(e)`
+
+### Test counts
+
+| Crate | Unit tests | Doc-tests | Property tests | Total |
+|-------|-----------|-----------|---------------|-------|
+| ferrosa-common | 14 | 5 | 4 | 23 |
+| ferrosa-sstable | 65 | 4 | 7 | 76 |
+| **Workspace** | **79** | **9** | **11** | **107** (includes integration) |
