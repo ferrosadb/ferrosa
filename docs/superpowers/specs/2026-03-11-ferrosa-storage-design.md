@@ -505,6 +505,7 @@ The upgrade is a single new file implementing `Memtable` — no changes to `Tabl
 
 ## Related Documents
 
+- [Storage Spec](../../../specs/storage.md) — architecture spec (specs/ canonical location)
 - [SSTable Design](2026-03-11-ferrosa-sstable-design.md) — SSTable crate design
 - [Component Architecture](../../../specs/components.md) — crate dependency graph
 - [Data Flow](../../../specs/data-flow.md) — write/read paths and S3 lifecycle
