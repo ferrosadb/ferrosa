@@ -286,7 +286,7 @@ pub fn read_node_header(data: &[u8]) -> Result<NodeHeader> {
                 return Err(Error::InvalidData("truncated Sparse12".into()));
             }
             let cc = data[1] as usize;
-            let ptr_bytes = (cc * 5).div_ceil(2);
+            let ptr_bytes = (cc * 3).div_ceil(2);
             let needed = 2 + cc + ptr_bytes;
             if data.len() < needed {
                 return Err(Error::InvalidData("truncated Sparse12 children".into()));
