@@ -70,10 +70,12 @@ ferrosa-storage/src/
 
 | Crate | Purpose |
 |-------|---------|
-| `ferrosa-common` | `DecoratedKey`, `CellValue`, `PartitionKey`, `Row`, `DeletionTime`, `LivenessInfo` |
+| `ferrosa-common` | `DecoratedKey`, `CellValue`, `PartitionKey` |
+| `ferrosa-sstable` | `Row`, `DeletionTime`, `LivenessInfo`, `Partition` (types reused from SSTable layer) |
 | `crc32fast` | CRC32 checksums for segment headers, sync markers, entries |
 | `parking_lot` | `Mutex` for closed-segment list and next-segment queue |
 | `arc_swap` | `ArcSwap<Segment>` for lock-free active segment access |
+| `serde` + `serde_json` | Checkpoint file serialization (JSON with format versioning) |
 | `proptest` (dev) | Property-based testing |
 | `tempfile` (dev) | Temporary directories for segment file tests |
 
@@ -114,7 +116,7 @@ Each segment file is a self-contained, append-only log. The format is Rust-nativ
 | Sync Section 0                                    |
 |  +- Sync Marker ---+                              |
 |  | next_marker_offset: u32                        ||
-|  | marker_crc: u32  (CRC of id + offset)          ||
+|  | marker_crc: u32  (CRC of segment_id || offset)  ||
 |  +------------------------------------------------+|
 |  +- Entry 0 ------+                               |
 |  | entry_size: u32                                ||
@@ -137,9 +139,9 @@ Each segment file is a self-contained, append-only log. The format is Rust-nativ
 ### Design Points
 
 - **Two-tier CRC per entry**: Size CRC lets the reader detect corruption before allocating a buffer for the payload. Payload CRC validates the mutation data itself. Same approach as Cassandra but without the Java serialization overhead.
-- **Sync marker chaining**: Each sync marker points to the next one, enabling fast skip-forward during replay. Markers are written at sync boundaries -- the positions where fsync has been called.
-- **17-byte header** vs Cassandra's ~50-200 bytes (no JSON params blob). Version byte is sufficient for format evolution. `config_flags` is reserved for future use (compression, encryption) without a format version bump.
-- **EOF marker** is all zeros -- naturally occurs if the process crashes mid-write since we pre-allocate with zeros.
+- **Sync marker chaining**: Each sync marker points to the next one, enabling fast skip-forward during replay. Markers are written at sync boundaries -- the positions where fsync has been called. `marker_crc` is computed over `segment_id` (from the header) concatenated with `next_marker_offset`, binding each marker to its segment.
+- **17-byte header**: `header_crc` is CRC32 over `[version || segment_id || config_flags]` (13 bytes). Compare to Cassandra's ~50-200 bytes (includes JSON params blob). Version byte is sufficient for format evolution. `config_flags` is reserved for future use (compression, encryption) without a format version bump.
+- **EOF marker** is all zeros -- naturally occurs if the process crashes mid-write since we pre-allocate with zeros. The EOF marker is only checked at positions indicated by the sync marker chain, so embedded zeros in payload data cannot cause false EOF detection.
 - **Entry overhead** per mutation: 12 bytes (4 size + 4 size_crc + 4 payload_crc).
 
 ## Mutation Type
@@ -159,6 +161,8 @@ pub struct Mutation {
 ### Binary Serialization Format
 
 Hand-rolled, versioned. Serialization writes directly into the segment buffer slice (zero extra copies). `Mutation::serialized_size()` computes exact size upfront for CAS allocation. Deserialization constructs `Mutation` from a `&[u8]` slice during replay.
+
+**Why not reuse SSTable row serialization?** SSTable on-disk row format uses delta-encoding against a `SerializationHeader` (min_timestamp, column names, type metadata). The commit log has no such header context -- each entry must be self-describing. A flat, field-by-field layout is simpler and sufficient for WAL replay.
 
 **Mutation layout:**
 
@@ -184,7 +188,7 @@ Hand-rolled, versioned. Serialization writes directly into the segment buffer sl
 | clustering_len: u16                  |
 | clustering: [u8; clustering_len]     |
 | deletion_marked_for_delete_at: i64   |
-| deletion_local_deletion_time: i32    |
+| deletion_local_deletion_time: u32    |
 | liveness_timestamp: i64              |
 | liveness_ttl: i32                    |
 | liveness_local_deletion_time: i32    |
@@ -207,6 +211,10 @@ Hand-rolled, versioned. Serialization writes directly into the segment buffer sl
 ```
 
 Format is compact -- no field names, no padding, no alignment requirements.
+
+**Type note:** `DeletionTime.local_deletion_time` is `u32` (from `ferrosa-sstable`), while `CellValue.local_deletion_time` is `i32` (from `ferrosa-common`). The binary format matches the actual Rust types: `u32` for row-level deletion, `i32` for cell-level deletion.
+
+**Schema assumption:** Part B assumes the schema is static between write and replay. Schema evolution during replay (column additions/removals that change column indices) is deferred to a later phase.
 
 ## Sync Strategies
 
@@ -375,6 +383,8 @@ pub struct TableId {
                                        past this segment
 ```
 
+Part C will add a "Shipped" state between Closed and Deleted for S3 segment archival.
+
 ### Dirty/Clean Tracking (SegmentTracker)
 
 Each segment tracks which tables have unflushed mutations via a `HashMap<TableId, PositionRange>`. When `discard_completed` is called:
@@ -472,11 +482,12 @@ fn arb_cell_value() -> impl Strategy<Value = CellValue> {
         (prop::collection::vec(any::<u8>(), 0..1024), 1i64..1_000_000)
             .prop_map(|(v, ts)| CellValue::live(v, ts)),
         // Tombstone (null value)
-        (1i64..1_000_000)
-            .prop_map(|ts| CellValue::tombstone(ts, 100)),
+        (1i64..1_000_000, 1_700_000_000i32..1_700_100_000)
+            .prop_map(|(ts, ldt)| CellValue::tombstone(ts, ldt)),
         // Live cell with TTL
-        (prop::collection::vec(any::<u8>(), 0..256), 1i64..1_000_000, 1i32..86400)
-            .prop_map(|(v, ts, ttl)| CellValue::expiring(v, ts, ttl, 100)),
+        (prop::collection::vec(any::<u8>(), 0..256), 1i64..1_000_000,
+         1i32..86400, 1_700_000_000i32..1_700_100_000)
+            .prop_map(|(v, ts, ttl, ldt)| CellValue::expiring(v, ts, ttl, ldt)),
     ]
 }
 
@@ -492,7 +503,7 @@ fn arb_row() -> impl Strategy<Value = Row> {
         prop::collection::vec(arb_cell(), 0..16),        // cells
         prop_oneof![                                      // deletion
             Just(DeletionTime::LIVE),
-            (1i64..1_000_000, 1i32..100_000)
+            (1i64..1_000_000, 1u32..100_000)
                 .prop_map(|(ts, ldt)| DeletionTime::new(ts, ldt)),
         ],
         1i64..1_000_000,                                  // liveness timestamp
@@ -579,8 +590,8 @@ mmap for the segment buffer to potentially eliminate the fsync copy. Priority or
 
 | Order | Module | Purpose |
 |-------|--------|---------|
-| 1 | `ferrosa-common/test_generators.rs` | Shared proptest generators (`#[cfg(feature = "test-generators")]`) |
-| 2 | `commitlog/config.rs` | `CommitLogConfig`, `SyncStrategyConfig` |
+| 1 | `ferrosa-common/test_generators.rs` | Shared proptest generators. Add `[features] test-generators = ["proptest"]` to `ferrosa-common/Cargo.toml` and move `proptest` to `[dependencies]` with `optional = true`. |
+| 2 | `commitlog/config.rs` | `CommitLogConfig`, `SyncStrategyConfig`. Add `crc32fast`, `serde`, `serde_json` to `ferrosa-storage/Cargo.toml`. |
 | 3 | `commitlog/descriptor.rs` | Segment header: write, read, CRC validation |
 | 4 | `commitlog/mutation.rs` | `Mutation` type, `serialize`, `deserialize`, `serialized_size` |
 | 5 | `commitlog/segment.rs` | `Segment`: buffer, CAS allocation, entry writing, sync markers |
