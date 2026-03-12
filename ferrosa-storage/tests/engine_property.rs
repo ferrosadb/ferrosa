@@ -62,7 +62,7 @@ fn make_row(value: &[u8], timestamp: i64) -> Row {
     }
 }
 
-/// Property: every write to the engine is subsequently readable.
+// Property: every write to the engine is subsequently readable.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(20))]
 
@@ -97,7 +97,7 @@ proptest! {
     }
 }
 
-/// Property: writes survive flush — no data loss.
+// Property: writes survive flush — no data loss.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
 
@@ -135,7 +135,7 @@ proptest! {
     }
 }
 
-/// Property: last-write-wins — overwriting a key always returns the latest value.
+// Property: last-write-wins — overwriting a key always returns the latest value.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(20))]
 

@@ -32,7 +32,7 @@ fn make_metadata(id: &str, size: u64) -> SSTableMetadata {
     }
 }
 
-/// Property: STCS bucket selection is deterministic.
+// Property: STCS bucket selection is deterministic.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
@@ -62,7 +62,7 @@ proptest! {
     }
 }
 
-/// Property: compaction tasks only include SSTables from the input set.
+// Property: compaction tasks only include SSTables from the input set.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
@@ -95,7 +95,7 @@ proptest! {
     }
 }
 
-/// Property: each compaction task has at least min_threshold inputs.
+// Property: each compaction task has at least min_threshold inputs.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
