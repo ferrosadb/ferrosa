@@ -157,7 +157,6 @@ mod tests {
             max_backoff: Duration::from_millis(500),
             lockout_duration: Duration::from_millis(100),
             window: Duration::from_millis(500),
-            ..Default::default()
         }
     }
 

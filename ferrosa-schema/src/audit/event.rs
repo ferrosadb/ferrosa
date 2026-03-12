@@ -91,7 +91,7 @@ mod tests {
     use super::*;
     use crate::auth::permission::{Permission, Resource};
     use std::collections::HashSet;
-    use std::net::SocketAddr;
+
     use std::time::SystemTime;
     use uuid::Uuid;
 
