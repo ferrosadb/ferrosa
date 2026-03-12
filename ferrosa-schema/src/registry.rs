@@ -19,7 +19,7 @@ use crate::auth::rate_limit::{AuthRateLimiter, RateLimitConfig};
 use crate::auth::role::{AuthContext, RoleMetadata};
 use crate::error::SchemaError;
 use crate::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
-use crate::metadata::table::TableMetadata;
+use crate::metadata::table::{TableMetadata, TableUpdates};
 use crate::secrets::SecretsProvider;
 use crate::startup::DeploymentMode;
 
@@ -376,6 +376,128 @@ impl Schema {
         self.emit_audit_with_actor(
             AuditEventKind::KeyspaceDropped {
                 keyspace: name.to_string(),
+            },
+            auth,
+        );
+        Ok(())
+    }
+
+    // ---- Table CRUD ----
+
+    /// Create a new table in an existing keyspace.
+    ///
+    /// Requires `Create` permission on the parent keyspace. The keyspace
+    /// must exist and the table must not already exist. Emits a
+    /// `TableCreated` audit event.
+    pub fn create_table(&self, table: TableMetadata, auth: &AuthContext) -> crate::Result<()> {
+        self.check_permission(
+            auth,
+            Permission::Create,
+            &Resource::Keyspace(table.keyspace.clone()),
+        )?;
+        if is_system_keyspace(&table.keyspace) {
+            return Err(SchemaError::SystemKeyspaceProtected(table.keyspace));
+        }
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        if !snap.keyspaces.contains_key(&table.keyspace) {
+            return Err(SchemaError::KeyspaceNotFound(table.keyspace));
+        }
+        let key = (table.keyspace.clone(), table.name.clone());
+        if snap.tables.contains_key(&key) {
+            return Err(SchemaError::TableExists(table.keyspace, table.name));
+        }
+        let ks = table.keyspace.clone();
+        let name = table.name.clone();
+        snap.tables.insert(key, table);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::TableCreated {
+                keyspace: ks,
+                table: name,
+            },
+            auth,
+        );
+        Ok(())
+    }
+
+    /// Alter an existing table.
+    ///
+    /// Requires `Alter` permission on the specific table. Applies
+    /// `TableUpdates`: replaces params if provided, adds new columns,
+    /// and drops specified columns.
+    pub fn alter_table(
+        &self,
+        ks: &str,
+        table: &str,
+        updates: TableUpdates,
+        auth: &AuthContext,
+    ) -> crate::Result<()> {
+        self.check_permission(
+            auth,
+            Permission::Alter,
+            &Resource::Table(ks.to_string(), table.to_string()),
+        )?;
+        if is_system_keyspace(ks) {
+            return Err(SchemaError::SystemKeyspaceProtected(ks.to_string()));
+        }
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        let key = (ks.to_string(), table.to_string());
+        let tbl = snap
+            .tables
+            .get_mut(&key)
+            .ok_or_else(|| SchemaError::TableNotFound(ks.to_string(), table.to_string()))?;
+        if let Some(params) = updates.params {
+            tbl.params = params;
+        }
+        for col in updates.add_columns {
+            tbl.columns.insert(col.name.clone(), col);
+        }
+        for col_name in &updates.drop_columns {
+            tbl.columns.shift_remove(col_name);
+        }
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::TableAltered {
+                keyspace: ks.to_string(),
+                table: table.to_string(),
+            },
+            auth,
+        );
+        Ok(())
+    }
+
+    /// Drop an existing table.
+    ///
+    /// Requires `Drop` permission on the parent keyspace. Emits a
+    /// `TableDropped` audit event.
+    pub fn drop_table(&self, keyspace: &str, table: &str, auth: &AuthContext) -> crate::Result<()> {
+        self.check_permission(
+            auth,
+            Permission::Drop,
+            &Resource::Keyspace(keyspace.to_string()),
+        )?;
+        if is_system_keyspace(keyspace) {
+            return Err(SchemaError::SystemKeyspaceProtected(keyspace.to_string()));
+        }
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        let key = (keyspace.to_string(), table.to_string());
+        if snap.tables.remove(&key).is_none() {
+            return Err(SchemaError::TableNotFound(
+                keyspace.to_string(),
+                table.to_string(),
+            ));
+        }
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::TableDropped {
+                keyspace: keyspace.to_string(),
+                table: table.to_string(),
             },
             auth,
         );
@@ -833,5 +955,165 @@ mod tests {
         let auth = normal_auth("nobody");
         let result = schema.create_keyspace(test_keyspace("forbidden"), &auth);
         assert!(matches!(result, Err(SchemaError::PermissionDenied { .. })));
+    }
+
+    // ---- Task 21: Table CRUD tests ----
+
+    use crate::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
+    use crate::metadata::table::{TableFlag, TableMetadata, TableParams, TableUpdates};
+    use indexmap::IndexMap;
+
+    fn test_table(keyspace: &str, name: &str) -> TableMetadata {
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "id".to_string(),
+            ColumnMetadata {
+                name: "id".to_string(),
+                kind: ColumnKind::PartitionKey,
+                position: 0,
+                column_type: "uuid".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        let mut flags = HashSet::new();
+        flags.insert(TableFlag::Compound);
+        TableMetadata {
+            keyspace: keyspace.to_string(),
+            name: name.to_string(),
+            id: Uuid::new_v4(),
+            columns,
+            partition_key: vec!["id".to_string()],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags,
+        }
+    }
+
+    #[test]
+    fn create_table_in_existing_keyspace() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("tbl_ks"), &auth)
+            .unwrap();
+
+        let table = test_table("tbl_ks", "users");
+        schema.create_table(table, &auth).unwrap();
+
+        let snap = schema.snapshot();
+        let key = ("tbl_ks".to_string(), "users".to_string());
+        assert!(snap.tables.contains_key(&key));
+    }
+
+    #[test]
+    fn create_table_in_nonexistent_keyspace_fails() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        let table = test_table("no_such_ks", "users");
+        let result = schema.create_table(table, &auth);
+        assert!(matches!(result, Err(SchemaError::KeyspaceNotFound(ref n)) if n == "no_such_ks"));
+    }
+
+    #[test]
+    fn create_table_duplicate_fails() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("dup_tbl_ks"), &auth)
+            .unwrap();
+        schema
+            .create_table(test_table("dup_tbl_ks", "t1"), &auth)
+            .unwrap();
+        let result = schema.create_table(test_table("dup_tbl_ks", "t1"), &auth);
+        assert!(matches!(result, Err(SchemaError::TableExists(_, _))));
+    }
+
+    #[test]
+    fn drop_table_removes_it() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("drop_tbl_ks"), &auth)
+            .unwrap();
+        schema
+            .create_table(test_table("drop_tbl_ks", "t1"), &auth)
+            .unwrap();
+        assert!(schema
+            .snapshot()
+            .tables
+            .contains_key(&("drop_tbl_ks".to_string(), "t1".to_string())));
+
+        schema.drop_table("drop_tbl_ks", "t1", &auth).unwrap();
+        assert!(!schema
+            .snapshot()
+            .tables
+            .contains_key(&("drop_tbl_ks".to_string(), "t1".to_string())));
+    }
+
+    #[test]
+    fn create_table_emits_audit() {
+        let sink = Arc::new(TestAuditSink::new());
+        let schema = test_schema_with_sink(sink.clone());
+        let auth = superuser_auth();
+
+        schema
+            .create_keyspace(test_keyspace("audit_tbl_ks"), &auth)
+            .unwrap();
+        sink.clear();
+        schema
+            .create_table(test_table("audit_tbl_ks", "events"), &auth)
+            .unwrap();
+
+        let events = sink.events();
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            AuditEventKind::TableCreated { keyspace, table }
+                if keyspace == "audit_tbl_ks" && table == "events"
+        )));
+    }
+
+    #[test]
+    fn create_table_in_system_keyspace_blocked() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        let table = test_table("system", "bad_table");
+        let result = schema.create_table(table, &auth);
+        assert!(
+            matches!(result, Err(SchemaError::SystemKeyspaceProtected(ref n)) if n == "system")
+        );
+    }
+
+    #[test]
+    fn alter_table_adds_column() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("alter_tbl_ks"), &auth)
+            .unwrap();
+        schema
+            .create_table(test_table("alter_tbl_ks", "t1"), &auth)
+            .unwrap();
+
+        let updates = TableUpdates {
+            params: None,
+            add_columns: vec![ColumnMetadata {
+                name: "email".to_string(),
+                kind: ColumnKind::Regular,
+                position: 0,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            }],
+            drop_columns: vec![],
+        };
+        schema
+            .alter_table("alter_tbl_ks", "t1", updates, &auth)
+            .unwrap();
+
+        let snap = schema.snapshot();
+        let key = ("alter_tbl_ks".to_string(), "t1".to_string());
+        let tbl = &snap.tables[&key];
+        assert!(tbl.columns.contains_key("email"));
     }
 }
