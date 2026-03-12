@@ -8,12 +8,15 @@
 //! - **TableStore**: lock-free composition (Part A)
 //! - **CommitLog**: write-ahead log for durability (Part B)
 
+pub mod cache;
 pub mod commitlog;
 pub mod compaction;
 pub mod flush;
+pub mod manifest;
 pub mod memtable;
 pub mod merge;
 pub mod store;
+pub mod upload;
 
 pub use commitlog::{
     CommitLog, CommitLogConfig, CommitLogPosition, Mutation, SyncStrategyConfig, TableId,
