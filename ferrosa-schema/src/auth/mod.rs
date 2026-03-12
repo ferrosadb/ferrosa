@@ -1,7 +1,9 @@
 //! Authentication and authorization types.
 
+pub mod password;
 pub mod permission;
 pub mod role;
 
+pub use password::PasswordHasher;
 pub use permission::{GrantEntry, Permission, Resource};
 pub use role::{AuthContext, RoleMetadata, RoleUpdates};
