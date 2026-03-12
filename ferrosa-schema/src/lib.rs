@@ -11,6 +11,7 @@ pub mod metadata;
 pub mod registry;
 pub mod secrets;
 pub mod startup;
+pub mod system;
 
 pub use audit::{
     AuditContext, AuditEvent, AuditEventKind, AuditLogEntry, AuditSink, CompositeSink,
@@ -30,3 +31,4 @@ pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};
 pub use startup::{
     validate_production_requirements, DeploymentMode, ProductionCheckConfig, ProductionViolation,
 };
+pub use system::local::{query_local, LocalInfo, NodeConfig};
