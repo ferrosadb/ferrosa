@@ -5,5 +5,7 @@
 //! Every mutation emits an audit event (ADR-008).
 
 pub mod error;
+pub mod metadata;
 
 pub use error::{Result, SchemaError};
+pub use metadata::{KeyspaceMetadata, ReplicationParams};
