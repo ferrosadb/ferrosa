@@ -20,11 +20,13 @@
 //! - **Read path**: `ArcSwap::load()` (wait-free) → check all sources → `merge_partitions()`
 //! - **Flush path**: `Mutex` serializes flushes; two brief `ArcSwap::store()` calls
 
+pub mod commitlog;
 pub mod flush;
 pub mod memtable;
 pub mod merge;
 pub mod store;
 
+pub use commitlog::{CommitLogConfig, CommitLogPosition, SyncStrategyConfig, TableId};
 pub use flush::{FileFlushTarget, FlushTarget, InMemoryFlushTarget};
 pub use memtable::sharded::ShardedBTreeMemtable;
 pub use memtable::Memtable;
