@@ -8,7 +8,7 @@
 //! 3. **SSTables** — immutable, ordered newest-first. The read path queries
 //!    all sources and merges results with cell-level last-write-wins.
 //!
-//! The read path is wait-free: it uses `ArcSwap::load()` to atomically
+//! The read path is lock-free: it uses `ArcSwap::load()` to atomically
 //! snapshot the current view without blocking any writer or flusher.
 //! Flush serialization is enforced by a `parking_lot::Mutex`.
 
@@ -157,11 +157,14 @@ impl<F: FlushTarget> TableStore<F> {
 
         // Step 3: No-op if the memtable was empty.
         if partitions.is_empty() {
-            // Clear the flushing reference.
+            // Re-load the live view to get current sstables (not the stale
+            // capture from the top of flush) — defensive against future
+            // changes to locking discipline.
+            let live = self.view.load();
             self.view.store(Arc::new(StoreView {
-                active: Arc::clone(&self.view.load().active),
+                active: Arc::clone(&live.active),
                 flushing: None,
-                sstables: Arc::clone(&current_sstables),
+                sstables: Arc::clone(&live.sstables),
             }));
             return Ok(());
         }
