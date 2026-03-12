@@ -98,7 +98,7 @@ graph TB
 | T02 | **I** | Plaintext CQL traffic intercepted (credentials, query data) | 3 | 3 | **9 Critical** | **Open**: CQL TLS not yet implemented |
 | T03 | **T** | MITM modifies CQL frames in transit | 2 | 3 | **6 High** | **Open**: No TLS = no integrity on wire |
 | T04 | **D** | Connection flood / query flood exhausts server resources | 3 | 2 | **6 High** | **Open**: No rate limiting or connection limits |
-| T05 | **S** | Brute-force password guessing against authenticate() | 3 | 2 | **6 High** | **Open**: No login attempt rate limiting |
+| T05 | **S** | Brute-force password guessing against authenticate() | 3 | 2 | **6 High** | Mitigated: `AuthRateLimiter` with exponential backoff + account lockout in auth module |
 | T06 | **I** | Error messages leak role existence or system state | 2 | 1 | **2 Medium** | Mitigated: `AuthenticationFailed` is intentionally vague |
 
 ### TB2: CQL → Schema Registry (Auth Boundary)
@@ -106,13 +106,13 @@ graph TB
 | ID | STRIDE | Threat | Likelihood | Impact | Risk | Status |
 |----|--------|--------|-----------|--------|------|--------|
 | T07 | **E** | Non-superuser escalates to superuser via role hierarchy manipulation | 2 | 3 | **6 High** | Mitigated: cycle detection + permission check on GRANT/ALTER ROLE |
-| T08 | **E** | Default `cassandra`/`cassandra` superuser credentials left unchanged | 3 | 3 | **9 Critical** | Partial: warning logged at startup; no forced rotation |
+| T08 | **E** | Default `cassandra`/`cassandra` superuser credentials left unchanged | 3 | 3 | **9 Critical** | Mitigated: `FERROSA_SUPERUSER_PASSWORD` env var or `must_change_password` flag blocks queries until changed |
 | T09 | **T** | Attacker modifies system keyspaces (`system`, `system_auth`, `system_schema`) | 2 | 3 | **6 High** | Mitigated: `SystemKeyspaceProtected` error on user DDL |
-| T10 | **I** | Password hashes leaked via system_auth query | 2 | 2 | **4 High** | **Open**: `system_auth.roles` exposes `salted_hash` column to roles with SELECT on `system_auth` |
+| T10 | **I** | Password hashes leaked via system_auth query | 2 | 2 | **4 High** | Mitigated: `query_roles()` filters `salted_hash` to `None` for non-superuser callers |
 | T11 | **R** | Admin performs destructive DDL (DROP KEYSPACE) with no audit trail | 2 | 2 | **4 High** | **Open**: No audit logging designed yet |
 | T12 | **T** | Race condition in clone-modify-swap corrupts SchemaSnapshot | 1 | 3 | **3 Medium** | Mitigated: `write_lock: Mutex<()>` serializes all mutations |
 | T13 | **E** | Time-of-check-to-time-of-use (TOCTOU): permission checked, then snapshot changes before operation | 1 | 2 | **2 Medium** | Mitigated: permission check and mutation happen under same `write_lock` acquisition |
-| T14 | **D** | Expensive password hashing (bcrypt cost 12 / argon2id) used as DoS vector via repeated auth attempts | 2 | 2 | **4 High** | **Open**: No rate limiting on authenticate() |
+| T14 | **D** | Expensive password hashing (bcrypt cost 12 / argon2id) used as DoS vector via repeated auth attempts | 2 | 2 | **4 High** | Mitigated: `AuthRateLimiter` checks *before* hashing — throttled/locked requests consume negligible CPU |
 | T15 | **I** | `AuthContext` cloned/forged in-process by malicious crate | 1 | 3 | **3 Medium** | Accepted: Rust module system provides boundary; `AuthContext` is `pub` but only constructible via `authenticate()` |
 
 ### TB3: Internode Communication (VPC)
@@ -137,7 +137,7 @@ graph TB
 
 | ID | STRIDE | Threat | Likelihood | Impact | Risk | Status |
 |----|--------|--------|-----------|--------|------|--------|
-| T24 | **I** | Local SSTables and commit log readable by co-tenant on shared host | 1 | 2 | **2 Medium** | Accepted: ephemeral storage; deploy on dedicated instances or use encrypted EBS |
+| T24 | **I** | Local SSTables and commit log readable by co-tenant on shared host / surviving on EBS volumes | 2 | 2 | **4 High** | Mitigated: startup check warns if data directory is not on an encrypted filesystem; encrypted EBS/LUKS documented as deployment prerequisite |
 | T25 | **T** | Commit log segments corrupted on disk | 2 | 2 | **4 High** | Mitigated: CRC32 checksums on commit log entries; corruption detected at replay |
 
 ### TB6: Environment / Configuration
@@ -157,7 +157,7 @@ graph TB
 | ID | Threat | Mitigation |
 |----|--------|-----------|
 | T02 | Plaintext CQL traffic | Implement CQL TLS (rustls). Default to TLS-required in production. |
-| T08 | Default superuser unchanged | Force password change on first superuser login, or require `FERROSA_SUPERUSER_PASSWORD` env var at bootstrap. |
+| T08 | Default superuser unchanged | Mitigated: `FERROSA_SUPERUSER_PASSWORD` env var at bootstrap; without it, `must_change_password` flag blocks queries until password is changed. |
 
 ### High (Risk 4-6) — Mitigate in current release cycle
 
@@ -165,14 +165,14 @@ graph TB
 |----|--------|-----------|
 | T03 | CQL MITM | Solved by T02's TLS implementation. |
 | T04 | Connection/query flood | Add configurable connection limits and per-IP rate limiting in ferrosa-cql. |
-| T05 | Auth brute-force | Rate limit `authenticate()` calls: exponential backoff per source IP, account lockout after N failures. |
+| T05 | Auth brute-force | Mitigated: `AuthRateLimiter` in schema crate with exponential backoff + account lockout. |
 | T07 | Privilege escalation via role hierarchy | Already mitigated by cycle detection + auth checks on grant/revoke. Verify in tests. |
 | T09 | System keyspace modification | Already mitigated. Verify in tests. |
-| T10 | Password hash exposure | Restrict SELECT on `system_auth` to superusers only. Consider omitting `salted_hash` from query results entirely (Cassandra behavior). |
+| T10 | Password hash exposure | Mitigated: `query_roles()` filters `salted_hash` to `None` for non-superuser callers. |
 | T11 | No audit trail | Design audit logging (append-only, tamper-evident) for DDL and auth events. |
-| T14 | Auth DoS via hashing cost | Same mitigation as T05 (rate limiting). Consider connection-level throttle before reaching password verification. |
+| T14 | Auth DoS via hashing cost | Mitigated: rate limiter checks *before* hashing; CQL layer adds per-IP throttle. |
 | T16 | Rogue node joins cluster | Implement mutual TLS for internode with certificate pinning or shared CA. |
-| T19 | S3 data unencrypted at app level | Document SSE-KMS requirement. Consider envelope encryption for sensitive tables (future). |
+| T19 | S3 data unencrypted at app level | Document SSE-KMS requirement. Startup check verifies bucket encryption is enabled. Envelope encryption deferred to hardening phase. |
 | T21 | S3 credential leak | Prefer instance profiles. Document: never use long-lived access keys in production. |
 | T23 | Manifest CAS conflict | Wire the retry loop (already designed, not connected). |
 | T25 | Commit log corruption | Already mitigated by CRC32. Verify replay rejects corrupt entries in tests. |
@@ -191,20 +191,21 @@ graph TB
 | T18 | Malicious Raft proposal | Mitigated by auth-gated API. |
 | T20 | S3 SSTable tampering | Partial (etag CAS). Future: checksum verification on read. |
 | T22 | S3 bucket deletion | Document ops procedure: versioning + MFA delete on bucket. |
-| T24 | Local disk co-tenant | Accepted for ephemeral storage. |
+| T24 | Local disk co-tenant / shared volumes | Mitigated: startup encryption check + deployment docs. |
 | T27 | Weakened hash cost | Accepted (requires host access). |
 
 ---
 
 ## Mitigations by Priority
 
-### Phase 1: Before ferrosa-schema ships (Chunk A)
+### Phase 1: Included in ferrosa-schema Chunk A
 
-| Mitigation | Threats | Effort |
-|-----------|---------|--------|
-| Force superuser password change or require env var at bootstrap | T08 | Small — modify `Schema::new()` |
-| Restrict `system_auth.roles` SELECT to superusers; omit `salted_hash` from non-superuser results | T10 | Small — filter in `query_roles()` |
-| Rate limit `authenticate()` with per-source backoff | T05, T14 | Medium — add rate limiter to registry or CQL layer |
+| Mitigation | Threats | Effort | Status |
+|-----------|---------|--------|--------|
+| `FERROSA_SUPERUSER_PASSWORD` env var + `must_change_password` flag | T08 | Small | Designed |
+| `query_roles()` filters `salted_hash` for non-superusers | T10 | Small | Designed |
+| `AuthRateLimiter` with exponential backoff + account lockout | T05, T14 | Medium | Designed |
+| Startup check: warn if data dir not on encrypted filesystem | T24 | Small | Designed |
 
 ### Phase 2: Before production (ferrosa-cql + ferrosa-net)
 
@@ -231,7 +232,7 @@ graph TB
 
 1. **Network**: Internode traffic is within a VPC; CQL port may be exposed to untrusted networks
 1. **S3**: Bucket has SSE-S3 or SSE-KMS enabled; bucket policy restricts access to Ferrosa IAM roles
-1. **Host**: Ferrosa runs on dedicated instances or in isolated containers (no co-tenant filesystem access)
+1. **Host**: Ferrosa data directory is on an encrypted filesystem (encrypted EBS, LUKS, or dm-crypt). Startup warns if not detected. Shared/persistent volumes (EBS) must be encrypted to prevent data exposure on volume reattach.
 1. **Rust safety**: Memory safety vulnerabilities (buffer overflows, use-after-free) are not a primary concern due to Rust's type system; `unsafe` blocks are reviewed
 1. **Dependencies**: Third-party crates (`bcrypt`, `argon2`, `arc-swap`, `object_store`) are maintained and free of known vulnerabilities at time of integration
 1. **Operator**: Operators follow documented security practices (change default password, enable TLS, use instance profiles)
@@ -239,8 +240,11 @@ graph TB
 ## Open Questions
 
 - [ ] Should ferrosa-schema enforce a minimum password complexity policy, or is that the operator's responsibility?
-- [ ] Should `authenticate()` rate limiting live in the schema crate or the CQL protocol layer? (CQL layer has access to source IP; schema crate does not.)
+- [x] ~~Should `authenticate()` rate limiting live in the schema crate or the CQL protocol layer?~~ **Resolved**: Both. Per-username rate limiting with backoff in schema crate (`AuthRateLimiter`); per-IP rate limiting in CQL layer (future).
 - [ ] What is the audit log format and destination? Append-only local file, structured logging to stdout, or a dedicated system keyspace (`system_auth.audit_log`)?
 - [ ] Should we support client certificate authentication (mutual TLS) as an alternative to password auth?
 - [ ] Do we need S3 object-level integrity verification (SHA-256 checksum on upload, verify on read) or is S3's built-in integrity sufficient?
 - [ ] Should `FERROSA_S3_ALLOW_HTTP` be gated behind a `FERROSA_ENV=development` check?
+- [x] ~~Should we force superuser password change at bootstrap?~~ **Resolved**: Yes. `FERROSA_SUPERUSER_PASSWORD` env var or `must_change_password` flag.
+- [x] ~~Should `salted_hash` be filtered from non-superuser queries?~~ **Resolved**: Yes. `query_roles()` returns `None` for non-superusers.
+- [x] ~~Should local disk encryption be required?~~ **Resolved**: Yes. Encrypted EBS/LUKS is a deployment prerequisite; startup check warns if not detected.

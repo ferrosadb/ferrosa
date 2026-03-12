@@ -51,7 +51,8 @@ ferrosa-schema/src/
 │   ├── mod.rs
 │   ├── role.rs             # RoleMetadata, RoleOption
 │   ├── permission.rs       # Permission enum, Resource, GrantEntry
-│   └── password.rs         # PasswordHasher, bcrypt/argon2id, auto-upgrade
+│   ├── password.rs         # PasswordHasher, bcrypt/argon2id, auto-upgrade
+│   └── rate_limit.rs       # AuthRateLimiter, exponential backoff, account lockout
 ├── registry.rs             # Schema: thread-safe in-memory registry via ArcSwap
 ├── system/
 │   ├── mod.rs
@@ -257,15 +258,53 @@ impl Default for PasswordHasher {
 
 ### AuthContext
 
+Passed to every mutating registry operation. Superusers bypass permission checks. The `authenticate()` method on `Schema` verifies credentials and returns an `AuthContext`. See Bootstrap section for the full struct definition including `must_change_password`.
+
+### Auth Rate Limiting and Backpressure
+
+The auth module includes a built-in rate limiter to defend against brute-force attacks and CPU-exhaustion DoS (bcrypt/argon2 are intentionally expensive). The rate limiter is keyed by username and tracks failed attempts.
+
 ```rust
-#[derive(Debug, Clone)]
-pub struct AuthContext {
-    pub role: String,
-    pub is_superuser: bool,
+pub struct AuthRateLimiter {
+    /// Failed attempt records keyed by username.
+    attempts: Mutex<HashMap<String, FailedAttempts>>,
+    config: RateLimitConfig,
+}
+
+pub struct FailedAttempts {
+    pub count: u32,
+    pub first_failure: Instant,
+    pub last_failure: Instant,
+}
+
+pub struct RateLimitConfig {
+    pub max_attempts: u32,            // default: 5
+    pub base_backoff: Duration,       // default: 1 second
+    pub max_backoff: Duration,        // default: 60 seconds
+    pub lockout_duration: Duration,   // default: 15 minutes
+    pub window: Duration,             // default: 15 minutes — failures older than this are forgotten
 }
 ```
 
-Passed to every mutating registry operation. Superusers bypass permission checks. The `authenticate()` method on `Schema` verifies credentials and returns an `AuthContext`.
+**Backoff algorithm**: Exponential backoff with jitter. After `n` consecutive failures for a username, `authenticate()` returns `AuthenticationFailed` immediately (without performing password verification) if called within `min(base_backoff * 2^(n-1), max_backoff)` of the last failure. This prevents attackers from consuming CPU with repeated bcrypt/argon2 operations.
+
+**Lockout**: After `max_attempts` failures within `window`, the account is locked for `lockout_duration`. All attempts during lockout return `AuthenticationFailed` immediately. Successful authentication resets the failure counter.
+
+**Backpressure**: The rate limiter is checked *before* password hashing, so locked-out or throttled requests consume negligible CPU.
+
+**Observability**: Each rejection logs at WARN level with username (not password) and failure count. Account lockout events log at ERROR level.
+
+**Configuration**:
+
+| Env Var | Field | Default |
+|---------|-------|---------|
+| `FERROSA_AUTH_MAX_ATTEMPTS` | `max_attempts` | `5` |
+| `FERROSA_AUTH_BASE_BACKOFF_MS` | `base_backoff` | `1000` |
+| `FERROSA_AUTH_MAX_BACKOFF_MS` | `max_backoff` | `60000` |
+| `FERROSA_AUTH_LOCKOUT_SECS` | `lockout_duration` | `900` (15 min) |
+| `FERROSA_AUTH_WINDOW_SECS` | `window` | `900` (15 min) |
+
+Note: The CQL layer (ferrosa-cql, future) may add per-IP rate limiting on top of this per-username limiter, since the schema crate has no concept of source IP.
 
 ### Permission Checking
 
@@ -287,6 +326,7 @@ pub struct Schema {
     inner: ArcSwap<SchemaSnapshot>,
     write_lock: Mutex<()>,             // serializes all mutations (clone-modify-swap)
     hasher_config: PasswordHasher,
+    rate_limiter: AuthRateLimiter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,10 +350,23 @@ pub struct SchemaSnapshot {
 On first startup (`Schema::new()`), a default superuser role is created:
 
 - **Role**: `cassandra`
-- **Password**: `cassandra` (hashed with the configured hasher)
 - **Superuser**: `true`, **Can login**: `true`
 
-This matches Cassandra's behavior. Operators should change this password immediately after first boot. The default credentials are logged as a warning at startup.
+The superuser password is determined by the `FERROSA_SUPERUSER_PASSWORD` environment variable:
+
+- **If set**: The provided password is hashed with the configured hasher. This is the recommended production path.
+- **If not set**: The password defaults to `cassandra` (matching Cassandra behavior) **and the role is marked as `password_must_change: true`**. The first successful `authenticate()` for this role logs an ERROR-level warning and returns an `AuthContext` with `must_change_password: true`. The CQL layer (future) uses this flag to reject all queries except `ALTER ROLE cassandra WITH PASSWORD = '...'`.
+
+```rust
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    pub role: String,
+    pub is_superuser: bool,
+    pub must_change_password: bool,   // true until default password is changed
+}
+```
+
+This eliminates T08 (default credentials left unchanged) — operators cannot use the system without either setting the env var or changing the password on first login.
 
 ### Result Type
 
@@ -393,6 +446,9 @@ pub enum SchemaError {
     /// Authentication failed. Message intentionally vague to avoid leaking
     /// whether the role exists, can't login, or has a bad password.
     AuthenticationFailed,
+    /// Rate limited — too many failed attempts. Returned without performing
+    /// password verification to prevent CPU exhaustion.
+    AuthenticationThrottled,
     PermissionDenied { role: String, permission: Permission, resource: Resource },
     SystemKeyspaceProtected(String),
     RoleCycleDetected(String),
@@ -485,7 +541,8 @@ Each `*Row` struct has fields matching the exact Cassandra `system_schema` colum
 
 ```rust
 // system_auth.roles — one row per role
-pub fn query_roles(snapshot: &SchemaSnapshot) -> Vec<RoleRow>;
+// auth parameter controls visibility: non-superusers see salted_hash as None
+pub fn query_roles(snapshot: &SchemaSnapshot, auth: &AuthContext) -> Vec<RoleRow>;
 
 // system_auth.role_members — derived from RoleMetadata.member_of
 pub fn query_role_members(snapshot: &SchemaSnapshot) -> Vec<RoleMemberRow>;
@@ -493,6 +550,8 @@ pub fn query_role_members(snapshot: &SchemaSnapshot) -> Vec<RoleMemberRow>;
 // system_auth.role_permissions — derived from grants
 pub fn query_role_permissions(snapshot: &SchemaSnapshot) -> Vec<RolePermissionRow>;
 ```
+
+**Hash filtering (T10 mitigation)**: `query_roles()` takes `&AuthContext` and omits the `salted_hash` field for non-superuser callers. The `RoleRow.salted_hash` field is `Option<String>` — superusers see the hash, everyone else sees `None`. This matches Cassandra's behavior where `system_auth.roles` is restricted.
 
 ---
 
@@ -605,8 +664,9 @@ System keyspaces (`system`, `system_schema`, `system_auth`) are protected from u
 
 - `metadata/` — construction, defaults, serialization round-trip, equality
 - `auth/password.rs` — bcrypt hash/verify, argon2id hash/verify, auto-detect from prefix, auto-upgrade
+- `auth/rate_limit.rs` — backoff calculation, lockout logic, window expiry, counter reset on success
 - `auth/permission.rs` — permission checking with hierarchy, superuser bypass, resource inheritance
-- `registry.rs` — CRUD operations, auth gating, version bumps, error cases (duplicates, not found, permission denied)
+- `registry.rs` — CRUD operations, auth gating, version bumps, error cases (duplicates, not found, permission denied), bootstrap with `FERROSA_SUPERUSER_PASSWORD`
 - `convert.rs` — `TableMetadata::to_storage_schema()` matches expected `TableSchema` output
 
 ### Integration Tests
@@ -615,6 +675,9 @@ System keyspaces (`system`, `system_schema`, `system_auth`) are protected from u
 - Permission denied: non-superuser can't create keyspace without grant
 - Role hierarchy: grants inherited via `member_of`
 - System keyspace correctness: `system.local` fields match node config, `system_schema.*` reflects current state
+- Bootstrap: default superuser with `FERROSA_SUPERUSER_PASSWORD` set uses env password; without it, `must_change_password` is true
+- Rate limiting: repeated failed auth triggers backoff; successful auth resets counter; lockout blocks all attempts
+- Hash filtering: non-superuser `query_roles()` returns `None` for `salted_hash`; superuser sees real hash
 
 ### Property Tests
 
