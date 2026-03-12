@@ -14,6 +14,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [SSTable](sstable.md) | BTI format, trie encoding, I/O traits, compression, public API | Approved |
 | [Storage](storage.md) | Storage engine: memtable, flush, merge, commit log, compaction, S3 upload, cache, engine composition | Approved |
 | [Testing](testing.md) | Test infrastructure, suites, performance regression detection | Approved |
+| [Schema](schema.md) | Schema management: metadata types, registry, auth, system keyspaces | Draft |
 
 ## Architecture Decision Records
 
@@ -24,6 +25,8 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [003](decisions/003-raft-metadata.md) | Raft for metadata, tunable CL for data, transactions deferred | Accepted |
 | [004](decisions/004-layered-sstable.md) | Layered SSTable: read Big+BTI, write BTI, future native | Accepted |
 | [005](decisions/005-rust-native-crates.md) | Rust-native crates + Java as behavioral oracle | Accepted |
+| [006](decisions/006-auth-first-schema.md) | Auth-first schema design — auth baked into registry from day one | Accepted |
+| [007](decisions/007-configurable-password-hashing.md) | Configurable password hashing — bcrypt default, argon2id optional | Accepted |
 
 ## Related Documents
 
