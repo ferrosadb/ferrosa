@@ -8,6 +8,7 @@ pub mod audit;
 pub mod auth;
 pub mod error;
 pub mod metadata;
+pub mod registry;
 pub mod secrets;
 pub mod startup;
 
@@ -24,6 +25,7 @@ pub use metadata::{
     CachingParams, ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata, KeyspaceMetadata,
     KeyspaceUpdates, ReplicationParams, TableFlag, TableMetadata, TableParams, TableUpdates,
 };
+pub use registry::{AuthMethod, SchemaConfig, SchemaSnapshot};
 pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};
 pub use startup::{
     validate_production_requirements, DeploymentMode, ProductionCheckConfig, ProductionViolation,
