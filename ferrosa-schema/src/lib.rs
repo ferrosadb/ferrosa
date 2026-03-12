@@ -9,5 +9,6 @@ pub mod metadata;
 
 pub use error::{Result, SchemaError};
 pub use metadata::{
-    ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata, KeyspaceMetadata, ReplicationParams,
+    CachingParams, ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata, KeyspaceMetadata,
+    ReplicationParams, TableFlag, TableMetadata, TableParams,
 };
