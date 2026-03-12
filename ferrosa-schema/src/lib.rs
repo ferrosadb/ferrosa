@@ -9,6 +9,7 @@ pub mod auth;
 pub mod error;
 pub mod metadata;
 pub mod secrets;
+pub mod startup;
 
 pub use audit::{
     AuditContext, AuditEvent, AuditEventKind, AuditLogEntry, AuditSink, CompositeSink,
@@ -24,3 +25,6 @@ pub use metadata::{
     KeyspaceUpdates, ReplicationParams, TableFlag, TableMetadata, TableParams, TableUpdates,
 };
 pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};
+pub use startup::{
+    validate_production_requirements, DeploymentMode, ProductionCheckConfig, ProductionViolation,
+};
