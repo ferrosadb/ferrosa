@@ -5,7 +5,7 @@
 
 ## Overview
 
-`ferrosa-sstable` is the second crate in the Ferrosa build order. It reads and writes Cassandra-compatible SSTable files, providing the on-disk data layer for the storage engine.
+`ferrosa-sstable` reads and writes Cassandra-compatible SSTable files, providing the on-disk data layer for the storage engine.
 
 The initial implementation targets the **BTI (Big Trie-Indexed)** format — Cassandra 5.x's default — for both reading and writing. Big format reading is deferred to a later phase (see [ADR-004](decisions/004-layered-sstable.md)).
 
@@ -97,6 +97,94 @@ pub trait WriteAt {
 
 `ferrosa-sstable` provides `FileReadAt` and `FileWriteAt` implementations backed by `std::fs::File` with `pread`/`pwrite` on Unix. The S3 implementation (`S3ReadAt`) lives in `ferrosa-storage`, which depends on this crate.
 
+## Common Encodings
+
+Several encoding schemes are used across multiple SSTable components.
+
+### Variable-Length Integers (VInt)
+
+Cassandra uses a leading-ones prefix encoding (NOT protobuf-style). The number of leading 1-bits in the first byte indicates the number of extra bytes to read. Remaining bits in the first byte are the most-significant value bits, followed by subsequent bytes in big-endian order.
+
+**Unsigned varint** (`unsigned_vint`):
+
+| First byte pattern | Total bytes | Value bits in first byte | Max value |
+|---|---|---|---|
+| `0xxxxxxx` | 1 | 7 | 127 |
+| `10xxxxxx` | 2 | 6 | 16,383 |
+| `110xxxxx` | 3 | 5 | 2,097,151 |
+| `1110xxxx` | 4 | 4 | 268,435,455 |
+| `11110xxx` | 5 | 3 | 34,359,738,367 |
+| `111110xx` | 6 | 2 | 4,398,046,511,103 |
+| `1111110x` | 7 | 1 | 562,949,953,421,311 |
+| `11111110` | 8 | 0 | 72,057,594,037,927,935 |
+| `11111111` | 9 | 0 (8 raw bytes follow) | `i64::MAX` |
+
+Decoding: `extra_bytes = count_leading_ones(first_byte)`. For 1–7 byte encodings (`extra_bytes` 0–6), mask first byte with `0xFF >> (extra_bytes + 1)` to get value bits. For 8-byte encoding (`extra_bytes` = 7, first byte `0xFE`), the first byte has no value bits — read 7 trailing bytes. For 9-byte encoding (`extra_bytes` = 8, first byte `0xFF`), the first byte has no value bits — read 8 trailing bytes. Read remaining bytes in big-endian order.
+
+**Implementation note:** A naive `0xFF >> (extra_bytes + 1)` overflows when `extra_bytes >= 7` on an 8-bit type. Guard this with a range check (`extra_bytes <= 6`) or use a wider intermediate.
+
+**Signed varint** (`signed_vint`): Standard zigzag encoding applied before unsigned encoding:
+
+- Encode: `zigzag(n) = (n << 1) ^ (n >> 63)` (arithmetic shift)
+- Decode: `unzigzag(n) = (n >>> 1) ^ -(n & 1)`
+
+Mapping: `0 -> 0, -1 -> 1, 1 -> 2, -2 -> 3, 2 -> 4, ...`
+
+**Unsigned varint32** (`unsigned_vint32`): Not a separate format. Uses the same unsigned varint encoding, narrowed to `u32` on read. Fields documented as `unsigned_vint32` will always contain values that fit in 32 bits.
+
+**Examples** (unsigned):
+
+| Value | Bytes |
+|-------|-------|
+| 0 | `0x00` |
+| 127 | `0x7F` |
+| 128 | `0x80 0x80` |
+| 255 | `0x80 0xFF` |
+
+Reference: `org.apache.cassandra.utils.vint.VIntCoding`
+
+### Short-Length-Prefixed Encoding
+
+A 2-byte big-endian unsigned length prefix followed by raw bytes. Maximum length: 65,535 bytes. Used for partition keys in the partition index footer, row index metadata, and Data.db partition headers.
+
+```
+[length: u16 big-endian] [bytes: length bytes]
+```
+
+Reference: `ByteBufferUtil.writeWithShortLength()`
+
+### DeletionTime Encoding (BTI format)
+
+Variable-length encoding used for partition-level and row-level deletions:
+
+**If LIVE (no deletion):**
+
+```
+[0x80: 1 byte]
+```
+
+**If deleted:**
+
+```
+[markedForDeleteAt: i64 big-endian] [localDeletionTime: u32 big-endian]
+```
+
+Total: 12 bytes. The first byte's high bit (0x80) is always 0 for deleted entries because `markedForDeleteAt` is a positive timestamp.
+
+### Delta Encoding (SerializationHeader)
+
+Timestamps, local deletion times, and TTLs within Data.db are delta-encoded against minimums stored in the SerializationHeader (in Statistics.db):
+
+- `encoded_timestamp = actual - header.minTimestamp` (written as `unsigned_vint`)
+- `encoded_ldt = actual - header.minLocalDeletionTime` (written as `unsigned_vint32`)
+- `encoded_ttl = actual - header.minTTL` (written as `unsigned_vint32`)
+
+The `EncodingStats` epoch defaults (used when no data exists):
+
+- `TIMESTAMP_EPOCH` = 1442880000000000 (Sept 22, 2015 00:00 UTC, microseconds)
+- `DELETION_TIME_EPOCH` = 1442880000 (same date, seconds)
+- `TTL_EPOCH` = 0
+
 ## BTI SSTable Components
 
 A BTI SSTable consists of these files, identified by a generation number:
@@ -113,13 +201,152 @@ A BTI SSTable consists of these files, identified by a generation number:
 
 ### Data File (Data.db)
 
-The data file stores serialized partitions in token order. Each partition contains:
+The data file stores serialized partitions back-to-back in token order. There is no file-level header — the `SerializationHeader` (encoding stats, column definitions) is stored in Statistics.db.
 
-1. **Partition header**: serialized partition key, deletion info
-2. **Rows**: ordered by clustering key, each containing cells
-3. **Partition footer**: end-of-partition marker
+Data is stored in compressed chunks (default 16KB uncompressed). Chunks are position-based — every N uncompressed bytes, regardless of partition boundaries. A partition can span multiple chunks, and a chunk can contain data from multiple partitions. The compression info file maps chunk index to file offset.
 
-Data is stored in compressed chunks (default 16KB uncompressed). The compression info file maps chunk index to file offset and compressed size.
+#### Partition Structure
+
+```
+partition :=
+  [key_len: u16 big-endian] [key: key_len bytes]   // short-length-prefixed
+  <partition_deletion>                               // DeletionTime: 1 or 12 bytes
+  [<static_row>]                                     // only if table has static columns
+  <unfiltered>*                                      // rows and range tombstone markers
+  [0x01]                                             // END_OF_PARTITION
+```
+
+#### Unfiltered Flags Byte
+
+Every row or marker starts with a flags byte:
+
+| Bit | Mask | Name | Meaning |
+|-----|------|------|---------|
+| 0 | 0x01 | `END_OF_PARTITION` | End marker; nothing follows |
+| 1 | 0x02 | `IS_MARKER` | Range tombstone marker (not a row) |
+| 2 | 0x04 | `HAS_TIMESTAMP` | Row has primary key liveness timestamp |
+| 3 | 0x08 | `HAS_TTL` | Row has TTL on primary key liveness |
+| 4 | 0x10 | `HAS_DELETION` | Row has a row-level deletion |
+| 5 | 0x20 | `HAS_ALL_COLUMNS` | Row contains all columns from the header |
+| 6 | 0x40 | `HAS_COMPLEX_DELETION` | At least one complex column has a deletion |
+| 7 | 0x80 | `EXTENSION_FLAG` | Extended flags byte follows |
+
+**Extended flags byte** (if `EXTENSION_FLAG` set):
+
+| Bit | Mask | Name | Meaning |
+|-----|------|------|---------|
+| 0 | 0x01 | `IS_STATIC` | Static row (no clustering key) |
+
+#### Row Encoding
+
+```
+row :=
+  [flags: u8] [ext_flags: u8 if EXTENSION_FLAG]
+  [<clustering>]                                   // absent for static rows
+  [row_size: unsigned_vint]                        // size of rest (for skipping)
+  [prev_unfiltered_size: unsigned_vint]            // offset to previous unfiltered
+  [timestamp: unsigned_vint if HAS_TIMESTAMP]      // delta from header.minTimestamp
+  [ttl: unsigned_vint32 if HAS_TTL]                // delta from header.minTTL
+  [local_deletion_time: unsigned_vint32 if HAS_TTL] // delta from header.minLocalDeletionTime
+  [del_ts: unsigned_vint if HAS_DELETION]          // row deletion timestamp (delta)
+  [del_ldt: unsigned_vint32 if HAS_DELETION]       // row deletion local time (delta)
+  [<column_subset> if !HAS_ALL_COLUMNS]
+  <column_data>*                                   // one per column in subset
+```
+
+`row_size` counts all bytes after itself (including `prev_unfiltered_size` and the row body).
+
+#### Clustering Key Encoding
+
+Clustering values are serialized in batches of up to 32. The number of clustering columns is known from the table schema (not written).
+
+```
+clustering :=
+  for each batch of 32 values:
+    [header: unsigned_vint]          // 2 bits per value
+    [value_bytes]*                   // only for present (non-null, non-empty) values
+```
+
+Header bit pairs per value (at bit positions `i*2` and `i*2+1`):
+
+- `00` = value is present (bytes follow)
+- `01` = value is empty (zero-length, no bytes)
+- `10` = value is null (no bytes)
+
+Value bytes: fixed-length types write raw bytes (no prefix); variable-length types write `[length: unsigned_vint32] [bytes]`.
+
+#### Column Subset Encoding
+
+When `HAS_ALL_COLUMNS` is NOT set, the subset of columns present is encoded relative to the `SerializationHeader`'s column list:
+
+**If fewer than 64 columns in the header:**
+
+```
+[bitmap: unsigned_vint]   // 1 bit per MISSING column (LSB first)
+```
+
+**If 64 or more columns:**
+
+```
+[missing_count: unsigned_vint32]
+[indices]*                         // unsigned_vint32 each
+```
+
+If `actual_count < superset_count / 2`: indices of present columns. Otherwise: indices of missing columns.
+
+#### Cell Encoding
+
+```
+cell :=
+  [flags: u8]
+  [timestamp: unsigned_vint if !USE_ROW_TIMESTAMP]         // delta
+  [local_deletion_time: unsigned_vint32 if (DELETED|EXPIRING) & !USE_ROW_TTL]  // delta
+  [ttl: unsigned_vint32 if EXPIRING & !USE_ROW_TTL]        // delta
+  [path_len: unsigned_vint32, path: bytes if complex col]  // cell path (collections/UDTs)
+  [value if !HAS_EMPTY_VALUE]                              // see below
+```
+
+**Cell flags byte:**
+
+| Bit | Mask | Name | Meaning |
+|-----|------|------|---------|
+| 0 | 0x01 | `IS_DELETED` | Cell is a tombstone |
+| 1 | 0x02 | `IS_EXPIRING` | Cell has TTL |
+| 2 | 0x04 | `HAS_EMPTY_VALUE` | No value bytes (tombstones) |
+| 3 | 0x08 | `USE_ROW_TIMESTAMP` | Timestamp same as row pk liveness (omitted) |
+| 4 | 0x10 | `USE_ROW_TTL` | TTL/ldt same as row pk liveness (omitted) |
+
+**Cell value encoding:** Fixed-length types (int=4, long=8, uuid=16, etc.) write raw bytes with no prefix. Variable-length types (text, blob, etc.) write `[length: unsigned_vint32] [bytes]`.
+
+#### Complex Column Data
+
+For non-frozen collections and UDTs:
+
+```
+complex_column :=
+  [del_ts: unsigned_vint, del_ldt: unsigned_vint32 if HAS_COMPLEX_DELETION]
+  [cell_count: unsigned_vint32]
+  <cell>*
+```
+
+#### Range Tombstone Marker Encoding
+
+When `IS_MARKER` (0x02) is set:
+
+```
+range_tombstone_marker :=
+  [flags: 0x02]
+  [kind: u8]                            // ClusteringPrefix.Kind ordinal
+  [num_values: u16 big-endian]          // clustering value count
+  <clustering_values>                   // same batch-of-32 format as rows
+  [marker_size: unsigned_vint]
+  [prev_unfiltered_size: unsigned_vint]
+  <deletion_time(s)>                    // 1 for bound, 2 for boundary
+```
+
+Kind ordinals: `0=EXCL_END_BOUND`, `1=INCL_START_BOUND`, `2=EXCL_END_INCL_START_BOUNDARY`, `5=INCL_END_EXCL_START_BOUNDARY`, `6=INCL_END_BOUND`, `7=EXCL_START_BOUND`.
+
+Deletion times are delta-encoded (unsigned_vint timestamp + unsigned_vint32 ldt). Boundary markers have two deletion times (end then start).
 
 ### Partition Index (Partitions.db)
 
@@ -226,16 +453,116 @@ The compressed size of chunk `i` is `offsets[i+1] - offsets[i]` for all but the 
 - **Zstd** (`zstd` crate): Better compression ratio, slightly slower.
 - **Snappy, Deflate**: Deferred to post-1.0. Reader returns `Error::UnsupportedCompression`.
 
+**When compression is disabled** (`Compression::None`): `CompressionInfo.db` is NOT written. Instead, Cassandra writes a `CRC.db` file with periodic checksums. The TOC lists whichever component was created. The reader checks the TOC for `CompressionInfo.db` — if absent, it reads Data.db as raw uncompressed bytes.
+
 ### Statistics (Statistics.db)
 
-SSTable-level metadata used for query optimization and compaction decisions:
+Contains four metadata components, each CRC32-checksummed. All BTI version flags are enabled (improved min/max, unsigned deletion times, commit log intervals, host IDs, key range, token space coverage).
 
-- Min/max partition token (for range queries and compaction overlap detection)
-- Row count, column count estimates
-- Min/max timestamps, min/max TTL, min/max local deletion time
-- Compression ratio
-- Tombstone histogram (for GC grace evaluation)
-- Column-level min/max (for partition key restrictions)
+#### File Structure
+
+```
+[component_count: i32]
+[crc32 of count: i32]
+[toc: (ordinal: i32, offset: i32) * component_count]
+[crc32 of toc: i32]
+[component_0 bytes] [crc32: i32]
+[component_1 bytes] [crc32: i32]
+[component_2 bytes] [crc32: i32]
+[component_3 bytes] [crc32: i32]
+```
+
+Components are ordered by ordinal. Each component's data length is derived from offset differences (subtract 4 for the CRC32 suffix).
+
+#### Component 0: ValidationMetadata
+
+| Field | Type |
+|-------|------|
+| Partitioner class name | Java UTF-8 (u16 big-endian length + bytes) |
+| Bloom filter FP chance | f64 big-endian |
+
+#### Component 1: CompactionMetadata
+
+| Field | Type |
+|-------|------|
+| Cardinality byte length | i32 |
+| Cardinality bytes | `byte[length]` (HyperLogLogPlus serialized) |
+
+#### Component 2: StatsMetadata
+
+Exact field order for BTI format:
+
+| # | Field | Type |
+|---|-------|------|
+| 1 | estimatedPartitionSize | EstimatedHistogram |
+| 2 | estimatedCellPerPartitionCount | EstimatedHistogram |
+| 3 | commitLogUpperBound | i64 segmentId + i32 position |
+| 4 | minTimestamp | i64 |
+| 5 | maxTimestamp | i64 |
+| 6 | minLocalDeletionTime | u32 (unsigned, BTI format) |
+| 7 | maxLocalDeletionTime | u32 |
+| 8 | minTTL | i32 |
+| 9 | maxTTL | i32 |
+| 10 | compressionRatio | f64 |
+| 11 | estimatedTombstoneDropTime | TombstoneHistogram |
+| 12 | sstableLevel | i32 |
+| 13 | repairedAt | i64 |
+| 14 | clusteringTypes | unsigned_vint32 count, then per type: unsigned_vint32 len + UTF-8 bytes |
+| 15 | coveredClustering | Slice (two ClusteringBounds) |
+| 16 | hasLegacyCounterShards | u8 boolean |
+| 17 | totalColumnsSet | i64 |
+| 18 | totalRows | i64 |
+| 19 | commitLogLowerBound | i64 segmentId + i32 position |
+| 20 | commitLogIntervals | i32 count, then count pairs of (i64 segmentId + i32 position) |
+| 21 | pendingRepair | u8 flag (0=null, 1=present) + optional 16-byte UUID |
+| 22 | isTransient | u8 boolean |
+| 23 | originatingHostId | u8 flag + optional 16-byte UUID |
+| 24 | hasPartitionLevelDeletions | u8 boolean |
+| 25 | firstKey | unsigned_vint32 length + raw bytes |
+| 26 | lastKey | unsigned_vint32 length + raw bytes |
+| 27 | tokenSpaceCoverage | f64 (NaN if not computed) |
+
+**EstimatedHistogram sub-format:**
+
+```
+[count: i32]                              // number of (offset, bucket) pairs
+for i in 0..count:
+  [offset: i64] [value: i64]
+```
+
+**TombstoneHistogram sub-format** (BTI uses new format, not legacy):
+
+```
+[maxBinSize: i32]                         // equals size (legacy compat, ignored)
+[size: i32]                               // entry count
+for i in 0..size:
+  [point: i64] [value: i32]
+```
+
+**ClusteringBound sub-format** (for coveredClustering Slice):
+
+```
+[kind: u8]                                // ordinal
+[size: u16 big-endian]                    // clustering value count
+<clustering_values>                       // batch-of-32 format (same as Data.db rows)
+```
+
+#### Component 3: SerializationHeader
+
+```
+[minTimestamp - TIMESTAMP_EPOCH: unsigned_vint]
+[minLocalDeletionTime - DELETION_TIME_EPOCH: unsigned_vint32]
+[minTTL - TTL_EPOCH: unsigned_vint32]
+[keyType: unsigned_vint32 len + UTF-8 bytes]
+[clusteringType count: unsigned_vint32]
+  for each: [unsigned_vint32 len + UTF-8 bytes]
+[staticColumn count: unsigned_vint32]
+  for each: [unsigned_vint32 nameLen + bytes] [unsigned_vint32 typeLen + UTF-8 bytes]
+[regularColumn count: unsigned_vint32]
+  for each: [unsigned_vint32 nameLen + bytes] [unsigned_vint32 typeLen + UTF-8 bytes]
+```
+
+The column type names and delta-encoding minimums from this header are required to decode Data.db correctly.
 
 ### TOC (TOC.txt)
 
@@ -282,10 +609,10 @@ CC = child count, CS = child span (max byte - min byte + 1). Size formulas for S
 The trie is constructed incrementally from sorted input using bottom-up page-aware packing:
 
 1. Keys are added in sorted order
-2. When a branch is complete (next key diverges from it), the builder serializes it
-3. Nodes accumulate until a branch exceeds 4096 bytes
-4. At that point, child subtrees (each fitting in a page) are laid out and the parent continues accumulating
-5. The root is the last node written; its position is recorded in the file footer
+1. When a branch is complete (next key diverges from it), the builder serializes it
+1. Nodes accumulate until a branch exceeds 4096 bytes
+1. At that point, child subtrees (each fitting in a page) are laid out and the parent continues accumulating
+1. The root is the last node written; its position is recorded in the file footer
 
 This matches Cassandra's `IncrementalDeepTrieWriterPageAware` algorithm.
 
@@ -426,14 +753,16 @@ Ferrosa must implement the byte-comparable encoding from `ByteComparable.java` (
 - Bloom filter: false positive rate within tolerance, compatibility with Cassandra-generated filters
 - Compression round-trip for all supported algorithms
 - Byte-comparable key encoding matches Cassandra
+- Varint encoding/decoding round-trip for all sizes
+- Data.db serialization round-trip for rows, cells, tombstones
 
 ### Integration Tests (Cassandra Oracle)
 
 Test fixtures are generated from the Cassandra submodule to verify binary compatibility:
 
 1. **SSTable fixtures**: Use `cassandra/tools/bin/sstablewriter` or CQL to create SSTables with known data
-2. **Read verification**: Ferrosa reads Cassandra-generated SSTables and produces identical query results
-3. **Round-trip**: Write data with Ferrosa, read with Cassandra's `sstableutil` / `sstabledump`, compare
+1. **Read verification**: Ferrosa reads Cassandra-generated SSTables and produces identical query results
+1. **Round-trip**: Write data with Ferrosa, read with Cassandra's `sstableutil` / `sstabledump`, compare
 
 Fixture generation scripts live in `tools/` alongside the existing `generate_murmur3_vectors.java`.
 
@@ -442,6 +771,8 @@ Fixture generation scripts live in `tools/` alongside the existing `generate_mur
 - Trie round-trip: arbitrary sorted key sets produce a trie that resolves every key correctly
 - Compression round-trip: arbitrary byte sequences survive compress/decompress
 - Bloom filter: no false negatives (inserted keys always found)
+- Varint round-trip: `decode(encode(n)) == n` for all valid integers
+- Data serialization round-trip: `deserialize(serialize(partition)) == partition`
 
 ## Error Handling
 

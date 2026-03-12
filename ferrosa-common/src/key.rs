@@ -1,3 +1,16 @@
+//! Partition key types: [`PartitionKey`] (raw bytes) and [`DecoratedKey`]
+//! (key + cached token).
+//!
+//! [`DecoratedKey`] is the primary key type throughout the storage engine.
+//! It pairs raw partition key bytes with their Murmur3 token, computed once
+//! at construction. Ordering is by token first, then by raw key bytes for
+//! tie-breaking (matching Cassandra's `DecoratedKey.compareTo`).
+//!
+//! # Bloom Filter Integration
+//!
+//! [`DecoratedKey::filter_hash`] returns both `(h1, h2)` from Murmur3 for
+//! Bloom filter double-hashing in `ferrosa-sstable`.
+
 use std::cmp::Ordering;
 
 use crate::Token;
@@ -69,6 +82,13 @@ pub struct DecoratedKey {
 
 impl DecoratedKey {
     /// Create a DecoratedKey by hashing the partition key with Murmur3.
+    ///
+    /// ```
+    /// use ferrosa_common::{DecoratedKey, PartitionKey, Token};
+    ///
+    /// let dk = DecoratedKey::new(PartitionKey::from(b"hello".as_slice()));
+    /// assert_eq!(dk.token, Token::from_key(b"hello"));
+    /// ```
     pub fn new(key: PartitionKey) -> Self {
         let token = Token::from_key(key.as_bytes());
         Self { token, key }

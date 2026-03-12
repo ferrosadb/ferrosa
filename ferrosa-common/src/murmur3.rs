@@ -1,3 +1,21 @@
+//! Cassandra-compatible Murmur3 x64_128 hash function.
+//!
+//! Produces identical output to Cassandra's
+//! `org.apache.cassandra.utils.MurmurHash.hash3_x64_128`. Returns `(h1, h2)`:
+//! - `h1` is the [`Token`](crate::Token) value (hash ring position)
+//! - Both `h1` and `h2` are used for Bloom filter double-hashing
+//!
+//! # Cassandra Sign Bug
+//!
+//! The tail bytes use sign-extension (`as i8 as i64`) matching Java's signed
+//! byte cast, while the body uses zero-extension (`& 0xff`). This asymmetry
+//! is intentional and must be preserved for compatibility.
+//!
+//! # Testing
+//!
+//! Characterization vectors generated from Cassandra source ensure exact
+//! compatibility. See the `tests` module and `tools/generate_murmur3_vectors.java`.
+
 /// Cassandra-compatible Murmur3 x64_128 hash function.
 ///
 /// Returns `(h1, h2)` where:
@@ -5,6 +23,14 @@
 /// - Both `h1` and `h2` are used for Bloom filter hashing
 ///
 /// Reference: `org.apache.cassandra.utils.MurmurHash.hash3_x64_128`
+///
+/// ```
+/// use ferrosa_common::murmur3::hash3_x64_128;
+///
+/// let (h1, h2) = hash3_x64_128(b"hello", 0);
+/// assert_eq!(h1, -3758069500696749310_i64);
+/// assert_eq!(h2, 6565844092913065241_i64);
+/// ```
 pub fn hash3_x64_128(data: &[u8], seed: i64) -> (i64, i64) {
     let len = data.len();
     let nblocks = len / 16;

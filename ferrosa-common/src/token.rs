@@ -1,3 +1,10 @@
+//! Token type representing a position on the Murmur3 hash ring.
+//!
+//! A [`Token`] wraps an `i64` produced by [`murmur3::hash3_x64_128`](crate::murmur3::hash3_x64_128).
+//! The full `i64::MIN..=i64::MAX` range is used, matching Cassandra's `LongToken`.
+//! Tokens determine data placement: which node owns a partition and where it
+//! appears in SSTables.
+
 /// Position on the Murmur3 hash ring.
 ///
 /// Wraps an `i64` produced by `murmur3::hash3_x64_128`. The full range
@@ -10,6 +17,14 @@ impl Token {
     pub const MAX: Token = Token(i64::MAX);
 
     /// Compute the token for a raw partition key by hashing with Murmur3.
+    ///
+    /// ```
+    /// use ferrosa_common::Token;
+    ///
+    /// let token = Token::from_key(b"hello");
+    /// assert_eq!(token, Token::from_key(b"hello")); // deterministic
+    /// assert_ne!(token, Token::from_key(b"world")); // different keys differ
+    /// ```
     pub fn from_key(key: &[u8]) -> Token {
         let (h1, _) = crate::murmur3::hash3_x64_128(key, 0);
         Token(h1)
