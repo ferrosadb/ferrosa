@@ -40,7 +40,7 @@ proptest! {
             is_superuser: true,
             must_change_password: false,
         };
-        let result = ferrosa_schema::auth::check_permission(
+        let result = check_permission(
             &snap, &auth, perms[perm_idx], &Resource::AllKeyspaces,
         );
         prop_assert!(result.is_ok());

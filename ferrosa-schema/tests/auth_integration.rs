@@ -77,6 +77,21 @@ fn bootstrap_without_env_password_must_change() {
 }
 
 #[test]
+fn production_mode_rejects_default_password() {
+    let config = ProductionCheckConfig {
+        mode: DeploymentMode::Production,
+        password_policy: PasswordPolicy::iso27001(),
+        has_superuser_password: false,
+        secrets_provider_type: "aws-sm".into(), // pragma: allowlist secret
+        s3_allow_http: false,
+    };
+    let violations = validate_production_requirements(&config);
+    assert!(violations
+        .iter()
+        .any(|v| matches!(v, ProductionViolation::DefaultSuperuserPassword)));
+}
+
+#[test]
 fn production_mode_rejects_weak_password_policy() {
     let config = ProductionCheckConfig {
         mode: DeploymentMode::Production,
