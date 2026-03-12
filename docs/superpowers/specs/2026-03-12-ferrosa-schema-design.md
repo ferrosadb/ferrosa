@@ -200,6 +200,7 @@ pub struct RoleMetadata {
 ### Permissions Model
 
 ```rust
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Permission {
     Create,
@@ -212,6 +213,7 @@ pub enum Permission {
     Execute,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Resource {
     AllKeyspaces,
@@ -283,6 +285,7 @@ Permission resolution walks the role hierarchy:
 ```rust
 pub struct Schema {
     inner: ArcSwap<SchemaSnapshot>,
+    write_lock: Mutex<()>,             // serializes all mutations (clone-modify-swap)
     hasher_config: PasswordHasher,
 }
 
@@ -292,14 +295,25 @@ pub struct SchemaSnapshot {
     pub keyspaces: HashMap<String, KeyspaceMetadata>,
     pub tables: HashMap<(String, String), TableMetadata>,  // (keyspace, table)
     pub roles: HashMap<String, RoleMetadata>,
-    pub grants: Vec<GrantEntry>,
+    pub grants: HashMap<String, Vec<GrantEntry>>,          // keyed by role name for O(1) lookup
 }
 ```
 
 - **Lock-free reads**: `ArcSwap` provides `Arc<SchemaSnapshot>` without locking
+- **Serialized writes**: `write_lock: Mutex<()>` held for duration of clone-modify-swap, preventing lost updates from concurrent mutations (same pattern as `ferrosa-storage::TableStore`)
 - **Copy-on-write mutations**: Clone snapshot, apply change, atomic swap
 - **Schema version**: New `Uuid` generated on every mutation (drivers poll this)
 - **Persistence**: Serializable via serde — Raft persistence (ferrosa-cluster) is follow-on
+
+### Bootstrap
+
+On first startup (`Schema::new()`), a default superuser role is created:
+
+- **Role**: `cassandra`
+- **Password**: `cassandra` (hashed with the configured hasher)
+- **Superuser**: `true`, **Can login**: `true`
+
+This matches Cassandra's behavior. Operators should change this password immediately after first boot. The default credentials are logged as a warning at startup.
 
 ### Public API
 
@@ -338,6 +352,7 @@ impl Schema {
 ### Error Types
 
 ```rust
+#[non_exhaustive]
 pub enum SchemaError {
     KeyspaceExists(String),
     KeyspaceNotFound(String),
@@ -345,11 +360,19 @@ pub enum SchemaError {
     TableNotFound(String, String),
     RoleExists(String),
     RoleNotFound(String),
+    /// Authentication failed. Message intentionally vague to avoid leaking
+    /// whether the role exists, can't login, or has a bad password.
     AuthenticationFailed,
     PermissionDenied { role: String, permission: Permission, resource: Resource },
+    SystemKeyspaceProtected(String),
+    RoleCycleDetected(String),
     InvalidSchema(String),
 }
 ```
+
+Note: `AuthenticationFailed` is intentionally a single variant — it does not distinguish "role not found" vs. "login disabled" vs. "bad password" to prevent information leakage. Internal logging may include the sub-reason for debugging.
+
+Permission resolution includes cycle detection: if a role hierarchy forms a cycle (A member_of B, B member_of A), the walk terminates and returns `RoleCycleDetected`. The `create_role` and `alter_role` operations also reject changes that would create a cycle.
 
 ---
 
@@ -359,12 +382,17 @@ pub enum SchemaError {
 
 ```rust
 pub struct LocalInfo {
+    pub key: String,                      // always "local" — primary key expected by drivers
     pub cluster_name: String,
     pub data_center: String,
     pub rack: String,
     pub host_id: Uuid,
+    pub broadcast_address: IpAddr,        // address other nodes use to reach this node
+    pub broadcast_port: u16,
     pub listen_address: IpAddr,
     pub listen_port: u16,
+    pub rpc_address: IpAddr,              // native transport address — drivers use this
+    pub rpc_port: u16,                    // native transport port
     pub native_protocol_version: String,  // "5"
     pub partitioner: String,              // "org.apache.cassandra.dht.Murmur3Partitioner"
     pub release_version: String,          // Ferrosa version string
@@ -377,6 +405,8 @@ pub struct LocalInfo {
 pub fn query_local(schema: &Schema, node_config: &NodeConfig) -> LocalInfo;
 ```
 
+The Java driver (DataStax v4) queries `SELECT * FROM system.local WHERE key='local'` and uses `rpc_address` to determine the node's contact address. Both `key` and `rpc_address` are required for driver compatibility.
+
 ### system.peers_v2
 
 ```rust
@@ -386,6 +416,8 @@ pub struct PeerInfo {
     pub data_center: String,
     pub rack: String,
     pub host_id: Uuid,
+    pub preferred_ip: Option<IpAddr>,     // multi-DC routing hint
+    pub preferred_port: Option<u16>,
     pub release_version: String,
     pub schema_version: Uuid,
     pub tokens: Vec<String>,
@@ -393,10 +425,16 @@ pub struct PeerInfo {
     pub native_port: u16,
 }
 
+/// Trait for cluster topology — ferrosa-cluster implements this.
+/// Single-node stub returns an empty peer list.
+pub trait ClusterState: Send + Sync {
+    fn peers(&self) -> Vec<PeerInfo>;
+}
+
 pub fn query_peers(schema: &Schema, cluster_state: &dyn ClusterState) -> Vec<PeerInfo>;
 ```
 
-`ClusterState` is a trait — ferrosa-cluster will implement it. For now, a stub returning an empty peer list (single-node mode).
+Only `system.peers_v2` is provided. Older drivers that require `system.peers` (v1) are not supported — Ferrosa targets CQL protocol v5 which uses v2. This is documented but not implemented as a fallback.
 
 ### system_schema.*
 
@@ -444,6 +482,36 @@ impl TableMetadata {
 
 This keeps `ferrosa_common::TableSchema` minimal (storage concerns only) while `TableMetadata` carries the full CQL-level schema.
 
+### CQL-to-Marshal Type Mapping
+
+The existing `ferrosa_common::TableSchema` uses Cassandra internal marshal type names (e.g., `"org.apache.cassandra.db.marshal.UTF8Type"`), while `ColumnMetadata` uses CQL type strings (e.g., `"text"`). The `convert.rs` module includes a `cql_to_marshal_type()` function that maps between these representations.
+
+Supported types in Chunk A:
+
+| CQL Type | Marshal Type |
+|----------|-------------|
+| `text`, `varchar` | `UTF8Type` |
+| `int` | `Int32Type` |
+| `bigint` | `LongType` |
+| `boolean` | `BooleanType` |
+| `float` | `FloatType` |
+| `double` | `DoubleType` |
+| `blob` | `BytesType` |
+| `uuid` | `UUIDType` |
+| `timeuuid` | `TimeUUIDType` |
+| `timestamp` | `TimestampType` |
+| `inet` | `InetAddressType` |
+| `counter` | `CounterColumnType` |
+| `ascii` | `AsciiType` |
+| `varint` | `IntegerType` |
+| `decimal` | `DecimalType` |
+| `set<T>` | `SetType(T)` |
+| `list<T>` | `ListType(T)` |
+| `map<K, V>` | `MapType(K, V)` |
+| `frozen<T>` | `FrozenType(T)` |
+
+For composite partition keys, `to_storage_schema()` synthesizes a `CompositeType(...)` marshal string from the component column types. UDT type mapping is deferred to Chunk C.
+
 ---
 
 ## NodeConfig
@@ -458,8 +526,10 @@ pub struct NodeConfig {
     pub host_id: Uuid,
     pub listen_address: IpAddr,
     pub listen_port: u16,
-    pub native_address: IpAddr,
-    pub native_port: u16,
+    pub broadcast_address: IpAddr,  // address other nodes use to reach this node
+    pub broadcast_port: u16,
+    pub rpc_address: IpAddr,        // native transport (CQL) address — used by drivers
+    pub rpc_port: u16,              // native transport (CQL) port
     pub tokens: Vec<String>,
 }
 ```
@@ -474,10 +544,14 @@ Populated from environment variables (`FERROSA_CLUSTER_NAME`, `FERROSA_DATA_CENT
 |-----------|-----------|
 | Read snapshot | Lock-free via `ArcSwap::load()` — returns `Arc<SchemaSnapshot>` |
 | Mutate schema | Clone snapshot, apply change, `ArcSwap::store()` — writers serialize via internal `Mutex` |
-| Authenticate | Read-only snapshot access + bcrypt/argon2 verify (CPU-bound) |
-| Auto-upgrade hash | Mutation after successful auth — same clone-and-swap path |
+| Authenticate (verify only) | Read-only snapshot access + bcrypt/argon2 verify (CPU-bound), no lock needed |
+| Authenticate (auto-upgrade) | Acquires `write_lock` only when hash algorithm differs from config — re-hash and swap |
 
-Writers are serialized (only one schema mutation at a time) but readers never block. This matches Cassandra's behavior — schema changes are rare and serialized through Raft.
+Writers are serialized via `write_lock` (only one schema mutation at a time) but readers never block. `authenticate()` takes the write lock only when a hash upgrade is needed, keeping the common path (verify only) lock-free. This matches Cassandra's behavior — schema changes are rare and serialized through Raft.
+
+### System Keyspace Protection
+
+System keyspaces (`system`, `system_schema`, `system_auth`) are protected from user modification. Any `create_table`, `alter_table`, or `drop_table` targeting a system keyspace returns `SchemaError::SystemKeyspaceProtected`. System keyspace contents are managed internally by the registry.
 
 ---
 
