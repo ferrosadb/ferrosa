@@ -30,7 +30,7 @@
 //! };
 //! let encoded = byte_comparable::encode(&dk);
 //! // 0x40, token(1 XOR sign bit), 0x00, 0x40, 0x41, 0x42, 0x00, 0x38
-//! assert_eq!(encoded.len(), 14);
+//! assert_eq!(encoded.len(), 15);
 //!
 //! let decoded = byte_comparable::decode(&encoded).unwrap();
 //! assert_eq!(decoded.token, dk.token);

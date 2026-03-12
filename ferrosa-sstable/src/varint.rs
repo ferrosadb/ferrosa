@@ -83,11 +83,11 @@ pub fn read_unsigned_vint(buf: &[u8]) -> Result<(u64, usize)> {
     }
 
     let mut value: u64;
-    if extra_bytes < 8 {
-        // Mask off the leading ones from the first byte
+    if extra_bytes <= 6 {
+        // Mask off the leading ones + separator from the first byte
         value = (first & (0xFF >> (extra_bytes + 1))) as u64;
     } else {
-        // 9-byte form: first byte is 0xFF, ignore it
+        // 8-byte (extra=7) or 9-byte (extra=8): no value bits in first byte
         value = 0;
     }
 
@@ -323,6 +323,37 @@ mod tests {
             assert_eq!(decoded, value, "round-trip failed for {value}");
             assert_eq!(consumed, n, "consumed mismatch for {value}");
         }
+    }
+
+    // --- Regression: 8-byte varint (extra_bytes=7) ---
+    // Proptest found: 0xFF >> 8 panics on u8 when extra_bytes=7.
+    // Values with 50-56 significant bits use 8-byte encoding where the
+    // first byte is 0xFE (no value bits), but the mask computation
+    // overflowed.
+
+    #[test]
+    fn unsigned_8_byte_round_trip() {
+        // 562949953421312 = 0x2000000000000 (50 significant bits = 8-byte encoding)
+        let value = 562949953421312u64;
+        assert_eq!(unsigned_vint_size(value), 8);
+        let mut buf = [0u8; 9];
+        let n = write_unsigned_vint(&mut buf, value);
+        assert_eq!(n, 8);
+        assert_eq!(buf[0], 0xFE); // 7 leading ones, no value bits
+        let (decoded, consumed) = read_unsigned_vint(&buf[..n]).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(consumed, 8);
+    }
+
+    #[test]
+    fn signed_8_byte_round_trip() {
+        // 281474976710656 zigzag-encodes to 562949953421312 (8-byte varint)
+        let value = 281474976710656i64;
+        let mut buf = [0u8; 9];
+        let n = write_signed_vint(&mut buf, value);
+        let (decoded, consumed) = read_signed_vint(&buf[..n]).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(consumed, n);
     }
 
     // --- Error cases ---
