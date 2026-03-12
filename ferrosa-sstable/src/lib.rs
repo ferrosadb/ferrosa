@@ -23,5 +23,6 @@ pub mod bloom;
 pub mod byte_comparable;
 pub mod compression;
 pub mod io;
+pub mod trie;
 pub mod types;
 pub mod varint;
