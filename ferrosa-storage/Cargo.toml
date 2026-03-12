@@ -1,0 +1,17 @@
+[package]
+name = "ferrosa-storage"
+description = "Single-node storage engine for Ferrosa: memtable, flush, merge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-sstable = { path = "../ferrosa-sstable" }
+arc-swap = "1.7"
+parking_lot = "0.12"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
