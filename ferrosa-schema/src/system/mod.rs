@@ -5,3 +5,4 @@
 
 pub mod local;
 pub mod peers;
+pub mod schema_tables;
