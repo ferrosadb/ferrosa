@@ -15,6 +15,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [Storage](storage.md) | Storage engine: memtable, flush, merge, commit log, compaction, S3 upload, cache, engine composition | Approved |
 | [Testing](testing.md) | Test infrastructure, suites, performance regression detection | Approved |
 | [Schema](schema.md) | Schema management: metadata types, registry, auth, system keyspaces | Draft |
+| [Threat Model](threat-model.md) | STRIDE threat analysis: trust boundaries, threat inventory, mitigations | Draft |
 
 ## Architecture Decision Records
 

@@ -1,0 +1,246 @@
+# Ferrosa Threat Model
+
+> Last updated: 2026-03-12
+> Status: Draft
+> Methodology: STRIDE
+> Scope: Full system — focused on ferrosa-schema (Chunk A) with broader system context
+
+## System Overview
+
+Ferrosa is a Rust reimplementation of Apache Cassandra with S3-backed storage. Nodes are ephemeral (local NVMe cache), S3 is the durable source of truth. The system exposes CQL protocol v5 to clients, uses a custom internode protocol with TLS, and communicates with S3 via HTTPS.
+
+**Deployment model**: AWS-first. Nodes in EC2/ECS/EKS, S3 for durability, VPC for internode isolation.
+
+---
+
+## Data Flow Diagram
+
+```mermaid
+graph TB
+    subgraph "Untrusted"
+        Client[CQL Client / Driver]
+    end
+
+    subgraph "DMZ / Network Boundary"
+        CQL[ferrosa-cql<br/>CQL Protocol v5]
+    end
+
+    subgraph "Application Tier"
+        Schema[ferrosa-schema<br/>Registry + Auth]
+        Storage[ferrosa-storage<br/>Memtable + CommitLog]
+        Cluster[ferrosa-cluster<br/>Raft + Routing]
+    end
+
+    subgraph "Internode (VPC)"
+        Net[ferrosa-net<br/>TLS + Custom Protocol]
+        Peer[Peer Ferrosa Node]
+    end
+
+    subgraph "Data Tier"
+        Local[(Local NVMe<br/>SSTables + CommitLog)]
+        S3[(S3 Bucket<br/>SSTables + Manifest)]
+    end
+
+    Client -->|"TCP (CQL v5)"| CQL
+    CQL -->|"authenticate()"| Schema
+    CQL -->|"check_permission()"| Schema
+    CQL -->|"read/write"| Storage
+    CQL -->|"system.local / peers"| Schema
+    Schema -->|"TableSchema"| Storage
+    Storage -->|"flush SSTable"| Local
+    Storage -->|"async upload"| S3
+    Storage -->|"commit log"| Local
+    Cluster -->|"Raft consensus"| Net
+    Net -->|"TLS"| Peer
+    Cluster -->|"schema replication"| Schema
+    Storage -->|"cache miss"| S3
+```
+
+---
+
+## Assets
+
+| # | Asset | Type | Impact if Compromised |
+|---|-------|------|----------------------|
+| A1 | User credentials (password hashes) | Confidentiality | Account takeover, privilege escalation |
+| A2 | Schema metadata (keyspaces, tables, roles) | Integrity | Data corruption, unauthorized DDL |
+| A3 | Data at rest (SSTables in S3) | Confidentiality | Full data breach |
+| A4 | Data in transit (CQL, internode) | Confidentiality | Eavesdropping, MITM |
+| A5 | Auth tokens / AuthContext | Integrity | Impersonation, privilege escalation |
+| A6 | S3 credentials | Confidentiality | Data exfiltration, deletion, tampering |
+| A7 | System keyspace responses | Integrity | Topology poisoning, driver misdirection |
+| A8 | Commit log segments | Integrity | Data loss, replay attacks |
+| A9 | Raft metadata | Integrity | Split-brain, schema divergence |
+| A10 | Audit trail | Integrity | Cover tracks after compromise |
+
+---
+
+## Trust Boundaries
+
+| # | Boundary | From | To |
+|---|----------|------|----|
+| TB1 | Client → CQL | Untrusted network | CQL protocol handler |
+| TB2 | CQL → Schema | Protocol layer | Auth + schema registry |
+| TB3 | Node → Node | VPC internode | Peer Ferrosa node |
+| TB4 | Node → S3 | Application | AWS S3 API |
+| TB5 | Node → Local disk | Application | Ephemeral NVMe |
+| TB6 | Env vars → Process | OS / container orchestrator | Ferrosa process |
+
+---
+
+## Threat Inventory
+
+### TB1: Client → CQL Protocol (Untrusted Network)
+
+| ID | STRIDE | Threat | Likelihood | Impact | Risk | Status |
+|----|--------|--------|-----------|--------|------|--------|
+| T01 | **S** | Attacker connects without authenticating and executes queries | 3 | 3 | **9 Critical** | Mitigated by ADR-006: auth required on all operations |
+| T02 | **I** | Plaintext CQL traffic intercepted (credentials, query data) | 3 | 3 | **9 Critical** | **Open**: CQL TLS not yet implemented |
+| T03 | **T** | MITM modifies CQL frames in transit | 2 | 3 | **6 High** | **Open**: No TLS = no integrity on wire |
+| T04 | **D** | Connection flood / query flood exhausts server resources | 3 | 2 | **6 High** | **Open**: No rate limiting or connection limits |
+| T05 | **S** | Brute-force password guessing against authenticate() | 3 | 2 | **6 High** | **Open**: No login attempt rate limiting |
+| T06 | **I** | Error messages leak role existence or system state | 2 | 1 | **2 Medium** | Mitigated: `AuthenticationFailed` is intentionally vague |
+
+### TB2: CQL → Schema Registry (Auth Boundary)
+
+| ID | STRIDE | Threat | Likelihood | Impact | Risk | Status |
+|----|--------|--------|-----------|--------|------|--------|
+| T07 | **E** | Non-superuser escalates to superuser via role hierarchy manipulation | 2 | 3 | **6 High** | Mitigated: cycle detection + permission check on GRANT/ALTER ROLE |
+| T08 | **E** | Default `cassandra`/`cassandra` superuser credentials left unchanged | 3 | 3 | **9 Critical** | Partial: warning logged at startup; no forced rotation |
+| T09 | **T** | Attacker modifies system keyspaces (`system`, `system_auth`, `system_schema`) | 2 | 3 | **6 High** | Mitigated: `SystemKeyspaceProtected` error on user DDL |
+| T10 | **I** | Password hashes leaked via system_auth query | 2 | 2 | **4 High** | **Open**: `system_auth.roles` exposes `salted_hash` column to roles with SELECT on `system_auth` |
+| T11 | **R** | Admin performs destructive DDL (DROP KEYSPACE) with no audit trail | 2 | 2 | **4 High** | **Open**: No audit logging designed yet |
+| T12 | **T** | Race condition in clone-modify-swap corrupts SchemaSnapshot | 1 | 3 | **3 Medium** | Mitigated: `write_lock: Mutex<()>` serializes all mutations |
+| T13 | **E** | Time-of-check-to-time-of-use (TOCTOU): permission checked, then snapshot changes before operation | 1 | 2 | **2 Medium** | Mitigated: permission check and mutation happen under same `write_lock` acquisition |
+| T14 | **D** | Expensive password hashing (bcrypt cost 12 / argon2id) used as DoS vector via repeated auth attempts | 2 | 2 | **4 High** | **Open**: No rate limiting on authenticate() |
+| T15 | **I** | `AuthContext` cloned/forged in-process by malicious crate | 1 | 3 | **3 Medium** | Accepted: Rust module system provides boundary; `AuthContext` is `pub` but only constructible via `authenticate()` |
+
+### TB3: Internode Communication (VPC)
+
+| ID | STRIDE | Threat | Likelihood | Impact | Risk | Status |
+|----|--------|--------|-----------|--------|------|--------|
+| T16 | **S** | Rogue node joins cluster and participates in Raft consensus | 2 | 3 | **6 High** | **Open**: Internode auth not yet implemented (TLS planned, mutual TLS needed) |
+| T17 | **I** | Internode traffic intercepted within VPC (lateral movement after compromise) | 1 | 3 | **3 Medium** | **Open**: TLS specified but not implemented |
+| T18 | **T** | Malicious Raft proposal alters schema on all nodes | 1 | 3 | **3 Medium** | Mitigated (future): Raft proposals go through auth-gated Schema API |
+
+### TB4: Node → S3 (Object Storage)
+
+| ID | STRIDE | Threat | Likelihood | Impact | Risk | Status |
+|----|--------|--------|-----------|--------|------|--------|
+| T19 | **I** | SSTable data readable by anyone with S3 bucket access (no envelope encryption) | 2 | 3 | **6 High** | Partial: relies on S3 SSE-KMS/SSE-S3 bucket policy; no application-level encryption |
+| T20 | **T** | Attacker with S3 write access tampers with SSTable or manifest | 1 | 3 | **3 Medium** | Partial: etag-based CAS for manifest; no integrity verification on SSTable reads |
+| T21 | **S** | S3 credentials (access key / secret key) leaked from environment | 2 | 3 | **6 High** | Partial: EC2 instance profiles preferred; env vars still supported |
+| T22 | **D** | S3 bucket deleted or lifecycle policy misconfigured, losing all durable data | 1 | 3 | **3 Medium** | **Open**: No S3 bucket policy validation or backup strategy |
+| T23 | **T** | Manifest CAS conflict causes lost SSTable references (data unreachable) | 2 | 2 | **4 High** | **Open**: CAS retry loop not yet wired |
+
+### TB5: Node → Local Disk (Ephemeral)
+
+| ID | STRIDE | Threat | Likelihood | Impact | Risk | Status |
+|----|--------|--------|-----------|--------|------|--------|
+| T24 | **I** | Local SSTables and commit log readable by co-tenant on shared host | 1 | 2 | **2 Medium** | Accepted: ephemeral storage; deploy on dedicated instances or use encrypted EBS |
+| T25 | **T** | Commit log segments corrupted on disk | 2 | 2 | **4 High** | Mitigated: CRC32 checksums on commit log entries; corruption detected at replay |
+
+### TB6: Environment / Configuration
+
+| ID | STRIDE | Threat | Likelihood | Impact | Risk | Status |
+|----|--------|--------|-----------|--------|------|--------|
+| T26 | **I** | Environment variables (`FERROSA_AUTH_*`, `FERROSA_S3_*`) exposed via /proc, container inspection, or logging | 2 | 2 | **4 High** | **Open**: No secrets management integration; env vars contain passwords and keys |
+| T27 | **T** | Attacker sets `FERROSA_AUTH_BCRYPT_COST=4` to weaken password hashing | 1 | 2 | **2 Medium** | Accepted: requires host access; cost floor of 4 is Rust bcrypt crate minimum |
+| T28 | **T** | `FERROSA_S3_ALLOW_HTTP=true` enables unencrypted S3 traffic in production | 2 | 2 | **4 High** | **Open**: No validation that HTTP is only used in dev/test |
+
+---
+
+## Risk Summary
+
+### Critical (Risk 9) — Must mitigate before production
+
+| ID | Threat | Mitigation |
+|----|--------|-----------|
+| T02 | Plaintext CQL traffic | Implement CQL TLS (rustls). Default to TLS-required in production. |
+| T08 | Default superuser unchanged | Force password change on first superuser login, or require `FERROSA_SUPERUSER_PASSWORD` env var at bootstrap. |
+
+### High (Risk 4-6) — Mitigate in current release cycle
+
+| ID | Threat | Mitigation |
+|----|--------|-----------|
+| T03 | CQL MITM | Solved by T02's TLS implementation. |
+| T04 | Connection/query flood | Add configurable connection limits and per-IP rate limiting in ferrosa-cql. |
+| T05 | Auth brute-force | Rate limit `authenticate()` calls: exponential backoff per source IP, account lockout after N failures. |
+| T07 | Privilege escalation via role hierarchy | Already mitigated by cycle detection + auth checks on grant/revoke. Verify in tests. |
+| T09 | System keyspace modification | Already mitigated. Verify in tests. |
+| T10 | Password hash exposure | Restrict SELECT on `system_auth` to superusers only. Consider omitting `salted_hash` from query results entirely (Cassandra behavior). |
+| T11 | No audit trail | Design audit logging (append-only, tamper-evident) for DDL and auth events. |
+| T14 | Auth DoS via hashing cost | Same mitigation as T05 (rate limiting). Consider connection-level throttle before reaching password verification. |
+| T16 | Rogue node joins cluster | Implement mutual TLS for internode with certificate pinning or shared CA. |
+| T19 | S3 data unencrypted at app level | Document SSE-KMS requirement. Consider envelope encryption for sensitive tables (future). |
+| T21 | S3 credential leak | Prefer instance profiles. Document: never use long-lived access keys in production. |
+| T23 | Manifest CAS conflict | Wire the retry loop (already designed, not connected). |
+| T25 | Commit log corruption | Already mitigated by CRC32. Verify replay rejects corrupt entries in tests. |
+| T26 | Env var secrets exposure | Document secrets manager integration path (AWS Secrets Manager, Vault). |
+| T28 | HTTP S3 in production | Log warning when `FERROSA_S3_ALLOW_HTTP=true`. Consider requiring `FERROSA_ENV=development` to enable. |
+
+### Medium (Risk 2-3) — Accept or plan
+
+| ID | Threat | Status |
+|----|--------|--------|
+| T06 | Auth error leakage | Mitigated by design. |
+| T12 | Snapshot race | Mitigated by `write_lock`. |
+| T13 | TOCTOU | Mitigated by lock scope. |
+| T15 | In-process AuthContext forgery | Accepted (Rust module boundary). |
+| T17 | Internode eavesdropping | Planned (TLS). |
+| T18 | Malicious Raft proposal | Mitigated by auth-gated API. |
+| T20 | S3 SSTable tampering | Partial (etag CAS). Future: checksum verification on read. |
+| T22 | S3 bucket deletion | Document ops procedure: versioning + MFA delete on bucket. |
+| T24 | Local disk co-tenant | Accepted for ephemeral storage. |
+| T27 | Weakened hash cost | Accepted (requires host access). |
+
+---
+
+## Mitigations by Priority
+
+### Phase 1: Before ferrosa-schema ships (Chunk A)
+
+| Mitigation | Threats | Effort |
+|-----------|---------|--------|
+| Force superuser password change or require env var at bootstrap | T08 | Small — modify `Schema::new()` |
+| Restrict `system_auth.roles` SELECT to superusers; omit `salted_hash` from non-superuser results | T10 | Small — filter in `query_roles()` |
+| Rate limit `authenticate()` with per-source backoff | T05, T14 | Medium — add rate limiter to registry or CQL layer |
+
+### Phase 2: Before production (ferrosa-cql + ferrosa-net)
+
+| Mitigation | Threats | Effort |
+|-----------|---------|--------|
+| CQL TLS via rustls (default: required) | T02, T03 | Medium |
+| Connection limits + per-IP rate limiting | T04 | Medium |
+| Internode mutual TLS | T16, T17 | Medium |
+| Audit logging for DDL + auth events | T11 | Medium |
+
+### Phase 3: Hardening
+
+| Mitigation | Threats | Effort |
+|-----------|---------|--------|
+| Secrets manager integration (AWS Secrets Manager / Vault) | T21, T26 | Medium |
+| S3 bucket policy validation at startup | T22, T28 | Small |
+| Manifest CAS retry loop | T23 | Small (designed, needs wiring) |
+| SSTable read-time checksum verification | T20 | Medium |
+| Envelope encryption for sensitive data | T19 | Large |
+
+---
+
+## Assumptions
+
+1. **Network**: Internode traffic is within a VPC; CQL port may be exposed to untrusted networks
+1. **S3**: Bucket has SSE-S3 or SSE-KMS enabled; bucket policy restricts access to Ferrosa IAM roles
+1. **Host**: Ferrosa runs on dedicated instances or in isolated containers (no co-tenant filesystem access)
+1. **Rust safety**: Memory safety vulnerabilities (buffer overflows, use-after-free) are not a primary concern due to Rust's type system; `unsafe` blocks are reviewed
+1. **Dependencies**: Third-party crates (`bcrypt`, `argon2`, `arc-swap`, `object_store`) are maintained and free of known vulnerabilities at time of integration
+1. **Operator**: Operators follow documented security practices (change default password, enable TLS, use instance profiles)
+
+## Open Questions
+
+- [ ] Should ferrosa-schema enforce a minimum password complexity policy, or is that the operator's responsibility?
+- [ ] Should `authenticate()` rate limiting live in the schema crate or the CQL protocol layer? (CQL layer has access to source IP; schema crate does not.)
+- [ ] What is the audit log format and destination? Append-only local file, structured logging to stdout, or a dedicated system keyspace (`system_auth.audit_log`)?
+- [ ] Should we support client certificate authentication (mutual TLS) as an alternative to password auth?
+- [ ] Do we need S3 object-level integrity verification (SHA-256 checksum on upload, verify on read) or is S3's built-in integrity sufficient?
+- [ ] Should `FERROSA_S3_ALLOW_HTTP` be gated behind a `FERROSA_ENV=development` check?
