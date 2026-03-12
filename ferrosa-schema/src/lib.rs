@@ -8,7 +8,10 @@ pub mod auth;
 pub mod error;
 pub mod metadata;
 
-pub use auth::{AuthContext, GrantEntry, Permission, Resource, RoleMetadata, RoleUpdates};
+pub use auth::{
+    AuthContext, AuthRateLimiter, GrantEntry, PasswordHasher, PasswordPolicy, Permission,
+    RateLimitConfig, Resource, RoleMetadata, RoleUpdates,
+};
 pub use error::{Result, SchemaError};
 pub use metadata::{
     CachingParams, ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata, KeyspaceMetadata,
