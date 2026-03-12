@@ -90,8 +90,6 @@ fn arb_mutation_sequence(range: std::ops::Range<usize>) -> impl Strategy<Value =
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
-
     /// For any Mutation, serialize then deserialize is identity.
     #[test]
     fn serialization_round_trip(mutation in arb_mutation()) {
@@ -122,8 +120,6 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(16))]
-
     /// For any sequence of mutations, append all then replay recovers all in order.
     #[test]
     fn append_replay_round_trip(mutations in arb_mutation_sequence(1..20)) {
@@ -272,8 +268,6 @@ fn cas_allocation_non_overlapping() {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(8))]
-
     /// All mutations recoverable even when spanning segment boundaries.
     #[test]
     fn segment_rotation_preserves_data(mutations in arb_mutation_sequence(1..50)) {
@@ -341,8 +335,6 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(8))]
-
     /// A segment is deleted iff every dirty table has flushed past it.
     ///
     /// We write mutations targeting two tables, flush one table at various
@@ -464,8 +456,6 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(8))]
-
     /// After crash (truncation), all entries before the truncation point
     /// are recoverable.
     #[test]
@@ -556,8 +546,6 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(8))]
-
     /// Replay never produces duplicate entries (same segment_id + offset).
     #[test]
     fn crash_recovery_no_duplicates(mutations in arb_mutation_sequence(1..20)) {
@@ -601,8 +589,6 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(8))]
-
     /// Discarding table_a then table_b produces the same result as
     /// discarding table_b then table_a.
     #[test]
@@ -717,8 +703,6 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
-
     /// `serialized_size()` returns the exact number of bytes written by
     /// `serialize_into()`.
     #[test]
@@ -744,8 +728,6 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(8))]
-
     /// After discard_completed + shutdown + replay, no mutations at or
     /// before the discarded position are replayed.
     #[test]
