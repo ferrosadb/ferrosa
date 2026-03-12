@@ -315,6 +315,36 @@ On first startup (`Schema::new()`), a default superuser role is created:
 
 This matches Cassandra's behavior. Operators should change this password immediately after first boot. The default credentials are logged as a warning at startup.
 
+### Result Type
+
+```rust
+pub type Result<T> = std::result::Result<T, SchemaError>;
+```
+
+### Update Types
+
+Chunk A defines the update structs referenced by `alter_*` methods. Full DDL validation is Chunk B; Chunk A applies updates to the snapshot without deep validation beyond auth and existence checks.
+
+```rust
+pub struct KeyspaceUpdates {
+    pub replication: Option<ReplicationParams>,
+    pub durable_writes: Option<bool>,
+}
+
+pub struct TableUpdates {
+    pub params: Option<TableParams>,
+    pub add_columns: Vec<ColumnMetadata>,
+    pub drop_columns: Vec<String>,
+}
+
+pub struct RoleUpdates {
+    pub is_superuser: Option<bool>,
+    pub can_login: Option<bool>,
+    pub password: Option<String>,       // plaintext — will be hashed by registry
+    pub member_of: Option<HashSet<String>>,
+}
+```
+
 ### Public API
 
 ```rust
@@ -534,7 +564,21 @@ pub struct NodeConfig {
 }
 ```
 
-Populated from environment variables (`FERROSA_CLUSTER_NAME`, `FERROSA_DATA_CENTER`, etc.) following the 12-factor config pattern established in ferrosa-storage.
+Populated from environment variables following the 12-factor config pattern established in ferrosa-storage:
+
+| Env Var | Field | Default |
+|---------|-------|---------|
+| `FERROSA_CLUSTER_NAME` | `cluster_name` | `"ferrosa"` |
+| `FERROSA_DATA_CENTER` | `data_center` | `"dc1"` |
+| `FERROSA_RACK` | `rack` | `"rack1"` |
+| `FERROSA_LISTEN_ADDRESS` | `listen_address` | `127.0.0.1` |
+| `FERROSA_LISTEN_PORT` | `listen_port` | `7000` |
+| `FERROSA_BROADCAST_ADDRESS` | `broadcast_address` | listen_address |
+| `FERROSA_BROADCAST_PORT` | `broadcast_port` | listen_port |
+| `FERROSA_RPC_ADDRESS` | `rpc_address` | `0.0.0.0` |
+| `FERROSA_RPC_PORT` | `rpc_port` | `9042` |
+
+`host_id` and `tokens` are generated/assigned at startup, not configured via environment.
 
 ---
 
