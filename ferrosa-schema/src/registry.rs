@@ -16,7 +16,7 @@ use crate::audit::AuditSink;
 use crate::auth::password::{PasswordHasher, PasswordPolicy};
 use crate::auth::permission::{GrantEntry, Permission, Resource};
 use crate::auth::rate_limit::{AuthRateLimiter, RateLimitConfig};
-use crate::auth::role::{AuthContext, RoleMetadata};
+use crate::auth::role::{AuthContext, RoleMetadata, RoleUpdates};
 use crate::error::SchemaError;
 use crate::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
 use crate::metadata::table::{TableMetadata, TableUpdates};
@@ -105,7 +105,6 @@ pub struct Schema {
     /// Password hashing configuration.
     hasher_config: PasswordHasher,
     /// Password strength policy (used by create_role/alter_role in CRUD operations).
-    #[allow(dead_code)]
     password_policy: PasswordPolicy,
     /// Authentication rate limiter.
     rate_limiter: AuthRateLimiter,
@@ -503,6 +502,144 @@ impl Schema {
         );
         Ok(())
     }
+
+    // ---- Role CRUD ----
+
+    /// Create a new role with optional password.
+    ///
+    /// Requires `Create` permission on `AllRoles`. Validates password
+    /// against the password policy and hashes it. Checks for role hierarchy
+    /// cycles in `member_of`.
+    pub fn create_role(
+        &self,
+        role: RoleMetadata,
+        password: Option<&str>,
+        auth: &AuthContext,
+    ) -> crate::Result<()> {
+        self.check_permission(auth, Permission::Create, &Resource::AllRoles)?;
+        let salted_hash = if let Some(pw) = password {
+            self.password_policy.validate(pw, &role.name)?;
+            Some(self.hasher_config.hash_password(pw)?)
+        } else {
+            None
+        };
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        if snap.roles.contains_key(&role.name) {
+            return Err(SchemaError::RoleExists(role.name));
+        }
+        for parent in &role.member_of {
+            if would_create_cycle(&snap, parent, &role.name) {
+                return Err(SchemaError::RoleCycleDetected(role.name));
+            }
+        }
+        let name = role.name.clone();
+        let is_su = role.is_superuser;
+        let mut role = role;
+        role.salted_hash = salted_hash;
+        snap.roles.insert(role.name.clone(), role);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::RoleCreated {
+                role: name,
+                is_superuser: is_su,
+            },
+            auth,
+        );
+        Ok(())
+    }
+
+    /// Alter an existing role.
+    ///
+    /// Requires `Alter` permission on `AllRoles`. Applies non-`None` fields
+    /// from `RoleUpdates`. If password changes, validates against policy,
+    /// hashes, and emits `PasswordChanged` audit event. Checks for cycles
+    /// if `member_of` changes.
+    pub fn alter_role(
+        &self,
+        name: &str,
+        updates: RoleUpdates,
+        auth: &AuthContext,
+    ) -> crate::Result<()> {
+        self.check_permission(auth, Permission::Alter, &Resource::AllRoles)?;
+        // Validate and hash password outside the write lock (expensive)
+        let new_hash = if let Some(ref pw) = updates.password {
+            self.password_policy.validate(pw, name)?;
+            Some(self.hasher_config.hash_password(pw)?)
+        } else {
+            None
+        };
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        if !snap.roles.contains_key(name) {
+            return Err(SchemaError::RoleNotFound(name.to_string()));
+        }
+        // Check for cycles before taking a mutable reference
+        if let Some(ref member_of) = updates.member_of {
+            for parent in member_of {
+                if would_create_cycle(&snap, parent, name) {
+                    return Err(SchemaError::RoleCycleDetected(name.to_string()));
+                }
+            }
+        }
+        let role = snap.roles.get_mut(name).unwrap();
+        if let Some(is_superuser) = updates.is_superuser {
+            role.is_superuser = is_superuser;
+        }
+        if let Some(can_login) = updates.can_login {
+            role.can_login = can_login;
+        }
+        if let Some(ref member_of) = updates.member_of {
+            role.member_of = member_of.clone();
+        }
+        let password_changed = new_hash.is_some();
+        if let Some(hash) = new_hash {
+            role.salted_hash = Some(hash);
+        }
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::RoleAltered {
+                role: name.to_string(),
+            },
+            auth,
+        );
+        if password_changed {
+            self.emit_audit_with_actor(
+                AuditEventKind::PasswordChanged {
+                    role: name.to_string(),
+                    upgraded_algorithm: false,
+                },
+                auth,
+            );
+        }
+        Ok(())
+    }
+
+    /// Drop an existing role.
+    ///
+    /// Requires `Drop` permission on `AllRoles`. Also removes all grants
+    /// associated with the role.
+    pub fn drop_role(&self, name: &str, auth: &AuthContext) -> crate::Result<()> {
+        self.check_permission(auth, Permission::Drop, &Resource::AllRoles)?;
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        if snap.roles.remove(name).is_none() {
+            return Err(SchemaError::RoleNotFound(name.to_string()));
+        }
+        // Remove all grants for the dropped role
+        snap.grants.remove(name);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::RoleDropped {
+                role: name.to_string(),
+            },
+            auth,
+        );
+        Ok(())
+    }
 }
 
 /// Returns true if the given name is a Cassandra system keyspace.
@@ -516,6 +653,28 @@ fn is_system_keyspace(name: &str) -> bool {
             | "system_traces"
             | "system_virtual_schema"
     )
+}
+
+/// Returns true if adding `new_role_name` as a child of `parent` would
+/// create a cycle in the role hierarchy.
+fn would_create_cycle(snap: &SchemaSnapshot, parent: &str, new_role_name: &str) -> bool {
+    // Walk upward from `parent` -- if we reach `new_role_name`, it's a cycle.
+    let mut visited = HashSet::new();
+    let mut stack = vec![parent.to_string()];
+    while let Some(current) = stack.pop() {
+        if current == new_role_name {
+            return true;
+        }
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        if let Some(role) = snap.roles.get(&current) {
+            for grandparent in &role.member_of {
+                stack.push(grandparent.clone());
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1115,5 +1274,160 @@ mod tests {
         let key = ("alter_tbl_ks".to_string(), "t1".to_string());
         let tbl = &snap.tables[&key];
         assert!(tbl.columns.contains_key("email"));
+    }
+
+    // ---- Task 22: Role CRUD tests ----
+
+    use crate::auth::role::RoleUpdates;
+
+    fn test_role(name: &str) -> RoleMetadata {
+        RoleMetadata {
+            name: name.to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: HashSet::new(),
+        }
+    }
+
+    fn test_schema_with_iso27001_sink(sink: Arc<TestAuditSink>) -> Schema {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
+        }
+        Schema::new(SchemaConfig {
+            password_policy: PasswordPolicy::iso27001(),
+            audit_sink: Box::new(sink),
+            ..test_config()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn create_role_with_password() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+
+        let role = test_role("app_user");
+        schema.create_role(role, Some("s3cretPwd"), &auth).unwrap();
+
+        let snap = schema.snapshot();
+        let r = snap.roles.get("app_user").expect("role exists");
+        assert!(r.salted_hash.is_some());
+        assert!(
+            PasswordHasher::verify_password_any("s3cretPwd", r.salted_hash.as_ref().unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn create_role_weak_password_rejected_by_policy() {
+        let sink = Arc::new(TestAuditSink::new());
+        let schema = test_schema_with_iso27001_sink(sink);
+        let auth = superuser_auth();
+
+        let role = test_role("weak_user");
+        let result = schema.create_role(role, Some("short"), &auth);
+        assert!(matches!(result, Err(SchemaError::PasswordTooWeak { .. })));
+    }
+
+    #[test]
+    fn alter_role_changes_password() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+
+        schema
+            .create_role(test_role("pw_user"), Some("oldpass"), &auth)
+            .unwrap();
+        schema
+            .alter_role(
+                "pw_user",
+                RoleUpdates {
+                    password: Some("newpass".to_string()),
+                    ..Default::default()
+                },
+                &auth,
+            )
+            .unwrap();
+
+        let snap = schema.snapshot();
+        let r = &snap.roles["pw_user"];
+        assert!(
+            PasswordHasher::verify_password_any("newpass", r.salted_hash.as_ref().unwrap())
+                .unwrap()
+        );
+        assert!(
+            !PasswordHasher::verify_password_any("oldpass", r.salted_hash.as_ref().unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn alter_role_password_change_emits_audit() {
+        let sink = Arc::new(TestAuditSink::new());
+        let schema = test_schema_with_sink(sink.clone());
+        let auth = superuser_auth();
+
+        schema
+            .create_role(test_role("audit_pw"), Some("original"), &auth)
+            .unwrap();
+        sink.clear();
+        schema
+            .alter_role(
+                "audit_pw",
+                RoleUpdates {
+                    password: Some("changed!".to_string()),
+                    ..Default::default()
+                },
+                &auth,
+            )
+            .unwrap();
+
+        let events = sink.events();
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            AuditEventKind::PasswordChanged { role, upgraded_algorithm: false }
+                if role == "audit_pw"
+        )));
+    }
+
+    #[test]
+    fn drop_role_removes_it() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+
+        schema
+            .create_role(test_role("doomed"), None, &auth)
+            .unwrap();
+        assert!(schema.snapshot().roles.contains_key("doomed"));
+
+        schema.drop_role("doomed", &auth).unwrap();
+        assert!(!schema.snapshot().roles.contains_key("doomed"));
+    }
+
+    #[test]
+    fn create_role_cycle_rejected() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+
+        // Create role A
+        schema
+            .create_role(test_role("role_a"), None, &auth)
+            .unwrap();
+        // Create role B as member of A
+        let mut role_b = test_role("role_b");
+        role_b.member_of.insert("role_a".to_string());
+        schema.create_role(role_b, None, &auth).unwrap();
+
+        // Now try to make role_a member_of role_b -- this creates a cycle
+        let result = schema.alter_role(
+            "role_a",
+            RoleUpdates {
+                member_of: Some(["role_b".to_string()].into_iter().collect()),
+                ..Default::default()
+            },
+            &auth,
+        );
+        assert!(matches!(result, Err(SchemaError::RoleCycleDetected(_))));
     }
 }
