@@ -4,3 +4,4 @@
 //! `system_schema.*`, and `system_auth.*` virtual tables.
 
 pub mod local;
+pub mod peers;

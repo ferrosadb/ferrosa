@@ -32,3 +32,4 @@ pub use startup::{
     validate_production_requirements, DeploymentMode, ProductionCheckConfig, ProductionViolation,
 };
 pub use system::local::{query_local, LocalInfo, NodeConfig};
+pub use system::peers::{query_peers, ClusterState, PeerInfo};
