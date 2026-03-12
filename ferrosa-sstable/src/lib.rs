@@ -22,7 +22,10 @@
 pub mod bloom;
 pub mod byte_comparable;
 pub mod compression;
+pub mod data;
 pub mod io;
+pub mod partition_index;
+pub mod row_index;
 pub mod statistics;
 pub mod toc;
 pub mod trie;
