@@ -55,9 +55,10 @@ ferrosa-schema/src/
 │   ├── password.rs         # PasswordHasher, bcrypt/argon2id, auto-upgrade
 │   └── rate_limit.rs       # AuthRateLimiter, exponential backoff, account lockout
 ├── audit/
-│   ├── mod.rs              # AuditEvent, AuditSink trait, re-exports
-│   ├── event.rs            # Event types, serialization
-│   └── log_sink.rs         # LogAuditSink — structured logging via tracing
+│   ├── mod.rs              # AuditEvent, AuditSink trait, CompositeSink, re-exports
+│   ├── event.rs            # AuditEvent, AuditEventKind, AuditLogEntry
+│   ├── log_sink.rs         # LogAuditSink — structured logging via tracing
+│   └── table_sink.rs       # SystemTableAuditSink — in-memory ring buffer for system_auth.audit_log
 ├── registry.rs             # Schema: thread-safe in-memory registry via ArcSwap
 ├── system/
 │   ├── mod.rs
@@ -265,6 +266,112 @@ impl Default for PasswordHasher {
 - **Auto-upgrade on login**: If configured hasher differs from stored hash algorithm, re-hash on next successful `authenticate()` call
 - **Verification**: Auto-detects algorithm from hash prefix, no config needed to verify
 
+### Password Complexity Policy
+
+Configurable password complexity enforcement. In production mode, ISO 27001 compliant minimums are enforced.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasswordPolicy {
+    pub min_length: usize,
+    pub require_uppercase: bool,
+    pub require_lowercase: bool,
+    pub require_digit: bool,
+    pub require_special: bool,
+    pub reject_username_as_password: bool,
+}
+```
+
+**Presets:**
+
+```rust
+impl PasswordPolicy {
+    /// No restrictions — for development/testing only.
+    pub fn permissive() -> Self;
+
+    /// ISO 27001 Annex A.9.4.3 compliant minimum:
+    /// - 12+ characters
+    /// - uppercase, lowercase, digit, special character required
+    /// - password != username
+    pub fn iso27001() -> Self;
+}
+```
+
+**ISO 27001 defaults** (used in production mode):
+
+| Rule | Value |
+|------|-------|
+| Minimum length | 12 |
+| Require uppercase | true |
+| Require lowercase | true |
+| Require digit | true |
+| Require special character | true |
+| Reject username as password | true |
+
+**Enforcement points:**
+
+- `create_role()` — validates password if provided
+- `alter_role()` — validates new password if changed
+- Bootstrap — `FERROSA_SUPERUSER_PASSWORD` is validated against the active policy
+
+**Mode integration:**
+
+- `FERROSA_MODE=production`: Uses `PasswordPolicy::iso27001()` as the minimum floor. Custom policy via env vars can only be *stricter*, not weaker.
+- `FERROSA_MODE=development`: Uses `PasswordPolicy::permissive()` by default. Custom policy via env vars overrides.
+
+**Configuration:**
+
+| Env Var | Values | Default (dev) | Default (prod) |
+|---------|--------|---------------|----------------|
+| `FERROSA_AUTH_MIN_PASSWORD_LENGTH` | integer | 1 | 12 |
+| `FERROSA_AUTH_REQUIRE_UPPERCASE` | `true`/`false` | false | true |
+| `FERROSA_AUTH_REQUIRE_LOWERCASE` | `true`/`false` | false | true |
+| `FERROSA_AUTH_REQUIRE_DIGIT` | `true`/`false` | false | true |
+| `FERROSA_AUTH_REQUIRE_SPECIAL` | `true`/`false` | false | true |
+
+**Error:**
+
+```rust
+PasswordTooWeak {
+    violations: Vec<String>,  // e.g. ["must be at least 12 characters", "must contain a digit"]
+}
+```
+
+### Client Certificate Authentication (Mutual TLS)
+
+When CQL TLS is configured with mutual authentication (ferrosa-cql, future), clients present an X.509 certificate signed by a trusted CA. The schema crate defines the auth model; the CQL crate implements the TLS handshake.
+
+```rust
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuthMethod {
+    /// Password-only authentication (default).
+    Password,
+    /// Certificate-only — client certificate CN maps to a Cassandra role.
+    Certificate,
+    /// Certificate + password — both required (two-factor).
+    CertificateAndPassword,
+}
+```
+
+**Certificate-to-role mapping**: The client certificate's Common Name (CN) or a Subject Alternative Name (SAN) maps to a Cassandra role name. If the role exists and `can_login` is true, authentication succeeds. No password is checked in `Certificate` mode.
+
+**Internode mutual TLS**: All internode connections require mutual TLS in production mode. Both nodes present certificates signed by the cluster CA. The peer's certificate CN must match a known node identity (validated against `system.peers_v2`).
+
+**Configuration** (applied by ferrosa-cql and ferrosa-net, not ferrosa-schema):
+
+| Env Var | Values | Default |
+|---------|--------|---------|
+| `FERROSA_AUTH_METHOD` | `password`, `certificate`, `certificate_and_password` | `password` |
+| `FERROSA_CQL_TLS_CERT` | Path to server certificate PEM | (required for TLS) |
+| `FERROSA_CQL_TLS_KEY` | Path to server private key PEM | (required for TLS) |
+| `FERROSA_CQL_TLS_CA` | Path to CA certificate PEM for client verification | (required for mutual TLS) |
+| `FERROSA_INTERNODE_TLS_CERT` | Path to node certificate PEM | (required for internode TLS) |
+| `FERROSA_INTERNODE_TLS_KEY` | Path to node private key PEM | (required for internode TLS) |
+| `FERROSA_INTERNODE_TLS_CA` | Path to cluster CA PEM | (required for internode TLS) |
+
+Chunk A defines the `AuthMethod` enum and includes it in `SchemaConfig`. The actual TLS handshake and certificate validation is implemented in ferrosa-cql and ferrosa-net.
+
 ### AuthContext
 
 Passed to every mutating registry operation. Superusers bypass permission checks. The `authenticate()` method on `Schema` verifies credentials and returns an `AuthContext`. See Bootstrap section for the full struct definition including `must_change_password`.
@@ -395,31 +502,66 @@ The trait is deliberately simple — one method, no error return. Audit emission
 
 ### Built-in Sinks
 
-**Chunk A provides one sink:**
+**Chunk A provides two sinks:**
 
 ```rust
 /// Emits audit events as structured JSON via the `tracing` crate at INFO level.
 /// Target: "ferrosa::audit" — operators filter/route via tracing-subscriber.
-///
-/// Example output:
-///   {"timestamp":"2026-03-12T10:30:00Z","event":"KeyspaceCreated",
-///    "actor":"admin","keyspace":"production","schema_version":"..."}
 pub struct LogAuditSink;
+
+/// Stores audit events in the in-memory audit log, queryable via
+/// system_auth.audit_log. Bounded ring buffer — oldest events evicted
+/// when capacity is reached.
+pub struct SystemTableAuditSink {
+    log: Mutex<VecDeque<AuditLogEntry>>,
+    capacity: usize,  // default: 10_000
+}
 ```
 
-Using `tracing` as the default sink gives operators immediate value:
+**`LogAuditSink`** provides structured JSON logging via `tracing`:
 
-- Structured JSON when using `tracing-subscriber` with JSON formatter
-- Routes to stdout, files, or log aggregators (CloudWatch, Datadog, etc.) via standard `tracing` configuration
-- Zero additional dependencies — `tracing` is already in the dependency tree via `ferrosa-storage`
-- Filter audit events with `RUST_LOG=ferrosa::audit=info`
+- Routes to stdout, files, or log aggregators (CloudWatch, Datadog, etc.)
+- Filter with `RUST_LOG=ferrosa::audit=info`
+
+**`SystemTableAuditSink`** stores events in `system_auth.audit_log`:
+
+```rust
+/// Row in system_auth.audit_log, queryable via CQL.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditLogEntry {
+    pub timestamp: SystemTime,
+    pub event_type: String,       // e.g. "AUTH_SUCCESS", "KEYSPACE_CREATED"
+    pub actor: Option<String>,    // role name
+    pub source: Option<String>,   // IP:port string
+    pub resource: Option<String>, // e.g. "keyspace:production", "table:ks.users"
+    pub operation: String,        // human-readable description
+    pub schema_version: Option<Uuid>,
+}
+
+pub fn query_audit_log(sink: &SystemTableAuditSink) -> Vec<AuditLogEntry>;
+```
+
+The audit log is an in-memory ring buffer (not persisted to SSTable). This is appropriate for Chunk A — the log survives for the lifetime of the node and is queryable via CQL. Persistence to durable storage (S3 archival) is follow-on work.
+
+**Default configuration**: Both sinks are active — events go to both `tracing` and the in-memory table. A `CompositeSink` wraps multiple sinks:
+
+```rust
+pub struct CompositeSink {
+    sinks: Vec<Box<dyn AuditSink>>,
+}
+```
+
+**Configuration:**
+
+| Env Var | Values | Default |
+|---------|--------|---------|
+| `FERROSA_AUDIT_LOG_CAPACITY` | integer | `10000` |
 
 **Future sinks (not in Chunk A):**
 
-| Sink | Chunk | Description |
-|------|-------|-------------|
-| `SystemTableAuditSink` | F | Writes to `system_auth.audit_log` table for CQL-queryable audit history |
-| `S3AuditSink` | Follow-on | Batches audit events to S3 as append-only JSON-lines files for compliance archival |
+| Sink | Description |
+|------|-------------|
+| `S3AuditSink` | Batches audit events to S3 as append-only JSON-lines files for compliance archival |
 
 ### Registry Integration
 
@@ -430,18 +572,13 @@ pub struct Schema {
     inner: ArcSwap<SchemaSnapshot>,
     write_lock: Mutex<()>,
     hasher_config: PasswordHasher,
+    password_policy: PasswordPolicy,
     rate_limiter: AuthRateLimiter,
     audit_sink: Box<dyn AuditSink>,
 }
 ```
 
-Constructor:
-
-```rust
-impl Schema {
-    pub fn new(hasher_config: PasswordHasher, audit_sink: Box<dyn AuditSink>) -> Self;
-}
-```
+Constructor — see Public API section for the full `SchemaConfig` struct and `Schema::new()` signature.
 
 Every registry method calls `self.audit_sink.emit(...)` after the operation completes (success or failure). For mutations, the event includes the new `schema_version`. For auth events, `schema_version` is `None`.
 
@@ -583,8 +720,18 @@ pub struct RoleUpdates {
 ### Public API
 
 ```rust
+pub struct SchemaConfig {
+    pub hasher: PasswordHasher,
+    pub password_policy: PasswordPolicy,
+    pub auth_method: AuthMethod,
+    pub rate_limit: RateLimitConfig,
+    pub audit_sink: Box<dyn AuditSink>,
+    pub secrets: Box<dyn SecretsProvider>,
+    pub mode: DeploymentMode,
+}
+
 impl Schema {
-    pub fn new(hasher_config: PasswordHasher, audit_sink: Box<dyn AuditSink>) -> Self;
+    pub fn new(config: SchemaConfig) -> Result<Self>;
 
     // Lock-free snapshot access
     pub fn snapshot(&self) -> Arc<SchemaSnapshot>;
@@ -634,6 +781,7 @@ pub enum SchemaError {
     PermissionDenied { role: String, permission: Permission, resource: Resource },
     SystemKeyspaceProtected(String),
     RoleCycleDetected(String),
+    PasswordTooWeak { violations: Vec<String> },
     InvalidSchema(String),
 }
 ```
@@ -731,6 +879,10 @@ pub fn query_role_members(snapshot: &SchemaSnapshot) -> Vec<RoleMemberRow>;
 
 // system_auth.role_permissions — derived from grants
 pub fn query_role_permissions(snapshot: &SchemaSnapshot) -> Vec<RolePermissionRow>;
+
+// system_auth.audit_log — audit event history from SystemTableAuditSink
+// Requires superuser. Returns most recent events first (ring buffer order).
+pub fn query_audit_log(sink: &SystemTableAuditSink, auth: &AuthContext) -> Result<Vec<AuditLogEntry>>;
 ```
 
 **Hash filtering (T10 mitigation)**: `query_roles()` takes `&AuthContext` and omits the `salted_hash` field for non-superuser callers. The `RoleRow.salted_hash` field is `Option<String>` — superusers see the hash, everyone else sees `None`. This matches Cassandra's behavior where `system_auth.roles` is restricted.
@@ -848,21 +1000,7 @@ The following secrets are retrievable via the provider:
 | `s3.access_key_id` | S3 upload | `FERROSA_S3_ACCESS_KEY_ID` |
 | `s3.secret_access_key` | S3 upload | `FERROSA_S3_SECRET_ACCESS_KEY` |
 
-The provider is consulted at startup and on-demand for rotation-aware backends. The `Schema::new()` constructor accepts `&dyn SecretsProvider` to retrieve the superuser password.
-
-### Integration
-
-```rust
-impl Schema {
-    pub fn new(
-        hasher_config: PasswordHasher,
-        audit_sink: Box<dyn AuditSink>,
-        secrets: &dyn SecretsProvider,
-    ) -> Self;
-}
-```
-
-The secrets provider is used during construction (for bootstrap password) and is not stored — secrets are resolved once at startup. Future rotation support would store a reference and re-resolve periodically.
+The provider is consulted at startup and on-demand for rotation-aware backends. `SchemaConfig.secrets` (see Public API) holds the provider. It is used during `Schema::new()` for bootstrap password retrieval and stored for future rotation support.
 
 ### Configuration
 
@@ -892,11 +1030,13 @@ Ferrosa supports a `FERROSA_MODE` environment variable that controls security en
 **Production mode enforces at startup:**
 
 1. **CQL TLS required**: CQL listener must have TLS configured (certificate + key). Refuses to bind without TLS.
-1. **Internode TLS required**: Internode protocol must have mutual TLS configured. Refuses to start cluster communication without TLS.
+1. **CQL mutual TLS required**: Client certificate authentication must be enabled. Clients must present a valid certificate signed by a trusted CA. This provides two-factor auth (certificate + password) or certificate-only auth depending on configuration.
+1. **Internode mutual TLS required**: Internode protocol must have mutual TLS configured. Both sides present certificates signed by the cluster CA. Refuses to start cluster communication without mutual TLS.
 1. **S3 HTTPS only**: `FERROSA_S3_ALLOW_HTTP=true` is rejected. S3 endpoint must use HTTPS.
 1. **Encrypted local storage**: Startup check verifies data directory is on an encrypted filesystem. Refuses to start if not detected (with override `FERROSA_ALLOW_UNENCRYPTED_DISK=true` for environments where encryption is handled at a layer Ferrosa can't detect, e.g., hardware encryption).
 1. **Secrets provider not `env`**: In production mode, `FERROSA_SECRETS_PROVIDER=env` logs a WARNING (not a hard block, since some locked-down environments manage env vars securely).
 1. **Default superuser password forbidden**: `FERROSA_SUPERUSER_PASSWORD` must be set or the node refuses to start. No `cassandra`/`cassandra` default in production mode.
+1. **Password policy floor**: Custom password policy cannot be weaker than `PasswordPolicy::iso27001()`. If any configured threshold is below the ISO 27001 minimum, the node refuses to start.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -912,19 +1052,21 @@ impl DeploymentMode {
 /// Validates all production-mode invariants. Returns a list of violations.
 /// Called at startup before binding any listeners.
 pub fn validate_production_requirements(
-    mode: DeploymentMode,
+    config: &SchemaConfig,
     node_config: &NodeConfig,
-    secrets: &dyn SecretsProvider,
 ) -> Vec<ProductionViolation>;
 
 #[non_exhaustive]
 pub enum ProductionViolation {
     CqlTlsNotConfigured,
+    CqlMutualTlsNotConfigured,     // client certificate auth required in production
     InternodeTlsNotConfigured,
+    InternodeMutualTlsNotConfigured, // internode mutual TLS required in production
     S3HttpEnabled,
     UnencryptedLocalStorage { path: PathBuf },
     DefaultSuperuserPassword,
     EnvSecretsInProduction,
+    PasswordPolicyBelowMinimum,     // custom policy weaker than ISO 27001 floor
 }
 ```
 
@@ -944,7 +1086,7 @@ pub enum ProductionViolation {
 
 The `DeploymentMode` enum and `validate_production_requirements()` function live in `ferrosa-schema` (since it already handles bootstrap and startup configuration). The actual TLS configuration lives in `ferrosa-cql` and `ferrosa-net` — production mode validation checks that those configs are present, not that it configures TLS itself.
 
-For Chunk A, the validation covers: S3 HTTP, local disk encryption, default superuser password, and secrets provider. CQL TLS and internode TLS checks are added when those crates are implemented.
+For Chunk A, the validation covers: S3 HTTP, local disk encryption, default superuser password, secrets provider, and password policy floor. CQL TLS, CQL mutual TLS, internode TLS, and internode mutual TLS checks are added when ferrosa-cql and ferrosa-net are implemented — the `ProductionViolation` enum is `#[non_exhaustive]` so variants can be added without breaking changes.
 
 ---
 
@@ -1013,7 +1155,9 @@ System keyspaces (`system`, `system_schema`, `system_auth`) are protected from u
 - `auth/permission.rs` — permission checking with hierarchy, superuser bypass, resource inheritance
 - `registry.rs` — CRUD operations, auth gating, version bumps, error cases (duplicates, not found, permission denied), bootstrap with `FERROSA_SUPERUSER_PASSWORD`
 - `audit/event.rs` — event serialization, all variants constructible
+- `auth/password.rs` — password policy validation: length, character classes, username rejection, ISO 27001 preset
 - `audit/log_sink.rs` — `LogAuditSink` emits valid structured JSON via tracing
+- `audit/table_sink.rs` — `SystemTableAuditSink` ring buffer capacity, eviction, query
 - `secrets/env.rs` — `EnvSecretsProvider` reads correct env vars, returns `None` for missing keys
 - `startup.rs` — production mode rejects S3 HTTP, default password, unencrypted disk; development mode warns
 - `convert.rs` — `TableMetadata::to_storage_schema()` matches expected `TableSchema` output
@@ -1029,8 +1173,10 @@ System keyspaces (`system`, `system_schema`, `system_auth`) are protected from u
 - Hash filtering: non-superuser `query_roles()` returns `None` for `salted_hash`; superuser sees real hash
 - Audit completeness: every registry mutation and auth call emits exactly one audit event via `TestAuditSink`
 - Audit content: events contain correct actor, timestamp, schema_version, and event-specific fields
-- Production mode: validation rejects missing TLS, HTTP S3, default password; development mode warns only
+- Production mode: validation rejects missing TLS, HTTP S3, default password, weak password policy; development mode warns only
 - Secrets provider: `EnvSecretsProvider` returns correct values; unknown keys return `None`
+- Password policy: weak passwords rejected by ISO 27001 policy; permissive policy allows anything; production mode rejects policy below floor
+- Audit log table: `SystemTableAuditSink` stores events, `query_audit_log()` returns them, ring buffer evicts oldest when full
 
 ### Property Tests
 

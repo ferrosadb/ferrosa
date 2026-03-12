@@ -242,10 +242,10 @@ graph TB
 
 ## Open Questions
 
-- [ ] Should ferrosa-schema enforce a minimum password complexity policy, or is that the operator's responsibility?
+- [x] ~~Should ferrosa-schema enforce a minimum password complexity policy?~~ **Resolved**: Yes. `PasswordPolicy` struct with `iso27001()` preset enforced as floor in production mode.
 - [x] ~~Should `authenticate()` rate limiting live in the schema crate or the CQL protocol layer?~~ **Resolved**: Both. Per-username rate limiting with backoff in schema crate (`AuthRateLimiter`); per-IP rate limiting in CQL layer (future).
-- [ ] What is the audit log format and destination? Append-only local file, structured logging to stdout, or a dedicated system keyspace (`system_auth.audit_log`)?
-- [ ] Should we support client certificate authentication (mutual TLS) as an alternative to password auth?
+- [x] ~~What is the audit log format and destination?~~ **Resolved**: Both. `LogAuditSink` (structured JSON via tracing) + `SystemTableAuditSink` (in-memory ring buffer queryable as `system_auth.audit_log`). S3 archival sink is follow-on.
+- [x] ~~Should we support client certificate authentication (mutual TLS)?~~ **Resolved**: Yes. `AuthMethod` enum: `Password`, `Certificate`, `CertificateAndPassword`. Production mode requires mutual TLS on both CQL and internode. Config designed in Chunk A, implemented in ferrosa-cql/ferrosa-net.
 - [ ] Do we need S3 object-level integrity verification (SHA-256 checksum on upload, verify on read) or is S3's built-in integrity sufficient?
 - [x] ~~Should `FERROSA_S3_ALLOW_HTTP` be gated behind a `FERROSA_ENV=development` check?~~ **Resolved**: Yes. `FERROSA_MODE=production` rejects it at startup (ADR-010).
 - [x] ~~Should we force superuser password change at bootstrap?~~ **Resolved**: Yes. `FERROSA_SUPERUSER_PASSWORD` env var or `must_change_password` flag.
