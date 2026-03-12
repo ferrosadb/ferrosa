@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::auth::permission::{Permission, Resource};
+
 /// Errors that can occur in schema operations.
 ///
 /// `#[non_exhaustive]` allows adding variants without semver breakage.
@@ -28,8 +30,8 @@ pub enum SchemaError {
     /// Insufficient permissions for the requested operation.
     PermissionDenied {
         role: String,
-        permission: String,
-        resource: String,
+        permission: Permission,
+        resource: Resource,
     },
     /// Cannot modify a system keyspace.
     SystemKeyspaceProtected(String),
@@ -123,8 +125,8 @@ mod tests {
             SchemaError::AuthenticationThrottled,
             SchemaError::PermissionDenied {
                 role: "r".into(),
-                permission: "SELECT".into(),
-                resource: "ks.t".into(),
+                permission: Permission::Select,
+                resource: Resource::Table("ks".into(), "t".into()),
             },
             SchemaError::SystemKeyspaceProtected("system".into()),
             SchemaError::RoleCycleDetected("r".into()),
