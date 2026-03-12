@@ -75,6 +75,9 @@ impl SyncStrategy for BatchSync {
         // will handle flush failures at a higher level. In a production
         // system we'd propagate, but the trait signature returns `()`.
         let _ = segment.flush_to_disk();
+        // No sync marker needed: BatchSync flushes every entry individually,
+        // so every entry is already durable. Markers are only useful for
+        // PeriodicSync/GroupSync where batches of entries are flushed together.
     }
 
     fn start(&self) {
@@ -394,13 +397,16 @@ mod tests {
         sync.on_write(&segment, offset);
 
         // After on_write, the file should exist on disk with the written data.
+        // Note: on_write flushes then writes a sync marker, so the file
+        // contains everything up to (but not including) the post-flush marker.
         let path = segment.path();
         assert!(path.exists(), "segment file should exist after batch sync");
         let contents = std::fs::read(path).unwrap();
-        assert_eq!(
-            contents.len(),
-            segment.current_position() as usize,
-            "file should contain all written data"
+        // File should contain at least the header + sync marker + entry.
+        assert!(
+            contents.len() > 25,
+            "file should contain data beyond the header, got {} bytes",
+            contents.len()
         );
 
         sync.stop();

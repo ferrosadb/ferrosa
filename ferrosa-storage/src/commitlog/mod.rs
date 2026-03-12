@@ -165,9 +165,12 @@ impl CommitLog {
         // Load active segment and try to allocate. The segment reference MUST
         // stay paired with the offset — writing to a different segment than
         // the one where CAS succeeded would corrupt data.
+        //
+        // allocate_and_begin_write() increments in_flight_writers BEFORE the CAS,
+        // closing the window where flush could read partially-written data.
         let (segment, offset) = {
             let seg = self.active.load_full();
-            match seg.allocate(total_size) {
+            match seg.allocate_and_begin_write(total_size) {
                 Some(offset) => (seg, offset),
                 None => {
                     // Segment is full — rotate (serialized) and retry.
@@ -175,7 +178,7 @@ impl CommitLog {
                     self.force_rotate()?;
                     let new_seg = self.active.load_full();
                     let offset = new_seg
-                        .allocate(total_size)
+                        .allocate_and_begin_write(total_size)
                         .expect("freshly rotated segment should have space");
                     (new_seg, offset)
                 }
@@ -183,6 +186,7 @@ impl CommitLog {
         };
 
         let position = segment.write_entry(offset, mutation);
+        segment.writer_done();
 
         // Track dirty table in this segment.
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
@@ -317,16 +321,28 @@ impl CommitLog {
             SyncStrategyConfig::Periodic { sync_interval } => {
                 let active_ref = Arc::clone(&active);
                 let flush_callback: FlushCallback = Arc::new(move || {
-                    let segment = active_ref.load();
-                    segment.flush_to_disk()
+                    let seg = active_ref.load();
+                    seg.flush_to_disk()?;
+                    // Write an EOF sync marker after flushing. Uses plain
+                    // allocate() since this is called from the flush thread
+                    // (not a writer), and the marker is complete before return.
+                    if let Some(offset) = seg.allocate(segment::SYNC_MARKER_SIZE) {
+                        seg.write_sync_marker_at(offset, 0);
+                    }
+                    Ok(())
                 });
                 Box::new(PeriodicSync::new(*sync_interval, flush_callback))
             }
             SyncStrategyConfig::Group { max_wait } => {
                 let active_ref = Arc::clone(&active);
                 let flush_callback: FlushCallback = Arc::new(move || {
-                    let segment = active_ref.load();
-                    segment.flush_to_disk()
+                    let seg = active_ref.load();
+                    seg.flush_to_disk()?;
+                    // Write an EOF sync marker after flushing.
+                    if let Some(offset) = seg.allocate(segment::SYNC_MARKER_SIZE) {
+                        seg.write_sync_marker_at(offset, 0);
+                    }
+                    Ok(())
                 });
                 Box::new(GroupSync::new(*max_wait, flush_callback))
             }

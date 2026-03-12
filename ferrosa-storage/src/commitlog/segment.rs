@@ -99,6 +99,25 @@ pub struct Segment {
 
     /// Tables with uncommitted data in this segment.
     dirty_tables: Mutex<HashMap<TableId, CommitLogPosition>>,
+
+    /// Number of writers currently between `allocate()` and `write_entry()`
+    /// completion. `flush_to_disk()` waits for this to reach zero before
+    /// reading the buffer, ensuring no partially-written entries are captured.
+    in_flight_writers: AtomicU64,
+
+    /// Persistent file handle for incremental flush. Opened on first flush,
+    /// reused for subsequent appends.
+    file_handle: Mutex<Option<std::fs::File>>,
+
+    /// Byte position up to which data has been flushed to disk. Used by
+    /// incremental flush to write only new bytes.
+    last_flushed: AtomicU64,
+
+    /// Absolute byte offset of the most recently written sync marker.
+    /// Used to build the forward-linked marker chain: when a new marker is
+    /// written, the previous marker's `next_marker_offset` is patched to
+    /// point to the new one.
+    last_sync_marker_offset: AtomicU64,
 }
 
 // SAFETY: The CAS allocation protocol guarantees that concurrent writers access
@@ -141,6 +160,10 @@ impl Segment {
             created_at: Instant::now(),
             path,
             dirty_tables: Mutex::new(HashMap::new()),
+            in_flight_writers: AtomicU64::new(0),
+            file_handle: Mutex::new(None),
+            last_flushed: AtomicU64::new(INITIAL_POSITION),
+            last_sync_marker_offset: AtomicU64::new(HEADER_SIZE as u64),
         }
     }
 
@@ -171,9 +194,54 @@ impl Segment {
         }
     }
 
+    /// Atomically allocates space AND increments the in-flight writer counter.
+    ///
+    /// This is the same as `allocate()` but also tracks the writer for
+    /// `flush_to_disk()` coordination. The caller MUST call `writer_done()`
+    /// after writing the entry.
+    ///
+    /// Used by `CommitLog::append()` to close the window between allocation
+    /// and entry write where flush could read partially-written data.
+    pub fn allocate_and_begin_write(&self, entry_total_size: usize) -> Option<u64> {
+        // Increment FIRST so that flush_to_disk() will wait for us even if
+        // another thread interleaves between our CAS success and write_entry().
+        self.in_flight_writers.fetch_add(1, Ordering::AcqRel);
+        match self.allocate(entry_total_size) {
+            Some(offset) => Some(offset),
+            None => {
+                // Allocation failed (segment full) — undo the increment.
+                self.in_flight_writers.fetch_sub(1, Ordering::AcqRel);
+                None
+            }
+        }
+    }
+
+    /// Decrements the in-flight writer count. Called after `write_entry()`
+    /// completes. Paired with the increment in [`allocate()`](Self::allocate).
+    pub fn writer_done(&self) {
+        self.in_flight_writers.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Spins until all in-flight writers have completed their entries.
+    /// Called by `flush_to_disk()` before reading the buffer.
+    fn wait_for_writers(&self) {
+        let mut spins = 0;
+        while self.in_flight_writers.load(Ordering::Acquire) > 0 {
+            spins += 1;
+            if spins > 1000 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
     /// Writes a mutation entry at the given offset.
     ///
     /// The entry format is: entry_size (u32) + size_crc (u32) + payload + payload_crc (u32).
+    ///
+    /// The caller MUST call `writer_begin()` before this method and
+    /// `writer_done()` after it returns to coordinate with `flush_to_disk()`.
     ///
     /// # Safety Argument
     ///
@@ -241,6 +309,29 @@ impl Segment {
             .fetch_add(SYNC_MARKER_SIZE as u64, Ordering::AcqRel);
     }
 
+    /// Writes a sync marker at an explicitly allocated offset, linking it
+    /// into the forward chain.
+    ///
+    /// Unlike `write_sync_marker()`, this does not advance the position — the
+    /// offset was already reserved via `allocate()`.
+    ///
+    /// The previous sync marker's `next_marker_offset` is patched to point to
+    /// this new marker, creating the forward-linked chain for crash recovery.
+    pub fn write_sync_marker_at(&self, offset: u64, next_marker_offset: u32) {
+        let buf = unsafe { &mut *self.buffer.get() };
+
+        // Patch the previous marker to point to this one.
+        let prev_offset = self.last_sync_marker_offset.load(Ordering::Acquire) as usize;
+        Self::write_sync_marker_to_buffer(buf, prev_offset, self.id, offset as u32);
+
+        // Write the new marker (EOF by default).
+        Self::write_sync_marker_to_buffer(buf, offset as usize, self.id, next_marker_offset);
+
+        // Update the tracker.
+        self.last_sync_marker_offset
+            .store(offset, Ordering::Release);
+    }
+
     /// Internal helper to write a sync marker into a buffer at a given offset.
     fn write_sync_marker_to_buffer(
         buf: &mut [u8],
@@ -261,26 +352,59 @@ impl Segment {
 
     /// Flushes the written portion of the buffer to disk and fsyncs.
     ///
-    /// Writes `buffer[0..position]` to the segment file, then calls `fsync`
-    /// to ensure durability.
+    /// Uses incremental flush: only writes bytes since the last flush.
+    /// Waits for all in-flight writers to complete before reading the buffer.
     pub fn flush_to_disk(&self) -> ferrosa_common::Result<()> {
-        let pos = self.position.load(Ordering::Acquire) as usize;
+        // Snapshot position BEFORE waiting. This captures only data from
+        // writers who have already allocated. New allocations after this
+        // point will be flushed on the next call.
+        let snapshot_pos = self.position.load(Ordering::Acquire) as usize;
 
-        // SAFETY: We only read buffer[0..pos]. All bytes in this range have
-        // been fully written by their owning threads (the sync strategy ensures
-        // all preceding writes are complete before flushing).
+        // Wait for all in-flight writers to complete their entries.
+        // After this returns, buffer[0..snapshot_pos] is fully written.
+        self.wait_for_writers();
+
+        // SAFETY: We only read buffer[0..snapshot_pos]. All bytes in this range
+        // have been fully written — wait_for_writers() ensures no in-flight writes.
         let buf = unsafe { &*self.buffer.get() };
 
-        // Ensure the parent directory exists.
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+        // File I/O happens under the file_handle mutex to prevent concurrent
+        // flushers from writing duplicate bytes.
+        let mut handle = self.file_handle.lock();
+        let last_flushed = self.last_flushed.load(Ordering::Acquire) as usize;
+        let current_pos = snapshot_pos;
+
+        match handle.as_mut() {
+            None => {
+                // First flush: create file, write from beginning (header + sync marker + entries).
+                if let Some(parent) = self.path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let f = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&self.path)?;
+                *handle = Some(f);
+                let file = handle.as_mut().unwrap();
+                use std::io::Write;
+                file.write_all(&buf[..current_pos])?;
+                file.sync_all()?;
+                self.last_flushed
+                    .store(current_pos as u64, Ordering::Release);
+            }
+            Some(file) if current_pos > last_flushed => {
+                // Incremental: append only new bytes.
+                use std::io::Write;
+                file.write_all(&buf[last_flushed..current_pos])?;
+                file.sync_all()?;
+                self.last_flushed
+                    .store(current_pos as u64, Ordering::Release);
+            }
+            Some(_) => {
+                // Nothing new to flush.
+            }
         }
-
-        fs::write(&self.path, &buf[..pos])?;
-
-        // fsync the file for durability.
-        let file = fs::OpenOptions::new().write(true).open(&self.path)?;
-        file.sync_all()?;
 
         Ok(())
     }
