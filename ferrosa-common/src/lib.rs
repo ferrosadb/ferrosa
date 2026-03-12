@@ -14,6 +14,9 @@ pub mod murmur3;
 pub mod schema;
 pub mod token;
 
+#[cfg(feature = "test-generators")]
+pub mod test_generators;
+
 pub use cell::{CellValue, Timestamp, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
 pub use error::{Error, Result};
 pub use key::{DecoratedKey, PartitionKey};
