@@ -96,6 +96,94 @@ impl PasswordHasher {
     }
 }
 
+/// Password strength policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasswordPolicy {
+    /// Minimum password length.
+    pub min_length: usize,
+    /// Require at least one uppercase letter.
+    pub require_uppercase: bool,
+    /// Require at least one lowercase letter.
+    pub require_lowercase: bool,
+    /// Require at least one digit.
+    pub require_digit: bool,
+    /// Require at least one special character.
+    pub require_special: bool,
+    /// Reject passwords that match the username.
+    pub reject_username_as_password: bool,
+}
+
+impl PasswordPolicy {
+    /// A permissive policy that accepts almost anything.
+    pub fn permissive() -> Self {
+        Self {
+            min_length: 1,
+            require_uppercase: false,
+            require_lowercase: false,
+            require_digit: false,
+            require_special: false,
+            reject_username_as_password: false,
+        }
+    }
+
+    /// A strict policy aligned with ISO 27001 recommendations.
+    pub fn iso27001() -> Self {
+        Self {
+            min_length: 12,
+            require_uppercase: true,
+            require_lowercase: true,
+            require_digit: true,
+            require_special: true,
+            reject_username_as_password: true,
+        }
+    }
+
+    /// Validate a password against this policy.
+    /// Returns `PasswordTooWeak` with violation descriptions on failure.
+    pub fn validate(&self, password: &str, username: &str) -> crate::Result<()> {
+        let mut violations = Vec::new();
+
+        if password.len() < self.min_length {
+            violations.push(format!("must be at least {} characters", self.min_length));
+        }
+        if self.require_uppercase && !password.chars().any(|c| c.is_uppercase()) {
+            violations.push("must contain at least one uppercase letter".to_string());
+        }
+        if self.require_lowercase && !password.chars().any(|c| c.is_lowercase()) {
+            violations.push("must contain at least one lowercase letter".to_string());
+        }
+        if self.require_digit && !password.chars().any(|c| c.is_ascii_digit()) {
+            violations.push("must contain at least one digit".to_string());
+        }
+        if self.require_special
+            && !password
+                .chars()
+                .any(|c| !c.is_alphanumeric() && !c.is_whitespace())
+        {
+            violations.push("must contain at least one special character".to_string());
+        }
+        if self.reject_username_as_password && password == username {
+            violations.push("password must not match username".to_string());
+        }
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(SchemaError::PasswordTooWeak { violations })
+        }
+    }
+
+    /// Returns true if this policy is at least as strict as `other`.
+    pub fn is_at_least_as_strong_as(&self, other: &PasswordPolicy) -> bool {
+        self.min_length >= other.min_length
+            && (self.require_uppercase || !other.require_uppercase)
+            && (self.require_lowercase || !other.require_lowercase)
+            && (self.require_digit || !other.require_digit)
+            && (self.require_special || !other.require_special)
+            && (self.reject_username_as_password || !other.reject_username_as_password)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +261,62 @@ mod tests {
             PasswordHasher::Bcrypt { cost } => assert_eq!(cost, 12),
             _ => panic!("default hasher should be Bcrypt"),
         }
+    }
+
+    // --- PasswordPolicy tests ---
+
+    #[test]
+    fn permissive_policy_accepts_anything() {
+        let policy = PasswordPolicy::permissive();
+        assert!(policy.validate("a", "admin").is_ok());
+        assert!(policy.validate("123", "admin").is_ok());
+        assert!(policy.validate("admin", "admin").is_ok()); // even username as password
+    }
+
+    #[test]
+    fn iso27001_rejects_short_password() {
+        let policy = PasswordPolicy::iso27001();
+        let err = policy.validate("Short1!", "user").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("12"), "should mention 12 characters: {msg}");
+    }
+
+    #[test]
+    fn iso27001_rejects_missing_uppercase() {
+        let policy = PasswordPolicy::iso27001();
+        let err = policy.validate("alllowercase1!", "user").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("uppercase"), "should mention uppercase: {msg}");
+    }
+
+    #[test]
+    fn iso27001_rejects_password_matching_username() {
+        let policy = PasswordPolicy::iso27001();
+        // Password matches username (case-insensitive would be a bonus but not required)
+        let err = policy.validate("admin", "admin").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("username"), "should mention username: {msg}");
+    }
+
+    #[test]
+    fn iso27001_accepts_strong_password() {
+        let policy = PasswordPolicy::iso27001();
+        assert!(policy.validate("MyStr0ng!Pass", "user").is_ok());
+    }
+
+    #[test]
+    fn is_at_least_as_strong_as_self() {
+        let iso = PasswordPolicy::iso27001();
+        assert!(iso.is_at_least_as_strong_as(&iso));
+
+        let permissive = PasswordPolicy::permissive();
+        assert!(permissive.is_at_least_as_strong_as(&permissive));
+    }
+
+    #[test]
+    fn permissive_not_as_strong_as_iso27001() {
+        let permissive = PasswordPolicy::permissive();
+        let iso = PasswordPolicy::iso27001();
+        assert!(!permissive.is_at_least_as_strong_as(&iso));
     }
 }
