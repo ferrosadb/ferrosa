@@ -10,7 +10,7 @@
 //!
 //! # Design
 //!
-//! The walker reads nodes via [`ReadAt`](crate::io::ReadAt), following child
+//! The walker reads nodes via [`ReadAt`], following child
 //! pointers as distances from the current node position. Since tries are
 //! written bottom-up, children are at lower file positions than parents.
 //!

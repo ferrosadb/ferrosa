@@ -4,8 +4,8 @@
 //! the default on-disk format in Apache Cassandra 5.x. It provides:
 //!
 //! - [`io::ReadAt`] / [`io::WriteAt`] — positional I/O traits decoupled from filesystem vs S3
-//! - `SSTableReader` — open and query BTI SSTables (planned)
-//! - `SSTableWriter` — write new BTI SSTables from sorted input (planned)
+//! - [`SSTableReader`] — open and query BTI SSTables
+//! - [`SSTableWriter`] — write new BTI SSTables from sorted input
 //!
 //! # Architecture
 //!
@@ -33,3 +33,9 @@ pub mod trie;
 pub mod types;
 pub mod varint;
 pub mod writer;
+
+pub use compression::Compression;
+pub use io::{FileReadAt, FileWriteAt, ReadAt, WriteAt};
+pub use reader::{SSTableComponents, SSTableReader};
+pub use types::{DeletionTime, LivenessInfo, Partition, Row};
+pub use writer::{SSTableOutput, SSTableWriter, WriteOptions};
