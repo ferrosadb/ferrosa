@@ -1,3 +1,14 @@
+//! Error types shared across all Ferrosa crates.
+//!
+//! [`Error`] is `#[non_exhaustive]` so new variants can be added without
+//! breaking downstream crates. The [`Result`] type alias is re-exported
+//! from the crate root for convenience.
+//!
+//! Key variants for SSTable operations:
+//! - [`Error::InvalidFormat`] — file doesn't match expected structure
+//! - [`Error::ChecksumMismatch`] — data corruption detected
+//! - [`Error::UnsupportedCompression`] — algorithm not yet implemented
+
 use std::fmt;
 
 /// Errors that can occur across Ferrosa crates.

@@ -1,3 +1,16 @@
+//! Cell values: the atomic unit of data in Cassandra/Ferrosa.
+//!
+//! A [`CellValue`] belongs to a specific column in a specific row and carries
+//! a value along with metadata (timestamp, TTL, local deletion time) used for
+//! last-write-wins conflict resolution and TTL expiration.
+//!
+//! Three cell states:
+//! - **Live**: value + timestamp, no expiration
+//! - **Expiring**: value + timestamp + TTL + local deletion time
+//! - **Tombstone**: no value, marks deletion at a specific timestamp
+//!
+//! Sentinel constants: [`NO_TIMESTAMP`], [`NO_TTL`], [`NO_DELETION_TIME`].
+
 /// Timestamp for a cell value (microseconds since epoch).
 /// Matches Cassandra's `Cell.timestamp()`.
 pub type Timestamp = i64;
@@ -36,6 +49,14 @@ pub struct CellValue {
 
 impl CellValue {
     /// A live cell with a value and timestamp, no expiration.
+    ///
+    /// ```
+    /// use ferrosa_common::CellValue;
+    ///
+    /// let cell = CellValue::live(b"hello".to_vec(), 1000);
+    /// assert!(cell.is_live());
+    /// assert!(!cell.is_tombstone());
+    /// ```
     pub fn live(value: Vec<u8>, timestamp: Timestamp) -> Self {
         Self {
             value: Some(value),
@@ -61,6 +82,14 @@ impl CellValue {
     }
 
     /// A tombstone marking deletion at the given timestamp.
+    ///
+    /// ```
+    /// use ferrosa_common::CellValue;
+    ///
+    /// let cell = CellValue::tombstone(1000, 1700000000);
+    /// assert!(cell.is_tombstone());
+    /// assert!(cell.value.is_none());
+    /// ```
     pub fn tombstone(timestamp: Timestamp, local_deletion_time: i32) -> Self {
         Self {
             value: None,
