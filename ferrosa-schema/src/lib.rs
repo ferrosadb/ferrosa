@@ -8,6 +8,7 @@ pub mod audit;
 pub mod auth;
 pub mod error;
 pub mod metadata;
+pub mod secrets;
 
 pub use audit::{
     AuditContext, AuditEvent, AuditEventKind, AuditLogEntry, AuditSink, CompositeSink,
@@ -22,3 +23,4 @@ pub use metadata::{
     CachingParams, ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata, KeyspaceMetadata,
     KeyspaceUpdates, ReplicationParams, TableFlag, TableMetadata, TableParams, TableUpdates,
 };
+pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};
