@@ -20,4 +20,5 @@
 //! [bti]: https://cassandra.apache.org/doc/latest/cassandra/architecture/storage-engine.html
 
 pub mod io;
+pub mod types;
 pub mod varint;
