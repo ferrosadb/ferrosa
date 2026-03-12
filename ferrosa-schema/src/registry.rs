@@ -640,6 +640,92 @@ impl Schema {
         );
         Ok(())
     }
+
+    // ---- Grant/Revoke ----
+
+    /// Grant permissions to a role on a resource.
+    ///
+    /// Requires `Authorize` permission on `AllRoles`. If the role already
+    /// has a grant for the resource, the new permissions are merged in.
+    pub fn grant(
+        &self,
+        role: &str,
+        resource: &Resource,
+        perms: HashSet<Permission>,
+        auth: &AuthContext,
+    ) -> crate::Result<()> {
+        self.check_permission(auth, Permission::Authorize, &Resource::AllRoles)?;
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        if !snap.roles.contains_key(role) {
+            return Err(SchemaError::RoleNotFound(role.to_string()));
+        }
+        let grants = snap.grants.entry(role.to_string()).or_default();
+        if let Some(existing) = grants.iter_mut().find(|g| g.resource == *resource) {
+            existing.permissions.extend(perms.iter().copied());
+        } else {
+            grants.push(GrantEntry {
+                role: role.to_string(),
+                resource: resource.clone(),
+                permissions: perms.clone(),
+            });
+        }
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::PermissionGranted {
+                role: role.to_string(),
+                resource: resource.clone(),
+                permissions: perms,
+            },
+            auth,
+        );
+        Ok(())
+    }
+
+    /// Revoke permissions from a role on a resource.
+    ///
+    /// Requires `Authorize` permission on `AllRoles`. Removes the specified
+    /// permissions. If all permissions are removed, the grant entry is
+    /// removed entirely.
+    pub fn revoke(
+        &self,
+        role: &str,
+        resource: &Resource,
+        perms: HashSet<Permission>,
+        auth: &AuthContext,
+    ) -> crate::Result<()> {
+        self.check_permission(auth, Permission::Authorize, &Resource::AllRoles)?;
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        if !snap.roles.contains_key(role) {
+            return Err(SchemaError::RoleNotFound(role.to_string()));
+        }
+        let grants = snap.grants.entry(role.to_string()).or_default();
+        if let Some(existing) = grants.iter_mut().find(|g| g.resource == *resource) {
+            for perm in &perms {
+                existing.permissions.remove(perm);
+            }
+        }
+        // Remove empty grant entries
+        if let Some(grants) = snap.grants.get_mut(role) {
+            grants.retain(|g| !g.permissions.is_empty());
+            if grants.is_empty() {
+                snap.grants.remove(role);
+            }
+        }
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::PermissionRevoked {
+                role: role.to_string(),
+                resource: resource.clone(),
+                permissions: perms,
+            },
+            auth,
+        );
+        Ok(())
+    }
 }
 
 /// Returns true if the given name is a Cassandra system keyspace.
@@ -1429,5 +1515,124 @@ mod tests {
             &auth,
         );
         assert!(matches!(result, Err(SchemaError::RoleCycleDetected(_))));
+    }
+
+    // ---- Task 23: Grant/Revoke tests ----
+
+    #[test]
+    fn grant_adds_permissions() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+
+        schema
+            .create_role(test_role("grantee"), None, &auth)
+            .unwrap();
+        schema
+            .create_keyspace(test_keyspace("grant_ks"), &auth)
+            .unwrap();
+
+        let perms: HashSet<Permission> = [Permission::Select, Permission::Modify]
+            .into_iter()
+            .collect();
+        schema
+            .grant(
+                "grantee",
+                &Resource::Keyspace("grant_ks".to_string()),
+                perms,
+                &auth,
+            )
+            .unwrap();
+
+        let snap = schema.snapshot();
+        let grants = &snap.grants["grantee"];
+        assert_eq!(grants.len(), 1);
+        assert!(grants[0].permissions.contains(&Permission::Select));
+        assert!(grants[0].permissions.contains(&Permission::Modify));
+    }
+
+    #[test]
+    fn revoke_removes_permissions() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+
+        schema
+            .create_role(test_role("revokee"), None, &auth)
+            .unwrap();
+
+        let perms: HashSet<Permission> = [Permission::Select, Permission::Modify]
+            .into_iter()
+            .collect();
+        schema
+            .grant("revokee", &Resource::AllKeyspaces, perms, &auth)
+            .unwrap();
+
+        // Revoke only Select
+        let to_revoke: HashSet<Permission> = [Permission::Select].into_iter().collect();
+        schema
+            .revoke("revokee", &Resource::AllKeyspaces, to_revoke, &auth)
+            .unwrap();
+
+        let snap = schema.snapshot();
+        let grants = &snap.grants["revokee"];
+        assert_eq!(grants.len(), 1);
+        assert!(!grants[0].permissions.contains(&Permission::Select));
+        assert!(grants[0].permissions.contains(&Permission::Modify));
+    }
+
+    #[test]
+    fn grant_emits_audit() {
+        let sink = Arc::new(TestAuditSink::new());
+        let schema = test_schema_with_sink(sink.clone());
+        let auth = superuser_auth();
+
+        schema
+            .create_role(test_role("audit_grantee"), None, &auth)
+            .unwrap();
+        sink.clear();
+
+        let perms: HashSet<Permission> = [Permission::Select].into_iter().collect();
+        schema
+            .grant("audit_grantee", &Resource::AllKeyspaces, perms, &auth)
+            .unwrap();
+
+        let events = sink.events();
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            AuditEventKind::PermissionGranted { role, .. } if role == "audit_grantee"
+        )));
+    }
+
+    #[test]
+    fn grant_to_nonexistent_role_fails() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+
+        let perms: HashSet<Permission> = [Permission::Select].into_iter().collect();
+        let result = schema.grant("ghost_role", &Resource::AllKeyspaces, perms, &auth);
+        assert!(matches!(result, Err(SchemaError::RoleNotFound(ref n)) if n == "ghost_role"));
+    }
+
+    #[test]
+    fn revoke_all_removes_entry() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+
+        schema
+            .create_role(test_role("full_revoke"), None, &auth)
+            .unwrap();
+
+        let perms: HashSet<Permission> = [Permission::Select].into_iter().collect();
+        schema
+            .grant("full_revoke", &Resource::AllKeyspaces, perms.clone(), &auth)
+            .unwrap();
+
+        // Revoke all permissions
+        schema
+            .revoke("full_revoke", &Resource::AllKeyspaces, perms, &auth)
+            .unwrap();
+
+        let snap = schema.snapshot();
+        // The grants entry should be completely removed
+        assert!(!snap.grants.contains_key("full_revoke"));
     }
 }
