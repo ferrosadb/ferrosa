@@ -1,25 +1,34 @@
 # Storage Engine
 
-> Last updated: 2026-03-11
+> Last updated: 2026-03-12
 > Status: Approved
 
 ## Overview
 
 `ferrosa-storage` is the single-node storage engine. It accepts writes into an in-memory buffer (memtable), flushes to SSTables, and merges reads across all sources. The read path is entirely wait-free via lock-free atomic pointer swaps.
 
-The crate is implemented in three parts:
+The crate is implemented in three parts, all complete:
 
-| Part | Scope | Key Deps |
-|------|-------|----------|
-| **A** | Memtable + Flush + Read-path merge | `ferrosa-common`, `ferrosa-sstable`, `arc_swap`, `parking_lot`, `rayon` |
-| **B** | Commit log (WAL, segments, replay) | Part A + versioned segment format |
-| **C** | Compaction + S3 manager + composition | Part A + B + `aws-sdk-s3`, `tokio` |
+| Part | Scope | Status | Key Deps |
+|------|-------|--------|----------|
+| **A** | Memtable + Flush + Read-path merge | Done | `ferrosa-common`, `ferrosa-sstable`, `arc_swap`, `parking_lot` |
+| **B** | Commit log (WAL, segments, sync, replay) | Done | Part A + `crc32fast` |
+| **C** | Compaction + S3 manager + StorageEngine | Done | Part A + B + `object_store`, `tokio`, `serde`, `bytes` |
 
 ## Architecture
 
 ```mermaid
 graph TB
-    subgraph "TableStore (lock-free ArcSwap)"
+    subgraph "StorageEngine"
+        CL["CommitLog<br/>CAS-based WAL"]
+        Tables["RwLock&lt;HashMap&lt;TableId, TableStore&gt;&gt;"]
+        Compact["CompactionExecutor<br/>Background std::thread"]
+        Upload["UploadManager<br/>tokio task + bounded mpsc"]
+        Cache["LocalCache<br/>LRU eviction"]
+        Manifest["Manifest<br/>JSON + etag CAS"]
+    end
+
+    subgraph "Per-Table: TableStore (lock-free ArcSwap)"
         View["StoreView (immutable snapshot)"]
         Active["Active Memtable<br/>ShardedBTreeMemtable"]
         Flushing["Flushing Memtable<br/>(read-only during flush)"]
@@ -27,7 +36,8 @@ graph TB
     end
 
     subgraph "Write Path"
-        W[write] -->|ArcSwap::load wait-free| View
+        W[write] -->|1. append| CL
+        W -->|2. ArcSwap::load| View
         View -->|put to single shard| Active
     end
 
@@ -42,31 +52,60 @@ graph TB
     subgraph "Flush Path"
         F[flush] -->|Mutex serializes| FlushGuard
         FlushGuard -->|1. atomic swap| View
-        FlushGuard -->|2. parallel snapshot| Flushing
-        FlushGuard -->|3. SSTableWriter| FT[FlushTarget]
+        FlushGuard -->|2. snapshot| Flushing
+        FlushGuard -->|3. SSTableWriter| FT[FileFlushTarget]
         FT --> NewSST[New SSTableReader]
         FlushGuard -->|4. atomic swap| SSTables
+        FlushGuard -->|5. maybe_compact| Compact
+        FlushGuard -.->|6. submit upload| Upload
     end
+
+    Upload -.->|update| Manifest
+    Cache -->|track files| SSTables
 ```
 
 ## Crate Structure
 
 ```
 ferrosa-common/src/
-  schema.rs               # TableSchema, ColumnDefinition (new)
+  schema.rs               # TableSchema, ColumnDefinition
 
 ferrosa-storage/
   Cargo.toml
   src/
     lib.rs                # Public API re-exports
+    engine.rs             # StorageEngine + StorageEngineConfig (Part C)
     memtable/
       mod.rs              # Memtable trait
       sharded.rs          # ShardedBTreeMemtable (64 shards)
-    flush.rs              # FlushTarget trait + InMemory/File impls + build_serialization_header()
+    flush.rs              # FlushTarget trait + InMemory/File impls
     store.rs              # TableStore — lock-free ArcSwap composition
-    merge.rs              # Read-path merge (cell-level LWW, deletion suppression)
+    merge.rs              # Read-path merge (cell-level LWW)
+    commitlog/
+      mod.rs              # CommitLog — compose segments + sync
+      config.rs           # CommitLogConfig, TableId, CommitLogPosition
+      segment.rs          # Segment — mmap buffer + CAS allocation
+      mutation.rs         # Mutation — self-describing binary format
+      sync.rs             # SyncStrategy trait + Batch/Periodic/Group
+      reader.rs           # SegmentReader — sync marker chain replay
+      checkpoint.rs       # CommitLogCheckpoint — per-table flush tracking
+      descriptor.rs       # SegmentDescriptor — segment file metadata
+    compaction/
+      mod.rs              # Module re-exports
+      metadata.rs         # SSTableMetadata, CompactionTask
+      strategy.rs         # CompactionStrategy trait + SizeTieredStrategy
+      executor.rs         # CompactionExecutor — background thread
+    upload/
+      mod.rs              # Module re-exports
+      config.rs           # ObjectStoreConfig — 12-factor env config
+      manager.rs          # UploadManager — tokio task + retry
+    manifest.rs           # Manifest — JSON + etag-based CAS
+    cache.rs              # LocalCache — LRU eviction with pinning
   tests/
-    integration.rs        # Module integration tests
+    integration.rs        # Part A module integration tests
+    engine_integration.rs # Part C end-to-end tests
+    engine_property.rs    # Part C property tests (proptest)
+    compaction_property.rs # STCS strategy property tests
 ```
 
 ## Dependencies
@@ -74,22 +113,26 @@ ferrosa-storage/
 | Crate | Version | Purpose | Justification |
 |-------|---------|---------|---------------|
 | `ferrosa-common` | workspace | Token, DecoratedKey, CellValue, TableSchema | Shared types |
-| `ferrosa-sstable` | workspace | SSTableReader, SSTableWriter, ReadAt, WriteAt | SSTable I/O |
-| `arc_swap` | 1.7 | Lock-free atomic `Arc` swaps for StoreView | Reads are wait-free; `load()` never contends with other readers. Uses debt-slot mechanism internally — each thread has pre-allocated slots, avoiding `Arc` refcount contention. `store()` is lock-free (not wait-free). Used by tokio, hyper in production. |
-| `parking_lot` | 0.12 | Fast RwLock for memtable shards | 1-word size (vs multi-word std), adaptive spinning for short critical sections, up to 50x faster under read-heavy contention. Hardware lock elision (HLE) available on x86. No poisoning. |
-| `rayon` | 1.x | Work-stealing thread pool for parallel shard drain | Better than `std::thread::scope` for 64 shards — avoids spawning 64 OS threads on 8-32 core machines. Handles unequal shard sizes via work stealing. |
-| `proptest` (dev) | 1.x | Property-based testing | |
-| `tempfile` (dev) | 3.x | Temporary directories for file-backed flush tests | |
+| `ferrosa-sstable` | workspace | SSTableReader, SSTableWriter, ReadAt | SSTable I/O |
+| `arc-swap` | 1.7 | Lock-free atomic `Arc` swaps for StoreView | Reads are wait-free; `load()` never contends with other readers. Uses debt-slot mechanism internally — each thread has pre-allocated slots, avoiding `Arc` refcount contention. `store()` is lock-free (not wait-free). |
+| `parking_lot` | 0.12 | Fast Mutex/RwLock for shards, flush guards, engine internals | 1-word size (vs multi-word std), adaptive spinning, no poisoning. |
+| `crc32fast` | 1 | Checksum for commit log entries | Hardware-accelerated CRC32C on supported CPUs. |
+| `object_store` | 0.11 (aws) | S3-compatible object storage via `AmazonS3Builder` | Works with AWS S3, MinIO, R2, Ceph. No `aws-sdk-s3` dependency. Provides `PutMode::Update` for etag-based CAS. |
+| `tokio` | 1 (rt, sync, time, macros) | Async runtime for upload manager | Upload manager runs as a spawned tokio task. Caller provides runtime handle. |
+| `serde` + `serde_json` | 1 | Manifest and config serialization | JSON for manifest.json, checkpoint.json. |
+| `bytes` | 1 | Zero-copy byte buffers for upload payloads | Used by `object_store` and upload manager. |
+| `proptest` (dev) | 1 | Property-based testing | |
+| `tempfile` (dev) | 3 | Temporary directories for file-backed tests | |
 
 ## Versioned Protocols
 
 No versioned protocols between in-process modules — they share Rust types directly. Versioned format headers are required for **persisted artifacts** that must survive rolling upgrades:
 
-| Artifact | Part | Versioning Strategy |
-|----------|------|---------------------|
-| Commit log segments | B | Version byte in segment header |
-| `manifest.json` (S3) | C | `"format_version"` field in JSON |
-| `checkpoint.json` (S3) | C | `"format_version"` field in JSON |
+| Artifact | Part | Versioning Strategy | Status |
+|----------|------|---------------------|--------|
+| Commit log segments | B | Segment header with descriptor (version, id, compression) | Implemented |
+| `manifest.json` (S3) | C | `"format_version": 1` field in JSON | Implemented |
+| `checkpoint.json` | B | `"format_version"` field in JSON | Implemented |
 
 ## Components
 
@@ -146,7 +189,7 @@ pub struct ShardedBTreeMemtable {
 - **Shard selection**: `key.token.0 as u64 % num_shards`
 - **`put()`**: Write-lock one shard. Merge cells by `(column_index)`, newer timestamp wins. Merge row/partition deletions (newer wins). Update `AtomicUsize` counters.
 - **`get()`**: Read-lock one shard, `Arc::clone()` (pointer bump), release. Nanosecond critical section.
-- **`snapshot()`**: Parallel drain via `rayon` — distribute 64 shards across thread pool, each read-locks and collects, then k-way merge into token order. No write contention (memtable already swapped out).
+- **`snapshot()`**: Sequential drain of all shards, collect into token-sorted order. No write contention (memtable already swapped out).
 - **`size_bytes()` / `partition_count()`**: `AtomicUsize::load(Relaxed)`. Wait-free.
 
 ### FlushTarget Trait
@@ -160,8 +203,8 @@ pub trait FlushTarget: Send + Sync {
 
 Two implementations:
 
-- **`InMemoryFlushTarget`**: Wraps `SSTableOutput` as `SSTableComponents<Vec<u8>>`. No filesystem. Used for tests and Part A.
-- **`FileFlushTarget`**: Writes component files to `{base_dir}/{generation}-{Component}.db`. Uses `rayon` to write up to 7 files in parallel (`CompressionInfo.db` omitted when compression is disabled). Opens `SSTableReader<FileReadAt>`.
+- **`InMemoryFlushTarget`**: Wraps `SSTableOutput` as `SSTableComponents<Vec<u8>>`. No filesystem. Used for tests.
+- **`FileFlushTarget`**: Writes component files to `{base_dir}/{generation}-{Component}.db`. Monotonically incrementing generation counter (`AtomicU64`). Opens `SSTableReader<FileReadAt>`.
 
 ### TableStore
 
@@ -185,7 +228,7 @@ struct StoreView<R: ReadAt + Send + Sync + 'static> {
 
 ```rust
 impl<F: FlushTarget> TableStore<F> {
-    pub fn new(schema: TableSchema, flush_target: F, options: ferrosa_sstable::WriteOptions) -> Self;
+    pub fn new(schema: TableSchema, flush_target: F, options: WriteOptions) -> Self;
     pub fn write(&self, key: &DecoratedKey, row: Row) -> Result<()>;
     pub fn read(&self, key: &DecoratedKey) -> Result<Option<Partition>>;
     pub fn flush(&self) -> Result<()>;
@@ -209,41 +252,224 @@ pub fn merge_partitions(sources: Vec<Partition>) -> Partition;
 - Static row: cell-level LWW. When one source has a static row and another does not, the one that has it is used.
 - Rows from multiple sources merged by clustering key (byte-ordered).
 
+### CommitLog (Part B)
+
+```rust
+pub struct CommitLog {
+    config: CommitLogConfig,
+    active: Arc<ArcSwap<Segment>>,
+    closed_segments: Mutex<Vec<Arc<Segment>>>,
+    segment_tracker: Mutex<HashMap<u64, HashMap<TableId, CommitLogPosition>>>,
+    sync_strategy: Box<dyn SyncStrategy>,
+    next_segment_id: AtomicU64,
+}
+```
+
+**Public API:**
+
+```rust
+impl CommitLog {
+    pub fn new(config: CommitLogConfig) -> Result<Self>;
+    pub fn append(&self, mutation: &Mutation) -> Result<CommitLogPosition>;
+    pub fn open_and_replay(config: CommitLogConfig) -> Result<(Self, Vec<Mutation>)>;
+    pub fn discard_completed(&self, table_id: &TableId, position: CommitLogPosition);
+    pub fn shutdown(&self) -> Result<()>;
+}
+```
+
+**Segment architecture:**
+
+- Fixed-size byte buffer (default 32 MB) with **CAS-based lock-free allocation** (`AtomicU64` position)
+- `allocate_and_begin_write()` increments an **in-flight writer counter** before CAS, undoes on failure
+- `flush_to_disk()` snapshots position, waits for in-flight writers to complete, then incrementally appends new bytes under a mutex
+- Forward-linked sync markers: `last_sync_marker_offset` tracks the chain for crash recovery replay
+
+**Sync strategies** (3 implementations of `SyncStrategy` trait):
+
+| Strategy | Throughput | Latency | Durability Window |
+|----------|-----------|---------|-------------------|
+| `BatchSync` | Lowest | Highest | Zero — fsync per write, no sync markers |
+| `PeriodicSync` | Highest | Lowest | Up to `sync_interval` (default 10ms) |
+| `GroupSync` | Good | Bounded | Up to `max_wait` (default 1ms) |
+
+**Mutation binary format** (self-describing, big-endian):
+
+```text
+keyspace_len:u16 | keyspace | table_len:u16 | table
+| key_len:u16 | key_bytes | token:i64 | timestamp:i64
+| row_count:u16 | rows...
+
+Row: clustering_len:u16 | clustering
+   | deletion_marked_for_delete_at:i64 | deletion_local_deletion_time:u32
+   | liveness_timestamp:i64 | liveness_ttl:i32 | liveness_local_deletion_time:i32
+   | cell_count:u16 | cells...
+
+Cell: column_index:u16 | timestamp:i64 | ttl:i32 | local_deletion_time:i32
+    | value_len:i32 (-1=tombstone) | value
+```
+
+### Compaction (Part C)
+
+**Strategy trait:**
+
+```rust
+pub trait CompactionStrategy: Send + Sync {
+    fn select(&self, sstables: &[SSTableMetadata]) -> Vec<CompactionTask>;
+}
+```
+
+**Size-Tiered Compaction Strategy (STCS)** — the only strategy currently implemented:
+
+- Groups SSTables into buckets by similar size (within `[bucket_low, bucket_high]` ratio of bucket median)
+- Triggers compaction when a bucket reaches `min_threshold` SSTables
+- Configuration from `FERROSA_COMPACTION_*` environment variables:
+  - `min_threshold` (default 4), `max_threshold` (default 32)
+  - `bucket_low` (default 0.5), `bucket_high` (default 1.5)
+
+**CompactionExecutor:**
+
+```rust
+pub struct CompactionExecutor {
+    task_tx: std::sync::mpsc::Sender<CompactionTask>,
+    result_rx: Mutex<std::sync::mpsc::Receiver<CompactionResult>>,
+    handle: Mutex<Option<thread::JoinHandle<()>>>,
+    stop_flag: Arc<AtomicBool>,
+}
+```
+
+Runs on a dedicated `std::thread` (not async — compaction is CPU+IO bound). Submit tasks via channel, poll results non-blocking.
+
+### S3 Upload Manager (Part C)
+
+**ObjectStoreConfig** — 12-factor configuration from `FERROSA_S3_*` environment variables:
+
+| Env Var | Required | Default | Purpose |
+|---------|----------|---------|---------|
+| `FERROSA_S3_ENDPOINT` | Yes | — | S3-compatible endpoint URL |
+| `FERROSA_S3_BUCKET` | Yes | — | Bucket name |
+| `FERROSA_S3_REGION` | No | `us-east-1` | AWS region |
+| `FERROSA_S3_ACCESS_KEY_ID` | No | Instance profile | Access key |
+| `FERROSA_S3_SECRET_ACCESS_KEY` | No | Instance profile | Secret key |
+| `FERROSA_S3_ALLOW_HTTP` | No | `false` | Allow non-TLS (for MinIO) |
+| `FERROSA_S3_PREFIX` | No | `` | Key prefix for multi-tenant separation |
+| `FERROSA_S3_UPLOAD_QUEUE_DEPTH` | No | `16` | Bounded upload queue depth |
+
+**UploadManager:**
+
+```rust
+pub struct UploadManager {
+    task_tx: mpsc::Sender<UploadTask>,
+    handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+```
+
+- Runs as a spawned tokio task on the caller-provided runtime handle
+- Bounded `tokio::sync::mpsc` channel provides backpressure
+- Exponential backoff retry on transient errors (5 retries, starting at 100ms)
+- Uploads SSTable component files to `{prefix}/sstables/{table_id}/{sstable_id}/{component}`
+
+### Manifest (Part C)
+
+```rust
+pub struct Manifest {
+    pub format_version: u32,
+    pub sstables: HashMap<String, Vec<ManifestEntry>>,
+    pub last_compacted_at: Option<String>,
+}
+```
+
+- JSON document in S3 listing all live SSTables per table
+- **Etag-based CAS**: loaded with `ObjectStore::get()` (captures etag), saved with `PutMode::Update(version)` for conditional put. On conflict, caller re-reads and retries.
+- `ManifestEntry` tracks: id, size, min/max token, min/max timestamp
+
+### LocalCache (Part C)
+
+```rust
+pub struct LocalCache {
+    base_dir: PathBuf,
+    max_bytes: u64,
+    entries: Mutex<HashMap<String, CacheEntry>>,
+}
+```
+
+- LRU eviction: when total size exceeds `max_bytes`, evicts least-recently-used entries
+- **Pinned entries** (referenced by current manifest) are never evicted
+- `register()` on download, `touch()` on read hit, `evict_if_needed()` after registration
+
+### StorageEngine (Part C)
+
+```rust
+pub struct StorageEngine {
+    config: StorageEngineConfig,
+    tables: RwLock<HashMap<TableId, TableState>>,
+    commit_log: CommitLog,
+    compaction_executor: CompactionExecutor,
+    upload_manager: Option<UploadManager>,
+    local_cache: LocalCache,
+}
+```
+
+**Public API:**
+
+```rust
+impl StorageEngine {
+    pub fn new(config: StorageEngineConfig, runtime: Option<&Handle>) -> Result<Self>;
+    pub fn register_table(&self, schema: TableSchema) -> Result<()>;
+    pub fn write(&self, table_id: &TableId, key: &DecoratedKey, row: Row, timestamp: i64) -> Result<()>;
+    pub fn read(&self, table_id: &TableId, key: &DecoratedKey) -> Result<Option<Partition>>;
+    pub fn flush(&self, table_id: &TableId) -> Result<()>;
+    pub fn flush_if_needed(&self) -> Result<()>;  // threshold-based auto-flush
+    pub fn poll_compactions(&self);
+    pub fn shutdown(&self) -> Result<()>;
+}
+```
+
+- `write()`: append to commit log, then write to table's memtable (both lock-free)
+- `flush()`: flush memtable to SSTable, then check if STCS compaction is needed
+- `flush_if_needed()`: flush any table whose memtable exceeds `flush_threshold_bytes`
+- `shutdown()`: flush all tables, stop compaction executor, stop commit log
+- `upload_manager` is `Option` — tests run without S3
+
 ## Data Flow
 
-### Write Path
+### Write Path (StorageEngine)
 
-1. `ArcSwap::load()` — wait-free, get current view
+1. Build `Mutation` from key + row + table metadata
+1. `commit_log.append(&mutation)` — CAS allocation in active segment, lock-free
+1. `ArcSwap::load()` on TableStore — wait-free, get current view
 1. `view.active.put(key, row)` — write-lock one shard out of 64
 
-### Read Path
+### Read Path (StorageEngine)
 
+1. `tables.read()` — get table's `TableStore`
 1. `ArcSwap::load()` — wait-free, get immutable snapshot
 1. Check active memtable → `Option<Arc<Partition>>`
 1. Check flushing memtable (if mid-flush) → `Option<Arc<Partition>>`
 1. Check flushed SSTables newest-first — `SSTableReader::get_partition()` handles bloom filter internally
 1. `merge_partitions()` — cell-level LWW across all sources
 
-### Flush Path
+### Flush Path (StorageEngine)
 
 1. Acquire `flush_guard` Mutex (serializes flushes; reads/writes unaffected)
 1. Atomic swap: install fresh memtable, move old to `flushing` — writes resume immediately
-1. Parallel snapshot via rayon: drain 64 shards, k-way merge into token order
+1. Snapshot flushing memtable, sort by key
 1. `build_serialization_header()` — scan partitions for min_timestamp etc.
 1. `SSTableWriter::new().add_partition()...finish()` — produce `SSTableOutput`
-1. `flush_target.flush(output)` — persist and open reader
+1. `flush_target.flush(output)` — write files, open reader
 1. Atomic swap: prepend new `SSTableReader`, clear `flushing`
+1. `maybe_compact()` — evaluate STCS, submit compaction tasks if buckets are full
 
 ## Concurrency Model
 
 | Operation | Mechanism | Contention |
 |-----------|-----------|------------|
 | `read()` | `ArcSwap::load()` (wait-free) + `get()` (read-lock one shard) | Near-zero |
-| `write()` | `ArcSwap::load()` (wait-free) + `put()` (write-lock one shard) | 1 of 64 shards |
-| `flush()` | `Mutex` serializes flushes; `ArcSwap::store()` for view transitions | Flushes only; reads/writes unaffected |
+| `write()` | Commit log CAS + `ArcSwap::load()` + `put()` (write-lock one shard) | 1 of 64 shards + segment CAS |
+| `flush()` | Per-table `Mutex`; `ArcSwap::store()` for view transitions | Flushes only; reads/writes unaffected |
 | `size_bytes()` | `AtomicUsize::load(Relaxed)` | Zero (wait-free) |
-| `snapshot()` | rayon parallel drain, read-locks on retired memtable | None (no writers) |
-| File writes | rayon parallel write of independent components | None |
+| Commit log alloc | `AtomicU64` CAS + in-flight writer counter | CAS contention under heavy write load |
+| Compaction | Background `std::thread`, channel-based submit/poll | None (isolated thread) |
+| Upload | tokio task, bounded `mpsc` channel | Backpressure when queue full |
 
 ### Concurrency Primitive Selection
 
@@ -251,7 +477,10 @@ pub fn merge_partitions(sources: Vec<Partition>) -> Partition;
 |-----------|--------|---------------------|
 | View swaps | `arc_swap::ArcSwap` | `RwLock<Arc<>>` would contend under concurrent reads. ArcSwap load is wait-free with zero reader-reader contention via debt-slot mechanism. |
 | Shard locks | `parking_lot::RwLock` | `std::sync::RwLock` is multi-word, no adaptive spinning, no HLE, poisoning overhead. `DashMap` lacks ordered iteration. |
-| Parallel work | `rayon` | `std::thread::scope` spawns 64 OS threads for 64 shards — oversubscription on 8-32 core machines. Rayon maps to CPU cores via work stealing. |
+| Commit log allocation | `AtomicU64` CAS loop | Lock-based allocation would serialize all writers. CAS allows truly concurrent appends to the same segment. |
+| In-flight tracking | `AtomicU64` counter | Ensures `flush_to_disk()` waits for all writers to finish writing their allocated bytes before reading the buffer. |
+| Compaction thread | `std::thread` + `std::sync::mpsc` | CPU+IO bound work. Async would waste a tokio runtime thread on blocking I/O. |
+| Upload task | `tokio::spawn` + `tokio::sync::mpsc` | Network I/O is async-native. Caller provides runtime handle. |
 | Stats counters | `AtomicUsize` | Any lock would add contention to every `put()` call for a stat update. |
 | Flush serialization | `Mutex<()>` | CAS loop on ArcSwap would be complex and fragile. Single flush at a time is correct — Cassandra also serializes flushes per table. |
 
@@ -267,66 +496,58 @@ The `Memtable` trait enables swapping `ShardedBTreeMemtable` for a lock-free imp
 
 ## Test Strategy
 
-### Unit Tests
+### Unit Tests (per module)
 
 | Module | Tests |
 |--------|-------|
 | `memtable/sharded.rs` | Put/get single row; merge-on-write (newer timestamp wins); multi-shard distribution; snapshot returns token-sorted; concurrent puts from N threads; size_bytes/partition_count accuracy |
 | `flush.rs` | InMemoryFlushTarget round-trip; FileFlushTarget writes correct files; build_serialization_header computes correct min values |
 | `merge.rs` | Two partitions merge by timestamp; row deletion suppresses older cells; partition deletion suppresses all rows; disjoint partitions concatenate; static row merge (one-sided and two-sided); commutative: merge(a,b) == merge(b,a) |
-| `store.rs` | Write + read (memtable only); flush + read (SSTable only); write + flush + write + read (merge across sources) |
+| `store.rs` | Write + read (memtable only); flush + read (SSTable only); write + flush + write + read (merge across sources); multiple flushes; empty flush is no-op |
+| `commitlog/segment.rs` | Allocate and write; in-flight writer counter; incremental flush; concurrent appends no data loss |
+| `commitlog/mod.rs` | Append and position; segment rotation; shutdown |
+| `commitlog/mutation.rs` | Serialize/deserialize round-trip |
+| `commitlog/sync.rs` | BatchSync flushes immediately; PeriodicSync flushes on timer |
+| `commitlog/reader.rs` | Read single entry; read multiple entries; sync marker chain traversal |
+| `compaction/strategy.rs` | Bucket selection by size; min_threshold gating; config from_env defaults |
+| `compaction/executor.rs` | Submit and poll; shutdown |
+| `upload/config.rs` | Test config defaults |
+| `upload/manager.rs` | Upload round-trip; multiple components uploaded |
+| `manifest.rs` | Load/save round-trip; add/remove sstables; empty prefix |
+| `cache.rs` | Register and total_size; get_path; eviction removes oldest; touch prevents eviction; pinned entries never evicted; no eviction when under limit |
+| `engine.rs` | Write then read; read unregistered table; write to unregistered table; write/flush/read; merge after flush; multiple tables; shutdown flushes all; flush_if_needed threshold |
 
-### Integration Tests (`tests/integration.rs`)
+### Integration Tests
 
-| Test | What It Proves |
-|------|----------------|
-| `write_flush_read_round_trip` | Write N partitions, flush, read each back |
-| `multiple_flushes_merge` | Write, flush, overwrite with newer timestamps, flush again, read merges 2 SSTables + memtable |
-| `flush_does_not_block_reads` | Reader thread + concurrent flush = consistent data always |
-| `deletion_suppresses_across_sources` | Tombstone in memtable suppresses flushed data |
-| `snapshot_produces_token_order` | Random keys, snapshot returns token-sorted |
-| `file_flush_target_creates_readable_sstables` | FileFlushTarget → tempdir → SSTableReader reads back |
-| `concurrent_writes_no_data_loss` | N threads write concurrently, all readable after flush |
-| `merge_is_commutative` | Different flush orders produce identical read results |
+| File | Tests |
+|------|-------|
+| `tests/integration.rs` | Part A: write/flush/read round-trip, multiple flushes, concurrent writes, deletion suppression, merge commutativity |
+| `tests/engine_integration.rs` | Part C: write/read round-trip, write/flush/read, memtable+SSTable merge, multiple flushes, multi-table isolation, concurrent writers (4 threads × 25 keys) |
 
 ### Property Tests (proptest)
 
-| Property | Invariant |
-|----------|-----------|
-| Memtable round-trip | `get(put(key, row))` contains all cells from row |
-| Merge commutativity | `merge([a, b]) == merge([b, a])` |
-| Merge associativity | `merge([merge([a, b]), c]) == merge([a, merge([b, c])])` |
-| Flush preserves data | Write N partitions → flush → read all N back |
-| Timestamp ordering | Higher timestamp cell survives merge at same column |
+| File | Properties |
+|------|-----------|
+| `tests/engine_property.rs` | All writes readable; writes survive flush; last-write-wins across flush boundaries |
+| `tests/compaction_property.rs` | STCS bucket selection is deterministic; tasks are subset of input; each task meets min_threshold; similar sizes grouped; different sizes separated |
+| Part A inline | Memtable round-trip; merge commutativity/associativity; flush preserves data; timestamp ordering |
 
-## Build Order (Part A)
+## Follow-on Work
 
-| Order | Module | Purpose |
-|-------|--------|---------|
-| 1 | `ferrosa-common/schema.rs` | `TableSchema`, `ColumnDefinition` |
-| 2 | `memtable/mod.rs` + `sharded.rs` | `Memtable` trait + `ShardedBTreeMemtable` |
-| 3 | `merge.rs` | `merge_partitions` |
-| 4 | `flush.rs` | `FlushTarget` + impls + `build_serialization_header()` |
-| 5 | `store.rs` | `TableStore` (composes all) |
-| 6 | `tests/integration.rs` | Cross-module integration tests |
+### Not Yet Implemented
 
-## Parts B and C (Future)
-
-### Part B: Commit Log
-
-- Segment-based WAL with versioned header (version byte)
-- Append-only writes with CRC32 checksums
-- Segment lifecycle: active → closed → shipped
-- Replay protocol on startup
-- Integration with `TableStore` flush tracking
-
-### Part C: Compaction + S3 + Composition
-
-- Compaction strategies: Size-Tiered, Leveled, Time-Window
-- SSTable lifecycle with `Arc`-based reference counting
-- S3 upload manager with async upload, backpressure, manifest
-- `manifest.json` and `checkpoint.json` with format versioning
-- Full `StorageEngine` composing TableStore + CommitLog + Compaction + S3
+| Area | Description | Depends On |
+|------|-------------|------------|
+| **Compaction execution** | `CompactionExecutor` has a placeholder `execute_task()` — needs to read input SSTables, merge, write output SSTable | SSTableReader merge iterator |
+| **SSTable metadata collection** | `collect_sstable_metadata()` returns empty — needs to iterate SSTableReader list and extract stats for STCS evaluation | SSTableReader stats API |
+| **S3 upload wiring** | `StorageEngine.flush()` doesn't yet submit uploaded files to `UploadManager` — the upload path is built but not wired into flush | Compaction execution |
+| **Manifest CAS loop** | Manifest load/save is implemented, but the retry loop on conflict isn't wired into the flush/upload pipeline | S3 upload wiring |
+| **Recovery (`open()`)** | Load manifest from S3, ensure local cache has SSTables, replay commit log into memtables | Manifest, upload wiring |
+| **Commit log S3 shipping** | Segments are flushed to local disk but not yet uploaded to S3 | UploadManager integration |
+| **LCS / TWCS** | Only STCS is implemented. Leveled and Time-Window strategies are future | CompactionStrategy trait is ready |
+| **Disk backpressure** | `flush_if_needed()` uses memtable size threshold but doesn't monitor local disk usage | Monitoring infrastructure |
+| **Grace period GC** | Safe deletion protocol for superseded SSTables (1-hour grace period) | Manifest, S3 integration |
+| **Orphan cleanup** | Periodic sweep of S3 objects not referenced by any manifest | Manifest |
 
 ## Related Specs
 

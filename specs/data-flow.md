@@ -1,6 +1,6 @@
 # Data Flow
 
-> Last updated: 2026-03-11
+> Last updated: 2026-03-12
 > Status: Approved
 
 ## Overview
@@ -95,17 +95,25 @@ stateDiagram-v2
 
 ### Manifest
 
-Each table has a `manifest.json` in S3 that lists the current set of active SSTable generations. The manifest is the source of truth for what SSTables are live. It is a complete document (not a diff) — each update writes a new version. Since S3 PUT is atomic for a single object, the manifest transitions atomically from one consistent state to another. A generation counter detects stale writes.
+Each table has a `manifest.json` in S3 that lists the current set of active SSTable entries per table. The manifest is the source of truth for what SSTables are live. It is a complete document (not a diff) — each update writes a new version.
 
-### Safe Deletion Protocol
+**Implementation status**: The `Manifest` struct (`ferrosa-storage/src/manifest.rs`) uses **etag-based CAS** (conditional put) via `object_store`'s `PutMode::Update(UpdateVersion { e_tag, version })` to detect stale writes. On `load()`, the current etag is captured; on `save()`, the etag is passed to the conditional put. If another node updated the manifest in the meantime, the put fails and the caller must reload and retry. The CAS retry loop is follow-on work — currently `save()` returns an error on conflict.
+
+The manifest contains a `format_version`, a map of table name to `Vec<ManifestEntry>` (SSTable ID, path, size, token range, timestamp range, partition count), and a `last_compacted_at` timestamp.
+
+### Safe Deletion Protocol (Follow-on)
+
+Not yet implemented. The design:
 
 1. Compaction completes: new SSTables uploaded, confirmed durable in S3
-1. Updated `manifest.json` written (atomic S3 PUT — new generations in, old out)
+1. Updated `manifest.json` written (etag-based CAS — new entries in, old out)
 1. Old SSTables marked for deletion with grace period (default 1 hour)
 1. Background GC deletes S3 objects whose grace period has expired
 1. Grace period ensures nodes reading old SSTables from S3 (cache miss during transition) have time to complete
 
-### Orphan Cleanup
+### Orphan Cleanup (Follow-on)
+
+Not yet implemented. The design:
 
 A periodic sweep compares SSTable objects in S3 against all known manifests. Objects not referenced by any manifest and older than the grace period are deleted. This catches orphans from partial upload failures or interrupted compactions.
 
@@ -125,35 +133,58 @@ stateDiagram-v2
 
 ### Commit Log Entry Format
 
-Self-describing binary records:
+**Segment-level**: Each entry in a segment is framed as:
 
 | Field | Size | Description |
 |-------|------|-------------|
-| Length prefix | 4 bytes | Record length |
-| Logical timestamp | 8 bytes | Monotonic per node |
-| Mutation payload | Variable | Serialized CQL partition update |
-| Checksum | 4 bytes | CRC32 |
+| Length prefix | 4 bytes | Record length (big-endian u32) |
+| Mutation payload | Variable | Self-describing binary (see below) |
+| CRC32 checksum | 4 bytes | CRC32 of the mutation payload |
 
-Segments are fixed-size files (default 32MB). A segment is closed and a new one opened when it reaches capacity.
+**Mutation binary layout** (implemented in `ferrosa-storage/src/commitlog/mutation.rs`):
 
-### S3 Shipping
+```text
+Mutation: keyspace_len:u16 | keyspace | table_len:u16 | table
+        | key_len:u16 | key_bytes | token:i64 | timestamp:i64
+        | row_count:u16 | rows...
 
-Closed segments are uploaded to S3 immediately. The active (not yet full) segment is uploaded on a configurable timer (`commitlog_ship_interval`, default TBD — candidate values: 1-10 seconds, trading durability window for upload overhead) as a partial segment. The `checkpoint.json` per node tracks:
+Row: clustering_len:u16 | clustering
+   | deletion_marked_for_delete_at:i64 | deletion_local_deletion_time:u32
+   | liveness_timestamp:i64 | liveness_ttl:i32 | liveness_local_deletion_time:i32
+   | cell_count:u16 | cells...
+
+Cell: column_index:u16 | timestamp:i64 | ttl:i32 | local_deletion_time:i32
+    | value_len:i32 (-1=tombstone) | value
+```
+
+All multi-byte integers are big-endian. Each entry is fully self-describing — it carries keyspace, table, key, token, and complete row/cell data. This is unlike SSTable row format (which uses delta-encoding against a `SerializationHeader`).
+
+Segments are configurable-size files (default 32 MB, `DEFAULT_SEGMENT_SIZE`). A segment is closed and a new one opened when it reaches capacity or max age (default 5 minutes, `DEFAULT_MAX_SEGMENT_AGE`). Segment space is allocated via compare-and-swap (CAS) on an `AtomicUsize` offset, enabling concurrent appends without holding a lock during serialization.
+
+### S3 Shipping (Follow-on)
+
+Commit log S3 shipping is not yet implemented. The design:
+
+Closed segments are uploaded to S3 immediately. The active (not yet full) segment is uploaded on a configurable timer (`commitlog_ship_interval`, candidate values: 1-10 seconds, trading durability window for upload overhead) as a partial segment. The `checkpoint.json` per node tracks:
 
 - The latest segment ID and offset confirmed durable in S3
 - The latest SSTable generation confirmed durable in S3
 - A mapping of segment IDs to their S3 object keys
 
-### Replay Protocol
+**What is implemented**: The commit log checkpoint system (`ferrosa-storage/src/commitlog/checkpoint.rs`) tracks per-table flush positions as `CommitLogPosition { segment_id, offset }`. The checkpoint is serialized as JSON and persisted to local disk. S3 upload of segments and checkpoint is follow-on work.
 
-1. Read `checkpoint.json` from S3 to find the replay starting point
+### Replay Protocol (Follow-on)
+
+Commit log replay is not yet implemented. The design:
+
+1. Read `checkpoint.json` from S3 (or local disk) to find the replay starting point
 1. Determine which commit log segments contain data newer than the latest durable SSTable
 1. Download and replay those segments in order, applying mutations to the memtable
 1. Once replay is complete, the node is current and can begin serving
 
 ### Commit Log Cleanup
 
-Segments in S3 are deleted once the data they contain has been flushed to SSTables and those SSTables are confirmed durable in S3. The checkpoint tracks this boundary.
+Segments are deleted once the data they contain has been flushed to SSTables. The checkpoint tracks per-table flush boundaries. Currently, local segment cleanup is based on the checkpoint; S3 segment cleanup is follow-on work.
 
 ## S3 Upload Backpressure
 
@@ -172,10 +203,12 @@ flowchart TD
 
 ### Backpressure Details
 
-1. **Queue depth monitoring**: Track pending uploads by count and total bytes.
-1. **Priority shedding**: Drop compaction output uploads first — they can be re-compacted. Freshly-flushed SSTables always get priority.
-1. **Disk space threshold**: When local ephemeral disk usage exceeds a configurable threshold (default 80%), begin rejecting writes with backpressure (return `WriteTimeout` to clients). This prevents the node from filling its ephemeral storage.
-1. **S3 outage behavior**: Writes continue locally as long as disk space permits. Uploads queue and retry with exponential backoff. When S3 returns, the queue drains in priority order.
+**Implementation status**: The `UploadManager` (`ferrosa-storage/src/upload/manager.rs`) uses a bounded `tokio::sync::mpsc` channel for backpressure — when the channel is full, senders block. Exponential backoff retry on upload failure is implemented. Priority shedding and disk space threshold monitoring are follow-on work.
+
+1. **Queue depth monitoring**: Track pending uploads by count and total bytes. *(follow-on)*
+1. **Priority shedding**: Drop compaction output uploads first — they can be re-compacted. Freshly-flushed SSTables always get priority. *(follow-on)*
+1. **Disk space threshold**: When local ephemeral disk usage exceeds a configurable threshold (default 80%), begin rejecting writes with backpressure (return `WriteTimeout` to clients). *(follow-on)*
+1. **S3 outage behavior**: Writes continue locally as long as disk space permits. Uploads queue and retry with exponential backoff. When S3 returns, the queue drains in priority order. *(backoff retry implemented; priority drain follow-on)*
 
 ## Node Recovery
 
@@ -208,7 +241,9 @@ sequenceDiagram
 | 4. Replica coordination | Track S3 upload confirmation per replica | Multi-node failure before any upload |
 | 5. Increased quorum (optional) | CL=ALL or higher RF | Catastrophic multi-node failure |
 
-## S3 Object Layout
+## S3 Object Layout (Design Target)
+
+The intended S3 layout once upload wiring is complete:
 
 ```
 s3://ferrosa-data/{cluster_id}/
@@ -222,6 +257,8 @@ s3://ferrosa-data/{cluster_id}/
     schema.json
     topology.json
 ```
+
+**Implementation status**: The `ObjectStoreConfig` (`ferrosa-storage/src/upload/config.rs`) configures the S3 bucket, region, endpoint, and prefix via `FERROSA_S3_*` environment variables. The `UploadManager` can upload files to S3 via the `object_store` crate. The actual path structure and wiring from flush/compaction to upload is follow-on work.
 
 ## S3 Object Metadata (per SSTable component)
 
