@@ -189,7 +189,7 @@ graph TB
 | T15 | In-process AuthContext forgery | Accepted (Rust module boundary). |
 | T17 | Internode eavesdropping | Planned (TLS). |
 | T18 | Malicious Raft proposal | Mitigated by auth-gated API. |
-| T20 | S3 SSTable tampering | Partial (etag CAS). Future: checksum verification on read. |
+| T20 | S3 SSTable tampering | Mitigated: SHA-256 checksum on upload, verify on read. Etag CAS for manifest. |
 | T22 | S3 bucket deletion | Document ops procedure: versioning + MFA delete on bucket. |
 | T24 | Local disk co-tenant / shared volumes | Mitigated: startup encryption check + deployment docs. |
 | T27 | Weakened hash cost | Accepted (requires host access). |
@@ -226,7 +226,7 @@ graph TB
 | Secrets manager concrete providers (AWS SM, Vault, file) | T21 | Medium |
 | S3 bucket policy validation at startup | T22, T28 | Small |
 | Manifest CAS retry loop | T23 | Small (designed, needs wiring) |
-| SSTable read-time checksum verification | T20 | Medium |
+| SSTable SHA-256 checksum on upload + verify on read | T20 | Medium |
 | Envelope encryption for sensitive data | T19 | Large |
 
 ---
@@ -246,7 +246,7 @@ graph TB
 - [x] ~~Should `authenticate()` rate limiting live in the schema crate or the CQL protocol layer?~~ **Resolved**: Both. Per-username rate limiting with backoff in schema crate (`AuthRateLimiter`); per-IP rate limiting in CQL layer (future).
 - [x] ~~What is the audit log format and destination?~~ **Resolved**: Both. `LogAuditSink` (structured JSON via tracing) + `SystemTableAuditSink` (in-memory ring buffer queryable as `system_auth.audit_log`). S3 archival sink is follow-on.
 - [x] ~~Should we support client certificate authentication (mutual TLS)?~~ **Resolved**: Yes. `AuthMethod` enum: `Password`, `Certificate`, `CertificateAndPassword`. Production mode requires mutual TLS on both CQL and internode. Config designed in Chunk A, implemented in ferrosa-cql/ferrosa-net.
-- [ ] Do we need S3 object-level integrity verification (SHA-256 checksum on upload, verify on read) or is S3's built-in integrity sufficient?
+- [x] ~~Do we need S3 object-level integrity verification?~~ **Resolved**: Yes. SHA-256 checksum computed on upload, stored in S3 object metadata (`x-amz-meta-ferrosa-checksum`), verified on every read. Catches silent corruption, S3 bit-rot, and tampering (T20).
 - [x] ~~Should `FERROSA_S3_ALLOW_HTTP` be gated behind a `FERROSA_ENV=development` check?~~ **Resolved**: Yes. `FERROSA_MODE=production` rejects it at startup (ADR-010).
 - [x] ~~Should we force superuser password change at bootstrap?~~ **Resolved**: Yes. `FERROSA_SUPERUSER_PASSWORD` env var or `must_change_password` flag.
 - [x] ~~Should `salted_hash` be filtered from non-superuser queries?~~ **Resolved**: Yes. `query_roles()` returns `None` for non-superusers.

@@ -367,6 +367,7 @@ pub struct UploadManager {
 - Bounded `tokio::sync::mpsc` channel provides backpressure
 - Exponential backoff retry on transient errors (5 retries, starting at 100ms)
 - Uploads SSTable component files to `{prefix}/sstables/{table_id}/{sstable_id}/{component}`
+- **Integrity**: SHA-256 checksum computed during upload, stored as `x-amz-meta-ferrosa-checksum: sha256:{hex}`. On read, checksum is recomputed and verified against the stored value. Mismatch returns `IntegrityError` — the object is treated as corrupt and re-fetched from S3 (once). Persistent mismatch is fatal for that SSTable component.
 
 ### Manifest (Part C)
 
@@ -548,6 +549,7 @@ The `Memtable` trait enables swapping `ShardedBTreeMemtable` for a lock-free imp
 | **Disk backpressure** | `flush_if_needed()` uses memtable size threshold but doesn't monitor local disk usage | Monitoring infrastructure |
 | **Grace period GC** | Safe deletion protocol for superseded SSTables (1-hour grace period) | Manifest, S3 integration |
 | **Orphan cleanup** | Periodic sweep of S3 objects not referenced by any manifest | Manifest |
+| **S3 integrity verification** | SHA-256 checksum on upload stored in object metadata, verified on every read — designed, awaiting S3 upload wiring | S3 upload wiring |
 
 ## Related Specs
 
