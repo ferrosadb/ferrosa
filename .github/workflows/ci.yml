@@ -8,19 +8,91 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  check:
+  # ── Stage 1: Format + Lint (fast feedback) ──────────────────────────
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
       - run: cargo fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
-      - run: cargo doc --no-deps
+
+  # ── Stage 2: Tests + Coverage ───────────────────────────────────────
+  test:
+    name: Test + Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Run tests with coverage
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - name: Run tests with coverage (HTML report)
+        run: cargo llvm-cov --all-features --workspace --html --output-dir coverage-html
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage-html/
+          retention-days: 14
+      - name: Upload lcov data
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-info
+          path: lcov.info
+          retention-days: 14
+      - name: Coverage summary
+        run: cargo llvm-cov --all-features --workspace --summary-only
+      - name: Check coverage threshold (80% line)
+        run: |
+          COVERAGE=$(cargo llvm-cov --all-features --workspace --summary-only 2>&1 | grep 'TOTAL' | awk '{print $10}' | tr -d '%')
+          echo "Total line coverage: ${COVERAGE}%"
+          if [ -z "$COVERAGE" ]; then
+            echo "::warning::Could not parse coverage percentage — skipping gate"
+            exit 0
+          fi
+          THRESHOLD=80
+          if [ "$(echo "$COVERAGE < $THRESHOLD" | bc -l)" -eq 1 ]; then
+            echo "::error::Line coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
+            exit 1
+          fi
+          echo "Coverage ${COVERAGE}% meets threshold ${THRESHOLD}%"
+
+  # ── Stage 3: Documentation ─────────────────────────────────────────
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate docs
+        run: cargo doc --no-deps --workspace
         env:
           RUSTDOCFLAGS: "-D warnings"
+      - name: Upload docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdoc
+          path: target/doc/
+          retention-days: 14
