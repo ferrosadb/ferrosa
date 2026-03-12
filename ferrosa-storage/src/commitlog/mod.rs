@@ -162,23 +162,26 @@ impl CommitLog {
     pub fn append(&self, mutation: &Mutation) -> ferrosa_common::Result<CommitLogPosition> {
         let total_size = Segment::entry_total_size(mutation);
 
-        // Load active segment and try to allocate.
-        let segment = self.active.load();
-
-        let offset = match segment.allocate(total_size) {
-            Some(offset) => offset,
-            None => {
-                // Segment is full — rotate and retry.
-                self.force_rotate()?;
-                let new_segment = self.active.load();
-                new_segment
-                    .allocate(total_size)
-                    .expect("freshly rotated segment should have space")
+        // Load active segment and try to allocate. The segment reference MUST
+        // stay paired with the offset — writing to a different segment than
+        // the one where CAS succeeded would corrupt data.
+        let (segment, offset) = {
+            let seg = self.active.load_full();
+            match seg.allocate(total_size) {
+                Some(offset) => (seg, offset),
+                None => {
+                    // Segment is full — rotate (serialized) and retry.
+                    drop(seg);
+                    self.force_rotate()?;
+                    let new_seg = self.active.load_full();
+                    let offset = new_seg
+                        .allocate(total_size)
+                        .expect("freshly rotated segment should have space");
+                    (new_seg, offset)
+                }
             }
         };
 
-        // Reload in case rotation happened.
-        let segment = self.active.load();
         let position = segment.write_entry(offset, mutation);
 
         // Track dirty table in this segment.
@@ -269,6 +272,10 @@ impl CommitLog {
     ///
     /// Allocates a new segment, atomically swaps it in via `ArcSwap`, and moves
     /// the old segment to the `closed_segments` list.
+    ///
+    /// If multiple threads race here, each creates a segment — the extras are
+    /// empty but harmless. No data is lost because each writer holds its own
+    /// `Arc<Segment>` paired with its CAS-allocated offset (see `append()`).
     pub fn force_rotate(&self) -> ferrosa_common::Result<()> {
         let new_id = self.next_segment_id.fetch_add(1, Ordering::AcqRel);
         let new_segment = Arc::new(Segment::new(
