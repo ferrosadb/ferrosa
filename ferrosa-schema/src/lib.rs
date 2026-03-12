@@ -6,6 +6,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod convert;
 pub mod error;
 pub mod metadata;
 pub mod registry;
@@ -21,6 +22,7 @@ pub use auth::{
     AuthContext, AuthRateLimiter, GrantEntry, PasswordHasher, PasswordPolicy, Permission,
     RateLimitConfig, Resource, RoleMetadata, RoleUpdates,
 };
+pub use convert::cql_to_marshal_type;
 pub use error::{Result, SchemaError};
 pub use metadata::{
     CachingParams, ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata, KeyspaceMetadata,
