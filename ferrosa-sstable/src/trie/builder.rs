@@ -126,12 +126,36 @@ impl TrieBuilder {
         let payload_bytes = encode_payload(&node.payload);
         let pb = compute_pb(&node.payload);
 
-        let node_bytes = if node.children.is_empty() {
-            // PayloadOnly
+        // For leaf nodes (no children), the bytes don't depend on write_pos.
+        // For non-leaf nodes, we must first determine the final write position
+        // (after any page-alignment padding) before encoding child distances.
+
+        if node.children.is_empty() {
+            // PayloadOnly — bytes don't depend on position
             let mut buf = vec![(NodeType::PayloadOnly as u8) << 4 | pb];
             buf.extend_from_slice(&payload_bytes);
-            buf
-        } else if node.children.len() == 1 {
+
+            let page_offset = self.write_pos % PAGE_SIZE;
+            if page_offset + buf.len() > PAGE_SIZE {
+                let padding = PAGE_SIZE - page_offset;
+                self.output.extend(vec![0u8; padding]);
+                self.write_pos += padding;
+            }
+
+            let pos = self.write_pos as u64;
+            self.output.extend_from_slice(&buf);
+            self.write_pos += buf.len();
+            return Ok(pos);
+        }
+
+        // For single-child and multi-child nodes, estimate the node size first
+        // to determine whether page-alignment padding is needed, then encode
+        // with the actual final write position.
+        //
+        // We estimate size using the CURRENT write_pos. In rare cases where
+        // padding changes the node type (e.g., a larger distance requires a
+        // wider pointer), we do a second pass.
+        let estimated_bytes = if node.children.len() == 1 {
             let (child_trans, child_pos) = node.children[0];
             let distance = self.write_pos as u64 - child_pos;
             encode_single_node(child_trans, distance, pb, &payload_bytes)
@@ -139,10 +163,27 @@ impl TrieBuilder {
             encode_sparse_node(&node.children, self.write_pos as u64, pb, &payload_bytes)
         };
 
-        // Page alignment: check if node fits in current page
+        // Determine final write_pos after page alignment
         let page_offset = self.write_pos % PAGE_SIZE;
-        if page_offset + node_bytes.len() > PAGE_SIZE {
-            let padding = PAGE_SIZE - page_offset;
+        let final_write_pos = if page_offset + estimated_bytes.len() > PAGE_SIZE {
+            self.write_pos + (PAGE_SIZE - page_offset)
+        } else {
+            self.write_pos
+        };
+
+        // Re-encode with the final position (distances may be larger due to padding)
+        let node_bytes = if node.children.len() == 1 {
+            let (child_trans, child_pos) = node.children[0];
+            let distance = final_write_pos as u64 - child_pos;
+            encode_single_node(child_trans, distance, pb, &payload_bytes)
+        } else {
+            encode_sparse_node(&node.children, final_write_pos as u64, pb, &payload_bytes)
+        };
+
+        // Apply padding if node size changed (distance encoding may have grown)
+        let page_offset2 = self.write_pos % PAGE_SIZE;
+        if page_offset2 + node_bytes.len() > PAGE_SIZE {
+            let padding = PAGE_SIZE - page_offset2;
             self.output.extend(vec![0u8; padding]);
             self.write_pos += padding;
         }

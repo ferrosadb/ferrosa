@@ -1,6 +1,6 @@
 # Ferrosa Architecture Specs
 
-> Last updated: 2026-03-11
+> Last updated: 2026-03-12
 
 Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassandra with S3-backed storage.
 
@@ -12,6 +12,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [Components](components.md) | Crate architecture, dependency graph, responsibilities | Approved |
 | [Data Flow](data-flow.md) | Write path, read path, compaction, S3 lifecycle | Approved |
 | [SSTable](sstable.md) | BTI format, trie encoding, I/O traits, compression, public API | Approved |
+| [Storage](storage.md) | Storage engine: memtable, flush, merge, commit log, compaction, S3 upload, cache, engine composition | Approved |
 | [Testing](testing.md) | Test infrastructure, suites, performance regression detection | Approved |
 
 ## Architecture Decision Records
