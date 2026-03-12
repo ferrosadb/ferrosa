@@ -747,7 +747,8 @@ impl Schema {
     pub fn drop_table(&self, keyspace: &str, table: &str, auth: &AuthContext) -> Result<()>;
 
     // Role operations (auth-gated)
-    pub fn create_role(&self, role: RoleMetadata, auth: &AuthContext) -> Result<()>;
+    // password is accepted separately to avoid embedding plaintext in RoleMetadata
+    pub fn create_role(&self, role: RoleMetadata, password: Option<&str>, auth: &AuthContext) -> Result<()>;
     pub fn alter_role(&self, name: &str, updates: RoleUpdates, auth: &AuthContext) -> Result<()>;
     pub fn drop_role(&self, name: &str, auth: &AuthContext) -> Result<()>;
 
