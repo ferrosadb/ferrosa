@@ -14,11 +14,11 @@ use uuid::Uuid;
 use crate::audit::event::{AuditEvent, AuditEventKind};
 use crate::audit::AuditSink;
 use crate::auth::password::{PasswordHasher, PasswordPolicy};
-use crate::auth::permission::GrantEntry;
+use crate::auth::permission::{GrantEntry, Permission, Resource};
 use crate::auth::rate_limit::{AuthRateLimiter, RateLimitConfig};
 use crate::auth::role::{AuthContext, RoleMetadata};
 use crate::error::SchemaError;
-use crate::metadata::keyspace::KeyspaceMetadata;
+use crate::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
 use crate::metadata::table::TableMetadata;
 use crate::secrets::SecretsProvider;
 use crate::startup::DeploymentMode;
@@ -278,6 +278,122 @@ impl Schema {
             schema_version: Some(self.snapshot().version),
         });
     }
+
+    /// Emit an audit event with actor information from the auth context.
+    fn emit_audit_with_actor(&self, kind: AuditEventKind, auth: &AuthContext) {
+        self.audit_sink.emit(&AuditEvent {
+            timestamp: SystemTime::now(),
+            event: kind,
+            actor: Some(auth.role.clone()),
+            source: None,
+            schema_version: Some(self.snapshot().version),
+        });
+    }
+
+    // ---- Keyspace CRUD ----
+
+    /// Create a new keyspace.
+    ///
+    /// Requires `Create` permission on `AllKeyspaces`. System keyspaces
+    /// cannot be created. Emits a `KeyspaceCreated` audit event.
+    pub fn create_keyspace(&self, ks: KeyspaceMetadata, auth: &AuthContext) -> crate::Result<()> {
+        self.check_permission(auth, Permission::Create, &Resource::AllKeyspaces)?;
+        if is_system_keyspace(&ks.name) {
+            return Err(SchemaError::SystemKeyspaceProtected(ks.name));
+        }
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        if snap.keyspaces.contains_key(&ks.name) {
+            return Err(SchemaError::KeyspaceExists(ks.name));
+        }
+        let name = ks.name.clone();
+        snap.keyspaces.insert(ks.name.clone(), ks);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(AuditEventKind::KeyspaceCreated { keyspace: name }, auth);
+        Ok(())
+    }
+
+    /// Alter an existing keyspace.
+    ///
+    /// Requires `Alter` permission on the specific keyspace. System keyspaces
+    /// cannot be altered. Applies `KeyspaceUpdates` fields that are `Some`.
+    pub fn alter_keyspace(
+        &self,
+        name: &str,
+        updates: KeyspaceUpdates,
+        auth: &AuthContext,
+    ) -> crate::Result<()> {
+        self.check_permission(
+            auth,
+            Permission::Alter,
+            &Resource::Keyspace(name.to_string()),
+        )?;
+        if is_system_keyspace(name) {
+            return Err(SchemaError::SystemKeyspaceProtected(name.to_string()));
+        }
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        let ks = snap
+            .keyspaces
+            .get_mut(name)
+            .ok_or_else(|| SchemaError::KeyspaceNotFound(name.to_string()))?;
+        if let Some(replication) = updates.replication {
+            ks.replication = replication;
+        }
+        if let Some(durable_writes) = updates.durable_writes {
+            ks.durable_writes = durable_writes;
+        }
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::KeyspaceAltered {
+                keyspace: name.to_string(),
+            },
+            auth,
+        );
+        Ok(())
+    }
+
+    /// Drop an existing keyspace.
+    ///
+    /// Requires `Drop` permission on `AllKeyspaces`. System keyspaces
+    /// cannot be dropped. Also removes all tables belonging to the keyspace.
+    pub fn drop_keyspace(&self, name: &str, auth: &AuthContext) -> crate::Result<()> {
+        self.check_permission(auth, Permission::Drop, &Resource::AllKeyspaces)?;
+        if is_system_keyspace(name) {
+            return Err(SchemaError::SystemKeyspaceProtected(name.to_string()));
+        }
+        let _guard = self.write_lock.lock().unwrap();
+        let mut snap = (*self.snapshot()).clone();
+        if snap.keyspaces.remove(name).is_none() {
+            return Err(SchemaError::KeyspaceNotFound(name.to_string()));
+        }
+        // Remove all tables in the dropped keyspace
+        snap.tables.retain(|(ks, _), _| ks != name);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        self.emit_audit_with_actor(
+            AuditEventKind::KeyspaceDropped {
+                keyspace: name.to_string(),
+            },
+            auth,
+        );
+        Ok(())
+    }
+}
+
+/// Returns true if the given name is a Cassandra system keyspace.
+fn is_system_keyspace(name: &str) -> bool {
+    matches!(
+        name,
+        "system"
+            | "system_schema"
+            | "system_auth"
+            | "system_distributed"
+            | "system_traces"
+            | "system_virtual_schema"
+    )
 }
 
 #[cfg(test)]
@@ -534,5 +650,188 @@ mod tests {
             SchemaError::AuthenticationThrottled => {}
             other => panic!("expected AuthenticationThrottled, got: {other}"),
         }
+    }
+
+    // ---- CRUD test helpers ----
+
+    use crate::auth::permission::{Permission, Resource};
+    use crate::metadata::keyspace::KeyspaceUpdates;
+
+    fn superuser_auth() -> AuthContext {
+        AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        }
+    }
+
+    fn normal_auth(role: &str) -> AuthContext {
+        AuthContext {
+            role: role.to_string(),
+            is_superuser: false,
+            must_change_password: false,
+        }
+    }
+
+    fn test_keyspace(name: &str) -> KeyspaceMetadata {
+        KeyspaceMetadata {
+            name: name.to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: {
+                    let mut opts = HashMap::new();
+                    opts.insert("replication_factor".to_string(), "3".to_string());
+                    opts
+                },
+            },
+        }
+    }
+
+    // ---- Task 20: Keyspace CRUD tests ----
+
+    #[test]
+    fn create_keyspace_as_superuser() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        let ks = test_keyspace("my_ks");
+        schema.create_keyspace(ks, &auth).unwrap();
+
+        let snap = schema.snapshot();
+        assert!(snap.keyspaces.contains_key("my_ks"));
+        assert_eq!(
+            snap.keyspaces["my_ks"].replication.strategy,
+            "SimpleStrategy"
+        );
+    }
+
+    #[test]
+    fn create_keyspace_duplicate_fails() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("dup_ks"), &auth)
+            .unwrap();
+        let result = schema.create_keyspace(test_keyspace("dup_ks"), &auth);
+        assert!(matches!(result, Err(SchemaError::KeyspaceExists(ref n)) if n == "dup_ks"));
+    }
+
+    #[test]
+    fn create_keyspace_bumps_version() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        let v1 = schema.snapshot().version;
+        schema
+            .create_keyspace(test_keyspace("ks_v"), &auth)
+            .unwrap();
+        let v2 = schema.snapshot().version;
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn create_keyspace_emits_audit() {
+        let sink = Arc::new(TestAuditSink::new());
+        let schema = test_schema_with_sink(sink.clone());
+        let auth = superuser_auth();
+        sink.clear();
+        schema
+            .create_keyspace(test_keyspace("audit_ks"), &auth)
+            .unwrap();
+
+        let events = sink.events();
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            AuditEventKind::KeyspaceCreated { keyspace } if keyspace == "audit_ks"
+        )));
+        // Actor should be set
+        let ks_event = events
+            .iter()
+            .find(|e| matches!(&e.event, AuditEventKind::KeyspaceCreated { .. }))
+            .unwrap();
+        assert_eq!(ks_event.actor.as_deref(), Some("cassandra"));
+    }
+
+    #[test]
+    fn drop_keyspace_removes_it() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("drop_ks"), &auth)
+            .unwrap();
+        assert!(schema.snapshot().keyspaces.contains_key("drop_ks"));
+
+        schema.drop_keyspace("drop_ks", &auth).unwrap();
+        assert!(!schema.snapshot().keyspaces.contains_key("drop_ks"));
+    }
+
+    #[test]
+    fn drop_keyspace_not_found() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        let result = schema.drop_keyspace("nonexistent", &auth);
+        assert!(matches!(result, Err(SchemaError::KeyspaceNotFound(ref n)) if n == "nonexistent"));
+    }
+
+    #[test]
+    fn alter_keyspace_updates_replication() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("alter_ks"), &auth)
+            .unwrap();
+
+        let updates = KeyspaceUpdates {
+            replication: Some(ReplicationParams {
+                strategy: "NetworkTopologyStrategy".to_string(),
+                options: {
+                    let mut opts = HashMap::new();
+                    opts.insert("dc1".to_string(), "3".to_string());
+                    opts
+                },
+            }),
+            durable_writes: Some(false),
+        };
+        schema.alter_keyspace("alter_ks", updates, &auth).unwrap();
+
+        let snap = schema.snapshot();
+        let ks = &snap.keyspaces["alter_ks"];
+        assert_eq!(ks.replication.strategy, "NetworkTopologyStrategy");
+        assert!(!ks.durable_writes);
+    }
+
+    #[test]
+    fn system_keyspace_protected() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+
+        // Cannot create a system keyspace
+        let result = schema.create_keyspace(test_keyspace("system"), &auth);
+        assert!(
+            matches!(result, Err(SchemaError::SystemKeyspaceProtected(ref n)) if n == "system")
+        );
+
+        // Cannot drop a system keyspace
+        let result = schema.drop_keyspace("system_auth", &auth);
+        assert!(
+            matches!(result, Err(SchemaError::SystemKeyspaceProtected(ref n)) if n == "system_auth")
+        );
+
+        // Cannot alter a system keyspace
+        let updates = KeyspaceUpdates {
+            replication: None,
+            durable_writes: Some(false),
+        };
+        let result = schema.alter_keyspace("system_schema", updates, &auth);
+        assert!(
+            matches!(result, Err(SchemaError::SystemKeyspaceProtected(ref n)) if n == "system_schema")
+        );
+    }
+
+    #[test]
+    fn non_superuser_without_grant_denied() {
+        let schema = test_schema();
+        let auth = normal_auth("nobody");
+        let result = schema.create_keyspace(test_keyspace("forbidden"), &auth);
+        assert!(matches!(result, Err(SchemaError::PermissionDenied { .. })));
     }
 }
