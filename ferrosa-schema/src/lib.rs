@@ -31,6 +31,9 @@ pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};
 pub use startup::{
     validate_production_requirements, DeploymentMode, ProductionCheckConfig, ProductionViolation,
 };
+pub use system::auth_tables::{
+    query_audit_log, query_role_members, query_role_permissions, query_roles,
+};
 pub use system::local::{query_local, LocalInfo, NodeConfig};
 pub use system::peers::{query_peers, ClusterState, PeerInfo};
 pub use system::schema_tables::{query_columns, query_keyspaces, query_tables};
