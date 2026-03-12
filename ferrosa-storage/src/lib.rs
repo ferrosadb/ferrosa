@@ -26,7 +26,9 @@ pub mod memtable;
 pub mod merge;
 pub mod store;
 
-pub use commitlog::{CommitLogConfig, CommitLogPosition, Mutation, SyncStrategyConfig, TableId};
+pub use commitlog::{
+    CommitLog, CommitLogConfig, CommitLogPosition, Mutation, SyncStrategyConfig, TableId,
+};
 pub use flush::{FileFlushTarget, FlushTarget, InMemoryFlushTarget};
 pub use memtable::sharded::ShardedBTreeMemtable;
 pub use memtable::Memtable;

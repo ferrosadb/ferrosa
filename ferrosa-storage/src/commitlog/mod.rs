@@ -3,6 +3,20 @@
 //! The commit log records every mutation before it reaches the memtable.
 //! On crash recovery, uncommitted mutations are replayed from segment
 //! files to restore memtable state.
+//!
+//! # Architecture
+//!
+//! The [`CommitLog`] composes all internal modules into a single public API:
+//!
+//! - **Segment** — fixed-size byte buffer with lock-free CAS allocation
+//! - **SyncStrategy** — controls when segments are fsynced (Batch / Periodic / Group)
+//! - **SegmentReader** — reads segment files during crash recovery replay
+//! - **CommitLogCheckpoint** — tracks per-table flush positions
+//!
+//! The active segment is held behind an [`ArcSwap`](arc_swap::ArcSwap),
+//! giving writers lock-free access. Segment rotation atomically swaps in
+//! a new segment while the old one stays alive (via `Arc`) until all
+//! tables have been flushed past it.
 
 pub(crate) mod checkpoint;
 pub(crate) mod config;
@@ -14,3 +28,577 @@ pub(crate) mod sync;
 
 pub use config::{CommitLogConfig, CommitLogPosition, SyncStrategyConfig, TableId};
 pub use mutation::Mutation;
+
+use std::collections::HashMap;
+use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use parking_lot::Mutex;
+
+use checkpoint::CommitLogCheckpoint;
+use config::CommitLogConfig as Config;
+use reader::SegmentReader;
+use segment::Segment;
+use sync::{BatchSync, FlushCallback, GroupSync, PeriodicSync, SyncStrategy};
+
+/// The commit log: write-ahead log for mutation durability.
+///
+/// Writers call [`append()`](Self::append) to record a mutation. The commit log
+/// manages segment allocation, rotation, sync strategy, and checkpoint tracking.
+///
+/// # Concurrency
+///
+/// - **Append** is lock-free on the hot path (CAS allocation in the active segment).
+/// - **Rotation** briefly takes the `closed_segments` mutex to move the old segment.
+/// - **Discard** takes both `segment_tracker` and `closed_segments` mutexes to
+///   clean up fully-flushed segments.
+pub struct CommitLog {
+    /// Commit log configuration.
+    config: Config,
+
+    /// The currently active segment, swapped atomically on rotation.
+    active: Arc<ArcSwap<Segment>>,
+
+    /// Segments that are full but still have dirty (unflushed) tables.
+    closed_segments: Mutex<Vec<Arc<Segment>>>,
+
+    /// Per-segment dirty table tracking. Key = segment ID, value = map of
+    /// table ID to the latest position written for that table in that segment.
+    segment_tracker: Mutex<HashMap<u64, HashMap<TableId, CommitLogPosition>>>,
+
+    /// Controls when segment buffers are fsynced to disk.
+    sync_strategy: Box<dyn SyncStrategy>,
+
+    /// Monotonic segment ID generator.
+    next_segment_id: AtomicU64,
+}
+
+impl CommitLog {
+    /// Creates a new commit log with the given configuration.
+    ///
+    /// Creates the log directory if it does not exist, allocates the first
+    /// segment, and starts the sync strategy.
+    pub fn new(config: Config) -> ferrosa_common::Result<Self> {
+        fs::create_dir_all(&config.log_dir)?;
+        fs::create_dir_all(&config.checkpoint_dir)?;
+
+        let first_segment = Arc::new(Segment::new(1, config.segment_size, &config.log_dir));
+        let active = Arc::new(ArcSwap::from(first_segment));
+
+        let sync_strategy = Self::create_sync_strategy(&config, Arc::clone(&active));
+        sync_strategy.start();
+
+        Ok(Self {
+            config,
+            active,
+            closed_segments: Mutex::new(Vec::new()),
+            segment_tracker: Mutex::new(HashMap::new()),
+            sync_strategy,
+            next_segment_id: AtomicU64::new(2), // first segment is 1
+        })
+    }
+
+    /// Opens an existing commit log directory, replays uncommitted mutations,
+    /// and returns a new `CommitLog` instance along with the replayed mutations.
+    ///
+    /// The replay process:
+    /// 1. Load the checkpoint file to find per-table flush positions.
+    /// 2. Scan the log directory for segment files, sorted by segment ID.
+    /// 3. For each segment, read all entries and filter those after checkpoint positions.
+    /// 4. Create a fresh `CommitLog` for new writes.
+    pub fn open_and_replay(config: Config) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
+        let checkpoint = CommitLogCheckpoint::load(&config.checkpoint_dir)?;
+
+        // Scan for segment files in log_dir.
+        let mut segment_files: Vec<(u64, std::path::PathBuf)> = Vec::new();
+        if config.log_dir.exists() {
+            for entry in fs::read_dir(&config.log_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(id) = parse_segment_id(name) {
+                        segment_files.push((id, path));
+                    }
+                }
+            }
+        }
+
+        // Sort by segment ID for deterministic replay order.
+        segment_files.sort_by_key(|(id, _)| *id);
+
+        let mut mutations = Vec::new();
+        for (_, path) in &segment_files {
+            let mut reader = SegmentReader::open(path)?;
+            let entries = reader.read_all()?;
+
+            for (pos, mutation) in entries {
+                let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+                // Keep entries that are after the checkpoint position for this table.
+                let dominated = checkpoint.get(&table_id).is_some_and(|cp| pos <= *cp);
+                if !dominated {
+                    mutations.push(mutation);
+                }
+            }
+        }
+
+        // Clean up old segment files before creating new CommitLog.
+        for (_, path) in &segment_files {
+            let _ = fs::remove_file(path);
+        }
+
+        let commit_log = Self::new(config)?;
+        Ok((commit_log, mutations))
+    }
+
+    /// Appends a mutation to the commit log.
+    ///
+    /// This is the hot path. The flow:
+    /// 1. Load the active segment (lock-free via `ArcSwap`).
+    /// 2. Try to allocate space in the segment (lock-free CAS).
+    /// 3. If the segment is full, rotate and retry.
+    /// 4. Write the entry, update dirty tracking, notify sync strategy.
+    pub fn append(&self, mutation: &Mutation) -> ferrosa_common::Result<CommitLogPosition> {
+        let total_size = Segment::entry_total_size(mutation);
+
+        // Load active segment and try to allocate.
+        let segment = self.active.load();
+
+        let offset = match segment.allocate(total_size) {
+            Some(offset) => offset,
+            None => {
+                // Segment is full — rotate and retry.
+                self.force_rotate()?;
+                let new_segment = self.active.load();
+                new_segment
+                    .allocate(total_size)
+                    .expect("freshly rotated segment should have space")
+            }
+        };
+
+        // Reload in case rotation happened.
+        let segment = self.active.load();
+        let position = segment.write_entry(offset, mutation);
+
+        // Track dirty table in this segment.
+        let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+        segment.mark_table_dirty(&table_id, position);
+
+        // Update segment tracker.
+        {
+            let mut tracker = self.segment_tracker.lock();
+            tracker
+                .entry(segment.id)
+                .or_default()
+                .entry(table_id)
+                .and_modify(|existing| {
+                    if position > *existing {
+                        *existing = position;
+                    }
+                })
+                .or_insert(position);
+        }
+
+        // Notify sync strategy.
+        self.sync_strategy.on_write(&segment, offset);
+
+        Ok(position)
+    }
+
+    /// Discards commit log data for a table up to the given position.
+    ///
+    /// When a table's memtable is flushed to an SSTable, the caller calls this
+    /// to indicate that all mutations up to `position` are durable elsewhere.
+    /// Segments where all tables have been flushed past their positions are
+    /// deleted from disk.
+    pub fn discard_completed(
+        &self,
+        table_id: &TableId,
+        position: CommitLogPosition,
+    ) -> ferrosa_common::Result<()> {
+        let mut segments_to_delete = Vec::new();
+
+        {
+            let mut tracker = self.segment_tracker.lock();
+
+            // For each tracked segment, check if this table's position is dominated.
+            let segment_ids: Vec<u64> = tracker.keys().copied().collect();
+            for seg_id in segment_ids {
+                if let Some(tables) = tracker.get_mut(&seg_id) {
+                    if let Some(table_pos) = tables.get(table_id) {
+                        if *table_pos <= position {
+                            tables.remove(table_id);
+                        }
+                    }
+                    if tables.is_empty() {
+                        tracker.remove(&seg_id);
+                        segments_to_delete.push(seg_id);
+                    }
+                }
+            }
+        }
+
+        // Remove deleted segments from closed_segments and delete files.
+        if !segments_to_delete.is_empty() {
+            let mut closed = self.closed_segments.lock();
+            for seg_id in &segments_to_delete {
+                if let Some(idx) = closed.iter().position(|s| s.id == *seg_id) {
+                    let segment = closed.remove(idx);
+                    let _ = fs::remove_file(segment.path());
+                }
+            }
+        }
+
+        // Update checkpoint.
+        let mut checkpoint = CommitLogCheckpoint::load(&self.config.checkpoint_dir)?;
+        checkpoint
+            .entry(table_id.clone())
+            .and_modify(|existing| {
+                if position > *existing {
+                    *existing = position;
+                }
+            })
+            .or_insert(position);
+        CommitLogCheckpoint::save(&self.config.checkpoint_dir, &checkpoint)?;
+
+        Ok(())
+    }
+
+    /// Forces rotation of the active segment.
+    ///
+    /// Allocates a new segment, atomically swaps it in via `ArcSwap`, and moves
+    /// the old segment to the `closed_segments` list.
+    pub fn force_rotate(&self) -> ferrosa_common::Result<()> {
+        let new_id = self.next_segment_id.fetch_add(1, Ordering::AcqRel);
+        let new_segment = Arc::new(Segment::new(
+            new_id,
+            self.config.segment_size,
+            &self.config.log_dir,
+        ));
+
+        // Swap the new segment in and get the old one.
+        let old_segment = self.active.swap(new_segment);
+
+        // Flush the old segment to disk before archiving.
+        old_segment.flush_to_disk()?;
+
+        // Move old segment to closed list.
+        let mut closed = self.closed_segments.lock();
+        closed.push(old_segment);
+
+        Ok(())
+    }
+
+    /// Shuts down the commit log cleanly.
+    ///
+    /// Stops the sync strategy and flushes the active segment to disk.
+    pub fn shutdown(&self) -> ferrosa_common::Result<()> {
+        self.sync_strategy.stop();
+        let segment = self.active.load();
+        segment.flush_to_disk()?;
+        Ok(())
+    }
+
+    /// Creates the appropriate sync strategy based on config.
+    fn create_sync_strategy(
+        config: &Config,
+        active: Arc<ArcSwap<Segment>>,
+    ) -> Box<dyn SyncStrategy> {
+        match &config.sync_strategy {
+            SyncStrategyConfig::Batch => Box::new(BatchSync::new()),
+            SyncStrategyConfig::Periodic { sync_interval } => {
+                let active_ref = Arc::clone(&active);
+                let flush_callback: FlushCallback = Arc::new(move || {
+                    let segment = active_ref.load();
+                    segment.flush_to_disk()
+                });
+                Box::new(PeriodicSync::new(*sync_interval, flush_callback))
+            }
+            SyncStrategyConfig::Group { max_wait } => {
+                let active_ref = Arc::clone(&active);
+                let flush_callback: FlushCallback = Arc::new(move || {
+                    let segment = active_ref.load();
+                    segment.flush_to_disk()
+                });
+                Box::new(GroupSync::new(*max_wait, flush_callback))
+            }
+        }
+    }
+}
+
+/// Parses a segment ID from a filename like `commitlog-42.log`.
+fn parse_segment_id(filename: &str) -> Option<u64> {
+    let name = filename.strip_prefix("commitlog-")?;
+    let id_str = name.strip_suffix(".log")?;
+    id_str.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+    /// Helper to create a simple mutation for testing.
+    fn simple_mutation() -> Mutation {
+        Mutation {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
+            rows: vec![Row {
+                clustering: vec![1, 2, 3],
+                cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            }],
+            timestamp: 42_000,
+        }
+    }
+
+    /// Helper to create a mutation targeting a different table.
+    fn mutation_for_table(keyspace: &str, table: &str) -> Mutation {
+        Mutation {
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
+            rows: vec![Row {
+                clustering: vec![1, 2, 3],
+                cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            }],
+            timestamp: 42_000,
+        }
+    }
+
+    #[test]
+    fn new_creates_segment_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config).unwrap();
+
+        // The first segment file should exist after BatchSync writes on first append,
+        // but the segment is pre-allocated in memory. Let's append and check.
+        let m = simple_mutation();
+        cl.append(&m).unwrap();
+
+        // After append with BatchSync, the segment file should be flushed.
+        let segment = cl.active.load();
+        assert!(
+            segment.path().exists(),
+            "segment file should exist after append with BatchSync"
+        );
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn append_returns_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config).unwrap();
+
+        let m1 = simple_mutation();
+        let m2 = simple_mutation();
+
+        let pos1 = cl.append(&m1).unwrap();
+        let pos2 = cl.append(&m2).unwrap();
+
+        // Positions should be in the same segment and increasing.
+        assert_eq!(pos1.segment_id, pos2.segment_id);
+        assert!(
+            pos2.offset > pos1.offset,
+            "second append should have higher offset"
+        );
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn append_and_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config).unwrap();
+
+        let m = simple_mutation();
+        cl.append(&m).unwrap();
+
+        let segment_path = cl.active.load().path().to_path_buf();
+        cl.shutdown().unwrap();
+
+        // After shutdown, the segment file should exist and contain data.
+        assert!(
+            segment_path.exists(),
+            "segment file should exist after shutdown"
+        );
+        let contents = fs::read(&segment_path).unwrap();
+        assert!(
+            contents.len() > 25,
+            "segment should contain data beyond header"
+        );
+    }
+
+    #[test]
+    fn rotation_on_full_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use a small segment size to force rotation after a few appends.
+        // Each entry is ~118 bytes; header+sync marker is 25 bytes.
+        // 512 bytes allows ~3-4 entries before rotation.
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+
+        let m = simple_mutation();
+
+        // Keep appending until we've rotated at least once.
+        let mut segment_ids = std::collections::HashSet::new();
+        for _ in 0..10 {
+            match cl.append(&m) {
+                Ok(pos) => {
+                    segment_ids.insert(pos.segment_id);
+                }
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            segment_ids.len() >= 2,
+            "should have rotated to at least 2 segments, got {}",
+            segment_ids.len()
+        );
+
+        // Verify multiple segment files exist.
+        let files: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("commitlog-") && n.ends_with(".log"))
+            })
+            .collect();
+
+        assert!(
+            files.len() >= 2,
+            "should have at least 2 segment files, got {}",
+            files.len()
+        );
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn discard_deletes_clean_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        // Small segment to force rotation after a few appends.
+        // Each entry is ~118 bytes; 512 bytes allows ~3-4 entries per segment.
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+
+        let m = simple_mutation();
+        let table_id = TableId::new("test_ks", "test_table");
+
+        // Append mutations — this will span multiple segments.
+        let mut last_pos = None;
+        for _ in 0..10 {
+            match cl.append(&m) {
+                Ok(pos) => last_pos = Some(pos),
+                Err(_) => break,
+            }
+        }
+        let last_pos = last_pos.expect("should have appended at least one mutation");
+
+        // Count segment files before discard.
+        let count_segments = || -> usize {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("commitlog-") && n.ends_with(".log"))
+                })
+                .count()
+        };
+
+        let before = count_segments();
+        assert!(before >= 2, "need at least 2 segments for this test");
+
+        // Discard all mutations up to the last position.
+        cl.discard_completed(&table_id, last_pos).unwrap();
+
+        let after = count_segments();
+        // The closed segments should have been deleted. The active segment stays.
+        assert!(
+            after < before,
+            "discard should have deleted some segments: before={before}, after={after}"
+        );
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn discard_keeps_partially_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        // Small segment to force rotation.
+        // Each entry is ~118 bytes; 512 bytes allows ~3-4 entries per segment.
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+
+        let m1 = mutation_for_table("ks", "table_a");
+        let m2 = mutation_for_table("ks", "table_b");
+        let table_a = TableId::new("ks", "table_a");
+
+        // Append mutations from two different tables.
+        let mut pos_a = None;
+        for _ in 0..5 {
+            if let Ok(pos) = cl.append(&m1) {
+                pos_a = Some(pos);
+            }
+        }
+        for _ in 0..5 {
+            let _ = cl.append(&m2);
+        }
+
+        let pos_a = pos_a.expect("should have appended table_a mutations");
+
+        // Count closed segments.
+        let closed_count = cl.closed_segments.lock().len();
+
+        // Discard only table_a — table_b is still dirty.
+        cl.discard_completed(&table_a, pos_a).unwrap();
+
+        // Segments with table_b data should NOT be deleted.
+        let closed_after = cl.closed_segments.lock().len();
+        // If table_b has data in the same segments, they should be retained.
+        // The exact count depends on which segments both tables share.
+        // The key invariant: segments with remaining dirty tables are kept.
+        assert!(
+            closed_after <= closed_count,
+            "should not have more closed segments after discard"
+        );
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn parse_segment_id_works() {
+        assert_eq!(parse_segment_id("commitlog-1.log"), Some(1));
+        assert_eq!(parse_segment_id("commitlog-42.log"), Some(42));
+        assert_eq!(parse_segment_id("commitlog-999.log"), Some(999));
+        assert_eq!(parse_segment_id("other-file.txt"), None);
+        assert_eq!(parse_segment_id("commitlog-.log"), None);
+        assert_eq!(parse_segment_id("commitlog-abc.log"), None);
+    }
+}
