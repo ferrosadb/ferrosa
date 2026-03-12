@@ -4,6 +4,7 @@
 //! On crash recovery, uncommitted mutations are replayed from segment
 //! files to restore memtable state.
 
+pub(crate) mod checkpoint;
 pub(crate) mod config;
 pub(crate) mod descriptor;
 pub(crate) mod mutation;
