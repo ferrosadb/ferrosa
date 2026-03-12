@@ -8,9 +8,12 @@
 //! minimum timestamp, local deletion time, and TTL across all cells, then
 //! builds a [`SerializationHeader`] compatible with the SSTable writer.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ferrosa_common::schema::TableSchema;
 use ferrosa_common::{Result, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
-use ferrosa_sstable::io::ReadAt;
+use ferrosa_sstable::io::{FileReadAt, ReadAt};
 use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
 use ferrosa_sstable::statistics::SerializationHeader;
 use ferrosa_sstable::types::Partition;
@@ -122,6 +125,102 @@ impl FlushTarget for InMemoryFlushTarget {
             filter: output.filter,
             compression_info: output.compression_info,
             statistics: output.statistics,
+        })
+    }
+}
+
+/// File-based flush target — writes components to numbered files on disk.
+///
+/// Each flush creates files named `{generation}-{Component}.db` under the
+/// configured base directory. Component files are written in parallel using
+/// `std::thread::scope`. An [`AtomicU64`] counter tracks the generation
+/// number across flushes.
+pub struct FileFlushTarget {
+    /// Directory where SSTable component files are written.
+    base_dir: PathBuf,
+    /// Monotonically increasing generation counter.
+    generation: AtomicU64,
+}
+
+impl FileFlushTarget {
+    /// Create a new file flush target writing to the given directory.
+    ///
+    /// The directory is created if it does not exist. The generation
+    /// counter starts at 0; the first flush produces generation 1.
+    pub fn new(base_dir: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&base_dir)?;
+        Ok(Self {
+            base_dir,
+            generation: AtomicU64::new(0),
+        })
+    }
+
+    /// Returns the current generation counter value (the last generation written).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+}
+
+impl FlushTarget for FileFlushTarget {
+    type Reader = FileReadAt;
+
+    fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<FileReadAt>> {
+        let gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let base = &self.base_dir;
+
+        let data_path = base.join(format!("{gen}-Data.db"));
+        let partitions_path = base.join(format!("{gen}-Partitions.db"));
+        let rows_path = base.join(format!("{gen}-Rows.db"));
+        let filter_path = base.join(format!("{gen}-Filter.db"));
+        let statistics_path = base.join(format!("{gen}-Statistics.db"));
+        let toc_path = base.join(format!("{gen}-TOC.txt"));
+        let compression_info_path = base.join(format!("{gen}-CompressionInfo.db"));
+
+        let has_compression_info = output.compression_info.is_some();
+
+        // Write compression info outside the thread scope to avoid borrow issues
+        if let Some(ref ci) = output.compression_info {
+            std::fs::write(&compression_info_path, ci)?;
+        }
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = [
+                s.spawn(|| std::fs::write(&data_path, &output.data)),
+                s.spawn(|| std::fs::write(&partitions_path, &output.partitions)),
+                s.spawn(|| std::fs::write(&rows_path, &output.rows)),
+                s.spawn(|| std::fs::write(&filter_path, &output.filter)),
+                s.spawn(|| std::fs::write(&statistics_path, &output.statistics)),
+                s.spawn(|| std::fs::write(&toc_path, &output.toc)),
+            ]
+            .into_iter()
+            .collect();
+
+            for h in handles {
+                h.join().unwrap()?;
+            }
+
+            Ok::<(), ferrosa_common::Error>(())
+        })?;
+
+        // FileReadAt::open returns ferrosa_common::Result — use ? directly
+        let data = FileReadAt::open(&data_path)?;
+        let partitions = FileReadAt::open(&partitions_path)?;
+        let rows = FileReadAt::open(&rows_path)?;
+        let filter = std::fs::read(&filter_path)?;
+        let statistics = std::fs::read(&statistics_path)?;
+        let compression_info = if has_compression_info {
+            Some(std::fs::read(&compression_info_path)?)
+        } else {
+            None
+        };
+
+        SSTableReader::open(SSTableComponents {
+            data,
+            partitions,
+            rows,
+            filter,
+            compression_info,
+            statistics,
         })
     }
 }
@@ -263,5 +362,112 @@ mod tests {
             assert_eq!(got.key.key.as_bytes(), p.key.key.as_bytes());
             assert_eq!(got.rows.len(), 1);
         }
+    }
+
+    #[test]
+    fn file_flush_target_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![
+            make_partition("k1", b"v1", 5000),
+            make_partition("k2", b"v2", 3000),
+        ];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let header = build_serialization_header(&schema, &partitions);
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+
+        let mut writer = SSTableWriter::new(options, header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let reader = target.flush(output).unwrap();
+
+        // Verify we can read back both partitions
+        for p in &partitions {
+            let got = reader.get_partition(&p.key).unwrap().expect("partition");
+            assert_eq!(got.key.key.as_bytes(), p.key.key.as_bytes());
+            assert_eq!(got.rows.len(), 1);
+        }
+    }
+
+    #[test]
+    fn file_flush_target_creates_component_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![make_partition("k1", b"v1", 5000)];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let header = build_serialization_header(&schema, &partitions);
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+
+        let mut writer = SSTableWriter::new(options, header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let _reader = target.flush(output).unwrap();
+
+        // Verify component files were created
+        assert!(dir.path().join("1-Data.db").exists());
+        assert!(dir.path().join("1-Partitions.db").exists());
+        assert!(dir.path().join("1-Rows.db").exists());
+        assert!(dir.path().join("1-Filter.db").exists());
+        assert!(dir.path().join("1-Statistics.db").exists());
+        assert!(dir.path().join("1-TOC.txt").exists());
+        // No compression, so CompressionInfo.db should not exist
+        assert!(!dir.path().join("1-CompressionInfo.db").exists());
+    }
+
+    #[test]
+    fn file_flush_target_increments_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(target.generation(), 0);
+
+        // First flush
+        let mut partitions = vec![make_partition("k1", b"v1", 5000)];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        let header = build_serialization_header(&schema, &partitions);
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let mut writer = SSTableWriter::new(options.clone(), header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+        let _reader1 = target.flush(output).unwrap();
+        assert_eq!(target.generation(), 1);
+
+        // Second flush
+        let mut partitions2 = vec![make_partition("k2", b"v2", 6000)];
+        partitions2.sort_by(|a, b| a.key.cmp(&b.key));
+        let header2 = build_serialization_header(&schema, &partitions2);
+        let mut writer2 = SSTableWriter::new(options, header2);
+        for p in &partitions2 {
+            writer2.add_partition(p).unwrap();
+        }
+        let output2 = writer2.finish().unwrap();
+        let _reader2 = target.flush(output2).unwrap();
+        assert_eq!(target.generation(), 2);
+
+        // Verify both generations have files
+        assert!(dir.path().join("1-Data.db").exists());
+        assert!(dir.path().join("2-Data.db").exists());
     }
 }
