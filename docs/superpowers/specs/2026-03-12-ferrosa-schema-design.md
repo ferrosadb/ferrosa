@@ -6,11 +6,11 @@
 
 ## Goal
 
-Build the schema management crate for Ferrosa: rich metadata types, a thread-safe schema registry, authentication and authorization with column masking, and system keyspace responses that let CQL drivers connect and discover schema.
+Build the schema management crate for Ferrosa: rich metadata types, a thread-safe schema registry, authentication and authorization with column masking, audit logging, and system keyspace responses that let CQL drivers connect and discover schema.
 
 ## Architecture
 
-`ferrosa-schema` is a single crate with layered modules. It depends only on `ferrosa-common`. It is the authority for what keyspaces, tables, columns, and roles exist. Every mutating operation requires an `AuthContext` — auth is baked in from day one, not retrofitted.
+`ferrosa-schema` is a single crate with layered modules. It depends only on `ferrosa-common`. It is the authority for what keyspaces, tables, columns, and roles exist. Every mutating operation requires an `AuthContext` — auth is baked in from day one, not retrofitted. Every auth and DDL operation emits an audit event — observability is baked in from day one, not retrofitted (ADR-008).
 
 The crate produces typed structs for system keyspace queries. The CQL layer (ferrosa-cql, future) handles wire serialization.
 
@@ -23,12 +23,13 @@ The crate produces typed structs for system keyspace queries. The CQL layer (fer
 - `argon2` — optional stronger password hashing
 - `serde`, `serde_json` — serialization for persistence
 - `indexmap` — insertion-ordered column maps
+- `tracing` — structured audit event logging (default sink)
 
 ## Chunk Breakdown
 
 | Chunk | Scope |
 |-------|-------|
-| **A (this spec)** | Core types + Schema registry + Auth (roles, permissions, column masking, `system_auth`) + system keyspaces (`system.local`, `system.peers_v2`, `system_schema.keyspaces/tables/columns`) |
+| **A (this spec)** | Core types + Schema registry + Auth (roles, permissions, column masking, `system_auth`) + Audit logging + system keyspaces (`system.local`, `system.peers_v2`, `system_schema.keyspaces/tables/columns`) |
 | **B** | DDL validation (CREATE/ALTER/DROP keyspaces and tables, type validation, auth-gated) |
 | **C** | UDTs + `system_schema.types` |
 | **D** | Indexes + Views + `system_schema.indexes/views` |
@@ -53,6 +54,10 @@ ferrosa-schema/src/
 │   ├── permission.rs       # Permission enum, Resource, GrantEntry
 │   ├── password.rs         # PasswordHasher, bcrypt/argon2id, auto-upgrade
 │   └── rate_limit.rs       # AuthRateLimiter, exponential backoff, account lockout
+├── audit/
+│   ├── mod.rs              # AuditEvent, AuditSink trait, re-exports
+│   ├── event.rs            # Event types, serialization
+│   └── log_sink.rs         # LogAuditSink — structured logging via tracing
 ├── registry.rs             # Schema: thread-safe in-memory registry via ArcSwap
 ├── system/
 │   ├── mod.rs
@@ -60,6 +65,10 @@ ferrosa-schema/src/
 │   ├── peers.rs            # system.peers_v2 responses
 │   ├── schema_tables.rs    # system_schema.keyspaces/tables/columns
 │   └── auth_tables.rs      # system_auth.roles/role_members/role_permissions
+├── secrets/
+│   ├── mod.rs              # SecretsProvider trait, SecretsError
+│   └── env.rs              # EnvSecretsProvider
+├── startup.rs              # DeploymentMode, validate_production_requirements()
 └── convert.rs              # TableMetadata → ferrosa_common::TableSchema
 ```
 
@@ -317,18 +326,191 @@ Permission resolution walks the role hierarchy:
 
 ---
 
-## Schema Registry
+## Audit Logging
 
-### Design
+### ADR Reference
+
+See [ADR-008: Audit-First Schema Design](../../specs/decisions/008-audit-first-schema.md).
+
+### Design Principles
+
+Audit logging follows the same "baked in from day one" pattern as authentication (ADR-006). Every auth event and every schema mutation emits an `AuditEvent` through a pluggable `AuditSink` trait. The registry holds a sink reference; there is no code path that mutates schema or processes authentication without producing an audit record.
+
+### Event Types
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditEvent {
+    pub timestamp: SystemTime,
+    pub event: AuditEventKind,
+    pub actor: Option<String>,        // role name; None for system-initiated (bootstrap)
+    pub source: Option<SocketAddr>,   // set by CQL layer if available
+    pub schema_version: Option<Uuid>, // snapshot version after mutation (None for auth events)
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize)]
+pub enum AuditEventKind {
+    // Authentication events
+    AuthSuccess { role: String },
+    AuthFailed { role: String },
+    AuthThrottled { role: String },
+    AuthLockedOut { role: String, failure_count: u32 },
+    PasswordChanged { role: String, upgraded_algorithm: bool },
+
+    // Keyspace DDL
+    KeyspaceCreated { keyspace: String },
+    KeyspaceAltered { keyspace: String },
+    KeyspaceDropped { keyspace: String },
+
+    // Table DDL
+    TableCreated { keyspace: String, table: String },
+    TableAltered { keyspace: String, table: String },
+    TableDropped { keyspace: String, table: String },
+
+    // Role management
+    RoleCreated { role: String, is_superuser: bool },
+    RoleAltered { role: String },
+    RoleDropped { role: String },
+
+    // Permission changes
+    PermissionGranted { role: String, resource: Resource, permissions: HashSet<Permission> },
+    PermissionRevoked { role: String, resource: Resource, permissions: HashSet<Permission> },
+
+    // System events
+    SchemaBootstrapped,
+    SuperuserPasswordMustChange,
+}
+```
+
+### AuditSink Trait
+
+```rust
+pub trait AuditSink: Send + Sync {
+    fn emit(&self, event: &AuditEvent);
+}
+```
+
+The trait is deliberately simple — one method, no error return. Audit emission must not block or fail schema operations. Implementations handle buffering, batching, and error recovery internally.
+
+### Built-in Sinks
+
+**Chunk A provides one sink:**
+
+```rust
+/// Emits audit events as structured JSON via the `tracing` crate at INFO level.
+/// Target: "ferrosa::audit" — operators filter/route via tracing-subscriber.
+///
+/// Example output:
+///   {"timestamp":"2026-03-12T10:30:00Z","event":"KeyspaceCreated",
+///    "actor":"admin","keyspace":"production","schema_version":"..."}
+pub struct LogAuditSink;
+```
+
+Using `tracing` as the default sink gives operators immediate value:
+
+- Structured JSON when using `tracing-subscriber` with JSON formatter
+- Routes to stdout, files, or log aggregators (CloudWatch, Datadog, etc.) via standard `tracing` configuration
+- Zero additional dependencies — `tracing` is already in the dependency tree via `ferrosa-storage`
+- Filter audit events with `RUST_LOG=ferrosa::audit=info`
+
+**Future sinks (not in Chunk A):**
+
+| Sink | Chunk | Description |
+|------|-------|-------------|
+| `SystemTableAuditSink` | F | Writes to `system_auth.audit_log` table for CQL-queryable audit history |
+| `S3AuditSink` | Follow-on | Batches audit events to S3 as append-only JSON-lines files for compliance archival |
+
+### Registry Integration
+
+The `Schema` struct holds a boxed sink:
 
 ```rust
 pub struct Schema {
     inner: ArcSwap<SchemaSnapshot>,
-    write_lock: Mutex<()>,             // serializes all mutations (clone-modify-swap)
+    write_lock: Mutex<()>,
     hasher_config: PasswordHasher,
     rate_limiter: AuthRateLimiter,
+    audit_sink: Box<dyn AuditSink>,
+}
+```
+
+Constructor:
+
+```rust
+impl Schema {
+    pub fn new(hasher_config: PasswordHasher, audit_sink: Box<dyn AuditSink>) -> Self;
+}
+```
+
+Every registry method calls `self.audit_sink.emit(...)` after the operation completes (success or failure). For mutations, the event includes the new `schema_version`. For auth events, `schema_version` is `None`.
+
+**Emit points** (every code path that modifies state or checks credentials):
+
+| Method | Event on Success | Event on Failure |
+|--------|-----------------|-----------------|
+| `authenticate()` | `AuthSuccess` | `AuthFailed`, `AuthThrottled`, or `AuthLockedOut` |
+| `create_keyspace()` | `KeyspaceCreated` | (no audit for existence errors — not security-relevant) |
+| `alter_keyspace()` | `KeyspaceAltered` | — |
+| `drop_keyspace()` | `KeyspaceDropped` | — |
+| `create_table()` | `TableCreated` | — |
+| `alter_table()` | `TableAltered` | — |
+| `drop_table()` | `TableDropped` | — |
+| `create_role()` | `RoleCreated` | — |
+| `alter_role()` | `RoleAltered`, `PasswordChanged` (if password changed) | — |
+| `drop_role()` | `RoleDropped` | — |
+| `grant()` | `PermissionGranted` | — |
+| `revoke()` | `PermissionRevoked` | — |
+
+**Permission denied** events: When `check_permission()` fails, the calling method (e.g., `create_keyspace`) returns `PermissionDenied` — this is logged at WARN level by the CQL layer, not by the audit sink, to avoid duplication. The sink focuses on state-changing events and auth outcomes.
+
+### Source Address Propagation
+
+The schema crate has no concept of network connections. The `source: Option<SocketAddr>` field in `AuditEvent` is set by the CQL layer before calling registry methods. The registry propagates it through a thread-local or by accepting an optional `AuditContext` parameter:
+
+```rust
+/// Optional context for enriching audit events with caller metadata.
+/// Set by CQL layer before calling registry methods.
+#[derive(Debug, Clone, Default)]
+pub struct AuditContext {
+    pub source: Option<SocketAddr>,
+}
+```
+
+Registry methods that accept `&AuthContext` also accept an optional `&AuditContext`. If not provided, `source` defaults to `None` (appropriate for internal/bootstrap operations).
+
+### Testing the Audit System
+
+```rust
+/// In-memory audit sink for testing. Collects all emitted events.
+pub struct TestAuditSink {
+    events: Mutex<Vec<AuditEvent>>,
 }
 
+impl TestAuditSink {
+    pub fn new() -> Self;
+    pub fn events(&self) -> Vec<AuditEvent>;
+    pub fn clear(&self);
+}
+```
+
+Tests assert on the collected events:
+
+- Every `create_*`/`alter_*`/`drop_*` produces exactly one audit event
+- `authenticate()` produces `AuthSuccess` or `AuthFailed`
+- Rate-limited auth produces `AuthThrottled` or `AuthLockedOut`
+- Bootstrap emits `SchemaBootstrapped` and optionally `SuperuserPasswordMustChange`
+- Events contain correct actor, timestamp, and schema_version
+
+---
+
+## Schema Registry
+
+### Design
+
+The `Schema` struct is defined in the Audit Logging section above (it holds the `AuditSink` alongside the other components). The snapshot it manages:
+
+```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaSnapshot {
     pub version: Uuid,
@@ -402,7 +584,7 @@ pub struct RoleUpdates {
 
 ```rust
 impl Schema {
-    pub fn new(hasher_config: PasswordHasher) -> Self;
+    pub fn new(hasher_config: PasswordHasher, audit_sink: Box<dyn AuditSink>) -> Self;
 
     // Lock-free snapshot access
     pub fn snapshot(&self) -> Arc<SchemaSnapshot>;
@@ -603,6 +785,169 @@ For composite partition keys, `to_storage_schema()` synthesizes a `CompositeType
 
 ---
 
+## Secrets Management
+
+### ADR Reference
+
+See [ADR-009: Pluggable Secrets Provider](../../specs/decisions/009-pluggable-secrets-provider.md).
+
+### Design Principles
+
+Ferrosa needs secrets at startup (S3 credentials, superuser password) and at runtime (password hashing config). Hard-coding these as environment variables works for development but is inadequate for production — env vars leak through `/proc`, container inspection, and crash dumps.
+
+The `SecretsProvider` trait abstracts secret retrieval behind a pluggable interface. Chunk A ships with an `EnvSecretsProvider` (current behavior) and defines the trait so that AWS Secrets Manager, HashiCorp Vault, and other backends can be added without changing the core.
+
+### SecretsProvider Trait
+
+```rust
+/// Retrieves secret values by key. Implementations handle caching,
+/// rotation, and backend-specific authentication internally.
+pub trait SecretsProvider: Send + Sync {
+    /// Retrieve a secret value by key. Returns None if the key doesn't exist.
+    fn get_secret(&self, key: &str) -> Result<Option<String>, SecretsError>;
+}
+
+#[derive(Debug)]
+pub enum SecretsError {
+    /// Backend unavailable (network, auth, permissions)
+    ProviderUnavailable(String),
+    /// Key exists but access denied
+    AccessDenied(String),
+    /// Other backend-specific errors
+    Other(String),
+}
+```
+
+### Built-in Providers
+
+**Chunk A provides one provider:**
+
+```rust
+/// Reads secrets from environment variables. Keys are uppercased and
+/// prefixed with FERROSA_ (e.g., key "s3.secret_key" → FERROSA_S3_SECRET_ACCESS_KEY).
+pub struct EnvSecretsProvider;
+```
+
+This preserves backward compatibility — existing env-var-based configuration works unchanged.
+
+**Future providers (not in Chunk A):**
+
+| Provider | Description |
+|----------|-------------|
+| `AwsSecretsManagerProvider` | Reads from AWS Secrets Manager. Secret ARN configured via `FERROSA_SECRETS_ARN`. Caches values with configurable TTL for rotation support. |
+| `VaultSecretsProvider` | Reads from HashiCorp Vault. Vault address and auth method configured via `FERROSA_VAULT_ADDR`, `FERROSA_VAULT_TOKEN` or Kubernetes auth. |
+| `FileSecretsProvider` | Reads from mounted secret files (Kubernetes secrets volume). Path configured via `FERROSA_SECRETS_DIR`. |
+
+### Secret Keys
+
+The following secrets are retrievable via the provider:
+
+| Key | Used By | Env Var Equivalent |
+|-----|---------|-------------------|
+| `superuser_password` | Bootstrap | `FERROSA_SUPERUSER_PASSWORD` |
+| `s3.access_key_id` | S3 upload | `FERROSA_S3_ACCESS_KEY_ID` |
+| `s3.secret_access_key` | S3 upload | `FERROSA_S3_SECRET_ACCESS_KEY` |
+
+The provider is consulted at startup and on-demand for rotation-aware backends. The `Schema::new()` constructor accepts `&dyn SecretsProvider` to retrieve the superuser password.
+
+### Integration
+
+```rust
+impl Schema {
+    pub fn new(
+        hasher_config: PasswordHasher,
+        audit_sink: Box<dyn AuditSink>,
+        secrets: &dyn SecretsProvider,
+    ) -> Self;
+}
+```
+
+The secrets provider is used during construction (for bootstrap password) and is not stored — secrets are resolved once at startup. Future rotation support would store a reference and re-resolve periodically.
+
+### Configuration
+
+| Env Var | Values | Default |
+|---------|--------|---------|
+| `FERROSA_SECRETS_PROVIDER` | `env`, `aws-secrets-manager`, `vault`, `file` | `env` |
+
+When set to `env`, the `EnvSecretsProvider` is used (backward compatible). Other values select the corresponding provider, which reads its own configuration from a minimal set of env vars (just enough to bootstrap the connection to the secrets backend).
+
+---
+
+## Production Mode
+
+### ADR Reference
+
+See [ADR-010: Production Mode — Mandatory Encryption](../../specs/decisions/010-production-mode.md).
+
+### Design
+
+Ferrosa supports a `FERROSA_MODE` environment variable that controls security enforcement:
+
+| Mode | Behavior |
+|------|----------|
+| `development` (default) | Permissive — allows plaintext S3 (`FERROSA_S3_ALLOW_HTTP`), unencrypted local disk, no TLS on CQL/internode. Logs warnings for each relaxation. |
+| `production` | Strict — refuses to start unless all encryption requirements are met. |
+
+**Production mode enforces at startup:**
+
+1. **CQL TLS required**: CQL listener must have TLS configured (certificate + key). Refuses to bind without TLS.
+1. **Internode TLS required**: Internode protocol must have mutual TLS configured. Refuses to start cluster communication without TLS.
+1. **S3 HTTPS only**: `FERROSA_S3_ALLOW_HTTP=true` is rejected. S3 endpoint must use HTTPS.
+1. **Encrypted local storage**: Startup check verifies data directory is on an encrypted filesystem. Refuses to start if not detected (with override `FERROSA_ALLOW_UNENCRYPTED_DISK=true` for environments where encryption is handled at a layer Ferrosa can't detect, e.g., hardware encryption).
+1. **Secrets provider not `env`**: In production mode, `FERROSA_SECRETS_PROVIDER=env` logs a WARNING (not a hard block, since some locked-down environments manage env vars securely).
+1. **Default superuser password forbidden**: `FERROSA_SUPERUSER_PASSWORD` must be set or the node refuses to start. No `cassandra`/`cassandra` default in production mode.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentMode {
+    Development,
+    Production,
+}
+
+impl DeploymentMode {
+    pub fn from_env() -> Self;  // reads FERROSA_MODE
+}
+
+/// Validates all production-mode invariants. Returns a list of violations.
+/// Called at startup before binding any listeners.
+pub fn validate_production_requirements(
+    mode: DeploymentMode,
+    node_config: &NodeConfig,
+    secrets: &dyn SecretsProvider,
+) -> Vec<ProductionViolation>;
+
+#[non_exhaustive]
+pub enum ProductionViolation {
+    CqlTlsNotConfigured,
+    InternodeTlsNotConfigured,
+    S3HttpEnabled,
+    UnencryptedLocalStorage { path: PathBuf },
+    DefaultSuperuserPassword,
+    EnvSecretsInProduction,
+}
+```
+
+**Startup behavior:**
+
+- In `Production` mode: if `validate_production_requirements()` returns any violations, log each at ERROR level and exit with a non-zero status code. The node does not start.
+- In `Development` mode: same checks run but violations are logged at WARN level. The node starts anyway.
+
+### Configuration
+
+| Env Var | Values | Default |
+|---------|--------|---------|
+| `FERROSA_MODE` | `development`, `production` | `development` |
+| `FERROSA_ALLOW_UNENCRYPTED_DISK` | `true`, `false` | `false` |
+
+### Scope
+
+The `DeploymentMode` enum and `validate_production_requirements()` function live in `ferrosa-schema` (since it already handles bootstrap and startup configuration). The actual TLS configuration lives in `ferrosa-cql` and `ferrosa-net` — production mode validation checks that those configs are present, not that it configures TLS itself.
+
+For Chunk A, the validation covers: S3 HTTP, local disk encryption, default superuser password, and secrets provider. CQL TLS and internode TLS checks are added when those crates are implemented.
+
+---
+
 ## NodeConfig
 
 Shared configuration for system keyspace responses:
@@ -667,6 +1012,10 @@ System keyspaces (`system`, `system_schema`, `system_auth`) are protected from u
 - `auth/rate_limit.rs` — backoff calculation, lockout logic, window expiry, counter reset on success
 - `auth/permission.rs` — permission checking with hierarchy, superuser bypass, resource inheritance
 - `registry.rs` — CRUD operations, auth gating, version bumps, error cases (duplicates, not found, permission denied), bootstrap with `FERROSA_SUPERUSER_PASSWORD`
+- `audit/event.rs` — event serialization, all variants constructible
+- `audit/log_sink.rs` — `LogAuditSink` emits valid structured JSON via tracing
+- `secrets/env.rs` — `EnvSecretsProvider` reads correct env vars, returns `None` for missing keys
+- `startup.rs` — production mode rejects S3 HTTP, default password, unencrypted disk; development mode warns
 - `convert.rs` — `TableMetadata::to_storage_schema()` matches expected `TableSchema` output
 
 ### Integration Tests
@@ -678,6 +1027,10 @@ System keyspaces (`system`, `system_schema`, `system_auth`) are protected from u
 - Bootstrap: default superuser with `FERROSA_SUPERUSER_PASSWORD` set uses env password; without it, `must_change_password` is true
 - Rate limiting: repeated failed auth triggers backoff; successful auth resets counter; lockout blocks all attempts
 - Hash filtering: non-superuser `query_roles()` returns `None` for `salted_hash`; superuser sees real hash
+- Audit completeness: every registry mutation and auth call emits exactly one audit event via `TestAuditSink`
+- Audit content: events contain correct actor, timestamp, schema_version, and event-specific fields
+- Production mode: validation rejects missing TLS, HTTP S3, default password; development mode warns only
+- Secrets provider: `EnvSecretsProvider` returns correct values; unknown keys return `None`
 
 ### Property Tests
 

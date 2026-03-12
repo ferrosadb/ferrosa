@@ -109,7 +109,7 @@ graph TB
 | T08 | **E** | Default `cassandra`/`cassandra` superuser credentials left unchanged | 3 | 3 | **9 Critical** | Mitigated: `FERROSA_SUPERUSER_PASSWORD` env var or `must_change_password` flag blocks queries until changed |
 | T09 | **T** | Attacker modifies system keyspaces (`system`, `system_auth`, `system_schema`) | 2 | 3 | **6 High** | Mitigated: `SystemKeyspaceProtected` error on user DDL |
 | T10 | **I** | Password hashes leaked via system_auth query | 2 | 2 | **4 High** | Mitigated: `query_roles()` filters `salted_hash` to `None` for non-superuser callers |
-| T11 | **R** | Admin performs destructive DDL (DROP KEYSPACE) with no audit trail | 2 | 2 | **4 High** | **Open**: No audit logging designed yet |
+| T11 | **R** | Admin performs destructive DDL (DROP KEYSPACE) with no audit trail | 2 | 2 | **4 High** | Mitigated: `AuditSink` trait with `LogAuditSink` default — every DDL and auth event emitted (ADR-008) |
 | T12 | **T** | Race condition in clone-modify-swap corrupts SchemaSnapshot | 1 | 3 | **3 Medium** | Mitigated: `write_lock: Mutex<()>` serializes all mutations |
 | T13 | **E** | Time-of-check-to-time-of-use (TOCTOU): permission checked, then snapshot changes before operation | 1 | 2 | **2 Medium** | Mitigated: permission check and mutation happen under same `write_lock` acquisition |
 | T14 | **D** | Expensive password hashing (bcrypt cost 12 / argon2id) used as DoS vector via repeated auth attempts | 2 | 2 | **4 High** | Mitigated: `AuthRateLimiter` checks *before* hashing — throttled/locked requests consume negligible CPU |
@@ -144,9 +144,9 @@ graph TB
 
 | ID | STRIDE | Threat | Likelihood | Impact | Risk | Status |
 |----|--------|--------|-----------|--------|------|--------|
-| T26 | **I** | Environment variables (`FERROSA_AUTH_*`, `FERROSA_S3_*`) exposed via /proc, container inspection, or logging | 2 | 2 | **4 High** | **Open**: No secrets management integration; env vars contain passwords and keys |
+| T26 | **I** | Environment variables (`FERROSA_AUTH_*`, `FERROSA_S3_*`) exposed via /proc, container inspection, or logging | 2 | 2 | **4 High** | Mitigated: `SecretsProvider` trait (ADR-009) — `EnvSecretsProvider` default, pluggable AWS Secrets Manager/Vault/file backends |
 | T27 | **T** | Attacker sets `FERROSA_AUTH_BCRYPT_COST=4` to weaken password hashing | 1 | 2 | **2 Medium** | Accepted: requires host access; cost floor of 4 is Rust bcrypt crate minimum |
-| T28 | **T** | `FERROSA_S3_ALLOW_HTTP=true` enables unencrypted S3 traffic in production | 2 | 2 | **4 High** | **Open**: No validation that HTTP is only used in dev/test |
+| T28 | **T** | `FERROSA_S3_ALLOW_HTTP=true` enables unencrypted S3 traffic in production | 2 | 2 | **4 High** | Mitigated: `FERROSA_MODE=production` rejects `FERROSA_S3_ALLOW_HTTP=true` at startup (ADR-010) |
 
 ---
 
@@ -169,15 +169,15 @@ graph TB
 | T07 | Privilege escalation via role hierarchy | Already mitigated by cycle detection + auth checks on grant/revoke. Verify in tests. |
 | T09 | System keyspace modification | Already mitigated. Verify in tests. |
 | T10 | Password hash exposure | Mitigated: `query_roles()` filters `salted_hash` to `None` for non-superuser callers. |
-| T11 | No audit trail | Design audit logging (append-only, tamper-evident) for DDL and auth events. |
+| T11 | No audit trail | Mitigated: `AuditSink` trait with `LogAuditSink` in Chunk A (ADR-008). System table sink in Chunk F. |
 | T14 | Auth DoS via hashing cost | Mitigated: rate limiter checks *before* hashing; CQL layer adds per-IP throttle. |
 | T16 | Rogue node joins cluster | Implement mutual TLS for internode with certificate pinning or shared CA. |
 | T19 | S3 data unencrypted at app level | Document SSE-KMS requirement. Startup check verifies bucket encryption is enabled. Envelope encryption deferred to hardening phase. |
 | T21 | S3 credential leak | Prefer instance profiles. Document: never use long-lived access keys in production. |
 | T23 | Manifest CAS conflict | Wire the retry loop (already designed, not connected). |
 | T25 | Commit log corruption | Already mitigated by CRC32. Verify replay rejects corrupt entries in tests. |
-| T26 | Env var secrets exposure | Document secrets manager integration path (AWS Secrets Manager, Vault). |
-| T28 | HTTP S3 in production | Log warning when `FERROSA_S3_ALLOW_HTTP=true`. Consider requiring `FERROSA_ENV=development` to enable. |
+| T26 | Env var secrets exposure | Mitigated: `SecretsProvider` trait with pluggable backends (ADR-009). |
+| T28 | HTTP S3 in production | Mitigated: production mode rejects `FERROSA_S3_ALLOW_HTTP=true` at startup (ADR-010). |
 
 ### Medium (Risk 2-3) — Accept or plan
 
@@ -206,6 +206,9 @@ graph TB
 | `query_roles()` filters `salted_hash` for non-superusers | T10 | Small | Designed |
 | `AuthRateLimiter` with exponential backoff + account lockout | T05, T14 | Medium | Designed |
 | Startup check: warn if data dir not on encrypted filesystem | T24 | Small | Designed |
+| `AuditSink` trait + `LogAuditSink` — structured JSON audit via tracing | T11 | Medium | Designed (ADR-008) |
+| `SecretsProvider` trait + `EnvSecretsProvider` — pluggable secrets backend | T26 | Medium | Designed (ADR-009) |
+| Production mode — `FERROSA_MODE=production` enforces TLS, encryption, no defaults | T02, T16, T24, T28 | Medium | Designed (ADR-010) |
 
 ### Phase 2: Before production (ferrosa-cql + ferrosa-net)
 
@@ -214,13 +217,13 @@ graph TB
 | CQL TLS via rustls (default: required) | T02, T03 | Medium |
 | Connection limits + per-IP rate limiting | T04 | Medium |
 | Internode mutual TLS | T16, T17 | Medium |
-| Audit logging for DDL + auth events | T11 | Medium |
+| Audit: system table sink (`system_auth.audit_log`) | T11 | Medium |
 
 ### Phase 3: Hardening
 
 | Mitigation | Threats | Effort |
 |-----------|---------|--------|
-| Secrets manager integration (AWS Secrets Manager / Vault) | T21, T26 | Medium |
+| Secrets manager concrete providers (AWS SM, Vault, file) | T21 | Medium |
 | S3 bucket policy validation at startup | T22, T28 | Small |
 | Manifest CAS retry loop | T23 | Small (designed, needs wiring) |
 | SSTable read-time checksum verification | T20 | Medium |
@@ -244,7 +247,7 @@ graph TB
 - [ ] What is the audit log format and destination? Append-only local file, structured logging to stdout, or a dedicated system keyspace (`system_auth.audit_log`)?
 - [ ] Should we support client certificate authentication (mutual TLS) as an alternative to password auth?
 - [ ] Do we need S3 object-level integrity verification (SHA-256 checksum on upload, verify on read) or is S3's built-in integrity sufficient?
-- [ ] Should `FERROSA_S3_ALLOW_HTTP` be gated behind a `FERROSA_ENV=development` check?
+- [x] ~~Should `FERROSA_S3_ALLOW_HTTP` be gated behind a `FERROSA_ENV=development` check?~~ **Resolved**: Yes. `FERROSA_MODE=production` rejects it at startup (ADR-010).
 - [x] ~~Should we force superuser password change at bootstrap?~~ **Resolved**: Yes. `FERROSA_SUPERUSER_PASSWORD` env var or `must_change_password` flag.
 - [x] ~~Should `salted_hash` be filtered from non-superuser queries?~~ **Resolved**: Yes. `query_roles()` returns `None` for non-superusers.
 - [x] ~~Should local disk encryption be required?~~ **Resolved**: Yes. Encrypted EBS/LUKS is a deployment prerequisite; startup check warns if not detected.
