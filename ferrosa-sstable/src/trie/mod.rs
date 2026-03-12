@@ -25,3 +25,4 @@
 //! Reference: Cassandra's `BtiFormat.md`, `IncrementalTrieWriterPageAware`
 
 pub mod node;
+pub mod walker;
