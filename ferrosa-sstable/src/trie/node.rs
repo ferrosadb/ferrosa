@@ -222,9 +222,17 @@ pub fn read_node_header(data: &[u8]) -> Result<NodeHeader> {
             if data.len() < 2 {
                 return Err(Error::InvalidData("truncated SingleNopayload4".into()));
             }
-            let trans = data[1] >> 4;
-            let ptr = (data[1] & 0x0F) as u64;
-            (vec![trans], vec![ptr], 2)
+            let ptr = (data[0] & 0x0F) as u64;
+            let trans = data[1];
+            // pb bits are repurposed as pointer bits — no payload
+            return Ok(NodeHeader {
+                node_type,
+                pb: 0,
+                transitions: vec![trans],
+                child_pointers: vec![ptr],
+                payload_offset: 0,
+                total_size: 2,
+            });
         }
 
         NodeType::Single8 => {
@@ -238,8 +246,8 @@ pub fn read_node_header(data: &[u8]) -> Result<NodeHeader> {
             if data.len() < 3 {
                 return Err(Error::InvalidData("truncated SingleNopayload12".into()));
             }
-            let trans = data[1];
-            let ptr = (((data[0] & 0x0F) as u64) << 8) | data[2] as u64;
+            let ptr = (((data[0] & 0x0F) as u64) << 8) | data[1] as u64;
+            let trans = data[2];
             // pb bits are repurposed as upper pointer bits
             return Ok(NodeHeader {
                 node_type,
@@ -594,8 +602,9 @@ mod tests {
     #[test]
     fn read_single_nopayload12_node() {
         // Type 0x3, pb bits repurposed as upper pointer bits
-        // ptr = 0x105 (261), upper nibble = 1, lower byte = 0x05
-        let data = [0x31, b'X', 0x05]; // type=3, pb_bits=1, trans='X', lower=0x05
+        // ptr = 0x105 (261): upper nibble = 1 in type byte, lower byte = 0x05 at data[1]
+        // trans = 'X' at data[2]
+        let data = [0x31, 0x05, b'X']; // type=3, pb_bits=1, lower=0x05, trans='X'
         let header = read_node_header(&data).unwrap();
         assert_eq!(header.node_type, NodeType::SingleNopayload12);
         assert_eq!(header.pb, 0); // Nopayload

@@ -200,10 +200,10 @@ fn encode_payload(payload: &Option<TriePayload>) -> Vec<u8> {
 
 /// Encode a single-child node, choosing the smallest type.
 fn encode_single_node(trans: u8, distance: u64, pb: u8, payload: &[u8]) -> Vec<u8> {
-    if pb == 0 && distance < 16 && trans < 16 {
-        // SingleNopayload4
-        let type_byte = (NodeType::SingleNopayload4 as u8) << 4;
-        vec![type_byte, (trans << 4) | (distance as u8)]
+    if pb == 0 && distance < 16 {
+        // SingleNopayload4: type byte has pointer in lower nibble, trans at data[1]
+        let type_byte = (NodeType::SingleNopayload4 as u8) << 4 | (distance as u8);
+        vec![type_byte, trans]
     } else if distance <= 0xFF {
         // Single8
         let type_byte = (NodeType::Single8 as u8) << 4 | pb;
@@ -211,10 +211,11 @@ fn encode_single_node(trans: u8, distance: u64, pb: u8, payload: &[u8]) -> Vec<u
         buf.extend_from_slice(payload);
         buf
     } else if pb == 0 && distance < 4096 {
-        // SingleNopayload12
+        // SingleNopayload12: type byte has upper 4 bits of pointer in lower nibble,
+        // lower 8 bits of pointer at data[1], transition at data[2]
         let upper = ((distance >> 8) & 0x0F) as u8;
         let type_byte = (NodeType::SingleNopayload12 as u8) << 4 | upper;
-        vec![type_byte, trans, (distance & 0xFF) as u8]
+        vec![type_byte, (distance & 0xFF) as u8, trans]
     } else if distance <= 0xFFFF {
         // Single16
         let type_byte = (NodeType::Single16 as u8) << 4 | pb;

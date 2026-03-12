@@ -14,6 +14,37 @@ use crate::partition_index::{PartitionIndex, PartitionLookup};
 use crate::statistics::{read_statistics, SerializationHeader};
 use crate::types::Partition;
 
+/// Decompress all chunks of Data.db into a contiguous buffer.
+///
+/// Each compressed chunk in Data.db has a trailing 4-byte CRC32 checksum
+/// appended by Cassandra's `CompressedSequentialWriter`. The CRC covers
+/// the compressed data (including the size prefix) and must be stripped
+/// before passing to the decompressor.
+fn decompress_data<R: ReadAt>(data: &R, ci: &CompressionInfo) -> Result<Vec<u8>> {
+    let file_len = data.len()?;
+    let mut decompressed = Vec::with_capacity(ci.data_length as usize);
+
+    for (i, &chunk_offset) in ci.chunk_offsets.iter().enumerate() {
+        // Determine compressed chunk size: from this offset to the next (or end of file)
+        let next_offset = if i + 1 < ci.chunk_offsets.len() {
+            ci.chunk_offsets[i + 1]
+        } else {
+            file_len
+        };
+        let chunk_size = (next_offset - chunk_offset) as usize;
+
+        let mut compressed = vec![0u8; chunk_size];
+        data.read_exact_at(&mut compressed, chunk_offset)?;
+
+        // Strip trailing 4-byte CRC32 checksum
+        let payload = &compressed[..chunk_size.saturating_sub(4)];
+        let chunk = ci.compression.decompress(payload, ci.chunk_length)?;
+        decompressed.extend_from_slice(&chunk);
+    }
+
+    Ok(decompressed)
+}
+
 /// Handles to all component files for an SSTable.
 pub struct SSTableComponents<R> {
     /// Data.db file handle.
@@ -37,6 +68,8 @@ pub struct SSTableReader<R: ReadAt> {
     compression_info: Option<CompressionInfo>,
     header: SerializationHeader,
     data: R,
+    /// Decompressed Data.db contents (when compression is used).
+    decompressed_data: Option<Vec<u8>>,
     #[allow(dead_code)]
     rows: R,
 }
@@ -59,12 +92,20 @@ impl<R: ReadAt> SSTableReader<R> {
 
         let partition_index = PartitionIndex::open(components.partitions)?;
 
+        // Decompress Data.db if compression is configured
+        let decompressed_data = if let Some(ref ci) = compression_info {
+            Some(decompress_data(&components.data, ci)?)
+        } else {
+            None
+        };
+
         Ok(SSTableReader {
             partition_index,
             bloom_filter,
             compression_info,
             header,
             data: components.data,
+            decompressed_data,
             rows: components.rows,
         })
     }
@@ -98,9 +139,14 @@ impl<R: ReadAt> SSTableReader<R> {
             PartitionLookup::NotFound => return Ok(None),
         };
 
-        // Step 3: read partition from Data.db
-        let mut data_reader = DataReader::new(&self.data, &self.header, data_position);
-        data_reader.read_partition()
+        // Step 3: read partition from Data.db (decompressed if applicable)
+        if let Some(ref decompressed) = self.decompressed_data {
+            let mut data_reader = DataReader::new(decompressed, &self.header, data_position);
+            data_reader.read_partition()
+        } else {
+            let mut data_reader = DataReader::new(&self.data, &self.header, data_position);
+            data_reader.read_partition()
+        }
     }
 
     /// Returns the number of partitions in this SSTable.
@@ -140,13 +186,6 @@ mod tests {
     // Test helpers
     // -----------------------------------------------------------------------
 
-    /// Write a signed varint to a buffer.
-    fn push_signed_vint(out: &mut Vec<u8>, value: i64) {
-        let mut buf = [0u8; 9];
-        let n = varint::write_signed_vint(&mut buf, value);
-        out.extend_from_slice(&buf[..n]);
-    }
-
     /// Write an unsigned varint to a buffer.
     fn push_unsigned_vint(out: &mut Vec<u8>, value: u64) {
         let mut buf = [0u8; 9];
@@ -185,10 +224,11 @@ mod tests {
     }
 
     /// Row flags constants (mirrored from data.rs for test use).
-    const HAS_TIMESTAMP: u8 = 0x02;
-    const HAS_ALL_COLUMNS: u8 = 0x10;
-    const CELL_USE_ROW_TIMESTAMP: u8 = 0x01;
+    const HAS_TIMESTAMP: u8 = 0x04;
+    const HAS_ALL_COLUMNS: u8 = 0x20;
+    const CELL_USE_ROW_TIMESTAMP: u8 = 0x08;
     const END_OF_PARTITION: u8 = 0x01;
+    const DELETION_IS_LIVE: u8 = 0x80;
 
     /// Build a Data.db blob for a single partition.
     ///
@@ -201,24 +241,23 @@ mod tests {
         data.extend_from_slice(&(key.len() as u16).to_be_bytes());
         data.extend_from_slice(key);
 
-        // Live deletion time
-        data.extend_from_slice(&i32::MAX.to_be_bytes());
-        data.extend_from_slice(&i64::MIN.to_be_bytes());
+        // Live deletion time (Cassandra 5.x: single byte 0x80)
+        data.push(DELETION_IS_LIVE);
 
         // Row flags: HAS_TIMESTAMP | HAS_ALL_COLUMNS
         data.push(HAS_TIMESTAMP | HAS_ALL_COLUMNS);
 
-        // Clustering key
+        // Clustering key (ClusteringPrefix format, Int32Type = fixed-length)
         let clustering = [0x00u8, 0x00, 0x00, 0x01];
-        push_unsigned_vint(&mut data, clustering.len() as u64);
+        push_unsigned_vint(&mut data, 0); // clustering header: all non-null, non-empty
         data.extend_from_slice(&clustering);
 
         // Row body size + prev unfiltered size (both skipped by reader)
         push_unsigned_vint(&mut data, 20);
         push_unsigned_vint(&mut data, 0);
 
-        // Liveness timestamp delta = 42
-        push_signed_vint(&mut data, 42);
+        // Liveness timestamp delta = 42 (unsigned varint)
+        push_unsigned_vint(&mut data, 42);
 
         // Cell: use row timestamp, value = b"hello"
         data.push(CELL_USE_ROW_TIMESTAMP);

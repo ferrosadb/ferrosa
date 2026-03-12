@@ -6,7 +6,7 @@
 //!
 //! Timestamps, TTLs, and local deletion times are **delta-encoded** against
 //! the baseline values stored in the [`SerializationHeader`] from Statistics.db.
-//! This dramatically reduces on-disk size when values cluster near the minimum.
+//! Deltas are written as **unsigned varints** (not zigzag-encoded).
 //!
 //! # Deferred
 //!
@@ -15,42 +15,70 @@
 //!
 //! [`SerializationHeader`]: crate::statistics::SerializationHeader
 
-use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Result};
+use ferrosa_common::{CellValue, DecoratedKey, Error, PartitionKey, Result};
 
 use crate::io::ReadAt;
+use crate::marshal;
 use crate::statistics::SerializationHeader;
 use crate::types::{DeletionTime, LivenessInfo, Partition, Row};
 use crate::varint;
 
 // ---------------------------------------------------------------------------
 // Row flags (bit positions in the flags byte preceding each unfiltered row)
+// Reference: UnfilteredSerializer.java lines 108-118
 // ---------------------------------------------------------------------------
 
 /// Marks the end of a partition's row sequence.
 const END_OF_PARTITION: u8 = 0x01;
+/// Whether the encoded unfiltered is a range tombstone marker (not a row).
+const IS_MARKER: u8 = 0x02;
 /// Row has a non-default timestamp (delta-encoded).
-const HAS_TIMESTAMP: u8 = 0x02;
+const HAS_TIMESTAMP: u8 = 0x04;
 /// Row has a TTL (delta-encoded).
-const HAS_TTL: u8 = 0x04;
+const HAS_TTL: u8 = 0x08;
 /// Row has a row-level deletion time.
-const HAS_DELETION: u8 = 0x08;
+const HAS_DELETION: u8 = 0x10;
 /// All columns in the schema are present (no missing-column bitmap).
-const HAS_ALL_COLUMNS: u8 = 0x10;
+const HAS_ALL_COLUMNS: u8 = 0x20;
+/// Row has complex column deletion for at least one column.
+#[allow(dead_code)]
+const HAS_COMPLEX_DELETION: u8 = 0x40;
+/// Extended flags byte follows.
+const EXTENSION_FLAG: u8 = 0x80;
+
+// ---------------------------------------------------------------------------
+// Extended flags (second byte, only present if EXTENSION_FLAG is set)
+// Reference: UnfilteredSerializer.java lines 120-131
+// ---------------------------------------------------------------------------
+
 /// This row is a static row (no clustering key).
-const IS_STATIC: u8 = 0x20;
+const EXT_IS_STATIC: u8 = 0x01;
 
 // ---------------------------------------------------------------------------
 // Cell flags
+// Reference: Cell.java lines 279-283
 // ---------------------------------------------------------------------------
 
-/// Cell inherits the row-level timestamp (no per-cell timestamp encoded).
-const CELL_USE_ROW_TIMESTAMP: u8 = 0x01;
-/// Cell inherits the row-level TTL.
-const CELL_USE_ROW_TTL: u8 = 0x02;
 /// Cell is a tombstone (deleted).
-const CELL_IS_DELETED: u8 = 0x04;
-/// Cell is empty (no value bytes).
-const CELL_IS_EMPTY: u8 = 0x08;
+const CELL_IS_DELETED: u8 = 0x01;
+/// Cell is expiring (has TTL).
+const CELL_IS_EXPIRING: u8 = 0x02;
+/// Cell has an empty value (tombstones, counters).
+const CELL_HAS_EMPTY_VALUE: u8 = 0x04;
+/// Cell inherits the row-level timestamp (no per-cell timestamp encoded).
+const CELL_USE_ROW_TIMESTAMP: u8 = 0x08;
+/// Cell inherits the row-level TTL.
+const CELL_USE_ROW_TTL: u8 = 0x10;
+
+// ---------------------------------------------------------------------------
+// Partition-level DeletionTime format (Cassandra 5.x UInt format)
+// Reference: DeletionTime.java lines 216-254
+// ---------------------------------------------------------------------------
+
+/// Byte marker for a live (not deleted) partition. Since real timestamps are
+/// positive, the MSB of `markedForDeleteAt` is always 0 for non-live
+/// deletions, so `0x80` in the first byte signals LIVE.
+const DELETION_IS_LIVE: u8 = 0x80;
 
 // ---------------------------------------------------------------------------
 // DataReader
@@ -109,6 +137,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     // -----------------------------------------------------------------------
 
     /// Read the partition header: key bytes + partition-level deletion time.
+    ///
+    /// Cassandra 5.x DeletionTime (UInt format):
+    /// - **LIVE**: single byte `0x80`
+    /// - **Non-live**: first byte is MSB of `markedForDeleteAt` (sign bit = 0),
+    ///   followed by 7 more bytes to complete the i64, then 4-byte u32
+    ///   `localDeletionTime`. Total: 12 bytes.
     fn read_partition_header(&mut self) -> Result<(Vec<u8>, DeletionTime)> {
         // Key: u16 BE length + key bytes
         let mut len_buf = [0u8; 2];
@@ -120,18 +154,35 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         self.reader.read_exact_at(&mut key_bytes, self.pos)?;
         self.pos += key_len as u64;
 
-        // Deletion time: i32 local_deletion_time + i64 marked_for_delete_at
-        let mut del_buf = [0u8; 12];
-        self.reader.read_exact_at(&mut del_buf, self.pos)?;
-        self.pos += 12;
+        // DeletionTime: read first byte to determine format
+        let mut first = [0u8; 1];
+        self.reader.read_exact_at(&mut first, self.pos)?;
+        self.pos += 1;
 
-        let local_deletion_time = i32::from_be_bytes(del_buf[0..4].try_into().unwrap());
-        let marked_for_delete_at = i64::from_be_bytes(del_buf[4..12].try_into().unwrap());
-
-        let deletion = if local_deletion_time == i32::MAX && marked_for_delete_at == i64::MIN {
+        let deletion = if first[0] & DELETION_IS_LIVE != 0 {
+            // LIVE — verify the byte is exactly 0x80
+            if first[0] != DELETION_IS_LIVE {
+                return Err(Error::InvalidData(format!(
+                    "corrupted DeletionTime flags: {:#04x}",
+                    first[0]
+                )));
+            }
             DeletionTime::LIVE
         } else {
-            DeletionTime::new(marked_for_delete_at, local_deletion_time as u32)
+            // Non-live: first byte is MSB of markedForDeleteAt (i64 BE).
+            // Read remaining 7 bytes of the long, then 4-byte ldt.
+            let mut remaining = [0u8; 11];
+            self.reader.read_exact_at(&mut remaining, self.pos)?;
+            self.pos += 11;
+
+            let mut mfda_bytes = [0u8; 8];
+            mfda_bytes[0] = first[0];
+            mfda_bytes[1..8].copy_from_slice(&remaining[0..7]);
+            let marked_for_delete_at = i64::from_be_bytes(mfda_bytes);
+
+            let local_deletion_time = u32::from_be_bytes(remaining[7..11].try_into().unwrap());
+
+            DeletionTime::new(marked_for_delete_at, local_deletion_time)
         };
 
         Ok((key_bytes, deletion))
@@ -156,9 +207,26 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 break;
             }
 
-            let row = self.read_row(flags)?;
+            if flags & IS_MARKER != 0 {
+                return Err(Error::InvalidData(
+                    "range tombstone markers not yet supported".into(),
+                ));
+            }
 
-            if flags & IS_STATIC != 0 {
+            // Extended flags byte (only present if EXTENSION_FLAG is set)
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            let row = self.read_row(flags, is_static)?;
+
+            if is_static {
                 static_row = Some(row);
             } else {
                 rows.push(row);
@@ -169,20 +237,47 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     }
 
     /// Read a single row given its already-consumed flags byte.
-    fn read_row(&mut self, flags: u8) -> Result<Row> {
-        let is_static = flags & IS_STATIC != 0;
-
+    fn read_row(&mut self, flags: u8, is_static: bool) -> Result<Row> {
         // Clustering key (not present for static rows)
+        //
+        // Cassandra 5.x ClusteringPrefix format:
+        //   - Header varint: 2 bits per component (null/empty flags, batched per 32)
+        //   - Per non-null/non-empty component:
+        //     - Fixed-length types (Int32Type etc.): raw bytes, no length prefix
+        //     - Variable-length types (UTF8Type etc.): varint(size) + value bytes
+        //
+        // Reference: ClusteringPrefix.Serializer + AbstractType.writeValue
         let clustering = if is_static {
             Vec::new()
         } else {
-            let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            let num_clustering = self.header.clustering_types.len();
+            let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            let ck_len = len as usize;
-            let mut cbuf = vec![0u8; ck_len];
-            self.reader.read_exact_at(&mut cbuf, self.pos)?;
-            self.pos += ck_len as u64;
-            cbuf
+
+            let mut ck_bytes = Vec::new();
+            for i in 0..num_clustering {
+                let is_null = (header_bits & (1u64 << (2 * i))) != 0;
+                let is_empty = (header_bits & (1u64 << (2 * i + 1))) != 0;
+
+                if is_null || is_empty {
+                    continue;
+                }
+
+                let type_name = &self.header.clustering_types[i];
+                let vlen = match marshal::value_length_if_fixed(type_name) {
+                    Some(fixed_len) => fixed_len,
+                    None => {
+                        let (len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                        self.pos += n as u64;
+                        len as usize
+                    }
+                };
+                let mut vbuf = vec![0u8; vlen];
+                self.reader.read_exact_at(&mut vbuf, self.pos)?;
+                self.pos += vlen as u64;
+                ck_bytes.extend_from_slice(&vbuf);
+            }
+            ck_bytes
         };
 
         // Row body size (serialized row size varint — we skip this, it's used
@@ -194,42 +289,41 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         let (_prev_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
         self.pos += n as u64;
 
-        // Liveness info
+        // Liveness info (unsigned varint deltas against SerializationHeader)
         let mut liveness = LivenessInfo::NONE;
         if flags & HAS_TIMESTAMP != 0 {
-            let (delta, n) = varint::read_signed_vint_at(self.reader, self.pos)?;
+            let (delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            liveness.timestamp = self.header.min_timestamp + delta;
+            liveness.timestamp = self.header.min_timestamp + delta as i64;
 
             if flags & HAS_TTL != 0 {
-                let (ttl_delta, n) = varint::read_signed_vint_at(self.reader, self.pos)?;
+                let (ttl_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
                 self.pos += n as u64;
                 liveness.ttl = self.header.min_ttl + ttl_delta as i32;
 
-                let (ldt_delta, n) = varint::read_signed_vint_at(self.reader, self.pos)?;
+                let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
                 self.pos += n as u64;
                 liveness.local_deletion_time =
                     self.header.min_local_deletion_time + ldt_delta as i32;
             }
         }
 
-        // Row-level deletion
+        // Row-level deletion (unsigned varint deltas via SerializationHeader)
         let deletion = if flags & HAS_DELETION != 0 {
-            let (ts_delta, n) = varint::read_signed_vint_at(self.reader, self.pos)?;
+            let (ts_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            let (ldt_delta, n) = varint::read_signed_vint_at(self.reader, self.pos)?;
+            let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
 
-            let marked_for_delete_at = self.header.min_timestamp + ts_delta;
+            let marked_for_delete_at = self.header.min_timestamp + ts_delta as i64;
             let local_deletion_time =
-                (self.header.min_local_deletion_time + ldt_delta as i32) as u32;
+                (self.header.min_local_deletion_time as i64 + ldt_delta as i64) as u32;
             DeletionTime::new(marked_for_delete_at, local_deletion_time)
         } else {
             DeletionTime::LIVE
         };
 
         // Columns present bitmap (only if not HAS_ALL_COLUMNS)
-        // For simplicity, when HAS_ALL_COLUMNS is not set we read a bitmap.
         let columns = if is_static {
             &self.header.static_columns
         } else {
@@ -241,7 +335,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             (0..num_columns).collect()
         } else {
             // Bitmap: ceil(num_columns / 8) bytes, one bit per column (MSB first).
-            // A set bit means the column is NOT present (missing).
+            // A SET bit means the column IS present (Cassandra BooleanArraySerializer).
             let bitmap_bytes = num_columns.div_ceil(8);
             let mut bitmap = vec![0u8; bitmap_bytes];
             self.reader.read_exact_at(&mut bitmap, self.pos)?;
@@ -251,7 +345,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             for i in 0..num_columns {
                 let byte_idx = i / 8;
                 let bit_idx = 7 - (i % 8); // MSB first
-                if bitmap[byte_idx] & (1 << bit_idx) == 0 {
+                if bitmap[byte_idx] & (1 << bit_idx) != 0 {
                     present.push(i);
                 }
             }
@@ -261,7 +355,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         // Read cells for present columns
         let mut cells = Vec::with_capacity(present_columns.len());
         for &col_idx in &present_columns {
-            let cell = self.read_cell(flags, &liveness)?;
+            let cell = self.read_cell(&liveness)?;
             cells.push((col_idx as u16, cell));
         }
 
@@ -275,46 +369,55 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
 
     // -----------------------------------------------------------------------
     // Internal: cell reading
+    // Reference: Cell.Serializer in Cell.java lines 377-419
     // -----------------------------------------------------------------------
 
-    /// Read a single cell value. The row's flags and liveness are needed for
-    /// inheriting row-level timestamp/TTL.
-    fn read_cell(&mut self, _row_flags: u8, row_liveness: &LivenessInfo) -> Result<CellValue> {
+    /// Read a single cell value.
+    fn read_cell(&mut self, row_liveness: &LivenessInfo) -> Result<CellValue> {
         let mut cell_flags_buf = [0u8; 1];
         self.reader.read_exact_at(&mut cell_flags_buf, self.pos)?;
         self.pos += 1;
         let cell_flags = cell_flags_buf[0];
 
         let is_deleted = cell_flags & CELL_IS_DELETED != 0;
-        let is_empty = cell_flags & CELL_IS_EMPTY != 0;
+        let is_expiring = cell_flags & CELL_IS_EXPIRING != 0;
+        let has_empty_value = cell_flags & CELL_HAS_EMPTY_VALUE != 0;
         let use_row_timestamp = cell_flags & CELL_USE_ROW_TIMESTAMP != 0;
         let use_row_ttl = cell_flags & CELL_USE_ROW_TTL != 0;
 
-        // Timestamp
+        // Timestamp (unsigned varint delta)
         let timestamp = if use_row_timestamp {
             row_liveness.timestamp
         } else {
-            let (delta, n) = varint::read_signed_vint_at(self.reader, self.pos)?;
+            let (delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            self.header.min_timestamp + delta
+            self.header.min_timestamp + delta as i64
         };
 
         // Local deletion time (for tombstones and expiring cells)
-        let mut local_deletion_time = ferrosa_common::NO_DELETION_TIME;
-        let mut ttl = ferrosa_common::NO_TTL;
-
-        if is_deleted {
-            // Deleted cells have a local deletion time delta
-            let (ldt_delta, n) = varint::read_signed_vint_at(self.reader, self.pos)?;
+        let local_deletion_time = if use_row_ttl {
+            row_liveness.local_deletion_time
+        } else if is_deleted || is_expiring {
+            let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            local_deletion_time = self.header.min_local_deletion_time + ldt_delta as i32;
-        } else if use_row_ttl {
-            ttl = row_liveness.ttl;
-            local_deletion_time = row_liveness.local_deletion_time;
-        }
+            self.header.min_local_deletion_time + ldt_delta as i32
+        } else {
+            ferrosa_common::NO_DELETION_TIME
+        };
 
-        // Value
-        let value = if is_deleted || is_empty {
+        // TTL (for expiring cells only)
+        let ttl = if use_row_ttl {
+            row_liveness.ttl
+        } else if is_expiring {
+            let (ttl_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            self.header.min_ttl + ttl_delta as i32
+        } else {
+            ferrosa_common::NO_TTL
+        };
+
+        // Value (absent if HAS_EMPTY_VALUE is set)
+        let value = if has_empty_value {
             None
         } else {
             let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -328,7 +431,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
 
         if is_deleted {
             Ok(CellValue::tombstone(timestamp, local_deletion_time))
-        } else if ttl != ferrosa_common::NO_TTL {
+        } else if is_expiring {
             Ok(CellValue::expiring(
                 value.unwrap_or_default(),
                 timestamp,
@@ -350,18 +453,16 @@ mod tests {
     use super::*;
     use crate::varint;
 
-    /// Helper: write a signed varint to a buffer, return bytes written.
-    fn push_signed_vint(out: &mut Vec<u8>, value: i64) {
-        let mut buf = [0u8; 9];
-        let n = varint::write_signed_vint(&mut buf, value);
-        out.extend_from_slice(&buf[..n]);
-    }
-
-    /// Helper: write an unsigned varint to a buffer, return bytes written.
+    /// Helper: write an unsigned varint to a buffer.
     fn push_unsigned_vint(out: &mut Vec<u8>, value: u64) {
         let mut buf = [0u8; 9];
         let n = varint::write_unsigned_vint(&mut buf, value);
         out.extend_from_slice(&buf[..n]);
+    }
+
+    /// Write a LIVE DeletionTime (single byte 0x80).
+    fn push_live_deletion(out: &mut Vec<u8>) {
+        out.push(DELETION_IS_LIVE);
     }
 
     /// Build a minimal serialization header for testing.
@@ -385,41 +486,35 @@ mod tests {
     /// Partition: key = b"pk1", live deletion
     /// Row: clustering = [0x00, 0x00, 0x00, 0x01] (int 1), timestamp delta = 42
     /// Cell: uses row timestamp, value = b"hello"
-    fn build_one_partition_blob(header: &SerializationHeader) -> Vec<u8> {
+    fn build_one_partition_blob(_header: &SerializationHeader) -> Vec<u8> {
         let mut data = Vec::new();
 
         // -- Partition header --
-        // Key: u16 BE length + key bytes
         let key = b"pk1";
         data.extend_from_slice(&(key.len() as u16).to_be_bytes());
         data.extend_from_slice(key);
-
-        // Deletion time: i32 local_deletion_time + i64 marked_for_delete_at (live)
-        data.extend_from_slice(&i32::MAX.to_be_bytes()); // live sentinel
-        data.extend_from_slice(&i64::MIN.to_be_bytes()); // live sentinel
+        push_live_deletion(&mut data);
 
         // -- Row --
         // Flags: HAS_TIMESTAMP | HAS_ALL_COLUMNS
-        let row_flags: u8 = HAS_TIMESTAMP | HAS_ALL_COLUMNS;
-        data.push(row_flags);
+        data.push(HAS_TIMESTAMP | HAS_ALL_COLUMNS);
 
-        // Clustering key: varint length + bytes
+        // Clustering key (ClusteringPrefix format): header varint + raw fixed-length bytes
+        // Int32Type is fixed-length (4 bytes), so no varint length prefix.
         let clustering = [0x00u8, 0x00, 0x00, 0x01]; // int32 = 1
-        push_unsigned_vint(&mut data, clustering.len() as u64);
+        push_unsigned_vint(&mut data, 0); // header: all non-null, non-empty
         data.extend_from_slice(&clustering);
 
-        // Row body size (we write a dummy value — the reader skips it)
+        // Row body size (dummy — reader skips it)
         push_unsigned_vint(&mut data, 20);
         // Previous unfiltered size
         push_unsigned_vint(&mut data, 0);
 
-        // Liveness info: timestamp delta = 42 (no TTL since HAS_TTL not set)
-        let ts_delta = 42i64;
-        push_signed_vint(&mut data, ts_delta);
+        // Liveness info: timestamp delta = 42 (unsigned varint)
+        push_unsigned_vint(&mut data, 42);
 
         // Cell: use row timestamp, has value
-        let cell_flags: u8 = CELL_USE_ROW_TIMESTAMP;
-        data.push(cell_flags);
+        data.push(CELL_USE_ROW_TIMESTAMP);
 
         // Value: varint length + bytes
         let value = b"hello";
@@ -429,7 +524,6 @@ mod tests {
         // -- End of partition --
         data.push(END_OF_PARTITION);
 
-        let _ = header; // used for documentation clarity
         data
     }
 
@@ -488,8 +582,7 @@ mod tests {
         let key = b"empty";
         data.extend_from_slice(&(key.len() as u16).to_be_bytes());
         data.extend_from_slice(key);
-        data.extend_from_slice(&i32::MAX.to_be_bytes());
-        data.extend_from_slice(&i64::MIN.to_be_bytes());
+        push_live_deletion(&mut data);
 
         // Immediately end of partition
         data.push(END_OF_PARTITION);
@@ -518,31 +611,28 @@ mod tests {
         let key = b"pk2";
         data.extend_from_slice(&(key.len() as u16).to_be_bytes());
         data.extend_from_slice(key);
-        data.extend_from_slice(&i32::MAX.to_be_bytes());
-        data.extend_from_slice(&i64::MIN.to_be_bytes());
+        push_live_deletion(&mut data);
 
         // Row: HAS_TIMESTAMP | HAS_ALL_COLUMNS
-        let row_flags: u8 = HAS_TIMESTAMP | HAS_ALL_COLUMNS;
-        data.push(row_flags);
+        data.push(HAS_TIMESTAMP | HAS_ALL_COLUMNS);
 
-        // Clustering
+        // Clustering (Int32Type = fixed-length, no varint prefix)
         let clustering = [0x00u8, 0x00, 0x00, 0x02];
-        push_unsigned_vint(&mut data, clustering.len() as u64);
+        push_unsigned_vint(&mut data, 0); // clustering header
         data.extend_from_slice(&clustering);
 
         // Row body size + prev size
         push_unsigned_vint(&mut data, 30);
         push_unsigned_vint(&mut data, 0);
 
-        // Liveness timestamp delta = 100
-        push_signed_vint(&mut data, 100);
+        // Liveness timestamp delta = 100 (unsigned varint)
+        push_unsigned_vint(&mut data, 100);
 
         // Cell: does NOT use row timestamp (flags = 0), has its own timestamp
-        let cell_flags: u8 = 0;
-        data.push(cell_flags);
+        data.push(0x00);
 
-        // Cell timestamp delta = 200
-        push_signed_vint(&mut data, 200);
+        // Cell timestamp delta = 200 (unsigned varint)
+        push_unsigned_vint(&mut data, 200);
 
         // Value
         let value = b"world";
@@ -569,45 +659,53 @@ mod tests {
 
     #[test]
     fn read_partition_with_deleted_cell() {
-        let header = test_header();
+        // Use a header where min_local_deletion_time allows positive unsigned deltas
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: 50,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        };
+
         let mut data = Vec::new();
 
         // Partition header
         let key = b"pk3";
         data.extend_from_slice(&(key.len() as u16).to_be_bytes());
         data.extend_from_slice(key);
-        data.extend_from_slice(&i32::MAX.to_be_bytes());
-        data.extend_from_slice(&i64::MIN.to_be_bytes());
+        push_live_deletion(&mut data);
 
         // Row: HAS_TIMESTAMP | HAS_ALL_COLUMNS
-        let row_flags: u8 = HAS_TIMESTAMP | HAS_ALL_COLUMNS;
-        data.push(row_flags);
+        data.push(HAS_TIMESTAMP | HAS_ALL_COLUMNS);
 
-        // Clustering
+        // Clustering (Int32Type = fixed-length, no varint prefix)
         let clustering = [0x00u8, 0x00, 0x00, 0x03];
-        push_unsigned_vint(&mut data, clustering.len() as u64);
+        push_unsigned_vint(&mut data, 0); // clustering header
         data.extend_from_slice(&clustering);
 
         // Row body size + prev size
         push_unsigned_vint(&mut data, 20);
         push_unsigned_vint(&mut data, 0);
 
-        // Liveness timestamp delta = 50
-        push_signed_vint(&mut data, 50);
+        // Liveness timestamp delta = 50 (unsigned)
+        push_unsigned_vint(&mut data, 50);
 
-        // Cell: deleted, does not use row timestamp
-        let cell_flags: u8 = CELL_IS_DELETED;
-        data.push(cell_flags);
+        // Cell: deleted + empty value, does not use row timestamp
+        data.push(CELL_IS_DELETED | CELL_HAS_EMPTY_VALUE);
 
-        // Cell timestamp delta = 60
-        push_signed_vint(&mut data, 60);
+        // Cell timestamp delta = 60 (unsigned)
+        push_unsigned_vint(&mut data, 60);
 
-        // Local deletion time delta (relative to header.min_local_deletion_time)
-        // header.min_local_deletion_time = i32::MAX, delta = -2147483547
-        // so actual = i32::MAX + (-2147483547) = 100
-        push_signed_vint(&mut data, -2_147_483_547);
+        // Local deletion time delta = 50 (actual = min(50) + 50 = 100)
+        push_unsigned_vint(&mut data, 50);
 
-        // No value (deleted cell)
+        // No value (HAS_EMPTY_VALUE set)
 
         // End of partition
         data.push(END_OF_PARTITION);
@@ -635,8 +733,7 @@ mod tests {
         let key2 = b"pk2";
         data.extend_from_slice(&(key2.len() as u16).to_be_bytes());
         data.extend_from_slice(key2);
-        data.extend_from_slice(&i32::MAX.to_be_bytes());
-        data.extend_from_slice(&i64::MIN.to_be_bytes());
+        push_live_deletion(&mut data);
         data.push(END_OF_PARTITION);
 
         let mut reader = DataReader::new(&data, &header, 0);
@@ -654,38 +751,48 @@ mod tests {
 
     #[test]
     fn read_partition_with_row_deletion() {
-        let header = test_header();
+        // Use a header where min_local_deletion_time allows positive unsigned deltas
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: 0,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        };
+
         let mut data = Vec::new();
 
         // Partition header
         let key = b"pkdel";
         data.extend_from_slice(&(key.len() as u16).to_be_bytes());
         data.extend_from_slice(key);
-        data.extend_from_slice(&i32::MAX.to_be_bytes());
-        data.extend_from_slice(&i64::MIN.to_be_bytes());
+        push_live_deletion(&mut data);
 
         // Row: HAS_TIMESTAMP | HAS_DELETION | HAS_ALL_COLUMNS
-        let row_flags: u8 = HAS_TIMESTAMP | HAS_DELETION | HAS_ALL_COLUMNS;
-        data.push(row_flags);
+        data.push(HAS_TIMESTAMP | HAS_DELETION | HAS_ALL_COLUMNS);
 
-        // Clustering
+        // Clustering (Int32Type = fixed-length, no varint prefix)
         let clustering = [0x00u8, 0x00, 0x00, 0x07];
-        push_unsigned_vint(&mut data, clustering.len() as u64);
+        push_unsigned_vint(&mut data, 0); // clustering header
         data.extend_from_slice(&clustering);
 
         // Row body size + prev size
         push_unsigned_vint(&mut data, 30);
         push_unsigned_vint(&mut data, 0);
 
-        // Liveness timestamp delta = 10
-        push_signed_vint(&mut data, 10);
+        // Liveness timestamp delta = 10 (unsigned)
+        push_unsigned_vint(&mut data, 10);
 
-        // Row deletion: timestamp delta = 20, local_deletion_time delta
-        // ldt: we want local_deletion_time = 500. header.min_local_deletion_time = i32::MAX.
-        // delta = 500 - i32::MAX
-        push_signed_vint(&mut data, 20);
-        let ldt_delta = 500i64 - i32::MAX as i64;
-        push_signed_vint(&mut data, ldt_delta);
+        // Row deletion: timestamp delta = 20, local_deletion_time delta = 500
+        // actual mfda = 1_000_000 + 20 = 1_000_020
+        // actual ldt = 0 + 500 = 500
+        push_unsigned_vint(&mut data, 20);
+        push_unsigned_vint(&mut data, 500);
 
         // Cell: use row timestamp
         data.push(CELL_USE_ROW_TIMESTAMP);
@@ -735,30 +842,28 @@ mod tests {
         let key = b"pk_sparse";
         data.extend_from_slice(&(key.len() as u16).to_be_bytes());
         data.extend_from_slice(key);
-        data.extend_from_slice(&i32::MAX.to_be_bytes());
-        data.extend_from_slice(&i64::MIN.to_be_bytes());
+        push_live_deletion(&mut data);
 
         // Row: HAS_TIMESTAMP, no HAS_ALL_COLUMNS
-        let row_flags: u8 = HAS_TIMESTAMP;
-        data.push(row_flags);
+        data.push(HAS_TIMESTAMP);
 
-        // Clustering
+        // Clustering (Int32Type = fixed-length, no varint prefix)
         let clustering = [0x00u8, 0x00, 0x00, 0x05];
-        push_unsigned_vint(&mut data, clustering.len() as u64);
+        push_unsigned_vint(&mut data, 0); // clustering header
         data.extend_from_slice(&clustering);
 
         // Row body size + prev size
         push_unsigned_vint(&mut data, 20);
         push_unsigned_vint(&mut data, 0);
 
-        // Liveness timestamp delta = 10
-        push_signed_vint(&mut data, 10);
+        // Liveness timestamp delta = 10 (unsigned)
+        push_unsigned_vint(&mut data, 10);
 
         // Missing-column bitmap: 2 columns -> 1 byte
         // We want column 0 present, column 1 missing.
-        // Bitmap: bit 7 = col 0 (0 = present), bit 6 = col 1 (1 = missing)
-        // = 0b01000000 = 0x40
-        data.push(0x40);
+        // Bitmap: bit 7 = col 0 (1 = present), bit 6 = col 1 (0 = missing)
+        // = 0b10000000 = 0x80
+        data.push(0x80);
 
         // Only column 0's cell: use row timestamp
         data.push(CELL_USE_ROW_TIMESTAMP);
@@ -810,27 +915,26 @@ mod tests {
         let key = b"ts_test";
         data.extend_from_slice(&(key.len() as u16).to_be_bytes());
         data.extend_from_slice(key);
-        data.extend_from_slice(&i32::MAX.to_be_bytes());
-        data.extend_from_slice(&i64::MIN.to_be_bytes());
+        push_live_deletion(&mut data);
 
         // Row: HAS_TIMESTAMP | HAS_ALL_COLUMNS
         data.push(HAS_TIMESTAMP | HAS_ALL_COLUMNS);
 
-        // Clustering
+        // Clustering (Int32Type = fixed-length, no varint prefix)
         let clustering = [0x00u8, 0x00, 0x00, 0x0A];
-        push_unsigned_vint(&mut data, clustering.len() as u64);
+        push_unsigned_vint(&mut data, 0); // clustering header
         data.extend_from_slice(&clustering);
 
         // Row body size + prev size
         push_unsigned_vint(&mut data, 20);
         push_unsigned_vint(&mut data, 0);
 
-        // Liveness timestamp delta = 999
-        push_signed_vint(&mut data, 999);
+        // Liveness timestamp delta = 999 (unsigned)
+        push_unsigned_vint(&mut data, 999);
 
-        // Cell: own timestamp, delta = 1500
+        // Cell: own timestamp, delta = 1500 (unsigned)
         data.push(0x00); // no cell flags
-        push_signed_vint(&mut data, 1500);
+        push_unsigned_vint(&mut data, 1500);
         let value = b"ts_value";
         push_unsigned_vint(&mut data, value.len() as u64);
         data.extend_from_slice(value);
@@ -861,5 +965,34 @@ mod tests {
 
         let _ = reader.read_partition().unwrap();
         assert_eq!(reader.position(), data_len);
+    }
+
+    #[test]
+    fn read_non_live_partition_deletion() {
+        let header = test_header();
+        let mut data = Vec::new();
+
+        // Partition header: key = b"del"
+        let key = b"del";
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+
+        // Non-live DeletionTime: 8-byte markedForDeleteAt + 4-byte localDeletionTime
+        let mfda: i64 = 1_700_000_000;
+        let ldt: u32 = 1_700_000;
+        data.extend_from_slice(&mfda.to_be_bytes());
+        data.extend_from_slice(&ldt.to_be_bytes());
+
+        data.push(END_OF_PARTITION);
+
+        let mut reader = DataReader::new(&data, &header, 0);
+        let partition = reader
+            .read_partition()
+            .unwrap()
+            .expect("expected partition");
+
+        assert!(!partition.deletion.is_live());
+        assert_eq!(partition.deletion.marked_for_delete_at, mfda);
+        assert_eq!(partition.deletion.local_deletion_time, ldt);
     }
 }
