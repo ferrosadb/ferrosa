@@ -9,6 +9,7 @@
 //! - **CommitLog**: write-ahead log for durability (Part B)
 
 pub mod commitlog;
+pub mod compaction;
 pub mod flush;
 pub mod memtable;
 pub mod merge;
