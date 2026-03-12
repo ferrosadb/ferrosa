@@ -8,6 +8,7 @@ pub(crate) mod config;
 pub(crate) mod descriptor;
 pub(crate) mod mutation;
 pub(crate) mod segment;
+pub(crate) mod sync;
 
 pub use config::{CommitLogConfig, CommitLogPosition, SyncStrategyConfig, TableId};
 pub use mutation::Mutation;
