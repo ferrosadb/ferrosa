@@ -48,7 +48,7 @@ impl Default for NodeConfig {
             listen_port: 7000,
             broadcast_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             broadcast_port: 7000,
-            rpc_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            rpc_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             tokens: Vec::new(),
         }
     }

@@ -27,9 +27,9 @@ pub struct PeerInfo {
     /// Preferred port for inter-node communication, if different from peer_port.
     pub preferred_port: Option<u16>,
     /// Address for CQL native transport connections.
-    pub native_transport_address: IpAddr,
+    pub native_address: IpAddr,
     /// Port for CQL native transport connections.
-    pub native_transport_port: u16,
+    pub native_port: u16,
     /// Schema version the peer is running.
     pub schema_version: Uuid,
     /// Token ranges owned by this peer.
@@ -55,6 +55,8 @@ pub fn query_peers(schema: &Schema, cluster: &dyn ClusterState) -> Vec<PeerInfo>
     let snap = schema.snapshot();
     let mut peers = cluster.peers();
     for peer in &mut peers {
+        // TODO: In multi-node mode, peers should report their own schema_version.
+        // This stamp is a single-node placeholder.
         peer.schema_version = snap.version;
     }
     peers
@@ -113,8 +115,8 @@ mod tests {
                     host_id: Uuid::new_v4(),
                     preferred_ip: None,
                     preferred_port: None,
-                    native_transport_address: "192.168.1.2".parse().unwrap(),
-                    native_transport_port: 9042,
+                    native_address: "192.168.1.2".parse().unwrap(),
+                    native_port: 9042,
                     schema_version: Uuid::nil(), // will be overwritten
                     tokens: vec!["-9223372036854775808".to_string()],
                     release_version: "5.1.0-ferrosa".to_string(),

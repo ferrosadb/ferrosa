@@ -7,3 +7,6 @@ pub mod auth_tables;
 pub mod local;
 pub mod peers;
 pub mod schema_tables;
+
+pub use auth_tables::{RoleMemberRow, RolePermissionRow, RoleRow};
+pub use schema_tables::{ColumnRow, KeyspaceRow, TableRow};
