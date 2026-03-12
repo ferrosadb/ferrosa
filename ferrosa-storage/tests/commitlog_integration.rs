@@ -17,7 +17,7 @@ use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
 use ferrosa_storage::commitlog::{
-    CommitLog, CommitLogConfig, CommitLogPosition, Mutation, SyncStrategyConfig, TableId,
+    CommitLog, CommitLogConfig, Mutation, SyncStrategyConfig, TableId,
 };
 
 // ---------------------------------------------------------------------------

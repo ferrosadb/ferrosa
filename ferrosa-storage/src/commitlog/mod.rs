@@ -13,7 +13,7 @@
 //! - **SegmentReader** — reads segment files during crash recovery replay
 //! - **CommitLogCheckpoint** — tracks per-table flush positions
 //!
-//! The active segment is held behind an [`ArcSwap`](arc_swap::ArcSwap),
+//! The active segment is held behind an [`ArcSwap`],
 //! giving writers lock-free access. Segment rotation atomically swaps in
 //! a new segment while the old one stays alive (via `Arc`) until all
 //! tables have been flushed past it.
