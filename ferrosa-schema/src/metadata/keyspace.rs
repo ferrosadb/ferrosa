@@ -24,6 +24,17 @@ pub struct ReplicationParams {
     pub options: HashMap<String, String>,
 }
 
+/// Optional updates for a keyspace (partial update).
+///
+/// `None` fields are left unchanged; `Some` fields are applied.
+#[derive(Debug, Clone)]
+pub struct KeyspaceUpdates {
+    /// New replication parameters, if changing.
+    pub replication: Option<ReplicationParams>,
+    /// New durable_writes setting, if changing.
+    pub durable_writes: Option<bool>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +113,32 @@ mod tests {
         let deserialized: ReplicationParams = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(params, deserialized);
+    }
+
+    #[test]
+    fn keyspace_updates_construction() {
+        let updates = KeyspaceUpdates {
+            replication: Some(ReplicationParams {
+                strategy: "NetworkTopologyStrategy".to_string(),
+                options: {
+                    let mut opts = HashMap::new();
+                    opts.insert("dc1".to_string(), "3".to_string());
+                    opts
+                },
+            }),
+            durable_writes: None,
+        };
+
+        assert!(updates.replication.is_some());
+        assert!(updates.durable_writes.is_none());
+
+        let updates_dw_only = KeyspaceUpdates {
+            replication: None,
+            durable_writes: Some(false),
+        };
+
+        assert!(updates_dw_only.replication.is_none());
+        assert_eq!(updates_dw_only.durable_writes, Some(false));
     }
 
     #[test]

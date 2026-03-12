@@ -5,5 +5,5 @@ pub mod keyspace;
 pub mod table;
 
 pub use column::{ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata};
-pub use keyspace::{KeyspaceMetadata, ReplicationParams};
-pub use table::{CachingParams, TableFlag, TableMetadata, TableParams};
+pub use keyspace::{KeyspaceMetadata, KeyspaceUpdates, ReplicationParams};
+pub use table::{CachingParams, TableFlag, TableMetadata, TableParams, TableUpdates};

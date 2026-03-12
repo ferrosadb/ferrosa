@@ -123,6 +123,20 @@ impl Default for TableParams {
     }
 }
 
+/// Optional updates for a table (partial update).
+///
+/// `None` fields are left unchanged; `Some` fields are applied.
+/// Columns can be added or dropped in the same update.
+#[derive(Debug, Clone)]
+pub struct TableUpdates {
+    /// New table parameters, if changing.
+    pub params: Option<TableParams>,
+    /// Columns to add to the table.
+    pub add_columns: Vec<ColumnMetadata>,
+    /// Column names to drop from the table.
+    pub drop_columns: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::column::ColumnKind;
@@ -315,6 +329,37 @@ mod tests {
         assert_eq!(table.partition_key, deserialized.partition_key);
         assert_eq!(table.clustering_key, deserialized.clustering_key);
         assert_eq!(table.flags, deserialized.flags);
+    }
+
+    #[test]
+    fn table_updates_construction() {
+        let updates = TableUpdates {
+            params: Some(TableParams::default()),
+            add_columns: vec![ColumnMetadata {
+                name: "new_col".to_string(),
+                kind: ColumnKind::Regular,
+                position: 0,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            }],
+            drop_columns: vec!["old_col".to_string()],
+        };
+
+        assert!(updates.params.is_some());
+        assert_eq!(updates.add_columns.len(), 1);
+        assert_eq!(updates.add_columns[0].name, "new_col");
+        assert_eq!(updates.drop_columns, vec!["old_col"]);
+
+        let empty_updates = TableUpdates {
+            params: None,
+            add_columns: vec![],
+            drop_columns: vec![],
+        };
+
+        assert!(empty_updates.params.is_none());
+        assert!(empty_updates.add_columns.is_empty());
+        assert!(empty_updates.drop_columns.is_empty());
     }
 
     #[test]
