@@ -25,7 +25,7 @@ pub use metadata::{
     CachingParams, ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata, KeyspaceMetadata,
     KeyspaceUpdates, ReplicationParams, TableFlag, TableMetadata, TableParams, TableUpdates,
 };
-pub use registry::{AuthMethod, SchemaConfig, SchemaSnapshot};
+pub use registry::{AuthMethod, Schema, SchemaConfig, SchemaSnapshot};
 pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};
 pub use startup::{
     validate_production_requirements, DeploymentMode, ProductionCheckConfig, ProductionViolation,

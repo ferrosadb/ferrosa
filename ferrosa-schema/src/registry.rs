@@ -3,15 +3,19 @@
 //! Contains `SchemaSnapshot` (the immutable point-in-time view),
 //! `SchemaConfig` (bootstrap configuration), and `AuthMethod`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::audit::event::{AuditEvent, AuditEventKind};
 use crate::audit::AuditSink;
 use crate::auth::password::{PasswordHasher, PasswordPolicy};
 use crate::auth::permission::GrantEntry;
-use crate::auth::rate_limit::RateLimitConfig;
+use crate::auth::rate_limit::{AuthRateLimiter, RateLimitConfig};
 use crate::auth::role::RoleMetadata;
 use crate::metadata::keyspace::KeyspaceMetadata;
 use crate::metadata::table::TableMetadata;
@@ -88,12 +92,113 @@ pub struct SchemaConfig {
     pub mode: DeploymentMode,
 }
 
+/// The central schema registry.
+///
+/// Holds the current `SchemaSnapshot` behind an `ArcSwap` for lock-free reads.
+/// Mutations acquire `write_lock`, clone-and-swap the snapshot, and emit audit events.
+#[allow(dead_code)] // Fields used by authenticate() and check_permission() added in next commits
+pub struct Schema {
+    /// Lock-free swappable snapshot.
+    inner: ArcSwap<SchemaSnapshot>,
+    /// Serializes writes (clone → mutate → store).
+    write_lock: Mutex<()>,
+    /// Password hashing configuration.
+    hasher_config: PasswordHasher,
+    /// Password strength policy.
+    password_policy: PasswordPolicy,
+    /// Authentication rate limiter.
+    rate_limiter: AuthRateLimiter,
+    /// Audit event sink.
+    audit_sink: Box<dyn AuditSink>,
+    /// Roles whose password is the default and must be changed.
+    default_password_roles: Mutex<HashSet<String>>,
+}
+
+impl Schema {
+    /// Bootstrap a new schema registry from the given configuration.
+    ///
+    /// Creates the default `cassandra` superuser role. If the secrets
+    /// provider supplies a `superuser_password`, that password is hashed.
+    /// Otherwise the default password `"cassandra"` is used and the role
+    /// is flagged as must-change.
+    pub fn new(config: SchemaConfig) -> crate::Result<Self> {
+        let mut snapshot = SchemaSnapshot::new();
+
+        // Check secrets provider for superuser password
+        let superuser_password = config
+            .secrets
+            .get_secret("superuser_password")
+            .unwrap_or(None);
+
+        let (password, is_default) = match superuser_password {
+            Some(pw) => (pw, false),
+            None => ("cassandra".to_string(), true),
+        };
+
+        // Hash the password
+        let salted_hash = config.hasher.hash_password(&password)?;
+
+        // Create the cassandra superuser role
+        let role = RoleMetadata {
+            name: "cassandra".to_string(),
+            is_superuser: true,
+            can_login: true,
+            salted_hash: Some(salted_hash),
+            member_of: HashSet::new(),
+        };
+        snapshot.roles.insert("cassandra".to_string(), role);
+
+        let mut default_password_roles = HashSet::new();
+        if is_default {
+            default_password_roles.insert("cassandra".to_string());
+        }
+
+        let schema = Self {
+            inner: ArcSwap::new(Arc::new(snapshot)),
+            write_lock: Mutex::new(()),
+            hasher_config: config.hasher,
+            password_policy: config.password_policy,
+            rate_limiter: AuthRateLimiter::new(config.rate_limit),
+            audit_sink: config.audit_sink,
+            default_password_roles: Mutex::new(default_password_roles),
+        };
+
+        // Emit bootstrap audit event
+        schema.emit_audit(AuditEventKind::SchemaBootstrapped);
+
+        if is_default {
+            schema.emit_audit(AuditEventKind::SuperuserPasswordMustChange);
+        }
+
+        Ok(schema)
+    }
+
+    /// Return a lock-free snapshot of the current schema state.
+    pub fn snapshot(&self) -> Arc<SchemaSnapshot> {
+        self.inner.load_full()
+    }
+
+    /// Emit an audit event through the configured sink.
+    fn emit_audit(&self, kind: AuditEventKind) {
+        self.audit_sink.emit(&AuditEvent {
+            timestamp: SystemTime::now(),
+            event: kind,
+            actor: None,
+            source: None,
+            schema_version: Some(self.snapshot().version),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::audit::TestAuditSink;
     use crate::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
     use crate::secrets::EnvSecretsProvider;
+
+    /// Mutex to serialize tests that manipulate the FERROSA_SUPERUSER_PASSWORD env var.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_config() -> SchemaConfig {
         SchemaConfig {
@@ -106,6 +211,28 @@ mod tests {
             mode: DeploymentMode::Development,
         }
     }
+
+    fn test_schema() -> Schema {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
+        }
+        Schema::new(test_config()).unwrap()
+    }
+
+    fn test_schema_with_sink(sink: Arc<TestAuditSink>) -> Schema {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
+        }
+        Schema::new(SchemaConfig {
+            audit_sink: Box::new(sink),
+            ..test_config()
+        })
+        .unwrap()
+    }
+
+    // ---- Task 16 tests ----
 
     #[test]
     fn schema_snapshot_is_empty_on_construction() {
@@ -156,5 +283,70 @@ mod tests {
         assert!(matches!(config.auth_method, AuthMethod::Password));
         assert!(matches!(config.mode, DeploymentMode::Development));
         assert!(matches!(config.hasher, PasswordHasher::Bcrypt { cost: 4 }));
+    }
+
+    // ---- Task 17 tests ----
+
+    #[test]
+    fn schema_new_creates_default_superuser() {
+        let schema = test_schema();
+        let snap = schema.snapshot();
+        let role = snap.roles.get("cassandra").expect("cassandra role exists");
+        assert!(role.is_superuser);
+        assert!(role.can_login);
+        assert!(role.salted_hash.is_some());
+    }
+
+    #[test]
+    fn schema_new_with_env_password() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("FERROSA_SUPERUSER_PASSWORD", "s3cure!Pass");
+        }
+        let schema = Schema::new(test_config()).unwrap();
+        unsafe {
+            std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
+        }
+
+        let snap = schema.snapshot();
+        let role = snap.roles.get("cassandra").expect("cassandra role exists");
+        let hash = role.salted_hash.as_ref().expect("has hash");
+
+        // The password from the env var should verify correctly
+        assert!(PasswordHasher::verify_password_any("s3cure!Pass", hash).unwrap());
+        // The default password should NOT verify
+        assert!(!PasswordHasher::verify_password_any("cassandra", hash).unwrap());
+    }
+
+    #[test]
+    fn schema_new_without_env_password_marks_must_change() {
+        let schema = test_schema();
+        // The cassandra role should be in the default_password_roles set
+        let defaults = schema.default_password_roles.lock().unwrap();
+        assert!(defaults.contains("cassandra"));
+    }
+
+    #[test]
+    fn schema_snapshot_returns_arc() {
+        let schema = test_schema();
+        let snap1 = schema.snapshot();
+        let snap2 = schema.snapshot();
+        // Both loads should return the same version (no mutations occurred)
+        assert_eq!(snap1.version, snap2.version);
+    }
+
+    #[test]
+    fn schema_bootstrap_emits_audit_event() {
+        let sink = Arc::new(TestAuditSink::new());
+        let _schema = test_schema_with_sink(sink.clone());
+
+        let events = sink.events();
+        // Should have SchemaBootstrapped and SuperuserPasswordMustChange
+        assert!(events
+            .iter()
+            .any(|e| matches!(&e.event, AuditEventKind::SchemaBootstrapped)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(&e.event, AuditEventKind::SuperuserPasswordMustChange)));
     }
 }
