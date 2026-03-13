@@ -140,6 +140,8 @@ pub struct TableUpdates {
     pub add_columns: Vec<ColumnMetadata>,
     /// Column names to drop from the table.
     pub drop_columns: Vec<String>,
+    /// Extensions to add or update on the table.
+    pub extensions: Option<HashMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -353,6 +355,7 @@ mod tests {
                 mask: None,
             }],
             drop_columns: vec!["old_col".to_string()],
+            extensions: None,
         };
 
         assert!(updates.params.is_some());
@@ -364,11 +367,29 @@ mod tests {
             params: None,
             add_columns: vec![],
             drop_columns: vec![],
+            extensions: None,
         };
 
         assert!(empty_updates.params.is_none());
         assert!(empty_updates.add_columns.is_empty());
         assert!(empty_updates.drop_columns.is_empty());
+    }
+
+    #[test]
+    fn table_updates_with_extensions() {
+        let mut ext = HashMap::new();
+        ext.insert("graph.type".to_string(), "vertex".to_string());
+
+        let updates = TableUpdates {
+            params: None,
+            add_columns: vec![],
+            drop_columns: vec![],
+            extensions: Some(ext),
+        };
+
+        assert!(updates.extensions.is_some());
+        let ext = updates.extensions.unwrap();
+        assert_eq!(ext.get("graph.type"), Some(&"vertex".to_string()));
     }
 
     #[test]

@@ -1353,6 +1353,7 @@ mod tests {
                 mask: None,
             }],
             drop_columns: vec![],
+            extensions: None,
         };
         schema
             .alter_table("alter_tbl_ks", "t1", updates, &auth)
