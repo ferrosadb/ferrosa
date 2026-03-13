@@ -1,6 +1,6 @@
 # Component Architecture
 
-> Last updated: 2026-03-11
+> Last updated: 2026-03-12
 > Status: Approved
 
 ## Overview
@@ -50,12 +50,12 @@ graph BT
 
 - **Purpose**: Read and write Cassandra-compatible SSTable files (BTI format)
 - **Location**: `ferrosa-sstable/`
-- **Dependencies**: `ferrosa-common`, `lz4_flex`, `zstd`
+- **Dependencies**: `ferrosa-common`, `lz4_flex`, `zstd`, `crc32fast`
 - **Detailed spec**: [SSTable Format Specification](sstable.md)
 - **Key interfaces**:
-  - `ReadAt` / `WriteAt` — abstract positional I/O traits (file-system impl here, S3 impl in ferrosa-storage)
-  - `SSTableReader` — open and query BTI SSTables
-  - `SSTableWriter` — write new BTI SSTables from sorted input
+  - `ReadAt` — abstract positional I/O trait (file-system impl here, S3 impl in ferrosa-storage)
+  - `SSTableReader<R: ReadAt>` — open and query BTI SSTables from `SSTableComponents<R>`
+  - `SSTableWriter` — write BTI SSTables to in-memory `Vec<u8>` buffers (`WrittenSSTable`), caller provides `SerializationHeader`, `WriteOptions`, and pre-computed byte-comparable keys + Bloom filter hashes
 - **Formats**: Phase 1: BTI (trie-based, Cassandra 5.x default) read + write. Phase 2: Big (legacy) read for migration. Phase 3: native Ferrosa format behind feature flag.
 - **Components handled**: Data.db, Partitions.db (trie partition index), Rows.db (trie row index), Filter.db (Bloom filter), Statistics.db, CompressionInfo.db, TOC.txt
 - **On-disk trie**: 16 node types with page-aware packing (4096-byte pages), bottom-up incremental construction, used by both partition and row indices
@@ -146,18 +146,19 @@ gantt
     ferrosa binary          :10, 11
 ```
 
-| Order | Crate | Testable Milestone |
-|-------|-------|--------------------|
-| 1 | ferrosa-common | Type definitions compile |
-| 2 | ferrosa-sstable | Read real Cassandra SSTables, round-trip BTI |
-| 3 | ferrosa-storage | Single-node writes + reads with S3 backend |
-| 4 | ferrosa-schema | Parse CREATE TABLE, system keyspaces queryable |
-| 5 | ferrosa-cql | cqlsh connects and runs basic queries |
-| 6 | ferrosa-net | Two nodes exchange messages |
-| 7 | ferrosa-cluster | 3-node cluster at QUORUM |
-| 8 | ferrosa (binary) | Full database, characterization tests pass |
+| Order | Crate | Testable Milestone | Status |
+|-------|-------|--------------------|--------|
+| 1 | ferrosa-common | Type definitions compile | Done |
+| 2 | ferrosa-sstable | Read real Cassandra SSTables, round-trip BTI | Done |
+| 3 | ferrosa-storage | Single-node writes + reads with S3 backend | Not started |
+| 4 | ferrosa-schema | Parse CREATE TABLE, system keyspaces queryable | Not started |
+| 5 | ferrosa-cql | cqlsh connects and runs basic queries | Not started |
+| 6 | ferrosa-net | Two nodes exchange messages | Not started |
+| 7 | ferrosa-cluster | 3-node cluster at QUORUM | Not started |
+| 8 | ferrosa (binary) | Full database, characterization tests pass | Not started |
 
 ## Related Specs
 
 - [Overview](overview.md) — system overview and design principles
 - [Data Flow](data-flow.md) — write/read paths
+- [CQL](cql.md) — CQL native protocol v5

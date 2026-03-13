@@ -188,7 +188,7 @@ Fixture generation scripts live in `tools/` alongside existing `generate_murmur3
 
 ## Public API
 
-Matches `specs/sstable.md` exactly:
+See `specs/sstable.md` for format specification and full API signatures.
 
 ```rust
 /// Positional read — read bytes at an offset without seeking.
@@ -197,20 +197,40 @@ pub trait ReadAt {
     fn len(&self) -> Result<u64>;
 }
 
-/// Positional write — write bytes at an offset.
-pub trait WriteAt {
-    fn write_at(&mut self, buf: &[u8], offset: u64) -> Result<usize>;
-    fn flush(&mut self) -> Result<()>;
+/// Reader composes all components via SSTableComponents<R: ReadAt>.
+pub struct SSTableReader<R: ReadAt> { /* ... */ }
+
+/// Writer accumulates to in-memory Vec<u8> buffers (no WriteAt trait).
+pub struct SSTableWriter { /* ... */ }
+
+/// Component handles for reading. filter/statistics/compression_info
+/// are pre-read into Vec<u8>; data/partitions use generic R: ReadAt.
+pub struct SSTableComponents<R> {
+    pub data: R,
+    pub partitions: R,
+    pub rows: Option<R>,
+    pub filter: Vec<u8>,
+    pub compression_info: Option<Vec<u8>>,
+    pub statistics: Vec<u8>,
 }
 
-pub struct SSTableReader<R: ReadAt> { /* ... */ }
-pub struct SSTableWriter<W: WriteAt> { /* ... */ }
-pub struct SSTableComponents<IO> { /* 7 component handles */ }
-pub struct WriteOptions { /* compression, bloom_fp_rate, chunk_size, row_index_granularity */ }
-pub enum Compression { None, Lz4, Zstd { level: i32 } }
-```
+/// Writer output — all component buffers.
+pub struct WrittenSSTable {
+    pub data: Vec<u8>,
+    pub partitions: Vec<u8>,
+    pub filter: Vec<u8>,
+    pub statistics: Vec<u8>,
+    pub toc: Vec<u8>,
+}
 
-See `specs/sstable.md` for full API signatures, type definitions, and the BTI format specification.
+pub struct WriteOptions {
+    pub compression: Option<Compression>,
+    pub bloom_fp_chance: f64,
+    pub partitioner: String,
+}
+
+pub enum Compression { Lz4, Zstd { level: i32 } }
+```
 
 ## Literate Programming (swdev compliance)
 

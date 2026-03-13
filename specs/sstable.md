@@ -1,6 +1,6 @@
 # SSTable Format Specification
 
-> Last updated: 2026-03-11
+> Last updated: 2026-03-12
 > Status: Approved
 
 ## Overview
@@ -26,7 +26,8 @@ The initial implementation targets the **BTI (Big Trie-Indexed)** format — Cas
 ferrosa-sstable
 ├── ferrosa-common  (Token, DecoratedKey, CellValue, Murmur3, Error)
 ├── lz4_flex        (LZ4 compression)
-└── zstd            (Zstd compression)
+├── zstd            (Zstd compression)
+└── crc32fast       (CRC32 checksums for Statistics.db)
 ```
 
 No async runtime dependency. All I/O goes through the abstract `ReadAt`/`WriteAt` traits, which are synchronous. Async wrappers (for S3) live in ferrosa-storage.
@@ -462,17 +463,12 @@ Contains four metadata components, each CRC32-checksummed. All BTI version flags
 #### File Structure
 
 ```
-[component_count: i32]
-[crc32 of count: i32]
-[toc: (ordinal: i32, offset: i32) * component_count]
-[crc32 of toc: i32]
-[component_0 bytes] [crc32: i32]
-[component_1 bytes] [crc32: i32]
-[component_2 bytes] [crc32: i32]
-[component_3 bytes] [crc32: i32]
+[component_count: u32]
+For each component:
+  [ordinal: u32] [data_length: u32] [data: data_length bytes] [crc32: u32]
 ```
 
-Components are ordered by ordinal. Each component's data length is derived from offset differences (subtract 4 for the CRC32 suffix).
+Components are ordered by ordinal. Each component is self-describing with its own length prefix and CRC32 checksum. The CRC32 covers only the component data bytes (not the ordinal or length fields).
 
 #### Component 0: ValidationMetadata
 
@@ -621,70 +617,107 @@ This matches Cassandra's `IncrementalDeepTrieWriterPageAware` algorithm.
 ### Reading
 
 ```rust
-/// Open an SSTable for reading from a directory.
+/// Unified SSTable reader composing all components.
 pub struct SSTableReader<R: ReadAt> { /* ... */ }
 
 impl<R: ReadAt> SSTableReader<R> {
-    /// Open an SSTable given ReadAt handles for each component.
+    /// Open an SSTable from its components.
     pub fn open(components: SSTableComponents<R>) -> Result<Self>;
 
-    /// Look up a partition by decorated key.
-    /// Returns None if the partition doesn't exist in this SSTable.
-    pub fn get_partition(&self, key: &DecoratedKey) -> Result<Option<Partition>>;
+    /// Look up a partition by its byte-comparable encoded key.
+    ///
+    /// `encoded_key` is produced by `byte_comparable::encode()`.
+    /// `filter_hash` enables trie-level bloom filter rejection.
+    /// Returns None if the partition is not found.
+    pub fn get_partition(
+        &self,
+        encoded_key: &[u8],
+        filter_hash: Option<u8>,
+    ) -> Result<Option<Partition>>;
 
-    /// Iterate all partitions in token order.
-    pub fn partitions(&self) -> Result<PartitionIterator<'_, R>>;
+    /// Key count from the partition index.
+    pub fn key_count(&self) -> u64;
 
-    /// Iterate partitions within a token range.
-    pub fn range(&self, start: Token, end: Token) -> Result<PartitionIterator<'_, R>>;
+    /// Access the serialization header.
+    pub fn header(&self) -> &SerializationHeader;
 
-    /// SSTable-level statistics.
-    pub fn statistics(&self) -> &SSTableStatistics;
+    /// Access the bloom filter.
+    pub fn bloom_filter(&self) -> &BloomFilter;
 }
 ```
 
 ### Writing
 
+The writer accumulates all component data in memory (`Vec<u8>` buffers) rather than streaming through `WriteAt`. This simplifies the implementation and allows the caller to write the buffers to any backing store (file system, S3, etc.).
+
 ```rust
 /// Write a new SSTable in BTI format.
-pub struct SSTableWriter<W: WriteAt> { /* ... */ }
+pub struct SSTableWriter { /* ... */ }
 
-impl<W: WriteAt> SSTableWriter<W> {
-    /// Create a writer for a new SSTable.
-    pub fn new(components: SSTableComponents<W>, options: WriteOptions) -> Result<Self>;
+impl SSTableWriter {
+    /// Create a writer with a serialization header, write options, and
+    /// expected partition count (used to size the Bloom filter).
+    pub fn new(
+        header: SerializationHeader,
+        options: WriteOptions,
+        expected_partitions: usize,
+    ) -> Self;
 
-    /// Add a partition (must be called in token order).
-    pub fn add_partition(&mut self, key: &DecoratedKey, rows: &[Row]) -> Result<()>;
+    /// Add a partition (must be called in token-sorted key order).
+    ///
+    /// The caller provides:
+    /// - `encoded_key`: byte-comparable encoded key (for the partition index trie)
+    /// - `key_bytes`: raw partition key bytes (stored in Data.db)
+    /// - `partition`: the partition data to write
+    /// - `filter_h1`, `filter_h2`: Murmur3 hash values for the Bloom filter
+    pub fn add_partition(
+        &mut self,
+        encoded_key: &[u8],
+        key_bytes: &[u8],
+        partition: &Partition,
+        filter_h1: i64,
+        filter_h2: i64,
+    ) -> Result<()>;
 
-    /// Finalize the SSTable: write indices, filter, statistics, TOC.
-    pub fn finish(self) -> Result<SSTableStatistics>;
+    /// Finalize and return all component buffers.
+    pub fn finish(self) -> Result<WrittenSSTable>;
+}
+
+/// All written component buffers produced by `SSTableWriter::finish()`.
+pub struct WrittenSSTable {
+    pub data: Vec<u8>,        // Data.db
+    pub partitions: Vec<u8>,  // Partitions.db (trie + key bounds + footer)
+    pub filter: Vec<u8>,      // Filter.db
+    pub statistics: Vec<u8>,  // Statistics.db
+    pub toc: Vec<u8>,         // TOC.txt
 }
 ```
 
 ### Types
 
 ```rust
-/// Handles to all component files for an SSTable.
-pub struct SSTableComponents<IO> {
-    pub data: IO,
-    pub partitions: IO,
-    pub rows: IO,
-    pub filter: IO,
-    pub compression_info: IO,
-    pub statistics: IO,
-    pub toc: IO,
+/// Handles to all component files/buffers for reading an SSTable.
+///
+/// `data` and `partitions` use the generic `R: ReadAt` for positional reads.
+/// `filter`, `compression_info`, and `statistics` are pre-read into `Vec<u8>`
+/// since they are fully loaded into memory on open.
+pub struct SSTableComponents<R> {
+    pub data: R,
+    pub partitions: R,
+    pub rows: Option<R>,
+    pub filter: Vec<u8>,
+    pub compression_info: Option<Vec<u8>>,
+    pub statistics: Vec<u8>,
 }
 
 /// Configuration for SSTable writing.
 pub struct WriteOptions {
-    pub compression: Compression,
-    pub bloom_fp_rate: f64,         // Default: 0.01
-    pub chunk_size: usize,          // Default: 16384
-    pub row_index_granularity: usize, // Default: 16384
+    pub compression: Option<Compression>,  // None = uncompressed
+    pub bloom_fp_chance: f64,              // Default: 0.01
+    pub partitioner: String,               // Partitioner class for Statistics.db
 }
 
 pub enum Compression {
-    None,
     Lz4,
     Zstd { level: i32 },
 }
