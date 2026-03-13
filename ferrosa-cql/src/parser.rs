@@ -1368,6 +1368,10 @@ impl<'input> Parser<'input> {
             Keyword::Writetime => "writetime",
             Keyword::All => "all",
             Keyword::Permissions => "permissions",
+            Keyword::Subscribe => "subscribe",
+            Keyword::Unsubscribe => "unsubscribe",
+            Keyword::Every => "every",
+            Keyword::Delta => "delta",
         }
         .to_string()
     }
