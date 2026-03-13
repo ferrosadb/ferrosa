@@ -18,6 +18,7 @@
 //! a new segment while the old one stays alive (via `Arc`) until all
 //! tables have been flushed past it.
 
+pub(crate) mod cdc;
 pub(crate) mod checkpoint;
 pub(crate) mod config;
 pub(crate) mod descriptor;
