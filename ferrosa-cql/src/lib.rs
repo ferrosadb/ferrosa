@@ -25,6 +25,7 @@ pub mod frame;
 pub mod lexer;
 pub mod parser;
 pub mod prepared;
+pub mod prometheus;
 pub mod result;
 pub mod router;
 pub mod server;
