@@ -10,8 +10,8 @@ use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use std::time::Duration;
 
 use ferrosa_storage::{
-    CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
-    TableId,
+    CommitLog, CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig,
+    SyncStrategyConfig, TableId,
 };
 
 fn test_schema() -> TableSchema {
@@ -169,4 +169,44 @@ fn multiple_flushes_read_all() {
     }
 
     engine.shutdown().unwrap();
+}
+
+/// Simulates a crash by dropping the engine without shutdown, then
+/// verifies that open_and_replay recovers the mutations.
+#[test]
+fn wal_replay_after_crash() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Phase 1: Write some data, then "crash" (drop without shutdown).
+    {
+        let engine = make_engine(dir.path());
+        engine.register_table(test_schema()).unwrap();
+        let tid = TableId::new("ks", "tbl");
+
+        for i in 0..5 {
+            let key = make_key(&format!("crash_k{i}"));
+            engine
+                .write(&tid, &key, make_row(b"recoverable", 1000), 1000)
+                .unwrap();
+        }
+        // Drop engine without calling shutdown — simulates crash.
+        // The commit log has BatchSync, so data is fsynced on each write.
+    }
+
+    // Phase 2: Replay the commit log.
+    let replay_config = CommitLogConfig {
+        segment_size: 4096,
+        max_segment_age: Duration::from_secs(60),
+        sync_strategy: SyncStrategyConfig::Batch,
+        log_dir: dir.path().join("commitlog"),
+        checkpoint_dir: dir.path().join("commitlog"),
+    };
+    let (commit_log, mutations) = CommitLog::open_and_replay(replay_config).unwrap();
+
+    assert_eq!(mutations.len(), 5, "should recover 5 mutations from WAL");
+    for mutation in &mutations {
+        assert!(mutation.key.key.as_bytes().starts_with(b"crash_k"));
+    }
+
+    commit_log.shutdown().unwrap();
 }
