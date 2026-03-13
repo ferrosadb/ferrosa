@@ -454,8 +454,7 @@ mod tests {
 
     #[test]
     fn error_to_response_storage_sanitized() {
-        let err = GraphError::Storage(ferrosa_common::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        let err = GraphError::Storage(ferrosa_common::Error::Io(std::io::Error::other(
             "disk failure",
         )));
         let resp = error_to_response(&err);

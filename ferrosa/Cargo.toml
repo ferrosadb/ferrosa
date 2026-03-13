@@ -1,0 +1,19 @@
+[package]
+name = "ferrosa"
+version = "0.1.0"
+edition = "2021"
+description = "Ferrosa — distributed database with CQL and Cypher"
+
+[[bin]]
+name = "ferrosa"
+path = "src/main.rs"
+
+[dependencies]
+ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-schema = { path = "../ferrosa-schema" }
+ferrosa-storage = { path = "../ferrosa-storage" }
+ferrosa-cql = { path = "../ferrosa-cql" }
+ferrosa-graph = { path = "../ferrosa-graph" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
