@@ -1,6 +1,6 @@
 # CQL Protocol Specification
 
-> Last updated: 2026-03-13
+> Last updated: 2026-03-13 (observability additions)
 > Status: Approved
 
 ## Overview
@@ -256,8 +256,284 @@ ferrosa-cql/
 - **Integration**: in-memory server with test harness sending raw frames
 - **No mocks**: real schema and storage objects
 
+## Virtual Tables in CQL
+
+The query router intercepts `SELECT` queries targeting `system_observability.*` tables. Instead of dispatching to `ferrosa-storage`, the router looks up the table name in `VirtualTableRegistry` and calls `table.read(predicate)`.
+
+**Constraints:**
+
+- Virtual tables are **read-only** — `INSERT`, `UPDATE`, and `DELETE` return `Invalid` error
+- `PREPARE` / `EXECUTE` are **not supported** for virtual table queries — returns `Invalid` error
+- Virtual tables expose **live system state**, not persisted data
+
+**Registry lookup flow:**
+
+```
+SELECT → Parser → Router
+  → is keyspace "system_observability"?
+    → yes: VirtualTableRegistry::get(table_name)
+      → found: table.read(predicate) → RESULT rows
+      → not found: ERROR(Invalid, "Unknown table")
+    → no: normal storage path
+```
+
+## system_observability Keyspace
+
+Three virtual tables expose live system state. All are read-only.
+
+### connections
+
+Active CQL client connections.
+
+| Column | CQL Type | Description |
+|--------|----------|-------------|
+| `peer_address` | `inet` | Remote IP address |
+| `port` | `int` | Remote port |
+| `state` | `text` | Connection state (`AUTHENTICATING`, `READY`, `CLOSING`) |
+| `username` | `text` | Authenticated username (null if unauthenticated) |
+| `connected_at` | `timestamp` | Connection establishment time |
+| `requests_served` | `bigint` | Total requests processed on this connection |
+| `protocol_version` | `int` | CQL protocol version negotiated |
+
+### active_queries
+
+Currently executing CQL queries.
+
+| Column | CQL Type | Description |
+|--------|----------|-------------|
+| `query_id` | `uuid` | Unique query identifier |
+| `client_address` | `inet` | Client IP address |
+| `username` | `text` | Authenticated username |
+| `query_text` | `text` | CQL query string |
+| `keyspace` | `text` | Active keyspace (null if none) |
+| `start_time` | `timestamp` | Query start time |
+| `elapsed_ms` | `bigint` | Milliseconds since query started |
+| `state` | `text` | Query state (`PARSING`, `EXECUTING`, `STREAMING`) |
+
+### storage_stats
+
+Per-table storage statistics. Backed by `ferrosa-storage::StorageStatsProvider`.
+
+| Column | CQL Type | Description |
+|--------|----------|-------------|
+| `keyspace` | `text` | Keyspace name |
+| `table_name` | `text` | Table name |
+| `memtable_size_bytes` | `bigint` | Active memtable size in bytes |
+| `memtable_count` | `int` | Number of partitions in active memtable |
+| `sstable_count` | `int` | Number of local SSTables |
+| `sstable_size_bytes` | `bigint` | Total SSTable size on disk |
+| `s3_object_count` | `int` | Number of S3 objects for this table |
+| `s3_bytes` | `bigint` | Total bytes stored in S3 |
+| `pending_compactions` | `int` | Number of pending compaction tasks |
+
+## SUBSCRIBE / UNSUBSCRIBE
+
+CQL extensions for streaming query results. These are Ferrosa-specific extensions, not part of the CQL v5 standard.
+
+### Lexer Tokens
+
+Four new keyword tokens added to the `phf` keyword map:
+
+- `SUBSCRIBE`
+- `UNSUBSCRIBE`
+- `EVERY`
+- `DELTA`
+
+### AST Variants
+
+```rust
+enum Statement {
+    // ... existing variants ...
+    Subscribe {
+        inner: Box<Statement>,          // the SELECT to re-execute
+        interval: Option<Duration>,     // from EVERY clause
+        delta: bool,                    // DELTA flag — only send changed rows
+    },
+    Unsubscribe {
+        stream_id: Option<u16>,         // None = unsubscribe all
+    },
+}
+```
+
+### Parser
+
+Handles the following syntax:
+
+```
+SUBSCRIBE <select_statement> [EVERY <n>s] [DELTA]
+UNSUBSCRIBE [<stream_id>]
+```
+
+- `<select_statement>` must be a valid `SELECT` statement (parser reuses `parse_select()`)
+- `EVERY <n>s` specifies the re-evaluation interval (integer seconds, e.g. `EVERY 5s`)
+- `DELTA` enables differential delivery — only rows that changed since the last push are sent
+- `UNSUBSCRIBE` with no argument unsubscribes all active streams on the connection
+
+### Frame Flag
+
+Response frames for streaming results carry the `STREAMING` flag:
+
+| Flag | Value | Description |
+|------|-------|-------------|
+| `STREAMING` | `0x10` | Set on response frames that are part of an active subscription stream |
+
+The stream ID in the frame header identifies the subscription. Multiple subscriptions can be active concurrently on the same connection using different stream IDs.
+
+## ConnectionTracker and QueryTracker
+
+Two tracking components on `SharedState` support the `system_observability` virtual tables.
+
+### ConnectionTracker
+
+```rust
+pub struct ConnectionTracker {
+    connections: DashMap<SocketAddr, ConnectionInfo>,
+}
+
+pub struct ConnectionInfo {
+    pub peer_address: IpAddr,
+    pub port: u16,
+    pub state: ConnectionState,
+    pub username: Option<String>,
+    pub connected_at: Instant,
+    pub requests_served: AtomicU64,
+    pub protocol_version: u8,
+}
+```
+
+- `register()` — called on TCP accept, inserts `ConnectionInfo` with state `AUTHENTICATING`
+- `deregister()` — called on TCP disconnect (or connection error), removes entry
+- `update_state()` — transitions state on auth success (`READY`) or close (`CLOSING`)
+- `increment_requests()` — called after each request completes, `AtomicU64` fetch_add
+
+### QueryTracker
+
+```rust
+pub struct QueryTracker {
+    active: DashMap<Uuid, QueryInfo>,
+}
+
+pub struct QueryInfo {
+    pub query_id: Uuid,
+    pub client_address: IpAddr,
+    pub username: String,
+    pub query_text: String,
+    pub keyspace: Option<String>,
+    pub start_time: Instant,
+    pub state: QueryState,
+}
+```
+
+- `begin()` — called before query execution, inserts `QueryInfo`, returns `QueryGuard`
+- `complete()` — called by `QueryGuard::drop()`, removes entry from `active`
+- **RAII cleanup**: `QueryGuard` holds the query ID and a reference to the tracker. On drop (normal completion or panic), it removes the query from `active`. This prevents stale entries if query execution panics.
+
+```rust
+pub struct QueryGuard<'a> {
+    tracker: &'a QueryTracker,
+    query_id: Uuid,
+}
+
+impl Drop for QueryGuard<'_> {
+    fn drop(&mut self) {
+        self.tracker.active.remove(&self.query_id);
+    }
+}
+```
+
+### SharedState Integration
+
+Both trackers are fields on `SharedState`, which is shared across all connection tasks:
+
+```rust
+pub struct SharedState {
+    pub schema: ArcSwap<Schema>,
+    pub storage: StorageEngine,
+    pub prepared_cache: moka::sync::Cache<[u8; 16], PreparedPlan>,
+    pub connection_tracker: ConnectionTracker,
+    pub query_tracker: QueryTracker,
+    pub virtual_tables: VirtualTableRegistry,
+}
+```
+
+## Prometheus Metrics
+
+`prometheus.rs` exposes a `render_metrics()` function that produces [Prometheus text exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/).
+
+**Implementation:**
+
+- Iterates virtual tables in `VirtualTableRegistry`
+- Reads rows from each virtual table (calls `table.read(None)` — no predicate filter)
+- Outputs `# HELP`, `# TYPE`, and metric lines for numeric columns
+- Metric names follow Prometheus conventions: `ferrosa_{table}_{column}`
+
+**Example output:**
+
+```
+# HELP ferrosa_connections_requests_served Total requests served per connection
+# TYPE ferrosa_connections_requests_served gauge
+ferrosa_connections_requests_served{peer_address="10.0.1.5",port="9042"} 1523
+
+# HELP ferrosa_storage_stats_memtable_size_bytes Active memtable size
+# TYPE ferrosa_storage_stats_memtable_size_bytes gauge
+ferrosa_storage_stats_memtable_size_bytes{keyspace="my_ks",table_name="my_table"} 4194304
+```
+
+## CQL Client Module
+
+`client.rs` provides a programmatic CQL client for use by `ferrosa-ctl` and integration tests.
+
+```rust
+pub struct CqlClient {
+    // internal: Framed<TcpStream, CqlCodec>
+}
+
+pub struct QueryResult {
+    pub columns: Vec<ColumnSpec>,
+    pub rows: Vec<ResultRow>,
+}
+
+pub struct ResultRow {
+    pub values: Vec<Option<CqlValue>>,
+}
+```
+
+**Public API:**
+
+```rust
+impl CqlClient {
+    pub async fn connect(addr: SocketAddr) -> Result<Self>;
+    pub async fn connect_with_auth(addr: SocketAddr, username: &str, password: &str) -> Result<Self>;
+    pub async fn query(&mut self, cql: &str) -> Result<QueryResult>;
+    pub async fn use_keyspace(&mut self, keyspace: &str) -> Result<()>;
+    pub async fn close(self) -> Result<()>;
+}
+```
+
+- **Async**: all methods are async, using tokio's TCP stream
+- **SocketAddr-based**: connect takes a `SocketAddr` directly, no service discovery
+- **Protocol**: uses the same `CqlCodec` from `frame.rs` for wire compatibility
+- **Auth**: `connect()` expects no-auth mode; `connect_with_auth()` performs SASL PLAIN handshake
+- **No connection pooling**: single connection per `CqlClient` instance. Pooling is the caller's responsibility.
+
+## Crate Structure (Updated)
+
+New files added for observability support:
+
+```
+ferrosa-cql/
+└── src/
+    ├── ... (existing files)
+    ├── virtual_table.rs    # VirtualTable trait, VirtualTableRegistry
+    ├── tracker.rs          # ConnectionTracker, QueryTracker, QueryGuard
+    ├── prometheus.rs       # render_metrics() — text exposition format
+    ├── client.rs           # CqlClient, QueryResult, ResultRow
+    └── subscribe.rs        # SUBSCRIBE/UNSUBSCRIBE handling, stream management
+```
+
 ## Related Specs
 
 - [Overview](overview.md) — system overview
 - [Components](components.md) — crate architecture
+- [Storage](storage.md) — storage engine (StorageStatsProvider, SubscriptionObserver)
 - [ADR-006](decisions/006-cql-architecture.md) — CQL architectural decisions

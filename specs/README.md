@@ -10,13 +10,14 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 |-------|--------|
 | ferrosa-common | Done |
 | ferrosa-sstable | Done |
-| ferrosa-storage | Done (core engine + observers; follow-on items tracked) |
-| ferrosa-schema | Done (DDL, auth, audit, system KS, graph extensions, system table protection) |
-| ferrosa-cql | Done (Parts A-D: protocol, parser, routing, prepared cache, security hardening) |
+| ferrosa-storage | Done (core engine + observers + subscription observer + storage stats) |
+| ferrosa-schema | Done (DDL, auth, audit, system KS, graph extensions, virtual tables) |
+| ferrosa-cql | Done (Parts A-D + observability: virtual tables, subscriptions, prometheus) |
 | ferrosa-graph | Done (Phase 1: parser, planner, executor, adjacency index, HTTP endpoint) |
 | ferrosa-net | Not started |
 | ferrosa-cluster | Not started |
-| ferrosa (binary) | Done (single-node: CQL on 9042, optional graph on 7474) |
+| ferrosa-ctl | Done (CLI + TUI monitoring dashboard) |
+| ferrosa (binary) | Done (single-node: CQL on 9042, optional graph on 7474, web console on 9090) |
 
 ## Specs Index
 
@@ -57,3 +58,4 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 - [Schema Design](../docs/superpowers/specs/2026-03-12-ferrosa-schema-design.md) — implementation design for ferrosa-schema
 - [CQL Design](../docs/superpowers/specs/2026-03-12-ferrosa-cql-design.md) — implementation design for ferrosa-cql
 - [Graph Design](../docs/superpowers/specs/2026-03-12-ferrosa-graph-design.md) — implementation design for ferrosa-graph
+- [Observability Design](../docs/superpowers/specs/2026-03-13-ferrosa-observability-design.md) — implementation design for observability (virtual tables, web dashboard, ferrosa-ctl)
