@@ -6,6 +6,10 @@
 
 pub mod ast;
 mod error;
+pub mod lexer;
+pub mod token;
 
 pub use ast::*;
-pub use error::{ParseError, ParseResult};
+pub use error::{ParseError, ParseResult, Span};
+pub use lexer::Lexer;
+pub use token::{Keyword, Token, TokenKind};
