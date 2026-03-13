@@ -216,6 +216,43 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Writes multiple rows to a table in a single call.
+    ///
+    /// Each mutation is (key, row, timestamp). Mutations are appended to the
+    /// commit log and memtable sequentially. Not atomic — a failure partway
+    /// through leaves earlier writes committed.
+    pub fn batch_write(
+        &self,
+        table_id: &TableId,
+        mutations: Vec<(DecoratedKey, Row, i64)>,
+    ) -> ferrosa_common::Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+
+        let tables = self.tables.read();
+        let state = tables.get(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+
+        for (key, row, timestamp) in mutations {
+            // Append to commit log.
+            let mutation = Mutation {
+                keyspace: table_id.keyspace.clone(),
+                table: table_id.table.clone(),
+                key: key.clone(),
+                rows: vec![row.clone()],
+                timestamp,
+            };
+            self.commit_log.append(&mutation)?;
+
+            // Write to memtable.
+            state.store.write(&key, row)?;
+        }
+
+        Ok(())
+    }
+
     /// Reads a partition from a table, merging memtable and SSTable sources.
     pub fn read(
         &self,
@@ -564,6 +601,38 @@ mod tests {
 
         // After shutdown, SSTable should exist (flush happened).
         assert_eq!(engine.sstable_count(&tid), 1);
+    }
+
+    #[test]
+    fn batch_write_multiple_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+        let mutations = vec![
+            (make_key("k1"), make_row(b"v1", 1000), 1000i64),
+            (make_key("k2"), make_row(b"v2", 2000), 2000),
+            (make_key("k3"), make_row(b"v3", 3000), 3000),
+        ];
+
+        engine.batch_write(&tid, mutations).unwrap();
+
+        assert!(engine.read(&tid, &make_key("k1")).unwrap().is_some());
+        assert!(engine.read(&tid, &make_key("k2")).unwrap().is_some());
+        assert!(engine.read(&tid, &make_key("k3")).unwrap().is_some());
+    }
+
+    #[test]
+    fn batch_write_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let mutations: Vec<(DecoratedKey, Row, i64)> = vec![];
+        engine.batch_write(&table_id(), mutations).unwrap();
     }
 
     #[test]
