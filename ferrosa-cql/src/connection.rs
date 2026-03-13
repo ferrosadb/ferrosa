@@ -30,6 +30,7 @@ use crate::parser;
 use crate::prepared::{PreparedCache, PreparedPlan};
 use crate::result;
 use crate::router::{RequestContext, RouteResult, SharedState};
+use crate::subscribe::SubscriptionState;
 use crate::types::CqlType;
 use crate::virtual_tables::connections::{ConnectionInfo, ConnectionTracker};
 
@@ -102,6 +103,7 @@ pub async fn handle_connection(
     let mut phase = ConnectionPhase::AwaitingStartup;
     let mut auth_context: Option<AuthContext> = None;
     let mut current_keyspace: Option<String> = None;
+    let mut subscription_state = SubscriptionState::new(8);
 
     loop {
         // M11: idle timeout — drop connection if no frame arrives within IDLE_TIMEOUT.
@@ -191,6 +193,9 @@ pub async fn handle_connection(
             }
         }
     }
+
+    // Cancel all active subscriptions on disconnect.
+    subscription_state.cancel_all();
 
     debug!("connection handler for {peer} finished");
 }

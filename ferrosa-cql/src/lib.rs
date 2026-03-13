@@ -29,5 +29,6 @@ pub mod prometheus;
 pub mod result;
 pub mod router;
 pub mod server;
+pub mod subscribe;
 pub mod types;
 pub mod virtual_tables;
