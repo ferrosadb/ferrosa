@@ -14,11 +14,13 @@ Both features are **integration tasks** — the building blocks (replay reader, 
 ```mermaid
 graph TB
     subgraph "Startup Path (Part 1)"
-        Boot[StorageEngine::new] --> Replay[CommitLog::open_and_replay]
+        Boot[StorageEngine::open] --> Replay[CommitLog::open_and_replay]
         Replay --> Filter[Filter mutations by checkpoint]
-        Filter --> Apply[Replay mutations into TableStore memtables]
+        Filter --> Register[Caller registers table schemas]
+        Register --> Apply[replay_mutations into TableStore memtables]
         Apply --> Flush[Flush replayed tables to SSTable]
         Flush --> Discard[discard_completed per table]
+        Discard --> DeleteSegs[Delete old segment files]
     end
 
     subgraph "Compaction Path (Part 2)"
@@ -55,42 +57,71 @@ No new crate dependencies.
 
 ### What Needs Wiring
 
-#### 1.1 StorageEngine startup calls replay
+#### 1.1 Two-phase startup: open, register, replay
 
-`StorageEngine::new()` currently calls `CommitLog::new(config)`. Change to:
+**Problem**: `StorageEngine::new()` creates the engine with an empty `tables` HashMap. Tables are registered later via `register_table()`. But replay needs tables registered first to route mutations. This is a chicken-and-egg problem.
 
+**Solution**: Split into two phases. `open()` returns both the engine and the pending mutations. The caller registers tables, then calls `replay_mutations()`:
+
+```rust
+// Phase 1: Open commit log, collect pending mutations.
+let (engine, pending) = StorageEngine::open(config, runtime)?;
+
+// Phase 2: Register table schemas (from schema store / CQL layer).
+engine.register_table(users_schema)?;
+engine.register_table(events_schema)?;
+
+// Phase 3: Replay pending mutations into registered tables.
+engine.replay_mutations(pending)?;
 ```
-let (commit_log, mutations) = CommitLog::open_and_replay(config)?;
-```
 
-Then replay each mutation into the appropriate `TableStore`:
+`StorageEngine::open()` replaces `new()` and calls `CommitLog::open_and_replay(config)` instead of `CommitLog::new(config)`. It returns `(Self, Vec<Mutation>)`.
 
-```
-for mutation in mutations {
-    let table_id = TableId::new(&mutation.keyspace, &mutation.table);
-    if let Some(store) = self.tables.get(&table_id) {
-        store.write_from_replay(mutation);
+`replay_mutations()` iterates over the mutations:
+
+```rust
+pub fn replay_mutations(&self, mutations: Vec<Mutation>) -> Result<()> {
+    let tables = self.tables.read();
+    for mutation in mutations {
+        let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+        if let Some(state) = tables.get(&table_id) {
+            for row in &mutation.rows {
+                state.store.write_from_replay(&mutation.key, row.clone())?;
+            }
+        }
+        // Unknown tables are silently skipped — schema may have changed
     }
-    // Unknown tables are silently skipped — schema may have changed
+    drop(tables);
+    // Post-replay flush (see 1.2)
+    self.flush_replayed_tables()?;
+    Ok(())
 }
 ```
 
-`write_from_replay()` is a new method on `TableStore` that writes directly to the memtable without appending to the commit log (avoiding circular writes).
+`write_from_replay()` is a new method on `TableStore` that writes directly to the memtable without appending to the commit log (avoiding circular writes). Signature: `fn write_from_replay(&self, key: &DecoratedKey, row: Row) -> Result<()>`.
 
-#### 1.2 Post-replay flush
+#### 1.2 Post-replay flush and segment cleanup
 
-After replay, flush all tables that received mutations to SSTable. This converts replayed data from memtable (volatile) to SSTable (durable), then updates the checkpoint:
+After replay, flush all tables that received mutations to SSTable, then clean up old segments:
 
-```
-for (table_id, store) in &self.tables {
-    if store.has_unflushed_data() {
-        let position = store.flush()?;
-        commit_log.discard_completed(&table_id, position)?;
+```rust
+fn flush_replayed_tables(&self) -> Result<()> {
+    let tables = self.tables.read();
+    for (table_id, state) in tables.iter() {
+        if state.store.has_unflushed_data() {
+            state.store.flush()?;
+            if let Some(position) = state.store.last_commit_log_position() {
+                self.commit_log.discard_completed(table_id, position)?;
+            }
+        }
     }
+    Ok(())
 }
 ```
 
-This is optional for correctness (the commit log is the durability guarantee) but important for performance — without it, the memtable holds all replayed data in memory until the next natural flush threshold.
+**Durability invariant**: `open_and_replay()` must NOT delete old segment files. The current implementation deletes segments before mutations are flushed to SSTables — if the process crashes after `open_and_replay` returns but before flush completes, replayed mutations are lost (neither in commit log nor in SSTables). Fix: remove the segment deletion from `open_and_replay()` and let `discard_completed()` handle cleanup after flush succeeds. This requires a one-line change to `open_and_replay()` (delete the `for (_, path) in &segment_files { let _ = fs::remove_file(path); }` loop).
+
+Post-replay flush is important for performance — without it, the memtable holds all replayed data in memory until the next natural flush threshold.
 
 #### 1.3 Flush-time checkpoint updates
 
@@ -102,7 +133,7 @@ The `StorageEngine::flush()` method already calls `TableStore::flush()`. Add the
 
 Each `StorageEngine::write()` call appends to the commit log and gets back a `CommitLogPosition`. This position must be associated with the table so that `discard_completed` can report the correct position at flush time.
 
-`TableStore` needs a `last_commit_log_position: Mutex<Option<CommitLogPosition>>` field, updated on each write, read at flush time.
+`TableStore` needs a `last_commit_log_position` field, updated on each write, read at flush time. Since `CommitLogPosition` is 16 bytes (`segment_id: u64` + `offset: u64`), use `parking_lot::Mutex<Option<CommitLogPosition>>` for simplicity. The mutex is per-table and only taken briefly for a copy — contention is negligible. Note: this introduces a lock on the write path, which technically violates the "writes are lock-free" doc comment on `StorageEngine`. For MVP this is acceptable; a future optimization could use `AtomicU128` or `ArcSwap<CommitLogPosition>` if profiling shows contention. Update the doc comment to reflect this.
 
 ### Error Handling
 
@@ -118,6 +149,7 @@ Each `StorageEngine::write()` call appends to the commit log and gets back a `Co
 - **Corruption tolerance**: Corrupt a segment file, restart — corrupted entries skipped, valid entries replayed.
 - **Empty replay**: Fresh start with no segments — engine starts normally.
 - **Schema change**: Write to table, drop table from schema, restart — mutations for dropped table silently skipped.
+- **Multi-table replay**: Write mutations to multiple tables, restart — verify correct routing to each table's memtable.
 
 ## Part 2: Compaction Execution (STCS)
 
@@ -140,14 +172,18 @@ Each `StorageEngine::write()` call appends to the commit log and gets back a `Co
 `execute_task()` currently returns placeholder metadata. Replace with:
 
 1. **Read**: Open each input SSTable via `SSTableReader::open(path)`
-2. **Collect**: Read all partitions from each reader into memory
-3. **Group**: Group partitions by decorated key across all inputs
-4. **Merge**: For each key group, call `merge_partitions()` to produce a single merged partition
-5. **Sort**: Ensure output partitions are in token order (SSTableWriter requires this)
-6. **Header**: Build `SerializationHeader` by scanning merged partitions (reuse `build_serialization_header()` from flush)
-7. **Write**: Create `SSTableWriter`, add all merged partitions, call `finish()`
-8. **Output**: Write the 7 component files to `task.output_dir` via `FileFlushTarget`
-9. **Return**: `CompactionResult` with output SSTable metadata
+1. **Collect**: Read all partitions from each reader into memory
+1. **Group**: Group partitions by decorated key across all inputs
+1. **Merge**: For each key group, call `merge_partitions()` to produce a single merged partition
+1. **Sort**: Ensure output partitions are in token order (SSTableWriter requires this)
+1. **Header**: Build `SerializationHeader` by scanning merged partitions (reuse `build_serialization_header()` from flush)
+1. **Write**: Create `SSTableWriter`, add all merged partitions, call `finish()`
+1. **Output**: Write the 7 component files to `task.output_dir` via `FileFlushTarget`
+1. **Return**: `CompactionResult` with output SSTable metadata
+
+**Schema propagation**: `CompactionTask` currently only has `inputs: Vec<SSTableMetadata>` and `output_dir: PathBuf`. Steps 6-7 need a `TableSchema` to build the `SerializationHeader` and create the `SSTableWriter`. Extend `CompactionTask` to include `schema: TableSchema`. This is simpler than giving the executor a schema registry reference and avoids shared state across threads.
+
+**Generation counter**: The output SSTable must use `FileFlushTarget` with the same generation counter as the table's flush path, ensuring monotonically increasing generation numbers. The `CompactionTask` should include a reference to the table's `FileFlushTarget` (or its `next_generation()` method) so the output generation is correctly sequenced.
 
 Memory concern: Loading all partitions into memory works for small-to-medium SSTables. For very large tables, a streaming merge with a priority queue would be needed — but that's a future optimization. The current merge.rs API already works on `Vec<Partition>` and the flush path loads entire memtables, so this is consistent.
 
@@ -161,22 +197,34 @@ Add a periodic background task that runs every N seconds (configurable, default 
 4. Poll executor for completed results
 5. On completion: swap new SSTable in, remove old SSTables from the table's list, delete old files
 
-The trigger loop runs on the existing tokio runtime (async task with `tokio::time::interval`).
+The trigger loop runs as a tokio async task (`tokio::time::interval`) on the existing runtime. Note that `CompactionExecutor` itself uses a dedicated OS thread with `std::sync::mpsc` — the async trigger task submits tasks via the existing channel and polls results. `StorageEngine::new()` already accepts `Option<&tokio::runtime::Handle>` for the upload manager; the compaction trigger loop also needs this handle. When `runtime` is `None` (tests without tokio), compaction is only triggered synchronously via `flush()` → `maybe_compact()`.
 
 #### 2.3 Atomic SSTable swap after compaction
 
-When compaction completes, the `TableStore` must atomically replace the input SSTables with the output SSTable. This uses the same `ArcSwap` pattern as flush:
+When compaction completes, the `TableStore` must atomically replace the input SSTables with the output SSTable. Add a new method to `TableStore`:
 
-1. Load current SSTable list
-2. Remove input SSTables (by ID/path matching)
-3. Insert output SSTable at the correct position (sorted by generation)
-4. Store new list via `ArcSwap::store()`
+```rust
+pub fn swap_compacted_sstables(
+    &self,
+    remove: &[PathBuf],      // input SSTable paths to remove
+    add: SSTableReader,       // output SSTable reader
+) -> Result<()>
+```
+
+This uses the same `ArcSwap` pattern as flush:
+
+1. Load current SSTable list from `StoreView`
+1. Remove input SSTables (by path matching against `remove`)
+1. Insert output SSTable at the correct position (sorted by generation)
+1. Store new list via `ArcSwap::store()`
 
 Old SSTable files are deleted after the swap. If deletion fails, log a warning but don't fail — orphan cleanup can handle it later.
 
 #### 2.4 SSTable metadata collection
 
 `TableStore` needs a method to collect `SSTableMetadata` for its current SSTables. This reads the stored statistics (partition count, size, token range, timestamp range) from each `SSTableReader`.
+
+Note: `StorageEngine::collect_sstable_metadata()` is currently a stub returning `Vec::new()` (engine.rs:516-526). This task replaces the stub with real metadata collection.
 
 ### Error Handling
 
