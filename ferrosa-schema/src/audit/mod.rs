@@ -6,7 +6,7 @@ pub mod table_sink;
 
 use std::sync::{Arc, Mutex};
 
-pub use event::{AuditContext, AuditEvent, AuditEventKind};
+pub use event::{AuditContext, AuditEvent, AuditEventKind, GraphAuditStatus};
 pub use log_sink::LogAuditSink;
 pub use table_sink::{AuditLogEntry, SystemTableAuditSink};
 

@@ -77,6 +77,35 @@ pub enum AuditEventKind {
     SchemaBootstrapped,
     /// Superuser password must be changed from the default.
     SuperuserPasswordMustChange,
+    /// A graph query (read) was executed.
+    GraphQueryExecuted {
+        query: String,
+        keyspace: String,
+        rows_returned: usize,
+        execution_ms: u64,
+        status: GraphAuditStatus,
+    },
+    /// A graph mutation (write) was executed.
+    GraphMutationExecuted {
+        query: String,
+        keyspace: String,
+        vertices_affected: usize,
+        edges_affected: usize,
+        status: GraphAuditStatus,
+    },
+}
+
+/// Status of a graph query or mutation for audit purposes.
+#[derive(Debug, Clone, Serialize)]
+pub enum GraphAuditStatus {
+    /// The operation completed successfully.
+    Ok,
+    /// The operation timed out.
+    Timeout,
+    /// The operation was denied (authorization failure).
+    Denied,
+    /// The operation failed with an error.
+    Error,
 }
 
 /// Context for audit event creation, carrying request metadata.
@@ -170,9 +199,55 @@ mod tests {
             },
             AuditEventKind::SchemaBootstrapped,
             AuditEventKind::SuperuserPasswordMustChange,
+            AuditEventKind::GraphQueryExecuted {
+                query: "MATCH (n) RETURN n".into(),
+                keyspace: "ks".into(),
+                rows_returned: 42,
+                execution_ms: 100,
+                status: GraphAuditStatus::Ok,
+            },
+            AuditEventKind::GraphMutationExecuted {
+                query: "CREATE (n:Person)".into(),
+                keyspace: "ks".into(),
+                vertices_affected: 1,
+                edges_affected: 0,
+                status: GraphAuditStatus::Ok,
+            },
         ];
 
-        assert_eq!(variants.len(), 18);
+        assert_eq!(variants.len(), 20);
+    }
+
+    #[test]
+    fn graph_audit_event_variants_constructible() {
+        let query_event = AuditEventKind::GraphQueryExecuted {
+            query: "MATCH (n:Person) RETURN n".into(),
+            keyspace: "social".into(),
+            rows_returned: 10,
+            execution_ms: 50,
+            status: GraphAuditStatus::Ok,
+        };
+        // Verify it can be debug-printed (ensures Debug is derived)
+        let _ = format!("{:?}", query_event);
+
+        let mutation_event = AuditEventKind::GraphMutationExecuted {
+            query: "CREATE (n:Person {name: 'Alice'})".into(),
+            keyspace: "social".into(),
+            vertices_affected: 1,
+            edges_affected: 0,
+            status: GraphAuditStatus::Error,
+        };
+        let _ = format!("{:?}", mutation_event);
+
+        // Verify all GraphAuditStatus variants
+        for status in &[
+            GraphAuditStatus::Ok,
+            GraphAuditStatus::Timeout,
+            GraphAuditStatus::Denied,
+            GraphAuditStatus::Error,
+        ] {
+            let _ = format!("{:?}", status);
+        }
     }
 
     #[test]
