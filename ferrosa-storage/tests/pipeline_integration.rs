@@ -267,3 +267,38 @@ fn concurrent_writers_during_flush() {
 
     engine.shutdown().unwrap();
 }
+
+use proptest::prelude::*;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    // Write arbitrary partitions, flush, verify all are readable.
+    #[test]
+    fn arbitrary_writes_recoverable(
+        count in 1usize..30,
+        base_ts in 1000i64..100_000,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = make_engine(dir.path());
+        engine.register_table(test_schema()).unwrap();
+        let tid = TableId::new("ks", "tbl");
+
+        let mut keys = Vec::new();
+        for i in 0..count {
+            let key = make_key(&format!("prop_k{i:06}"));
+            let row = make_row(format!("val_{i}").as_bytes(), base_ts + i as i64);
+            engine.write(&tid, &key, row, base_ts + i as i64).unwrap();
+            keys.push(key);
+        }
+
+        engine.flush(&tid).unwrap();
+
+        for (i, key) in keys.iter().enumerate() {
+            let result = engine.read(&tid, key).unwrap();
+            prop_assert!(result.is_some(), "missing partition {i}");
+        }
+
+        engine.shutdown().unwrap();
+    }
+}
