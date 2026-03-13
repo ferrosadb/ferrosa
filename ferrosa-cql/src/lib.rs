@@ -18,6 +18,7 @@
 pub mod ast;
 pub mod auth;
 pub mod bridge;
+pub mod client;
 pub mod connection;
 pub mod error;
 pub mod frame;
