@@ -191,11 +191,11 @@ pub async fn run_peers(addr: SocketAddr) -> Result<(), CqlError> {
 
 // ── monitor ──────────────────────────────────────────────────────────────────
 
-/// Interactive TUI monitor (stub — T24 will implement).
-pub async fn run_monitor(_addr: SocketAddr, panel: Option<&str>) -> Result<(), CqlError> {
-    let panel_label = panel.unwrap_or("overview");
-    println!("TUI mode not yet implemented (panel: {panel_label})");
-    println!("Coming in T24.");
+/// Launch the interactive TUI monitor dashboard.
+pub async fn run_monitor(addr: SocketAddr, panel: Option<&str>) -> Result<(), CqlError> {
+    crate::tui::run(addr, panel.map(String::from))
+        .await
+        .map_err(|e| CqlError::Protocol(format!("TUI error: {e}")))?;
     Ok(())
 }
 
@@ -316,14 +316,5 @@ mod tests {
         assert_eq!(result.rows[0].columns[0].as_deref(), Some(b"q2" as &[u8]));
         assert_eq!(result.rows[1].columns[0].as_deref(), Some(b"q3" as &[u8]));
         assert_eq!(result.rows[2].columns[0].as_deref(), Some(b"q1" as &[u8]));
-    }
-
-    #[test]
-    fn monitor_stub_message() {
-        // run_monitor is async; just verify the stub path compiles and the
-        // message string is stable (checked via the function body, not here).
-        let panel_label = "overview";
-        let msg = format!("TUI mode not yet implemented (panel: {panel_label})");
-        assert!(msg.contains("not yet implemented"));
     }
 }

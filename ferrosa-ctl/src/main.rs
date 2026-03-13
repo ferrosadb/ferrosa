@@ -24,6 +24,7 @@ use std::process;
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod tui;
 
 /// Administration and observability CLI for Ferrosa.
 #[derive(Debug, Parser)]
