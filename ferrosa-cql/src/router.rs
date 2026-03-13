@@ -31,6 +31,7 @@ use crate::error::CqlError;
 use crate::prepared::PreparedCache;
 use crate::result;
 use crate::types::{CqlType, CqlValue};
+use crate::virtual_tables::connections::ConnectionTracker;
 
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
 const MAX_BATCH_STATEMENTS: usize = 500;
@@ -42,6 +43,7 @@ pub struct SharedState {
     pub node_config: Arc<NodeConfig>,
     pub cluster_state: Arc<dyn ClusterState>,
     pub prepared_cache: Arc<PreparedCache>,
+    pub connection_tracker: Arc<ConnectionTracker>,
 }
 
 /// Per-request context: authentication and current keyspace.
@@ -1468,6 +1470,7 @@ mod tests {
             node_config,
             cluster_state: Arc::new(SingleNodeClusterState),
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
+            connection_tracker: Arc::new(ConnectionTracker::new()),
         };
         (state, dir)
     }
