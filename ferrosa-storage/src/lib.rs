@@ -24,6 +24,7 @@ pub mod merge;
 pub mod observer;
 pub mod store;
 pub mod upload;
+pub mod virtual_tables;
 
 pub use cache::LocalCache;
 pub use commitlog::cdc::CdcReader;
