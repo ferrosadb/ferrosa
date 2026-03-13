@@ -388,6 +388,18 @@ fn route_select(
                 &rows,
             ))
         }
+        // cqlsh queries these system_schema tables during startup introspection.
+        // Return empty results for tables we don't populate yet.
+        (
+            "system_schema",
+            "types" | "functions" | "aggregates" | "triggers" | "views" | "indexes",
+        ) => Ok(result::encode_rows(
+            &["keyspace_name".into(), "type_name".into()],
+            &[CqlType::Varchar, CqlType::Varchar],
+            "system_schema",
+            s.table.as_str(),
+            &[],
+        )),
         _ => {
             // User table: permission check + bridge + storage
             route_select_user_table(state, ctx, ks, &s)
