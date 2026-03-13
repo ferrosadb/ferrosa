@@ -16,6 +16,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -111,6 +112,9 @@ pub struct StorageEngine {
     upload_manager: Option<UploadManager>,
     local_cache: LocalCache,
     observers: RwLock<Vec<Arc<dyn crate::observer::WriteObserver>>>,
+    async_observers: RwLock<Vec<AsyncObserverState>>,
+    /// Default channel capacity for async observers.
+    async_observer_capacity: usize,
 }
 
 /// Per-table state: schema + store.
@@ -118,6 +122,14 @@ struct TableState {
     #[allow(dead_code)]
     schema: TableSchema,
     store: TableStore<FileFlushTarget>,
+}
+
+/// State for a single async observer: the observer, its sender half, and a
+/// drop counter for backpressure metrics.
+struct AsyncObserverState {
+    observer: Arc<dyn crate::observer::WriteObserver>,
+    sender: tokio::sync::mpsc::Sender<(TableId, Mutation)>,
+    drop_count: Arc<AtomicU64>,
 }
 
 impl StorageEngine {
@@ -162,6 +174,8 @@ impl StorageEngine {
             upload_manager,
             local_cache,
             observers: RwLock::new(Vec::new()),
+            async_observers: RwLock::new(Vec::new()),
+            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
         })
     }
 
@@ -190,9 +204,41 @@ impl StorageEngine {
     /// Registers an observer that will be notified when mutations are written.
     ///
     /// Sync observers are called inline on the write path. Async observers
-    /// receive mutations through a bounded channel (see Task 2.3).
+    /// receive mutations through a bounded channel — the drain loop is
+    /// started externally (e.g., by `GraphEngine` in Slice 5).
     pub fn register_observer(&self, observer: Arc<dyn crate::observer::WriteObserver>) {
-        self.observers.write().push(observer);
+        match observer.mode() {
+            crate::observer::ObserverMode::Sync => {
+                self.observers.write().push(observer);
+            }
+            crate::observer::ObserverMode::Async => {
+                let capacity = self.async_observer_capacity;
+                let (tx, _rx) = tokio::sync::mpsc::channel(capacity);
+                let state = AsyncObserverState {
+                    observer,
+                    sender: tx,
+                    drop_count: Arc::new(AtomicU64::new(0)),
+                };
+                self.async_observers.write().push(state);
+            }
+        }
+    }
+
+    /// Registers an async observer and returns the receiver end of the bounded
+    /// channel. The caller is responsible for draining the receiver.
+    pub fn register_async_observer(
+        &self,
+        observer: Arc<dyn crate::observer::WriteObserver>,
+        capacity: usize,
+    ) -> tokio::sync::mpsc::Receiver<(TableId, Mutation)> {
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        let state = AsyncObserverState {
+            observer,
+            sender: tx,
+            drop_count: Arc::new(AtomicU64::new(0)),
+        };
+        self.async_observers.write().push(state);
+        rx
     }
 
     /// Dispatches a mutation to all sync observers watching the given table.
@@ -223,6 +269,35 @@ impl StorageEngine {
                 }
             }
         }
+    }
+
+    /// Dispatches a mutation to all async observers watching the given table.
+    ///
+    /// Uses `try_send` — never blocks the write path. If the channel is full,
+    /// the mutation is dropped and the drop counter is incremented.
+    fn dispatch_async_observers(&self, table_id: &TableId, mutation: &Mutation) {
+        let async_obs = self.async_observers.read();
+        for state in async_obs.iter() {
+            let watched = state.observer.tables();
+            if watched.iter().any(|t| t == table_id)
+                && state
+                    .sender
+                    .try_send((table_id.clone(), mutation.clone()))
+                    .is_err()
+            {
+                state.drop_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Returns the total number of mutations dropped by async observers due to
+    /// backpressure (channel full).
+    pub fn observer_drop_count(&self) -> u64 {
+        let async_obs = self.async_observers.read();
+        async_obs
+            .iter()
+            .map(|s| s.drop_count.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Writes a row to the commit log and the table's memtable.
@@ -256,6 +331,7 @@ impl StorageEngine {
 
         // 3. Notify observers after successful commit log + memtable write.
         self.dispatch_sync_observers(table_id, &mutation);
+        self.dispatch_async_observers(table_id, &mutation);
 
         Ok(())
     }
@@ -300,6 +376,7 @@ impl StorageEngine {
 
             // Notify observers after successful commit log + memtable write.
             self.dispatch_sync_observers(table_id, &mutation);
+            self.dispatch_async_observers(table_id, &mutation);
         }
 
         Ok(())
@@ -817,5 +894,91 @@ mod tests {
             .unwrap();
 
         assert_eq!(observer.count(), 0);
+    }
+
+    /// A test observer that operates in async mode.
+    struct AsyncCountingObserver {
+        watched: Vec<TableId>,
+        call_count: std::sync::atomic::AtomicU64,
+    }
+
+    impl AsyncCountingObserver {
+        fn new(watched: Vec<TableId>) -> Self {
+            Self {
+                watched,
+                call_count: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl crate::observer::WriteObserver for AsyncCountingObserver {
+        fn mode(&self) -> crate::observer::ObserverMode {
+            crate::observer::ObserverMode::Async
+        }
+
+        fn tables(&self) -> Vec<TableId> {
+            self.watched.clone()
+        }
+
+        fn on_write(&self, _table: &TableId, _mutation: &Mutation) -> Vec<Mutation> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn async_observer_does_not_block_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+        let observer = Arc::new(AsyncCountingObserver::new(vec![tid.clone()]));
+        let mut rx = engine.register_async_observer(observer, 16);
+
+        let key = make_key("k1");
+        engine
+            .write(&tid, &key, make_row(b"val", 1000), 1000)
+            .unwrap();
+
+        // Write should succeed (async observer does not block).
+        // The mutation should be in the channel.
+        let msg = rx.try_recv();
+        assert!(msg.is_ok());
+        let (recv_tid, recv_mutation) = msg.unwrap();
+        assert_eq!(recv_tid, tid);
+        assert_eq!(recv_mutation.keyspace, "test_ks");
+    }
+
+    #[test]
+    fn async_observer_backpressure_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+        let observer = Arc::new(AsyncCountingObserver::new(vec![tid.clone()]));
+        // Tiny channel capacity of 2 to test backpressure.
+        let _rx = engine.register_async_observer(observer, 2);
+
+        assert_eq!(engine.observer_drop_count(), 0);
+
+        // Write 5 mutations — channel holds 2, so at least 3 should be dropped.
+        for i in 0..5 {
+            let key = make_key(&format!("k{i}"));
+            engine
+                .write(&tid, &key, make_row(b"val", 1000 + i), 1000 + i)
+                .unwrap();
+        }
+
+        // Drop count should be >= 3 (channel capacity 2, 5 writes).
+        assert!(
+            engine.observer_drop_count() >= 3,
+            "expected >= 3 drops, got {}",
+            engine.observer_drop_count()
+        );
     }
 }
