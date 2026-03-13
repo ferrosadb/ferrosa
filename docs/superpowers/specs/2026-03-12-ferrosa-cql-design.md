@@ -108,8 +108,8 @@ Single `CqlValue` enum covering all CQL types with `encode`/`decode` methods.
 | `varint` | variable-length signed | `num_bigint::BigInt` |
 | `decimal` | varint scale + varint unscaled | `(i32, BigInt)` |
 | `list<T>` | `[n][element]*n` | `Vec<CqlValue>` |
-| `set<T>` | `[n][element]*n` | `BTreeSet<CqlValue>` |
-| `map<K,V>` | `[n][key,val]*n` | `BTreeMap<CqlValue, CqlValue>` |
+| `set<T>` | `[n][element]*n` | `Vec<CqlValue>` (wire-order; bridge converts) |
+| `map<K,V>` | `[n][key,val]*n` | `Vec<(CqlValue, CqlValue)>` (wire-order; bridge converts) |
 | `tuple` | concatenated elements | `Vec<Option<CqlValue>>` |
 | `frozen<UDT>` | concatenated named fields | `Vec<(String, Option<CqlValue>)>` |
 
