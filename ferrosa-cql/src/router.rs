@@ -136,6 +136,7 @@ fn route_select(
                 "broadcast_address",
                 "rpc_address",
                 "bootstrapped",
+                "tokens",
             ]
             .into_iter()
             .map(String::from)
@@ -156,7 +157,13 @@ fn route_select(
                 CqlType::Inet,
                 CqlType::Inet,
                 CqlType::Varchar,
+                CqlType::Set(Box::new(CqlType::Varchar)),
             ];
+            let tokens_set: Vec<CqlValue> = info
+                .tokens
+                .iter()
+                .map(|t| CqlValue::Text(t.clone()))
+                .collect();
             let row = vec![
                 Some(CqlValue::Text(info.key)),
                 Some(CqlValue::Text(info.cluster_name)),
@@ -173,6 +180,7 @@ fn route_select(
                 Some(CqlValue::Inet(info.broadcast_address)),
                 Some(CqlValue::Inet(info.rpc_address)),
                 Some(CqlValue::Text(info.bootstrapped)),
+                Some(CqlValue::Set(tokens_set)),
             ];
             Ok(result::encode_rows(
                 &col_names,
@@ -388,6 +396,18 @@ fn route_select(
                 &rows,
             ))
         }
+        // cqlsh queries these system_schema tables during startup introspection.
+        // Return empty results for tables we don't populate yet.
+        (
+            "system_schema",
+            "types" | "functions" | "aggregates" | "triggers" | "views" | "indexes",
+        ) => Ok(result::encode_rows(
+            &["keyspace_name".into(), "type_name".into()],
+            &[CqlType::Varchar, CqlType::Varchar],
+            "system_schema",
+            s.table.as_str(),
+            &[],
+        )),
         _ => {
             // User table: permission check + bridge + storage
             route_select_user_table(state, ctx, ks, &s)
@@ -1458,9 +1478,74 @@ mod tests {
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).unwrap();
         match &result {
-            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
+            RouteResult::Result(b) => {
+                // Result kind = Rows (0x0002)
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+                // Column count is at offset 8 (after kind(4) + flags(4))
+                let col_count = i32::from_be_bytes(b[8..12].try_into().unwrap());
+                // 16 columns: key, cluster_name, data_center, rack, host_id,
+                // partitioner, native_protocol_version, cql_version,
+                // release_version, schema_version, rpc_port, listen_address,
+                // broadcast_address, rpc_address, bootstrapped, tokens
+                assert_eq!(col_count, 16);
+            }
             _ => panic!("expected Result"),
         }
+    }
+
+    /// Regression test: cqlsh expects `tokens` column (set<varchar>) in
+    /// system.local. Without it, cqlsh prints "'local' not found in
+    /// keyspace 'system'" during startup introspection.
+    #[test]
+    fn select_system_local_includes_tokens_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
+        let result = route(&state, &ctx, stmt).unwrap();
+        let b = match &result {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected Result"),
+        };
+
+        // Decode column names from the Rows metadata.
+        // Layout: [i32 kind][i32 flags][i32 col_count][string ks][string table]
+        //         then per column: [string name][u16 type_id][type params]
+        let col_count = i32::from_be_bytes(b[8..12].try_into().unwrap()) as usize;
+
+        // Skip past keyspace and table global_table_spec strings
+        let mut off = 12;
+        // keyspace string: [u16 len][bytes]
+        let ks_len = u16::from_be_bytes(b[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        // table string: [u16 len][bytes]
+        let tbl_len = u16::from_be_bytes(b[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+
+        // Read column names
+        let mut col_names = Vec::new();
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(b[off..off + 2].try_into().unwrap()) as usize;
+            off += 2;
+            let name = std::str::from_utf8(&b[off..off + name_len]).unwrap();
+            col_names.push(name.to_string());
+            off += name_len;
+            // Skip type_id (u16) + possible type params
+            let type_id = u16::from_be_bytes(b[off..off + 2].try_into().unwrap());
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2, // List/Set: element type_id
+                0x0021 => off += 4,          // Map: key + val type_ids
+                _ => {}
+            }
+        }
+
+        assert!(
+            col_names.contains(&"tokens".to_string()),
+            "system.local must include 'tokens' column, got: {col_names:?}"
+        );
     }
 
     #[test]
