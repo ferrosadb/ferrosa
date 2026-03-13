@@ -12,14 +12,9 @@ proptest! {
     #[test]
     fn lexer_never_panics(input in "\\PC{0,200}") {
         let mut lexer = ferrosa_graph::parser::Lexer::new(&input);
-        loop {
-            match lexer.next_token() {
-                Ok(tok) => {
-                    if tok.kind == ferrosa_graph::parser::TokenKind::Eof {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(tok) = lexer.next_token() {
+            if tok.kind == ferrosa_graph::parser::TokenKind::Eof {
+                break;
             }
         }
     }

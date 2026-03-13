@@ -2,737 +2,768 @@
 //!
 //! One function per grammar rule. LL(2) — at most two-token lookahead.
 //! Produces an AST from the token stream.
+//!
+//! Expression nesting is capped at [`MAX_EXPR_DEPTH`] (64) to prevent
+//! stack overflow from adversarial input (threat model T1).
 
 use crate::parser::ast::*;
-use crate::parser::error::{ParseError, ParseResult};
+use crate::parser::error::{ParseError, ParseResult, Span};
 use crate::parser::lexer::Lexer;
 use crate::parser::token::{Keyword, TokenKind};
 
-/// Parse a complete Cypher statement from source text.
-pub fn parse(input: &str) -> ParseResult<Statement> {
-    let mut lexer = Lexer::new(input);
-    let stmt = parse_statement(&mut lexer)?;
-    // Ensure we consumed all input.
-    let tok = lexer.next_token()?;
-    if tok.kind != TokenKind::Eof {
-        return Err(ParseError::new(
-            format!("unexpected token after statement: {:?}", tok.kind),
-            tok.span,
-        ));
-    }
-    Ok(stmt)
+/// Maximum expression nesting depth before the parser returns an error.
+/// Prevents stack overflow from deeply nested parentheses or chained
+/// NOT/unary operators. (Threat model T1 mitigation.)
+const MAX_EXPR_DEPTH: usize = 64;
+
+/// Parser state wrapping a [`Lexer`] and tracking expression nesting depth.
+struct Parser<'input> {
+    lexer: Lexer<'input>,
+    /// Current expression nesting depth (incremented on recursive entry).
+    expr_depth: usize,
 }
 
-fn parse_statement(lexer: &mut Lexer<'_>) -> ParseResult<Statement> {
-    let tok = lexer.peek()?;
-    match &tok.kind {
-        TokenKind::Keyword(Keyword::Match) => parse_match(lexer),
-        TokenKind::Keyword(Keyword::Create) => parse_create(lexer),
-        _ => Err(ParseError::new(
-            format!("expected MATCH or CREATE, got {:?}", tok.kind),
-            tok.span,
-        )),
-    }
-}
-
-fn parse_match(lexer: &mut Lexer<'_>) -> ParseResult<Statement> {
-    lexer.expect(&TokenKind::Keyword(Keyword::Match))?;
-    let pattern = parse_pattern_list(lexer)?;
-
-    // Optional WHERE.
-    let where_clause = if lexer.eat(&TokenKind::Keyword(Keyword::Where))? {
-        Some(parse_expr(lexer)?)
-    } else {
-        None
-    };
-
-    // Check what follows: RETURN, SET, DELETE, DETACH DELETE.
-    let tok = lexer.peek()?;
-    match &tok.kind {
-        TokenKind::Keyword(Keyword::Return) => {
-            let return_clause = parse_return_clause(lexer)?;
-            Ok(Statement::Match {
-                pattern,
-                where_clause,
-                return_clause,
-            })
-        }
-        TokenKind::Keyword(Keyword::Set) => {
-            lexer.next_token()?;
-            let assignments = parse_assignment_list(lexer)?;
-            Ok(Statement::Set {
-                pattern,
-                where_clause,
-                assignments,
-            })
-        }
-        TokenKind::Keyword(Keyword::Delete) => {
-            lexer.next_token()?;
-            let variables = parse_var_list(lexer)?;
-            Ok(Statement::Delete {
-                pattern,
-                where_clause,
-                detach: false,
-                variables,
-            })
-        }
-        TokenKind::Keyword(Keyword::Detach) => {
-            lexer.next_token()?;
-            lexer.expect(&TokenKind::Keyword(Keyword::Delete))?;
-            let variables = parse_var_list(lexer)?;
-            Ok(Statement::Delete {
-                pattern,
-                where_clause,
-                detach: true,
-                variables,
-            })
-        }
-        _ => Err(ParseError::new(
-            format!(
-                "expected RETURN, SET, DELETE, or DETACH DELETE after MATCH, got {:?}",
-                tok.kind
-            ),
-            tok.span,
-        )),
-    }
-}
-
-fn parse_create(lexer: &mut Lexer<'_>) -> ParseResult<Statement> {
-    lexer.expect(&TokenKind::Keyword(Keyword::Create))?;
-    let patterns = parse_pattern_list(lexer)?;
-    Ok(Statement::Create { patterns })
-}
-
-// --- Pattern parsing ---
-
-fn parse_pattern_list(lexer: &mut Lexer<'_>) -> ParseResult<Vec<Pattern>> {
-    let mut patterns = vec![parse_pattern(lexer)?];
-    while lexer.eat(&TokenKind::Comma)? {
-        patterns.push(parse_pattern(lexer)?);
-    }
-    Ok(patterns)
-}
-
-fn parse_pattern(lexer: &mut Lexer<'_>) -> ParseResult<Pattern> {
-    let first = parse_node_pattern(lexer)?;
-    let mut elements = vec![first];
-
-    // Check for relationship continuation: -[ or <- or ->
-    loop {
-        let tok = lexer.peek()?;
-        match &tok.kind {
-            TokenKind::DashBracket | TokenKind::ArrowLeft | TokenKind::Minus => {
-                let rel = parse_rel_pattern(lexer)?;
-                elements.push(rel);
-                let node = parse_node_pattern(lexer)?;
-                elements.push(node);
-            }
-            _ => break,
+impl<'input> Parser<'input> {
+    fn new(input: &'input str) -> Self {
+        Self {
+            lexer: Lexer::new(input),
+            expr_depth: 0,
         }
     }
 
-    if elements.len() == 1 {
-        Ok(elements.into_iter().next().unwrap())
-    } else {
-        Ok(Pattern::Path(elements))
-    }
-}
-
-pub(crate) fn parse_node_pattern(lexer: &mut Lexer<'_>) -> ParseResult<Pattern> {
-    lexer.expect(&TokenKind::LParen)?;
-
-    let mut var = None;
-    let mut label = None;
-    let mut props = vec![];
-
-    let tok = lexer.peek()?;
-    match &tok.kind {
-        TokenKind::RParen => {
-            // Empty node: ()
-        }
-        TokenKind::Colon => {
-            // Label only: (:Person)
-            label = Some(parse_label(lexer)?);
-            if lexer.peek()?.kind == TokenKind::LBrace {
-                props = parse_prop_map(lexer)?;
-            }
-        }
-        TokenKind::Ident(_) => {
-            // Variable, possibly followed by label and props.
-            let name_tok = lexer.next_token()?;
-            if let TokenKind::Ident(name) = name_tok.kind {
-                var = Some(name.to_string());
-            }
-            if lexer.peek()?.kind == TokenKind::Colon {
-                label = Some(parse_label(lexer)?);
-            }
-            if lexer.peek()?.kind == TokenKind::LBrace {
-                props = parse_prop_map(lexer)?;
-            }
-        }
-        TokenKind::LBrace => {
-            props = parse_prop_map(lexer)?;
-        }
-        _ => {
-            return Err(ParseError::new(
+    /// Increment expression depth, returning an error if the limit is exceeded.
+    fn enter_expr(&mut self) -> ParseResult<()> {
+        self.expr_depth += 1;
+        if self.expr_depth > MAX_EXPR_DEPTH {
+            let pos = self.lexer.pos();
+            Err(ParseError::new(
                 format!(
-                    "expected variable, label, or ')' in node pattern, got {:?}",
+                    "expression nesting depth exceeds maximum of {}",
+                    MAX_EXPR_DEPTH
+                ),
+                Span {
+                    start: pos,
+                    end: pos,
+                },
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn exit_expr(&mut self) {
+        self.expr_depth -= 1;
+    }
+
+    fn parse_statement(&mut self) -> ParseResult<Statement> {
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            TokenKind::Keyword(Keyword::Match) => self.parse_match(),
+            TokenKind::Keyword(Keyword::Create) => self.parse_create(),
+            _ => Err(ParseError::new(
+                format!("expected MATCH or CREATE, got {:?}", tok.kind),
+                tok.span,
+            )),
+        }
+    }
+
+    fn parse_match(&mut self) -> ParseResult<Statement> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Match))?;
+        let pattern = self.parse_pattern_list()?;
+
+        // Optional WHERE.
+        let where_clause = if self.lexer.eat(&TokenKind::Keyword(Keyword::Where))? {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        // Check what follows: RETURN, SET, DELETE, DETACH DELETE.
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            TokenKind::Keyword(Keyword::Return) => {
+                let return_clause = self.parse_return_clause()?;
+                Ok(Statement::Match {
+                    pattern,
+                    where_clause,
+                    return_clause,
+                })
+            }
+            TokenKind::Keyword(Keyword::Set) => {
+                self.lexer.next_token()?;
+                let assignments = self.parse_assignment_list()?;
+                Ok(Statement::Set {
+                    pattern,
+                    where_clause,
+                    assignments,
+                })
+            }
+            TokenKind::Keyword(Keyword::Delete) => {
+                self.lexer.next_token()?;
+                let variables = self.parse_var_list()?;
+                Ok(Statement::Delete {
+                    pattern,
+                    where_clause,
+                    detach: false,
+                    variables,
+                })
+            }
+            TokenKind::Keyword(Keyword::Detach) => {
+                self.lexer.next_token()?;
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Delete))?;
+                let variables = self.parse_var_list()?;
+                Ok(Statement::Delete {
+                    pattern,
+                    where_clause,
+                    detach: true,
+                    variables,
+                })
+            }
+            _ => Err(ParseError::new(
+                format!(
+                    "expected RETURN, SET, DELETE, or DETACH DELETE after MATCH, got {:?}",
                     tok.kind
                 ),
                 tok.span,
-            ));
+            )),
         }
     }
 
-    lexer.expect(&TokenKind::RParen)?;
+    fn parse_create(&mut self) -> ParseResult<Statement> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Create))?;
+        let patterns = self.parse_pattern_list()?;
+        Ok(Statement::Create { patterns })
+    }
 
-    Ok(Pattern::Node { var, label, props })
-}
+    // --- Pattern parsing ---
 
-fn parse_rel_pattern(lexer: &mut Lexer<'_>) -> ParseResult<Pattern> {
-    let tok = lexer.peek()?;
-    match &tok.kind {
-        // -[:TYPE]-> or -[:TYPE]- or -[var:TYPE {props}]->
-        TokenKind::DashBracket => {
-            lexer.next_token()?;
-            let (var, rel_type, props) = parse_rel_detail(lexer)?;
+    fn parse_pattern_list(&mut self) -> ParseResult<Vec<Pattern>> {
+        let mut patterns = vec![self.parse_pattern()?];
+        while self.lexer.eat(&TokenKind::Comma)? {
+            patterns.push(self.parse_pattern()?);
+        }
+        Ok(patterns)
+    }
 
-            // Expect ]-> or ]- or ]
-            let close = lexer.peek()?;
-            let direction = match &close.kind {
-                TokenKind::BracketArrow => {
-                    lexer.next_token()?;
-                    Direction::Out
+    fn parse_pattern(&mut self) -> ParseResult<Pattern> {
+        let first = self.parse_node_pattern()?;
+        let mut elements = vec![first];
+
+        // Check for relationship continuation: -[ or <- or ->
+        loop {
+            let tok = self.lexer.peek()?;
+            match &tok.kind {
+                TokenKind::DashBracket | TokenKind::ArrowLeft | TokenKind::Minus => {
+                    let rel = self.parse_rel_pattern()?;
+                    elements.push(rel);
+                    let node = self.parse_node_pattern()?;
+                    elements.push(node);
                 }
-                TokenKind::BracketDash => {
-                    lexer.next_token()?;
-                    Direction::Both
+                _ => break,
+            }
+        }
+
+        if elements.len() == 1 {
+            Ok(elements.into_iter().next().unwrap())
+        } else {
+            Ok(Pattern::Path(elements))
+        }
+    }
+
+    fn parse_node_pattern(&mut self) -> ParseResult<Pattern> {
+        self.lexer.expect(&TokenKind::LParen)?;
+
+        let mut var = None;
+        let mut label = None;
+        let mut props = vec![];
+
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            TokenKind::RParen => {
+                // Empty node: ()
+            }
+            TokenKind::Colon => {
+                // Label only: (:Person)
+                label = Some(self.parse_label()?);
+                if self.lexer.peek()?.kind == TokenKind::LBrace {
+                    props = self.parse_prop_map()?;
                 }
-                TokenKind::RBracket => {
-                    lexer.next_token()?;
-                    // Check for trailing ->; otherwise treat as undirected.
-                    if lexer.eat(&TokenKind::ArrowRight)? {
+            }
+            TokenKind::Ident(_) => {
+                // Variable, possibly followed by label and props.
+                let name_tok = self.lexer.next_token()?;
+                if let TokenKind::Ident(name) = name_tok.kind {
+                    var = Some(name.to_string());
+                }
+                if self.lexer.peek()?.kind == TokenKind::Colon {
+                    label = Some(self.parse_label()?);
+                }
+                if self.lexer.peek()?.kind == TokenKind::LBrace {
+                    props = self.parse_prop_map()?;
+                }
+            }
+            TokenKind::LBrace => {
+                props = self.parse_prop_map()?;
+            }
+            _ => {
+                return Err(ParseError::new(
+                    format!(
+                        "expected variable, label, or ')' in node pattern, got {:?}",
+                        tok.kind
+                    ),
+                    tok.span,
+                ));
+            }
+        }
+
+        self.lexer.expect(&TokenKind::RParen)?;
+
+        Ok(Pattern::Node { var, label, props })
+    }
+
+    fn parse_rel_pattern(&mut self) -> ParseResult<Pattern> {
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            // -[:TYPE]-> or -[:TYPE]- or -[var:TYPE {props}]->
+            TokenKind::DashBracket => {
+                self.lexer.next_token()?;
+                let (var, rel_type, props) = self.parse_rel_detail()?;
+
+                // Expect ]-> or ]- or ]
+                let close = self.lexer.peek()?;
+                let direction = match &close.kind {
+                    TokenKind::BracketArrow => {
+                        self.lexer.next_token()?;
                         Direction::Out
-                    } else {
-                        // Consume optional trailing dash for ]-
-                        let _ = lexer.eat(&TokenKind::Minus)?;
+                    }
+                    TokenKind::BracketDash => {
+                        self.lexer.next_token()?;
                         Direction::Both
                     }
-                }
-                _ => {
-                    return Err(ParseError::new(
-                        format!(
-                            "expected ]->, ]-, or ] in relationship, got {:?}",
-                            close.kind
-                        ),
-                        close.span,
-                    ));
-                }
-            };
+                    TokenKind::RBracket => {
+                        self.lexer.next_token()?;
+                        // Check for trailing ->; otherwise treat as undirected.
+                        if self.lexer.eat(&TokenKind::ArrowRight)? {
+                            Direction::Out
+                        } else {
+                            // Consume optional trailing dash for ]-
+                            let _ = self.lexer.eat(&TokenKind::Minus)?;
+                            Direction::Both
+                        }
+                    }
+                    _ => {
+                        return Err(ParseError::new(
+                            format!(
+                                "expected ]->, ]-, or ] in relationship, got {:?}",
+                                close.kind
+                            ),
+                            close.span,
+                        ));
+                    }
+                };
 
-            Ok(Pattern::Rel {
-                var,
-                rel_type,
-                direction,
-                props,
-            })
+                Ok(Pattern::Rel {
+                    var,
+                    rel_type,
+                    direction,
+                    props,
+                })
+            }
+            // <-[:TYPE]- or <-[var:TYPE]-
+            TokenKind::ArrowLeft => {
+                self.lexer.next_token()?;
+                self.lexer.expect(&TokenKind::LBracket)?;
+                let (var, rel_type, props) = self.parse_rel_detail()?;
+                // Expect ]- or ]
+                let close = self.lexer.peek()?;
+                match &close.kind {
+                    TokenKind::BracketDash => {
+                        self.lexer.next_token()?;
+                    }
+                    TokenKind::RBracket => {
+                        self.lexer.next_token()?;
+                        self.lexer.expect(&TokenKind::Minus)?;
+                    }
+                    _ => {
+                        return Err(ParseError::new(
+                            format!("expected ]- in incoming relationship, got {:?}", close.kind),
+                            close.span,
+                        ));
+                    }
+                }
+                Ok(Pattern::Rel {
+                    var,
+                    rel_type,
+                    direction: Direction::In,
+                    props,
+                })
+            }
+            // Bare - used in undirected: (a)-(b) — treated as Both
+            TokenKind::Minus => {
+                self.lexer.next_token()?;
+                Ok(Pattern::Rel {
+                    var: None,
+                    rel_type: None,
+                    direction: Direction::Both,
+                    props: vec![],
+                })
+            }
+            _ => Err(ParseError::new(
+                format!(
+                    "expected -[, <-, or - in relationship pattern, got {:?}",
+                    tok.kind
+                ),
+                tok.span,
+            )),
         }
-        // <-[:TYPE]- or <-[var:TYPE]-
-        TokenKind::ArrowLeft => {
-            lexer.next_token()?;
-            lexer.expect(&TokenKind::LBracket)?;
-            let (var, rel_type, props) = parse_rel_detail(lexer)?;
-            // Expect ]- or ]
-            let close = lexer.peek()?;
-            match &close.kind {
-                TokenKind::BracketDash => {
-                    lexer.next_token()?;
+    }
+
+    /// Parse the inside of `[ ... ]` in a relationship: `var:TYPE {props}`
+    fn parse_rel_detail(&mut self) -> ParseResult<(Option<String>, Option<String>, PropMap)> {
+        let mut var = None;
+        let mut rel_type = None;
+        let mut props = vec![];
+
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            TokenKind::Colon => {
+                rel_type = Some(self.parse_label()?);
+            }
+            TokenKind::Ident(_) => {
+                let name_tok = self.lexer.next_token()?;
+                if let TokenKind::Ident(name) = name_tok.kind {
+                    var = Some(name.to_string());
                 }
-                TokenKind::RBracket => {
-                    lexer.next_token()?;
-                    lexer.expect(&TokenKind::Minus)?;
-                }
-                _ => {
-                    return Err(ParseError::new(
-                        format!("expected ]- in incoming relationship, got {:?}", close.kind),
-                        close.span,
-                    ));
+                if self.lexer.peek()?.kind == TokenKind::Colon {
+                    rel_type = Some(self.parse_label()?);
                 }
             }
-            Ok(Pattern::Rel {
-                var,
-                rel_type,
-                direction: Direction::In,
-                props,
-            })
-        }
-        // Bare - used in undirected: (a)-(b) — treated as Both
-        TokenKind::Minus => {
-            lexer.next_token()?;
-            Ok(Pattern::Rel {
-                var: None,
-                rel_type: None,
-                direction: Direction::Both,
-                props: vec![],
-            })
-        }
-        _ => Err(ParseError::new(
-            format!(
-                "expected -[, <-, or - in relationship pattern, got {:?}",
-                tok.kind
-            ),
-            tok.span,
-        )),
-    }
-}
-
-/// Parse the inside of `[ ... ]` in a relationship: `var:TYPE {props}`
-fn parse_rel_detail(
-    lexer: &mut Lexer<'_>,
-) -> ParseResult<(Option<String>, Option<String>, PropMap)> {
-    let mut var = None;
-    let mut rel_type = None;
-    let mut props = vec![];
-
-    let tok = lexer.peek()?;
-    match &tok.kind {
-        TokenKind::Colon => {
-            rel_type = Some(parse_label(lexer)?);
-        }
-        TokenKind::Ident(_) => {
-            let name_tok = lexer.next_token()?;
-            if let TokenKind::Ident(name) = name_tok.kind {
-                var = Some(name.to_string());
-            }
-            if lexer.peek()?.kind == TokenKind::Colon {
-                rel_type = Some(parse_label(lexer)?);
+            _ => {
+                // Empty brackets: -[]-
             }
         }
-        _ => {
-            // Empty brackets: -[]-
+
+        if self.lexer.peek()?.kind == TokenKind::LBrace {
+            props = self.parse_prop_map()?;
+        }
+
+        Ok((var, rel_type, props))
+    }
+
+    /// Parse `:Label` — consume colon and return the label name.
+    fn parse_label(&mut self) -> ParseResult<String> {
+        self.lexer.expect(&TokenKind::Colon)?;
+        let tok = self.lexer.next_token()?;
+        match tok.kind {
+            TokenKind::Ident(name) => Ok(name.to_string()),
+            // Keywords can be labels too (e.g., :Order, :Set).
+            TokenKind::Keyword(_) => {
+                let text = &self.lexer.input[tok.span.start..tok.span.end];
+                Ok(text.to_string())
+            }
+            _ => Err(ParseError::new(
+                format!("expected label name after ':', got {:?}", tok.kind),
+                tok.span,
+            )),
         }
     }
 
-    if lexer.peek()?.kind == TokenKind::LBrace {
-        props = parse_prop_map(lexer)?;
-    }
+    /// Parse `{key: value, ...}`.
+    fn parse_prop_map(&mut self) -> ParseResult<PropMap> {
+        self.lexer.expect(&TokenKind::LBrace)?;
+        let mut props = vec![];
 
-    Ok((var, rel_type, props))
-}
+        if self.lexer.peek()?.kind != TokenKind::RBrace {
+            loop {
+                let key_tok = self.lexer.next_token()?;
+                let key = match key_tok.kind {
+                    TokenKind::Ident(name) => name.to_string(),
+                    _ => {
+                        return Err(ParseError::new(
+                            format!("expected property name, got {:?}", key_tok.kind),
+                            key_tok.span,
+                        ));
+                    }
+                };
+                self.lexer.expect(&TokenKind::Colon)?;
+                let value = self.parse_expr()?;
+                props.push((key, value));
 
-/// Parse `:Label` — consume colon and return the label name.
-fn parse_label(lexer: &mut Lexer<'_>) -> ParseResult<String> {
-    lexer.expect(&TokenKind::Colon)?;
-    let tok = lexer.next_token()?;
-    match tok.kind {
-        TokenKind::Ident(name) => Ok(name.to_string()),
-        // Keywords can be labels too (e.g., :Order, :Set).
-        TokenKind::Keyword(_) => {
-            let text = &lexer.input[tok.span.start..tok.span.end];
-            Ok(text.to_string())
+                if !self.lexer.eat(&TokenKind::Comma)? {
+                    break;
+                }
+            }
         }
-        _ => Err(ParseError::new(
-            format!("expected label name after ':', got {:?}", tok.kind),
-            tok.span,
-        )),
+
+        self.lexer.expect(&TokenKind::RBrace)?;
+        Ok(props)
     }
-}
 
-/// Parse `{key: value, ...}`.
-fn parse_prop_map(lexer: &mut Lexer<'_>) -> ParseResult<PropMap> {
-    lexer.expect(&TokenKind::LBrace)?;
-    let mut props = vec![];
+    // --- Expression parsing (precedence climbing) ---
+    // Depth is checked at the entry point to catch all recursive paths.
 
-    if lexer.peek()?.kind != TokenKind::RBrace {
+    fn parse_expr(&mut self) -> ParseResult<Expr> {
+        self.enter_expr()?;
+        let result = self.parse_or_expr();
+        self.exit_expr();
+        result
+    }
+
+    fn parse_or_expr(&mut self) -> ParseResult<Expr> {
+        let mut left = self.parse_and_expr()?;
+        while self.lexer.eat(&TokenKind::Keyword(Keyword::Or))? {
+            let right = self.parse_and_expr()?;
+            left = Expr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_and_expr(&mut self) -> ParseResult<Expr> {
+        let mut left = self.parse_not_expr()?;
+        while self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+            let right = self.parse_not_expr()?;
+            left = Expr::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_not_expr(&mut self) -> ParseResult<Expr> {
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::Not))? {
+            // NOT recurses — check depth.
+            self.enter_expr()?;
+            let inner = self.parse_not_expr();
+            self.exit_expr();
+            Ok(Expr::Not(Box::new(inner?)))
+        } else {
+            self.parse_comparison()
+        }
+    }
+
+    fn parse_comparison(&mut self) -> ParseResult<Expr> {
+        let left = self.parse_addition()?;
+
+        // Check for IS NULL / IS NOT NULL.
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::Is))? {
+            if self.lexer.eat(&TokenKind::Keyword(Keyword::Not))? {
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Null))?;
+                return Ok(Expr::IsNotNull(Box::new(left)));
+            } else {
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Null))?;
+                return Ok(Expr::IsNull(Box::new(left)));
+            }
+        }
+
+        let tok = self.lexer.peek()?;
+        let op = match &tok.kind {
+            TokenKind::Eq => Some(CompareOp::Eq),
+            TokenKind::Neq => Some(CompareOp::Neq),
+            TokenKind::Lt => Some(CompareOp::Lt),
+            TokenKind::Gt => Some(CompareOp::Gt),
+            TokenKind::LtEq => Some(CompareOp::LtEq),
+            TokenKind::GtEq => Some(CompareOp::GtEq),
+            _ => None,
+        };
+
+        if let Some(op) = op {
+            self.lexer.next_token()?;
+            let right = self.parse_addition()?;
+            Ok(Expr::Comparison {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            })
+        } else {
+            Ok(left)
+        }
+    }
+
+    fn parse_addition(&mut self) -> ParseResult<Expr> {
+        let mut left = self.parse_multiplication()?;
         loop {
-            let key_tok = lexer.next_token()?;
-            let key = match key_tok.kind {
-                TokenKind::Ident(name) => name.to_string(),
-                _ => {
-                    return Err(ParseError::new(
-                        format!("expected property name, got {:?}", key_tok.kind),
-                        key_tok.span,
-                    ));
-                }
+            let tok = self.lexer.peek()?;
+            let op = match &tok.kind {
+                TokenKind::Plus => Some(ArithOp::Add),
+                TokenKind::Minus => Some(ArithOp::Sub),
+                _ => None,
             };
-            lexer.expect(&TokenKind::Colon)?;
-            let value = parse_expr(lexer)?;
-            props.push((key, value));
-
-            if !lexer.eat(&TokenKind::Comma)? {
+            if let Some(op) = op {
+                self.lexer.next_token()?;
+                let right = self.parse_multiplication()?;
+                left = Expr::Arithmetic {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                };
+            } else {
                 break;
             }
         }
-    }
-
-    lexer.expect(&TokenKind::RBrace)?;
-    Ok(props)
-}
-
-// --- Expression parsing (precedence climbing) ---
-
-pub(crate) fn parse_expr(lexer: &mut Lexer<'_>) -> ParseResult<Expr> {
-    parse_or_expr(lexer)
-}
-
-fn parse_or_expr(lexer: &mut Lexer<'_>) -> ParseResult<Expr> {
-    let mut left = parse_and_expr(lexer)?;
-    while lexer.eat(&TokenKind::Keyword(Keyword::Or))? {
-        let right = parse_and_expr(lexer)?;
-        left = Expr::Or(Box::new(left), Box::new(right));
-    }
-    Ok(left)
-}
-
-fn parse_and_expr(lexer: &mut Lexer<'_>) -> ParseResult<Expr> {
-    let mut left = parse_not_expr(lexer)?;
-    while lexer.eat(&TokenKind::Keyword(Keyword::And))? {
-        let right = parse_not_expr(lexer)?;
-        left = Expr::And(Box::new(left), Box::new(right));
-    }
-    Ok(left)
-}
-
-fn parse_not_expr(lexer: &mut Lexer<'_>) -> ParseResult<Expr> {
-    if lexer.eat(&TokenKind::Keyword(Keyword::Not))? {
-        let inner = parse_not_expr(lexer)?;
-        Ok(Expr::Not(Box::new(inner)))
-    } else {
-        parse_comparison(lexer)
-    }
-}
-
-fn parse_comparison(lexer: &mut Lexer<'_>) -> ParseResult<Expr> {
-    let left = parse_addition(lexer)?;
-
-    // Check for IS NULL / IS NOT NULL.
-    if lexer.eat(&TokenKind::Keyword(Keyword::Is))? {
-        if lexer.eat(&TokenKind::Keyword(Keyword::Not))? {
-            lexer.expect(&TokenKind::Keyword(Keyword::Null))?;
-            return Ok(Expr::IsNotNull(Box::new(left)));
-        } else {
-            lexer.expect(&TokenKind::Keyword(Keyword::Null))?;
-            return Ok(Expr::IsNull(Box::new(left)));
-        }
-    }
-
-    let tok = lexer.peek()?;
-    let op = match &tok.kind {
-        TokenKind::Eq => Some(CompareOp::Eq),
-        TokenKind::Neq => Some(CompareOp::Neq),
-        TokenKind::Lt => Some(CompareOp::Lt),
-        TokenKind::Gt => Some(CompareOp::Gt),
-        TokenKind::LtEq => Some(CompareOp::LtEq),
-        TokenKind::GtEq => Some(CompareOp::GtEq),
-        _ => None,
-    };
-
-    if let Some(op) = op {
-        lexer.next_token()?;
-        let right = parse_addition(lexer)?;
-        Ok(Expr::Comparison {
-            left: Box::new(left),
-            op,
-            right: Box::new(right),
-        })
-    } else {
         Ok(left)
     }
-}
 
-fn parse_addition(lexer: &mut Lexer<'_>) -> ParseResult<Expr> {
-    let mut left = parse_multiplication(lexer)?;
-    loop {
-        let tok = lexer.peek()?;
-        let op = match &tok.kind {
-            TokenKind::Plus => Some(ArithOp::Add),
-            TokenKind::Minus => Some(ArithOp::Sub),
-            _ => None,
-        };
-        if let Some(op) = op {
-            lexer.next_token()?;
-            let right = parse_multiplication(lexer)?;
-            left = Expr::Arithmetic {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
+    fn parse_multiplication(&mut self) -> ParseResult<Expr> {
+        let mut left = self.parse_unary()?;
+        loop {
+            let tok = self.lexer.peek()?;
+            let op = match &tok.kind {
+                TokenKind::Star => Some(ArithOp::Mul),
+                TokenKind::Slash => Some(ArithOp::Div),
+                _ => None,
             };
+            if let Some(op) = op {
+                self.lexer.next_token()?;
+                let right = self.parse_unary()?;
+                left = Expr::Arithmetic {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_unary(&mut self) -> ParseResult<Expr> {
+        if self.lexer.eat(&TokenKind::Minus)? {
+            // Unary minus recurses — check depth.
+            self.enter_expr()?;
+            let inner = self.parse_unary();
+            self.exit_expr();
+            // Negate: wrap as 0 - inner.
+            Ok(Expr::Arithmetic {
+                left: Box::new(Expr::Literal(Literal::Integer(0))),
+                op: ArithOp::Sub,
+                right: Box::new(inner?),
+            })
         } else {
-            break;
+            self.parse_primary()
         }
     }
-    Ok(left)
-}
 
-fn parse_multiplication(lexer: &mut Lexer<'_>) -> ParseResult<Expr> {
-    let mut left = parse_unary(lexer)?;
-    loop {
-        let tok = lexer.peek()?;
-        let op = match &tok.kind {
-            TokenKind::Star => Some(ArithOp::Mul),
-            TokenKind::Slash => Some(ArithOp::Div),
-            _ => None,
-        };
-        if let Some(op) = op {
-            lexer.next_token()?;
-            let right = parse_unary(lexer)?;
-            left = Expr::Arithmetic {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            };
-        } else {
-            break;
-        }
-    }
-    Ok(left)
-}
-
-fn parse_unary(lexer: &mut Lexer<'_>) -> ParseResult<Expr> {
-    if lexer.eat(&TokenKind::Minus)? {
-        let inner = parse_unary(lexer)?;
-        // Negate: wrap as 0 - inner.
-        Ok(Expr::Arithmetic {
-            left: Box::new(Expr::Literal(Literal::Integer(0))),
-            op: ArithOp::Sub,
-            right: Box::new(inner),
-        })
-    } else {
-        parse_primary(lexer)
-    }
-}
-
-fn parse_primary(lexer: &mut Lexer<'_>) -> ParseResult<Expr> {
-    let tok = lexer.peek()?;
-    match &tok.kind {
-        TokenKind::Integer(_) => {
-            let tok = lexer.next_token()?;
-            if let TokenKind::Integer(v) = tok.kind {
-                Ok(Expr::Literal(Literal::Integer(v)))
-            } else {
-                unreachable!()
-            }
-        }
-        TokenKind::Float(_) => {
-            let tok = lexer.next_token()?;
-            if let TokenKind::Float(v) = tok.kind {
-                Ok(Expr::Literal(Literal::Float(v)))
-            } else {
-                unreachable!()
-            }
-        }
-        TokenKind::StringLit(_) => {
-            let tok = lexer.next_token()?;
-            if let TokenKind::StringLit(s) = tok.kind {
-                Ok(Expr::Literal(Literal::String(s)))
-            } else {
-                unreachable!()
-            }
-        }
-        TokenKind::Keyword(Keyword::True) => {
-            lexer.next_token()?;
-            Ok(Expr::Literal(Literal::Bool(true)))
-        }
-        TokenKind::Keyword(Keyword::False) => {
-            lexer.next_token()?;
-            Ok(Expr::Literal(Literal::Bool(false)))
-        }
-        TokenKind::Keyword(Keyword::Null) => {
-            lexer.next_token()?;
-            Ok(Expr::Literal(Literal::Null))
-        }
-        TokenKind::LParen => {
-            lexer.next_token()?;
-            let expr = parse_expr(lexer)?;
-            lexer.expect(&TokenKind::RParen)?;
-            Ok(expr)
-        }
-        TokenKind::Ident(_) => {
-            let tok = lexer.next_token()?;
-            let name = if let TokenKind::Ident(s) = tok.kind {
-                s.to_string()
-            } else {
-                unreachable!()
-            };
-
-            // Check for property access (var.prop) or function call (fn(...)).
-            let next = lexer.peek()?;
-            match &next.kind {
-                TokenKind::Dot => {
-                    lexer.next_token()?;
-                    let prop_tok = lexer.next_token()?;
-                    let prop = match prop_tok.kind {
-                        TokenKind::Ident(p) => p.to_string(),
-                        _ => {
-                            return Err(ParseError::new(
-                                format!(
-                                    "expected property name after '.', got {:?}",
-                                    prop_tok.kind
-                                ),
-                                prop_tok.span,
-                            ));
-                        }
-                    };
-                    Ok(Expr::Property {
-                        var: name,
-                        name: prop,
-                    })
+    fn parse_primary(&mut self) -> ParseResult<Expr> {
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            TokenKind::Integer(_) => {
+                let tok = self.lexer.next_token()?;
+                if let TokenKind::Integer(v) = tok.kind {
+                    Ok(Expr::Literal(Literal::Integer(v)))
+                } else {
+                    unreachable!()
                 }
-                TokenKind::LParen => {
-                    lexer.next_token()?;
-                    let mut args = vec![];
-                    if lexer.peek()?.kind != TokenKind::RParen {
-                        loop {
-                            args.push(parse_expr(lexer)?);
-                            if !lexer.eat(&TokenKind::Comma)? {
-                                break;
+            }
+            TokenKind::Float(_) => {
+                let tok = self.lexer.next_token()?;
+                if let TokenKind::Float(v) = tok.kind {
+                    Ok(Expr::Literal(Literal::Float(v)))
+                } else {
+                    unreachable!()
+                }
+            }
+            TokenKind::StringLit(_) => {
+                let tok = self.lexer.next_token()?;
+                if let TokenKind::StringLit(s) = tok.kind {
+                    Ok(Expr::Literal(Literal::String(s)))
+                } else {
+                    unreachable!()
+                }
+            }
+            TokenKind::Keyword(Keyword::True) => {
+                self.lexer.next_token()?;
+                Ok(Expr::Literal(Literal::Bool(true)))
+            }
+            TokenKind::Keyword(Keyword::False) => {
+                self.lexer.next_token()?;
+                Ok(Expr::Literal(Literal::Bool(false)))
+            }
+            TokenKind::Keyword(Keyword::Null) => {
+                self.lexer.next_token()?;
+                Ok(Expr::Literal(Literal::Null))
+            }
+            TokenKind::LParen => {
+                // Parenthesized expression — recursion depth is tracked
+                // via parse_expr's enter_expr/exit_expr.
+                self.lexer.next_token()?;
+                let expr = self.parse_expr()?;
+                self.lexer.expect(&TokenKind::RParen)?;
+                Ok(expr)
+            }
+            TokenKind::Ident(_) => {
+                let tok = self.lexer.next_token()?;
+                let name = if let TokenKind::Ident(s) = tok.kind {
+                    s.to_string()
+                } else {
+                    unreachable!()
+                };
+
+                // Check for property access (var.prop) or function call (fn(...)).
+                let next = self.lexer.peek()?;
+                match &next.kind {
+                    TokenKind::Dot => {
+                        self.lexer.next_token()?;
+                        let prop_tok = self.lexer.next_token()?;
+                        let prop = match prop_tok.kind {
+                            TokenKind::Ident(p) => p.to_string(),
+                            _ => {
+                                return Err(ParseError::new(
+                                    format!(
+                                        "expected property name after '.', got {:?}",
+                                        prop_tok.kind
+                                    ),
+                                    prop_tok.span,
+                                ));
+                            }
+                        };
+                        Ok(Expr::Property {
+                            var: name,
+                            name: prop,
+                        })
+                    }
+                    TokenKind::LParen => {
+                        self.lexer.next_token()?;
+                        let mut args = vec![];
+                        if self.lexer.peek()?.kind != TokenKind::RParen {
+                            loop {
+                                args.push(self.parse_expr()?);
+                                if !self.lexer.eat(&TokenKind::Comma)? {
+                                    break;
+                                }
                             }
                         }
+                        self.lexer.expect(&TokenKind::RParen)?;
+                        Ok(Expr::Function { name, args })
                     }
-                    lexer.expect(&TokenKind::RParen)?;
-                    Ok(Expr::Function { name, args })
+                    _ => Ok(Expr::Var(name)),
                 }
-                _ => Ok(Expr::Var(name)),
             }
+            _ => Err(ParseError::new(
+                format!("expected expression, got {:?}", tok.kind),
+                tok.span,
+            )),
         }
-        _ => Err(ParseError::new(
-            format!("expected expression, got {:?}", tok.kind),
-            tok.span,
-        )),
-    }
-}
-
-// --- RETURN clause ---
-
-fn parse_return_clause(lexer: &mut Lexer<'_>) -> ParseResult<ReturnClause> {
-    lexer.expect(&TokenKind::Keyword(Keyword::Return))?;
-
-    let distinct = lexer.eat(&TokenKind::Keyword(Keyword::Distinct))?;
-
-    let mut items = vec![parse_return_item(lexer)?];
-    while lexer.eat(&TokenKind::Comma)? {
-        items.push(parse_return_item(lexer)?);
     }
 
-    let order_by = if lexer.eat(&TokenKind::Keyword(Keyword::Order))? {
-        lexer.expect(&TokenKind::Keyword(Keyword::By))?;
-        let mut orders = vec![parse_order_item(lexer)?];
-        while lexer.eat(&TokenKind::Comma)? {
-            orders.push(parse_order_item(lexer)?);
-        }
-        orders
-    } else {
-        vec![]
-    };
+    // --- RETURN clause ---
 
-    let limit = if lexer.eat(&TokenKind::Keyword(Keyword::Limit))? {
-        let tok = lexer.next_token()?;
-        match tok.kind {
-            TokenKind::Integer(v) => Some(v),
+    fn parse_return_clause(&mut self) -> ParseResult<ReturnClause> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Return))?;
+
+        let distinct = self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))?;
+
+        let mut items = vec![self.parse_return_item()?];
+        while self.lexer.eat(&TokenKind::Comma)? {
+            items.push(self.parse_return_item()?);
+        }
+
+        let order_by = if self.lexer.eat(&TokenKind::Keyword(Keyword::Order))? {
+            self.lexer.expect(&TokenKind::Keyword(Keyword::By))?;
+            let mut orders = vec![self.parse_order_item()?];
+            while self.lexer.eat(&TokenKind::Comma)? {
+                orders.push(self.parse_order_item()?);
+            }
+            orders
+        } else {
+            vec![]
+        };
+
+        let limit = if self.lexer.eat(&TokenKind::Keyword(Keyword::Limit))? {
+            let tok = self.lexer.next_token()?;
+            match tok.kind {
+                TokenKind::Integer(v) => Some(v),
+                _ => {
+                    return Err(ParseError::new(
+                        format!("expected integer after LIMIT, got {:?}", tok.kind),
+                        tok.span,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(ReturnClause {
+            distinct,
+            items,
+            order_by,
+            limit,
+        })
+    }
+
+    fn parse_return_item(&mut self) -> ParseResult<ReturnItem> {
+        let expr = self.parse_expr()?;
+        let alias = if self.lexer.eat(&TokenKind::Keyword(Keyword::As))? {
+            let tok = self.lexer.next_token()?;
+            match tok.kind {
+                TokenKind::Ident(name) => Some(name.to_string()),
+                _ => {
+                    return Err(ParseError::new(
+                        format!("expected alias name after AS, got {:?}", tok.kind),
+                        tok.span,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(ReturnItem { expr, alias })
+    }
+
+    fn parse_order_item(&mut self) -> ParseResult<OrderItem> {
+        let expr = self.parse_expr()?;
+        let direction = if self.lexer.eat(&TokenKind::Keyword(Keyword::Desc))? {
+            SortDir::Desc
+        } else {
+            self.lexer.eat(&TokenKind::Keyword(Keyword::Asc))?;
+            SortDir::Asc
+        };
+        Ok(OrderItem { expr, direction })
+    }
+
+    // --- SET and DELETE helpers ---
+
+    fn parse_assignment_list(&mut self) -> ParseResult<Vec<Assignment>> {
+        let mut assignments = vec![self.parse_assignment()?];
+        while self.lexer.eat(&TokenKind::Comma)? {
+            assignments.push(self.parse_assignment()?);
+        }
+        Ok(assignments)
+    }
+
+    fn parse_assignment(&mut self) -> ParseResult<Assignment> {
+        let tok = self.lexer.next_token()?;
+        let var = match tok.kind {
+            TokenKind::Ident(name) => name.to_string(),
             _ => {
                 return Err(ParseError::new(
-                    format!("expected integer after LIMIT, got {:?}", tok.kind),
+                    format!("expected variable name in SET, got {:?}", tok.kind),
                     tok.span,
                 ));
             }
-        }
-    } else {
-        None
-    };
-
-    Ok(ReturnClause {
-        distinct,
-        items,
-        order_by,
-        limit,
-    })
-}
-
-fn parse_return_item(lexer: &mut Lexer<'_>) -> ParseResult<ReturnItem> {
-    let expr = parse_expr(lexer)?;
-    let alias = if lexer.eat(&TokenKind::Keyword(Keyword::As))? {
-        let tok = lexer.next_token()?;
-        match tok.kind {
-            TokenKind::Ident(name) => Some(name.to_string()),
+        };
+        self.lexer.expect(&TokenKind::Dot)?;
+        let prop_tok = self.lexer.next_token()?;
+        let property = match prop_tok.kind {
+            TokenKind::Ident(name) => name.to_string(),
             _ => {
                 return Err(ParseError::new(
-                    format!("expected alias name after AS, got {:?}", tok.kind),
-                    tok.span,
+                    format!("expected property name after '.', got {:?}", prop_tok.kind),
+                    prop_tok.span,
                 ));
             }
-        }
-    } else {
-        None
-    };
-    Ok(ReturnItem { expr, alias })
-}
-
-fn parse_order_item(lexer: &mut Lexer<'_>) -> ParseResult<OrderItem> {
-    let expr = parse_expr(lexer)?;
-    let direction = if lexer.eat(&TokenKind::Keyword(Keyword::Desc))? {
-        SortDir::Desc
-    } else {
-        lexer.eat(&TokenKind::Keyword(Keyword::Asc))?;
-        SortDir::Asc
-    };
-    Ok(OrderItem { expr, direction })
-}
-
-// --- SET and DELETE helpers ---
-
-fn parse_assignment_list(lexer: &mut Lexer<'_>) -> ParseResult<Vec<Assignment>> {
-    let mut assignments = vec![parse_assignment(lexer)?];
-    while lexer.eat(&TokenKind::Comma)? {
-        assignments.push(parse_assignment(lexer)?);
+        };
+        self.lexer.expect(&TokenKind::Eq)?;
+        let value = self.parse_expr()?;
+        Ok(Assignment {
+            var,
+            property,
+            value,
+        })
     }
-    Ok(assignments)
-}
 
-fn parse_assignment(lexer: &mut Lexer<'_>) -> ParseResult<Assignment> {
-    let tok = lexer.next_token()?;
-    let var = match tok.kind {
-        TokenKind::Ident(name) => name.to_string(),
-        _ => {
-            return Err(ParseError::new(
-                format!("expected variable name in SET, got {:?}", tok.kind),
-                tok.span,
-            ));
-        }
-    };
-    lexer.expect(&TokenKind::Dot)?;
-    let prop_tok = lexer.next_token()?;
-    let property = match prop_tok.kind {
-        TokenKind::Ident(name) => name.to_string(),
-        _ => {
-            return Err(ParseError::new(
-                format!("expected property name after '.', got {:?}", prop_tok.kind),
-                prop_tok.span,
-            ));
-        }
-    };
-    lexer.expect(&TokenKind::Eq)?;
-    let value = parse_expr(lexer)?;
-    Ok(Assignment {
-        var,
-        property,
-        value,
-    })
-}
-
-fn parse_var_list(lexer: &mut Lexer<'_>) -> ParseResult<Vec<String>> {
-    let mut vars = vec![];
-    let tok = lexer.next_token()?;
-    match tok.kind {
-        TokenKind::Ident(name) => vars.push(name.to_string()),
-        _ => {
-            return Err(ParseError::new(
-                format!("expected variable name in DELETE, got {:?}", tok.kind),
-                tok.span,
-            ));
-        }
-    }
-    while lexer.eat(&TokenKind::Comma)? {
-        let tok = lexer.next_token()?;
+    fn parse_var_list(&mut self) -> ParseResult<Vec<String>> {
+        let mut vars = vec![];
+        let tok = self.lexer.next_token()?;
         match tok.kind {
             TokenKind::Ident(name) => vars.push(name.to_string()),
             _ => {
@@ -742,77 +773,115 @@ fn parse_var_list(lexer: &mut Lexer<'_>) -> ParseResult<Vec<String>> {
                 ));
             }
         }
+        while self.lexer.eat(&TokenKind::Comma)? {
+            let tok = self.lexer.next_token()?;
+            match tok.kind {
+                TokenKind::Ident(name) => vars.push(name.to_string()),
+                _ => {
+                    return Err(ParseError::new(
+                        format!("expected variable name in DELETE, got {:?}", tok.kind),
+                        tok.span,
+                    ));
+                }
+            }
+        }
+        Ok(vars)
     }
-    Ok(vars)
+}
+
+/// Parse a complete Cypher statement from source text.
+pub fn parse(input: &str) -> ParseResult<Statement> {
+    let mut parser = Parser::new(input);
+    let stmt = parser.parse_statement()?;
+    // Ensure we consumed all input.
+    let tok = parser.lexer.next_token()?;
+    if tok.kind != TokenKind::Eof {
+        return Err(ParseError::new(
+            format!("unexpected token after statement: {:?}", tok.kind),
+            tok.span,
+        ));
+    }
+    Ok(stmt)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::ast::*;
 
     // --- Node patterns ---
 
     #[test]
     fn parse_empty_node() {
-        let mut lexer = Lexer::new("()");
-        let node = parse_node_pattern(&mut lexer).unwrap();
-        assert_eq!(
-            node,
-            Pattern::Node {
-                var: None,
-                label: None,
-                props: vec![]
-            }
-        );
+        let stmt = parse("CREATE ()").unwrap();
+        if let Statement::Create { patterns } = stmt {
+            assert_eq!(
+                patterns[0],
+                Pattern::Node {
+                    var: None,
+                    label: None,
+                    props: vec![]
+                }
+            );
+        } else {
+            panic!("expected Create");
+        }
     }
 
     #[test]
     fn parse_node_with_var() {
-        let mut lexer = Lexer::new("(n)");
-        let node = parse_node_pattern(&mut lexer).unwrap();
-        assert_eq!(
-            node,
-            Pattern::Node {
-                var: Some("n".into()),
-                label: None,
-                props: vec![]
-            }
-        );
+        let stmt = parse("CREATE (n)").unwrap();
+        if let Statement::Create { patterns } = stmt {
+            assert_eq!(
+                patterns[0],
+                Pattern::Node {
+                    var: Some("n".into()),
+                    label: None,
+                    props: vec![]
+                }
+            );
+        } else {
+            panic!("expected Create");
+        }
     }
 
     #[test]
     fn parse_node_with_label() {
-        let mut lexer = Lexer::new("(n:Person)");
-        let node = parse_node_pattern(&mut lexer).unwrap();
-        assert_eq!(
-            node,
-            Pattern::Node {
-                var: Some("n".into()),
-                label: Some("Person".into()),
-                props: vec![],
-            }
-        );
+        let stmt = parse("CREATE (n:Person)").unwrap();
+        if let Statement::Create { patterns } = stmt {
+            assert_eq!(
+                patterns[0],
+                Pattern::Node {
+                    var: Some("n".into()),
+                    label: Some("Person".into()),
+                    props: vec![],
+                }
+            );
+        } else {
+            panic!("expected Create");
+        }
     }
 
     #[test]
     fn parse_node_with_props() {
-        let mut lexer = Lexer::new("(n:Person {name: 'Alice', age: 30})");
-        let node = parse_node_pattern(&mut lexer).unwrap();
-        assert_eq!(
-            node,
-            Pattern::Node {
-                var: Some("n".into()),
-                label: Some("Person".into()),
-                props: vec![
-                    (
-                        "name".into(),
-                        Expr::Literal(Literal::String("Alice".into()))
-                    ),
-                    ("age".into(), Expr::Literal(Literal::Integer(30))),
-                ],
-            }
-        );
+        let stmt = parse("CREATE (n:Person {name: 'Alice', age: 30})").unwrap();
+        if let Statement::Create { patterns } = stmt {
+            assert_eq!(
+                patterns[0],
+                Pattern::Node {
+                    var: Some("n".into()),
+                    label: Some("Person".into()),
+                    props: vec![
+                        (
+                            "name".into(),
+                            Expr::Literal(Literal::String("Alice".into()))
+                        ),
+                        ("age".into(), Expr::Literal(Literal::Integer(30))),
+                    ],
+                }
+            );
+        } else {
+            panic!("expected Create");
+        }
     }
 
     // --- Relationship patterns ---
@@ -1057,7 +1126,7 @@ mod tests {
         assert!(err.message.contains("expected"));
     }
 
-    // --- Additional coverage (from review) ---
+    // --- Additional coverage ---
 
     #[test]
     fn parse_multiple_patterns() {
@@ -1173,7 +1242,7 @@ mod tests {
 
     #[test]
     fn parse_float_in_where() {
-        let stmt = parse("MATCH (a) WHERE a.score > 3.14 RETURN a").unwrap();
+        let stmt = parse("MATCH (a) WHERE a.score > 3.25 RETURN a").unwrap();
         assert!(matches!(
             stmt,
             Statement::Match {
@@ -1181,5 +1250,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // --- T1 mitigation: expression depth limit ---
+
+    #[test]
+    fn parse_deeply_nested_parens_errors() {
+        // Build ((((...))))-deep nesting past the limit.
+        let depth = MAX_EXPR_DEPTH + 1;
+        let opens: String = "(".repeat(depth);
+        let closes: String = ")".repeat(depth);
+        let query = format!("MATCH (a) WHERE {}a.x{} > 1 RETURN a", opens, closes);
+        let err = parse(&query).unwrap_err();
+        assert!(
+            err.message.contains("nesting depth"),
+            "expected depth error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_at_max_depth_succeeds() {
+        // Exactly at the limit should still work.
+        // Use fewer parens since each parse_expr call counts as one depth.
+        let depth = 30; // Well under 64
+        let opens: String = "(".repeat(depth);
+        let closes: String = ")".repeat(depth);
+        let query = format!("MATCH (a) WHERE {}1{} > 0 RETURN a", opens, closes);
+        assert!(parse(&query).is_ok(), "should succeed at depth {}", depth);
+    }
+
+    #[test]
+    fn parse_chained_not_depth_limit() {
+        // Chain NOT operators past the limit.
+        let nots = "NOT ".repeat(MAX_EXPR_DEPTH + 1);
+        let query = format!("MATCH (a) WHERE {}a.x = 1 RETURN a", nots);
+        let err = parse(&query).unwrap_err();
+        assert!(
+            err.message.contains("nesting depth"),
+            "expected depth error, got: {}",
+            err.message
+        );
     }
 }

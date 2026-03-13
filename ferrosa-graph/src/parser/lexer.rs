@@ -531,10 +531,10 @@ mod tests {
 
     #[test]
     fn lex_numbers() {
-        let tokens = lex_all("42 3.14");
+        let tokens = lex_all("42 3.25");
         assert_eq!(
             tokens,
-            vec![TokenKind::Integer(42), TokenKind::Float(3.14),]
+            vec![TokenKind::Integer(42), TokenKind::Float(3.25),]
         );
     }
 
