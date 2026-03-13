@@ -25,6 +25,7 @@ pub mod store;
 pub mod upload;
 
 pub use cache::LocalCache;
+pub use commitlog::cdc::CdcReader;
 pub use commitlog::{
     CommitLog, CommitLogConfig, CommitLogPosition, Mutation, SyncStrategyConfig, TableId,
 };
