@@ -23,5 +23,6 @@ pub mod error;
 pub mod frame;
 pub mod lexer;
 pub mod parser;
+pub mod result;
 pub mod server;
 pub mod types;

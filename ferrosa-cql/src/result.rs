@@ -1,0 +1,263 @@
+//! RESULT frame body encoder for CQL native protocol v5.
+//!
+//! Each public function encodes a specific RESULT kind and returns a
+//! `BytesMut` containing the complete frame body (starting with the
+//! 4-byte kind code). The caller wraps this in a CQL frame header.
+//!
+//! Result kind codes:
+//! - Void         = 0x0001
+//! - Rows         = 0x0002
+//! - SetKeyspace  = 0x0003
+//! - Prepared     = 0x0004
+//! - SchemaChange = 0x0005
+
+use bytes::{BufMut, BytesMut};
+
+use crate::types::{CqlType, CqlValue};
+
+// ── Public encoders ────────────────────────────────────────────────────────
+
+/// Encode a Void RESULT body.
+pub fn encode_void() -> BytesMut {
+    let mut buf = BytesMut::with_capacity(4);
+    buf.put_i32(0x0001); // Void kind
+    buf
+}
+
+/// Encode a SetKeyspace RESULT body.
+pub fn encode_set_keyspace(keyspace: &str) -> BytesMut {
+    let mut buf = BytesMut::new();
+    buf.put_i32(0x0003); // SetKeyspace kind
+    encode_string(&mut buf, keyspace);
+    buf
+}
+
+/// Encode a SchemaChange RESULT body.
+///
+/// `change_type` is one of `"CREATED"`, `"UPDATED"`, `"DROPPED"`.
+/// `target` is one of `"KEYSPACE"`, `"TABLE"`.
+/// `options` contains the keyspace name and, for table targets, the table name.
+pub fn encode_schema_change(change_type: &str, target: &str, options: &[&str]) -> BytesMut {
+    let mut buf = BytesMut::new();
+    buf.put_i32(0x0005); // SchemaChange kind
+    encode_string(&mut buf, change_type);
+    encode_string(&mut buf, target);
+    for opt in options {
+        encode_string(&mut buf, opt);
+    }
+    buf
+}
+
+/// Encode a Rows RESULT body.
+///
+/// Uses the `Global_tables_spec` flag (0x0001): a single keyspace/table
+/// pair is written once before the column specs.
+pub fn encode_rows(
+    column_names: &[String],
+    column_types: &[CqlType],
+    keyspace: &str,
+    table: &str,
+    rows: &[Vec<Option<CqlValue>>],
+) -> BytesMut {
+    let mut buf = BytesMut::new();
+    buf.put_i32(0x0002); // Rows kind
+
+    encode_rows_metadata(&mut buf, column_names, column_types, keyspace, table);
+
+    // rows_count
+    buf.put_i32(rows.len() as i32);
+
+    // row data
+    for row in rows {
+        for cell in row {
+            encode_cell(&mut buf, cell);
+        }
+    }
+
+    buf
+}
+
+/// Encode a Prepared RESULT body.
+///
+/// Contains:
+/// 1. The prepared statement ID (16 bytes, prefixed by u16 length).
+/// 2. Bind-variable metadata (same layout as Rows metadata).
+/// 3. Result-column metadata (same layout as Rows metadata).
+pub fn encode_prepared(
+    id: &[u8; 16],
+    bound_names: &[String],
+    bound_types: &[CqlType],
+    result_column_names: &[String],
+    result_column_types: &[CqlType],
+    keyspace: &str,
+    table: &str,
+) -> BytesMut {
+    let mut buf = BytesMut::new();
+    buf.put_i32(0x0004); // Prepared kind
+
+    // Prepared statement ID: [u16 length][bytes]
+    buf.put_u16(16u16);
+    buf.put_slice(id);
+
+    // Bind-variable metadata
+    encode_rows_metadata(&mut buf, bound_names, bound_types, keyspace, table);
+
+    // Result-column metadata
+    encode_rows_metadata(
+        &mut buf,
+        result_column_names,
+        result_column_types,
+        keyspace,
+        table,
+    );
+
+    buf
+}
+
+// ── Private helpers ────────────────────────────────────────────────────────
+
+/// Write a CQL short string: `[u16 length][bytes]`.
+fn encode_string(buf: &mut BytesMut, s: &str) {
+    buf.put_u16(s.len() as u16);
+    buf.put_slice(s.as_bytes());
+}
+
+/// Write column metadata used by both Rows and Prepared results.
+///
+/// Format:
+/// ```text
+/// [i32 flags=0x0001]   // Global_tables_spec
+/// [i32 columns_count]
+/// [string keyspace][string table]
+/// For each column: [string name][u16 type_id][type params]
+/// ```
+fn encode_rows_metadata(
+    buf: &mut BytesMut,
+    column_names: &[String],
+    column_types: &[CqlType],
+    keyspace: &str,
+    table: &str,
+) {
+    buf.put_i32(0x0001); // flags: Global_tables_spec
+    buf.put_i32(column_names.len() as i32);
+    encode_string(buf, keyspace);
+    encode_string(buf, table);
+    for (name, cql_type) in column_names.iter().zip(column_types.iter()) {
+        encode_string(buf, name);
+        encode_type(buf, cql_type);
+    }
+}
+
+/// Write a type ID and any accompanying type parameters.
+///
+/// Simple types: `[u16 type_id]`
+/// List/Set:     `[u16 type_id][u16 elem_type_id]`
+/// Map:          `[u16 type_id][u16 key_type_id][u16 val_type_id]`
+/// Tuple:        `[u16 type_id][u16 count][u16 type_id]*count`
+fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
+    buf.put_u16(cql_type.type_id());
+    match cql_type {
+        CqlType::List(elem) | CqlType::Set(elem) => {
+            buf.put_u16(elem.type_id());
+        }
+        CqlType::Map(key, val) => {
+            buf.put_u16(key.type_id());
+            buf.put_u16(val.type_id());
+        }
+        CqlType::Tuple(types) => {
+            buf.put_u16(types.len() as u16);
+            for t in types {
+                buf.put_u16(t.type_id());
+            }
+        }
+        // All simple types: type_id alone is sufficient.
+        _ => {}
+    }
+}
+
+/// Write a single result-set cell.
+///
+/// Null (either `None` or `CqlValue::Null`) is written as `[i32 -1]`.
+/// Non-null values are written as `[i32 byte_length][bytes]`.
+fn encode_cell(buf: &mut BytesMut, value: &Option<CqlValue>) {
+    match value {
+        None => buf.put_i32(-1),
+        Some(CqlValue::Null) => buf.put_i32(-1),
+        Some(val) => {
+            let bytes = val.encode_value();
+            buf.put_i32(bytes.len() as i32);
+            buf.put_slice(&bytes);
+        }
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_void_result() {
+        let buf = encode_void();
+        assert_eq!(&buf[0..4], &0x0001i32.to_be_bytes());
+        assert_eq!(buf.len(), 4);
+    }
+
+    #[test]
+    fn encode_set_keyspace_result() {
+        let buf = encode_set_keyspace("my_ks");
+        assert_eq!(&buf[0..4], &0x0003i32.to_be_bytes());
+        let len = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+        assert_eq!(&buf[6..6 + len], b"my_ks");
+    }
+
+    #[test]
+    fn encode_rows_single_int_column() {
+        let buf = encode_rows(
+            &["id".into()],
+            &[CqlType::Int],
+            "ks",
+            "users",
+            &[vec![Some(CqlValue::Int(42))]],
+        );
+        assert_eq!(&buf[0..4], &0x0002i32.to_be_bytes()); // Rows kind
+    }
+
+    #[test]
+    fn encode_rows_null_cell() {
+        let buf = encode_rows(&["v".into()], &[CqlType::Varchar], "ks", "t", &[vec![None]]);
+        // Find the row data section and verify null encoding (-1)
+        assert_eq!(&buf[0..4], &0x0002i32.to_be_bytes());
+    }
+
+    #[test]
+    fn encode_rows_empty() {
+        let buf = encode_rows(&["id".into()], &[CqlType::Int], "ks", "users", &[]);
+        assert_eq!(&buf[0..4], &0x0002i32.to_be_bytes());
+    }
+
+    #[test]
+    fn encode_schema_change_created() {
+        let buf = encode_schema_change("CREATED", "TABLE", &["ks", "users"]);
+        assert_eq!(&buf[0..4], &0x0005i32.to_be_bytes());
+    }
+
+    #[test]
+    fn encode_prepared_result() {
+        let id = [1u8; 16];
+        let buf = encode_prepared(
+            &id,
+            &["k".into()],
+            &[CqlType::Int],
+            &["k".into(), "v".into()],
+            &[CqlType::Int, CqlType::Varchar],
+            "ks",
+            "t",
+        );
+        assert_eq!(&buf[0..4], &0x0004i32.to_be_bytes());
+        // Verify ID follows
+        assert_eq!(u16::from_be_bytes([buf[4], buf[5]]), 16);
+        assert_eq!(&buf[6..22], &[1u8; 16]);
+    }
+}
