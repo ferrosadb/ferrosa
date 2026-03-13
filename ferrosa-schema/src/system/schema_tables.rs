@@ -179,6 +179,7 @@ fn system_column_rows() -> Vec<ColumnRow> {
         ("broadcast_address", "regular", "inet", -1),
         ("rpc_address", "regular", "inet", -1),
         ("bootstrapped", "regular", "text", -1),
+        ("tokens", "regular", "set<varchar>", -1),
     ];
     for (name, kind, cql_type, pos) in local_cols {
         rows.push(ColumnRow {
@@ -355,5 +356,24 @@ mod tests {
         assert_eq!(s_row.kind, "static");
         let r_row = rows.iter().find(|r| r.column_name == "r").unwrap();
         assert_eq!(r_row.kind, "regular");
+    }
+
+    /// Regression test: cqlsh expects `tokens` in system_schema.columns for
+    /// system.local. Without it, cqlsh fails to validate system.local queries
+    /// and prints "'local' not found in keyspace 'system'".
+    #[test]
+    fn system_local_columns_include_tokens() {
+        let snap = SchemaSnapshot::new();
+        let rows = query_columns(&snap);
+        let local_cols: Vec<_> = rows
+            .iter()
+            .filter(|r| r.keyspace_name == "system" && r.table_name == "local")
+            .collect();
+        let tokens_col = local_cols
+            .iter()
+            .find(|r| r.column_name == "tokens")
+            .expect("system.local must have a 'tokens' column");
+        assert_eq!(tokens_col.column_type, "set<varchar>");
+        assert_eq!(tokens_col.kind, "regular");
     }
 }
