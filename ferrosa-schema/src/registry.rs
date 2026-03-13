@@ -441,9 +441,19 @@ impl Schema {
         if is_system_keyspace(ks) {
             return Err(SchemaError::SystemKeyspaceProtected(ks.to_string()));
         }
+        let snap_ref = self.snapshot();
+        let key = (ks.to_string(), table.to_string());
+        if let Some(existing) = snap_ref.tables.get(&key) {
+            if existing.is_system {
+                return Err(SchemaError::SystemTableProtected(
+                    ks.to_string(),
+                    table.to_string(),
+                ));
+            }
+        }
+        drop(snap_ref);
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
-        let key = (ks.to_string(), table.to_string());
         let tbl = snap
             .tables
             .get_mut(&key)
@@ -482,9 +492,19 @@ impl Schema {
         if is_system_keyspace(keyspace) {
             return Err(SchemaError::SystemKeyspaceProtected(keyspace.to_string()));
         }
+        let snap_ref = self.snapshot();
+        let key = (keyspace.to_string(), table.to_string());
+        if let Some(existing) = snap_ref.tables.get(&key) {
+            if existing.is_system {
+                return Err(SchemaError::SystemTableProtected(
+                    keyspace.to_string(),
+                    table.to_string(),
+                ));
+            }
+        }
+        drop(snap_ref);
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
-        let key = (keyspace.to_string(), table.to_string());
         if snap.tables.remove(&key).is_none() {
             return Err(SchemaError::TableNotFound(
                 keyspace.to_string(),
@@ -1363,6 +1383,46 @@ mod tests {
         let key = ("alter_tbl_ks".to_string(), "t1".to_string());
         let tbl = &snap.tables[&key];
         assert!(tbl.columns.contains_key("email"));
+    }
+
+    #[test]
+    fn drop_system_table_rejected() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("sys_tbl_ks"), &auth)
+            .unwrap();
+        let mut table = test_table("sys_tbl_ks", "sys_t");
+        table.is_system = true;
+        schema.create_table(table, &auth).unwrap();
+
+        let result = schema.drop_table("sys_tbl_ks", "sys_t", &auth);
+        assert!(
+            matches!(result, Err(SchemaError::SystemTableProtected(ref ks, ref t)) if ks == "sys_tbl_ks" && t == "sys_t")
+        );
+    }
+
+    #[test]
+    fn alter_system_table_rejected() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("sys_tbl_ks2"), &auth)
+            .unwrap();
+        let mut table = test_table("sys_tbl_ks2", "sys_t2");
+        table.is_system = true;
+        schema.create_table(table, &auth).unwrap();
+
+        let updates = TableUpdates {
+            params: None,
+            add_columns: vec![],
+            drop_columns: vec![],
+            extensions: None,
+        };
+        let result = schema.alter_table("sys_tbl_ks2", "sys_t2", updates, &auth);
+        assert!(
+            matches!(result, Err(SchemaError::SystemTableProtected(ref ks, ref t)) if ks == "sys_tbl_ks2" && t == "sys_t2")
+        );
     }
 
     // ---- Task 22: Role CRUD tests ----
