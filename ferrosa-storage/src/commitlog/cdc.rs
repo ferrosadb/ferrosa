@@ -263,6 +263,52 @@ mod tests {
         assert_eq!(results[1].table, "t2");
     }
 
+    #[test]
+    fn reader_filters_by_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config).unwrap();
+
+        cl.append(&test_mutation("ks", "wanted")).unwrap();
+        cl.append(&test_mutation("ks", "ignored")).unwrap();
+        cl.append(&test_mutation("ks", "wanted")).unwrap();
+        cl.shutdown().unwrap();
+
+        let filter = HashSet::from([TableId::new("ks", "wanted")]);
+        let mut reader = CdcReader::new(dir.path(), dir.path(), Some(filter)).unwrap();
+
+        let mut results = Vec::new();
+        while let Some((mutation, _)) = reader.next_mutation().unwrap() {
+            results.push(mutation);
+        }
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|m| m.table == "wanted"));
+    }
+
+    #[test]
+    fn reader_resumes_from_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config).unwrap();
+
+        cl.append(&test_mutation("ks", "t1")).unwrap();
+        let mid_pos = cl.append(&test_mutation("ks", "t2")).unwrap();
+        cl.append(&test_mutation("ks", "t3")).unwrap();
+        cl.shutdown().unwrap();
+
+        // Save checkpoint at mid_pos.
+        CdcCheckpoint::save(dir.path(), &mid_pos).unwrap();
+
+        // New reader should start after mid_pos.
+        let mut reader = CdcReader::new(dir.path(), dir.path(), None).unwrap();
+        let mut results = Vec::new();
+        while let Some((mutation, _)) = reader.next_mutation().unwrap() {
+            results.push(mutation);
+        }
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].table, "t3");
+    }
+
     fn test_mutation(ks: &str, table: &str) -> Mutation {
         use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
         use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
