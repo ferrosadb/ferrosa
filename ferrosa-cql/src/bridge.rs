@@ -752,10 +752,10 @@ mod tests {
 
     #[test]
     fn term_float_ok() {
-        let val = term_to_cql_value(&Term::FloatLiteral(3.14), &CqlType::Float).unwrap();
+        let val = term_to_cql_value(&Term::FloatLiteral(3.125), &CqlType::Float).unwrap();
         if let CqlValue::Float(bits) = val {
             let f = f32::from_bits(bits);
-            assert!((f - 3.14f32).abs() < 1e-6);
+            assert!((f - 3.125f32).abs() < 1e-6);
         } else {
             panic!("expected Float");
         }
@@ -763,8 +763,8 @@ mod tests {
 
     #[test]
     fn term_double_ok() {
-        let val = term_to_cql_value(&Term::FloatLiteral(3.14), &CqlType::Double).unwrap();
-        assert_eq!(val, CqlValue::Double(3.14f64.to_bits()));
+        let val = term_to_cql_value(&Term::FloatLiteral(3.125), &CqlType::Double).unwrap();
+        assert_eq!(val, CqlValue::Double(3.125f64.to_bits()));
     }
 
     #[test]

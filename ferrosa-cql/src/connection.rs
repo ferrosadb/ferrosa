@@ -1,29 +1,691 @@
 //! Per-connection CQL protocol handler.
+//!
+//! Implements the CQL v5 connection lifecycle:
+//!
+//! 1. **AwaitingStartup** — only STARTUP and OPTIONS are accepted.
+//! 2. **Authenticating** — only AUTH_RESPONSE is accepted; max 3 attempts.
+//! 3. **Ready** — QUERY, PREPARE, EXECUTE, BATCH, REGISTER accepted.
+//!
+//! Security mitigations:
+//! - **M7**: State machine enforcement — wrong-phase opcodes return ERROR(Protocol).
+//! - **M11**: Idle timeout of 300 seconds via `tokio::time::timeout()`.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures::StreamExt;
 use tokio::net::TcpStream;
-use tracing::debug;
+use tokio::time::timeout;
+use tokio_util::codec::Framed;
+use tracing::{debug, warn};
+
+use crate::auth::{
+    encode_auth_success, encode_authenticate_response, parse_sasl_plain, MAX_AUTH_ATTEMPTS,
+};
+use crate::error::CqlError;
+use crate::frame::{CqlCodec, CqlFrame, FrameHeader, Opcode, VERSION_RESPONSE};
+use crate::parser;
+use crate::prepared::{PreparedCache, PreparedPlan};
+use crate::result;
+use crate::router::{RequestContext, RouteResult, SharedState};
+use crate::types::CqlType;
+
+use ferrosa_schema::AuthContext;
+
+use futures::SinkExt;
+
+/// Idle timeout: drop connection if no complete frame arrives within this duration (M11).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Connection phase state machine (M7).
+#[derive(Debug)]
+enum ConnectionPhase {
+    /// Initial phase — only STARTUP and OPTIONS are allowed.
+    AwaitingStartup,
+    /// After STARTUP when auth is enabled — only AUTH_RESPONSE is allowed.
+    Authenticating { attempts: u32 },
+    /// After successful auth (or STARTUP with auth disabled) — queries allowed.
+    Ready,
+}
 
 /// Handle a single CQL connection.
 ///
-/// Stub implementation: holds the connection open until the client
-/// disconnects. Will be expanded in Task 11 with the full handshake.
+/// This function owns the TCP connection and processes frames until the client
+/// disconnects, an error occurs, or the idle timeout fires.
 pub async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
-    _max_frame_size: u32,
-    _auth_disabled: bool,
+    max_frame_size: u32,
+    auth_disabled: bool,
+    state: Arc<SharedState>,
 ) {
     debug!("new connection from {peer}");
-    // Hold connection open until client disconnects (read until EOF).
-    let mut buf = [0u8; 1024];
+
+    let codec = CqlCodec::new(max_frame_size);
+    let mut framed = Framed::new(stream, codec);
+    let mut phase = ConnectionPhase::AwaitingStartup;
+    let mut auth_context: Option<AuthContext> = None;
+    let mut current_keyspace: Option<String> = None;
+
     loop {
-        match stream.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+        // M11: idle timeout — drop connection if no frame arrives within IDLE_TIMEOUT.
+        let maybe_frame = match timeout(IDLE_TIMEOUT, framed.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(e))) => {
+                warn!("frame decode error from {peer}: {e}");
+                break;
+            }
+            Ok(None) => {
+                // Stream ended — client disconnected.
+                debug!("connection from {peer} closed (EOF)");
+                break;
+            }
+            Err(_) => {
+                // Timeout — drop the connection.
+                debug!("idle timeout for {peer}, closing connection");
+                break;
+            }
+        };
+
+        let stream_id = maybe_frame.header.stream_id;
+
+        match handle_frame(
+            &mut phase,
+            &mut auth_context,
+            &mut current_keyspace,
+            &state,
+            auth_disabled,
+            &maybe_frame,
+        ) {
+            HandleResult::Reply(opcode, body) => {
+                let body_bytes = body.freeze();
+                let frame = CqlFrame {
+                    header: FrameHeader {
+                        version: VERSION_RESPONSE,
+                        flags: 0,
+                        stream_id,
+                        opcode,
+                        length: 0, // CqlCodec::encode will set this
+                    },
+                    body: body_bytes,
+                };
+                if framed.send(frame).await.is_err() {
+                    break;
+                }
+            }
+            HandleResult::Close(opcode, body) => {
+                let body_bytes = body.freeze();
+                let frame = CqlFrame {
+                    header: FrameHeader {
+                        version: VERSION_RESPONSE,
+                        flags: 0,
+                        stream_id,
+                        opcode,
+                        length: 0,
+                    },
+                    body: body_bytes,
+                };
+                let _ = framed.send(frame).await;
+                break;
+            }
+            HandleResult::CloseNow => {
+                break;
+            }
         }
     }
-    debug!("connection from {peer} closed");
+
+    debug!("connection handler for {peer} finished");
+}
+
+/// Outcome of processing a single frame.
+enum HandleResult {
+    /// Send a response and continue reading.
+    Reply(Opcode, BytesMut),
+    /// Send a response and then close the connection.
+    Close(Opcode, BytesMut),
+    /// Close immediately without sending anything (reserved for future use).
+    #[allow(dead_code)]
+    CloseNow,
+}
+
+/// Dispatch a single frame based on the current connection phase.
+fn handle_frame(
+    phase: &mut ConnectionPhase,
+    auth_context: &mut Option<AuthContext>,
+    current_keyspace: &mut Option<String>,
+    state: &SharedState,
+    auth_disabled: bool,
+    frame: &CqlFrame,
+) -> HandleResult {
+    match phase {
+        ConnectionPhase::AwaitingStartup => match frame.header.opcode {
+            Opcode::Startup => handle_startup(phase, auth_disabled, &frame.body),
+            Opcode::Options => handle_options(),
+            _ => {
+                let err = CqlError::Protocol(format!(
+                    "unexpected opcode {:?} before STARTUP",
+                    frame.header.opcode
+                ));
+                HandleResult::Reply(Opcode::Error, err.encode_body())
+            }
+        },
+        ConnectionPhase::Authenticating { .. } => match frame.header.opcode {
+            Opcode::AuthResponse => handle_auth_response(phase, auth_context, state, &frame.body),
+            _ => {
+                let err = CqlError::Protocol(format!(
+                    "unexpected opcode {:?} during authentication",
+                    frame.header.opcode
+                ));
+                HandleResult::Reply(Opcode::Error, err.encode_body())
+            }
+        },
+        ConnectionPhase::Ready => match frame.header.opcode {
+            Opcode::Query => handle_query(auth_context, current_keyspace, state, &frame.body),
+            Opcode::Prepare => handle_prepare(auth_context, current_keyspace, state, &frame.body),
+            Opcode::Execute => handle_execute(auth_context, current_keyspace, state, &frame.body),
+            Opcode::Batch => handle_batch(auth_context, current_keyspace, state, &frame.body),
+            Opcode::Register => handle_register(),
+            Opcode::Options => handle_options(),
+            _ => {
+                let err = CqlError::Protocol(format!(
+                    "unexpected opcode {:?} in Ready phase",
+                    frame.header.opcode
+                ));
+                HandleResult::Reply(Opcode::Error, err.encode_body())
+            }
+        },
+    }
+}
+
+// ── STARTUP ─────────────────────────────────────────────────────────────
+
+fn handle_startup(phase: &mut ConnectionPhase, auth_disabled: bool, body: &Bytes) -> HandleResult {
+    // Parse the string map from the STARTUP body.
+    if body.len() < 2 {
+        let err = CqlError::Protocol("STARTUP body too short".into());
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+
+    let mut cursor = &body[..];
+    let n_pairs = cursor.get_u16() as usize;
+
+    let mut cql_version: Option<String> = None;
+    for _ in 0..n_pairs {
+        if cursor.remaining() < 2 {
+            let err = CqlError::Protocol("STARTUP body truncated".into());
+            return HandleResult::Reply(Opcode::Error, err.encode_body());
+        }
+        let key_len = cursor.get_u16() as usize;
+        if cursor.remaining() < key_len {
+            let err = CqlError::Protocol("STARTUP body truncated".into());
+            return HandleResult::Reply(Opcode::Error, err.encode_body());
+        }
+        let key = std::str::from_utf8(&cursor[..key_len]).unwrap_or("");
+        cursor.advance(key_len);
+
+        if cursor.remaining() < 2 {
+            let err = CqlError::Protocol("STARTUP body truncated".into());
+            return HandleResult::Reply(Opcode::Error, err.encode_body());
+        }
+        let val_len = cursor.get_u16() as usize;
+        if cursor.remaining() < val_len {
+            let err = CqlError::Protocol("STARTUP body truncated".into());
+            return HandleResult::Reply(Opcode::Error, err.encode_body());
+        }
+        let val = std::str::from_utf8(&cursor[..val_len]).unwrap_or("");
+        cursor.advance(val_len);
+
+        if key == "CQL_VERSION" {
+            cql_version = Some(val.to_string());
+        }
+    }
+
+    if cql_version.is_none() {
+        let err = CqlError::Protocol("STARTUP missing CQL_VERSION".into());
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+
+    if auth_disabled {
+        *phase = ConnectionPhase::Ready;
+        // Return READY (empty body).
+        HandleResult::Reply(Opcode::Ready, BytesMut::new())
+    } else {
+        *phase = ConnectionPhase::Authenticating { attempts: 0 };
+        // Return AUTHENTICATE with the authenticator class name.
+        let body = BytesMut::from(&encode_authenticate_response()[..]);
+        HandleResult::Reply(Opcode::Authenticate, body)
+    }
+}
+
+// ── OPTIONS ──────────────────────────────────────────────────────────────
+
+fn handle_options() -> HandleResult {
+    // Encode a SUPPORTED string-multimap.
+    // Format: [short n_keys]([short key_len][bytes key][short n_values]([short val_len][bytes val])*)*
+    let mut body = BytesMut::new();
+    body.put_u16(2); // 2 keys
+
+    // CQL_VERSION
+    let key = b"CQL_VERSION";
+    body.put_u16(key.len() as u16);
+    body.put_slice(key);
+    body.put_u16(1); // 1 value
+    let val = b"3.0.0";
+    body.put_u16(val.len() as u16);
+    body.put_slice(val);
+
+    // COMPRESSION
+    let key = b"COMPRESSION";
+    body.put_u16(key.len() as u16);
+    body.put_slice(key);
+    body.put_u16(0); // 0 values (no compression supported)
+
+    HandleResult::Reply(Opcode::Supported, body)
+}
+
+// ── AUTH_RESPONSE ─────────────────────────────────────────────────────────
+
+fn handle_auth_response(
+    phase: &mut ConnectionPhase,
+    auth_context: &mut Option<AuthContext>,
+    state: &SharedState,
+    body: &Bytes,
+) -> HandleResult {
+    // Parse the SASL payload: [int length][bytes payload]
+    if body.len() < 4 {
+        let err = CqlError::Protocol("AUTH_RESPONSE body too short".into());
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+
+    let mut cursor = &body[..];
+    let payload_len = cursor.get_i32();
+    if payload_len < 0 || cursor.remaining() < payload_len as usize {
+        let err = CqlError::BadCredentials;
+        return increment_auth_attempts_and_reply(phase, err);
+    }
+
+    let payload = &cursor[..payload_len as usize];
+
+    match parse_sasl_plain(payload) {
+        Ok((username, password)) => match state.schema.authenticate(username, password) {
+            Ok(ctx) => {
+                *auth_context = Some(ctx);
+                *phase = ConnectionPhase::Ready;
+                let body = BytesMut::from(&encode_auth_success()[..]);
+                HandleResult::Reply(Opcode::AuthSuccess, body)
+            }
+            Err(_) => {
+                let err = CqlError::BadCredentials;
+                increment_auth_attempts_and_reply(phase, err)
+            }
+        },
+        Err(_) => {
+            let err = CqlError::BadCredentials;
+            increment_auth_attempts_and_reply(phase, err)
+        }
+    }
+}
+
+/// Increment auth attempts, and close connection if MAX_AUTH_ATTEMPTS reached.
+fn increment_auth_attempts_and_reply(phase: &mut ConnectionPhase, err: CqlError) -> HandleResult {
+    if let ConnectionPhase::Authenticating { attempts } = phase {
+        *attempts += 1;
+        if *attempts >= MAX_AUTH_ATTEMPTS {
+            return HandleResult::Close(Opcode::Error, err.encode_body());
+        }
+    }
+    HandleResult::Reply(Opcode::Error, err.encode_body())
+}
+
+// ── QUERY ────────────────────────────────────────────────────────────────
+
+fn handle_query(
+    auth_context: &mut Option<AuthContext>,
+    current_keyspace: &mut Option<String>,
+    state: &SharedState,
+    body: &Bytes,
+) -> HandleResult {
+    // Parse the query string: [int length][bytes query][short consistency][byte flags]...
+    if body.len() < 4 {
+        let err = CqlError::Protocol("QUERY body too short".into());
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+
+    let mut cursor = &body[..];
+    let query_len = cursor.get_i32();
+    if query_len < 0 || cursor.remaining() < query_len as usize {
+        let err = CqlError::Protocol("QUERY body truncated".into());
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+    let query_bytes = &cursor[..query_len as usize];
+    let query = match std::str::from_utf8(query_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            let err = CqlError::Protocol(format!("QUERY: invalid UTF-8: {e}"));
+            return HandleResult::Reply(Opcode::Error, err.encode_body());
+        }
+    };
+
+    // Parse the CQL statement.
+    let stmt = match parser::parse(query) {
+        Ok(s) => s,
+        Err(e) => {
+            return HandleResult::Reply(Opcode::Error, e.encode_body());
+        }
+    };
+
+    // Build an auth context for routing (use a default if auth was disabled).
+    let ctx = build_request_context(auth_context, current_keyspace);
+
+    match crate::router::route(state, &ctx, stmt) {
+        Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
+        Ok(RouteResult::SetKeyspace(ks, body)) => {
+            *current_keyspace = Some(ks);
+            HandleResult::Reply(Opcode::Result, body)
+        }
+        Err(e) => HandleResult::Reply(Opcode::Error, e.encode_body()),
+    }
+}
+
+// ── PREPARE ──────────────────────────────────────────────────────────────
+
+fn handle_prepare(
+    _auth_context: &mut Option<AuthContext>,
+    current_keyspace: &mut Option<String>,
+    state: &SharedState,
+    body: &Bytes,
+) -> HandleResult {
+    // Parse the query string: [int length][bytes query]
+    if body.len() < 4 {
+        let err = CqlError::Protocol("PREPARE body too short".into());
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+
+    let mut cursor = &body[..];
+    let query_len = cursor.get_i32();
+    if query_len < 0 || cursor.remaining() < query_len as usize {
+        let err = CqlError::Protocol("PREPARE body truncated".into());
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+    let query_bytes = &cursor[..query_len as usize];
+    let query = match std::str::from_utf8(query_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            let err = CqlError::Protocol(format!("PREPARE: invalid UTF-8: {e}"));
+            return HandleResult::Reply(Opcode::Error, err.encode_body());
+        }
+    };
+
+    let stmt = match parser::parse(query) {
+        Ok(s) => s,
+        Err(e) => {
+            return HandleResult::Reply(Opcode::Error, e.encode_body());
+        }
+    };
+
+    let id = PreparedCache::compute_id(query);
+
+    // Determine keyspace and table from the statement for the prepared metadata.
+    let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
+
+    // Build bound_columns from the statement (simplified — no full type inference).
+    let bound_columns: Vec<(String, CqlType)> = Vec::new();
+
+    // Build result_columns (simplified — empty for non-SELECT).
+    let result_columns: Vec<(String, CqlType)> = Vec::new();
+
+    let plan = PreparedPlan {
+        id,
+        query: query.to_string(),
+        statement: stmt,
+        keyspace: current_keyspace.clone(),
+        result_columns: result_columns.clone(),
+        bound_columns: bound_columns.clone(),
+        table_keyspace: table_ks.clone(),
+        table_name: table_name.clone(),
+    };
+
+    state.prepared_cache.insert(plan);
+
+    let bound_names: Vec<String> = bound_columns.iter().map(|(n, _)| n.clone()).collect();
+    let bound_types: Vec<CqlType> = bound_columns.iter().map(|(_, t)| t.clone()).collect();
+    let result_names: Vec<String> = result_columns.iter().map(|(n, _)| n.clone()).collect();
+    let result_types: Vec<CqlType> = result_columns.iter().map(|(_, t)| t.clone()).collect();
+
+    let result_body = result::encode_prepared(
+        &id,
+        &bound_names,
+        &bound_types,
+        &result_names,
+        &result_types,
+        &table_ks,
+        &table_name,
+    );
+
+    HandleResult::Reply(Opcode::Result, result_body)
+}
+
+// ── EXECUTE ──────────────────────────────────────────────────────────────
+
+fn handle_execute(
+    auth_context: &mut Option<AuthContext>,
+    current_keyspace: &mut Option<String>,
+    state: &SharedState,
+    body: &Bytes,
+) -> HandleResult {
+    // Parse the prepared ID: [short id_len][bytes id]
+    if body.len() < 2 {
+        let err = CqlError::Protocol("EXECUTE body too short".into());
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+
+    let mut cursor = &body[..];
+    let id_len = cursor.get_u16() as usize;
+    if id_len != 16 || cursor.remaining() < 16 {
+        let err = CqlError::Protocol("EXECUTE: invalid prepared ID length".into());
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&cursor[..16]);
+
+    // Look up the prepared plan.
+    let plan = match state.prepared_cache.get(&id) {
+        Some(p) => p,
+        None => {
+            let err = CqlError::Unprepared(id);
+            return HandleResult::Reply(Opcode::Error, err.encode_body());
+        }
+    };
+
+    // Re-route the stored statement (simplified: no bound value substitution).
+    let ctx = build_request_context(auth_context, current_keyspace);
+
+    match crate::router::route(state, &ctx, plan.statement.clone()) {
+        Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
+        Ok(RouteResult::SetKeyspace(ks, body)) => {
+            *current_keyspace = Some(ks);
+            HandleResult::Reply(Opcode::Result, body)
+        }
+        Err(e) => HandleResult::Reply(Opcode::Error, e.encode_body()),
+    }
+}
+
+// ── BATCH ────────────────────────────────────────────────────────────────
+
+fn handle_batch(
+    auth_context: &mut Option<AuthContext>,
+    current_keyspace: &mut Option<String>,
+    state: &SharedState,
+    body: &Bytes,
+) -> HandleResult {
+    // Parse batch: [byte batch_type][short n_statements]
+    if body.len() < 3 {
+        let err = CqlError::Protocol("BATCH body too short".into());
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+
+    let mut cursor = &body[..];
+    let _batch_type = cursor.get_u8();
+    let n_statements = cursor.get_u16() as usize;
+
+    if n_statements > 500 {
+        let err = CqlError::Protocol("BATCH: too many statements (max 500)".into());
+        return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+
+    // Collect all statements first, then route them.
+    let mut statements = Vec::with_capacity(n_statements);
+
+    for _ in 0..n_statements {
+        if cursor.remaining() < 1 {
+            let err = CqlError::Protocol("BATCH body truncated".into());
+            return HandleResult::Reply(Opcode::Error, err.encode_body());
+        }
+        let kind = cursor.get_u8();
+
+        let stmt = if kind == 0 {
+            // Inline query string: [int len][bytes query]
+            if cursor.remaining() < 4 {
+                let err = CqlError::Protocol("BATCH body truncated".into());
+                return HandleResult::Reply(Opcode::Error, err.encode_body());
+            }
+            let query_len = cursor.get_i32();
+            if query_len < 0 || cursor.remaining() < query_len as usize {
+                let err = CqlError::Protocol("BATCH body truncated".into());
+                return HandleResult::Reply(Opcode::Error, err.encode_body());
+            }
+            let query = match std::str::from_utf8(&cursor[..query_len as usize]) {
+                Ok(q) => q.to_string(),
+                Err(e) => {
+                    let err = CqlError::Protocol(format!("BATCH: invalid UTF-8: {e}"));
+                    return HandleResult::Reply(Opcode::Error, err.encode_body());
+                }
+            };
+            cursor.advance(query_len as usize);
+
+            match parser::parse(&query) {
+                Ok(s) => s,
+                Err(e) => {
+                    return HandleResult::Reply(Opcode::Error, e.encode_body());
+                }
+            }
+        } else if kind == 1 {
+            // Prepared ID: [short id_len][bytes id]
+            if cursor.remaining() < 2 {
+                let err = CqlError::Protocol("BATCH body truncated".into());
+                return HandleResult::Reply(Opcode::Error, err.encode_body());
+            }
+            let id_len = cursor.get_u16() as usize;
+            if id_len != 16 || cursor.remaining() < 16 {
+                let err = CqlError::Protocol("BATCH: invalid prepared ID".into());
+                return HandleResult::Reply(Opcode::Error, err.encode_body());
+            }
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&cursor[..16]);
+            cursor.advance(16);
+
+            match state.prepared_cache.get(&id) {
+                Some(p) => p.statement.clone(),
+                None => {
+                    let err = CqlError::Unprepared(id);
+                    return HandleResult::Reply(Opcode::Error, err.encode_body());
+                }
+            }
+        } else {
+            let err = CqlError::Protocol(format!("BATCH: invalid statement kind {kind}"));
+            return HandleResult::Reply(Opcode::Error, err.encode_body());
+        };
+
+        // Skip bound values: [short n_values]([int val_len][bytes val])*
+        if cursor.remaining() >= 2 {
+            let n_values = cursor.get_u16() as usize;
+            for _ in 0..n_values {
+                if cursor.remaining() < 4 {
+                    break;
+                }
+                let val_len = cursor.get_i32();
+                if val_len > 0 && cursor.remaining() >= val_len as usize {
+                    cursor.advance(val_len as usize);
+                }
+            }
+        }
+
+        statements.push(stmt);
+    }
+
+    // Route each statement.
+    for stmt in statements {
+        let ctx = build_request_context(auth_context, current_keyspace);
+        match crate::router::route(state, &ctx, stmt) {
+            Ok(RouteResult::SetKeyspace(ks, _)) => {
+                *current_keyspace = Some(ks);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return HandleResult::Reply(Opcode::Error, e.encode_body());
+            }
+        }
+    }
+
+    // BATCH returns a void result.
+    HandleResult::Reply(Opcode::Result, result::encode_void())
+}
+
+// ── REGISTER ─────────────────────────────────────────────────────────────
+
+fn handle_register() -> HandleResult {
+    // Accept registration and return READY. Event push is deferred.
+    HandleResult::Reply(Opcode::Ready, BytesMut::new())
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+/// Build a `RequestContext` from the current auth context and keyspace.
+fn build_request_context<'a>(
+    auth_context: &'a mut Option<AuthContext>,
+    current_keyspace: &'a Option<String>,
+) -> RequestContext<'a> {
+    // If auth was disabled, we need a default auth context.
+    if auth_context.is_none() {
+        *auth_context = Some(AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        });
+    }
+    RequestContext {
+        auth: auth_context.as_ref().unwrap(),
+        current_keyspace,
+    }
+}
+
+/// Extract keyspace and table name from a statement for prepared metadata.
+fn extract_keyspace_table(
+    stmt: &crate::ast::Statement,
+    current_keyspace: &Option<String>,
+) -> (String, String) {
+    use crate::ast::Statement;
+    let default_ks = current_keyspace.clone().unwrap_or_default();
+
+    match stmt {
+        Statement::Select(s) => (
+            s.keyspace.clone().unwrap_or_else(|| default_ks.clone()),
+            s.table.clone(),
+        ),
+        Statement::Insert(i) => (
+            i.keyspace.clone().unwrap_or_else(|| default_ks.clone()),
+            i.table.clone(),
+        ),
+        Statement::Update(u) => (
+            u.keyspace.clone().unwrap_or_else(|| default_ks.clone()),
+            u.table.clone(),
+        ),
+        Statement::Delete(d) => (
+            d.keyspace.clone().unwrap_or_else(|| default_ks.clone()),
+            d.table.clone(),
+        ),
+        _ => (default_ks, String::new()),
+    }
 }

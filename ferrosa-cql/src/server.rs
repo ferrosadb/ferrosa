@@ -13,6 +13,7 @@ use crate::error::CqlError;
 use crate::frame::{
     CqlCodec, CqlFrame, FrameHeader, Opcode, DEFAULT_MAX_FRAME_SIZE, VERSION_RESPONSE,
 };
+use crate::router::SharedState;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -21,7 +22,7 @@ pub struct ServerConfig {
     pub max_connections: usize,
     pub max_frame_size: u32,
     /// Max concurrent in-flight requests per connection (default 128).
-    /// TODO: Enforce in connection handler (Part B) — reject with ERROR(Overloaded).
+    /// TODO: Enforce in connection handler — reject with ERROR(Overloaded).
     pub max_in_flight_per_connection: usize,
     /// If true, skip auth (STARTUP returns READY directly).
     pub auth_disabled: bool,
@@ -42,13 +43,15 @@ impl Default for ServerConfig {
 /// CQL protocol server.
 pub struct CqlServer {
     config: ServerConfig,
+    state: Arc<SharedState>,
     active_connections: Arc<AtomicUsize>,
 }
 
 impl CqlServer {
-    pub fn new(config: ServerConfig) -> Self {
+    pub fn new(config: ServerConfig, state: Arc<SharedState>) -> Self {
         Self {
             config,
+            state,
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -61,6 +64,7 @@ impl CqlServer {
         let max_frame_size = self.config.max_frame_size;
         let auth_disabled = self.config.auth_disabled;
         let active = self.active_connections.clone();
+        let state = self.state.clone();
 
         info!("CQL server listening on {addr}");
 
@@ -90,12 +94,14 @@ impl CqlServer {
                             continue;
                         }
                         let active = active.clone();
+                        let state = state.clone();
                         tokio::spawn(async move {
                             crate::connection::handle_connection(
                                 stream,
                                 peer,
                                 max_frame_size,
                                 auth_disabled,
+                                state,
                             )
                             .await;
                             active.fetch_sub(1, Ordering::Relaxed);
@@ -121,11 +127,77 @@ impl CqlServer {
 mod tests {
     use super::*;
     use crate::frame::{FrameHeader, Opcode, HEADER_SIZE};
+    use crate::prepared::PreparedCache;
+    use crate::router::SingleNodeClusterState;
+    use ferrosa_schema::NodeConfig;
+    use ferrosa_schema::{
+        AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
+        RateLimitConfig, Schema, SchemaConfig, TestAuditSink,
+    };
+    use ferrosa_storage::{
+        CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
+    };
+    use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
 
+    fn setup_state() -> (Arc<SharedState>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let commit_log = CommitLogConfig {
+            segment_size: 4096,
+            max_segment_age: std::time::Duration::from_secs(60),
+            sync_strategy: SyncStrategyConfig::Batch,
+            log_dir: dir.path().join("commitlog"),
+            checkpoint_dir: dir.path().join("commitlog"),
+        };
+        let compaction = CompactionConfig::from_env(dir.path().join("compaction"));
+        let engine_config = StorageEngineConfig {
+            commit_log,
+            compaction,
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            flush_threshold_bytes: 4096,
+            data_dir: dir.path().to_path_buf(),
+        };
+        let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
+        let schema = Arc::new(
+            Schema::new(SchemaConfig {
+                hasher: PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: PasswordPolicy::permissive(),
+                auth_method: AuthMethod::Password,
+                rate_limit: RateLimitConfig::default(),
+                audit_sink: Box::new(TestAuditSink::new()),
+                secrets: Box::new(EnvSecretsProvider),
+                mode: DeploymentMode::Development,
+            })
+            .unwrap(),
+        );
+        let node_config = Arc::new(NodeConfig {
+            cluster_name: "test".into(),
+            data_center: "dc1".into(),
+            rack: "rack1".into(),
+            rpc_port: 9042,
+            host_id: uuid::Uuid::new_v4(),
+            listen_address: "127.0.0.1".parse().unwrap(),
+            listen_port: 7000,
+            broadcast_address: "127.0.0.1".parse().unwrap(),
+            broadcast_port: 7000,
+            rpc_address: "127.0.0.1".parse().unwrap(),
+            tokens: vec![],
+        });
+        let state = Arc::new(SharedState {
+            engine,
+            schema,
+            node_config,
+            cluster_state: Arc::new(SingleNodeClusterState),
+            prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
+        });
+        (state, dir)
+    }
+
     #[tokio::test]
     async fn server_accepts_connection() {
+        let (state, _dir) = setup_state();
         let config = ServerConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             max_connections: 10,
@@ -133,13 +205,14 @@ mod tests {
             max_in_flight_per_connection: 128,
             auth_disabled: false,
         };
-        let server = CqlServer::new(config);
+        let server = CqlServer::new(config, state);
         let addr = server.start_background().await.unwrap();
         let _stream = TcpStream::connect(addr).await.unwrap();
     }
 
     #[tokio::test]
     async fn server_rejects_over_limit_with_overloaded() {
+        let (state, _dir) = setup_state();
         let config = ServerConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             max_connections: 1,
@@ -147,7 +220,7 @@ mod tests {
             max_in_flight_per_connection: 128,
             auth_disabled: false,
         };
-        let server = CqlServer::new(config);
+        let server = CqlServer::new(config, state);
         let addr = server.start_background().await.unwrap();
 
         let _conn1 = TcpStream::connect(addr).await.unwrap();
