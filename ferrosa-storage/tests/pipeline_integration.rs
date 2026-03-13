@@ -210,3 +210,60 @@ fn wal_replay_after_crash() {
 
     commit_log.shutdown().unwrap();
 }
+
+/// Concurrent writers and a reader during flush — verifies no data loss
+/// or panics under contention.
+#[test]
+fn concurrent_writers_during_flush() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(make_engine(dir.path()));
+    engine.register_table(test_schema()).unwrap();
+    let tid = TableId::new("ks", "tbl");
+
+    let writers: Vec<_> = (0..4)
+        .map(|t| {
+            let engine = Arc::clone(&engine);
+            let tid = tid.clone();
+            thread::spawn(move || {
+                for i in 0..20 {
+                    let key = make_key(&format!("t{t}_k{i}"));
+                    engine
+                        .write(&tid, &key, make_row(b"v", 1000 + t), 1000 + t)
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+
+    // Flush while writers are active.
+    let flusher = {
+        let engine = Arc::clone(&engine);
+        let tid = tid.clone();
+        thread::spawn(move || {
+            // Small sleep to let some writes happen first.
+            thread::sleep(Duration::from_millis(1));
+            engine.flush(&tid).unwrap();
+        })
+    };
+
+    for w in writers {
+        w.join().unwrap();
+    }
+    flusher.join().unwrap();
+
+    // All 80 partitions should be readable (some from memtable, some from SSTable).
+    for t in 0..4i64 {
+        for i in 0..20 {
+            let key = make_key(&format!("t{t}_k{i}"));
+            assert!(
+                engine.read(&tid, &key).unwrap().is_some(),
+                "missing t{t}_k{i}"
+            );
+        }
+    }
+
+    engine.shutdown().unwrap();
+}
