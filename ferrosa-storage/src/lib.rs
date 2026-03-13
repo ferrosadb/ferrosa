@@ -35,6 +35,8 @@ pub use engine::{StorageEngine, StorageEngineConfig};
 pub use flush::{FileFlushTarget, FlushTarget, InMemoryFlushTarget};
 pub use manifest::Manifest;
 pub use memtable::sharded::ShardedBTreeMemtable;
+#[cfg(feature = "skiplist-memtable")]
+pub use memtable::skiplist::SkipListMemtable;
 pub use memtable::Memtable;
 pub use merge::merge_partitions;
 pub use store::TableStore;

@@ -27,7 +27,10 @@ use ferrosa_sstable::writer::SSTableWriter;
 use ferrosa_sstable::WriteOptions;
 
 use crate::flush::{self, FlushTarget};
+#[cfg(not(feature = "skiplist-memtable"))]
 use crate::memtable::sharded::ShardedBTreeMemtable;
+#[cfg(feature = "skiplist-memtable")]
+use crate::memtable::skiplist::SkipListMemtable;
 use crate::memtable::Memtable;
 use crate::merge;
 
@@ -60,10 +63,21 @@ pub struct TableStore<F: FlushTarget> {
     options: WriteOptions,
 }
 
+fn new_memtable() -> Arc<dyn Memtable> {
+    #[cfg(feature = "skiplist-memtable")]
+    {
+        Arc::new(SkipListMemtable::new())
+    }
+    #[cfg(not(feature = "skiplist-memtable"))]
+    {
+        Arc::new(ShardedBTreeMemtable::with_default_shards())
+    }
+}
+
 impl<F: FlushTarget> TableStore<F> {
     /// Create a new `TableStore` with an empty memtable and no SSTables.
     pub fn new(schema: TableSchema, flush_target: F, options: WriteOptions) -> Self {
-        let active: Arc<dyn Memtable> = Arc::new(ShardedBTreeMemtable::with_default_shards());
+        let active: Arc<dyn Memtable> = new_memtable();
         let initial_view = StoreView {
             active,
             flushing: None,
@@ -138,7 +152,7 @@ impl<F: FlushTarget> TableStore<F> {
         let _guard = self.flush_guard.lock();
 
         // Step 1: Swap in a fresh active memtable, move old to flushing.
-        let new_active: Arc<dyn Memtable> = Arc::new(ShardedBTreeMemtable::with_default_shards());
+        let new_active: Arc<dyn Memtable> = new_memtable();
         let old_view = self.view.load();
         let old_active = Arc::clone(&old_view.active);
         let current_sstables = Arc::clone(&old_view.sstables);
