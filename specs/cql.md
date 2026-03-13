@@ -36,7 +36,9 @@ ferrosa-cql
 ├── uuid             (UUID type support)
 ├── num-bigint       (varint/decimal support)
 ├── tracing          (structured logging)
-└── moka             (lock-free prepared statement cache)
+├── moka             (lock-free prepared statement cache)
+├── lz4_flex         (LZ4 frame compression)
+└── snap             (Snappy frame compression)
 ```
 
 ## Architecture
@@ -121,7 +123,7 @@ graph TB
 - **Tokio codec pattern**: `Encoder`/`Decoder` traits on `Framed<TcpStream, CqlCodec>`
 - **Multiplexing**: stream IDs allow concurrent in-flight requests per connection
 - **Max frame size**: configurable, default 256 MiB
-- **Frame compression**: LZ4/Snappy negotiated during STARTUP. Deferred — flag parsed but compression not applied.
+- **Frame compression**: LZ4 and Snappy negotiated during STARTUP. Compression applied transparently by `CqlCodec` after handshake completes. Only compresses when output is smaller than input.
 
 ## CQL Type System
 
@@ -369,13 +371,31 @@ UNSUBSCRIBE [<stream_id>]
 - `DELTA` enables differential delivery — only rows that changed since the last push are sent
 - `UNSUBSCRIBE` with no argument unsubscribes all active streams on the connection
 
-### Frame Flag
-
-Response frames for streaming results carry the `STREAMING` flag:
+### Frame Flags
 
 | Flag | Value | Description |
 |------|-------|-------------|
-| `STREAMING` | `0x10` | Set on response frames that are part of an active subscription stream |
+| `COMPRESSION` | `0x01` | Frame body is compressed (LZ4 or Snappy) |
+| `STREAMING` | `0x10` | Response is part of an active subscription stream |
+
+### Frame Compression
+
+Compression is negotiated during the STARTUP/OPTIONS handshake:
+
+1. Client sends OPTIONS; server responds with SUPPORTED listing `lz4` and `snappy`
+1. Client sends STARTUP with `COMPRESSION` key set to chosen algorithm
+1. Server validates the algorithm and sends READY
+1. All subsequent frames (both directions) may have `COMPRESSION` flag set
+1. STARTUP and READY frames themselves are never compressed
+
+Implementation in `CqlCodec`:
+
+- `Compression` enum: `Lz4` and `Snappy` variants with `protocol_name()`/`from_protocol_name()`
+- `set_compression()` enables compression after handshake completes
+- Encoder compresses body and sets flag only when compression reduces size
+- Decoder checks flag and decompresses; rejects compressed frames if no compression negotiated
+- LZ4 uses CQL v5 wire format: 4-byte big-endian uncompressed length prefix + lz4 block
+- Snappy uses raw Snappy encoding via `snap` crate
 
 The stream ID in the frame header identifies the subscription. Multiple subscriptions can be active concurrently on the same connection using different stream IDs.
 
