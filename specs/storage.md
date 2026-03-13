@@ -1,6 +1,6 @@
 # Storage Engine
 
-> Last updated: 2026-03-12
+> Last updated: 2026-03-13 (observability additions)
 > Status: Approved
 
 ## Overview
@@ -532,6 +532,119 @@ The `Memtable` trait enables swapping `ShardedBTreeMemtable` for a lock-free imp
 | `tests/engine_property.rs` | All writes readable; writes survive flush; last-write-wins across flush boundaries |
 | `tests/compaction_property.rs` | STCS bucket selection is deterministic; tasks are subset of input; each task meets min_threshold; similar sizes grouped; different sizes separated |
 | Part A inline | Memtable round-trip; merge commutativity/associativity; flush preserves data; timestamp ordering |
+
+## SubscriptionObserver
+
+`SubscriptionObserver` implements the `WriteObserver` trait to support CQL `SUBSCRIBE` queries. It maintains a dynamic set of active subscriptions and filters writes to determine which subscriptions need notification.
+
+### Design
+
+```rust
+pub struct SubscriptionObserver {
+    subscriptions: DashMap<SubscriptionId, SubscriptionFilter>,
+    table_ref_counts: DashMap<TableId, AtomicUsize>,
+}
+
+pub struct SubscriptionFilter {
+    pub table_id: TableId,
+    pub predicate: Option<KeyPredicate>,
+    pub stream_id: u16,
+    pub connection_id: ConnectionId,
+}
+```
+
+**Observer mode:** `ObserverMode::Async` — writes are never blocked by subscription evaluation. The `on_write()` method returns an empty `Vec`, deferring notification delivery to a separate async task.
+
+### Registration
+
+```rust
+impl SubscriptionObserver {
+    pub fn register(&self, id: SubscriptionId, filter: SubscriptionFilter);
+    pub fn deregister(&self, id: &SubscriptionId);
+    pub fn active_count(&self) -> usize;
+}
+```
+
+- `register()` inserts the filter and increments the ref count for the watched table in `table_ref_counts`
+- `deregister()` removes the filter and decrements the ref count; when a table's count reaches zero, writes to that table skip subscription checking entirely
+- Ref counts allow the hot write path to short-circuit: if no subscriptions watch a table, `on_write()` returns immediately
+
+### WriteObserver Implementation
+
+```rust
+impl WriteObserver for SubscriptionObserver {
+    fn mode(&self) -> ObserverMode {
+        ObserverMode::Async
+    }
+
+    fn on_write(&self, table_id: &TableId, key: &DecoratedKey, row: &Row) -> Vec<ObserverAction> {
+        // Check ref count — if zero, return immediately
+        // Match against subscription filters
+        // Return empty vec — delivery is deferred
+        Vec::new()
+    }
+}
+```
+
+The deferred delivery model ensures writes proceed at full speed regardless of subscription count. A separate notification task (in `ferrosa-cql`) polls for matched writes and pushes results to subscribed clients.
+
+## StorageStatsTable
+
+Virtual table at `system_observability.storage_stats`. Provides per-table storage metrics by querying the storage engine directly.
+
+### VirtualTable Trait
+
+```rust
+pub trait VirtualTable: Send + Sync {
+    fn name(&self) -> &str;
+    fn keyspace(&self) -> &str;
+    fn columns(&self) -> &[VirtualColumnDef];
+    fn read(&self, predicate: Option<&Predicate>) -> Result<Vec<Vec<Option<CqlValue>>>>;
+}
+```
+
+`StorageStatsTable` implements `VirtualTable` with `keyspace() = "system_observability"` and `name() = "storage_stats"`.
+
+### StorageStatsProvider Trait
+
+```rust
+pub trait StorageStatsProvider: Send + Sync {
+    fn collect_stats(&self) -> Vec<StorageStats>;
+}
+
+pub struct StorageStats {
+    pub keyspace: String,
+    pub table_name: String,
+    pub memtable_size_bytes: u64,
+    pub memtable_count: u32,
+    pub sstable_count: u32,
+    pub sstable_size_bytes: u64,
+    pub s3_object_count: u32,
+    pub s3_bytes: u64,
+    pub pending_compactions: u32,
+}
+```
+
+`StorageEngine` implements `StorageStatsProvider`. It iterates over registered tables and collects:
+
+- `memtable_size_bytes` / `memtable_count` — from `TableStore::memtable_size()` and `memtable_partition_count()` (both `AtomicUsize`, wait-free)
+- `sstable_count` / `sstable_size_bytes` — from `TableStore::sstable_count()` and SSTable metadata
+- `s3_object_count` / `s3_bytes` — from the current `Manifest` (if loaded)
+- `pending_compactions` — from `CompactionExecutor` pending task count
+
+### Columns
+
+| Column | CQL Type | Source |
+|--------|----------|--------|
+| `keyspace` | `text` | `TableSchema.keyspace` |
+| `table_name` | `text` | `TableSchema.table` |
+| `memtable_size_bytes` | `bigint` | `TableStore::memtable_size()` |
+| `memtable_count` | `int` | `TableStore::memtable_partition_count()` |
+| `sstable_count` | `int` | `TableStore::sstable_count()` |
+| `sstable_size_bytes` | `bigint` | SSTable file metadata |
+| `s3_object_count` | `int` | `Manifest::sstables` entry count |
+| `s3_bytes` | `bigint` | `ManifestEntry::size` sum |
+| `pending_compactions` | `int` | `CompactionExecutor` queue depth |
 
 ## Follow-on Work
 

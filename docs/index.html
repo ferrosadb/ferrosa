@@ -1075,6 +1075,14 @@ user = session.execute(stmt, [user_id])
           <td><span class="cross">✗</span></td>
         </tr>
         <tr>
+          <td>Built-in Observability</td>
+          <td class="ferrosa-col"><span class="check">✓</span> CQL + TUI + Web</td>
+          <td>JMX/nodetool</td>
+          <td>Prometheus</td>
+          <td>CloudWatch</td>
+          <td>CloudWatch</td>
+        </tr>
+        <tr>
           <td>Node Recovery</td>
           <td class="ferrosa-col">Seconds</td>
           <td>Hours</td>
@@ -1126,6 +1134,15 @@ user = session.execute(stmt, [user_id])
         <div class="arch-layer-items">
           <span class="arch-item">ferrosa-cql</span>
           <span class="arch-item">ferrosa-net</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Observe</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">Virtual Tables</span>
+          <span class="arch-item">Prometheus</span>
+          <span class="arch-item">Web Console</span>
+          <span class="arch-item">ferrosa-ctl</span>
         </div>
       </div>
       <div class="arch-layer">
