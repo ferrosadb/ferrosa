@@ -1668,6 +1668,52 @@ mod tests {
         assert_eq!(tbl.extensions.get("graph.type"), Some(&"edge".to_string()));
     }
 
+    #[test]
+    fn graph_extension_requires_create_permission() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("graph_perm_ks"), &auth)
+            .unwrap();
+
+        // Create a role with ALTER but not CREATE on the keyspace
+        schema
+            .create_role(
+                crate::auth::role::RoleMetadata {
+                    name: "alter_only".to_string(),
+                    is_superuser: false,
+                    can_login: true,
+                    salted_hash: None,
+                    member_of: HashSet::new(),
+                },
+                Some("password123!A"),
+                &auth,
+            )
+            .unwrap();
+        let mut alter_perms = HashSet::new();
+        alter_perms.insert(Permission::Alter);
+        schema
+            .grant(
+                "alter_only",
+                &Resource::Keyspace("graph_perm_ks".to_string()),
+                alter_perms,
+                &auth,
+            )
+            .unwrap();
+
+        // Try to create a table with graph.type extension using alter-only user
+        let alter_auth = normal_auth("alter_only");
+        let mut vertex = test_table("graph_perm_ks", "person");
+        vertex
+            .extensions
+            .insert("graph.type".to_string(), "vertex".to_string());
+        let result = schema.create_table(vertex, &alter_auth);
+        assert!(
+            result.is_err(),
+            "graph.* extensions should require Permission::Create on keyspace"
+        );
+    }
+
     // ---- Task 22: Role CRUD tests ----
 
     use crate::auth::role::RoleUpdates;
