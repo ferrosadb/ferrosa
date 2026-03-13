@@ -12,20 +12,20 @@
 //! tradeoff: reading committed data simplifies the concurrency model and
 //! guarantees at-least-once delivery of durable mutations.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-use super::config::CommitLogPosition;
+use super::config::{CommitLogPosition, TableId};
+use super::mutation::Mutation;
+use super::reader::SegmentReader;
 
-#[allow(dead_code)]
 const CDC_CHECKPOINT_FILENAME: &str = "cdc_checkpoint.json";
 
 /// Persists the CDC reader's position so it can resume after restart.
-#[allow(dead_code)]
 pub(crate) struct CdcCheckpoint;
 
 impl CdcCheckpoint {
     /// Loads the CDC checkpoint. Returns `None` if no checkpoint exists.
-    #[allow(dead_code)]
     pub fn load(dir: &Path) -> ferrosa_common::Result<Option<CommitLogPosition>> {
         let path = dir.join(CDC_CHECKPOINT_FILENAME);
         match std::fs::read(&path) {
@@ -46,7 +46,6 @@ impl CdcCheckpoint {
     }
 
     /// Saves the CDC checkpoint atomically (tmp + rename).
-    #[allow(dead_code)]
     pub fn save(dir: &Path, position: &CommitLogPosition) -> ferrosa_common::Result<()> {
         let tmp = dir.join("cdc_checkpoint.json.tmp");
         let final_path = dir.join(CDC_CHECKPOINT_FILENAME);
@@ -63,19 +62,164 @@ impl CdcCheckpoint {
     }
 }
 
-#[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CdcPosition {
     segment_id: u64,
     offset: u64,
 }
 
+/// Tails commit log segments and yields mutations.
+///
+/// The reader scans segment files in order (by segment ID), starting from
+/// the last checkpointed position. It optionally filters by table ID.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut reader = CdcReader::new(log_dir, checkpoint_dir, None)?;
+/// while let Some((mutation, pos)) = reader.next_mutation()? {
+///     process(mutation);
+///     reader.save_checkpoint()?; // persist progress
+/// }
+/// ```
+pub struct CdcReader {
+    log_dir: PathBuf,
+    checkpoint_dir: PathBuf,
+    table_filter: Option<HashSet<TableId>>,
+    position: CommitLogPosition,
+    /// Buffered mutations from the current segment, with positions.
+    buffer: Vec<(CommitLogPosition, Mutation)>,
+    /// Index into buffer for the next mutation to yield.
+    buffer_cursor: usize,
+    /// Segment files we haven't processed yet, sorted by segment ID.
+    pending_segments: Vec<(u64, PathBuf)>,
+    /// Whether we've scanned for segment files.
+    scanned: bool,
+}
+
+impl CdcReader {
+    /// Creates a new CDC reader.
+    ///
+    /// If `table_filter` is `Some`, only mutations for those tables are yielded.
+    /// If `None`, all mutations are yielded.
+    ///
+    /// Starts from the last saved checkpoint, or from the beginning if none.
+    pub fn new(
+        log_dir: &Path,
+        checkpoint_dir: &Path,
+        table_filter: Option<HashSet<TableId>>,
+    ) -> ferrosa_common::Result<Self> {
+        let position = CdcCheckpoint::load(checkpoint_dir)?.unwrap_or(CommitLogPosition {
+            segment_id: 0,
+            offset: 0,
+        });
+
+        Ok(Self {
+            log_dir: log_dir.to_path_buf(),
+            checkpoint_dir: checkpoint_dir.to_path_buf(),
+            table_filter,
+            position,
+            buffer: Vec::new(),
+            buffer_cursor: 0,
+            pending_segments: Vec::new(),
+            scanned: false,
+        })
+    }
+
+    /// Returns the next mutation, or `None` if no more are available.
+    ///
+    /// Scans segment files lazily on first call. Returns mutations in
+    /// commit log order (segment ID, then offset within segment).
+    pub fn next_mutation(
+        &mut self,
+    ) -> ferrosa_common::Result<Option<(Mutation, CommitLogPosition)>> {
+        loop {
+            // Yield from buffer if available.
+            if self.buffer_cursor < self.buffer.len() {
+                let (pos, mutation) = self.buffer[self.buffer_cursor].clone();
+                self.buffer_cursor += 1;
+                self.position = pos;
+                return Ok(Some((mutation, pos)));
+            }
+
+            // Buffer exhausted -- load next segment.
+            if !self.scanned {
+                self.scan_segments()?;
+                self.scanned = true;
+            }
+
+            if self.pending_segments.is_empty() {
+                return Ok(None);
+            }
+
+            let (_seg_id, path) = self.pending_segments.remove(0);
+            self.load_segment(&path)?;
+        }
+    }
+
+    /// Saves the current position as a checkpoint.
+    pub fn save_checkpoint(&self) -> ferrosa_common::Result<()> {
+        CdcCheckpoint::save(&self.checkpoint_dir, &self.position)
+    }
+
+    /// Returns the current reader position.
+    pub fn position(&self) -> CommitLogPosition {
+        self.position
+    }
+
+    /// Scans log_dir for segment files, sorted by ID, filtered to those
+    /// after our checkpoint position.
+    fn scan_segments(&mut self) -> ferrosa_common::Result<()> {
+        let mut segments = Vec::new();
+        if self.log_dir.exists() {
+            for entry in std::fs::read_dir(&self.log_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(id) = super::parse_segment_id(name) {
+                        if id >= self.position.segment_id {
+                            segments.push((id, path));
+                        }
+                    }
+                }
+            }
+        }
+        segments.sort_by_key(|(id, _)| *id);
+        self.pending_segments = segments;
+        Ok(())
+    }
+
+    /// Loads a segment file into the buffer, filtering by table and position.
+    fn load_segment(&mut self, path: &Path) -> ferrosa_common::Result<()> {
+        let mut reader = SegmentReader::open(path)?;
+        let entries = reader.read_all()?;
+
+        self.buffer.clear();
+        self.buffer_cursor = 0;
+
+        for (pos, mutation) in entries {
+            // Skip entries at or before our checkpoint position.
+            if pos <= self.position {
+                continue;
+            }
+            // Apply table filter.
+            if let Some(ref filter) = self.table_filter {
+                let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+                if !filter.contains(&table_id) {
+                    continue;
+                }
+            }
+            self.buffer.push((pos, mutation));
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commitlog::config::CommitLogPosition;
-    // Used by reader_yields_mutations_from_segment (commented out until CdcReader is implemented).
-    #[allow(unused_imports)]
     use crate::commitlog::{CommitLog, CommitLogConfig};
 
     #[test]
@@ -97,34 +241,32 @@ mod tests {
         assert_eq!(loaded, None);
     }
 
-    // TODO: Uncomment when CdcReader is implemented (Chunk 1, Task 3).
-    // #[test]
-    // fn reader_yields_mutations_from_segment() {
-    //     let dir = tempfile::tempdir().unwrap();
-    //     let config = CommitLogConfig::test_config(dir.path());
-    //     let cl = CommitLog::new(config).unwrap();
-    //
-    //     let m1 = test_mutation("ks", "t1");
-    //     let m2 = test_mutation("ks", "t2");
-    //     cl.append(&m1).unwrap();
-    //     cl.append(&m2).unwrap();
-    //     cl.shutdown().unwrap();
-    //
-    //     let mut reader = CdcReader::new(dir.path(), dir.path(), None).unwrap();
-    //     let mut results = Vec::new();
-    //     while let Some((mutation, _pos)) = reader.next_mutation().unwrap() {
-    //         results.push(mutation);
-    //     }
-    //     assert_eq!(results.len(), 2);
-    //     assert_eq!(results[0].table, "t1");
-    //     assert_eq!(results[1].table, "t2");
-    // }
+    #[test]
+    fn reader_yields_mutations_from_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config).unwrap();
 
-    #[allow(dead_code)]
-    fn test_mutation(ks: &str, table: &str) -> super::super::mutation::Mutation {
+        let m1 = test_mutation("ks", "t1");
+        let m2 = test_mutation("ks", "t2");
+        cl.append(&m1).unwrap();
+        cl.append(&m2).unwrap();
+        cl.shutdown().unwrap();
+
+        let mut reader = CdcReader::new(dir.path(), dir.path(), None).unwrap();
+        let mut results = Vec::new();
+        while let Some((mutation, _pos)) = reader.next_mutation().unwrap() {
+            results.push(mutation);
+        }
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].table, "t1");
+        assert_eq!(results[1].table, "t2");
+    }
+
+    fn test_mutation(ks: &str, table: &str) -> Mutation {
         use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
         use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
-        super::super::mutation::Mutation {
+        Mutation {
             keyspace: ks.to_string(),
             table: table.to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
