@@ -1,6 +1,6 @@
 # Ferrosa Architecture Specs
 
-> Last updated: 2026-03-12
+> Last updated: 2026-03-13
 
 Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassandra with S3-backed storage.
 
@@ -10,13 +10,13 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 |-------|--------|
 | ferrosa-common | Done |
 | ferrosa-sstable | Done |
-| ferrosa-storage | Done (core engine; follow-on items tracked) |
-| ferrosa-schema | Done |
-| ferrosa-cql | In progress (Part A: protocol + types + auth) |
-| ferrosa-graph | In progress (Cypher parser) |
+| ferrosa-storage | Done (core engine + observers; follow-on items tracked) |
+| ferrosa-schema | Done (DDL, auth, audit, system KS, graph extensions, system table protection) |
+| ferrosa-cql | Done (Parts A-D: protocol, parser, routing, prepared cache, security hardening) |
+| ferrosa-graph | Done (Phase 1: parser, planner, executor, adjacency index, HTTP endpoint) |
 | ferrosa-net | Not started |
 | ferrosa-cluster | Not started |
-| ferrosa (binary) | Not started |
+| ferrosa (binary) | Done (single-node: CQL on 9042, optional graph on 7474) |
 
 ## Specs Index
 
@@ -31,6 +31,8 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [CQL](cql.md) | CQL native protocol v5, parser, query routing, prepared cache | Approved |
 | [Schema](schema.md) | Schema management: metadata types, registry, auth, system keyspaces | Approved |
 | [Threat Model](threat-model.md) | STRIDE threat analysis: trust boundaries, threat inventory, mitigations | Draft |
+| [Threat Model — CQL B/C](threat-model-cql-bc.md) | STRIDE for CQL parser, routing, prepared cache | Approved |
+| [Threat Model — Graph](threat-model-graph.md) | STRIDE for graph engine, HTTP endpoint, adjacency index | Draft |
 
 ## Architecture Decision Records
 
