@@ -179,7 +179,7 @@ impl Memtable for ShardedBTreeMemtable {
 /// Binary searches the partition's rows by clustering key. If a row with the
 /// same clustering key exists, merges cells (newer timestamp wins per cell).
 /// Otherwise inserts the row at the correct sorted position.
-fn merge_row_into_partition(partition: &mut Partition, new_row: Row) {
+pub(crate) fn merge_row_into_partition(partition: &mut Partition, new_row: Row) {
     // Binary search by clustering key
     let pos = partition
         .rows
