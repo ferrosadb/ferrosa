@@ -8,6 +8,8 @@
 //! - **M4**: No `unwrap()` on user-derived data — all fallible paths return `Result`.
 //! - **M6**: Collection element count capped at `MAX_COLLECTION_ELEMENTS` (65,536).
 
+use std::time::Duration;
+
 use crate::ast::*;
 use crate::error::CqlError;
 use crate::lexer::{Keyword, Lexer, TokenKind};
@@ -86,6 +88,8 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Truncate) => self.parse_truncate().map(Statement::Truncate),
             TokenKind::Keyword(Keyword::Grant) => self.parse_grant().map(Statement::Grant),
             TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke().map(Statement::Revoke),
+            TokenKind::Keyword(Keyword::Subscribe) => self.parse_subscribe(),
+            TokenKind::Keyword(Keyword::Unsubscribe) => self.parse_unsubscribe(),
             TokenKind::Eof => Err(CqlError::SyntaxError("empty query".to_string())),
             _ => Err(CqlError::SyntaxError(format!(
                 "unexpected token {:?} at position {}",
@@ -899,6 +903,104 @@ impl<'input> Parser<'input> {
                 let (ks, table) = self.parse_table_ref()?;
                 Ok(GrantResource::Table(ks, table))
             }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // SUBSCRIBE / UNSUBSCRIBE
+    // ---------------------------------------------------------------
+
+    fn parse_subscribe(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Subscribe))?;
+
+        // The inner statement must be a SELECT
+        let tok = self.lexer.peek()?;
+        if !matches!(tok.kind, TokenKind::Keyword(Keyword::Select)) {
+            return Err(CqlError::SyntaxError(
+                "SUBSCRIBE requires a SELECT statement".to_string(),
+            ));
+        }
+        let inner = self.parse_select().map(Statement::Select)?;
+
+        // Optional EVERY <duration>
+        let interval = if self.lexer.eat(&TokenKind::Keyword(Keyword::Every))? {
+            let dur = self.parse_duration()?;
+            if dur < Duration::from_millis(500) {
+                return Err(CqlError::SyntaxError(format!(
+                    "SUBSCRIBE interval must be at least 500ms, got {}ms",
+                    dur.as_millis()
+                )));
+            }
+            Some(dur)
+        } else {
+            None
+        };
+
+        // Optional DELTA
+        let delta = self.lexer.eat(&TokenKind::Keyword(Keyword::Delta))?;
+
+        Ok(Statement::Subscribe {
+            inner: Box::new(inner),
+            interval,
+            delta,
+        })
+    }
+
+    fn parse_unsubscribe(&mut self) -> Result<Statement, CqlError> {
+        self.lexer
+            .expect(&TokenKind::Keyword(Keyword::Unsubscribe))?;
+
+        // Optional integer stream_id
+        let tok = self.lexer.peek()?;
+        let stream_id = if let TokenKind::IntegerLiteral(n) = tok.kind {
+            self.lexer.next_token()?;
+            let id = u16::try_from(n)
+                .map_err(|_| CqlError::SyntaxError(format!("stream_id out of u16 range: {n}")))?;
+            Some(id)
+        } else {
+            None
+        };
+
+        Ok(Statement::Unsubscribe { stream_id })
+    }
+
+    /// Parse a duration string like `5s`, `500ms`, `1m`.
+    ///
+    /// The lexer produces these as a single `Ident` token (e.g. `"5s"`)
+    /// because a digit run followed by letters is read as one alphanumeric word.
+    fn parse_duration(&mut self) -> Result<Duration, CqlError> {
+        let tok = self.lexer.next_token()?;
+        let text = match &tok.kind {
+            TokenKind::Ident(s) => s.to_string(),
+            _ => {
+                return Err(CqlError::SyntaxError(format!(
+                    "expected duration (e.g. 5s, 500ms, 1m), got {:?} at position {}",
+                    tok.kind, tok.pos
+                )))
+            }
+        };
+
+        // Split into numeric prefix and unit suffix
+        let split_pos = text.find(|c: char| !c.is_ascii_digit()).ok_or_else(|| {
+            CqlError::SyntaxError(format!(
+                "expected duration with unit suffix (s, ms, m), got {:?}",
+                text
+            ))
+        })?;
+
+        let (num_str, unit) = text.split_at(split_pos);
+        let value: u64 = num_str.parse().map_err(|_| {
+            CqlError::SyntaxError(format!("invalid duration number: {:?}", num_str))
+        })?;
+
+        match unit {
+            "s" => Ok(Duration::from_secs(value)),
+            "ms" => Ok(Duration::from_millis(value)),
+            "m" => Ok(Duration::from_secs(value * 60)),
+            _ => Err(CqlError::SyntaxError(format!(
+                "unknown duration unit {:?}, expected s, ms, or m",
+                unit
+            ))),
         }
     }
 
@@ -2002,6 +2104,77 @@ mod tests {
             }
             other => panic!("expected CreateKeyspace, got {:?}", other),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // SUBSCRIBE / UNSUBSCRIBE tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_subscribe_select() {
+        let stmt = parse("SUBSCRIBE SELECT * FROM users WHERE active = true").unwrap();
+        match stmt {
+            Statement::Subscribe {
+                inner,
+                interval,
+                delta,
+            } => {
+                assert!(interval.is_none());
+                assert!(!delta);
+                assert!(matches!(*inner, Statement::Select { .. }));
+            }
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_subscribe_with_every() {
+        let stmt = parse("SUBSCRIBE SELECT * FROM t EVERY 5s").unwrap();
+        match stmt {
+            Statement::Subscribe { interval, .. } => {
+                assert_eq!(interval, Some(Duration::from_secs(5)));
+            }
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_subscribe_with_delta() {
+        let stmt = parse("SUBSCRIBE SELECT * FROM t DELTA").unwrap();
+        match stmt {
+            Statement::Subscribe { delta, .. } => assert!(delta),
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_subscribe_every_and_delta() {
+        let stmt = parse("SUBSCRIBE SELECT * FROM t EVERY 1s DELTA").unwrap();
+        match stmt {
+            Statement::Subscribe {
+                interval, delta, ..
+            } => {
+                assert_eq!(interval, Some(Duration::from_secs(1)));
+                assert!(delta);
+            }
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_unsubscribe_all() {
+        let stmt = parse("UNSUBSCRIBE").unwrap();
+        assert!(matches!(stmt, Statement::Unsubscribe { stream_id: None }));
+    }
+
+    #[test]
+    fn parse_subscribe_rejects_non_select() {
+        assert!(parse("SUBSCRIBE INSERT INTO t (a) VALUES (1)").is_err());
+    }
+
+    #[test]
+    fn parse_subscribe_enforces_min_interval() {
+        assert!(parse("SUBSCRIBE SELECT * FROM t EVERY 100ms").is_err());
     }
 }
 
