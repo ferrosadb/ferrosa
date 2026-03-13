@@ -87,7 +87,7 @@ graph LR
 
 Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable.
 
-**Current progress**: `ferrosa-common`, `ferrosa-sstable`, and `ferrosa-storage` are implemented. Next up: `ferrosa-schema`.
+**Current progress**: `ferrosa-common`, `ferrosa-sstable`, `ferrosa-storage`, and `ferrosa-schema` are implemented. `ferrosa-cql` Part A (protocol framing, type system, TCP server, auth) is complete. `ferrosa-graph` (Cypher parser) is in progress. Next up: `ferrosa-cql` Parts B-D (parser, query routing, prepared cache).
 
 ## Key Architectural Decisions
 

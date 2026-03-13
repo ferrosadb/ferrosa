@@ -17,6 +17,7 @@ graph BT
     Storage[ferrosa-storage<br/>Write-behind S3 engine]
     Schema[ferrosa-schema<br/>DDL, system keyspaces]
     CQL[ferrosa-cql<br/>CQL protocol v5]
+    Graph[ferrosa-graph<br/>Cypher/GQL parser]
     Cluster[ferrosa-cluster<br/>Raft, routing, CL]
     Bin[ferrosa<br/>Binary]
 
@@ -67,21 +68,21 @@ graph BT
 
 - **Purpose**: Storage engine with S3 write-behind
 - **Location**: `ferrosa-storage/`
-- **Dependencies**: `ferrosa-common`, `ferrosa-sstable`, `arc-swap`, `parking_lot`, `crc32fast`, `object_store` (S3), `tokio`, `serde`, `serde_json`, `bytes`
+- **Dependencies**: `ferrosa-common`, `ferrosa-sstable`, `arc-swap`, `parking_lot`, `crc32fast`, `object_store` (S3), `tokio`, `serde`, `serde_json`, `bytes`, `crossbeam-skiplist` (optional)
 - **Status**: Parts A/B/C implemented — memtable, flush, merge, commit log, compaction, S3 upload manager, manifest, local cache, StorageEngine composition
 - **Modules**:
-  - `memtable/` — `ShardedBTreeMemtable` (16-shard `BTreeMap` with `parking_lot::RwLock`)
+  - `memtable/` — `Memtable` trait with two implementations: `ShardedBTreeMemtable` (64-shard `BTreeMap` with `parking_lot::RwLock`), `SkipListMemtable` (lock-free, behind `skiplist-memtable` feature flag)
   - `flush.rs` — `FlushTarget` trait, `FileFlushTarget` (disk), `InMemoryFlushTarget` (testing)
   - `merge.rs` — Read-path merge across memtable + multiple SSTables (last-write-wins)
   - `store.rs` — `TableStore`: lock-free per-table composition via `arc-swap`
-  - `commitlog/` — CAS-allocated segments, CRC32-checksummed entries, configurable sync strategies (Periodic/Batch/Group), checkpoint tracking per table
+  - `commitlog/` — CAS-allocated segments, CRC32-checksummed entries, configurable sync strategies (Periodic/Batch/Group), checkpoint tracking per table, CDC reader
   - `compaction/` — `SizeTieredStrategy` (STCS), `CompactionExecutor` (background `std::thread` with `mpsc`)
   - `upload/` — `UploadManager` (tokio task with bounded `mpsc`, exponential backoff retry), `ObjectStoreConfig` (12-factor env vars)
   - `manifest.rs` — S3 manifest with etag-based CAS (conditional put via `PutMode::Update`)
   - `cache.rs` — `LocalCache` with LRU eviction, pinned entries, size tracking
   - `engine.rs` — `StorageEngine` composing all components, `StorageEngineConfig` with `from_env()` for 12-factor config
 - **Concurrency**:
-  - *Memtable writes*: 16-shard `BTreeMap` — different partitions write in parallel; same-shard writes serialize on a per-shard `RwLock`.
+  - *Memtable writes*: 64-shard `BTreeMap` — different partitions write in parallel; same-shard writes serialize on a per-shard `RwLock`. Alternative: `SkipListMemtable` (lock-free, `crossbeam-skiplist`, behind feature flag).
   - *Memtable flush*: Atomic swap via `arc-swap` — current memtable replaced with a fresh one; old memtable flushed to SSTable. Reads check both active and flushing memtable.
   - *SSTable reads during compaction*: `Arc`-based refcounting. Compaction creates new SSTables and atomically swaps the active set via `arc-swap`. In-flight reads hold references to old SSTables, cleaned up when last reference drops.
   - *S3 upload concurrency*: Independent tokio task observes new SSTables via bounded `mpsc` channel (backpressure), uploads without holding storage engine locks. Local files retained until S3 upload confirms.
@@ -90,9 +91,19 @@ graph BT
 
 ### ferrosa-schema
 
-- **Purpose**: Schema management and system keyspaces
+- **Purpose**: Schema management, auth, audit, and system keyspaces
 - **Location**: `ferrosa-schema/`
-- **Dependencies**: `ferrosa-common`
+- **Dependencies**: `ferrosa-common`, `arc-swap`, `bcrypt`, `argon2`, `uuid`, `serde`, `serde_json`, `indexmap`, `tracing`, `password-hash`
+- **Status**: Implemented — metadata types, schema registry with lock-free snapshots, auth (roles, permissions, RBAC, rate limiting), audit logging (composite sinks), system keyspace queries, secrets provider, production mode validation
+- **Modules**:
+  - `metadata/` — `KeyspaceMetadata`, `TableMetadata`, `ColumnMetadata`, replication params, caching params
+  - `registry.rs` — `Schema` with `ArcSwap<SchemaSnapshot>` for lock-free reads, `AuthMethod` config
+  - `auth/` — `AuthContext`, `Permission`, `Resource`, RBAC with `check_permission()`, `PasswordHasher` (bcrypt/argon2id), `AuthRateLimiter`
+  - `audit/` — `AuditEvent`, `AuditSink` trait, `LogAuditSink`, `SystemTableAuditSink`, `CompositeSink`
+  - `system/` — System keyspace queries: `system.local`, `system.peers`, `system_schema.keyspaces/tables/columns`, `system_auth.roles/role_members/role_permissions`
+  - `secrets/` — `SecretsProvider` trait, `EnvSecretsProvider`
+  - `startup.rs` — `validate_production_requirements()`, `DeploymentMode`
+  - `convert.rs` — CQL-to-marshal type conversion
 - **Key interfaces**: Table/keyspace definitions, CREATE/ALTER/DROP validation, system keyspace queries (`system.local`, `system.peers`, `system_schema.*`)
 - **Persistence**: Schema is Raft-committed metadata (via `ferrosa-cluster`). All nodes have identical schema at the same Raft index.
 - **Agreement**: Raft applied index comparison, not gossip-based version UUIDs (though UUIDs maintained for driver compat)
@@ -101,11 +112,29 @@ graph BT
 
 - **Purpose**: CQL native protocol v5 and query execution
 - **Location**: `ferrosa-cql/`
-- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`
-- **Key interfaces**: Protocol framing, CQL parser, query planner, result serialization, CQL type system
-- **Auth**: Password-only initially, pluggable auth provider trait
+- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `tokio`, `tokio-util`, `bytes`, `futures`, `arc-swap`, `uuid`, `num-bigint`, `phf`, `md-5`, `tracing`
+- **Status**: Part A implemented (protocol framing, CQL type system, TCP server, SASL PLAIN auth). Parts B-D (parser, query routing, prepared cache, security hardening) are next.
+- **Implemented modules**:
+  - `frame.rs` — CQL v5 binary framing, `CqlCodec` (Tokio `Encoder`/`Decoder`)
+  - `types.rs` — `CqlValue` enum with encode/decode for all CQL types
+  - `server.rs` — TCP listener, per-connection Tokio tasks
+  - `connection.rs` — Connection handler, auth flow, request routing
+  - `auth.rs` — SASL PLAIN authentication
+  - `error.rs` — CQL error codes
+- **Key interfaces**: Protocol framing, CQL type system with encode/decode, TCP server with auth
+- **Auth**: SASL PLAIN initially, pluggable auth provider trait
 - **Minimum viable subset**: STARTUP, OPTIONS, QUERY, PREPARE, EXECUTE, REGISTER, RESULT + basic types + system keyspace queries
 - **Target**: All standard CQL drivers connect without modification
+
+### ferrosa-graph
+
+- **Purpose**: Graph query engine with Cypher/GQL support
+- **Location**: `ferrosa-graph/`
+- **Dependencies**: `phf`
+- **Status**: Early stage — Cypher parser (lexer, parser, AST) implemented. Not yet integrated with storage or CQL layers.
+- **Modules**:
+  - `parser/` — `lexer.rs` (tokenizer), `parse_impl.rs` (recursive descent parser), `ast.rs` (AST types), `token.rs` (token definitions), `error.rs` (parse errors)
+- **Design**: Data stored in normal CQL tables, accessed via system-managed adjacency index
 
 ### ferrosa-net
 
@@ -146,11 +175,12 @@ gantt
 
     section Engine
     ferrosa-storage         :done, 3, 5
-    ferrosa-schema          :active, 5, 6
+    ferrosa-schema          :done, 5, 6
 
     section Protocol
-    ferrosa-cql             :6, 8
-    ferrosa-net             :6, 7
+    ferrosa-cql             :active, 6, 8
+    ferrosa-graph           :active, 6, 7
+    ferrosa-net             :7, 8
 
     section Distributed
     ferrosa-cluster         :8, 10
@@ -162,8 +192,9 @@ gantt
 | 1 | ferrosa-common | Type definitions compile — **done** |
 | 2 | ferrosa-sstable | Read real Cassandra SSTables, round-trip BTI — **done** |
 | 3 | ferrosa-storage | Single-node writes + reads with S3 backend — **done** (core engine; follow-on items tracked) |
-| 4 | ferrosa-schema | Parse CREATE TABLE, system keyspaces queryable |
-| 5 | ferrosa-cql | cqlsh connects and runs basic queries |
+| 4 | ferrosa-schema | Schema registry, auth, audit, system keyspaces queryable — **done** |
+| 5 | ferrosa-cql | cqlsh connects and runs basic queries — **Part A done** (framing, types, server, auth) |
+| 5b | ferrosa-graph | Cypher parser produces valid ASTs — **parser done** |
 | 6 | ferrosa-net | Two nodes exchange messages |
 | 7 | ferrosa-cluster | 3-node cluster at QUORUM |
 | 8 | ferrosa (binary) | Full database, characterization tests pass |
@@ -172,4 +203,5 @@ gantt
 
 - [Overview](overview.md) — system overview and design principles
 - [Data Flow](data-flow.md) — write/read paths
+- [Storage](storage.md) — storage engine details
 - [CQL](cql.md) — CQL native protocol v5

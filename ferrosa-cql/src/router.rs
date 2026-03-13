@@ -1,0 +1,1599 @@
+//! CQL query router — dispatches parsed statements to schema/storage.
+//!
+//! This is the central piece of the CQL layer: it takes a parsed `Statement`,
+//! resolves keyspaces, checks permissions, and delegates to the appropriate
+//! schema or storage operations.
+//!
+//! Security mitigations:
+//! - **M8**: Every `route_*` function checks permissions via `Schema::check_permission`.
+//! - **M12**: Batch size is capped at `MAX_BATCH_STATEMENTS` (500).
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use bytes::BytesMut;
+use indexmap::IndexMap;
+
+use ferrosa_schema::{
+    query_columns, query_keyspaces, query_local, query_peers, query_role_members,
+    query_role_permissions, query_roles, query_tables, AuthContext, ClusterState,
+    ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, KeyspaceMetadata,
+    KeyspaceUpdates, NodeConfig, PeerInfo, Permission, ReplicationParams, Resource, RoleMetadata,
+    RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
+};
+use ferrosa_storage::StorageEngine;
+use ferrosa_storage::TableId;
+
+use crate::ast::*;
+use crate::bridge;
+use crate::error::CqlError;
+use crate::prepared::PreparedCache;
+use crate::result;
+use crate::types::{CqlType, CqlValue};
+
+/// Maximum number of statements allowed in a BATCH (security mitigation M12).
+const MAX_BATCH_STATEMENTS: usize = 500;
+
+/// Shared state available to all request handlers.
+pub struct SharedState {
+    pub engine: Arc<StorageEngine>,
+    pub schema: Arc<Schema>,
+    pub node_config: Arc<NodeConfig>,
+    pub cluster_state: Arc<dyn ClusterState>,
+    pub prepared_cache: Arc<PreparedCache>,
+}
+
+/// Per-request context: authentication and current keyspace.
+pub struct RequestContext<'a> {
+    pub auth: &'a AuthContext,
+    pub current_keyspace: &'a Option<String>,
+}
+
+/// A single-node cluster state that reports no peers.
+pub struct SingleNodeClusterState;
+
+impl ClusterState for SingleNodeClusterState {
+    fn peers(&self) -> Vec<PeerInfo> {
+        vec![]
+    }
+}
+
+/// Result of routing a statement.
+pub enum RouteResult {
+    /// A CQL RESULT frame body.
+    Result(BytesMut),
+    /// USE keyspace: returns the new keyspace name and a SetKeyspace frame body.
+    SetKeyspace(String, BytesMut),
+}
+
+// ── Main dispatch ────────────────────────────────────────────────────────
+
+/// Route a parsed statement to the appropriate handler.
+pub fn route(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    stmt: Statement,
+) -> Result<RouteResult, CqlError> {
+    match stmt {
+        Statement::Select(s) => route_select(state, ctx, s).map(RouteResult::Result),
+        Statement::Insert(i) => route_insert(state, ctx, i).map(RouteResult::Result),
+        Statement::Update(u) => route_update(state, ctx, u).map(RouteResult::Result),
+        Statement::Delete(d) => route_delete(state, ctx, d).map(RouteResult::Result),
+        Statement::Batch(b) => route_batch(state, ctx, b).map(RouteResult::Result),
+        Statement::CreateKeyspace(ck) => {
+            route_create_keyspace(state, ctx, ck).map(RouteResult::Result)
+        }
+        Statement::CreateTable(ct) => route_create_table(state, ctx, ct).map(RouteResult::Result),
+        Statement::AlterTable(at) => route_alter_table(state, ctx, at).map(RouteResult::Result),
+        Statement::DropTable(dt) => route_drop_table(state, ctx, dt).map(RouteResult::Result),
+        Statement::AlterKeyspace(ak) => {
+            route_alter_keyspace(state, ctx, ak).map(RouteResult::Result)
+        }
+        Statement::DropKeyspace(dk) => route_drop_keyspace(state, ctx, dk).map(RouteResult::Result),
+        Statement::CreateRole(cr) => route_create_role(state, ctx, cr).map(RouteResult::Result),
+        Statement::AlterRole(ar) => route_alter_role(state, ctx, ar).map(RouteResult::Result),
+        Statement::DropRole(dr) => route_drop_role(state, ctx, dr).map(RouteResult::Result),
+        Statement::Grant(g) => route_grant(state, ctx, g).map(RouteResult::Result),
+        Statement::Revoke(r) => route_revoke(state, ctx, r).map(RouteResult::Result),
+        Statement::Use(u) => {
+            let body = result::encode_set_keyspace(&u.keyspace);
+            Ok(RouteResult::SetKeyspace(u.keyspace, body))
+        }
+        Statement::Truncate(t) => route_truncate(state, ctx, t).map(RouteResult::Result),
+    }
+}
+
+// ── SELECT ───────────────────────────────────────────────────────────────
+
+fn route_select(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: SelectStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = s
+        .keyspace
+        .as_deref()
+        .or(ctx.current_keyspace.as_deref())
+        .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
+
+    // System table dispatch — no permission check needed for system tables.
+    match (ks, s.table.as_str()) {
+        ("system", "local") => {
+            let info = query_local(&state.schema, &state.node_config);
+            let col_names: Vec<String> = vec![
+                "key",
+                "cluster_name",
+                "data_center",
+                "rack",
+                "host_id",
+                "partitioner",
+                "native_protocol_version",
+                "cql_version",
+                "release_version",
+                "schema_version",
+                "rpc_port",
+                "listen_address",
+                "broadcast_address",
+                "rpc_address",
+                "bootstrapped",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Uuid,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Uuid,
+                CqlType::Int,
+                CqlType::Inet,
+                CqlType::Inet,
+                CqlType::Inet,
+                CqlType::Varchar,
+            ];
+            let row = vec![
+                Some(CqlValue::Text(info.key)),
+                Some(CqlValue::Text(info.cluster_name)),
+                Some(CqlValue::Text(info.data_center)),
+                Some(CqlValue::Text(info.rack)),
+                Some(CqlValue::Uuid(info.host_id)),
+                Some(CqlValue::Text(info.partitioner)),
+                Some(CqlValue::Text(info.native_protocol_version)),
+                Some(CqlValue::Text(info.cql_version)),
+                Some(CqlValue::Text(info.release_version)),
+                Some(CqlValue::Uuid(info.schema_version)),
+                Some(CqlValue::Int(info.rpc_port as i32)),
+                Some(CqlValue::Inet(info.listen_address)),
+                Some(CqlValue::Inet(info.broadcast_address)),
+                Some(CqlValue::Inet(info.rpc_address)),
+                Some(CqlValue::Text(info.bootstrapped)),
+            ];
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system",
+                "local",
+                &[row],
+            ))
+        }
+        ("system", "peers" | "peers_v2") => {
+            let peers = query_peers(&state.schema, state.cluster_state.as_ref());
+            let col_names: Vec<String> = vec![
+                "peer",
+                "peer_port",
+                "data_center",
+                "rack",
+                "host_id",
+                "native_address",
+                "native_port",
+                "schema_version",
+                "release_version",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            let col_types = vec![
+                CqlType::Inet,
+                CqlType::Int,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Uuid,
+                CqlType::Inet,
+                CqlType::Int,
+                CqlType::Uuid,
+                CqlType::Varchar,
+            ];
+            let rows: Vec<Vec<Option<CqlValue>>> = peers
+                .iter()
+                .map(|p| {
+                    vec![
+                        Some(CqlValue::Inet(p.peer)),
+                        Some(CqlValue::Int(p.peer_port as i32)),
+                        Some(CqlValue::Text(p.data_center.clone())),
+                        Some(CqlValue::Text(p.rack.clone())),
+                        Some(CqlValue::Uuid(p.host_id)),
+                        Some(CqlValue::Inet(p.native_address)),
+                        Some(CqlValue::Int(p.native_port as i32)),
+                        Some(CqlValue::Uuid(p.schema_version)),
+                        Some(CqlValue::Text(p.release_version.clone())),
+                    ]
+                })
+                .collect();
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system",
+                s.table.as_str(),
+                &rows,
+            ))
+        }
+        ("system_schema", "keyspaces") => {
+            let snap = state.schema.snapshot();
+            let ks_rows = query_keyspaces(&snap);
+            let col_names = vec!["keyspace_name".into(), "durable_writes".into()];
+            let col_types = vec![CqlType::Varchar, CqlType::Boolean];
+            let rows: Vec<Vec<Option<CqlValue>>> = ks_rows
+                .iter()
+                .map(|k| {
+                    vec![
+                        Some(CqlValue::Text(k.keyspace_name.clone())),
+                        Some(CqlValue::Boolean(k.durable_writes)),
+                    ]
+                })
+                .collect();
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_schema",
+                "keyspaces",
+                &rows,
+            ))
+        }
+        ("system_schema", "tables") => {
+            let snap = state.schema.snapshot();
+            let table_rows = query_tables(&snap);
+            let col_names = vec!["keyspace_name".into(), "table_name".into(), "id".into()];
+            let col_types = vec![CqlType::Varchar, CqlType::Varchar, CqlType::Uuid];
+            let rows: Vec<Vec<Option<CqlValue>>> = table_rows
+                .iter()
+                .map(|t| {
+                    vec![
+                        Some(CqlValue::Text(t.keyspace_name.clone())),
+                        Some(CqlValue::Text(t.table_name.clone())),
+                        Some(CqlValue::Uuid(t.id)),
+                    ]
+                })
+                .collect();
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_schema",
+                "tables",
+                &rows,
+            ))
+        }
+        ("system_schema", "columns") => {
+            let snap = state.schema.snapshot();
+            let col_rows = query_columns(&snap);
+            let col_names = vec![
+                "keyspace_name".into(),
+                "table_name".into(),
+                "column_name".into(),
+                "kind".into(),
+                "position".into(),
+                "type".into(),
+                "clustering_order".into(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Int,
+                CqlType::Varchar,
+                CqlType::Varchar,
+            ];
+            let rows: Vec<Vec<Option<CqlValue>>> = col_rows
+                .iter()
+                .map(|c| {
+                    vec![
+                        Some(CqlValue::Text(c.keyspace_name.clone())),
+                        Some(CqlValue::Text(c.table_name.clone())),
+                        Some(CqlValue::Text(c.column_name.clone())),
+                        Some(CqlValue::Text(c.kind.clone())),
+                        Some(CqlValue::Int(c.position)),
+                        Some(CqlValue::Text(c.column_type.clone())),
+                        Some(CqlValue::Text(c.clustering_order.clone())),
+                    ]
+                })
+                .collect();
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_schema",
+                "columns",
+                &rows,
+            ))
+        }
+        ("system_auth", "roles") => {
+            let snap = state.schema.snapshot();
+            let role_rows = query_roles(&snap, ctx.auth);
+            let col_names = vec!["role".into(), "is_superuser".into(), "can_login".into()];
+            let col_types = vec![CqlType::Varchar, CqlType::Boolean, CqlType::Boolean];
+            let rows: Vec<Vec<Option<CqlValue>>> = role_rows
+                .iter()
+                .map(|r| {
+                    vec![
+                        Some(CqlValue::Text(r.role.clone())),
+                        Some(CqlValue::Boolean(r.is_superuser)),
+                        Some(CqlValue::Boolean(r.can_login)),
+                    ]
+                })
+                .collect();
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_auth",
+                "roles",
+                &rows,
+            ))
+        }
+        ("system_auth", "role_members") => {
+            let snap = state.schema.snapshot();
+            let rows_data = query_role_members(&snap);
+            let col_names = vec!["role".into(), "member".into()];
+            let col_types = vec![CqlType::Varchar, CqlType::Varchar];
+            let rows: Vec<Vec<Option<CqlValue>>> = rows_data
+                .iter()
+                .map(|r| {
+                    vec![
+                        Some(CqlValue::Text(r.role.clone())),
+                        Some(CqlValue::Text(r.member.clone())),
+                    ]
+                })
+                .collect();
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_auth",
+                "role_members",
+                &rows,
+            ))
+        }
+        ("system_auth", "role_permissions") => {
+            let snap = state.schema.snapshot();
+            let rows_data = query_role_permissions(&snap);
+            let col_names = vec!["role".into(), "resource".into()];
+            let col_types = vec![CqlType::Varchar, CqlType::Varchar];
+            let rows: Vec<Vec<Option<CqlValue>>> = rows_data
+                .iter()
+                .map(|r| {
+                    vec![
+                        Some(CqlValue::Text(r.role.clone())),
+                        Some(CqlValue::Text(r.resource.clone())),
+                    ]
+                })
+                .collect();
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_auth",
+                "role_permissions",
+                &rows,
+            ))
+        }
+        _ => {
+            // User table: permission check + bridge + storage
+            route_select_user_table(state, ctx, ks, &s)
+        }
+    }
+}
+
+fn route_select_user_table(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    ks: &str,
+    s: &SelectStatement,
+) -> Result<BytesMut, CqlError> {
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Select,
+        &Resource::Table(ks.to_string(), s.table.clone()),
+    )?;
+
+    if s.allow_filtering {
+        return Err(CqlError::Invalid("ALLOW FILTERING not supported".into()));
+    }
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), s.table.clone()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+
+    // Build column info for result
+    let (col_names, col_types) = build_column_info(table_meta, &s.columns)?;
+
+    // Extract PK values from WHERE clauses
+    let pk_values = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta)?;
+    let pk_types: Vec<CqlType> = table_meta
+        .partition_key
+        .iter()
+        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
+
+    match state.engine.read(&table_id, &decorated_key)? {
+        Some(partition) => {
+            // Build column index maps for partition_to_rows
+            let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+            let all_col_types: Vec<CqlType> = table_meta
+                .columns
+                .values()
+                .map(|c| bridge::parse_cql_type(&c.column_type))
+                .collect::<Result<Vec<_>, _>>()?;
+            let pk_indices: Vec<usize> = table_meta
+                .partition_key
+                .iter()
+                .map(|name| table_meta.columns.get_index_of(name).unwrap())
+                .collect();
+            let ck_indices: Vec<usize> = table_meta
+                .clustering_key
+                .iter()
+                .map(|(name, _)| table_meta.columns.get_index_of(name).unwrap())
+                .collect();
+
+            let rows = bridge::partition_to_rows(
+                &partition,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+            );
+
+            // Apply column selection if not Star
+            let selected_rows = select_columns(&rows, &all_col_names, &col_names);
+
+            // Apply LIMIT
+            let limited = if let Some(limit) = s.limit {
+                &selected_rows[..std::cmp::min(selected_rows.len(), limit as usize)]
+            } else {
+                &selected_rows
+            };
+
+            Ok(result::encode_rows(
+                &col_names, &col_types, ks, &s.table, limited,
+            ))
+        }
+        None => Ok(result::encode_rows(
+            &col_names,
+            &col_types,
+            ks,
+            &s.table,
+            &[],
+        )),
+    }
+}
+
+// ── INSERT ───────────────────────────────────────────────────────────────
+
+fn route_insert(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: InsertStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Modify,
+        &Resource::Table(ks.to_string(), s.table.clone()),
+    )?;
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), s.table.clone()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+
+    // Convert terms to CqlValues using target column types
+    let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
+    let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
+    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    let timestamp = s.using_timestamp.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64
+    });
+
+    for (i, col_name) in s.columns.iter().enumerate() {
+        let col_meta = table_meta
+            .columns
+            .get(col_name)
+            .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?;
+        let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+        let value = bridge::term_to_cql_value(&s.values[i], &cql_type)?;
+
+        match col_meta.kind {
+            ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
+            ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
+            ColumnKind::Regular | ColumnKind::Static => {
+                let col_idx = table_meta.columns.get_index_of(col_name).unwrap() as u16;
+                regular_cells.push((col_idx, value));
+            }
+        }
+    }
+
+    // Sort PK and CK by position
+    pk_vals.sort_by_key(|(pos, _)| *pos);
+    ck_vals.sort_by_key(|(pos, _)| *pos);
+    let pk_values: Vec<CqlValue> = pk_vals.into_iter().map(|(_, v)| v).collect();
+    let ck_values: Vec<CqlValue> = ck_vals.into_iter().map(|(_, v)| v).collect();
+    let pk_types: Vec<CqlType> = table_meta
+        .partition_key
+        .iter()
+        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let table_id = TableId::new(ks, &s.table);
+
+    state
+        .engine
+        .write(&table_id, &decorated_key, row, timestamp)?;
+    Ok(result::encode_void())
+}
+
+// ── UPDATE ───────────────────────────────────────────────────────────────
+
+fn route_update(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: UpdateStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Modify,
+        &Resource::Table(ks.to_string(), s.table.clone()),
+    )?;
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), s.table.clone()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+
+    let timestamp = s.using_timestamp.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64
+    });
+
+    // Extract PK and CK values from WHERE clauses
+    let pk_values = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta)?;
+    let pk_types: Vec<CqlType> = table_meta
+        .partition_key
+        .iter()
+        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Extract CK values from WHERE
+    let ck_names: Vec<String> = table_meta
+        .clustering_key
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut ck_values = Vec::new();
+    for ck_name in &ck_names {
+        for wc in &s.where_clauses {
+            if wc.column == *ck_name && wc.op == ComparisonOp::Eq {
+                let col_meta = &table_meta.columns[ck_name];
+                let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+                let val = bridge::term_to_cql_value(&wc.value, &cql_type)?;
+                ck_values.push(val);
+                break;
+            }
+        }
+    }
+
+    // Build cells from SET assignments
+    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    for (col_name, term) in &s.assignments {
+        let col_meta = table_meta
+            .columns
+            .get(col_name)
+            .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?;
+        let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+        let value = bridge::term_to_cql_value(term, &cql_type)?;
+        let col_idx = table_meta.columns.get_index_of(col_name).unwrap() as u16;
+        regular_cells.push((col_idx, value));
+    }
+
+    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let table_id = TableId::new(ks, &s.table);
+
+    state
+        .engine
+        .write(&table_id, &decorated_key, row, timestamp)?;
+    Ok(result::encode_void())
+}
+
+// ── DELETE ────────────────────────────────────────────────────────────────
+
+fn route_delete(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: DeleteStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Modify,
+        &Resource::Table(ks.to_string(), s.table.clone()),
+    )?;
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), s.table.clone()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+
+    let timestamp = s.using_timestamp.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64
+    });
+
+    // Extract PK values from WHERE
+    let pk_values = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta)?;
+    let pk_types: Vec<CqlType> = table_meta
+        .partition_key
+        .iter()
+        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Extract CK values from WHERE
+    let ck_names: Vec<String> = table_meta
+        .clustering_key
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut ck_values = Vec::new();
+    for ck_name in &ck_names {
+        for wc in &s.where_clauses {
+            if wc.column == *ck_name && wc.op == ComparisonOp::Eq {
+                let col_meta = &table_meta.columns[ck_name];
+                let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+                let val = bridge::term_to_cql_value(&wc.value, &cql_type)?;
+                ck_values.push(val);
+                break;
+            }
+        }
+    }
+
+    // Build delete column indices (empty = row-level delete)
+    let delete_columns: Vec<u16> = s
+        .columns
+        .iter()
+        .map(|col_name| {
+            table_meta
+                .columns
+                .get_index_of(col_name)
+                .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))
+                .map(|idx| idx as u16)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    let row = bridge::build_delete_row(&delete_columns, &ck_values, timestamp);
+    let table_id = TableId::new(ks, &s.table);
+
+    state
+        .engine
+        .write(&table_id, &decorated_key, row, timestamp)?;
+    Ok(result::encode_void())
+}
+
+// ── BATCH ────────────────────────────────────────────────────────────────
+
+fn route_batch(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    b: BatchStatement,
+) -> Result<BytesMut, CqlError> {
+    // Security mitigation M12: batch size limit
+    if b.statements.len() > MAX_BATCH_STATEMENTS {
+        return Err(CqlError::Invalid(format!(
+            "batch too large: {} statements (max {})",
+            b.statements.len(),
+            MAX_BATCH_STATEMENTS
+        )));
+    }
+
+    for stmt in b.statements {
+        match stmt {
+            Statement::Insert(s) => {
+                route_insert(state, ctx, s)?;
+            }
+            Statement::Update(s) => {
+                route_update(state, ctx, s)?;
+            }
+            Statement::Delete(s) => {
+                route_delete(state, ctx, s)?;
+            }
+            _ => {
+                return Err(CqlError::Invalid(
+                    "batch may only contain INSERT, UPDATE, or DELETE statements".into(),
+                ));
+            }
+        }
+    }
+    Ok(result::encode_void())
+}
+
+// ── DDL: Keyspace ────────────────────────────────────────────────────────
+
+fn route_create_keyspace(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: CreateKeyspaceStatement,
+) -> Result<BytesMut, CqlError> {
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Create, &Resource::AllKeyspaces)?;
+
+    let mut options = std::collections::HashMap::new();
+    let mut strategy = String::new();
+    for (k, v) in &s.replication {
+        if k == "class" {
+            strategy = v.clone();
+        } else {
+            options.insert(k.clone(), v.clone());
+        }
+    }
+
+    let ks_meta = KeyspaceMetadata {
+        name: s.name.clone(),
+        durable_writes: s.durable_writes.unwrap_or(true),
+        replication: ReplicationParams { strategy, options },
+    };
+
+    state.schema.create_keyspace(ks_meta, ctx.auth)?;
+    Ok(result::encode_schema_change(
+        "CREATED",
+        "KEYSPACE",
+        &[&s.name],
+    ))
+}
+
+fn route_alter_keyspace(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: AlterKeyspaceStatement,
+) -> Result<BytesMut, CqlError> {
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Alter,
+        &Resource::Keyspace(s.name.clone()),
+    )?;
+
+    let replication = s.replication.map(|pairs| {
+        let mut options = std::collections::HashMap::new();
+        let mut strategy = String::new();
+        for (k, v) in &pairs {
+            if k == "class" {
+                strategy = v.clone();
+            } else {
+                options.insert(k.clone(), v.clone());
+            }
+        }
+        ReplicationParams { strategy, options }
+    });
+
+    let updates = KeyspaceUpdates {
+        replication,
+        durable_writes: s.durable_writes,
+    };
+
+    state.schema.alter_keyspace(&s.name, updates, ctx.auth)?;
+    Ok(result::encode_schema_change(
+        "UPDATED",
+        "KEYSPACE",
+        &[&s.name],
+    ))
+}
+
+fn route_drop_keyspace(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: DropKeyspaceStatement,
+) -> Result<BytesMut, CqlError> {
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Drop,
+        &Resource::Keyspace(s.name.clone()),
+    )?;
+
+    state.schema.drop_keyspace(&s.name, ctx.auth)?;
+    Ok(result::encode_schema_change(
+        "DROPPED",
+        "KEYSPACE",
+        &[&s.name],
+    ))
+}
+
+// ── DDL: Table ───────────────────────────────────────────────────────────
+
+fn route_create_table(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: CreateTableStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Create,
+        &Resource::Keyspace(ks.to_string()),
+    )?;
+
+    // Build column metadata
+    let mut columns = IndexMap::new();
+    let pk_set: HashSet<&str> = s.partition_key.iter().map(|s| s.as_str()).collect();
+    let ck_map: std::collections::HashMap<&str, (i32, crate::ast::ClusteringOrder)> = s
+        .clustering_key
+        .iter()
+        .enumerate()
+        .map(|(i, (name, order))| (name.as_str(), (i as i32, *order)))
+        .collect();
+
+    let mut pk_position = 0i32;
+    for (col_name, type_name) in &s.columns {
+        let type_str = cql_type_name_to_string(type_name);
+        let (kind, position, clustering_order) = if pk_set.contains(col_name.as_str()) {
+            let pos = pk_position;
+            pk_position += 1;
+            (ColumnKind::PartitionKey, pos, SchemaClusteringOrder::None)
+        } else if let Some((ck_pos, ck_order)) = ck_map.get(col_name.as_str()) {
+            let schema_order = match ck_order {
+                crate::ast::ClusteringOrder::Asc => SchemaClusteringOrder::Asc,
+                crate::ast::ClusteringOrder::Desc => SchemaClusteringOrder::Desc,
+            };
+            (ColumnKind::Clustering, *ck_pos, schema_order)
+        } else {
+            (ColumnKind::Regular, 0, SchemaClusteringOrder::None)
+        };
+
+        columns.insert(
+            col_name.clone(),
+            ColumnMetadata {
+                name: col_name.clone(),
+                kind,
+                position,
+                column_type: type_str,
+                clustering_order,
+                mask: None,
+            },
+        );
+    }
+
+    let table_meta = TableMetadata {
+        keyspace: ks.to_string(),
+        name: s.name.clone(),
+        id: uuid::Uuid::new_v4(),
+        columns,
+        partition_key: s.partition_key.clone(),
+        clustering_key: s
+            .clustering_key
+            .iter()
+            .map(|(name, order)| {
+                let schema_order = match order {
+                    crate::ast::ClusteringOrder::Asc => SchemaClusteringOrder::Asc,
+                    crate::ast::ClusteringOrder::Desc => SchemaClusteringOrder::Desc,
+                };
+                (name.clone(), schema_order)
+            })
+            .collect(),
+        params: TableParams::default(),
+        flags: HashSet::new(),
+    };
+
+    // Register with schema
+    state.schema.create_table(table_meta.clone(), ctx.auth)?;
+
+    // Register with storage engine
+    let storage_schema = table_meta.to_storage_schema();
+    state.engine.register_table(storage_schema)?;
+
+    Ok(result::encode_schema_change(
+        "CREATED",
+        "TABLE",
+        &[ks, &s.name],
+    ))
+}
+
+fn route_alter_table(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: AlterTableStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Alter,
+        &Resource::Table(ks.to_string(), s.table.clone()),
+    )?;
+
+    let add_columns: Vec<ColumnMetadata> = s
+        .add_columns
+        .iter()
+        .map(|(name, type_name)| ColumnMetadata {
+            name: name.clone(),
+            kind: ColumnKind::Regular,
+            position: 0,
+            column_type: cql_type_name_to_string(type_name),
+            clustering_order: SchemaClusteringOrder::None,
+            mask: None,
+        })
+        .collect();
+
+    let updates = TableUpdates {
+        params: None,
+        add_columns,
+        drop_columns: s.drop_columns.clone(),
+    };
+
+    state.schema.alter_table(ks, &s.table, updates, ctx.auth)?;
+    Ok(result::encode_schema_change(
+        "UPDATED",
+        "TABLE",
+        &[ks, &s.table],
+    ))
+}
+
+fn route_drop_table(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: DropTableStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Drop,
+        &Resource::Table(ks.to_string(), s.table.clone()),
+    )?;
+
+    state.schema.drop_table(ks, &s.table, ctx.auth)?;
+    Ok(result::encode_schema_change(
+        "DROPPED",
+        "TABLE",
+        &[ks, &s.table],
+    ))
+}
+
+// ── DDL: Role ────────────────────────────────────────────────────────────
+
+fn route_create_role(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: CreateRoleStatement,
+) -> Result<BytesMut, CqlError> {
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Create, &Resource::AllRoles)?;
+
+    let role = RoleMetadata {
+        name: s.name.clone(),
+        is_superuser: s.superuser.unwrap_or(false),
+        can_login: s.login.unwrap_or(false),
+        salted_hash: None, // schema layer handles hashing
+        member_of: HashSet::new(),
+    };
+
+    state
+        .schema
+        .create_role(role, s.password.as_deref(), ctx.auth)?;
+    Ok(result::encode_void())
+}
+
+fn route_alter_role(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: AlterRoleStatement,
+) -> Result<BytesMut, CqlError> {
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Alter, &Resource::Role(s.name.clone()))?;
+
+    let updates = RoleUpdates {
+        is_superuser: s.superuser,
+        can_login: s.login,
+        password: s.password.clone(),
+        member_of: None,
+    };
+
+    state.schema.alter_role(&s.name, updates, ctx.auth)?;
+    Ok(result::encode_void())
+}
+
+fn route_drop_role(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: DropRoleStatement,
+) -> Result<BytesMut, CqlError> {
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Drop, &Resource::Role(s.name.clone()))?;
+
+    state.schema.drop_role(&s.name, ctx.auth)?;
+    Ok(result::encode_void())
+}
+
+// ── GRANT / REVOKE ───────────────────────────────────────────────────────
+
+fn route_grant(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: GrantStatement,
+) -> Result<BytesMut, CqlError> {
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Authorize,
+        &ast_resource_to_schema(&s.resource, ctx.current_keyspace)?,
+    )?;
+
+    let resource = ast_resource_to_schema(&s.resource, ctx.current_keyspace)?;
+    let perms = parse_permissions(&s.permissions)?;
+
+    state.schema.grant(&s.role, &resource, perms, ctx.auth)?;
+    Ok(result::encode_void())
+}
+
+fn route_revoke(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: RevokeStatement,
+) -> Result<BytesMut, CqlError> {
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Authorize,
+        &ast_resource_to_schema(&s.resource, ctx.current_keyspace)?,
+    )?;
+
+    let resource = ast_resource_to_schema(&s.resource, ctx.current_keyspace)?;
+    let perms = parse_permissions(&s.permissions)?;
+
+    state.schema.revoke(&s.role, &resource, perms, ctx.auth)?;
+    Ok(result::encode_void())
+}
+
+// ── TRUNCATE ─────────────────────────────────────────────────────────────
+
+fn route_truncate(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: TruncateStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Modify,
+        &Resource::Table(ks.to_string(), s.table.clone()),
+    )?;
+
+    // Truncation is a follow-on storage feature; return Void for now.
+    Ok(result::encode_void())
+}
+
+// ── Helper functions ─────────────────────────────────────────────────────
+
+/// Resolve an explicit keyspace or fall back to the session's current keyspace.
+fn resolve_keyspace<'a>(
+    explicit: &'a Option<String>,
+    current: &'a Option<String>,
+) -> Result<&'a str, CqlError> {
+    explicit
+        .as_deref()
+        .or(current.as_deref())
+        .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))
+}
+
+/// Build column names and types for a SELECT result.
+fn build_column_info(
+    table_meta: &TableMetadata,
+    select_columns: &[SelectColumn],
+) -> Result<(Vec<String>, Vec<CqlType>), CqlError> {
+    // Check for Star
+    let has_star = select_columns
+        .iter()
+        .any(|c| matches!(c, SelectColumn::Star));
+    if has_star {
+        // Return all columns
+        let names: Vec<String> = table_meta.columns.keys().cloned().collect();
+        let types: Vec<CqlType> = table_meta
+            .columns
+            .values()
+            .map(|c| bridge::parse_cql_type(&c.column_type))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok((names, types));
+    }
+
+    let mut names = Vec::new();
+    let mut types = Vec::new();
+    for sc in select_columns {
+        match sc {
+            SelectColumn::Star => unreachable!(),
+            SelectColumn::Column(name) => {
+                let col = table_meta
+                    .columns
+                    .get(name)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", name)))?;
+                names.push(name.clone());
+                types.push(bridge::parse_cql_type(&col.column_type)?);
+            }
+        }
+    }
+    Ok((names, types))
+}
+
+/// Extract partition key values from WHERE clauses, in PK column order.
+fn extract_pk_values(
+    where_clauses: &[WhereClause],
+    pk_names: &[String],
+    table_meta: &TableMetadata,
+) -> Result<Vec<CqlValue>, CqlError> {
+    let mut values = Vec::with_capacity(pk_names.len());
+    for pk_name in pk_names {
+        let wc = where_clauses
+            .iter()
+            .find(|w| w.column == *pk_name && w.op == ComparisonOp::Eq)
+            .ok_or_else(|| {
+                CqlError::Invalid(format!(
+                    "missing equality constraint on partition key column: {}",
+                    pk_name
+                ))
+            })?;
+        let col_meta = &table_meta.columns[pk_name];
+        let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+        let val = bridge::term_to_cql_value(&wc.value, &cql_type)?;
+        values.push(val);
+    }
+    Ok(values)
+}
+
+/// Project rows to a selected column subset.
+fn select_columns(
+    rows: &[Vec<Option<CqlValue>>],
+    all_names: &[String],
+    selected: &[String],
+) -> Vec<Vec<Option<CqlValue>>> {
+    // If selected == all_names, return as-is
+    if all_names == selected {
+        return rows.to_vec();
+    }
+    // Build index mapping
+    let indices: Vec<usize> = selected
+        .iter()
+        .filter_map(|name| all_names.iter().position(|n| n == name))
+        .collect();
+    rows.iter()
+        .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
+        .collect()
+}
+
+/// Convert an AST `GrantResource` to a schema `Resource`.
+fn ast_resource_to_schema(
+    resource: &GrantResource,
+    current_ks: &Option<String>,
+) -> Result<Resource, CqlError> {
+    match resource {
+        GrantResource::AllKeyspaces => Ok(Resource::AllKeyspaces),
+        GrantResource::Keyspace(ks) => Ok(Resource::Keyspace(ks.clone())),
+        GrantResource::Table(opt_ks, table) => {
+            let ks = opt_ks
+                .as_deref()
+                .or(current_ks.as_deref())
+                .ok_or_else(|| CqlError::Invalid("no keyspace specified for table".into()))?;
+            Ok(Resource::Table(ks.to_string(), table.clone()))
+        }
+        GrantResource::AllRoles => Ok(Resource::AllRoles),
+        GrantResource::Role(name) => Ok(Resource::Role(name.clone())),
+    }
+}
+
+/// Parse permission strings into a `HashSet<Permission>`.
+fn parse_permissions(perm_strings: &[String]) -> Result<HashSet<Permission>, CqlError> {
+    let mut perms = HashSet::new();
+    for s in perm_strings {
+        match s.to_uppercase().as_str() {
+            "ALL" | "ALL PERMISSIONS" => {
+                perms.insert(Permission::Create);
+                perms.insert(Permission::Alter);
+                perms.insert(Permission::Drop);
+                perms.insert(Permission::Select);
+                perms.insert(Permission::Modify);
+                perms.insert(Permission::Authorize);
+                perms.insert(Permission::Describe);
+                perms.insert(Permission::Execute);
+            }
+            "CREATE" => {
+                perms.insert(Permission::Create);
+            }
+            "ALTER" => {
+                perms.insert(Permission::Alter);
+            }
+            "DROP" => {
+                perms.insert(Permission::Drop);
+            }
+            "SELECT" => {
+                perms.insert(Permission::Select);
+            }
+            "MODIFY" => {
+                perms.insert(Permission::Modify);
+            }
+            "AUTHORIZE" => {
+                perms.insert(Permission::Authorize);
+            }
+            "DESCRIBE" => {
+                perms.insert(Permission::Describe);
+            }
+            "EXECUTE" => {
+                perms.insert(Permission::Execute);
+            }
+            _ => {
+                return Err(CqlError::Invalid(format!("unknown permission: {}", s)));
+            }
+        }
+    }
+    Ok(perms)
+}
+
+/// Convert an AST `CqlTypeName` to a column_type string for `ColumnMetadata`.
+fn cql_type_name_to_string(type_name: &CqlTypeName) -> String {
+    match type_name {
+        CqlTypeName::Simple(s) => s.clone(),
+        CqlTypeName::List(inner) => format!("list<{}>", cql_type_name_to_string(inner)),
+        CqlTypeName::Set(inner) => format!("set<{}>", cql_type_name_to_string(inner)),
+        CqlTypeName::Map(k, v) => format!(
+            "map<{}, {}>",
+            cql_type_name_to_string(k),
+            cql_type_name_to_string(v)
+        ),
+        CqlTypeName::Tuple(types) => {
+            let inner: Vec<String> = types.iter().map(cql_type_name_to_string).collect();
+            format!("tuple<{}>", inner.join(", "))
+        }
+        CqlTypeName::Frozen(inner) => format!("frozen<{}>", cql_type_name_to_string(inner)),
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrosa_schema::{
+        AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
+        RateLimitConfig, SchemaConfig, TestAuditSink,
+    };
+    use ferrosa_storage::{
+        CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
+    };
+    use tempfile::TempDir;
+
+    fn setup() -> (SharedState, TempDir) {
+        let dir = TempDir::new().unwrap();
+
+        let commit_log = CommitLogConfig {
+            segment_size: 4096,
+            max_segment_age: std::time::Duration::from_secs(60),
+            sync_strategy: SyncStrategyConfig::Batch,
+            log_dir: dir.path().join("commitlog"),
+            checkpoint_dir: dir.path().join("commitlog"),
+        };
+        let compaction = CompactionConfig::from_env(dir.path().join("compaction"));
+        let engine_config = StorageEngineConfig {
+            commit_log,
+            compaction,
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            flush_threshold_bytes: 4096,
+            data_dir: dir.path().to_path_buf(),
+        };
+        let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
+
+        let schema = Arc::new(
+            Schema::new(SchemaConfig {
+                hasher: PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: PasswordPolicy::permissive(),
+                auth_method: AuthMethod::Password,
+                rate_limit: RateLimitConfig::default(),
+                audit_sink: Box::new(TestAuditSink::new()),
+                secrets: Box::new(EnvSecretsProvider),
+                mode: DeploymentMode::Development,
+            })
+            .unwrap(),
+        );
+
+        let node_config = Arc::new(NodeConfig {
+            cluster_name: "test".into(),
+            data_center: "dc1".into(),
+            rack: "rack1".into(),
+            rpc_port: 9042,
+            host_id: uuid::Uuid::new_v4(),
+            listen_address: "127.0.0.1".parse().unwrap(),
+            listen_port: 7000,
+            broadcast_address: "127.0.0.1".parse().unwrap(),
+            broadcast_port: 7000,
+            rpc_address: "127.0.0.1".parse().unwrap(),
+            tokens: vec![],
+        });
+
+        let state = SharedState {
+            engine,
+            schema,
+            node_config,
+            cluster_state: Arc::new(SingleNodeClusterState),
+            prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
+        };
+        (state, dir)
+    }
+
+    fn dev_auth() -> AuthContext {
+        AuthContext {
+            role: "cassandra".into(),
+            is_superuser: true,
+            must_change_password: false,
+        }
+    }
+
+    #[test]
+    fn create_keyspace_then_table_then_insert_then_select() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // CREATE KEYSPACE
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).unwrap();
+        match &result {
+            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0005i32.to_be_bytes()),
+            _ => panic!("expected Result"),
+        }
+
+        // CREATE TABLE
+        let stmt =
+            crate::parser::parse("CREATE TABLE ks.users (id int PRIMARY KEY, name text)").unwrap();
+        let result = route(&state, &ctx, stmt).unwrap();
+        match &result {
+            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0005i32.to_be_bytes()),
+            _ => panic!("expected Result"),
+        }
+
+        // INSERT
+        let stmt =
+            crate::parser::parse("INSERT INTO ks.users (id, name) VALUES (1, 'alice')").unwrap();
+        let result = route(&state, &ctx, stmt).unwrap();
+        match &result {
+            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0001i32.to_be_bytes()),
+            _ => panic!("expected Result"),
+        }
+
+        // SELECT
+        let stmt = crate::parser::parse("SELECT * FROM ks.users WHERE id = 1").unwrap();
+        let result = route(&state, &ctx, stmt).unwrap();
+        match &result {
+            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[test]
+    fn use_sets_default_keyspace() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt = crate::parser::parse("USE my_ks").unwrap();
+        match route(&state, &ctx, stmt).unwrap() {
+            RouteResult::SetKeyspace(ks, body) => {
+                assert_eq!(ks, "my_ks");
+                assert_eq!(&body[0..4], &0x0003i32.to_be_bytes());
+            }
+            _ => panic!("expected SetKeyspace"),
+        }
+    }
+
+    #[test]
+    fn select_system_local() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
+        let result = route(&state, &ctx, stmt).unwrap();
+        match &result {
+            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[test]
+    fn no_keyspace_returns_invalid() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt = crate::parser::parse("SELECT * FROM users WHERE id = 1").unwrap();
+        assert!(route(&state, &ctx, stmt).is_err());
+    }
+
+    #[test]
+    fn batch_too_large_rejected() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        // Build a batch statement with > 500 entries programmatically
+        let stmts: Vec<Statement> = (0..501)
+            .map(|i| {
+                Statement::Insert(InsertStatement {
+                    keyspace: Some("ks".into()),
+                    table: "t".into(),
+                    columns: vec!["k".into()],
+                    values: vec![Term::IntegerLiteral(i)],
+                    if_not_exists: false,
+                    using_timestamp: None,
+                    using_ttl: None,
+                })
+            })
+            .collect();
+        let batch = Statement::Batch(BatchStatement {
+            batch_type: BatchType::Unlogged,
+            statements: stmts,
+            using_timestamp: None,
+        });
+        assert!(route(&state, &ctx, batch).is_err());
+    }
+
+    #[test]
+    fn select_system_peers_empty() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system.peers").unwrap();
+        let result = route(&state, &ctx, stmt).unwrap();
+        match &result {
+            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[test]
+    fn select_system_schema_keyspaces() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system_schema.keyspaces").unwrap();
+        let result = route(&state, &ctx, stmt).unwrap();
+        match &result {
+            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[test]
+    fn cql_type_name_to_string_simple() {
+        assert_eq!(
+            cql_type_name_to_string(&CqlTypeName::Simple("text".into())),
+            "text"
+        );
+    }
+
+    #[test]
+    fn cql_type_name_to_string_collection() {
+        assert_eq!(
+            cql_type_name_to_string(&CqlTypeName::Map(
+                Box::new(CqlTypeName::Simple("text".into())),
+                Box::new(CqlTypeName::Simple("int".into())),
+            )),
+            "map<text, int>"
+        );
+    }
+
+    #[test]
+    fn parse_permissions_all() {
+        let perms = parse_permissions(&["ALL".into()]).unwrap();
+        assert!(perms.contains(&Permission::Select));
+        assert!(perms.contains(&Permission::Modify));
+        assert!(perms.contains(&Permission::Create));
+        assert!(perms.contains(&Permission::Drop));
+        assert!(perms.contains(&Permission::Alter));
+        assert!(perms.contains(&Permission::Authorize));
+    }
+
+    #[test]
+    fn parse_permissions_single() {
+        let perms = parse_permissions(&["SELECT".into()]).unwrap();
+        assert_eq!(perms.len(), 1);
+        assert!(perms.contains(&Permission::Select));
+    }
+
+    #[test]
+    fn parse_permissions_unknown_rejected() {
+        assert!(parse_permissions(&["BANANA".into()]).is_err());
+    }
+
+    #[test]
+    fn truncate_returns_void() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+        };
+
+        // Create keyspace and table first
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY)").unwrap();
+        route(&state, &ctx, stmt).unwrap();
+
+        let stmt = crate::parser::parse("TRUNCATE ks.t").unwrap();
+        let result = route(&state, &ctx, stmt).unwrap();
+        match &result {
+            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0001i32.to_be_bytes()),
+            _ => panic!("expected Result"),
+        }
+    }
+}

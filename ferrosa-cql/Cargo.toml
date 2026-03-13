@@ -7,19 +7,22 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+arc-swap = "1.7"
+bytes = "1"
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-schema = { path = "../ferrosa-schema" }
+ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-storage = { path = "../ferrosa-storage" }
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec"] }
-bytes = "1"
 futures = "0.3"
-arc-swap = "1.7"
-uuid = { version = "1", features = ["v4"] }
+indexmap = "2"
+md-5 = "0.10"
+moka = { version = "0.12", features = ["sync"] }
 num-bigint = "0.4"
 phf = { version = "0.11", features = ["macros"] }
-md-5 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 proptest = "1"

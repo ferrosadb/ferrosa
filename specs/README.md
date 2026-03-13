@@ -10,9 +10,10 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 |-------|--------|
 | ferrosa-common | Done |
 | ferrosa-sstable | Done |
-| ferrosa-storage | Not started |
-| ferrosa-schema | Not started |
-| ferrosa-cql | Not started |
+| ferrosa-storage | Done (core engine; follow-on items tracked) |
+| ferrosa-schema | Done |
+| ferrosa-cql | In progress (Part A: protocol + types + auth) |
+| ferrosa-graph | In progress (Cypher parser) |
 | ferrosa-net | Not started |
 | ferrosa-cluster | Not started |
 | ferrosa (binary) | Not started |
@@ -27,7 +28,8 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [SSTable](sstable.md) | BTI format, trie encoding, I/O traits, compression, public API | Approved |
 | [Storage](storage.md) | Storage engine: memtable, flush, merge, commit log, compaction, S3 upload, cache, engine composition | Approved |
 | [Testing](testing.md) | Test infrastructure, suites, performance regression detection | Approved |
-| [Schema](schema.md) | Schema management: metadata types, registry, auth, system keyspaces | Draft |
+| [CQL](cql.md) | CQL native protocol v5, parser, query routing, prepared cache | Approved |
+| [Schema](schema.md) | Schema management: metadata types, registry, auth, system keyspaces | Approved |
 | [Threat Model](threat-model.md) | STRIDE threat analysis: trust boundaries, threat inventory, mitigations | Draft |
 
 ## Architecture Decision Records
@@ -49,4 +51,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 
 - [README](../README.md) — project introduction
 - [SSTable Design](../docs/superpowers/specs/2026-03-11-ferrosa-sstable-design.md) — implementation design for ferrosa-sstable
+- [Storage Design](../docs/superpowers/specs/2026-03-11-ferrosa-storage-design.md) — implementation design for ferrosa-storage
+- [Schema Design](../docs/superpowers/specs/2026-03-12-ferrosa-schema-design.md) — implementation design for ferrosa-schema
 - [CQL Design](../docs/superpowers/specs/2026-03-12-ferrosa-cql-design.md) — implementation design for ferrosa-cql
+- [Graph Design](../docs/superpowers/specs/2026-03-12-ferrosa-graph-design.md) — implementation design for ferrosa-graph
