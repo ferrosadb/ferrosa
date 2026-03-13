@@ -8,6 +8,9 @@
 //! 5. Wait for shutdown signal
 //! 6. Graceful shutdown
 
+#[allow(dead_code)]
+mod web;
+
 use std::sync::Arc;
 
 #[tokio::main]
