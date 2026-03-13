@@ -4,6 +4,12 @@
 //! Collection types (list, map, set) carry their element type IDs inline.
 //! `CqlValue` is the runtime representation used throughout query execution.
 
+use std::net::IpAddr;
+
+use num_bigint::BigInt;
+
+use crate::error::CqlError;
+
 /// CQL data type with protocol type ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CqlType {
@@ -66,9 +72,275 @@ impl CqlType {
     }
 }
 
+/// A CQL value at runtime.
+///
+/// Covers all scalar and collection types. Float/Double store raw bits
+/// as u32/u64 so `Eq` can be derived. `Ord` is implemented manually
+/// using `f32::total_cmp`/`f64::total_cmp` for IEEE 754 total ordering.
+///
+/// Note: `Null` is signaled out-of-band via the CQL wire protocol
+/// length prefix (-1). `encode_value` for `Null` returns an empty vec;
+/// callers are responsible for writing the -1 length prefix when encoding
+/// a null cell. `decode_value` is never called for null (the caller
+/// checks the length prefix first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CqlValue {
+    Null,
+    Ascii(String),
+    Bigint(i64),
+    Blob(Vec<u8>),
+    Boolean(bool),
+    Counter(i64),
+    Decimal { scale: i32, unscaled: BigInt },
+    Double(u64), // f64 bits for Eq/Ord
+    Float(u32),  // f32 bits for Eq/Ord
+    Int(i32),
+    Timestamp(i64),
+    Uuid(uuid::Uuid),
+    Text(String), // varchar
+    Varint(BigInt),
+    Timeuuid(uuid::Uuid),
+    Inet(IpAddr),
+    Date(u32),
+    Time(i64),
+    Smallint(i16),
+    Tinyint(i8),
+}
+
+impl PartialOrd for CqlValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CqlValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let d_self = std::mem::discriminant(self);
+        let d_other = std::mem::discriminant(other);
+        if d_self != d_other {
+            return self.discriminant_index().cmp(&other.discriminant_index());
+        }
+        match (self, other) {
+            (Self::Null, Self::Null) => Ordering::Equal,
+            (Self::Ascii(a), Self::Ascii(b)) | (Self::Text(a), Self::Text(b)) => a.cmp(b),
+            (Self::Bigint(a), Self::Bigint(b))
+            | (Self::Counter(a), Self::Counter(b))
+            | (Self::Timestamp(a), Self::Timestamp(b))
+            | (Self::Time(a), Self::Time(b)) => a.cmp(b),
+            (Self::Int(a), Self::Int(b)) => a.cmp(b),
+            (Self::Smallint(a), Self::Smallint(b)) => a.cmp(b),
+            (Self::Tinyint(a), Self::Tinyint(b)) => a.cmp(b),
+            (Self::Boolean(a), Self::Boolean(b)) => a.cmp(b),
+            (Self::Float(a), Self::Float(b)) => f32::from_bits(*a).total_cmp(&f32::from_bits(*b)),
+            (Self::Double(a), Self::Double(b)) => f64::from_bits(*a).total_cmp(&f64::from_bits(*b)),
+            (Self::Blob(a), Self::Blob(b)) => a.cmp(b),
+            (Self::Uuid(a), Self::Uuid(b)) | (Self::Timeuuid(a), Self::Timeuuid(b)) => a.cmp(b),
+            (Self::Inet(a), Self::Inet(b)) => a.to_string().cmp(&b.to_string()),
+            (Self::Date(a), Self::Date(b)) => a.cmp(b),
+            (Self::Varint(a), Self::Varint(b)) => a.cmp(b),
+            (
+                Self::Decimal {
+                    scale: sa,
+                    unscaled: ua,
+                },
+                Self::Decimal {
+                    scale: sb,
+                    unscaled: ub,
+                },
+            ) => sa.cmp(sb).then_with(|| ua.cmp(ub)),
+            _ => Ordering::Equal, // same discriminant, unreachable
+        }
+    }
+}
+
+impl CqlValue {
+    /// Discriminant index for cross-type ordering.
+    fn discriminant_index(&self) -> u8 {
+        match self {
+            Self::Null => 0,
+            Self::Ascii(_) => 1,
+            Self::Bigint(_) => 2,
+            Self::Blob(_) => 3,
+            Self::Boolean(_) => 4,
+            Self::Counter(_) => 5,
+            Self::Decimal { .. } => 6,
+            Self::Double(_) => 7,
+            Self::Float(_) => 8,
+            Self::Int(_) => 9,
+            Self::Timestamp(_) => 10,
+            Self::Uuid(_) => 11,
+            Self::Text(_) => 12,
+            Self::Varint(_) => 13,
+            Self::Timeuuid(_) => 14,
+            Self::Inet(_) => 15,
+            Self::Date(_) => 16,
+            Self::Time(_) => 17,
+            Self::Smallint(_) => 18,
+            Self::Tinyint(_) => 19,
+        }
+    }
+
+    /// Encode this value as CQL wire-format bytes (no length prefix).
+    pub fn encode_value(&self) -> Vec<u8> {
+        match self {
+            Self::Ascii(s) | Self::Text(s) => s.as_bytes().to_vec(),
+            Self::Bigint(n) | Self::Counter(n) | Self::Timestamp(n) => n.to_be_bytes().to_vec(),
+            Self::Blob(b) => b.clone(),
+            Self::Boolean(b) => vec![if *b { 1 } else { 0 }],
+            Self::Decimal { scale, unscaled } => {
+                let mut buf = scale.to_be_bytes().to_vec();
+                buf.extend_from_slice(&unscaled.to_signed_bytes_be());
+                buf
+            }
+            Self::Double(bits) => bits.to_be_bytes().to_vec(),
+            Self::Float(bits) => bits.to_be_bytes().to_vec(),
+            Self::Int(n) => n.to_be_bytes().to_vec(),
+            Self::Uuid(u) | Self::Timeuuid(u) => u.as_bytes().to_vec(),
+            Self::Varint(n) => n.to_signed_bytes_be(),
+            Self::Inet(ip) => match ip {
+                IpAddr::V4(v4) => v4.octets().to_vec(),
+                IpAddr::V6(v6) => v6.octets().to_vec(),
+            },
+            Self::Date(d) => d.to_be_bytes().to_vec(),
+            Self::Time(t) => t.to_be_bytes().to_vec(),
+            Self::Smallint(n) => n.to_be_bytes().to_vec(),
+            Self::Tinyint(n) => n.to_be_bytes().to_vec(),
+            Self::Null => vec![],
+        }
+    }
+
+    /// Decode a value from CQL wire-format bytes given its type.
+    pub fn decode_value(cql_type: &CqlType, bytes: &[u8]) -> Result<Self, CqlError> {
+        match cql_type {
+            CqlType::Ascii => Ok(Self::Ascii(
+                String::from_utf8(bytes.to_vec())
+                    .map_err(|e| CqlError::Invalid(format!("invalid ASCII: {e}")))?,
+            )),
+            CqlType::Varchar => Ok(Self::Text(
+                String::from_utf8(bytes.to_vec())
+                    .map_err(|e| CqlError::Invalid(format!("invalid UTF-8: {e}")))?,
+            )),
+            CqlType::Bigint => {
+                let arr: [u8; 8] = bytes
+                    .try_into()
+                    .map_err(|_| CqlError::Invalid("bigint requires 8 bytes".into()))?;
+                Ok(Self::Bigint(i64::from_be_bytes(arr)))
+            }
+            CqlType::Counter => {
+                let arr: [u8; 8] = bytes
+                    .try_into()
+                    .map_err(|_| CqlError::Invalid("counter requires 8 bytes".into()))?;
+                Ok(Self::Counter(i64::from_be_bytes(arr)))
+            }
+            CqlType::Blob => Ok(Self::Blob(bytes.to_vec())),
+            CqlType::Boolean => {
+                if bytes.len() != 1 {
+                    return Err(CqlError::Invalid("boolean requires 1 byte".into()));
+                }
+                Ok(Self::Boolean(bytes[0] != 0))
+            }
+            CqlType::Double => {
+                let arr: [u8; 8] = bytes
+                    .try_into()
+                    .map_err(|_| CqlError::Invalid("double requires 8 bytes".into()))?;
+                Ok(Self::Double(u64::from_be_bytes(arr)))
+            }
+            CqlType::Float => {
+                let arr: [u8; 4] = bytes
+                    .try_into()
+                    .map_err(|_| CqlError::Invalid("float requires 4 bytes".into()))?;
+                Ok(Self::Float(u32::from_be_bytes(arr)))
+            }
+            CqlType::Int => {
+                let arr: [u8; 4] = bytes
+                    .try_into()
+                    .map_err(|_| CqlError::Invalid("int requires 4 bytes".into()))?;
+                Ok(Self::Int(i32::from_be_bytes(arr)))
+            }
+            CqlType::Timestamp => {
+                let arr: [u8; 8] = bytes
+                    .try_into()
+                    .map_err(|_| CqlError::Invalid("timestamp requires 8 bytes".into()))?;
+                Ok(Self::Timestamp(i64::from_be_bytes(arr)))
+            }
+            CqlType::Uuid => {
+                if bytes.len() != 16 {
+                    return Err(CqlError::Invalid("uuid requires 16 bytes".into()));
+                }
+                Ok(Self::Uuid(uuid::Uuid::from_slice(bytes).map_err(|e| {
+                    CqlError::Invalid(format!("invalid uuid: {e}"))
+                })?))
+            }
+            CqlType::Timeuuid => {
+                if bytes.len() != 16 {
+                    return Err(CqlError::Invalid("timeuuid requires 16 bytes".into()));
+                }
+                Ok(Self::Timeuuid(uuid::Uuid::from_slice(bytes).map_err(
+                    |e| CqlError::Invalid(format!("invalid timeuuid: {e}")),
+                )?))
+            }
+            CqlType::Inet => match bytes.len() {
+                4 => {
+                    let arr: [u8; 4] = bytes.try_into().unwrap();
+                    Ok(Self::Inet(IpAddr::V4(arr.into())))
+                }
+                16 => {
+                    let arr: [u8; 16] = bytes.try_into().unwrap();
+                    Ok(Self::Inet(IpAddr::V6(arr.into())))
+                }
+                n => Err(CqlError::Invalid(format!(
+                    "inet requires 4 or 16 bytes, got {n}"
+                ))),
+            },
+            CqlType::Date => {
+                let arr: [u8; 4] = bytes
+                    .try_into()
+                    .map_err(|_| CqlError::Invalid("date requires 4 bytes".into()))?;
+                Ok(Self::Date(u32::from_be_bytes(arr)))
+            }
+            CqlType::Time => {
+                let arr: [u8; 8] = bytes
+                    .try_into()
+                    .map_err(|_| CqlError::Invalid("time requires 8 bytes".into()))?;
+                Ok(Self::Time(i64::from_be_bytes(arr)))
+            }
+            CqlType::Smallint => {
+                let arr: [u8; 2] = bytes
+                    .try_into()
+                    .map_err(|_| CqlError::Invalid("smallint requires 2 bytes".into()))?;
+                Ok(Self::Smallint(i16::from_be_bytes(arr)))
+            }
+            CqlType::Tinyint => {
+                if bytes.len() != 1 {
+                    return Err(CqlError::Invalid("tinyint requires 1 byte".into()));
+                }
+                Ok(Self::Tinyint(bytes[0] as i8))
+            }
+            CqlType::Varint => Ok(Self::Varint(BigInt::from_signed_bytes_be(bytes))),
+            CqlType::Decimal => {
+                if bytes.len() < 4 {
+                    return Err(CqlError::Invalid(
+                        "decimal requires at least 4 bytes".into(),
+                    ));
+                }
+                let scale = i32::from_be_bytes(bytes[..4].try_into().unwrap());
+                let unscaled = BigInt::from_signed_bytes_be(&bytes[4..]);
+                Ok(Self::Decimal { scale, unscaled })
+            }
+            _ => Err(CqlError::Invalid(format!(
+                "unsupported type for decode: {:?}",
+                cql_type
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // === Task 5: CqlType tests ===
 
     #[test]
     fn type_id_roundtrip() {
@@ -117,5 +389,206 @@ mod tests {
             0x0021
         );
         assert_eq!(CqlType::Set(Box::new(CqlType::Uuid)).type_id(), 0x0022);
+    }
+
+    // === Task 6: CqlValue scalar encode/decode tests ===
+
+    #[test]
+    fn encode_decode_int() {
+        let val = CqlValue::Int(42);
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Int, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_bigint() {
+        let val = CqlValue::Bigint(i64::MAX);
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Bigint, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_text() {
+        let val = CqlValue::Text("hello world".to_string());
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Varchar, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_boolean_true() {
+        let val = CqlValue::Boolean(true);
+        let bytes = val.encode_value();
+        assert_eq!(bytes, vec![1]);
+        let decoded = CqlValue::decode_value(&CqlType::Boolean, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_boolean_false() {
+        let val = CqlValue::Boolean(false);
+        let bytes = val.encode_value();
+        assert_eq!(bytes, vec![0]);
+    }
+
+    #[test]
+    fn encode_decode_float() {
+        let val = CqlValue::Float(3.14f32.to_bits());
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Float, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_double() {
+        let val = CqlValue::Double(std::f64::consts::PI.to_bits());
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Double, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_uuid() {
+        let id = uuid::Uuid::new_v4();
+        let val = CqlValue::Uuid(id);
+        let bytes = val.encode_value();
+        assert_eq!(bytes.len(), 16);
+        let decoded = CqlValue::decode_value(&CqlType::Uuid, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_blob() {
+        let val = CqlValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Blob, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_inet_v4() {
+        let val = CqlValue::Inet(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+        let bytes = val.encode_value();
+        assert_eq!(bytes.len(), 4);
+        let decoded = CqlValue::decode_value(&CqlType::Inet, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_inet_v6() {
+        let val = CqlValue::Inet(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        let bytes = val.encode_value();
+        assert_eq!(bytes.len(), 16);
+        let decoded = CqlValue::decode_value(&CqlType::Inet, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_smallint() {
+        let val = CqlValue::Smallint(-1234);
+        let bytes = val.encode_value();
+        assert_eq!(bytes.len(), 2);
+        let decoded = CqlValue::decode_value(&CqlType::Smallint, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_tinyint() {
+        let val = CqlValue::Tinyint(-42);
+        let bytes = val.encode_value();
+        assert_eq!(bytes.len(), 1);
+        let decoded = CqlValue::decode_value(&CqlType::Tinyint, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_date() {
+        let val = CqlValue::Date(19000);
+        let bytes = val.encode_value();
+        assert_eq!(bytes.len(), 4);
+        let decoded = CqlValue::decode_value(&CqlType::Date, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_time() {
+        let nanos: i64 = 12 * 3_600_000_000_000 + 30 * 60_000_000_000;
+        let val = CqlValue::Time(nanos);
+        let bytes = val.encode_value();
+        assert_eq!(bytes.len(), 8);
+        let decoded = CqlValue::decode_value(&CqlType::Time, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_timestamp() {
+        let val = CqlValue::Timestamp(1_710_000_000_000);
+        let bytes = val.encode_value();
+        assert_eq!(bytes.len(), 8);
+        let decoded = CqlValue::decode_value(&CqlType::Timestamp, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_varint() {
+        let val = CqlValue::Varint(BigInt::from(123_456_789i64));
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Varint, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_varint_negative() {
+        let val = CqlValue::Varint(BigInt::from(-1i64));
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Varint, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_decimal() {
+        let val = CqlValue::Decimal {
+            scale: 2,
+            unscaled: BigInt::from(12345i64),
+        };
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Decimal, &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_ascii() {
+        let val = CqlValue::Ascii("hello".into());
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Ascii, &bytes).unwrap();
+        assert_eq!(decoded, val);
+        assert!(matches!(decoded, CqlValue::Ascii(_)));
+    }
+
+    #[test]
+    fn encode_decode_counter() {
+        let val = CqlValue::Counter(42);
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Counter, &bytes).unwrap();
+        assert_eq!(decoded, val);
+        assert!(matches!(decoded, CqlValue::Counter(_)));
+    }
+
+    #[test]
+    fn encode_decode_timeuuid() {
+        let val = CqlValue::Timeuuid(uuid::Uuid::new_v4());
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Timeuuid, &bytes).unwrap();
+        assert_eq!(decoded, val);
+        assert!(matches!(decoded, CqlValue::Timeuuid(_)));
+    }
+
+    #[test]
+    fn float_ord_uses_total_ordering() {
+        let neg = CqlValue::Float((-1.0f32).to_bits());
+        let pos = CqlValue::Float(1.0f32.to_bits());
+        assert!(neg < pos);
     }
 }
