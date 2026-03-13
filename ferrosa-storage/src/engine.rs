@@ -266,6 +266,21 @@ impl StorageEngine {
         }
     }
 
+    /// Reads partitions from a table in token order with optional bounds and limit.
+    pub fn read_range(
+        &self,
+        table_id: &TableId,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        limit: usize,
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.read_range(start, end, limit),
+            None => Ok(vec![]),
+        }
+    }
+
     /// Flushes the active memtable for a table to an SSTable on disk.
     ///
     /// After flushing, checks if compaction is needed and submits tasks
@@ -633,6 +648,29 @@ mod tests {
 
         let mutations: Vec<(DecoratedKey, Row, i64)> = vec![];
         engine.batch_write(&table_id(), mutations).unwrap();
+    }
+
+    #[test]
+    fn engine_read_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+        for i in 0..5 {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"v", 1000),
+                    1000,
+                )
+                .unwrap();
+        }
+
+        let results = engine.read_range(&tid, None, None, 100).unwrap();
+        assert_eq!(results.len(), 5);
     }
 
     #[test]
