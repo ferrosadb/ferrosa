@@ -1,249 +1,341 @@
-//! Statistics.db reader and writer.
+//! Statistics.db reader and writer for Cassandra BTI SSTables.
 //!
-//! Contains four metadata components, each CRC32-checksummed:
-//! 0: ValidationMetadata (partitioner, bloom FP rate)
-//! 1: CompactionMetadata (HyperLogLogPlus cardinality)
-//! 2: StatsMetadata (timestamps, sizes, histograms)
-//! 3: SerializationHeader (column definitions, delta-encoding minimums)
+//! The Statistics.db file contains four CRC32-checksummed components:
 //!
-//! # File Format
+//! | Ordinal | Name                   | Description                                     |
+//! |---------|------------------------|-------------------------------------------------|
+//! | 0       | ValidationMetadata     | Partitioner class name + Bloom filter FP chance  |
+//! | 1       | CompactionMetadata     | HyperLogLogPlus cardinality estimate (opaque)    |
+//! | 2       | StatsMetadata          | Timestamps, sizes, histograms (opaque for now)   |
+//! | 3       | SerializationHeader    | Column definitions for Data.db delta decoding    |
+//!
+//! # File layout
 //!
 //! ```text
-//! [component_count: u32]
-//! For each component:
-//!   [ordinal: u32] [data_length: u32] [data: data_length bytes] [crc: u32]
+//! [i32 component_count]
+//! [i32 ordinal, i32 offset] * component_count   // TOC
+//! [component data]                                // concatenated
+//! [u32 crc32] * component_count                   // one per component
 //! ```
 //!
-//! Reference: `org.apache.cassandra.io.sstable.metadata.MetadataSerializer`
+//! The CRC32 checksum for each component covers that component's serialized bytes.
 
 use ferrosa_common::{Error, Result};
 
 use crate::varint;
 
-/// Parsed Statistics.db file.
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// All four components of a Statistics.db file.
 #[derive(Debug, Clone)]
 pub struct Statistics {
-    /// Validation metadata (partitioner + bloom filter settings).
     pub validation: ValidationMetadata,
-    /// Opaque CompactionMetadata (HyperLogLogPlus cardinality estimator).
-    pub compaction: Vec<u8>,
-    /// Opaque StatsMetadata (timestamps, sizes, histograms).
-    pub stats: Vec<u8>,
-    /// Serialization header required for decoding Data.db.
+    pub compaction: CompactionMetadata,
+    pub stats: StatsMetadata,
     pub header: SerializationHeader,
 }
 
-/// Validation metadata (partitioner + bloom filter settings).
+/// Ordinal 0 — partitioner class name and Bloom filter false-positive chance.
 #[derive(Debug, Clone)]
 pub struct ValidationMetadata {
-    /// Fully-qualified partitioner class name.
-    pub partitioner: String,
-    /// Bloom filter false-positive chance.
+    /// Fully-qualified Java class name, e.g.
+    /// `"org.apache.cassandra.dht.Murmur3Partitioner"`.
+    pub partitioner_class: String,
+    /// Bloom filter false-positive chance, typically 0.01.
     pub bloom_fp_chance: f64,
 }
 
-/// Serialization header from Statistics.db.
-///
-/// Required for decoding Data.db — provides the delta-encoding minimums
-/// and column type definitions.
+/// Ordinal 1 — HyperLogLogPlus cardinality estimate (stored as opaque bytes).
+#[derive(Debug, Clone)]
+pub struct CompactionMetadata {
+    pub data: Vec<u8>,
+}
+
+/// Ordinal 2 — aggregate statistics (stored as opaque bytes for now).
+#[derive(Debug, Clone)]
+pub struct StatsMetadata {
+    pub data: Vec<u8>,
+}
+
+/// Ordinal 3 — column definitions needed for Data.db delta decoding.
 #[derive(Debug, Clone)]
 pub struct SerializationHeader {
-    /// Minimum timestamp (varint-encoded in file).
     pub min_timestamp: i64,
-    /// Minimum local deletion time (varint-encoded in file).
     pub min_local_deletion_time: i32,
-    /// Minimum TTL (varint-encoded in file).
     pub min_ttl: i32,
-    /// Key type as a Cassandra type string (e.g. "org.apache.cassandra.db.marshal.UTF8Type").
+    /// CQL type of the partition key, e.g. `"org.apache.cassandra.db.marshal.UTF8Type"`.
     pub key_type: String,
-    /// Clustering column types.
+    /// CQL types of the clustering columns.
     pub clustering_types: Vec<String>,
-    /// Static columns as (name_bytes, type_string) pairs.
+    /// Static columns: (name bytes, CQL type string).
     pub static_columns: Vec<(Vec<u8>, String)>,
-    /// Regular columns as (name_bytes, type_string) pairs.
+    /// Regular columns: (name bytes, CQL type string).
     pub regular_columns: Vec<(Vec<u8>, String)>,
 }
 
-/// Component ordinals in Statistics.db.
-const VALIDATION_ORDINAL: u32 = 0;
-const COMPACTION_ORDINAL: u32 = 1;
-const STATS_ORDINAL: u32 = 2;
-const HEADER_ORDINAL: u32 = 3;
-
 // ---------------------------------------------------------------------------
-// Top-level read/write
+// Top-level read / write
 // ---------------------------------------------------------------------------
 
-/// Read a Statistics.db file from raw bytes.
+/// Deserialize a complete Statistics.db file from `data`.
+///
+/// Cassandra's Statistics.db layout has inline CRC32 checksums:
+///
+/// ```text
+/// [i32 component_count]
+/// [i32 CRC of count]
+/// [toc: (i32 ordinal, i32 offset) * component_count]
+/// [i32 CRC of TOC]
+/// [component_0 bytes] [i32 CRC]
+/// [component_1 bytes] [i32 CRC]
+/// ...
+/// ```
+///
+/// Offsets in the TOC are relative to the first component byte (after the
+/// TOC CRC). Each component's CRC follows its data inline.
 pub fn read_statistics(data: &[u8]) -> Result<Statistics> {
-    let mut pos = 0;
+    if data.len() < 8 {
+        return Err(Error::InvalidFormat(
+            "Statistics.db too short for component count + CRC".into(),
+        ));
+    }
 
-    let component_count = read_u32(data, &mut pos)? as usize;
+    let component_count = i32_be(data, 0) as usize;
     if component_count != 4 {
         return Err(Error::InvalidFormat(format!(
-            "expected 4 statistics components, got {component_count}"
+            "expected 4 components, got {component_count}"
         )));
     }
 
-    let mut validation: Option<ValidationMetadata> = None;
-    let mut compaction: Option<Vec<u8>> = None;
-    let mut stats: Option<Vec<u8>> = None;
-    let mut header: Option<SerializationHeader> = None;
+    // Verify CRC of component count.
+    let count_crc_expected = u32_be(data, 4);
+    let count_crc_actual = crc32_of_i32(component_count as i32);
+    if count_crc_expected != count_crc_actual {
+        return Err(Error::ChecksumMismatch {
+            expected: count_crc_expected,
+            actual: count_crc_actual,
+        });
+    }
 
-    for _ in 0..component_count {
-        let ordinal = read_u32(data, &mut pos)?;
-        let data_length = read_u32(data, &mut pos)? as usize;
+    // TOC: component_count * (ordinal i32, offset i32), starting at byte 8.
+    let toc_size = component_count * 8;
+    let toc_start = 8;
+    let toc_end = toc_start + toc_size;
+    if data.len() < toc_end + 4 {
+        return Err(Error::InvalidFormat(
+            "Statistics.db too short for TOC + CRC".into(),
+        ));
+    }
 
-        if pos + data_length + 4 > data.len() {
-            return Err(Error::InvalidData(format!(
-                "component {ordinal}: need {} bytes at offset {pos}, only {} available",
-                data_length + 4,
-                data.len() - pos
+    // Verify CRC of TOC — Cassandra uses a cumulative CRC: the CRC32 object
+    // is NOT reset after writing the count CRC, so the TOC CRC covers
+    // count bytes + TOC bytes (skipping the count CRC itself).
+    let toc_crc_expected = u32_be(data, toc_end);
+    let toc_crc_actual = {
+        let mut h = crc32fast::Hasher::new();
+        h.update(&data[0..4]); // count bytes
+        h.update(&data[toc_start..toc_end]); // TOC bytes
+        h.finalize()
+    };
+    if toc_crc_expected != toc_crc_actual {
+        return Err(Error::ChecksumMismatch {
+            expected: toc_crc_expected,
+            actual: toc_crc_actual,
+        });
+    }
+
+    // Parse TOC entries and sort by ordinal.
+    let mut toc: Vec<(i32, i32)> = Vec::with_capacity(component_count);
+    for i in 0..component_count {
+        let base = toc_start + i * 8;
+        let ordinal = i32_be(data, base);
+        let offset = i32_be(data, base + 4);
+        toc.push((ordinal, offset));
+    }
+    toc.sort_by_key(|&(ord, _)| ord);
+
+    // Offsets in the TOC are absolute positions within the file.
+    // Each component's data ends 4 bytes before the next component starts
+    // (the 4-byte inline CRC).
+    let mut components: Vec<(i32, &[u8])> = Vec::with_capacity(component_count);
+    for (idx, &(ordinal, offset)) in toc.iter().enumerate() {
+        let comp_start = offset as usize;
+        let comp_end = if idx + 1 < component_count {
+            toc[idx + 1].1 as usize - 4
+        } else {
+            data.len() - 4
+        };
+        if comp_start > comp_end || comp_end > data.len() {
+            return Err(Error::InvalidFormat(format!(
+                "component {ordinal} has invalid range {comp_start}..{comp_end}"
             )));
         }
+        let comp_data = &data[comp_start..comp_end];
 
-        let component_data = &data[pos..pos + data_length];
-        pos += data_length;
-
-        let stored_crc = read_u32(data, &mut pos)?;
-        let computed_crc = crc32fast::hash(component_data);
-        if stored_crc != computed_crc {
+        // CRC follows inline after the component data.
+        let expected_crc = u32_be(data, comp_end);
+        let actual_crc = crc32fast::hash(comp_data);
+        if expected_crc != actual_crc {
             return Err(Error::ChecksumMismatch {
-                expected: stored_crc,
-                actual: computed_crc,
+                expected: expected_crc,
+                actual: actual_crc,
             });
         }
 
-        match ordinal {
-            VALIDATION_ORDINAL => {
-                validation = Some(read_validation_metadata(component_data)?);
-            }
-            COMPACTION_ORDINAL => {
-                compaction = Some(component_data.to_vec());
-            }
-            STATS_ORDINAL => {
-                stats = Some(component_data.to_vec());
-            }
-            HEADER_ORDINAL => {
-                header = Some(read_serialization_header(component_data)?);
-            }
-            _ => {
-                // Unknown component — skip silently for forward compatibility.
-            }
-        }
+        components.push((ordinal, comp_data));
     }
 
+    // Extract each component by ordinal.
+    let find = |ord: i32| -> Result<&[u8]> {
+        components
+            .iter()
+            .find(|&&(o, _)| o == ord)
+            .map(|&(_, d)| d)
+            .ok_or_else(|| Error::InvalidFormat(format!("missing component ordinal {ord}")))
+    };
+
+    let validation = read_validation_metadata(find(0)?)?;
+    let compaction = CompactionMetadata {
+        data: find(1)?.to_vec(),
+    };
+    let stats = StatsMetadata {
+        data: find(2)?.to_vec(),
+    };
+    let header = read_serialization_header(find(3)?)?;
+
     Ok(Statistics {
-        validation: validation
-            .ok_or_else(|| Error::InvalidFormat("missing ValidationMetadata".into()))?,
-        compaction: compaction
-            .ok_or_else(|| Error::InvalidFormat("missing CompactionMetadata".into()))?,
-        stats: stats.ok_or_else(|| Error::InvalidFormat("missing StatsMetadata".into()))?,
-        header: header.ok_or_else(|| Error::InvalidFormat("missing SerializationHeader".into()))?,
+        validation,
+        compaction,
+        stats,
+        header,
     })
 }
 
-/// Write a Statistics.db file to bytes.
+/// Serialize a `Statistics` into the Statistics.db binary format.
+///
+/// Produces the Cassandra-compatible layout with inline CRC32 checksums.
 pub fn write_statistics(stats: &Statistics) -> Vec<u8> {
+    // Serialize each component.
+    let comp0 = write_validation_metadata(&stats.validation);
+    let comp1 = stats.compaction.data.clone();
+    let comp2 = stats.stats.data.clone();
+    let comp3 = write_serialization_header(&stats.header);
+
+    let components: [(i32, &[u8]); 4] = [(0, &comp0), (1, &comp1), (2, &comp2), (3, &comp3)];
+
+    let component_count: i32 = 4;
+
     let mut out = Vec::new();
 
-    // Component count
-    out.extend_from_slice(&4u32.to_be_bytes());
+    // Component count + CRC.
+    out.extend_from_slice(&component_count.to_be_bytes());
+    out.extend_from_slice(&crc32_of_i32(component_count).to_be_bytes());
 
-    // Component 0: ValidationMetadata
-    let validation_data = write_validation_metadata(&stats.validation);
-    write_component(&mut out, VALIDATION_ORDINAL, &validation_data);
+    // TOC: ordinal + offset pairs. Offsets are absolute file positions.
+    // Header is: count(4) + count_crc(4) + toc(n*8) + toc_crc(4).
+    let header_size = 4 + 4 + (component_count as usize * 8) + 4;
+    let toc_start = out.len();
+    let mut offset: i32 = header_size as i32;
+    for &(ordinal, d) in &components {
+        out.extend_from_slice(&ordinal.to_be_bytes());
+        out.extend_from_slice(&offset.to_be_bytes());
+        // Next offset = current offset + component data len + 4 bytes CRC
+        offset += d.len() as i32 + 4;
+    }
+    let toc_end = out.len();
 
-    // Component 1: CompactionMetadata (opaque)
-    write_component(&mut out, COMPACTION_ORDINAL, &stats.compaction);
+    // Cumulative CRC: count bytes + TOC bytes (Cassandra doesn't reset the CRC).
+    let toc_crc = {
+        let mut h = crc32fast::Hasher::new();
+        h.update(&out[0..4]); // count bytes
+        h.update(&out[toc_start..toc_end]); // TOC bytes
+        h.finalize()
+    };
+    out.extend_from_slice(&toc_crc.to_be_bytes());
 
-    // Component 2: StatsMetadata (opaque)
-    write_component(&mut out, STATS_ORDINAL, &stats.stats);
-
-    // Component 3: SerializationHeader
-    let header_data = write_serialization_header(&stats.header);
-    write_component(&mut out, HEADER_ORDINAL, &header_data);
+    // Component data, each followed by its inline CRC.
+    for &(_, d) in &components {
+        out.extend_from_slice(d);
+        let crc = crc32fast::hash(d);
+        out.extend_from_slice(&crc.to_be_bytes());
+    }
 
     out
 }
 
 // ---------------------------------------------------------------------------
-// Component framing helpers
-// ---------------------------------------------------------------------------
-
-/// Write a single component: ordinal, data length, data, CRC32.
-fn write_component(out: &mut Vec<u8>, ordinal: u32, data: &[u8]) {
-    out.extend_from_slice(&ordinal.to_be_bytes());
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(data);
-    let crc = crc32fast::hash(data);
-    out.extend_from_slice(&crc.to_be_bytes());
-}
-
-// ---------------------------------------------------------------------------
-// ValidationMetadata
+// ValidationMetadata (ordinal 0)
 // ---------------------------------------------------------------------------
 
 fn read_validation_metadata(data: &[u8]) -> Result<ValidationMetadata> {
-    let mut pos = 0;
-    let partitioner = read_u16_string(data, &mut pos)?;
-
-    if pos + 8 > data.len() {
-        return Err(Error::InvalidData(
-            "ValidationMetadata: truncated bloom_fp_chance".into(),
+    if data.len() < 2 {
+        return Err(Error::InvalidFormat("ValidationMetadata too short".into()));
+    }
+    let (class, consumed) = read_utf8_string(data)?;
+    let rest = &data[consumed..];
+    if rest.len() < 8 {
+        return Err(Error::InvalidFormat(
+            "ValidationMetadata missing bloom_fp_chance".into(),
         ));
     }
-    let bloom_fp_chance =
-        f64::from_be_bytes(data[pos..pos + 8].try_into().expect("8 bytes for f64"));
-    // pos += 8; -- not needed, last field
-
+    let bloom_fp_chance = f64::from_be_bytes(rest[..8].try_into().unwrap());
     Ok(ValidationMetadata {
-        partitioner,
+        partitioner_class: class,
         bloom_fp_chance,
     })
 }
 
 fn write_validation_metadata(v: &ValidationMetadata) -> Vec<u8> {
     let mut out = Vec::new();
-    write_u16_string(&mut out, &v.partitioner);
+    write_utf8_string(&mut out, &v.partitioner_class);
     out.extend_from_slice(&v.bloom_fp_chance.to_be_bytes());
     out
 }
 
 // ---------------------------------------------------------------------------
-// SerializationHeader
+// SerializationHeader (ordinal 3)
 // ---------------------------------------------------------------------------
 
-/// Read a SerializationHeader from raw component bytes.
+/// Epoch constants for delta-encoding in the SerializationHeader.
+const TIMESTAMP_EPOCH: i64 = 1_442_880_000_000_000; // Sept 22, 2015 00:00 UTC, microseconds
+const DELETION_TIME_EPOCH: i32 = 1_442_880_000; // Same date, seconds
+const TTL_EPOCH: i32 = 0;
+
+/// Decode a `SerializationHeader` from its binary representation.
+///
+/// All fields use unsigned varints. The min_timestamp, min_local_deletion_time,
+/// and min_ttl are delta-encoded against epoch constants.
 pub fn read_serialization_header(data: &[u8]) -> Result<SerializationHeader> {
     let mut pos = 0;
 
-    let min_timestamp = read_vint_i64(data, &mut pos)?;
-    let min_local_deletion_time = read_vint_i32(data, &mut pos)?;
-    let min_ttl = read_vint_i32(data, &mut pos)?;
+    let min_timestamp = read_uvint_u64(data, &mut pos)? as i64 + TIMESTAMP_EPOCH;
+    let min_local_deletion_time = read_uvint_u32(data, &mut pos)? as i32 + DELETION_TIME_EPOCH;
+    let min_ttl = read_uvint_u32(data, &mut pos)? as i32 + TTL_EPOCH;
 
-    let key_type = read_u16_string(data, &mut pos)?;
+    let key_type = read_vint_prefixed_string(data, &mut pos)?;
 
-    let clustering_count = read_u16(data, &mut pos)? as usize;
+    let clustering_count = read_uvint_u32(data, &mut pos)? as usize;
     let mut clustering_types = Vec::with_capacity(clustering_count);
     for _ in 0..clustering_count {
-        clustering_types.push(read_u16_string(data, &mut pos)?);
+        clustering_types.push(read_vint_prefixed_string(data, &mut pos)?);
     }
 
-    let static_count = read_u16(data, &mut pos)? as usize;
+    let static_count = read_uvint_u32(data, &mut pos)? as usize;
     let mut static_columns = Vec::with_capacity(static_count);
     for _ in 0..static_count {
-        let name = read_u16_bytes(data, &mut pos)?;
-        let type_str = read_u16_string(data, &mut pos)?;
-        static_columns.push((name, type_str));
+        let name = read_vint_prefixed_bytes(data, &mut pos)?;
+        let typ = read_vint_prefixed_string(data, &mut pos)?;
+        static_columns.push((name, typ));
     }
 
-    let regular_count = read_u16(data, &mut pos)? as usize;
+    let regular_count = read_uvint_u32(data, &mut pos)? as usize;
     let mut regular_columns = Vec::with_capacity(regular_count);
     for _ in 0..regular_count {
-        let name = read_u16_bytes(data, &mut pos)?;
-        let type_str = read_u16_string(data, &mut pos)?;
-        regular_columns.push((name, type_str));
+        let name = read_vint_prefixed_bytes(data, &mut pos)?;
+        let typ = read_vint_prefixed_string(data, &mut pos)?;
+        regular_columns.push((name, typ));
     }
 
     Ok(SerializationHeader {
@@ -257,72 +349,92 @@ pub fn read_serialization_header(data: &[u8]) -> Result<SerializationHeader> {
     })
 }
 
-/// Write a SerializationHeader to bytes.
-pub fn write_serialization_header(header: &SerializationHeader) -> Vec<u8> {
+/// Encode a `SerializationHeader` into its binary representation.
+///
+/// All fields use unsigned varints. The min_timestamp, min_local_deletion_time,
+/// and min_ttl are delta-encoded against epoch constants.
+pub fn write_serialization_header(h: &SerializationHeader) -> Vec<u8> {
     let mut out = Vec::new();
+    let mut vbuf = [0u8; 9];
 
-    write_vint_i64(&mut out, header.min_timestamp);
-    write_vint_i32(&mut out, header.min_local_deletion_time);
-    write_vint_i32(&mut out, header.min_ttl);
+    // min_timestamp delta (unsigned vint)
+    let ts_delta = (h.min_timestamp - TIMESTAMP_EPOCH) as u64;
+    let n = varint::write_unsigned_vint(&mut vbuf, ts_delta);
+    out.extend_from_slice(&vbuf[..n]);
 
-    write_u16_string(&mut out, &header.key_type);
+    // min_local_deletion_time delta (unsigned vint32)
+    let ldt_delta = (h.min_local_deletion_time - DELETION_TIME_EPOCH) as u64;
+    let n = varint::write_unsigned_vint(&mut vbuf, ldt_delta);
+    out.extend_from_slice(&vbuf[..n]);
 
-    out.extend_from_slice(&(header.clustering_types.len() as u16).to_be_bytes());
-    for ct in &header.clustering_types {
-        write_u16_string(&mut out, ct);
+    // min_ttl delta (unsigned vint32)
+    let ttl_delta = (h.min_ttl - TTL_EPOCH) as u64;
+    let n = varint::write_unsigned_vint(&mut vbuf, ttl_delta);
+    out.extend_from_slice(&vbuf[..n]);
+
+    // key_type (unsigned vint32 length + UTF-8 bytes)
+    write_vint_prefixed_string(&mut out, &h.key_type);
+
+    // clustering_types
+    let n = varint::write_unsigned_vint(&mut vbuf, h.clustering_types.len() as u64);
+    out.extend_from_slice(&vbuf[..n]);
+    for ct in &h.clustering_types {
+        write_vint_prefixed_string(&mut out, ct);
     }
 
-    out.extend_from_slice(&(header.static_columns.len() as u16).to_be_bytes());
-    for (name, type_str) in &header.static_columns {
-        write_u16_bytes(&mut out, name);
-        write_u16_string(&mut out, type_str);
+    // static_columns
+    let n = varint::write_unsigned_vint(&mut vbuf, h.static_columns.len() as u64);
+    out.extend_from_slice(&vbuf[..n]);
+    for (name, typ) in &h.static_columns {
+        write_vint_prefixed_bytes(&mut out, name);
+        write_vint_prefixed_string(&mut out, typ);
     }
 
-    out.extend_from_slice(&(header.regular_columns.len() as u16).to_be_bytes());
-    for (name, type_str) in &header.regular_columns {
-        write_u16_bytes(&mut out, name);
-        write_u16_string(&mut out, type_str);
+    // regular_columns
+    let n = varint::write_unsigned_vint(&mut vbuf, h.regular_columns.len() as u64);
+    out.extend_from_slice(&vbuf[..n]);
+    for (name, typ) in &h.regular_columns {
+        write_vint_prefixed_bytes(&mut out, name);
+        write_vint_prefixed_string(&mut out, typ);
     }
 
     out
 }
 
 // ---------------------------------------------------------------------------
-// Primitive read/write helpers
+// Helpers — varint-prefixed reads (SerializationHeader)
 // ---------------------------------------------------------------------------
 
-fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
-    if *pos + 4 > data.len() {
-        return Err(Error::InvalidData(format!(
-            "need 4 bytes at offset {}, only {} available",
-            *pos,
-            data.len() - *pos
-        )));
-    }
-    let val = u32::from_be_bytes(data[*pos..*pos + 4].try_into().expect("4 bytes for u32"));
-    *pos += 4;
+/// Read an unsigned varint as `u64` from `data[pos..]`, advancing `pos`.
+fn read_uvint_u64(data: &[u8], pos: &mut usize) -> Result<u64> {
+    let (val, n) = varint::read_unsigned_vint(&data[*pos..])?;
+    *pos += n;
     Ok(val)
 }
 
-fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16> {
-    if *pos + 2 > data.len() {
+/// Read an unsigned varint as `u32` from `data[pos..]`, advancing `pos`.
+///
+/// Returns an error if the decoded value exceeds `u32::MAX`.
+fn read_uvint_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
+    let (val, n) = varint::read_unsigned_vint(&data[*pos..])?;
+    *pos += n;
+    if val > u32::MAX as u64 {
         return Err(Error::InvalidData(format!(
-            "need 2 bytes at offset {}, only {} available",
-            *pos,
-            data.len() - *pos
+            "unsigned vint32 value {val} exceeds u32::MAX"
         )));
     }
-    let val = u16::from_be_bytes(data[*pos..*pos + 2].try_into().expect("2 bytes for u16"));
-    *pos += 2;
-    Ok(val)
+    Ok(val as u32)
 }
 
-fn read_u16_string(data: &[u8], pos: &mut usize) -> Result<String> {
-    let len = read_u16(data, pos)? as usize;
+/// Read a vint-length-prefixed UTF-8 string from `data[pos..]`, advancing `pos`.
+///
+/// The length prefix is an unsigned varint (matching Cassandra's `writeUnsignedVInt32`
+/// for string lengths in `SerializationHeader`).
+fn read_vint_prefixed_string(data: &[u8], pos: &mut usize) -> Result<String> {
+    let len = read_uvint_u32(data, pos)? as usize;
     if *pos + len > data.len() {
         return Err(Error::InvalidData(format!(
-            "string: need {len} bytes at offset {}, only {} available",
-            *pos,
+            "vint-prefixed string length {len} exceeds available data {}",
             data.len() - *pos
         )));
     }
@@ -332,12 +444,12 @@ fn read_u16_string(data: &[u8], pos: &mut usize) -> Result<String> {
     Ok(s.to_owned())
 }
 
-fn read_u16_bytes(data: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
-    let len = read_u16(data, pos)? as usize;
+/// Read vint-length-prefixed raw bytes from `data[pos..]`, advancing `pos`.
+fn read_vint_prefixed_bytes(data: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
+    let len = read_uvint_u32(data, pos)? as usize;
     if *pos + len > data.len() {
         return Err(Error::InvalidData(format!(
-            "bytes: need {len} bytes at offset {}, only {} available",
-            *pos,
+            "vint-prefixed bytes length {len} exceeds available data {}",
             data.len() - *pos
         )));
     }
@@ -346,40 +458,70 @@ fn read_u16_bytes(data: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn write_u16_string(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+/// Write a vint-length-prefixed UTF-8 string.
+fn write_vint_prefixed_string(out: &mut Vec<u8>, s: &str) {
+    let mut vbuf = [0u8; 9];
+    let n = varint::write_unsigned_vint(&mut vbuf, s.len() as u64);
+    out.extend_from_slice(&vbuf[..n]);
     out.extend_from_slice(s.as_bytes());
 }
 
-fn write_u16_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+/// Write vint-length-prefixed raw bytes.
+fn write_vint_prefixed_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    let mut vbuf = [0u8; 9];
+    let n = varint::write_unsigned_vint(&mut vbuf, bytes.len() as u64);
+    out.extend_from_slice(&vbuf[..n]);
     out.extend_from_slice(bytes);
 }
 
-/// Read a varint-encoded i64 (signed zigzag).
-fn read_vint_i64(data: &[u8], pos: &mut usize) -> Result<i64> {
-    let (val, consumed) = varint::read_signed_vint(&data[*pos..])?;
-    *pos += consumed;
-    Ok(val)
+// ---------------------------------------------------------------------------
+// Helpers — primitive encoding
+// ---------------------------------------------------------------------------
+
+/// Compute CRC32 of a single big-endian i32 value.
+///
+/// Cassandra's `updateChecksumInt` feeds each byte of the big-endian
+/// representation individually to `java.util.zip.CRC32`.
+fn crc32_of_i32(value: i32) -> u32 {
+    crc32fast::hash(&value.to_be_bytes())
 }
 
-/// Read a varint-encoded i32 (signed zigzag, read as i64 then narrowed).
-fn read_vint_i32(data: &[u8], pos: &mut usize) -> Result<i32> {
-    let val = read_vint_i64(data, pos)?;
-    i32::try_from(val)
-        .map_err(|_| Error::InvalidData(format!("varint value {val} does not fit in i32")))
+/// Read a big-endian i32 at the given byte offset.
+fn i32_be(data: &[u8], off: usize) -> i32 {
+    i32::from_be_bytes(data[off..off + 4].try_into().unwrap())
 }
 
-/// Write a signed varint (zigzag) for an i64.
-fn write_vint_i64(out: &mut Vec<u8>, value: i64) {
-    let mut buf = [0u8; 9];
-    let n = varint::write_signed_vint(&mut buf, value);
-    out.extend_from_slice(&buf[..n]);
+/// Read a big-endian u32 at the given byte offset.
+fn u32_be(data: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes(data[off..off + 4].try_into().unwrap())
 }
 
-/// Write a signed varint (zigzag) for an i32 (widened to i64).
-fn write_vint_i32(out: &mut Vec<u8>, value: i32) {
-    write_vint_i64(out, value as i64);
+/// Read a UTF-8 string prefixed by a big-endian u16 length.
+/// Returns the string and total bytes consumed (2 + len).
+fn read_utf8_string(data: &[u8]) -> Result<(String, usize)> {
+    if data.len() < 2 {
+        return Err(Error::InvalidData(
+            "not enough bytes for string length prefix".into(),
+        ));
+    }
+    let len = u16::from_be_bytes(data[..2].try_into().unwrap()) as usize;
+    let end = 2 + len;
+    if data.len() < end {
+        return Err(Error::InvalidData(format!(
+            "string length {len} exceeds available data {}",
+            data.len() - 2
+        )));
+    }
+    let s = std::str::from_utf8(&data[2..end])
+        .map_err(|e| Error::InvalidData(format!("invalid UTF-8: {e}")))?;
+    Ok((s.to_owned(), end))
+}
+
+/// Write a UTF-8 string with a big-endian u16 length prefix.
+fn write_utf8_string(out: &mut Vec<u8>, s: &str) {
+    let len = s.len() as u16;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -390,111 +532,192 @@ fn write_vint_i32(out: &mut Vec<u8>, value: i32) {
 mod tests {
     use super::*;
 
-    fn sample_validation() -> ValidationMetadata {
-        ValidationMetadata {
-            partitioner: "org.apache.cassandra.dht.Murmur3Partitioner".to_string(),
-            bloom_fp_chance: 0.01,
-        }
-    }
-
+    /// Helper: build a sample `SerializationHeader`.
     fn sample_header() -> SerializationHeader {
         SerializationHeader {
             min_timestamp: 1_700_000_000_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
-            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".to_string()],
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
             static_columns: vec![(
-                b"s1".to_vec(),
-                "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                b"sc1".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
             )],
             regular_columns: vec![
                 (
-                    b"value".to_vec(),
-                    "org.apache.cassandra.db.marshal.BytesType".to_string(),
+                    b"val".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
                 ),
                 (
-                    b"ts".to_vec(),
-                    "org.apache.cassandra.db.marshal.TimestampType".to_string(),
+                    b"age".to_vec(),
+                    "org.apache.cassandra.db.marshal.Int32Type".into(),
                 ),
             ],
         }
     }
 
+    /// Helper: build a sample `Statistics`.
     fn sample_statistics() -> Statistics {
         Statistics {
-            validation: sample_validation(),
-            compaction: vec![0xCA, 0xFE, 0xBA, 0xBE],
-            stats: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02],
+            validation: ValidationMetadata {
+                partitioner_class: "org.apache.cassandra.dht.Murmur3Partitioner".into(),
+                bloom_fp_chance: 0.01,
+            },
+            compaction: CompactionMetadata {
+                data: vec![0xCA, 0xFE, 0xBA, 0xBE],
+            },
+            stats: StatsMetadata {
+                data: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02],
+            },
             header: sample_header(),
         }
     }
 
-    #[test]
-    fn validation_metadata_round_trip() {
-        let v = sample_validation();
-        let encoded = write_validation_metadata(&v);
-        let decoded = read_validation_metadata(&encoded).unwrap();
-
-        assert_eq!(decoded.partitioner, v.partitioner);
-        assert!((decoded.bloom_fp_chance - v.bloom_fp_chance).abs() < f64::EPSILON);
-    }
+    // -- SerializationHeader round-trip --
 
     #[test]
     fn serialization_header_round_trip() {
-        let h = sample_header();
-        let encoded = write_serialization_header(&h);
+        let original = sample_header();
+        let encoded = write_serialization_header(&original);
         let decoded = read_serialization_header(&encoded).unwrap();
 
-        assert_eq!(decoded.min_timestamp, h.min_timestamp);
-        assert_eq!(decoded.min_local_deletion_time, h.min_local_deletion_time);
-        assert_eq!(decoded.min_ttl, h.min_ttl);
-        assert_eq!(decoded.key_type, h.key_type);
-        assert_eq!(decoded.clustering_types, h.clustering_types);
-        assert_eq!(decoded.static_columns, h.static_columns);
-        assert_eq!(decoded.regular_columns, h.regular_columns);
+        assert_eq!(decoded.min_timestamp, original.min_timestamp);
+        assert_eq!(
+            decoded.min_local_deletion_time,
+            original.min_local_deletion_time
+        );
+        assert_eq!(decoded.min_ttl, original.min_ttl);
+        assert_eq!(decoded.key_type, original.key_type);
+        assert_eq!(decoded.clustering_types, original.clustering_types);
+        assert_eq!(decoded.static_columns, original.static_columns);
+        assert_eq!(decoded.regular_columns, original.regular_columns);
     }
 
     #[test]
-    fn full_statistics_round_trip() {
-        let s = sample_statistics();
-        let encoded = write_statistics(&s);
+    fn serialization_header_empty_columns() {
+        let header = SerializationHeader {
+            min_timestamp: TIMESTAMP_EPOCH,
+            min_local_deletion_time: DELETION_TIME_EPOCH,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.BytesType".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![],
+        };
+        let encoded = write_serialization_header(&header);
+        let decoded = read_serialization_header(&encoded).unwrap();
+
+        assert_eq!(decoded.min_timestamp, TIMESTAMP_EPOCH);
+        assert_eq!(decoded.min_local_deletion_time, DELETION_TIME_EPOCH);
+        assert!(decoded.clustering_types.is_empty());
+        assert!(decoded.static_columns.is_empty());
+        assert!(decoded.regular_columns.is_empty());
+    }
+
+    #[test]
+    fn serialization_header_live_partition_values() {
+        // i32::MAX for local_deletion_time means "live" (no deletion).
+        let header = SerializationHeader {
+            min_timestamp: TIMESTAMP_EPOCH + 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            key_type: "T".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![],
+        };
+        let encoded = write_serialization_header(&header);
+        let decoded = read_serialization_header(&encoded).unwrap();
+
+        assert_eq!(decoded.min_timestamp, TIMESTAMP_EPOCH + 1_000_000);
+        assert_eq!(decoded.min_local_deletion_time, i32::MAX);
+        assert_eq!(decoded.min_ttl, 0);
+    }
+
+    // -- Full Statistics round-trip --
+
+    #[test]
+    fn statistics_round_trip() {
+        let original = sample_statistics();
+        let encoded = write_statistics(&original);
         let decoded = read_statistics(&encoded).unwrap();
 
         // ValidationMetadata
-        assert_eq!(decoded.validation.partitioner, s.validation.partitioner);
+        assert_eq!(
+            decoded.validation.partitioner_class,
+            original.validation.partitioner_class
+        );
         assert!(
-            (decoded.validation.bloom_fp_chance - s.validation.bloom_fp_chance).abs()
+            (decoded.validation.bloom_fp_chance - original.validation.bloom_fp_chance).abs()
                 < f64::EPSILON
         );
 
-        // Opaque components
-        assert_eq!(decoded.compaction, s.compaction);
-        assert_eq!(decoded.stats, s.stats);
+        // CompactionMetadata (opaque)
+        assert_eq!(decoded.compaction.data, original.compaction.data);
+
+        // StatsMetadata (opaque)
+        assert_eq!(decoded.stats.data, original.stats.data);
 
         // SerializationHeader
-        assert_eq!(decoded.header.min_timestamp, s.header.min_timestamp);
+        assert_eq!(decoded.header.min_timestamp, original.header.min_timestamp);
         assert_eq!(
             decoded.header.min_local_deletion_time,
-            s.header.min_local_deletion_time
+            original.header.min_local_deletion_time
         );
-        assert_eq!(decoded.header.min_ttl, s.header.min_ttl);
-        assert_eq!(decoded.header.key_type, s.header.key_type);
-        assert_eq!(decoded.header.clustering_types, s.header.clustering_types);
-        assert_eq!(decoded.header.static_columns, s.header.static_columns);
-        assert_eq!(decoded.header.regular_columns, s.header.regular_columns);
+        assert_eq!(decoded.header.min_ttl, original.header.min_ttl);
+        assert_eq!(decoded.header.key_type, original.header.key_type);
+        assert_eq!(
+            decoded.header.clustering_types,
+            original.header.clustering_types
+        );
+        assert_eq!(
+            decoded.header.static_columns,
+            original.header.static_columns
+        );
+        assert_eq!(
+            decoded.header.regular_columns,
+            original.header.regular_columns
+        );
     }
 
     #[test]
-    fn crc_checksum_validated() {
-        let s = sample_statistics();
-        let mut encoded = write_statistics(&s);
+    fn statistics_round_trip_empty_opaque() {
+        let stats = Statistics {
+            validation: ValidationMetadata {
+                partitioner_class: "P".into(),
+                bloom_fp_chance: 0.1,
+            },
+            compaction: CompactionMetadata { data: vec![] },
+            stats: StatsMetadata { data: vec![] },
+            header: SerializationHeader {
+                min_timestamp: TIMESTAMP_EPOCH,
+                min_local_deletion_time: DELETION_TIME_EPOCH,
+                min_ttl: 0,
+                key_type: "K".into(),
+                clustering_types: vec![],
+                static_columns: vec![],
+                regular_columns: vec![],
+            },
+        };
+        let encoded = write_statistics(&stats);
+        let decoded = read_statistics(&encoded).unwrap();
+        assert!(decoded.compaction.data.is_empty());
+        assert!(decoded.stats.data.is_empty());
+    }
 
-        // Corrupt a byte inside the first component's data.
-        // Layout: 4 (count) + 4 (ordinal) + 4 (data_length) = 12, then data starts.
-        let data_start = 12;
-        assert!(data_start < encoded.len());
-        encoded[data_start] ^= 0xFF;
+    // -- CRC validation --
+
+    #[test]
+    fn statistics_crc_mismatch_detected() {
+        let stats = sample_statistics();
+        let mut encoded = write_statistics(&stats);
+
+        // Corrupt one byte of component data (after TOC).
+        let toc_end = 4 + 4 * 8; // 4 + 32 = 36
+        if encoded.len() > toc_end {
+            encoded[toc_end] ^= 0xFF;
+        }
 
         let result = read_statistics(&encoded);
         assert!(result.is_err());
@@ -505,41 +728,64 @@ mod tests {
     }
 
     #[test]
-    fn header_with_no_columns() {
-        let h = SerializationHeader {
-            min_timestamp: 0,
-            min_local_deletion_time: 0,
-            min_ttl: 0,
-            key_type: "org.apache.cassandra.db.marshal.BytesType".to_string(),
-            clustering_types: vec![],
-            static_columns: vec![],
-            regular_columns: vec![],
-        };
-        let encoded = write_serialization_header(&h);
-        let decoded = read_serialization_header(&encoded).unwrap();
-
-        assert_eq!(decoded.min_timestamp, 0);
-        assert_eq!(decoded.clustering_types.len(), 0);
-        assert_eq!(decoded.static_columns.len(), 0);
-        assert_eq!(decoded.regular_columns.len(), 0);
+    fn statistics_bad_component_count() {
+        let mut data = vec![0u8; 40];
+        // Set component count to 5 (invalid)
+        data[..4].copy_from_slice(&5_i32.to_be_bytes());
+        let result = read_statistics(&data);
+        assert!(result.is_err());
     }
 
-    #[test]
-    fn header_negative_varints() {
-        let h = SerializationHeader {
-            min_timestamp: -1_000_000,
-            min_local_deletion_time: -1,
-            min_ttl: -42,
-            key_type: "k".to_string(),
-            clustering_types: vec![],
-            static_columns: vec![],
-            regular_columns: vec![],
-        };
-        let encoded = write_serialization_header(&h);
-        let decoded = read_serialization_header(&encoded).unwrap();
+    // -- ValidationMetadata --
 
-        assert_eq!(decoded.min_timestamp, -1_000_000);
-        assert_eq!(decoded.min_local_deletion_time, -1);
-        assert_eq!(decoded.min_ttl, -42);
+    #[test]
+    fn validation_metadata_round_trip() {
+        let v = ValidationMetadata {
+            partitioner_class: "org.apache.cassandra.dht.Murmur3Partitioner".into(),
+            bloom_fp_chance: 0.01,
+        };
+        let encoded = write_validation_metadata(&v);
+        let decoded = read_validation_metadata(&encoded).unwrap();
+        assert_eq!(decoded.partitioner_class, v.partitioner_class);
+        assert!((decoded.bloom_fp_chance - v.bloom_fp_chance).abs() < f64::EPSILON);
+    }
+
+    // -- File structure verification --
+
+    #[test]
+    fn statistics_file_structure() {
+        let stats = sample_statistics();
+        let encoded = write_statistics(&stats);
+
+        // First 4 bytes: component count = 4
+        assert_eq!(i32_be(&encoded, 0), 4);
+
+        // Bytes 4-7: CRC of count
+        let count_crc = crc32_of_i32(4);
+        assert_eq!(u32_be(&encoded, 4), count_crc);
+
+        // TOC: 4 entries * 8 bytes each = 32 bytes starting at offset 8.
+        // Ordinals should be 0, 1, 2, 3.
+        for i in 0..4 {
+            let ordinal = i32_be(&encoded, 8 + i * 8);
+            assert_eq!(ordinal, i as i32);
+        }
+
+        // Byte 40-43: cumulative CRC of (count bytes + TOC bytes)
+        let toc_crc = {
+            let mut h = crc32fast::Hasher::new();
+            h.update(&encoded[0..4]); // count
+            h.update(&encoded[8..40]); // TOC
+            h.finalize()
+        };
+        assert_eq!(u32_be(&encoded, 40), toc_crc);
+
+        // Component 0 starts at offset stored in TOC[0] (absolute).
+        let comp0_start = i32_be(&encoded, 8 + 4) as usize; // offset field of TOC[0]
+        let comp1_start = i32_be(&encoded, 8 + 8 + 4) as usize; // offset field of TOC[1]
+                                                                // Component 0 data is comp0_start..comp1_start-4 (minus inline CRC)
+        let comp0_data = &encoded[comp0_start..comp1_start - 4];
+        let comp0_crc = crc32fast::hash(comp0_data);
+        assert_eq!(u32_be(&encoded, comp1_start - 4), comp0_crc);
     }
 }

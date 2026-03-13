@@ -2,7 +2,9 @@
 resolver = "2"
 members = [
     "ferrosa-common",
+    "ferrosa-schema",
     "ferrosa-sstable",
+    "ferrosa-storage",
 ]
 
 [workspace.package]

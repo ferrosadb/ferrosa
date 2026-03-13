@@ -1,72 +1,101 @@
-//! TOC.txt reader and writer.
+//! TOC.txt reader and writer for BTI SSTables.
 //!
-//! The TOC file lists all component filenames of an SSTable, one per line.
-//! Used to enumerate files for deletion, upload, or verification.
+//! Each SSTable has an associated TOC.txt file that lists one component
+//! filename per line. This module parses and writes that file, and provides
+//! helpers that return the standard component lists for compressed and
+//! uncompressed BTI SSTables.
 
 use ferrosa_common::{Error, Result};
 
-/// Known SSTable component suffixes.
-pub const COMPONENT_DATA: &str = "Data.db";
-pub const COMPONENT_PARTITIONS: &str = "Partitions.db";
-pub const COMPONENT_ROWS: &str = "Rows.db";
-pub const COMPONENT_FILTER: &str = "Filter.db";
-pub const COMPONENT_COMPRESSION: &str = "CompressionInfo.db";
-pub const COMPONENT_STATISTICS: &str = "Statistics.db";
-pub const COMPONENT_TOC: &str = "TOC.txt";
-pub const COMPONENT_CRC: &str = "CRC.db";
+// ---------------------------------------------------------------------------
+// Component suffix constants
+// ---------------------------------------------------------------------------
 
-/// Parse a TOC file into component names.
+/// Data file suffix.
+pub const DATA: &str = "Data.db";
+/// Partition index (trie) suffix.
+pub const PARTITIONS: &str = "Partitions.db";
+/// Row index (trie) suffix.
+pub const ROWS: &str = "Rows.db";
+/// Bloom-filter suffix.
+pub const FILTER: &str = "Filter.db";
+/// Compression metadata suffix (present when compression is enabled).
+pub const COMPRESSION_INFO: &str = "CompressionInfo.db";
+/// Statistics / metadata suffix.
+pub const STATISTICS: &str = "Statistics.db";
+/// Table-of-contents suffix.
+pub const TOC: &str = "TOC.txt";
+/// CRC suffix (present when compression is disabled).
+pub const CRC: &str = "CRC.db";
+
+// ---------------------------------------------------------------------------
+// Read / Write
+// ---------------------------------------------------------------------------
+
+/// Parse a TOC.txt file, returning one component filename per entry.
+///
+/// Empty lines are silently skipped. Returns an error if the data is not
+/// valid UTF-8.
 pub fn read_toc(data: &[u8]) -> Result<Vec<String>> {
     let text = std::str::from_utf8(data)
-        .map_err(|e| Error::InvalidFormat(format!("TOC not valid UTF-8: {e}")))?;
+        .map_err(|e| Error::InvalidFormat(format!("TOC.txt is not valid UTF-8: {e}")))?;
+
     Ok(text
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.trim().to_string())
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(String::from)
         .collect())
 }
 
-/// Write a TOC file from component names.
+/// Write a TOC.txt file from a list of component filenames.
+///
+/// Each component is written on its own line terminated by `\n`.
 pub fn write_toc(components: &[&str]) -> Vec<u8> {
     let mut buf = String::new();
-    for name in components {
-        buf.push_str(name);
+    for c in components {
+        buf.push_str(c);
         buf.push('\n');
     }
     buf.into_bytes()
 }
 
-/// Return the standard component list for a compressed BTI SSTable.
+// ---------------------------------------------------------------------------
+// Standard component lists
+// ---------------------------------------------------------------------------
+
+/// All suffixes used in a BTI SSTable.
+const COMMON_SUFFIXES: &[&str] = &[DATA, PARTITIONS, ROWS, FILTER, STATISTICS, TOC];
+
+/// Return the 7 standard component filenames for a **compressed** BTI SSTable.
+///
+/// Includes `CompressionInfo.db`, excludes `CRC.db`.
 pub fn standard_compressed_components(prefix: &str) -> Vec<String> {
-    [
-        COMPONENT_DATA,
-        COMPONENT_PARTITIONS,
-        COMPONENT_ROWS,
-        COMPONENT_FILTER,
-        COMPONENT_COMPRESSION,
-        COMPONENT_STATISTICS,
-        COMPONENT_TOC,
-    ]
-    .iter()
-    .map(|suffix| format!("{prefix}-{suffix}"))
-    .collect()
+    let mut out: Vec<String> = COMMON_SUFFIXES
+        .iter()
+        .map(|s| format!("{prefix}-{s}"))
+        .collect();
+    out.push(format!("{prefix}-{COMPRESSION_INFO}"));
+    out.sort();
+    out
 }
 
-/// Return the standard component list for an uncompressed BTI SSTable.
+/// Return the 7 standard component filenames for an **uncompressed** BTI SSTable.
+///
+/// Includes `CRC.db`, excludes `CompressionInfo.db`.
 pub fn standard_uncompressed_components(prefix: &str) -> Vec<String> {
-    [
-        COMPONENT_DATA,
-        COMPONENT_PARTITIONS,
-        COMPONENT_ROWS,
-        COMPONENT_FILTER,
-        COMPONENT_CRC,
-        COMPONENT_STATISTICS,
-        COMPONENT_TOC,
-    ]
-    .iter()
-    .map(|suffix| format!("{prefix}-{suffix}"))
-    .collect()
+    let mut out: Vec<String> = COMMON_SUFFIXES
+        .iter()
+        .map(|s| format!("{prefix}-{s}"))
+        .collect();
+    out.push(format!("{prefix}-{CRC}"));
+    out.sort();
+    out
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -74,39 +103,54 @@ mod tests {
 
     #[test]
     fn read_toc_basic() {
-        let data = b"na-1-big-Data.db\nna-1-big-Filter.db\n";
-        let components = read_toc(data).unwrap();
-        assert_eq!(components, vec!["na-1-big-Data.db", "na-1-big-Filter.db"]);
+        let input = b"nb-1-big-Data.db\nnb-1-big-Filter.db\nnb-1-big-TOC.txt\n";
+        let result = read_toc(input).unwrap();
+        assert_eq!(
+            result,
+            vec!["nb-1-big-Data.db", "nb-1-big-Filter.db", "nb-1-big-TOC.txt",]
+        );
     }
 
     #[test]
     fn read_toc_empty_lines() {
-        let data = b"na-1-big-Data.db\n\n\nna-1-big-Filter.db\n\n";
-        let components = read_toc(data).unwrap();
-        assert_eq!(components, vec!["na-1-big-Data.db", "na-1-big-Filter.db"]);
+        let input = b"\nnb-1-big-Data.db\n\n\nnb-1-big-Filter.db\n\n";
+        let result = read_toc(input).unwrap();
+        assert_eq!(result, vec!["nb-1-big-Data.db", "nb-1-big-Filter.db"]);
     }
 
     #[test]
     fn write_toc_round_trip() {
-        let original = &["na-1-big-Data.db", "na-1-big-Filter.db", "na-1-big-TOC.txt"];
-        let bytes = write_toc(original);
+        let components = vec!["nb-1-big-Data.db", "nb-1-big-Filter.db", "nb-1-big-TOC.txt"];
+        let bytes = write_toc(&components);
         let parsed = read_toc(&bytes).unwrap();
-        assert_eq!(parsed, original);
+        assert_eq!(parsed, components);
     }
 
     #[test]
     fn standard_components_compressed() {
-        let components = standard_compressed_components("na-1-big");
-        assert_eq!(components.len(), 7);
-        assert!(components.iter().any(|c| c.ends_with("CompressionInfo.db")));
-        assert!(!components.iter().any(|c| c.ends_with("CRC.db")));
+        let comps = standard_compressed_components("nb-1-big");
+        assert_eq!(comps.len(), 7);
+        assert!(
+            comps.iter().any(|c| c.ends_with("CompressionInfo.db")),
+            "compressed components must include CompressionInfo.db"
+        );
+        assert!(
+            !comps.iter().any(|c| c.ends_with("CRC.db")),
+            "compressed components must not include CRC.db"
+        );
     }
 
     #[test]
     fn standard_components_uncompressed() {
-        let components = standard_uncompressed_components("na-1-big");
-        assert_eq!(components.len(), 7);
-        assert!(components.iter().any(|c| c.ends_with("CRC.db")));
-        assert!(!components.iter().any(|c| c.ends_with("CompressionInfo.db")));
+        let comps = standard_uncompressed_components("nb-1-big");
+        assert_eq!(comps.len(), 7);
+        assert!(
+            comps.iter().any(|c| c.ends_with("CRC.db")),
+            "uncompressed components must include CRC.db"
+        );
+        assert!(
+            !comps.iter().any(|c| c.ends_with("CompressionInfo.db")),
+            "uncompressed components must not include CompressionInfo.db"
+        );
     }
 }

@@ -1,35 +1,44 @@
-//! Partition index (Partitions.db) reader.
+//! Partitions.db reader for the BTI partition index.
 //!
-//! The partition index is an on-disk trie mapping byte-ordered partition key
-//! prefixes to positions in the data or row index file. The trie is built by
-//! [`crate::trie::builder::TrieBuilder`] and traversed by
-//! [`crate::trie::walker`].
+//! The partition index file contains:
+//! 1. A trie mapping byte-comparable encoded partition keys to payload (hash, idxpos)
+//! 2. A footer (last 24 bytes): 3 big-endian i64s:
+//!    - `key_bounds_offset`: offset to the key bounds section
+//!    - `key_count`: number of partitions
+//!    - `root_pos`: file position of the trie root node
+//! 3. Key bounds section (at `key_bounds_offset`): two short-length-prefixed keys
+//!    (smallest, largest)
 //!
-//! # File layout
+//! # Lookup
 //!
-//! ```text
-//! [trie nodes ...]
-//! [key_bounds: u16-length-prefixed smallest key + u16-length-prefixed largest key]
-//! [footer: 3 big-endian i64s]
-//!   key_bounds_offset (i64)
-//!   key_count         (i64)
-//!   root_pos          (i64)
-//! ```
+//! The lookup encodes a `DecoratedKey` to its byte-comparable form, walks the
+//! trie, verifies the hash byte, and interprets the idxpos:
+//! - Positive idxpos: row index position (`RowIndex`)
+//! - Negative idxpos: direct data pointer via bitwise NOT (`DataDirect`)
 //!
-//! Reference: `PartitionIndex.java`, `BtiTableWriter.java`
-
-use ferrosa_common::{Error, Result};
+//! Reference: Cassandra's `PartitionIndex.java`, `BtiTableReader.java`
 
 use crate::io::ReadAt;
+use crate::trie::node;
 use crate::trie::walker;
+use crate::{byte_comparable, trie::walker::LookupResult};
+use ferrosa_common::{DecoratedKey, Error, Result};
 
-/// Footer size: 3 big-endian i64 values = 24 bytes.
+/// Footer size: 3 x i64 = 24 bytes.
 const FOOTER_SIZE: u64 = 24;
 
-/// Partition index reader for Partitions.db.
-///
-/// Wraps a [`ReadAt`] source and provides lookup of encoded partition keys
-/// in the trie, returning their position in the data or row index file.
+/// Result of a partition index lookup.
+#[derive(Debug)]
+pub enum PartitionLookup {
+    /// Partition found; row index position for further row-level lookups.
+    RowIndex { position: u64 },
+    /// Partition found; direct data file position (no row index indirection).
+    DataDirect { position: u64 },
+    /// Partition not found in the index.
+    NotFound,
+}
+
+/// Reader for a Partitions.db file.
 pub struct PartitionIndex<R: ReadAt> {
     reader: R,
     root_pos: u64,
@@ -38,50 +47,47 @@ pub struct PartitionIndex<R: ReadAt> {
     largest_key: Vec<u8>,
 }
 
-/// Result of looking up a partition key in the index.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PartitionLookup {
-    /// The partition has a row index entry at the given position in Rows.db.
-    RowIndex { position: u64 },
-    /// The partition data is directly at the given position in Data.db.
-    DataDirect { position: u64 },
-    /// The partition was not found in the index.
-    NotFound,
+/// Read a short-length-prefixed byte array: u16 big-endian length + that many bytes.
+/// Advances `pos` past the consumed bytes.
+fn read_short_length_prefixed<R: ReadAt>(reader: &R, pos: &mut u64) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 2];
+    reader.read_exact_at(&mut len_buf, *pos)?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    *pos += 2;
+
+    let mut data = vec![0u8; len];
+    reader.read_exact_at(&mut data, *pos)?;
+    *pos += len as u64;
+
+    Ok(data)
 }
 
 impl<R: ReadAt> PartitionIndex<R> {
-    /// Open a partition index from the given reader.
+    /// Open a partition index from a reader.
     ///
-    /// Reads the footer (last 24 bytes) to obtain the root position, key
-    /// count, and key bounds offset, then reads the key bounds section.
+    /// Reads the footer (last 24 bytes) to extract `key_bounds_offset`,
+    /// `key_count`, and `root_pos`, then reads the key bounds section.
     pub fn open(reader: R) -> Result<Self> {
         let file_len = reader.len()?;
         if file_len < FOOTER_SIZE {
             return Err(Error::InvalidFormat(
-                "partition index too small for footer".into(),
+                "partition index file too small for footer".into(),
             ));
         }
 
-        // Read footer: 3 big-endian i64s.
+        // Read footer: 3 big-endian i64s
         let footer_offset = file_len - FOOTER_SIZE;
-        let mut footer = [0u8; 24];
-        reader.read_exact_at(&mut footer, footer_offset)?;
+        let mut footer_buf = [0u8; 24];
+        reader.read_exact_at(&mut footer_buf, footer_offset)?;
 
-        let key_bounds_offset = i64::from_be_bytes(footer[0..8].try_into().unwrap());
-        let key_count = i64::from_be_bytes(footer[8..16].try_into().unwrap());
-        let root_pos = i64::from_be_bytes(footer[16..24].try_into().unwrap());
+        let key_bounds_offset = i64::from_be_bytes(footer_buf[0..8].try_into().unwrap());
+        let key_count = i64::from_be_bytes(footer_buf[8..16].try_into().unwrap());
+        let root_pos = i64::from_be_bytes(footer_buf[16..24].try_into().unwrap());
 
-        if key_bounds_offset < 0 || key_count < 0 || root_pos < 0 {
-            return Err(Error::InvalidFormat(
-                "partition index footer has negative values".into(),
-            ));
-        }
-
-        // Read key bounds: two u16-length-prefixed keys.
-        let (smallest_key, bytes_read) =
-            read_short_length_prefixed(&reader, key_bounds_offset as u64)?;
-        let (largest_key, _) =
-            read_short_length_prefixed(&reader, key_bounds_offset as u64 + bytes_read as u64)?;
+        // Read key bounds
+        let mut bounds_pos = key_bounds_offset as u64;
+        let smallest_key = read_short_length_prefixed(&reader, &mut bounds_pos)?;
+        let largest_key = read_short_length_prefixed(&reader, &mut bounds_pos)?;
 
         Ok(PartitionIndex {
             reader,
@@ -92,44 +98,41 @@ impl<R: ReadAt> PartitionIndex<R> {
         })
     }
 
-    /// Look up a byte-comparable encoded key in the partition index trie.
+    /// Look up a partition key in the index.
     ///
-    /// If the trie payload includes a hash byte, it is compared against
-    /// `filter_hash`. If they do not match, [`PartitionLookup::NotFound`]
-    /// is returned (Bloom filter rejection).
-    ///
-    /// The payload encodes an `idxpos` value:
-    /// - If `idxpos >= 0`: the partition has a row index entry at that position
-    ///   in Rows.db ([`PartitionLookup::RowIndex`]).
-    /// - If `idxpos < 0`: the partition data is directly in Data.db at position
-    ///   `!idxpos` (bitwise NOT) ([`PartitionLookup::DataDirect`]).
-    pub fn lookup_raw(
-        &self,
-        encoded_key: &[u8],
-        filter_hash: Option<u8>,
-    ) -> Result<PartitionLookup> {
-        let result = walker::lookup_payload(&self.reader, self.root_pos, encoded_key)?;
+    /// Encodes the key to byte-comparable form, walks the trie, verifies
+    /// the hash byte, and interprets the idxpos.
+    pub fn lookup(&self, key: &DecoratedKey) -> Result<PartitionLookup> {
+        let encoded = byte_comparable::encode(key);
 
-        match result {
-            Some((payload_hash, idxpos)) => {
-                // If both the payload and query have a hash byte, compare them.
-                if let (Some(ph), Some(fh)) = (payload_hash, filter_hash) {
-                    if ph != fh {
+        match walker::lookup(&self.reader, self.root_pos, &encoded)? {
+            LookupResult::Found {
+                payload_pb,
+                payload_bytes,
+            } => {
+                let (hash_opt, idxpos) = node::decode_payload(payload_pb, &payload_bytes)?;
+
+                // Verify hash if present
+                if let Some(hash) = hash_opt {
+                    let (_h1, h2) = key.filter_hash();
+                    let expected_hash = (h2 & 0xFF) as u8;
+                    if hash != expected_hash {
                         return Ok(PartitionLookup::NotFound);
                     }
                 }
 
-                if idxpos >= 0 {
-                    Ok(PartitionLookup::RowIndex {
-                        position: idxpos as u64,
-                    })
-                } else {
+                // Interpret idxpos: negative means direct data pointer (bitwise NOT)
+                if idxpos < 0 {
                     Ok(PartitionLookup::DataDirect {
                         position: !idxpos as u64,
                     })
+                } else {
+                    Ok(PartitionLookup::RowIndex {
+                        position: idxpos as u64,
+                    })
                 }
             }
-            None => Ok(PartitionLookup::NotFound),
+            LookupResult::NotFound => Ok(PartitionLookup::NotFound),
         }
     }
 
@@ -138,234 +141,253 @@ impl<R: ReadAt> PartitionIndex<R> {
         self.key_count
     }
 
-    /// Returns the smallest key stored in the key bounds section.
+    /// Returns the smallest key in the index (raw bytes, short-length-prefixed value).
     pub fn smallest_key(&self) -> &[u8] {
         &self.smallest_key
     }
 
-    /// Returns the largest key stored in the key bounds section.
+    /// Returns the largest key in the index (raw bytes, short-length-prefixed value).
     pub fn largest_key(&self) -> &[u8] {
         &self.largest_key
     }
-}
-
-/// Read a u16-length-prefixed byte sequence from the reader at the given offset.
-///
-/// Returns `(bytes, total_bytes_consumed)` where `total_bytes_consumed`
-/// includes the 2-byte length prefix.
-fn read_short_length_prefixed(reader: &impl ReadAt, offset: u64) -> Result<(Vec<u8>, usize)> {
-    let mut len_buf = [0u8; 2];
-    reader.read_exact_at(&mut len_buf, offset)?;
-    let len = u16::from_be_bytes(len_buf) as usize;
-
-    let mut data = vec![0u8; len];
-    reader.read_exact_at(&mut data, offset + 2)?;
-
-    Ok((data, 2 + len))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::trie::builder::{TrieBuilder, TriePayload};
+    use ferrosa_common::{PartitionKey, Token};
 
-    /// Build a complete partition index file in memory:
-    /// 1. Trie data from the builder
-    /// 2. Key bounds section (u16-prefixed smallest + largest keys)
-    /// 3. Footer (3 i64s: key_bounds_offset, key_count, root_pos)
-    fn build_test_partition_index(
-        keys: &[(&[u8], TriePayload)],
+    /// Build a partition index file from a trie + key bounds + footer.
+    fn build_partition_index(
+        trie_data: &[u8],
+        root_pos: u64,
+        key_count: u64,
         smallest: &[u8],
         largest: &[u8],
     ) -> Vec<u8> {
-        let mut builder = TrieBuilder::new();
-        for (key, payload) in keys {
-            builder.add(key, payload.clone()).unwrap();
-        }
-        let (trie_data, root_pos) = builder.finish().unwrap();
+        let mut buf = Vec::new();
 
-        let mut file = trie_data;
+        // Trie data
+        buf.extend_from_slice(trie_data);
 
-        // Key bounds section starts right after the trie data.
-        let key_bounds_offset = file.len() as i64;
+        // Key bounds section
+        let key_bounds_offset = buf.len() as i64;
+        // smallest key: u16 len + bytes
+        buf.extend_from_slice(&(smallest.len() as u16).to_be_bytes());
+        buf.extend_from_slice(smallest);
+        // largest key: u16 len + bytes
+        buf.extend_from_slice(&(largest.len() as u16).to_be_bytes());
+        buf.extend_from_slice(largest);
 
-        // Write smallest key: u16 length + key bytes.
-        file.extend_from_slice(&(smallest.len() as u16).to_be_bytes());
-        file.extend_from_slice(smallest);
+        // Footer: 3 big-endian i64s
+        buf.extend_from_slice(&key_bounds_offset.to_be_bytes());
+        buf.extend_from_slice(&(key_count as i64).to_be_bytes());
+        buf.extend_from_slice(&(root_pos as i64).to_be_bytes());
 
-        // Write largest key: u16 length + key bytes.
-        file.extend_from_slice(&(largest.len() as u16).to_be_bytes());
-        file.extend_from_slice(largest);
-
-        // Footer: key_bounds_offset, key_count, root_pos.
-        let key_count = keys.len() as i64;
-        file.extend_from_slice(&key_bounds_offset.to_be_bytes());
-        file.extend_from_slice(&key_count.to_be_bytes());
-        file.extend_from_slice(&(root_pos as i64).to_be_bytes());
-
-        file
+        buf
     }
 
     #[test]
     fn open_reads_footer_and_key_bounds() {
-        let keys = vec![
-            (
-                b"aaa".as_slice(),
+        // Build a minimal trie: single leaf node with payload
+        let trie_data = vec![
+            0x08, // PayloadOnly, pb=8
+            0xAA, // hash byte
+            0x42, // idxpos = 0x42
+        ];
+        let root_pos = 0u64;
+        let smallest = b"aaa";
+        let largest = b"zzz";
+
+        let index_data = build_partition_index(&trie_data, root_pos, 1, smallest, largest);
+
+        let pi = PartitionIndex::open(index_data).unwrap();
+        assert_eq!(pi.key_count(), 1);
+        assert_eq!(pi.smallest_key(), b"aaa");
+        assert_eq!(pi.largest_key(), b"zzz");
+    }
+
+    #[test]
+    fn open_file_too_small() {
+        let data = vec![0u8; 10]; // less than 24 bytes
+        let result = PartitionIndex::open(data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lookup_with_hand_built_trie() {
+        // Build a hand-crafted trie with two entries.
+        // We use the trie builder for correctness.
+        let dk1 = DecoratedKey {
+            token: Token(1),
+            key: PartitionKey::from(b"key1".as_slice()),
+        };
+        let dk2 = DecoratedKey {
+            token: Token(2),
+            key: PartitionKey::from(b"key2".as_slice()),
+        };
+
+        let encoded1 = byte_comparable::encode(&dk1);
+        let encoded2 = byte_comparable::encode(&dk2);
+
+        let (_h1_1, h2_1) = dk1.filter_hash();
+        let hash1 = (h2_1 & 0xFF) as u8;
+        let (_h1_2, h2_2) = dk2.filter_hash();
+        let hash2 = (h2_2 & 0xFF) as u8;
+
+        let idxpos1: i64 = 1000;
+        let idxpos2: i64 = 2000;
+
+        // Sort encoded keys and add in order
+        let mut entries = vec![
+            (encoded1.clone(), hash1, idxpos1),
+            (encoded2.clone(), hash2, idxpos2),
+        ];
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut builder = TrieBuilder::new();
+        for (encoded, hash, pos) in &entries {
+            builder
+                .add(
+                    encoded,
+                    TriePayload {
+                        hash: Some(*hash),
+                        position: *pos,
+                    },
+                )
+                .unwrap();
+        }
+        let (trie_data, root_pos) = builder.finish().unwrap();
+
+        let index_data = build_partition_index(&trie_data, root_pos, 2, b"key1", b"key2");
+
+        let pi = PartitionIndex::open(index_data).unwrap();
+        assert_eq!(pi.key_count(), 2);
+
+        // Lookup dk1
+        match pi.lookup(&dk1).unwrap() {
+            PartitionLookup::RowIndex { position } => {
+                assert_eq!(position, 1000);
+            }
+            other => panic!("expected RowIndex, got {:?}", other),
+        }
+
+        // Lookup dk2
+        match pi.lookup(&dk2).unwrap() {
+            PartitionLookup::RowIndex { position } => {
+                assert_eq!(position, 2000);
+            }
+            other => panic!("expected RowIndex, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lookup_not_found() {
+        let dk = DecoratedKey {
+            token: Token(1),
+            key: PartitionKey::from(b"key1".as_slice()),
+        };
+        let encoded = byte_comparable::encode(&dk);
+        let (_h1, h2) = dk.filter_hash();
+        let hash = (h2 & 0xFF) as u8;
+
+        let mut builder = TrieBuilder::new();
+        builder
+            .add(
+                &encoded,
                 TriePayload {
-                    hash: None,
+                    hash: Some(hash),
                     position: 100,
                 },
-            ),
-            (
-                b"bbb".as_slice(),
+            )
+            .unwrap();
+        let (trie_data, root_pos) = builder.finish().unwrap();
+
+        let index_data = build_partition_index(&trie_data, root_pos, 1, b"key1", b"key1");
+        let pi = PartitionIndex::open(index_data).unwrap();
+
+        // Look up a key that doesn't exist
+        let missing = DecoratedKey {
+            token: Token(999),
+            key: PartitionKey::from(b"missing".as_slice()),
+        };
+        match pi.lookup(&missing).unwrap() {
+            PartitionLookup::NotFound => {}
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lookup_data_direct_negative_idxpos() {
+        // A negative idxpos means a direct data pointer (bitwise NOT).
+        let dk = DecoratedKey {
+            token: Token(42),
+            key: PartitionKey::from(b"direct".as_slice()),
+        };
+        let encoded = byte_comparable::encode(&dk);
+        let (_h1, h2) = dk.filter_hash();
+        let hash = (h2 & 0xFF) as u8;
+
+        // idxpos = -1 means data position = !(-1) = 0
+        // idxpos = -101 means data position = !(-101) = 100
+        let idxpos: i64 = -101;
+
+        let mut builder = TrieBuilder::new();
+        builder
+            .add(
+                &encoded,
                 TriePayload {
-                    hash: None,
-                    position: 200,
+                    hash: Some(hash),
+                    position: idxpos,
                 },
-            ),
-            (
-                b"ccc".as_slice(),
+            )
+            .unwrap();
+        let (trie_data, root_pos) = builder.finish().unwrap();
+
+        let index_data = build_partition_index(&trie_data, root_pos, 1, b"direct", b"direct");
+        let pi = PartitionIndex::open(index_data).unwrap();
+
+        match pi.lookup(&dk).unwrap() {
+            PartitionLookup::DataDirect { position } => {
+                assert_eq!(position, 100);
+            }
+            other => panic!("expected DataDirect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lookup_hash_mismatch_returns_not_found() {
+        // Build an index with one key but a wrong hash byte. The lookup
+        // should fail the hash check and return NotFound.
+        let dk = DecoratedKey {
+            token: Token(7),
+            key: PartitionKey::from(b"hashtest".as_slice()),
+        };
+        let encoded = byte_comparable::encode(&dk);
+        let (_h1, h2) = dk.filter_hash();
+        let correct_hash = (h2 & 0xFF) as u8;
+        let wrong_hash = correct_hash.wrapping_add(1);
+
+        let mut builder = TrieBuilder::new();
+        builder
+            .add(
+                &encoded,
                 TriePayload {
-                    hash: None,
-                    position: 300,
+                    hash: Some(wrong_hash),
+                    position: 500,
                 },
-            ),
-        ];
+            )
+            .unwrap();
+        let (trie_data, root_pos) = builder.finish().unwrap();
 
-        let file = build_test_partition_index(&keys, b"smallest_key", b"largest_key");
-        let index = PartitionIndex::open(file).unwrap();
+        let index_data = build_partition_index(&trie_data, root_pos, 1, b"hashtest", b"hashtest");
+        let pi = PartitionIndex::open(index_data).unwrap();
 
-        assert_eq!(index.key_count(), 3);
-        assert_eq!(index.smallest_key(), b"smallest_key");
-        assert_eq!(index.largest_key(), b"largest_key");
-    }
-
-    #[test]
-    fn lookup_existing_keys() {
-        let keys = vec![
-            (
-                b"key_a".as_slice(),
-                TriePayload {
-                    hash: None,
-                    position: 1000,
-                },
-            ),
-            (
-                b"key_b".as_slice(),
-                TriePayload {
-                    hash: None,
-                    position: 2000,
-                },
-            ),
-        ];
-
-        let file = build_test_partition_index(&keys, b"key_a", b"key_b");
-        let index = PartitionIndex::open(file).unwrap();
-
-        // Positive idxpos -> RowIndex.
-        let result = index.lookup_raw(b"key_a", None).unwrap();
-        assert_eq!(result, PartitionLookup::RowIndex { position: 1000 });
-
-        let result = index.lookup_raw(b"key_b", None).unwrap();
-        assert_eq!(result, PartitionLookup::RowIndex { position: 2000 });
-    }
-
-    #[test]
-    fn lookup_missing_key_returns_not_found() {
-        let keys = vec![(
-            b"exists".as_slice(),
-            TriePayload {
-                hash: None,
-                position: 42,
-            },
-        )];
-
-        let file = build_test_partition_index(&keys, b"exists", b"exists");
-        let index = PartitionIndex::open(file).unwrap();
-
-        let result = index.lookup_raw(b"missing", None).unwrap();
-        assert_eq!(result, PartitionLookup::NotFound);
-    }
-
-    #[test]
-    fn lookup_data_direct_for_negative_idxpos() {
-        // Negative idxpos means DataDirect: position = !idxpos.
-        // For position P in Data.db, idxpos = !P = -(P+1).
-        // So for data position 500, idxpos = -501.
-        let keys = vec![(
-            b"direct".as_slice(),
-            TriePayload {
-                hash: None,
-                position: -501, // !500 = -501
-            },
-        )];
-
-        let file = build_test_partition_index(&keys, b"direct", b"direct");
-        let index = PartitionIndex::open(file).unwrap();
-
-        let result = index.lookup_raw(b"direct", None).unwrap();
-        assert_eq!(result, PartitionLookup::DataDirect { position: 500 });
-    }
-
-    #[test]
-    fn lookup_with_hash_match() {
-        let keys = vec![(
-            b"hashed".as_slice(),
-            TriePayload {
-                hash: Some(0xAB),
-                position: 777,
-            },
-        )];
-
-        let file = build_test_partition_index(&keys, b"hashed", b"hashed");
-        let index = PartitionIndex::open(file).unwrap();
-
-        // Hash matches -> found.
-        let result = index.lookup_raw(b"hashed", Some(0xAB)).unwrap();
-        assert_eq!(result, PartitionLookup::RowIndex { position: 777 });
-    }
-
-    #[test]
-    fn lookup_with_hash_mismatch_returns_not_found() {
-        let keys = vec![(
-            b"hashed".as_slice(),
-            TriePayload {
-                hash: Some(0xAB),
-                position: 777,
-            },
-        )];
-
-        let file = build_test_partition_index(&keys, b"hashed", b"hashed");
-        let index = PartitionIndex::open(file).unwrap();
-
-        // Hash mismatch -> NotFound (Bloom filter rejection).
-        let result = index.lookup_raw(b"hashed", Some(0xCD)).unwrap();
-        assert_eq!(result, PartitionLookup::NotFound);
-    }
-
-    #[test]
-    fn lookup_with_no_filter_hash_ignores_payload_hash() {
-        let keys = vec![(
-            b"hashed".as_slice(),
-            TriePayload {
-                hash: Some(0xAB),
-                position: 777,
-            },
-        )];
-
-        let file = build_test_partition_index(&keys, b"hashed", b"hashed");
-        let index = PartitionIndex::open(file).unwrap();
-
-        // No filter hash provided -> hash check is skipped.
-        let result = index.lookup_raw(b"hashed", None).unwrap();
-        assert_eq!(result, PartitionLookup::RowIndex { position: 777 });
-    }
-
-    #[test]
-    fn open_rejects_too_small_file() {
-        let tiny: Vec<u8> = vec![0; 10];
-        let result = PartitionIndex::open(tiny);
-        assert!(result.is_err());
+        match pi.lookup(&dk).unwrap() {
+            PartitionLookup::NotFound => {}
+            other => panic!("expected NotFound due to hash mismatch, got {:?}", other),
+        }
     }
 
     #[test]
@@ -376,51 +398,66 @@ mod tests {
         data.extend_from_slice(&3u16.to_be_bytes());
         data.extend_from_slice(b"bye");
 
-        let (bytes, consumed) = read_short_length_prefixed(&data, 0).unwrap();
-        assert_eq!(bytes, b"hello");
-        assert_eq!(consumed, 7);
+        let mut pos = 0u64;
+        let first = read_short_length_prefixed(&data, &mut pos).unwrap();
+        assert_eq!(first, b"hello");
+        assert_eq!(pos, 7);
 
-        let (bytes2, consumed2) = read_short_length_prefixed(&data, 7).unwrap();
-        assert_eq!(bytes2, b"bye");
-        assert_eq!(consumed2, 5);
+        let second = read_short_length_prefixed(&data, &mut pos).unwrap();
+        assert_eq!(second, b"bye");
+        assert_eq!(pos, 12);
     }
 
     #[test]
-    fn many_keys_lookup() {
-        let mut keys: Vec<(Vec<u8>, TriePayload)> = Vec::new();
-        for i in 0..50u32 {
-            keys.push((
-                format!("partition_{i:04}").into_bytes(),
-                TriePayload {
-                    hash: Some((i & 0xFF) as u8),
-                    position: i as i64 * 100,
-                },
-            ));
-        }
-
-        let borrowed: Vec<(&[u8], TriePayload)> = keys
-            .iter()
-            .map(|(k, p)| (k.as_slice(), p.clone()))
+    fn multiple_keys_lookup() {
+        // Build an index with several keys and verify all are found.
+        let keys: Vec<DecoratedKey> = (0..10)
+            .map(|i| DecoratedKey {
+                token: Token(i * 100),
+                key: PartitionKey::from(format!("part{}", i).as_bytes()),
+            })
             .collect();
-        let file = build_test_partition_index(
-            &borrowed,
-            keys.first().unwrap().0.as_slice(),
-            keys.last().unwrap().0.as_slice(),
-        );
-        let index = PartitionIndex::open(file).unwrap();
 
-        assert_eq!(index.key_count(), 50);
+        // Encode and sort
+        let mut entries: Vec<(Vec<u8>, u8, i64, usize)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, dk)| {
+                let encoded = byte_comparable::encode(dk);
+                let (_h1, h2) = dk.filter_hash();
+                let hash = (h2 & 0xFF) as u8;
+                (encoded, hash, (i * 1000) as i64, i)
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for (i, (key, _)) in keys.iter().enumerate() {
-            let result = index.lookup_raw(key, Some(i as u8)).unwrap();
-            assert_eq!(
-                result,
-                PartitionLookup::RowIndex {
-                    position: i as u64 * 100
-                },
-                "lookup failed for key {:?}",
-                String::from_utf8_lossy(key)
-            );
+        let mut builder = TrieBuilder::new();
+        for (encoded, hash, pos, _) in &entries {
+            builder
+                .add(
+                    encoded,
+                    TriePayload {
+                        hash: Some(*hash),
+                        position: *pos,
+                    },
+                )
+                .unwrap();
+        }
+        let (trie_data, root_pos) = builder.finish().unwrap();
+
+        let index_data =
+            build_partition_index(&trie_data, root_pos, keys.len() as u64, b"part0", b"part9");
+        let pi = PartitionIndex::open(index_data).unwrap();
+        assert_eq!(pi.key_count(), 10);
+
+        // Verify each key
+        for (i, dk) in keys.iter().enumerate() {
+            match pi.lookup(dk).unwrap() {
+                PartitionLookup::RowIndex { position } => {
+                    assert_eq!(position, (i * 1000) as u64, "wrong position for key {}", i);
+                }
+                other => panic!("expected RowIndex for key {}, got {:?}", i, other),
+            }
         }
     }
 }

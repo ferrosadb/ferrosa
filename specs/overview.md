@@ -1,6 +1,6 @@
 # System Overview
 
-> Last updated: 2026-03-11
+> Last updated: 2026-03-12
 > Status: Approved
 
 ## Overview
@@ -85,7 +85,9 @@ graph LR
     A3 -.->|scopes| R3
 ```
 
-Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable. Track 2a (`ferrosa-sstable`) can start immediately.
+Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable.
+
+**Current progress**: `ferrosa-common`, `ferrosa-sstable`, and `ferrosa-storage` are implemented. Next up: `ferrosa-schema`.
 
 ## Key Architectural Decisions
 
@@ -103,21 +105,21 @@ Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analys
 Ferrosa is AWS-first but must remain portable to S3-compatible stores (MinIO, etc.):
 
 - **S3 object metadata** (`x-amz-meta-*`): Standard across S3-compatible stores. No lock-in.
-- **S3 client library**: Start with `aws-sdk-s3` (works with MinIO via endpoint override). Add trait abstraction for `object_store` crate (Apache Arrow) if broader backend support needed.
-- **S3 conditional writes** (`If-None-Match`, Nov 2024): Not required for write-behind model. If used in future native format, flag as portability concern — MinIO supports them, other S3-compat stores may not.
+- **S3 client library**: Using `object_store` crate 0.11 (Apache Arrow project) with `aws` feature. Supports S3, MinIO (via endpoint override), GCS, Azure. Configured via `FERROSA_S3_*` environment variables in `ObjectStoreConfig`.
+- **S3 conditional writes**: The manifest uses etag-based conditional put (`PutMode::Update`) for CAS. The `object_store` crate supports this on S3 and MinIO. Other S3-compatible stores may vary — flag as portability concern if expanding.
 
 ## Research Items
 
 Deferred but tracked for future investigation:
 
-| Area | Options | Notes |
-|------|---------|-------|
-| Distributed transactions | Accord, Tempo, Janus, EPaxos | Evaluate when core is stable |
-| Clock synchronization | HLC, TrueTime-like | Needed for cross-DC consistency |
-| Transport protocol | QUIC (`quinn` crate) | Better for multi-DC, built-in multiplexing |
-| Native SSTable format | S3-optimized: larger blocks, content-addressed, embedded metadata | Behind feature flag, after BTI is solid |
-| Object store abstraction | `object_store` crate (Apache Arrow) | For GCS/Azure/MinIO portability |
-| S3 conditional writes | `If-None-Match` for consistency | Portability concern |
+| Area | Options | Status |
+|------|---------|--------|
+| Distributed transactions | Accord, Tempo, Janus, EPaxos | Research — evaluate when core is stable |
+| Clock synchronization | HLC, TrueTime-like | Research — needed for cross-DC consistency |
+| Transport protocol | QUIC (`quinn` crate) | Research — better for multi-DC, built-in multiplexing |
+| Native SSTable format | S3-optimized: larger blocks, content-addressed, embedded metadata | Research — behind feature flag, after BTI is solid |
+| Object store abstraction | `object_store` crate (Apache Arrow) | **Adopted** — used for S3/MinIO/GCS/Azure portability |
+| S3 conditional writes | Etag-based CAS via `object_store` `PutMode::Update` | **Adopted** — used in manifest for consistency |
 
 ## References
 

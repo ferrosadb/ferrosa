@@ -1,0 +1,16 @@
+# Proptest configuration for ferrosa workspace.
+#
+# Override at runtime: PROPTEST_CASES=50000 cargo test
+# Regression files (*.proptest-regressions) are committed to the repo
+# so discovered failures are permanently guarded against.
+
+[default]
+# Cases per property test in normal CI / local runs.
+cases = 256
+
+# Generous shrinking budget — find minimal failing inputs.
+max_shrink_iters = 10000
+
+# Persist failing cases next to the test source file.
+# e.g. tests/foo.rs → tests/foo.proptest-regressions
+failure_persistence = "file"

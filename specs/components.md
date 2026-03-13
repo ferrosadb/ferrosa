@@ -67,15 +67,26 @@ graph BT
 
 - **Purpose**: Storage engine with S3 write-behind
 - **Location**: `ferrosa-storage/`
-- **Dependencies**: `ferrosa-common`, `ferrosa-sstable`
-- **Key interfaces**: Memtable, commit log, flush, compaction, S3 upload manager, local cache (LRU)
+- **Dependencies**: `ferrosa-common`, `ferrosa-sstable`, `arc-swap`, `parking_lot`, `crc32fast`, `object_store` (S3), `tokio`, `serde`, `serde_json`, `bytes`
+- **Status**: Parts A/B/C implemented — memtable, flush, merge, commit log, compaction, S3 upload manager, manifest, local cache, StorageEngine composition
+- **Modules**:
+  - `memtable/` — `ShardedBTreeMemtable` (16-shard `BTreeMap` with `parking_lot::RwLock`)
+  - `flush.rs` — `FlushTarget` trait, `FileFlushTarget` (disk), `InMemoryFlushTarget` (testing)
+  - `merge.rs` — Read-path merge across memtable + multiple SSTables (last-write-wins)
+  - `store.rs` — `TableStore`: lock-free per-table composition via `arc-swap`
+  - `commitlog/` — CAS-allocated segments, CRC32-checksummed entries, configurable sync strategies (Periodic/Batch/Group), checkpoint tracking per table
+  - `compaction/` — `SizeTieredStrategy` (STCS), `CompactionExecutor` (background `std::thread` with `mpsc`)
+  - `upload/` — `UploadManager` (tokio task with bounded `mpsc`, exponential backoff retry), `ObjectStoreConfig` (12-factor env vars)
+  - `manifest.rs` — S3 manifest with etag-based CAS (conditional put via `PutMode::Update`)
+  - `cache.rs` — `LocalCache` with LRU eviction, pinned entries, size tracking
+  - `engine.rs` — `StorageEngine` composing all components, `StorageEngineConfig` with `from_env()` for 12-factor config
 - **Concurrency**:
-  - *Memtable writes*: Concurrent skip list (or lock-free trie). Different partitions written in parallel; same-partition writes serialize on a per-partition lock.
-  - *Memtable flush*: Atomic swap — current memtable replaced with a fresh one; old memtable flushed to SSTable in background. Reads check both active and flushing memtable.
-  - *SSTable reads during compaction*: `Arc`-based refcounting. Compaction creates new SSTables and atomically swaps the active set. In-flight reads hold references to old SSTables, cleaned up when last reference drops.
-  - *S3 upload concurrency*: Independent async task observes new SSTables via channel, uploads without holding storage engine locks. Local files retained until S3 upload confirms.
-- **Compaction strategies**: Size-Tiered, Leveled, Time-Window
-- **External deps**: `aws-sdk-s3`, `tokio`, `crossbeam`
+  - *Memtable writes*: 16-shard `BTreeMap` — different partitions write in parallel; same-shard writes serialize on a per-shard `RwLock`.
+  - *Memtable flush*: Atomic swap via `arc-swap` — current memtable replaced with a fresh one; old memtable flushed to SSTable. Reads check both active and flushing memtable.
+  - *SSTable reads during compaction*: `Arc`-based refcounting. Compaction creates new SSTables and atomically swaps the active set via `arc-swap`. In-flight reads hold references to old SSTables, cleaned up when last reference drops.
+  - *S3 upload concurrency*: Independent tokio task observes new SSTables via bounded `mpsc` channel (backpressure), uploads without holding storage engine locks. Local files retained until S3 upload confirms.
+- **Compaction strategies**: Size-Tiered (STCS) implemented; Leveled (LCS) and Time-Window (TWCS) are follow-on work
+- **Follow-on work**: Compaction execution wiring (merge I/O), metadata collection from SSTables, S3 upload trigger from flush, manifest CAS loop integration, commit log recovery/replay, commit log S3 shipping, LCS/TWCS strategies, disk backpressure, grace period GC, orphan cleanup
 
 ### ferrosa-schema
 
@@ -131,11 +142,11 @@ gantt
 
     section Foundation
     ferrosa-common          :done, 0, 1
-    ferrosa-sstable         :active, 1, 3
+    ferrosa-sstable         :done, 1, 3
 
     section Engine
-    ferrosa-storage         :active, 3, 5
-    ferrosa-schema          :5, 6
+    ferrosa-storage         :done, 3, 5
+    ferrosa-schema          :active, 5, 6
 
     section Protocol
     ferrosa-cql             :6, 8
@@ -146,16 +157,16 @@ gantt
     ferrosa binary          :10, 11
 ```
 
-| Order | Crate | Testable Milestone | Status |
-|-------|-------|--------------------|--------|
-| 1 | ferrosa-common | Type definitions compile | Done |
-| 2 | ferrosa-sstable | Read real Cassandra SSTables, round-trip BTI | Done |
-| 3 | ferrosa-storage | Single-node writes + reads with S3 backend | Not started |
-| 4 | ferrosa-schema | Parse CREATE TABLE, system keyspaces queryable | Not started |
-| 5 | ferrosa-cql | cqlsh connects and runs basic queries | Not started |
-| 6 | ferrosa-net | Two nodes exchange messages | Not started |
-| 7 | ferrosa-cluster | 3-node cluster at QUORUM | Not started |
-| 8 | ferrosa (binary) | Full database, characterization tests pass | Not started |
+| Order | Crate | Testable Milestone |
+|-------|-------|--------------------|
+| 1 | ferrosa-common | Type definitions compile — **done** |
+| 2 | ferrosa-sstable | Read real Cassandra SSTables, round-trip BTI — **done** |
+| 3 | ferrosa-storage | Single-node writes + reads with S3 backend — **done** (core engine; follow-on items tracked) |
+| 4 | ferrosa-schema | Parse CREATE TABLE, system keyspaces queryable |
+| 5 | ferrosa-cql | cqlsh connects and runs basic queries |
+| 6 | ferrosa-net | Two nodes exchange messages |
+| 7 | ferrosa-cluster | 3-node cluster at QUORUM |
+| 8 | ferrosa (binary) | Full database, characterization tests pass |
 
 ## Related Specs
 

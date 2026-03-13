@@ -617,11 +617,11 @@ This matches Cassandra's `IncrementalDeepTrieWriterPageAware` algorithm.
 ### Reading
 
 ```rust
-/// Unified SSTable reader composing all components.
+/// Composes all SSTable component readers into a single read interface.
 pub struct SSTableReader<R: ReadAt> { /* ... */ }
 
 impl<R: ReadAt> SSTableReader<R> {
-    /// Open an SSTable from its components.
+    /// Open an SSTable from its component file handles.
     pub fn open(components: SSTableComponents<R>) -> Result<Self>;
 
     /// Look up a partition by its byte-comparable encoded key.
@@ -635,86 +635,78 @@ impl<R: ReadAt> SSTableReader<R> {
         filter_hash: Option<u8>,
     ) -> Result<Option<Partition>>;
 
-    /// Key count from the partition index.
+    /// Returns the number of partitions in this SSTable.
     pub fn key_count(&self) -> u64;
 
-    /// Access the serialization header.
+    /// Returns a reference to the bloom filter.
+    pub fn bloom_filter(&self) -> &BloomFilter;
+
+    /// Returns a reference to the serialization header.
     pub fn header(&self) -> &SerializationHeader;
 
-    /// Access the bloom filter.
-    pub fn bloom_filter(&self) -> &BloomFilter;
+    /// Returns a reference to the compression info, if present.
+    pub fn compression_info(&self) -> Option<&CompressionInfo>;
 }
 ```
+
+**Deferred to Phase 2:**
+
+- `partitions(&self) -> PartitionIterator` — full partition iteration in token order
+- `range(start, end) -> PartitionIterator` — range iteration
+- `statistics(&self) -> &SSTableStatistics` — aggregate statistics accessor
 
 ### Writing
 
 The writer accumulates all component data in memory (`Vec<u8>` buffers) rather than streaming through `WriteAt`. This simplifies the implementation and allows the caller to write the buffers to any backing store (file system, S3, etc.).
 
 ```rust
-/// Write a new SSTable in BTI format.
+/// SSTable writer that accumulates partitions and produces all component files.
 pub struct SSTableWriter { /* ... */ }
 
 impl SSTableWriter {
-    /// Create a writer with a serialization header, write options, and
-    /// expected partition count (used to size the Bloom filter).
-    pub fn new(
-        header: SerializationHeader,
-        options: WriteOptions,
-        expected_partitions: usize,
-    ) -> Self;
+    /// Create a new SSTableWriter with the given options and serialization header.
+    pub fn new(options: WriteOptions, header: SerializationHeader) -> Self;
 
-    /// Add a partition (must be called in token-sorted key order).
-    ///
-    /// The caller provides:
-    /// - `encoded_key`: byte-comparable encoded key (for the partition index trie)
-    /// - `key_bytes`: raw partition key bytes (stored in Data.db)
-    /// - `partition`: the partition data to write
-    /// - `filter_h1`, `filter_h2`: Murmur3 hash values for the Bloom filter
-    pub fn add_partition(
-        &mut self,
-        encoded_key: &[u8],
-        key_bytes: &[u8],
-        partition: &Partition,
-        filter_h1: i64,
-        filter_h2: i64,
-    ) -> Result<()>;
+    /// Add a partition (must be called in token order).
+    pub fn add_partition(&mut self, partition: &Partition) -> Result<()>;
 
-    /// Finalize and return all component buffers.
-    pub fn finish(self) -> Result<WrittenSSTable>;
-}
-
-/// All written component buffers produced by `SSTableWriter::finish()`.
-pub struct WrittenSSTable {
-    pub data: Vec<u8>,        // Data.db
-    pub partitions: Vec<u8>,  // Partitions.db (trie + key bounds + footer)
-    pub filter: Vec<u8>,      // Filter.db
-    pub statistics: Vec<u8>,  // Statistics.db
-    pub toc: Vec<u8>,         // TOC.txt
+    /// Finalize the SSTable and produce all component files.
+    pub fn finish(self) -> Result<SSTableOutput>;
 }
 ```
 
 ### Types
 
 ```rust
-/// Handles to all component files/buffers for reading an SSTable.
-///
-/// `data` and `partitions` use the generic `R: ReadAt` for positional reads.
-/// `filter`, `compression_info`, and `statistics` are pre-read into `Vec<u8>`
-/// since they are fully loaded into memory on open.
+/// Handles to all component files for reading an SSTable.
+/// Some components (filter, compression_info, statistics) are read fully
+/// into memory, while data/partitions/rows use the ReadAt trait for
+/// positional access.
 pub struct SSTableComponents<R> {
     pub data: R,
     pub partitions: R,
-    pub rows: Option<R>,
+    pub rows: R,
     pub filter: Vec<u8>,
     pub compression_info: Option<Vec<u8>>,
     pub statistics: Vec<u8>,
 }
 
+/// Result of writing an SSTable — the raw bytes for each component file.
+pub struct SSTableOutput {
+    pub data: Vec<u8>,
+    pub partitions: Vec<u8>,
+    pub rows: Vec<u8>,
+    pub filter: Vec<u8>,
+    pub compression_info: Option<Vec<u8>>,
+    pub statistics: Vec<u8>,
+    pub toc: Vec<u8>,
+}
+
 /// Configuration for SSTable writing.
 pub struct WriteOptions {
-    pub compression: Option<Compression>,  // None = uncompressed
+    pub compression: Option<Compression>,  // None = no compression
     pub bloom_fp_chance: f64,              // Default: 0.01
-    pub partitioner: String,               // Partitioner class for Statistics.db
+    pub chunk_size: usize,                 // Default: 65536
 }
 
 pub enum Compression {
@@ -755,15 +747,24 @@ Ferrosa must implement the byte-comparable encoding from `ByteComparable.java` (
 
 ## Phasing
 
-### Phase 1 (this spec)
+### Phase 1 (implemented)
 
-- BTI format reader: all component files
-- BTI format writer: all component files
+- BTI format reader: all component files (Data.db, Partitions.db, Rows.db, Filter.db, CompressionInfo.db, Statistics.db, TOC.txt)
+- BTI format writer: all component files (produces `SSTableOutput` in-memory byte buffers)
 - On-disk trie: walker (reader) and page-aware builder
 - Bloom filter: read and write, Cassandra-compatible
 - Compression: LZ4 and Zstd
 - File-system `ReadAt`/`WriteAt` implementations
+- Byte-comparable key encoding (OSS50)
+- Varint encoding/decoding with property tests
+- Unit tests and round-trip tests
+
+### Phase 1b (in progress)
+
 - Round-trip tests against Cassandra-generated fixtures
+- `SSTableReader` partition iteration (`partitions()`, `range()`)
+- `SSTableStatistics` aggregate type
+- Row index granularity configuration
 
 ### Phase 2 (deferred)
 

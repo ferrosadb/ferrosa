@@ -85,7 +85,11 @@ pub fn lookup(reader: &impl ReadAt, root_pos: u64, key: &[u8]) -> Result<LookupR
                 key_idx += 1;
             }
             None => {
-                return Ok(LookupResult::NotFound);
+                // No matching transition. In Cassandra's BTI prefix trie, a node
+                // may carry a payload even though the full key hasn't been consumed.
+                // The trie only stores enough bytes to distinguish keys; the hash
+                // byte in the payload verifies the match.
+                return extract_payload(&buf, &header);
             }
         }
     }
@@ -308,11 +312,22 @@ mod tests {
     }
 
     #[test]
-    fn not_found_key_too_long() {
+    fn prefix_match_returns_payload() {
         let (data, root_pos) = build_test_trie();
-        // "abc" matches "ab" prefix but leaf has no transition for 'c'
+        // "abc" follows 'a'->'b' to leaf1 which has a payload but no transition for 'c'.
+        // In BTI prefix tries, the trie only stores enough bytes to distinguish keys,
+        // so we return the payload — the caller uses the hash byte to verify the match.
         let result = lookup(&data, root_pos, b"abc").unwrap();
-        assert_eq!(result, LookupResult::NotFound);
+        match result {
+            LookupResult::Found {
+                payload_pb,
+                payload_bytes,
+            } => {
+                assert_eq!(payload_pb, 1);
+                assert_eq!(payload_bytes, vec![42]);
+            }
+            LookupResult::NotFound => panic!("expected Found (prefix match)"),
+        }
     }
 
     #[test]

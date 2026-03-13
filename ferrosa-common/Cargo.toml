@@ -6,5 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+proptest = { version = "1", optional = true }
+
+[features]
+test-generators = ["proptest"]
+
 [dev-dependencies]
 proptest = "1"

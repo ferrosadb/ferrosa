@@ -1,0 +1,11 @@
+//! S3-compatible upload manager using the `object_store` crate.
+//!
+//! Uploads SSTable component files to S3-compatible storage (AWS S3, MinIO,
+//! Cloudflare R2, Ceph). Configuration is 12-factor: all settings from
+//! environment variables.
+
+pub mod config;
+pub mod manager;
+
+pub use config::ObjectStoreConfig;
+pub use manager::{UploadManager, UploadTask};

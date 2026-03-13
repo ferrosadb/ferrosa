@@ -18,6 +18,16 @@ Write-behind async S3. Writes go to local commit log and memtable, ACK to client
 - Commit log shipping to S3 every 5 seconds further narrows the window
 - Compatible with any S3-compatible store (no conditional writes required)
 
+## Implementation Status (2026-03-12)
+
+The write-behind model is implemented in `ferrosa-storage`:
+
+- **Commit log**: CAS-allocated segments, CRC32-checksummed entries, configurable sync strategies (Periodic/Batch/Group), checkpoint tracking. S3 shipping of segments is follow-on work.
+- **S3 upload**: `UploadManager` with bounded `tokio::sync::mpsc` channel and exponential backoff retry, using `object_store` crate 0.11 (not `aws-sdk-s3` as originally considered). Wiring from flush/compaction output to upload is follow-on work.
+- **Manifest**: Etag-based CAS via `object_store`'s `PutMode::Update` for consistent manifest updates. CAS retry loop is follow-on work.
+- **Local cache**: LRU eviction with pinned entries and size tracking. S3 fetch-on-miss is follow-on work.
+- **Backpressure**: Bounded channel provides basic backpressure. Priority shedding and disk threshold monitoring are follow-on work.
+
 ## Consequences
 
 - Data loss window exists between local write and S3 upload on any single node
@@ -29,3 +39,4 @@ Write-behind async S3. Writes go to local commit log and memtable, ACK to client
 
 - **Write-through**: S3 PUT latency on every write. Unacceptable for p99 targets.
 - **S3-primary**: Truly stateless but requires S3 conditional writes (portability concern) and adds latency to every flush.
+- **`aws-sdk-s3`**: Initially considered, but `object_store` crate (Apache Arrow project) chosen instead for multi-backend portability (S3, MinIO, GCS, Azure) and simpler API.

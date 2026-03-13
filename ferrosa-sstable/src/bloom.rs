@@ -28,6 +28,16 @@ pub struct BloomFilter {
 }
 
 impl BloomFilter {
+    /// Number of hash functions.
+    pub fn hash_count(&self) -> i32 {
+        self.hash_count
+    }
+
+    /// Raw bit words (for debugging).
+    pub fn bits(&self) -> &[u64] {
+        &self.bits
+    }
+
     /// Create a new Bloom filter sized for the expected key count and FP rate.
     ///
     /// ```
@@ -48,13 +58,16 @@ impl BloomFilter {
     /// Add a key to the filter using its Murmur3 h1 and h2 values.
     ///
     /// Call with `DecoratedKey::filter_hash()` to get `(h1, h2)`.
+    ///
+    /// Cassandra's `BloomFilter.setIndexes` uses h2 as the base and h1 as the
+    /// increment: `hash_i = h2 + i * h1`. See `BloomFilter.java` line 101-103.
     pub fn add(&mut self, h1: i64, h2: i64) {
         let num_bits = (self.bits.len() * 64) as i64;
         for i in 0..self.hash_count as i64 {
-            let hash = h1.wrapping_add(i.wrapping_mul(h2));
-            let bit_index = (hash % num_bits + num_bits) % num_bits;
-            let word = bit_index as usize / 64;
-            let bit = bit_index as usize % 64;
+            let hash = h2.wrapping_add(i.wrapping_mul(h1));
+            let bit_index = (hash % num_bits).unsigned_abs() as usize;
+            let word = bit_index / 64;
+            let bit = bit_index % 64;
             self.bits[word] |= 1u64 << bit;
         }
     }
@@ -63,10 +76,10 @@ impl BloomFilter {
     pub fn is_present(&self, h1: i64, h2: i64) -> bool {
         let num_bits = (self.bits.len() * 64) as i64;
         for i in 0..self.hash_count as i64 {
-            let hash = h1.wrapping_add(i.wrapping_mul(h2));
-            let bit_index = (hash % num_bits + num_bits) % num_bits;
-            let word = bit_index as usize / 64;
-            let bit = bit_index as usize % 64;
+            let hash = h2.wrapping_add(i.wrapping_mul(h1));
+            let bit_index = (hash % num_bits).unsigned_abs() as usize;
+            let word = bit_index / 64;
+            let bit = bit_index % 64;
             if self.bits[word] & (1u64 << bit) == 0 {
                 return false;
             }

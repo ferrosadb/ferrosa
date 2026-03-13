@@ -1,7 +1,7 @@
 # ferrosa-sstable Design
 
 > **Date:** 2026-03-11
-> **Status:** Approved — Phase 1 leaf components (Part A) complete, Part B pending
+> **Status:** Approved — Part A complete, Part B complete (all Tasks 13–24 done)
 > **Approach:** Bottom-up by component, strict TDD (red-green-refactor)
 > **Methodology:** Literate programming (swdev) — module docs, doc-tests, property tests
 
@@ -188,48 +188,18 @@ Fixture generation scripts live in `tools/` alongside existing `generate_murmur3
 
 ## Public API
 
-See `specs/sstable.md` for format specification and full API signatures.
+See `specs/sstable.md` for full API signatures and the BTI format specification.
 
 ```rust
-/// Positional read — read bytes at an offset without seeking.
-pub trait ReadAt {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize>;
-    fn len(&self) -> Result<u64>;
-}
+pub trait ReadAt { /* positional read */ }
+pub trait WriteAt { /* positional write */ }
 
-/// Reader composes all components via SSTableComponents<R: ReadAt>.
 pub struct SSTableReader<R: ReadAt> { /* ... */ }
-
-/// Writer accumulates to in-memory Vec<u8> buffers (no WriteAt trait).
-pub struct SSTableWriter { /* ... */ }
-
-/// Component handles for reading. filter/statistics/compression_info
-/// are pre-read into Vec<u8>; data/partitions use generic R: ReadAt.
-pub struct SSTableComponents<R> {
-    pub data: R,
-    pub partitions: R,
-    pub rows: Option<R>,
-    pub filter: Vec<u8>,
-    pub compression_info: Option<Vec<u8>>,
-    pub statistics: Vec<u8>,
-}
-
-/// Writer output — all component buffers.
-pub struct WrittenSSTable {
-    pub data: Vec<u8>,
-    pub partitions: Vec<u8>,
-    pub filter: Vec<u8>,
-    pub statistics: Vec<u8>,
-    pub toc: Vec<u8>,
-}
-
-pub struct WriteOptions {
-    pub compression: Option<Compression>,
-    pub bloom_fp_chance: f64,
-    pub partitioner: String,
-}
-
-pub enum Compression { Lz4, Zstd { level: i32 } }
+pub struct SSTableWriter { /* no generic — produces SSTableOutput in-memory */ }
+pub struct SSTableComponents<R> { /* mixed: R for data/partitions/rows, Vec<u8> for filter/stats */ }
+pub struct SSTableOutput { /* all 7 components as Vec<u8> */ }
+pub struct WriteOptions { /* compression: Option<Compression>, bloom_fp_chance, chunk_size */ }
+pub enum Compression { None, Lz4, Zstd { level: i32 } }
 ```
 
 ## Literate Programming (swdev compliance)
