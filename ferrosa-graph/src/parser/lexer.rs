@@ -35,6 +35,15 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "IS" => Keyword::Is,
 };
 
+/// Check if two token kinds match. For keywords, this compares the
+/// specific keyword variant. For other token kinds, uses discriminant.
+fn kind_matches(actual: &TokenKind<'_>, expected: &TokenKind<'_>) -> bool {
+    match (actual, expected) {
+        (TokenKind::Keyword(a), TokenKind::Keyword(b)) => a == b,
+        _ => std::mem::discriminant(actual) == std::mem::discriminant(expected),
+    }
+}
+
 /// Zero-allocation lexer for Cypher queries.
 ///
 /// Yields `Token<'input>` values that borrow from the source string.
@@ -77,7 +86,7 @@ impl<'input> Lexer<'input> {
     /// Consume the next token and assert its kind matches.
     pub fn expect(&mut self, expected: &TokenKind<'_>) -> ParseResult<Token<'input>> {
         let tok = self.next_token()?;
-        if std::mem::discriminant(&tok.kind) == std::mem::discriminant(expected) {
+        if kind_matches(&tok.kind, expected) {
             Ok(tok)
         } else {
             Err(ParseError::new(
@@ -91,7 +100,7 @@ impl<'input> Lexer<'input> {
     /// if consumed.
     pub fn eat(&mut self, expected: &TokenKind<'_>) -> ParseResult<bool> {
         let tok = self.peek()?;
-        if std::mem::discriminant(&tok.kind) == std::mem::discriminant(expected) {
+        if kind_matches(&tok.kind, expected) {
             self.next_token()?;
             Ok(true)
         } else {
