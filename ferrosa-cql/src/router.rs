@@ -920,6 +920,7 @@ fn route_create_table(
             .collect(),
         params: TableParams::default(),
         flags: HashSet::new(),
+        extensions: std::collections::HashMap::new(),
     };
 
     // Register with schema

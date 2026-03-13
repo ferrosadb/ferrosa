@@ -27,6 +27,8 @@ pub struct TableMetadata {
     pub params: TableParams,
     /// Table flags describing the table's characteristics.
     pub flags: HashSet<TableFlag>,
+    /// Opaque key-value extensions on the table (e.g., graph.type, graph.label).
+    pub extensions: HashMap<String, String>,
 }
 
 /// Flags describing table characteristics.
@@ -278,6 +280,7 @@ mod tests {
             clustering_key: vec![("ts".to_string(), ClusteringOrder::Desc)],
             params: TableParams::default(),
             flags,
+            extensions: HashMap::new(),
         };
 
         assert_eq!(table.keyspace, "my_ks");
@@ -317,6 +320,7 @@ mod tests {
             clustering_key: vec![],
             params: TableParams::default(),
             flags,
+            extensions: HashMap::new(),
         };
 
         let json = serde_json::to_string(&table).expect("serialize");
@@ -360,6 +364,54 @@ mod tests {
         assert!(empty_updates.params.is_none());
         assert!(empty_updates.add_columns.is_empty());
         assert!(empty_updates.drop_columns.is_empty());
+    }
+
+    #[test]
+    fn table_metadata_extensions_default_empty() {
+        let table = TableMetadata {
+            keyspace: "ks".to_string(),
+            name: "t".to_string(),
+            id: Uuid::new_v4(),
+            columns: IndexMap::new(),
+            partition_key: vec![],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+        };
+        assert!(table.extensions.is_empty());
+    }
+
+    #[test]
+    fn table_metadata_extensions_serde_roundtrip() {
+        let mut extensions = HashMap::new();
+        extensions.insert("graph.type".to_string(), "vertex".to_string());
+        extensions.insert("graph.label".to_string(), "person".to_string());
+
+        let table = TableMetadata {
+            keyspace: "ks".to_string(),
+            name: "t".to_string(),
+            id: Uuid::new_v4(),
+            columns: IndexMap::new(),
+            partition_key: vec![],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions,
+        };
+
+        let json = serde_json::to_string(&table).expect("serialize");
+        let deserialized: TableMetadata = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(table.extensions.len(), deserialized.extensions.len());
+        assert_eq!(
+            table.extensions.get("graph.type"),
+            deserialized.extensions.get("graph.type")
+        );
+        assert_eq!(
+            table.extensions.get("graph.label"),
+            deserialized.extensions.get("graph.label")
+        );
     }
 
     #[test]

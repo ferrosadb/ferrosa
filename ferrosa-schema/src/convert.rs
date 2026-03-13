@@ -198,7 +198,7 @@ mod tests {
     use crate::metadata::column::{ClusteringOrder, ColumnMetadata};
     use crate::metadata::table::TableParams;
     use indexmap::IndexMap;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn cql_text_to_utf8type() {
@@ -336,6 +336,7 @@ mod tests {
             clustering_key: vec![],
             params: TableParams::default(),
             flags: HashSet::new(),
+            extensions: HashMap::new(),
         };
 
         let schema = table.to_storage_schema();
@@ -398,6 +399,7 @@ mod tests {
             clustering_key: vec![("ts".to_string(), ClusteringOrder::Desc)],
             params: TableParams::default(),
             flags: HashSet::new(),
+            extensions: HashMap::new(),
         };
 
         let schema = table.to_storage_schema();

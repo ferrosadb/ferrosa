@@ -1232,6 +1232,7 @@ mod tests {
             clustering_key: vec![],
             params: TableParams::default(),
             flags,
+            extensions: HashMap::new(),
         }
     }
 
