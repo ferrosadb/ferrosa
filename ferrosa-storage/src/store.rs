@@ -27,7 +27,10 @@ use ferrosa_sstable::writer::SSTableWriter;
 use ferrosa_sstable::WriteOptions;
 
 use crate::flush::{self, FlushTarget};
+#[cfg(not(feature = "skiplist-memtable"))]
 use crate::memtable::sharded::ShardedBTreeMemtable;
+#[cfg(feature = "skiplist-memtable")]
+use crate::memtable::skiplist::SkipListMemtable;
 use crate::memtable::Memtable;
 use crate::merge;
 
@@ -60,10 +63,21 @@ pub struct TableStore<F: FlushTarget> {
     options: WriteOptions,
 }
 
+fn new_memtable() -> Arc<dyn Memtable> {
+    #[cfg(feature = "skiplist-memtable")]
+    {
+        Arc::new(SkipListMemtable::new())
+    }
+    #[cfg(not(feature = "skiplist-memtable"))]
+    {
+        Arc::new(ShardedBTreeMemtable::with_default_shards())
+    }
+}
+
 impl<F: FlushTarget> TableStore<F> {
     /// Create a new `TableStore` with an empty memtable and no SSTables.
     pub fn new(schema: TableSchema, flush_target: F, options: WriteOptions) -> Self {
-        let active: Arc<dyn Memtable> = Arc::new(ShardedBTreeMemtable::with_default_shards());
+        let active: Arc<dyn Memtable> = new_memtable();
         let initial_view = StoreView {
             active,
             flushing: None,
@@ -138,7 +152,7 @@ impl<F: FlushTarget> TableStore<F> {
         let _guard = self.flush_guard.lock();
 
         // Step 1: Swap in a fresh active memtable, move old to flushing.
-        let new_active: Arc<dyn Memtable> = Arc::new(ShardedBTreeMemtable::with_default_shards());
+        let new_active: Arc<dyn Memtable> = new_memtable();
         let old_view = self.view.load();
         let old_active = Arc::clone(&old_view.active);
         let current_sstables = Arc::clone(&old_view.sstables);
@@ -199,6 +213,44 @@ impl<F: FlushTarget> TableStore<F> {
         }));
 
         Ok(())
+    }
+
+    /// Reads partitions from the memtable in token order with an optional
+    /// token range filter and limit.
+    ///
+    /// Currently scans the active memtable only (full snapshot, then filter).
+    /// This is O(N) in the memtable size — acceptable for an initial impl
+    /// but should be optimized with a range-aware iterator when the
+    /// SkipListMemtable is available. SSTable range reads will be added
+    /// when the SSTable reader supports range iteration.
+    pub fn read_range(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        limit: usize,
+    ) -> Result<Vec<Partition>> {
+        let guard = self.view.load();
+        let snapshot = guard.active.snapshot();
+
+        let filtered: Vec<Partition> = snapshot
+            .into_iter()
+            .filter(|p| {
+                if let Some(s) = start {
+                    if p.key < *s {
+                        return false;
+                    }
+                }
+                if let Some(e) = end {
+                    if p.key > *e {
+                        return false;
+                    }
+                }
+                true
+            })
+            .take(limit)
+            .collect();
+
+        Ok(filtered)
     }
 
     /// Number of SSTables currently in the store.
@@ -408,7 +460,44 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Test 8: flush on an empty memtable is a no-op
+    // Test 8: read_range returns partitions in order
+    // -------------------------------------------------------------------------
+    #[test]
+    fn read_range_returns_partitions_in_order() {
+        let store = test_store();
+        // Write several partitions.
+        for i in 0..5 {
+            let key = make_key(&format!("k{i}"));
+            store
+                .write(&key, make_row(format!("v{i}").as_bytes(), 1000))
+                .unwrap();
+        }
+
+        let results = store.read_range(None, None, 100).unwrap();
+        assert_eq!(results.len(), 5);
+        // Should be in token order.
+        for window in results.windows(2) {
+            assert!(window[0].key <= window[1].key);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 9: read_range with limit
+    // -------------------------------------------------------------------------
+    #[test]
+    fn read_range_with_limit() {
+        let store = test_store();
+        for i in 0..10 {
+            store
+                .write(&make_key(&format!("k{i}")), make_row(b"v", 1000))
+                .unwrap();
+        }
+        let results = store.read_range(None, None, 3).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 10: flush on an empty memtable is a no-op
     // -------------------------------------------------------------------------
     #[test]
     fn flush_empty_memtable_is_noop() {
