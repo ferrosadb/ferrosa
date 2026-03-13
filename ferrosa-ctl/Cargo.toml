@@ -1,0 +1,18 @@
+[package]
+name = "ferrosa-ctl"
+description = "CLI administration and observability tool for Ferrosa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ferrosa-ctl"
+path = "src/main.rs"
+
+[dependencies]
+ferrosa-cql = { path = "../ferrosa-cql" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tabled = "0.17"
+serde_json = "1"

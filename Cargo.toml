@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "ferrosa",
     "ferrosa-common",
+    "ferrosa-ctl",
     "ferrosa-cql",
     "ferrosa-graph",
     "ferrosa-schema",
