@@ -120,7 +120,13 @@ impl GraphEngine {
         let snap = self.schema.snapshot();
         let logical = validate(&snap, auth, keyspace, statement)?;
         let physical = plan(logical)?;
-        execute(physical, &self.storage, keyspace, &self.config)
+        execute(
+            physical,
+            &self.storage,
+            keyspace,
+            &self.config,
+            Some(self.schema.virtual_tables()),
+        )
     }
 
     /// Explain a query: parse -> validate -> plan (return plan description).
