@@ -13,6 +13,7 @@ ferrosa-storage = { path = "../ferrosa-storage" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
+futures = "0.3"
 arc-swap = "1.7"
 uuid = { version = "1", features = ["v4"] }
 num-bigint = "0.4"

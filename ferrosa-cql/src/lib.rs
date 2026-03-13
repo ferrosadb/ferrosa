@@ -16,6 +16,8 @@
 //! access goes through `Arc<StorageEngine>`.
 
 pub mod auth;
+pub mod connection;
 pub mod error;
 pub mod frame;
+pub mod server;
 pub mod types;
