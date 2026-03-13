@@ -178,6 +178,14 @@ impl Schema {
         self.inner.load_full()
     }
 
+    /// Return a reference to the inner ArcSwap for lock-free reads.
+    ///
+    /// For hot-path code that needs repeated lock-free reads (e.g., observers),
+    /// use this instead of `snapshot()` to avoid `Arc` cloning on each call.
+    pub fn schema_ref(&self) -> &ArcSwap<SchemaSnapshot> {
+        &self.inner
+    }
+
     /// Authenticate a user with username and password.
     ///
     /// Checks the rate limiter, verifies the password, optionally upgrades
