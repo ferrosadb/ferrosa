@@ -5,7 +5,7 @@
 
 ## Overview
 
-Ferrosa is a Cargo workspace of 8 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently.
+Ferrosa is a Cargo workspace of 9 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently.
 
 ## Dependency Graph
 
@@ -19,6 +19,7 @@ graph BT
     CQL[ferrosa-cql<br/>CQL protocol v5]
     Graph[ferrosa-graph<br/>Graph query engine]
     Cluster[ferrosa-cluster<br/>Raft, routing, CL]
+    Ctl[ferrosa-ctl<br/>CLI admin + TUI]
     Bin[ferrosa<br/>Binary]
 
     SST --> Common
@@ -36,6 +37,7 @@ graph BT
     Cluster --> Common
     Cluster --> Net
     Cluster --> Storage
+    Ctl --> CQL
     Bin --> CQL
     Bin --> Graph
     Bin --> Cluster
@@ -87,6 +89,8 @@ graph BT
   - `cache.rs` — `LocalCache` with LRU eviction, pinned entries, size tracking
   - `engine.rs` — `StorageEngine` composing all components, `StorageEngineConfig` with `from_env()` for 12-factor config
   - `observer.rs` — `WriteObserver` trait with `ObserverMode::Sync`/`Async`, bounded `mpsc` channel for async dispatch with backpressure (T9 mitigation)
+  - `subscription_observer.rs` — `SubscriptionObserver` (`WriteObserver` impl, async mode), pushes write events to connected subscribers
+  - `virtual_tables.rs` — `StorageStatsTable`, `StorageStatsProvider` trait for exposing memtable/SSTable/cache metrics to virtual table queries
 - **Concurrency**:
   - *Memtable writes*: 64-shard `BTreeMap` — different partitions write in parallel; same-shard writes serialize on a per-shard `RwLock`. Alternative: `SkipListMemtable` (lock-free, `crossbeam-skiplist`, behind feature flag).
   - *Memtable flush*: Atomic swap via `arc-swap` — current memtable replaced with a fresh one; old memtable flushed to SSTable. Reads check both active and flushing memtable.
@@ -110,6 +114,8 @@ graph BT
   - `secrets/` — `SecretsProvider` trait, `EnvSecretsProvider`
   - `startup.rs` — `validate_production_requirements()`, `DeploymentMode`
   - `convert.rs` — CQL-to-marshal type conversion
+  - `virtual_table.rs` — `VirtualTable` trait, `VirtualRow`, `VirtualColumnDef`, `RowPredicate`, `SubscriptionMode` (None/Polling/Push)
+  - `virtual_registry.rs` — `VirtualTableRegistry` with lock-free `ArcSwap` for concurrent reads, register/lookup by keyspace.table
 - **Key interfaces**: Table/keyspace definitions, CREATE/ALTER/DROP validation, system keyspace queries (`system.local`, `system.peers`, `system_schema.*`)
 - **Persistence**: Schema is Raft-committed metadata (via `ferrosa-cluster`). All nodes have identical schema at the same Raft index.
 - **Agreement**: Raft applied index comparison, not gossip-based version UUIDs (though UUIDs maintained for driver compat)
@@ -134,6 +140,11 @@ graph BT
   - `router.rs` — Query routing to schema/storage, `SharedState`, `SingleNodeClusterState`
   - `prepared.rs` — `PreparedCache` (moka W-TinyLFU, weight-based, MD5 IDs)
   - `result.rs` — CQL result encoding
+  - `virtual_tables/connections.rs` — `ConnectionTracker` (`RwLock`-backed), `ConnectionInfo` for tracking active CQL connections
+  - `virtual_tables/active_queries.rs` — `QueryTracker`, `QueryInfo`, `QueryGuard` (RAII auto-deregister), `ActiveQueriesTable` for in-flight query monitoring
+  - `subscribe.rs` — `SubscriptionState`, `SubscriptionHandle` for per-connection lifecycle management of virtual table subscriptions
+  - `prometheus.rs` — `render_metrics()` — Prometheus text exposition format from virtual tables (connections, queries, storage stats)
+  - `client.rs` — `CqlClient`, thin async CQL client for admin tooling (`QueryResult`, `ResultRow`)
 - **Key interfaces**: Full CQL query lifecycle — frame decode → parse → route → execute → encode result
 - **Auth**: SASL PLAIN with `Schema::authenticate()`, rate limiting, connection state machine
 - **Supported operations**: SELECT, INSERT, UPDATE, DELETE, BATCH, CREATE/ALTER/DROP KEYSPACE/TABLE, CREATE/ALTER/DROP ROLE, GRANT/REVOKE, TRUNCATE, USE, PREPARE/EXECUTE, system table queries
@@ -160,6 +171,19 @@ graph BT
 - **Security mitigations**: T2 (HTTP auth), T3 (per-hop auth), T4 (timeout + fan-out limits), T5 (reconciliation), T6 (extension validation in schema), T7 (system table protection), T8 (error sanitization), T9 (observer backpressure), T10 (audit events), T11 (TLS)
 - **Design**: Data stored in normal CQL tables with `graph.*` extensions, accessed via system-managed adjacency index per keyspace
 
+### ferrosa-ctl
+
+- **Purpose**: CLI admin tool with TUI monitor for inspecting and managing a running Ferrosa node
+- **Location**: `ferrosa-ctl/`
+- **Dependencies**: `ferrosa-cql`, `clap`, `ratatui`, `crossterm`, `tabled`, `tokio`
+- **Status**: Implemented — CLI subcommands for node inspection, live TUI dashboard with auto-refresh
+- **Modules**:
+  - `main.rs` — CLI entry point with `clap` derive, subcommands: `status`, `connections`, `queries`, `storage`, `topology`, `peers`, `monitor`
+  - `commands.rs` — Async subcommand implementations using `CqlClient` to query virtual tables
+  - `tui.rs` — `ratatui` TUI with `Panel` enum (`Connections`/`Queries`/`Storage`), `AppState`, 2-second auto-refresh, keyboard navigation
+- **Key interfaces**: Connects to a Ferrosa node via CQL protocol using `ferrosa-cql::CqlClient`, queries `system_virtual.*` tables for live metrics
+- **Usage**: `ferrosa-ctl --host 127.0.0.1 --port 9042 <subcommand>`
+
 ### ferrosa-net
 
 - **Purpose**: Custom internode protocol
@@ -182,10 +206,15 @@ graph BT
 
 - **Purpose**: Compose all crates into the running database
 - **Location**: `ferrosa/` (workspace root binary)
-- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `ferrosa-cql`, `ferrosa-graph`, `tokio`, `tracing`, `tracing-subscriber`
-- **Status**: Single-node operation implemented — starts CQL server on port 9042, optionally starts graph HTTP on port 7474
-- **Startup sequence**: tracing init → `StorageEngine::new()` → `Schema::new()` → `CqlServer::start_background()` → optional `GraphEngine` + HTTP (gated by `FERROSA_GRAPH_ENABLED`) → ctrl-c → graceful shutdown
-- **Environment variables**: `FERROSA_CQL_BIND` (default `0.0.0.0:9042`), `FERROSA_AUTH_DISABLED` (default false), `FERROSA_GRAPH_ENABLED` (default false), plus storage/schema env vars
+- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `ferrosa-cql`, `ferrosa-graph`, `axum`, `rust-embed`, `tokio`, `tracing`, `tracing-subscriber`
+- **Status**: Single-node operation implemented — starts CQL server on port 9042, optionally starts graph HTTP on port 7474, starts web admin server on port 9090
+- **Modules**:
+  - `web/mod.rs` — `WebConfig`, `start_web_server()` on port 9090 (configurable), Axum router composition
+  - `web/api.rs` — Axum JSON API routes: `/api/connections`, `/api/storage_stats`, `/api/active_queries`, `/api/tables`
+  - `web/static_files.rs` — `rust-embed` static file serving for the dashboard UI
+  - `web/index.html` — Single-file HTML/CSS/JS dashboard with auto-refresh, connection/query/storage panels
+- **Startup sequence**: tracing init → `StorageEngine::new()` → `Schema::new()` → `CqlServer::start_background()` → optional `GraphEngine` + HTTP (gated by `FERROSA_GRAPH_ENABLED`) → web admin server on port 9090 → ctrl-c → graceful shutdown
+- **Environment variables**: `FERROSA_CQL_BIND` (default `0.0.0.0:9042`), `FERROSA_AUTH_DISABLED` (default false), `FERROSA_GRAPH_ENABLED` (default false), `FERROSA_WEB_BIND` (default `0.0.0.0:9090`), plus storage/schema env vars
 
 ## Build Order
 
@@ -208,9 +237,12 @@ gantt
     ferrosa-graph           :done, 6, 7
     ferrosa-net             :7, 8
 
+    section Tools
+    ferrosa-ctl             :done, 8, 9
+
     section Distributed
-    ferrosa-cluster         :8, 10
-    ferrosa binary          :done, 10, 11
+    ferrosa-cluster         :9, 11
+    ferrosa binary          :done, 11, 12
 ```
 
 | Order | Crate | Testable Milestone |
@@ -221,6 +253,7 @@ gantt
 | 4 | ferrosa-schema | Schema registry, auth, audit, system keyspaces queryable — **done** |
 | 5 | ferrosa-cql | cqlsh connects and runs basic queries — **done** (full CQL lifecycle: parse, route, execute, prepared cache) |
 | 5b | ferrosa-graph | Graph queries via HTTP with auth — **done** (Phase 1: parser, planner, executor, adjacency index, HTTP) |
+| 5c | ferrosa-ctl | CLI admin connects and displays node status — **done** (subcommands, TUI monitor) |
 | 6 | ferrosa-net | Two nodes exchange messages |
 | 7 | ferrosa-cluster | 3-node cluster at QUORUM |
 | 8 | ferrosa (binary) | Single-node binary accepts CQL on 9042 — **done**; distributed mode pending ferrosa-net/cluster |

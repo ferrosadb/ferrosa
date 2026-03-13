@@ -1,6 +1,6 @@
 # Data Flow
 
-> Last updated: 2026-03-12
+> Last updated: 2026-03-13
 > Status: Approved
 
 ## Overview
@@ -273,6 +273,233 @@ s3://ferrosa-data/{cluster_id}/
 | `x-amz-meta-ferrosa-checksum` | `sha256:abc123...` | Integrity verification |
 | `x-amz-meta-ferrosa-uploaded-by` | `node-3` | Source node |
 | `x-amz-meta-ferrosa-created-at` | `2026-03-11T...` | Lifecycle policies |
+
+## Observability
+
+### Virtual Table Read Path
+
+Virtual tables are code-backed (not SSTable-backed) and served entirely in-process. The router intercepts SELECTs targeting virtual table keyspaces before the storage engine is consulted.
+
+```mermaid
+sequenceDiagram
+    participant C as CQL Client
+    participant Router as CQL Router
+    participant VTR as VirtualTableRegistry
+    participant VT as VirtualTable impl
+
+    C->>Router: SELECT * FROM system_observability.connections
+    Router->>VTR: get("system_observability", "connections")
+    alt Found in registry
+        VTR->>Router: Arc<dyn VirtualTable>
+        Router->>VT: table.read(predicate)
+        VT->>Router: Vec<VirtualRow>
+        Router->>C: CQL RESULT frame (rows)
+    else Not found
+        Router->>Router: Fall through to user table lookup
+    end
+```
+
+**Implementation**: The `VirtualTableRegistry` (`ferrosa-schema/src/virtual_registry.rs`) stores `Arc<dyn VirtualTable>` in an `ArcSwap<HashMap>` for lock-free reads. The router (`ferrosa-cql/src/router.rs`) checks `state.schema.virtual_tables().get(ks, &s.table)` before attempting storage engine lookups.
+
+### Connection Tracking Flow
+
+Every CQL TCP connection is registered with a `ConnectionTracker` on accept and deregistered on disconnect. State transitions are tracked as the connection progresses through the protocol handshake.
+
+```mermaid
+sequenceDiagram
+    participant TCP as TCP Accept
+    participant Server as CQL Server
+    participant CT as ConnectionTracker
+    participant VT as ConnectionsTable
+
+    TCP->>Server: New connection (SocketAddr)
+    Server->>CT: register(addr, ConnectionInfo{state: "startup"})
+
+    Server->>Server: Receive STARTUP frame
+    Server->>CT: update_state(addr, "authenticating")
+
+    Server->>Server: Auth handshake completes
+    Server->>CT: update_state(addr, "ready")
+    Server->>CT: update_username(addr, "alice")
+
+    loop Each request
+        Server->>CT: increment_requests(addr)
+    end
+
+    Note over VT: SELECT * FROM system_observability.connections
+    VT->>CT: read(None) — snapshot all ConnectionInfo
+
+    Server->>Server: Connection closes
+    Server->>CT: deregister(addr)
+```
+
+**Implementation**: `ConnectionTracker` (`ferrosa-cql/src/virtual_tables/connections.rs`) uses `RwLock<HashMap<SocketAddr, ConnectionInfo>>`. Each `ConnectionInfo` carries `peer_address`, `peer_port`, `state` (`"startup"` / `"authenticating"` / `"ready"`), `username`, `connected_at`, `requests_served`, and `protocol_version`. The `ConnectionsTable` exposes this as `system_observability.connections` with primary key `(peer_address, peer_port)`.
+
+### Query Tracking Flow
+
+Every query is tracked from arrival to completion via `QueryTracker`. The RAII `QueryGuard` ensures automatic deregistration even if query execution panics.
+
+```mermaid
+sequenceDiagram
+    participant C as CQL Client
+    participant Server as CQL Server
+    participant QT as QueryTracker
+    participant VT as ActiveQueriesTable
+
+    C->>Server: QUERY frame
+    Server->>QT: begin_guarded(query, keyspace, client, username)
+    QT->>Server: QueryGuard (holds query_id)
+
+    Server->>Server: Execute query
+
+    Note over VT: SELECT * FROM system_observability.active_queries
+    VT->>QT: snapshot() — all in-flight QueryInfo
+
+    Server->>Server: Query completes (or panics)
+    Note over QT: QueryGuard dropped → auto-calls complete(id)
+    QT->>QT: Remove from active map, increment total_executed
+```
+
+**Implementation**: `QueryTracker` (`ferrosa-cql/src/virtual_tables/active_queries.rs`) uses `RwLock<HashMap<u64, QueryInfo>>` with `AtomicU64` for ID generation and total-executed counting. `QueryGuard` implements `Drop` to call `complete()`. The `ActiveQueriesTable` exposes this as `system_observability.active_queries` with primary key `query_id`. Columns: `query_id`, `client_address`, `username`, `query_text`, `keyspace`, `start_time` (epoch ms), `elapsed_ms`, `state`.
+
+### Prometheus Scrape Flow
+
+The Prometheus exporter converts all virtual tables in `system_observability` into text exposition format. Text columns become labels; numeric columns (Int, BigInt, Double) become metric values named `ferrosa_<table>_<column>`.
+
+```mermaid
+sequenceDiagram
+    participant P as Prometheus
+    participant HTTP as HTTP Server (port 9090)
+    participant Prom as prometheus::render_metrics()
+    participant VTR as VirtualTableRegistry
+
+    P->>HTTP: GET /metrics
+    HTTP->>Prom: render_metrics(registry)
+    Prom->>VTR: list("system_observability")
+    VTR->>Prom: Vec<Arc<dyn VirtualTable>>
+
+    loop Each virtual table
+        Prom->>Prom: table.read(None)
+        Prom->>Prom: Text columns → labels, numeric columns → metric values
+        Prom->>Prom: format_metric("ferrosa_{table}_{column}", labels, value)
+    end
+
+    Prom->>HTTP: Prometheus text exposition string
+    HTTP->>P: HTTP 200 text/plain
+```
+
+**Implementation**: `render_metrics()` (`ferrosa-cql/src/prometheus.rs`) iterates `registry.list("system_observability")`, calls `table.read(None)` on each, and emits metric lines. Tombstoned cells are skipped. The `/metrics` route wiring is follow-on work — the renderer is complete.
+
+### Web Dashboard Flow
+
+An Axum-based web server (default port 9090) serves both a static HTML frontend and JSON API endpoints backed by the `VirtualTableRegistry`. The frontend auto-refreshes every 5 seconds.
+
+```mermaid
+sequenceDiagram
+    participant Browser as Browser
+    participant Axum as Axum Web Server (port 9090)
+    participant API as API Handler
+    participant VTR as VirtualTableRegistry
+    participant VT as VirtualTable impl
+
+    Browser->>Axum: GET /api/connections
+    Axum->>API: get_connections(State(registry))
+    API->>VTR: get("system_observability", "connections")
+    VTR->>API: Arc<dyn VirtualTable>
+    API->>VT: table.read(None)
+    VT->>API: Vec<VirtualRow>
+    API->>API: virtual_table_to_json() — decode cells by DataType
+    API->>Axum: Json(Value)
+    Axum->>Browser: HTTP 200 application/json
+
+    Note over Browser: Auto-refresh every 5 seconds
+```
+
+**Endpoints**:
+
+| Route | Handler | Virtual Table |
+|-------|---------|---------------|
+| `GET /api/connections` | `get_connections` | `system_observability.connections` |
+| `GET /api/storage_stats` | `get_storage_stats` | `system_observability.storage_stats` |
+| `GET /api/active_queries` | `get_active_queries` | `system_observability.active_queries` |
+| `GET /api/tables` | `list_tables` | Lists all tables in `system_observability` |
+
+**Implementation**: `ferrosa/src/web/mod.rs` binds on `FERROSA_WEB_BIND` (default `0.0.0.0:9090`). `ferrosa/src/web/api.rs` converts virtual table rows to JSON: Text columns become strings, Int/BigInt become numbers, Double uses `from_f64`, Boolean checks first byte, tombstones become `null`, and unrecognized types render as `"<binary>"`. Static files are served via rust-embed on the fallback route.
+
+### TUI Monitor Flow
+
+`ferrosa-ctl monitor` provides a terminal dashboard using ratatui. It connects as a CQL client and polls virtual tables via standard CQL queries.
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant CTL as ferrosa-ctl monitor
+    participant CQL as CQL Server
+    participant VT as Virtual Tables
+
+    User->>CTL: ferrosa-ctl monitor --node 127.0.0.1:9042
+
+    CTL->>CQL: CqlClient::connect(addr)
+    CTL->>CTL: Enter raw terminal mode (crossterm)
+
+    loop Event loop (poll every 100ms)
+        alt Refresh due (every 2 seconds)
+            CTL->>CQL: SELECT * FROM system_observability.connections
+            CQL->>VT: route_select → VirtualTable.read()
+            VT->>CQL: rows
+            CQL->>CTL: QueryResult
+
+            CTL->>CQL: SELECT * FROM system_observability.active_queries
+            CQL->>CTL: QueryResult
+
+            CTL->>CQL: SELECT * FROM system_observability.storage_stats
+            CQL->>CTL: QueryResult
+        end
+
+        CTL->>CTL: ratatui renders panels (Connections, Queries, Storage)
+
+        alt Keyboard input
+            Note over CTL: Tab → next panel, Up/Down → scroll, q → quit
+        end
+    end
+
+    CTL->>CTL: Leave raw terminal mode
+```
+
+**Implementation**: `ferrosa-ctl/src/tui.rs` uses three panels (`Connections`, `Queries`, `Storage`). The event loop polls crossterm events with a 100 ms timeout and refreshes CQL data every 2 seconds via `AppState::refresh()`. Panel switching resets scroll position. The CQL client runs on a tokio runtime handle with `block_on()` for synchronous integration with the ratatui render loop.
+
+### Subscription Flow (Deferred)
+
+SUBSCRIBE allows clients to receive notifications when watched tables are written to. The observer hooks into the storage write path and filters mutations by subscription interest.
+
+```mermaid
+sequenceDiagram
+    participant C as CQL Client
+    participant Parser as CQL Parser
+    participant SO as SubscriptionObserver
+    participant Engine as Storage Engine
+
+    C->>Parser: SUBSCRIBE SELECT * FROM ks.users
+    Parser->>Parser: Produce Subscribe AST
+
+    Parser->>SO: register(SubscriptionFilter{tables: [ks.users]})
+    SO->>SO: Increment table_watch_counts[ks.users]
+    SO->>Parser: SubscriptionId
+
+    Note over SO: SubscriptionObserver implements WriteObserver (Async mode)
+
+    loop On each write to ks.users
+        Engine->>SO: on_write(table, mutation)
+        SO->>SO: watches_table(table) → true
+        Note over SO: Notification delivery via tokio channels (T19 — follow-on)
+    end
+
+    C->>C: Disconnect
+    Note over SO: deregister(subscription_id)
+    SO->>SO: Decrement table_watch_counts[ks.users]
+```
+
+**Implementation status**: The `SubscriptionObserver` (`ferrosa-storage/src/subscription_observer.rs`) implements `WriteObserver` with `ObserverMode::Async`. It maintains ref-counted `table_watch_counts` so multiple subscriptions to the same table are handled correctly — only when the last subscription is removed does `watches_table()` return false. Currently, `on_write()` returns an empty vec; notification delivery via tokio channels is deferred (T19). The `SubscriptionState` per-connection tracking and `SUBSCRIBE` AST parsing are also follow-on work.
 
 ## Related Specs
 

@@ -14,6 +14,7 @@ graph TB
     subgraph Clients
         D1[CQL Drivers]
         D2[cqlsh]
+        D3[ferrosa-ctl<br/>CLI + TUI Monitor]
     end
 
     subgraph "Ferrosa Node"
@@ -23,6 +24,7 @@ graph TB
         Storage[ferrosa-storage<br/>Memtable, Cache, Compaction]
         SST[ferrosa-sstable<br/>BTI Read + Write]
         Net[ferrosa-net<br/>Internode Protocol]
+        Web[Web Console<br/>Port 9090]
     end
 
     subgraph "Persistence"
@@ -36,6 +38,7 @@ graph TB
     end
 
     D1 & D2 -->|CQL Native Protocol v5| CQL
+    D3 -->|CQL + HTTP| CQL & Web
     CQL --> Schema
     CQL --> Storage
     CQL --> Cluster
@@ -77,6 +80,7 @@ graph LR
         R5 --> R6[ferrosa-net]
         R6 --> R7[ferrosa-cluster]
         R7 --> R8[ferrosa binary]
+        R8 --> R9[ferrosa-ctl]
     end
 
     A4 -.->|feeds| R2
@@ -87,7 +91,7 @@ graph LR
 
 Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable.
 
-**Current progress**: All core crates are implemented. `ferrosa-common`, `ferrosa-sstable`, `ferrosa-storage`, `ferrosa-schema`, and `ferrosa-cql` (Parts A-D: protocol, parser, routing, prepared cache, security hardening) are complete. `ferrosa-graph` Phase 1 is complete (Cypher parser, planner, executor, adjacency index, HTTP endpoint with auth/TLS). The `ferrosa` binary crate composes everything into a working single-node database accepting CQL on port 9042 and optionally graph queries on port 7474. Next up: `ferrosa-net` (internode protocol) and `ferrosa-cluster` (Raft, distributed coordination).
+**Current progress**: All core crates are implemented. `ferrosa-common`, `ferrosa-sstable`, `ferrosa-storage`, `ferrosa-schema`, and `ferrosa-cql` (Parts A-D + observability) are complete. `ferrosa-graph` Phase 1 is complete (Cypher parser, planner, executor, adjacency index, HTTP endpoint with auth/TLS). The observability system is complete: virtual tables in `system_observability`, Prometheus metrics, web dashboard, SUBSCRIBE/UNSUBSCRIBE CQL extensions, and the `ferrosa-ctl` CLI admin tool with TUI monitor. The `ferrosa` binary crate composes everything into a working single-node database accepting CQL on port 9042, optionally graph queries on port 7474, and a web console on port 9090. Next up: `ferrosa-net` (internode protocol) and `ferrosa-cluster` (Raft, distributed coordination).
 
 ## Key Architectural Decisions
 
@@ -107,6 +111,46 @@ Ferrosa is AWS-first but must remain portable to S3-compatible stores (MinIO, et
 - **S3 object metadata** (`x-amz-meta-*`): Standard across S3-compatible stores. No lock-in.
 - **S3 client library**: Using `object_store` crate 0.11 (Apache Arrow project) with `aws` feature. Supports S3, MinIO (via endpoint override), GCS, Azure. Configured via `FERROSA_S3_*` environment variables in `ObjectStoreConfig`.
 - **S3 conditional writes**: The manifest uses etag-based conditional put (`PutMode::Update`) for CAS. The `object_store` crate supports this on S3 and MinIO. Other S3-compatible stores may vary — flag as portability concern if expanding.
+
+## Observability
+
+Ferrosa includes a built-in observability system that exposes live database state through multiple interfaces without requiring external tooling for basic monitoring.
+
+### Virtual Tables
+
+The `system_observability` keyspace provides read-only virtual tables that are computed on demand rather than stored on disk:
+
+| Table | Source | Contents |
+|-------|--------|----------|
+| `connections` | `ConnectionTracker` (ferrosa-cql) | Active CQL client connections, addresses, auth state |
+| `active_queries` | `QueryTracker` (ferrosa-cql) | In-flight queries, elapsed time, bound parameters |
+| `storage_stats` | `StorageStatsTable` (ferrosa-storage) | Memtable sizes, flush counts, compaction stats, cache hit rates |
+
+Virtual tables are backed by the `VirtualTable` trait defined in ferrosa-schema (`virtual_table.rs`). Each implementation provides a `read_rows()` method that returns the current state as CQL rows. The `VirtualTableRegistry` (`virtual_registry.rs`) manages registration and lookup using `ArcSwap` for lock-free concurrent reads.
+
+### Web Dashboard
+
+The ferrosa binary hosts an Axum web server on port 9090 (`web/` module) that provides:
+
+- **JSON API** — programmatic access to connection, query, and storage stats
+- **Static file serving** — embedded HTML/JS dashboard for browser-based monitoring
+- **Prometheus `/metrics` endpoint** — standard Prometheus text format for scraping by Prometheus, Grafana, Datadog, and other monitoring tools
+
+### CQL Extensions
+
+Two new CQL commands support real-time push-based monitoring:
+
+- **`SUBSCRIBE`** — register for streaming updates on virtual table changes (backed by `subscribe.rs` in ferrosa-cql)
+- **`UNSUBSCRIBE`** — cancel an active subscription
+
+The `subscription_observer.rs` in ferrosa-storage bridges storage events into the subscription system, pushing updates to connected clients as state changes occur.
+
+### ferrosa-ctl
+
+`ferrosa-ctl` is a standalone CLI admin tool built with `ratatui` and `crossterm`. It connects to a running Ferrosa node and provides:
+
+- **CLI mode** — issue admin queries, inspect virtual tables, check node health
+- **TUI monitor mode** — live-updating terminal dashboard showing connections, active queries, and storage stats in a multi-panel layout
 
 ## Research Items
 
