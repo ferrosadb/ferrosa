@@ -3,7 +3,7 @@
 //! Resolves Cypher labels to tables using schema extensions and validates
 //! property references. Performs per-hop authorization checks (T3).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ferrosa_schema::auth::permission::{check_permission, Permission, Resource};
 use ferrosa_schema::auth::role::AuthContext;
@@ -34,6 +34,22 @@ pub struct LogicalPlan {
     pub statement: Statement,
     /// The keyspace context for this query.
     pub keyspace: String,
+}
+
+impl LogicalPlan {
+    /// Returns the set of (keyspace, table) pairs this query depends on.
+    /// Used by SUBSCRIBE to know which tables to watch for changes.
+    pub fn table_dependencies(&self) -> Vec<(String, String)> {
+        let mut seen = HashSet::new();
+        let mut deps = Vec::new();
+        for resolved in self.bindings.values() {
+            let key = (resolved.keyspace.clone(), resolved.table.clone());
+            if seen.insert(key.clone()) {
+                deps.push(key);
+            }
+        }
+        deps
+    }
 }
 
 /// Resolve a graph label to a table in the schema snapshot.
@@ -166,8 +182,6 @@ fn resolve_pattern_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::collections::HashSet;
 
     use indexmap::IndexMap;
     use uuid::Uuid;
@@ -303,5 +317,103 @@ mod tests {
             result.unwrap_err(),
             GraphError::PermissionDenied(_)
         ));
+    }
+
+    /// Insert a graph-labeled table into an existing snapshot.
+    fn add_graph_table(
+        snap: &mut SchemaSnapshot,
+        keyspace: &str,
+        table: &str,
+        label: &str,
+        graph_type: &str,
+    ) {
+        let mut extensions = HashMap::new();
+        extensions.insert("graph.type".to_string(), graph_type.to_string());
+        extensions.insert("graph.label".to_string(), label.to_string());
+
+        let meta = TableMetadata {
+            keyspace: keyspace.to_string(),
+            name: table.to_string(),
+            id: Uuid::new_v4(),
+            columns: IndexMap::new(),
+            partition_key: vec![],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions,
+            is_system: false,
+        };
+        snap.tables
+            .insert((keyspace.to_string(), table.to_string()), meta);
+    }
+
+    #[test]
+    fn planner_returns_table_dependencies() {
+        // Build a schema with a vertex table (User) and an edge table (FOLLOWS).
+        let mut snap = SchemaSnapshot::new();
+        add_graph_table(&mut snap, "social", "user_v", "User", "vertex");
+        add_graph_table(&mut snap, "social", "follows_e", "FOLLOWS", "edge");
+
+        let auth = superuser_auth();
+
+        // MATCH (u:User)-[r:FOLLOWS]->(f:User) RETURN u, f
+        let stmt = Statement::Match {
+            pattern: vec![Pattern::Path(vec![
+                Pattern::Node {
+                    var: Some("u".into()),
+                    label: Some("User".into()),
+                    props: vec![],
+                },
+                Pattern::Rel {
+                    var: Some("r".into()),
+                    rel_type: Some("FOLLOWS".into()),
+                    direction: crate::parser::Direction::Out,
+                    props: vec![],
+                },
+                Pattern::Node {
+                    var: Some("f".into()),
+                    label: Some("User".into()),
+                    props: vec![],
+                },
+            ])],
+            where_clause: None,
+            return_clause: crate::parser::ReturnClause {
+                distinct: false,
+                items: vec![
+                    crate::parser::ReturnItem {
+                        expr: crate::parser::Expr::Var("u".into()),
+                        alias: None,
+                    },
+                    crate::parser::ReturnItem {
+                        expr: crate::parser::Expr::Var("f".into()),
+                        alias: None,
+                    },
+                ],
+                order_by: vec![],
+                limit: None,
+            },
+        };
+
+        let plan = validate(&snap, &auth, "social", stmt).unwrap();
+        let deps = plan.table_dependencies();
+
+        // Should have at least 2 entries: user_v (vertex) and follows_e (edge).
+        // Note: u and f both resolve to user_v, so de-duplication yields 2 unique tables.
+        assert!(
+            deps.len() >= 2,
+            "expected at least 2 table deps, got {}",
+            deps.len()
+        );
+
+        // Verify the expected tables are present.
+        let dep_set: HashSet<_> = deps.into_iter().collect();
+        assert!(
+            dep_set.contains(&("social".to_string(), "user_v".to_string())),
+            "missing user_v dependency"
+        );
+        assert!(
+            dep_set.contains(&("social".to_string(), "follows_e".to_string())),
+            "missing follows_e dependency"
+        );
     }
 }
