@@ -178,6 +178,14 @@ impl Schema {
         self.inner.load_full()
     }
 
+    /// Return a reference to the inner ArcSwap for lock-free reads.
+    ///
+    /// For hot-path code that needs repeated lock-free reads (e.g., observers),
+    /// use this instead of `snapshot()` to avoid `Arc` cloning on each call.
+    pub fn schema_ref(&self) -> &ArcSwap<SchemaSnapshot> {
+        &self.inner
+    }
+
     /// Authenticate a user with username and password.
     ///
     /// Checks the rate limiter, verifies the password, optionally upgrades
@@ -287,6 +295,100 @@ impl Schema {
             source: None,
             schema_version: Some(self.snapshot().version),
         });
+    }
+
+    /// Validate graph-related extensions on a table.
+    ///
+    /// Rules:
+    /// - Any `graph.*` key requires `Permission::Create` on the keyspace.
+    /// - `graph.type` must be `"vertex"` or `"edge"`.
+    /// - If `graph.type = "edge"`, then `graph.source`, `graph.target`,
+    ///   `graph.source_label`, and `graph.target_label` are required.
+    /// - `graph.source_label` and `graph.target_label` must reference
+    ///   existing tables with `graph.type = "vertex"` in the same keyspace.
+    /// - `graph.source` and `graph.target` must reference existing columns
+    ///   in the table being created/altered.
+    fn validate_graph_extensions(
+        &self,
+        snap: &SchemaSnapshot,
+        ks: &str,
+        table_name: &str,
+        extensions: &HashMap<String, String>,
+        table_columns: &indexmap::IndexMap<String, crate::metadata::column::ColumnMetadata>,
+        auth: &AuthContext,
+    ) -> crate::Result<()> {
+        let has_graph_keys = extensions.keys().any(|k| k.starts_with("graph."));
+        if !has_graph_keys {
+            return Ok(());
+        }
+
+        // Any graph.* key requires Create permission on the keyspace
+        self.check_permission(
+            auth,
+            Permission::Create,
+            &Resource::Keyspace(ks.to_string()),
+        )?;
+
+        // Validate graph.type
+        if let Some(graph_type) = extensions.get("graph.type") {
+            match graph_type.as_str() {
+                "vertex" => {}
+                "edge" => {
+                    // Require edge-specific keys
+                    for required_key in &[
+                        "graph.source",
+                        "graph.target",
+                        "graph.source_label",
+                        "graph.target_label",
+                    ] {
+                        if !extensions.contains_key(*required_key) {
+                            return Err(SchemaError::InvalidSchema(format!(
+                                "edge table {ks}.{table_name} requires extension key '{required_key}'"
+                            )));
+                        }
+                    }
+
+                    // Validate source_label and target_label reference vertex tables
+                    for label_key in &["graph.source_label", "graph.target_label"] {
+                        let label = &extensions[*label_key];
+                        let ref_key = (ks.to_string(), label.clone());
+                        match snap.tables.get(&ref_key) {
+                            None => {
+                                return Err(SchemaError::InvalidSchema(format!(
+                                    "edge table {ks}.{table_name}: {label_key} references non-existent table '{label}'"
+                                )));
+                            }
+                            Some(ref_table) => {
+                                if ref_table.extensions.get("graph.type")
+                                    != Some(&"vertex".to_string())
+                                {
+                                    return Err(SchemaError::InvalidSchema(format!(
+                                        "edge table {ks}.{table_name}: {label_key} references table '{label}' which is not a vertex table"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+
+                    // Validate source and target reference columns in this table
+                    for col_key in &["graph.source", "graph.target"] {
+                        let col_name = &extensions[*col_key];
+                        if !table_columns.contains_key(col_name) {
+                            return Err(SchemaError::InvalidSchema(format!(
+                                "edge table {ks}.{table_name}: {col_key} references non-existent column '{col_name}'"
+                            )));
+                        }
+                    }
+                }
+                other => {
+                    return Err(SchemaError::InvalidSchema(format!(
+                        "invalid graph.type '{other}' on table {ks}.{table_name}; must be 'vertex' or 'edge'"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     // ---- Keyspace CRUD ----
@@ -406,6 +508,16 @@ impl Schema {
         if snap.tables.contains_key(&key) {
             return Err(SchemaError::TableExists(table.keyspace, table.name));
         }
+        if table.extensions.keys().any(|k| k.starts_with("graph.")) {
+            self.validate_graph_extensions(
+                &snap,
+                &table.keyspace,
+                &table.name,
+                &table.extensions,
+                &table.columns,
+                auth,
+            )?;
+        }
         let ks = table.keyspace.clone();
         let name = table.name.clone();
         snap.tables.insert(key, table);
@@ -441,9 +553,19 @@ impl Schema {
         if is_system_keyspace(ks) {
             return Err(SchemaError::SystemKeyspaceProtected(ks.to_string()));
         }
+        let snap_ref = self.snapshot();
+        let key = (ks.to_string(), table.to_string());
+        if let Some(existing) = snap_ref.tables.get(&key) {
+            if existing.is_system {
+                return Err(SchemaError::SystemTableProtected(
+                    ks.to_string(),
+                    table.to_string(),
+                ));
+            }
+        }
+        drop(snap_ref);
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
-        let key = (ks.to_string(), table.to_string());
         let tbl = snap
             .tables
             .get_mut(&key)
@@ -456,6 +578,23 @@ impl Schema {
         }
         for col_name in &updates.drop_columns {
             tbl.columns.shift_remove(col_name);
+        }
+        if let Some(ref extensions) = updates.extensions {
+            if extensions.keys().any(|k| k.starts_with("graph.")) {
+                let columns_snapshot = tbl.columns.clone();
+                self.validate_graph_extensions(
+                    &snap,
+                    ks,
+                    table,
+                    extensions,
+                    &columns_snapshot,
+                    auth,
+                )?;
+            }
+            let tbl = snap.tables.get_mut(&key).expect("table must exist");
+            for (k, v) in extensions {
+                tbl.extensions.insert(k.clone(), v.clone());
+            }
         }
         snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
@@ -482,9 +621,19 @@ impl Schema {
         if is_system_keyspace(keyspace) {
             return Err(SchemaError::SystemKeyspaceProtected(keyspace.to_string()));
         }
+        let snap_ref = self.snapshot();
+        let key = (keyspace.to_string(), table.to_string());
+        if let Some(existing) = snap_ref.tables.get(&key) {
+            if existing.is_system {
+                return Err(SchemaError::SystemTableProtected(
+                    keyspace.to_string(),
+                    table.to_string(),
+                ));
+            }
+        }
+        drop(snap_ref);
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
-        let key = (keyspace.to_string(), table.to_string());
         if snap.tables.remove(&key).is_none() {
             return Err(SchemaError::TableNotFound(
                 keyspace.to_string(),
@@ -1232,6 +1381,8 @@ mod tests {
             clustering_key: vec![],
             params: TableParams::default(),
             flags,
+            extensions: HashMap::new(),
+            is_system: false,
         }
     }
 
@@ -1351,6 +1502,7 @@ mod tests {
                 mask: None,
             }],
             drop_columns: vec![],
+            extensions: None,
         };
         schema
             .alter_table("alter_tbl_ks", "t1", updates, &auth)
@@ -1360,6 +1512,206 @@ mod tests {
         let key = ("alter_tbl_ks".to_string(), "t1".to_string());
         let tbl = &snap.tables[&key];
         assert!(tbl.columns.contains_key("email"));
+    }
+
+    #[test]
+    fn drop_system_table_rejected() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("sys_tbl_ks"), &auth)
+            .unwrap();
+        let mut table = test_table("sys_tbl_ks", "sys_t");
+        table.is_system = true;
+        schema.create_table(table, &auth).unwrap();
+
+        let result = schema.drop_table("sys_tbl_ks", "sys_t", &auth);
+        assert!(
+            matches!(result, Err(SchemaError::SystemTableProtected(ref ks, ref t)) if ks == "sys_tbl_ks" && t == "sys_t")
+        );
+    }
+
+    #[test]
+    fn alter_system_table_rejected() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("sys_tbl_ks2"), &auth)
+            .unwrap();
+        let mut table = test_table("sys_tbl_ks2", "sys_t2");
+        table.is_system = true;
+        schema.create_table(table, &auth).unwrap();
+
+        let updates = TableUpdates {
+            params: None,
+            add_columns: vec![],
+            drop_columns: vec![],
+            extensions: None,
+        };
+        let result = schema.alter_table("sys_tbl_ks2", "sys_t2", updates, &auth);
+        assert!(
+            matches!(result, Err(SchemaError::SystemTableProtected(ref ks, ref t)) if ks == "sys_tbl_ks2" && t == "sys_t2")
+        );
+    }
+
+    #[test]
+    fn graph_extension_invalid_type_rejected() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("graph_ks"), &auth)
+            .unwrap();
+        let mut table = test_table("graph_ks", "bad_type");
+        table
+            .extensions
+            .insert("graph.type".to_string(), "invalid".to_string());
+        let result = schema.create_table(table, &auth);
+        assert!(
+            matches!(result, Err(SchemaError::InvalidSchema(ref msg)) if msg.contains("invalid graph.type"))
+        );
+    }
+
+    #[test]
+    fn graph_edge_extension_validates_source_label() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("graph_ks2"), &auth)
+            .unwrap();
+
+        // Create a vertex table first
+        let mut vertex = test_table("graph_ks2", "person");
+        vertex
+            .extensions
+            .insert("graph.type".to_string(), "vertex".to_string());
+        schema.create_table(vertex, &auth).unwrap();
+
+        // Try to create an edge that references a non-existent vertex table
+        let mut edge = test_table("graph_ks2", "knows");
+        edge.extensions
+            .insert("graph.type".to_string(), "edge".to_string());
+        edge.extensions
+            .insert("graph.source".to_string(), "id".to_string());
+        edge.extensions
+            .insert("graph.target".to_string(), "id".to_string());
+        edge.extensions
+            .insert("graph.source_label".to_string(), "person".to_string());
+        edge.extensions
+            .insert("graph.target_label".to_string(), "nonexistent".to_string());
+        let result = schema.create_table(edge, &auth);
+        assert!(
+            matches!(result, Err(SchemaError::InvalidSchema(ref msg)) if msg.contains("non-existent table"))
+        );
+    }
+
+    #[test]
+    fn create_table_with_graph_extension_validates() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("graph_ks3"), &auth)
+            .unwrap();
+
+        // Create vertex tables
+        let mut person = test_table("graph_ks3", "person");
+        person
+            .extensions
+            .insert("graph.type".to_string(), "vertex".to_string());
+        schema.create_table(person, &auth).unwrap();
+
+        let mut company = test_table("graph_ks3", "company");
+        company
+            .extensions
+            .insert("graph.type".to_string(), "vertex".to_string());
+        schema.create_table(company, &auth).unwrap();
+
+        // Create a valid edge table
+        let mut edge = test_table("graph_ks3", "works_at");
+        edge.columns.insert(
+            "source_id".to_string(),
+            ColumnMetadata {
+                name: "source_id".to_string(),
+                kind: ColumnKind::Regular,
+                position: 0,
+                column_type: "uuid".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        edge.columns.insert(
+            "target_id".to_string(),
+            ColumnMetadata {
+                name: "target_id".to_string(),
+                kind: ColumnKind::Regular,
+                position: 0,
+                column_type: "uuid".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        edge.extensions
+            .insert("graph.type".to_string(), "edge".to_string());
+        edge.extensions
+            .insert("graph.source".to_string(), "source_id".to_string());
+        edge.extensions
+            .insert("graph.target".to_string(), "target_id".to_string());
+        edge.extensions
+            .insert("graph.source_label".to_string(), "person".to_string());
+        edge.extensions
+            .insert("graph.target_label".to_string(), "company".to_string());
+        schema.create_table(edge, &auth).unwrap();
+
+        // Verify the edge table was created with extensions
+        let snap = schema.snapshot();
+        let key = ("graph_ks3".to_string(), "works_at".to_string());
+        let tbl = &snap.tables[&key];
+        assert_eq!(tbl.extensions.get("graph.type"), Some(&"edge".to_string()));
+    }
+
+    #[test]
+    fn graph_extension_requires_create_permission() {
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("graph_perm_ks"), &auth)
+            .unwrap();
+
+        // Create a role with ALTER but not CREATE on the keyspace
+        schema
+            .create_role(
+                crate::auth::role::RoleMetadata {
+                    name: "alter_only".to_string(),
+                    is_superuser: false,
+                    can_login: true,
+                    salted_hash: None,
+                    member_of: HashSet::new(),
+                },
+                Some("password123!A"),
+                &auth,
+            )
+            .unwrap();
+        let mut alter_perms = HashSet::new();
+        alter_perms.insert(Permission::Alter);
+        schema
+            .grant(
+                "alter_only",
+                &Resource::Keyspace("graph_perm_ks".to_string()),
+                alter_perms,
+                &auth,
+            )
+            .unwrap();
+
+        // Try to create a table with graph.type extension using alter-only user
+        let alter_auth = normal_auth("alter_only");
+        let mut vertex = test_table("graph_perm_ks", "person");
+        vertex
+            .extensions
+            .insert("graph.type".to_string(), "vertex".to_string());
+        let result = schema.create_table(vertex, &alter_auth);
+        assert!(
+            result.is_err(),
+            "graph.* extensions should require Permission::Create on keyspace"
+        );
     }
 
     // ---- Task 22: Role CRUD tests ----

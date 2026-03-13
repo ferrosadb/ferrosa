@@ -920,6 +920,8 @@ fn route_create_table(
             .collect(),
         params: TableParams::default(),
         flags: HashSet::new(),
+        extensions: std::collections::HashMap::new(),
+        is_system: false,
     };
 
     // Register with schema
@@ -967,6 +969,7 @@ fn route_alter_table(
         params: None,
         add_columns,
         drop_columns: s.drop_columns.clone(),
+        extensions: None,
     };
 
     state.schema.alter_table(ks, &s.table, updates, ctx.auth)?;

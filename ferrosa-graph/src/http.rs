@@ -1,0 +1,494 @@
+//! HTTP/JSON endpoint for graph queries.
+//!
+//! Provides a REST API for executing Cypher queries, explaining query plans,
+//! inspecting graph schema, and health checks. Includes Basic auth middleware (T2),
+//! error sanitization (T8), and TLS support (T11).
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::{Query, State};
+use axum::http::{header, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Json, Response};
+use axum::routing::{get, post};
+use axum::Router;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::limit::RequestBodyLimitLayer;
+
+use ferrosa_schema::auth::role::AuthContext;
+use ferrosa_schema::Schema;
+
+use crate::engine::GraphEngine;
+use crate::error::GraphError;
+
+/// Configuration for the graph HTTP server.
+#[derive(Debug, Clone)]
+pub struct GraphHttpConfig {
+    /// Bind address (default: 0.0.0.0:7474).
+    pub bind_addr: SocketAddr,
+    /// Path to TLS certificate file (PEM).
+    pub tls_cert_path: Option<String>,
+    /// Path to TLS private key file (PEM).
+    pub tls_key_path: Option<String>,
+    /// Whether TLS is required (T11: fail if true and no cert provided).
+    pub require_tls: bool,
+    /// Maximum request body size in bytes (default: 1MB).
+    pub max_request_body_bytes: usize,
+}
+
+impl Default for GraphHttpConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: SocketAddr::from(([0, 0, 0, 0], 7474)),
+            tls_cert_path: None,
+            tls_key_path: None,
+            require_tls: false,
+            max_request_body_bytes: 1_048_576, // 1 MB
+        }
+    }
+}
+
+/// Shared application state for route handlers.
+#[derive(Clone)]
+pub struct AppState {
+    pub engine: Arc<GraphEngine>,
+    pub schema: Arc<Schema>,
+}
+
+/// Request body for query and explain endpoints.
+#[derive(Debug, Deserialize)]
+pub struct QueryRequest {
+    pub query: String,
+    pub keyspace: String,
+}
+
+/// Query parameters for the schema endpoint.
+#[derive(Debug, Deserialize)]
+pub struct SchemaParams {
+    pub keyspace: String,
+}
+
+/// Error response body.
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+/// Convert a `GraphError` to an HTTP response with sanitized error messages (T8).
+fn error_to_response(err: &GraphError) -> Response {
+    let (status, message) = match err {
+        GraphError::Parse(e) => (
+            StatusCode::BAD_REQUEST,
+            format!("parse error at byte {}: {}", e.span.start, e.message),
+        ),
+        GraphError::Validation(msg) => {
+            (StatusCode::BAD_REQUEST, format!("validation error: {msg}"))
+        }
+        GraphError::PermissionDenied(_) => (StatusCode::FORBIDDEN, "permission denied".to_string()),
+        GraphError::Timeout => (StatusCode::REQUEST_TIMEOUT, "query timeout".to_string()),
+        GraphError::ResourceLimit(msg) => {
+            (StatusCode::BAD_REQUEST, format!("resource limit: {msg}"))
+        }
+        // T8: Internal errors are never exposed to the client.
+        GraphError::Storage(_) | GraphError::Schema(_) | GraphError::Internal(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error".to_string(),
+        ),
+    };
+
+    let body = ErrorResponse { error: message };
+    (status, Json(body)).into_response()
+}
+
+/// Auth middleware (T2): extract Basic auth header, decode, authenticate.
+///
+/// Injects `AuthContext` as a request extension on success.
+async fn auth_middleware(
+    State(state): State<AppState>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
+    let auth_header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let Some(auth_value) = auth_header else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing Authorization header".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let Some(encoded) = auth_value.strip_prefix("Basic ") else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "unsupported auth scheme (expected Basic)".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded.trim()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid base64 in Authorization header".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let decoded_str = match String::from_utf8(decoded) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid UTF-8 in credentials".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let Some((username, password)) = decoded_str.split_once(':') else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid credentials format".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    match state.schema.authenticate(username, password) {
+        Ok(auth_ctx) => {
+            req.extensions_mut().insert(auth_ctx);
+            next.run(req).await
+        }
+        Err(_) => (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "authentication failed".to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /graph/query — execute a graph query with audit emission (T10).
+async fn handle_query(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let auth = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .unwrap_or(AuthContext {
+            role: "anonymous".to_string(),
+            is_superuser: false,
+            must_change_password: false,
+        });
+
+    // Extract JSON body
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1_048_576).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "invalid request body".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let query_req: QueryRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid JSON: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // T10: Audit logging via tracing (Phase 1)
+    tracing::info!(
+        user = %auth.role,
+        keyspace = %query_req.keyspace,
+        query = %query_req.query,
+        "graph query submitted"
+    );
+
+    match state
+        .engine
+        .execute(&query_req.query, &query_req.keyspace, &auth)
+    {
+        Ok(result) => {
+            tracing::info!(
+                user = %auth.role,
+                keyspace = %query_req.keyspace,
+                rows = result.rows.len(),
+                execution_ms = result.stats.execution_ms,
+                status = "Ok",
+                "graph query completed"
+            );
+            Json(result).into_response()
+        }
+        Err(ref e) => {
+            let status_str = match e {
+                GraphError::Timeout => "Timeout",
+                GraphError::PermissionDenied(_) => "Denied",
+                _ => "Error",
+            };
+            tracing::info!(
+                user = %auth.role,
+                keyspace = %query_req.keyspace,
+                status = status_str,
+                error = %e,
+                "graph query failed"
+            );
+            error_to_response(e)
+        }
+    }
+}
+
+/// POST /graph/explain — return query plan without executing.
+async fn handle_explain(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let auth = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .unwrap_or(AuthContext {
+            role: "anonymous".to_string(),
+            is_superuser: false,
+            must_change_password: false,
+        });
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1_048_576).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "invalid request body".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let query_req: QueryRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid JSON: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    match state
+        .engine
+        .explain(&query_req.query, &query_req.keyspace, &auth)
+    {
+        Ok(plan_debug) => Json(serde_json::json!({ "plan": plan_debug })).into_response(),
+        Err(ref e) => error_to_response(e),
+    }
+}
+
+/// GET /graph/schema?keyspace=... — list vertex/edge tables with labels.
+async fn handle_schema(
+    State(state): State<AppState>,
+    Query(params): Query<SchemaParams>,
+) -> Response {
+    match state.engine.graph_schema(&params.keyspace) {
+        Ok(schema) => Json(schema).into_response(),
+        Err(ref e) => error_to_response(e),
+    }
+}
+
+/// GET /graph/health — health check (no auth required).
+async fn handle_health() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// Build the Axum router with all graph routes.
+///
+/// Auth middleware is applied to all routes except /graph/health.
+pub fn build_router(state: AppState) -> Router {
+    // Routes that require authentication.
+    let authenticated = Router::new()
+        .route("/graph/query", post(handle_query))
+        .route("/graph/explain", post(handle_explain))
+        .route("/graph/schema", get(handle_schema))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .with_state(state.clone());
+
+    // Health check does not require auth.
+    let health = Router::new().route("/graph/health", get(handle_health));
+
+    Router::new().merge(authenticated).merge(health)
+}
+
+/// Start the graph HTTP server.
+///
+/// T11: If `require_tls` is true but no cert/key is provided, returns an error.
+pub async fn start_graph_http(
+    config: &GraphHttpConfig,
+    state: AppState,
+) -> crate::error::Result<()> {
+    // T11: Check TLS requirements.
+    if config.require_tls && (config.tls_cert_path.is_none() || config.tls_key_path.is_none()) {
+        return Err(GraphError::Internal(
+            "require_tls is true but tls_cert_path or tls_key_path is not configured".to_string(),
+        ));
+    }
+
+    let app = build_router(state)
+        .layer(CatchPanicLayer::new())
+        .layer(RequestBodyLimitLayer::new(config.max_request_body_bytes));
+
+    if let (Some(cert_path), Some(key_path)) = (&config.tls_cert_path, &config.tls_key_path) {
+        // TLS mode
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
+            .await
+            .map_err(|e| GraphError::Internal(format!("TLS configuration error: {e}")))?;
+
+        tracing::info!(addr = %config.bind_addr, "starting graph HTTP server with TLS");
+
+        axum_server::bind_rustls(config.bind_addr, tls_config)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| GraphError::Internal(format!("HTTP server error: {e}")))?;
+    } else {
+        // Plain HTTP mode
+        tracing::info!(addr = %config.bind_addr, "starting graph HTTP server (plain)");
+
+        let listener = tokio::net::TcpListener::bind(config.bind_addr)
+            .await
+            .map_err(|e| GraphError::Internal(format!("bind error: {e}")))?;
+
+        axum::serve(listener, app)
+            .await
+            .map_err(|e| GraphError::Internal(format!("HTTP server error: {e}")))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config() {
+        let config = GraphHttpConfig::default();
+        assert_eq!(config.bind_addr, SocketAddr::from(([0, 0, 0, 0], 7474)));
+        assert!(config.tls_cert_path.is_none());
+        assert!(config.tls_key_path.is_none());
+        assert!(!config.require_tls);
+        assert_eq!(config.max_request_body_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn error_to_response_parse_error() {
+        use crate::parser::{ParseError, Span};
+        let err = GraphError::Parse(ParseError {
+            message: "unexpected token".to_string(),
+            span: Span { start: 5, end: 10 },
+        });
+        let resp = error_to_response(&err);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn error_to_response_validation() {
+        let err = GraphError::Validation("bad label".to_string());
+        let resp = error_to_response(&err);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn error_to_response_permission_denied() {
+        let err = GraphError::PermissionDenied("no access".to_string());
+        let resp = error_to_response(&err);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn error_to_response_timeout() {
+        let err = GraphError::Timeout;
+        let resp = error_to_response(&err);
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn error_to_response_resource_limit() {
+        let err = GraphError::ResourceLimit("too many rows".to_string());
+        let resp = error_to_response(&err);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn error_to_response_storage_sanitized() {
+        let err = GraphError::Storage(ferrosa_common::Error::Io(std::io::Error::other(
+            "disk failure",
+        )));
+        let resp = error_to_response(&err);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn error_to_response_internal_sanitized() {
+        let err = GraphError::Internal("secret details".to_string());
+        let resp = error_to_response(&err);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn query_request_deserialize() {
+        let json = r#"{"query": "MATCH (n) RETURN n", "keyspace": "social"}"#;
+        let req: QueryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.query, "MATCH (n) RETURN n");
+        assert_eq!(req.keyspace, "social");
+    }
+
+    #[test]
+    fn schema_params_deserialize() {
+        let json = r#"{"keyspace": "social"}"#;
+        let params: SchemaParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.keyspace, "social");
+    }
+
+    #[test]
+    fn error_response_serialize() {
+        let resp = ErrorResponse {
+            error: "test error".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("test error"));
+    }
+}

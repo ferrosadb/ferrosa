@@ -39,6 +39,8 @@ pub enum SchemaError {
     RoleCycleDetected(String),
     /// Password does not meet policy requirements.
     PasswordTooWeak { violations: Vec<String> },
+    /// Cannot modify a system-managed table (keyspace, table).
+    SystemTableProtected(String, String),
     /// Generic schema validation error.
     InvalidSchema(String),
 }
@@ -74,6 +76,9 @@ impl fmt::Display for SchemaError {
             }
             Self::PasswordTooWeak { violations } => {
                 write!(f, "password too weak: {}", violations.join(", "))
+            }
+            Self::SystemTableProtected(ks, t) => {
+                write!(f, "cannot modify system table: {ks}.{t}")
             }
             Self::InvalidSchema(msg) => write!(f, "invalid schema: {msg}"),
         }
@@ -113,6 +118,12 @@ mod tests {
     }
 
     #[test]
+    fn system_table_protected_display() {
+        let err = SchemaError::SystemTableProtected("ks".into(), "t".into());
+        assert_eq!(err.to_string(), "cannot modify system table: ks.t");
+    }
+
+    #[test]
     fn all_variants_display() {
         let errors = vec![
             SchemaError::KeyspaceExists("ks".into()),
@@ -133,6 +144,7 @@ mod tests {
             SchemaError::PasswordTooWeak {
                 violations: vec!["too short".into()],
             },
+            SchemaError::SystemTableProtected("ks".into(), "t".into()),
             SchemaError::InvalidSchema("bad".into()),
         ];
         for err in &errors {

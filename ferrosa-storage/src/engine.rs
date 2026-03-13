@@ -16,6 +16,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -110,6 +111,10 @@ pub struct StorageEngine {
     compaction_executor: CompactionExecutor,
     upload_manager: Option<UploadManager>,
     local_cache: LocalCache,
+    observers: RwLock<Vec<Arc<dyn crate::observer::WriteObserver>>>,
+    async_observers: RwLock<Vec<AsyncObserverState>>,
+    /// Default channel capacity for async observers.
+    async_observer_capacity: usize,
 }
 
 /// Per-table state: schema + store.
@@ -117,6 +122,14 @@ struct TableState {
     #[allow(dead_code)]
     schema: TableSchema,
     store: TableStore<FileFlushTarget>,
+}
+
+/// State for a single async observer: the observer, its sender half, and a
+/// drop counter for backpressure metrics.
+struct AsyncObserverState {
+    observer: Arc<dyn crate::observer::WriteObserver>,
+    sender: tokio::sync::mpsc::Sender<(TableId, Mutation)>,
+    drop_count: Arc<AtomicU64>,
 }
 
 impl StorageEngine {
@@ -160,6 +173,9 @@ impl StorageEngine {
             compaction_executor,
             upload_manager,
             local_cache,
+            observers: RwLock::new(Vec::new()),
+            async_observers: RwLock::new(Vec::new()),
+            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
         })
     }
 
@@ -183,6 +199,105 @@ impl StorageEngine {
         let state = TableState { schema, store };
         self.tables.write().insert(table_id, state);
         Ok(())
+    }
+
+    /// Registers an observer that will be notified when mutations are written.
+    ///
+    /// Sync observers are called inline on the write path. Async observers
+    /// receive mutations through a bounded channel — the drain loop is
+    /// started externally (e.g., by `GraphEngine` in Slice 5).
+    pub fn register_observer(&self, observer: Arc<dyn crate::observer::WriteObserver>) {
+        match observer.mode() {
+            crate::observer::ObserverMode::Sync => {
+                self.observers.write().push(observer);
+            }
+            crate::observer::ObserverMode::Async => {
+                let capacity = self.async_observer_capacity;
+                let (tx, _rx) = tokio::sync::mpsc::channel(capacity);
+                let state = AsyncObserverState {
+                    observer,
+                    sender: tx,
+                    drop_count: Arc::new(AtomicU64::new(0)),
+                };
+                self.async_observers.write().push(state);
+            }
+        }
+    }
+
+    /// Registers an async observer and returns the receiver end of the bounded
+    /// channel. The caller is responsible for draining the receiver.
+    pub fn register_async_observer(
+        &self,
+        observer: Arc<dyn crate::observer::WriteObserver>,
+        capacity: usize,
+    ) -> tokio::sync::mpsc::Receiver<(TableId, Mutation)> {
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        let state = AsyncObserverState {
+            observer,
+            sender: tx,
+            drop_count: Arc::new(AtomicU64::new(0)),
+        };
+        self.async_observers.write().push(state);
+        rx
+    }
+
+    /// Dispatches a mutation to all sync observers watching the given table.
+    ///
+    /// Derived mutations produced by observers go through the commit log for
+    /// durability and are written to the target table's memtable.
+    fn dispatch_sync_observers(&self, table_id: &TableId, mutation: &Mutation) {
+        let observers = self.observers.read();
+        for obs in observers.iter() {
+            if obs.mode() == crate::observer::ObserverMode::Sync {
+                let watched = obs.tables();
+                if watched.iter().any(|t| t == table_id) {
+                    let derived = obs.on_write(table_id, mutation);
+                    for dm in derived {
+                        // Durability: go through commit log.
+                        if let Err(e) = self.commit_log.append(&dm) {
+                            eprintln!("[observer] commit log append failed: {e}");
+                            continue;
+                        }
+                        let dtid = TableId::new(&dm.keyspace, &dm.table);
+                        let tables = self.tables.read();
+                        if let Some(state) = tables.get(&dtid) {
+                            for row in &dm.rows {
+                                let _ = state.store.write(&dm.key, row.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dispatches a mutation to all async observers watching the given table.
+    ///
+    /// Uses `try_send` — never blocks the write path. If the channel is full,
+    /// the mutation is dropped and the drop counter is incremented.
+    fn dispatch_async_observers(&self, table_id: &TableId, mutation: &Mutation) {
+        let async_obs = self.async_observers.read();
+        for state in async_obs.iter() {
+            let watched = state.observer.tables();
+            if watched.iter().any(|t| t == table_id)
+                && state
+                    .sender
+                    .try_send((table_id.clone(), mutation.clone()))
+                    .is_err()
+            {
+                state.drop_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Returns the total number of mutations dropped by async observers due to
+    /// backpressure (channel full).
+    pub fn observer_drop_count(&self) -> u64 {
+        let async_obs = self.async_observers.read();
+        async_obs
+            .iter()
+            .map(|s| s.drop_count.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Writes a row to the commit log and the table's memtable.
@@ -212,6 +327,11 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
         state.store.write(key, row)?;
+        drop(tables);
+
+        // 3. Notify observers after successful commit log + memtable write.
+        self.dispatch_sync_observers(table_id, &mutation);
+        self.dispatch_async_observers(table_id, &mutation);
 
         Ok(())
     }
@@ -230,13 +350,8 @@ impl StorageEngine {
             return Ok(());
         }
 
-        let tables = self.tables.read();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
-
+        // Collect committed mutations for observer dispatch after each write.
         for (key, row, timestamp) in mutations {
-            // Append to commit log.
             let mutation = Mutation {
                 keyspace: table_id.keyspace.clone(),
                 table: table_id.table.clone(),
@@ -244,10 +359,24 @@ impl StorageEngine {
                 rows: vec![row.clone()],
                 timestamp,
             };
+
+            // Append to commit log.
             self.commit_log.append(&mutation)?;
 
-            // Write to memtable.
-            state.store.write(&key, row)?;
+            // Write to memtable (scoped read lock).
+            {
+                let tables = self.tables.read();
+                let state = tables.get(table_id).ok_or_else(|| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "table not registered: {table_id}"
+                    ))
+                })?;
+                state.store.write(&key, row)?;
+            }
+
+            // Notify observers after successful commit log + memtable write.
+            self.dispatch_sync_observers(table_id, &mutation);
+            self.dispatch_async_observers(table_id, &mutation);
         }
 
         Ok(())
@@ -690,5 +819,166 @@ mod tests {
         engine.flush_if_needed().unwrap();
 
         assert_eq!(engine.sstable_count(&tid), 1);
+    }
+
+    /// A test observer that counts `on_write` calls.
+    struct CountingObserver {
+        watched: Vec<TableId>,
+        call_count: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingObserver {
+        fn new(watched: Vec<TableId>) -> Self {
+            Self {
+                watched,
+                call_count: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn count(&self) -> u64 {
+            self.call_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::observer::WriteObserver for CountingObserver {
+        fn mode(&self) -> crate::observer::ObserverMode {
+            crate::observer::ObserverMode::Sync
+        }
+
+        fn tables(&self) -> Vec<TableId> {
+            self.watched.clone()
+        }
+
+        fn on_write(&self, _table: &TableId, _mutation: &Mutation) -> Vec<Mutation> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn sync_observer_fires_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+        let observer = Arc::new(CountingObserver::new(vec![tid.clone()]));
+        engine.register_observer(observer.clone());
+
+        let key = make_key("k1");
+        engine
+            .write(&tid, &key, make_row(b"val", 1000), 1000)
+            .unwrap();
+
+        assert_eq!(observer.count(), 1);
+    }
+
+    #[test]
+    fn sync_observer_only_fires_for_watched_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        // Observer watches table_a, but we write to test_table.
+        let table_a = TableId::new("other_ks", "other_table");
+        let observer = Arc::new(CountingObserver::new(vec![table_a]));
+        engine.register_observer(observer.clone());
+
+        let tid = table_id();
+        let key = make_key("k1");
+        engine
+            .write(&tid, &key, make_row(b"val", 1000), 1000)
+            .unwrap();
+
+        assert_eq!(observer.count(), 0);
+    }
+
+    /// A test observer that operates in async mode.
+    struct AsyncCountingObserver {
+        watched: Vec<TableId>,
+        call_count: std::sync::atomic::AtomicU64,
+    }
+
+    impl AsyncCountingObserver {
+        fn new(watched: Vec<TableId>) -> Self {
+            Self {
+                watched,
+                call_count: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl crate::observer::WriteObserver for AsyncCountingObserver {
+        fn mode(&self) -> crate::observer::ObserverMode {
+            crate::observer::ObserverMode::Async
+        }
+
+        fn tables(&self) -> Vec<TableId> {
+            self.watched.clone()
+        }
+
+        fn on_write(&self, _table: &TableId, _mutation: &Mutation) -> Vec<Mutation> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn async_observer_does_not_block_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+        let observer = Arc::new(AsyncCountingObserver::new(vec![tid.clone()]));
+        let mut rx = engine.register_async_observer(observer, 16);
+
+        let key = make_key("k1");
+        engine
+            .write(&tid, &key, make_row(b"val", 1000), 1000)
+            .unwrap();
+
+        // Write should succeed (async observer does not block).
+        // The mutation should be in the channel.
+        let msg = rx.try_recv();
+        assert!(msg.is_ok());
+        let (recv_tid, recv_mutation) = msg.unwrap();
+        assert_eq!(recv_tid, tid);
+        assert_eq!(recv_mutation.keyspace, "test_ks");
+    }
+
+    #[test]
+    fn async_observer_backpressure_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+        let observer = Arc::new(AsyncCountingObserver::new(vec![tid.clone()]));
+        // Tiny channel capacity of 2 to test backpressure.
+        let _rx = engine.register_async_observer(observer, 2);
+
+        assert_eq!(engine.observer_drop_count(), 0);
+
+        // Write 5 mutations — channel holds 2, so at least 3 should be dropped.
+        for i in 0..5 {
+            let key = make_key(&format!("k{i}"));
+            engine
+                .write(&tid, &key, make_row(b"val", 1000 + i), 1000 + i)
+                .unwrap();
+        }
+
+        // Drop count should be >= 3 (channel capacity 2, 5 writes).
+        assert!(
+            engine.observer_drop_count() >= 3,
+            "expected >= 3 drops, got {}",
+            engine.observer_drop_count()
+        );
     }
 }

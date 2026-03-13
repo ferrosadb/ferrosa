@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "ferrosa",
     "ferrosa-common",
     "ferrosa-cql",
     "ferrosa-graph",

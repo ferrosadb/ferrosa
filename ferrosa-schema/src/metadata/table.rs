@@ -27,6 +27,11 @@ pub struct TableMetadata {
     pub params: TableParams,
     /// Table flags describing the table's characteristics.
     pub flags: HashSet<TableFlag>,
+    /// Opaque key-value extensions on the table (e.g., graph.type, graph.label).
+    pub extensions: HashMap<String, String>,
+    /// Whether this is a system-managed table (protected from user DDL).
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 /// Flags describing table characteristics.
@@ -135,6 +140,8 @@ pub struct TableUpdates {
     pub add_columns: Vec<ColumnMetadata>,
     /// Column names to drop from the table.
     pub drop_columns: Vec<String>,
+    /// Extensions to add or update on the table.
+    pub extensions: Option<HashMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -278,6 +285,8 @@ mod tests {
             clustering_key: vec![("ts".to_string(), ClusteringOrder::Desc)],
             params: TableParams::default(),
             flags,
+            extensions: HashMap::new(),
+            is_system: false,
         };
 
         assert_eq!(table.keyspace, "my_ks");
@@ -317,6 +326,8 @@ mod tests {
             clustering_key: vec![],
             params: TableParams::default(),
             flags,
+            extensions: HashMap::new(),
+            is_system: false,
         };
 
         let json = serde_json::to_string(&table).expect("serialize");
@@ -344,6 +355,7 @@ mod tests {
                 mask: None,
             }],
             drop_columns: vec!["old_col".to_string()],
+            extensions: None,
         };
 
         assert!(updates.params.is_some());
@@ -355,11 +367,101 @@ mod tests {
             params: None,
             add_columns: vec![],
             drop_columns: vec![],
+            extensions: None,
         };
 
         assert!(empty_updates.params.is_none());
         assert!(empty_updates.add_columns.is_empty());
         assert!(empty_updates.drop_columns.is_empty());
+    }
+
+    #[test]
+    fn table_updates_with_extensions() {
+        let mut ext = HashMap::new();
+        ext.insert("graph.type".to_string(), "vertex".to_string());
+
+        let updates = TableUpdates {
+            params: None,
+            add_columns: vec![],
+            drop_columns: vec![],
+            extensions: Some(ext),
+        };
+
+        assert!(updates.extensions.is_some());
+        let ext = updates.extensions.unwrap();
+        assert_eq!(ext.get("graph.type"), Some(&"vertex".to_string()));
+    }
+
+    #[test]
+    fn table_metadata_extensions_default_empty() {
+        let table = TableMetadata {
+            keyspace: "ks".to_string(),
+            name: "t".to_string(),
+            id: Uuid::new_v4(),
+            columns: IndexMap::new(),
+            partition_key: vec![],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        };
+        assert!(table.extensions.is_empty());
+    }
+
+    #[test]
+    fn table_metadata_extensions_serde_roundtrip() {
+        let mut extensions = HashMap::new();
+        extensions.insert("graph.type".to_string(), "vertex".to_string());
+        extensions.insert("graph.label".to_string(), "person".to_string());
+
+        let table = TableMetadata {
+            keyspace: "ks".to_string(),
+            name: "t".to_string(),
+            id: Uuid::new_v4(),
+            columns: IndexMap::new(),
+            partition_key: vec![],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions,
+            is_system: false,
+        };
+
+        let json = serde_json::to_string(&table).expect("serialize");
+        let deserialized: TableMetadata = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(table.extensions.len(), deserialized.extensions.len());
+        assert_eq!(
+            table.extensions.get("graph.type"),
+            deserialized.extensions.get("graph.type")
+        );
+        assert_eq!(
+            table.extensions.get("graph.label"),
+            deserialized.extensions.get("graph.label")
+        );
+    }
+
+    #[test]
+    fn table_metadata_is_system_default_false() {
+        let table = TableMetadata {
+            keyspace: "ks".to_string(),
+            name: "t".to_string(),
+            id: Uuid::new_v4(),
+            columns: IndexMap::new(),
+            partition_key: vec![],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        };
+        assert!(!table.is_system);
+
+        // Verify serde(default) works: deserializing JSON without is_system yields false
+        let json = r#"{"keyspace":"ks","name":"t","id":"00000000-0000-0000-0000-000000000000","columns":{},"partition_key":[],"clustering_key":[],"params":{"bloom_filter_fp_chance":0.01,"caching":{"keys":"ALL","rows_per_partition":"NONE"},"comment":"","compaction":{},"compression":{},"crc_check_chance":1.0,"default_time_to_live":0,"gc_grace_seconds":864000,"max_index_interval":2048,"min_index_interval":128,"memtable_flush_period_in_ms":0,"speculative_retry":"99PERCENTILE","additional_write_policy":"99PERCENTILE","cdc":false,"read_repair":"BLOCKING","allow_auto_snapshot":true,"incremental_backups":true},"flags":[],"extensions":{}}"#;
+        let deserialized: TableMetadata = serde_json::from_str(json).expect("deserialize");
+        assert!(!deserialized.is_system);
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub mod system;
 
 pub use audit::{
     AuditContext, AuditEvent, AuditEventKind, AuditLogEntry, AuditSink, CompositeSink,
-    LogAuditSink, SystemTableAuditSink, TestAuditSink,
+    GraphAuditStatus, LogAuditSink, SystemTableAuditSink, TestAuditSink,
 };
 pub use auth::{
     check_permission, AuthContext, AuthRateLimiter, GrantEntry, PasswordHasher, PasswordPolicy,

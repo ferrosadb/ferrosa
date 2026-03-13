@@ -21,6 +21,7 @@ pub mod flush;
 pub mod manifest;
 pub mod memtable;
 pub mod merge;
+pub mod observer;
 pub mod store;
 pub mod upload;
 
@@ -40,5 +41,6 @@ pub use memtable::sharded::ShardedBTreeMemtable;
 pub use memtable::skiplist::SkipListMemtable;
 pub use memtable::Memtable;
 pub use merge::merge_partitions;
+pub use observer::{ObserverConfig, ObserverMode, WriteObserver};
 pub use store::TableStore;
 pub use upload::{ObjectStoreConfig, UploadManager};

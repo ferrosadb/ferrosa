@@ -84,6 +84,8 @@ fn test_table(keyspace: &str, name: &str) -> TableMetadata {
         clustering_key: vec![],
         params: TableParams::default(),
         flags: HashSet::new(),
+        extensions: HashMap::new(),
+        is_system: false,
     }
 }
 
