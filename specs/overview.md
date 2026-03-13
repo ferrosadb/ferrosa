@@ -1,6 +1,6 @@
 # System Overview
 
-> Last updated: 2026-03-12
+> Last updated: 2026-03-13
 > Status: Approved
 
 ## Overview
@@ -87,7 +87,7 @@ graph LR
 
 Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable.
 
-**Current progress**: `ferrosa-common`, `ferrosa-sstable`, `ferrosa-storage`, and `ferrosa-schema` are implemented. `ferrosa-cql` Part A (protocol framing, type system, TCP server, auth) is complete. `ferrosa-graph` (Cypher parser) is in progress. Next up: `ferrosa-cql` Parts B-D (parser, query routing, prepared cache).
+**Current progress**: All core crates are implemented. `ferrosa-common`, `ferrosa-sstable`, `ferrosa-storage`, `ferrosa-schema`, and `ferrosa-cql` (Parts A-D: protocol, parser, routing, prepared cache, security hardening) are complete. `ferrosa-graph` Phase 1 is complete (Cypher parser, planner, executor, adjacency index, HTTP endpoint with auth/TLS). The `ferrosa` binary crate composes everything into a working single-node database accepting CQL on port 9042 and optionally graph queries on port 7474. Next up: `ferrosa-net` (internode protocol) and `ferrosa-cluster` (Raft, distributed coordination).
 
 ## Key Architectural Decisions
 
