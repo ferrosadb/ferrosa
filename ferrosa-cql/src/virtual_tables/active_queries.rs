@@ -61,13 +61,7 @@ impl QueryTracker {
     /// The caller must call [`complete`](Self::complete) with the returned ID
     /// when the query finishes (or use [`begin_guarded`](Self::begin_guarded)
     /// for automatic cleanup).
-    pub fn begin(
-        &self,
-        query: &str,
-        keyspace: &str,
-        client: &str,
-        username: &str,
-    ) -> u64 {
+    pub fn begin(&self, query: &str, keyspace: &str, client: &str, username: &str) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)

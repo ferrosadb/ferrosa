@@ -218,12 +218,10 @@ impl VirtualTable for ConnectionsTable {
                     .min(i32::MAX as u64) as i32;
 
                 // Column 0: peer_address (Text)
-                let peer_address =
-                    CellValue::live(info.peer_address.as_bytes().to_vec(), 0);
+                let peer_address = CellValue::live(info.peer_address.as_bytes().to_vec(), 0);
 
                 // Column 1: peer_port (Int — 4 bytes big-endian)
-                let peer_port =
-                    CellValue::live((info.peer_port as i32).to_be_bytes().to_vec(), 0);
+                let peer_port = CellValue::live((info.peer_port as i32).to_be_bytes().to_vec(), 0);
 
                 // Column 2: state (Text)
                 let state = CellValue::live(info.state.as_bytes().to_vec(), 0);
@@ -303,8 +301,15 @@ mod tests {
         let names: Vec<&str> = table.columns().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            ["peer_address", "peer_port", "state", "username", "idle_seconds",
-             "requests_served", "protocol_version"]
+            [
+                "peer_address",
+                "peer_port",
+                "state",
+                "username",
+                "idle_seconds",
+                "requests_served",
+                "protocol_version"
+            ]
         );
 
         // Verify data types.
@@ -326,13 +331,20 @@ mod tests {
         let table = ConnectionsTable::new(Arc::clone(&tracker));
         let rows = table.read(None);
 
-        assert_eq!(rows.len(), 2, "expected 2 rows for 2 registered connections");
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected 2 rows for 2 registered connections"
+        );
 
         for row in &rows {
             assert_eq!(row.cells.len(), 7, "each row must have 7 cells");
 
             // peer_address should decode to "127.0.0.1"
-            let addr_bytes = row.cells[0].value.as_deref().expect("peer_address not null");
+            let addr_bytes = row.cells[0]
+                .value
+                .as_deref()
+                .expect("peer_address not null");
             assert_eq!(addr_bytes, b"127.0.0.1");
 
             // state should decode to "ready"
@@ -340,12 +352,18 @@ mod tests {
             assert_eq!(state_bytes, b"ready");
 
             // requests_served should be 42 (i64 big-endian)
-            let req_bytes = row.cells[5].value.as_deref().expect("requests_served not null");
+            let req_bytes = row.cells[5]
+                .value
+                .as_deref()
+                .expect("requests_served not null");
             let req: i64 = i64::from_be_bytes(req_bytes.try_into().unwrap());
             assert_eq!(req, 42);
 
             // protocol_version should be 5 (i32 big-endian)
-            let pv_bytes = row.cells[6].value.as_deref().expect("protocol_version not null");
+            let pv_bytes = row.cells[6]
+                .value
+                .as_deref()
+                .expect("protocol_version not null");
             let pv: i32 = i32::from_be_bytes(pv_bytes.try_into().unwrap());
             assert_eq!(pv, 5);
         }
@@ -355,7 +373,10 @@ mod tests {
     fn connections_table_is_pollable() {
         let tracker = make_tracker();
         let table = ConnectionsTable::new(tracker);
-        assert!(matches!(table.subscription_mode(), SubscriptionMode::Pollable));
+        assert!(matches!(
+            table.subscription_mode(),
+            SubscriptionMode::Pollable
+        ));
     }
 
     #[test]

@@ -39,6 +39,12 @@ pub trait WriteObserver: Send + Sync {
     /// Only mutations targeting one of these tables will be dispatched.
     fn tables(&self) -> Vec<TableId>;
 
+    /// Returns true if this observer wants mutations for the given table.
+    /// Default delegates to tables().contains(). Override for dynamic sets.
+    fn watches_table(&self, table: &TableId) -> bool {
+        self.tables().contains(table)
+    }
+
     /// Called when a mutation is committed to the write-ahead log and memtable.
     ///
     /// Returns zero or more derived mutations to be applied (e.g., index entries).
@@ -156,5 +162,24 @@ mod tests {
         let config = ObserverConfig::default();
         assert_eq!(config.queue_capacity, 10_000);
         assert_eq!(config.batch_interval_ms, 10);
+    }
+
+    #[test]
+    fn default_watches_table_delegates_to_tables() {
+        struct TestObs;
+        impl WriteObserver for TestObs {
+            fn mode(&self) -> ObserverMode {
+                ObserverMode::Sync
+            }
+            fn tables(&self) -> Vec<TableId> {
+                vec![TableId::new("ks", "tbl")]
+            }
+            fn on_write(&self, _: &TableId, _: &Mutation) -> Vec<Mutation> {
+                vec![]
+            }
+        }
+        let obs = TestObs;
+        assert!(obs.watches_table(&TableId::new("ks", "tbl")));
+        assert!(!obs.watches_table(&TableId::new("ks", "other")));
     }
 }
