@@ -64,7 +64,7 @@ graph TB
         end
 
         subgraph "Bridge"
-            Bridge[CqlValue ↔ CellValue<br/>Key serialization]
+            Bridge["CqlValue ↔ CellValue<br/>Key serialization"]
         end
     end
 
