@@ -5,28 +5,27 @@
 
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-use ferrosa_schema::registry::SchemaSnapshot;
+use ferrosa_schema::Schema;
 use ferrosa_storage::{Mutation, ObserverMode, TableId, WriteObserver};
 
 use crate::adjacency::schema::{adjacency_keyspace_name, DIRECTION_IN, DIRECTION_OUT};
 
 /// Async observer that maintains per-keyspace adjacency index entries.
 pub struct AdjacencyIndexObserver {
-    /// Schema snapshot for discovering edge tables and reading extensions.
-    schema: Arc<ArcSwap<SchemaSnapshot>>,
+    /// Schema registry for discovering edge tables and reading extensions.
+    schema: Arc<Schema>,
     /// The user keyspace this observer manages.
     keyspace: String,
 }
 
 impl AdjacencyIndexObserver {
-    pub fn new(schema: Arc<ArcSwap<SchemaSnapshot>>, keyspace: String) -> Self {
+    pub fn new(schema: Arc<Schema>, keyspace: String) -> Self {
         Self { schema, keyspace }
     }
 
     /// Find all edge tables in this keyspace from the current schema snapshot.
     fn edge_tables(&self) -> Vec<TableId> {
-        let snap = self.schema.load();
+        let snap = self.schema.schema_ref().load();
         snap.tables
             .iter()
             .filter(|((ks, _), meta)| {
@@ -48,7 +47,7 @@ impl WriteObserver for AdjacencyIndexObserver {
     }
 
     fn on_write(&self, table: &TableId, mutation: &Mutation) -> Vec<Mutation> {
-        let snap = self.schema.load();
+        let snap = self.schema.schema_ref().load();
         let key = (table.keyspace.clone(), table.table.clone());
         let meta = match snap.tables.get(&key) {
             Some(m) => m,
