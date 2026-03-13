@@ -53,9 +53,9 @@ graph BT
 - **Dependencies**: `ferrosa-common`, `lz4_flex`, `zstd`, `crc32fast`
 - **Detailed spec**: [SSTable Format Specification](sstable.md)
 - **Key interfaces**:
-  - `ReadAt` / `WriteAt` — abstract positional I/O traits (file-system impl here, S3 impl in ferrosa-storage)
-  - `SSTableReader` — open and query BTI SSTables
-  - `SSTableWriter` — write new BTI SSTables from sorted input
+  - `ReadAt` — abstract positional I/O trait (file-system impl here, S3 impl in ferrosa-storage)
+  - `SSTableReader<R: ReadAt>` — open and query BTI SSTables from `SSTableComponents<R>`
+  - `SSTableWriter` — write BTI SSTables to in-memory `Vec<u8>` buffers (`WrittenSSTable`), caller provides `SerializationHeader`, `WriteOptions`, and pre-computed byte-comparable keys + Bloom filter hashes
 - **Formats**: Phase 1: BTI (trie-based, Cassandra 5.x default) read + write. Phase 2: Big (legacy) read for migration. Phase 3: native Ferrosa format behind feature flag.
 - **Components handled**: Data.db, Partitions.db (trie partition index), Rows.db (trie row index), Filter.db (Bloom filter), Statistics.db, CompressionInfo.db, TOC.txt
 - **On-disk trie**: 16 node types with page-aware packing (4096-byte pages), bottom-up incremental construction, used by both partition and row indices
@@ -172,3 +172,4 @@ gantt
 
 - [Overview](overview.md) — system overview and design principles
 - [Data Flow](data-flow.md) — write/read paths
+- [CQL](cql.md) — CQL native protocol v5

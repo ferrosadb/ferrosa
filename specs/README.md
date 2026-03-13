@@ -4,6 +4,19 @@
 
 Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassandra with S3-backed storage.
 
+## Implementation Status
+
+| Crate | Status |
+|-------|--------|
+| ferrosa-common | Done |
+| ferrosa-sstable | Done |
+| ferrosa-storage | Not started |
+| ferrosa-schema | Not started |
+| ferrosa-cql | Not started |
+| ferrosa-net | Not started |
+| ferrosa-cluster | Not started |
+| ferrosa (binary) | Not started |
+
 ## Specs Index
 
 | Spec | Description | Status |
@@ -35,3 +48,5 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 ## Related Documents
 
 - [README](../README.md) — project introduction
+- [SSTable Design](../docs/superpowers/specs/2026-03-11-ferrosa-sstable-design.md) — implementation design for ferrosa-sstable
+- [CQL Design](../docs/superpowers/specs/2026-03-12-ferrosa-cql-design.md) — implementation design for ferrosa-cql
