@@ -88,7 +88,10 @@ fn execute_expand(
     // Step 1: Anchor lookup.
     // Check if the anchor table is a virtual table before going to storage.
     let is_virtual = virtual_tables
-        .map(|vt| vt.get(&anchor.table.keyspace, &anchor.table.table).is_some())
+        .map(|vt| {
+            vt.get(&anchor.table.keyspace, &anchor.table.table)
+                .is_some()
+        })
         .unwrap_or(false);
 
     if is_virtual {
@@ -347,7 +350,10 @@ mod tests {
     use std::sync::Arc;
 
     use ferrosa_common::CellValue;
-    use ferrosa_schema::virtual_table::{VirtualColumnDef, VirtualRow, VirtualTable};
+    use ferrosa_common::DataType;
+    use ferrosa_schema::virtual_table::{
+        RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow, VirtualTable,
+    };
 
     /// A test virtual table that returns a fixed set of rows.
     #[derive(Debug)]
@@ -368,8 +374,14 @@ mod tests {
         fn columns(&self) -> &[VirtualColumnDef] {
             &self.cols
         }
-        fn read(&self) -> Vec<VirtualRow> {
+        fn primary_key_columns(&self) -> &[usize] {
+            &[0]
+        }
+        fn read(&self, _predicate: Option<&RowPredicate>) -> Vec<VirtualRow> {
             self.rows.clone()
+        }
+        fn subscription_mode(&self) -> SubscriptionMode {
+            SubscriptionMode::Pollable
         }
     }
 
@@ -424,11 +436,11 @@ mod tests {
             cols: vec![
                 VirtualColumnDef {
                     name: "peer_address".to_string(),
-                    data_type: "text".to_string(),
+                    data_type: DataType::Text,
                 },
                 VirtualColumnDef {
                     name: "state".to_string(),
-                    data_type: "text".to_string(),
+                    data_type: DataType::Text,
                 },
             ],
             rows: vec![
@@ -495,7 +507,7 @@ mod tests {
             ks: "system_observability".to_string(),
             cols: vec![VirtualColumnDef {
                 name: "peer_address".to_string(),
-                data_type: "text".to_string(),
+                data_type: DataType::Text,
             }],
             rows: vec![VirtualRow {
                 cells: vec![CellValue::live(b"10.0.0.1".to_vec(), 1000)],
@@ -539,7 +551,7 @@ mod tests {
             ks: "system_observability".to_string(),
             cols: vec![VirtualColumnDef {
                 name: "val".to_string(),
-                data_type: "text".to_string(),
+                data_type: DataType::Text,
             }],
             rows: vec![VirtualRow {
                 cells: vec![CellValue::tombstone(1000, 1700000000)],
@@ -574,7 +586,7 @@ mod tests {
             ks: "system_observability".to_string(),
             cols: vec![VirtualColumnDef {
                 name: "val".to_string(),
-                data_type: "text".to_string(),
+                data_type: DataType::Text,
             }],
             rows: vec![],
         });
@@ -645,7 +657,7 @@ mod tests {
             ks: "system_observability".to_string(),
             cols: vec![VirtualColumnDef {
                 name: "val".to_string(),
-                data_type: "text".to_string(),
+                data_type: DataType::Text,
             }],
             rows,
         });

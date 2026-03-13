@@ -47,7 +47,7 @@ pub trait VirtualTable: Send + Sync {
 }
 
 /// A single row returned by a virtual table.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct VirtualRow {
     /// Cell values in column order, matching [`VirtualTable::columns`].
     pub cells: Vec<CellValue>,
