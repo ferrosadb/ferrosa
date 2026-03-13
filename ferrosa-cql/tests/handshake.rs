@@ -15,6 +15,7 @@ use ferrosa_cql::frame::*;
 use ferrosa_cql::prepared::PreparedCache;
 use ferrosa_cql::router::{SharedState, SingleNodeClusterState};
 use ferrosa_cql::server::{CqlServer, ServerConfig};
+use ferrosa_cql::virtual_tables::active_queries::QueryTracker;
 use ferrosa_cql::virtual_tables::connections::ConnectionTracker;
 
 use ferrosa_schema::{
@@ -80,6 +81,7 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         cluster_state: Arc::new(SingleNodeClusterState),
         prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
         connection_tracker: Arc::new(ConnectionTracker::new()),
+        query_tracker: Arc::new(QueryTracker::new()),
     });
     (state, dir)
 }

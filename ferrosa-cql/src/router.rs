@@ -31,6 +31,7 @@ use crate::error::CqlError;
 use crate::prepared::PreparedCache;
 use crate::result;
 use crate::types::{CqlType, CqlValue};
+use crate::virtual_tables::active_queries::QueryTracker;
 use crate::virtual_tables::connections::ConnectionTracker;
 
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
@@ -44,6 +45,7 @@ pub struct SharedState {
     pub cluster_state: Arc<dyn ClusterState>,
     pub prepared_cache: Arc<PreparedCache>,
     pub connection_tracker: Arc<ConnectionTracker>,
+    pub query_tracker: Arc<QueryTracker>,
 }
 
 /// Per-request context: authentication and current keyspace.
@@ -77,6 +79,16 @@ pub fn route(
     ctx: &RequestContext<'_>,
     stmt: Statement,
 ) -> Result<RouteResult, CqlError> {
+    // Track the query for observability; the guard calls complete() on drop.
+    let query_desc: String = format!("{:?}", &stmt).chars().take(200).collect();
+    let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
+    let _guard = state.query_tracker.begin_guarded(
+        &query_desc,
+        keyspace,
+        "",             // client address not yet available in RequestContext
+        &ctx.auth.role, // authenticated role name
+    );
+
     match stmt {
         Statement::Select(s) => route_select(state, ctx, s).map(RouteResult::Result),
         Statement::Insert(i) => route_insert(state, ctx, i).map(RouteResult::Result),
@@ -1471,6 +1483,7 @@ mod tests {
             cluster_state: Arc::new(SingleNodeClusterState),
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
+            query_tracker: Arc::new(QueryTracker::new()),
         };
         (state, dir)
     }
@@ -1671,6 +1684,20 @@ mod tests {
     #[test]
     fn parse_permissions_unknown_rejected() {
         assert!(parse_permissions(&["BANANA".into()]).is_err());
+    }
+
+    #[test]
+    fn router_tracks_query_count() {
+        let (state, _dir) = setup();
+        assert_eq!(state.query_tracker.total_executed(), 0);
+        // Execute a simple query
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
+        let _ = route(&state, &ctx, stmt);
+        assert_eq!(state.query_tracker.total_executed(), 1);
     }
 
     #[test]
