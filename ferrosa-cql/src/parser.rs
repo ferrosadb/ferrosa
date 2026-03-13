@@ -617,7 +617,7 @@ impl<'input> Parser<'input> {
         })
     }
 
-    /// Parse a map literal of string keys and string values: {'key': 'value', ...}
+    /// Parse a map literal of string keys and string/integer values: {'key': 'value', 'key2': 1, ...}
     fn parse_string_map(&mut self) -> Result<Vec<(String, String)>, CqlError> {
         self.lexer.expect(&TokenKind::LBrace)?;
         let mut entries = vec![];
@@ -629,7 +629,20 @@ impl<'input> Parser<'input> {
         loop {
             let key = self.expect_string_literal()?;
             self.lexer.expect(&TokenKind::Colon)?;
-            let value = self.expect_string_literal()?;
+            // Accept both string literals and integer literals as values
+            // (Cassandra allows e.g. 'replication_factor': 1)
+            let tok = self.lexer.peek()?;
+            let value = match tok.kind {
+                TokenKind::IntegerLiteral(_) => {
+                    let t = self.lexer.next_token()?;
+                    if let TokenKind::IntegerLiteral(n) = t.kind {
+                        n.to_string()
+                    } else {
+                        unreachable!()
+                    }
+                }
+                _ => self.expect_string_literal()?,
+            };
             entries.push((key, value));
             if entries.len() > MAX_COLLECTION_ELEMENTS {
                 return Err(CqlError::SyntaxError("collection too large".to_string()));

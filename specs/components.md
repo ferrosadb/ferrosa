@@ -1,6 +1,6 @@
 # Component Architecture
 
-> Last updated: 2026-03-12
+> Last updated: 2026-03-13
 > Status: Approved
 
 ## Overview
@@ -17,7 +17,7 @@ graph BT
     Storage[ferrosa-storage<br/>Write-behind S3 engine]
     Schema[ferrosa-schema<br/>DDL, system keyspaces]
     CQL[ferrosa-cql<br/>CQL protocol v5]
-    Graph[ferrosa-graph<br/>Cypher/GQL parser]
+    Graph[ferrosa-graph<br/>Graph query engine]
     Cluster[ferrosa-cluster<br/>Raft, routing, CL]
     Bin[ferrosa<br/>Binary]
 
@@ -29,10 +29,15 @@ graph BT
     CQL --> Common
     CQL --> Schema
     CQL --> Storage
+    Graph --> Common
+    Graph --> Schema
+    Graph --> SST
+    Graph --> Storage
     Cluster --> Common
     Cluster --> Net
     Cluster --> Storage
     Bin --> CQL
+    Bin --> Graph
     Bin --> Cluster
     Bin --> Common
 ```
@@ -69,7 +74,7 @@ graph BT
 - **Purpose**: Storage engine with S3 write-behind
 - **Location**: `ferrosa-storage/`
 - **Dependencies**: `ferrosa-common`, `ferrosa-sstable`, `arc-swap`, `parking_lot`, `crc32fast`, `object_store` (S3), `tokio`, `serde`, `serde_json`, `bytes`, `crossbeam-skiplist` (optional)
-- **Status**: Parts A/B/C implemented — memtable, flush, merge, commit log, compaction, S3 upload manager, manifest, local cache, StorageEngine composition
+- **Status**: Parts A/B/C implemented — memtable, flush, merge, commit log, compaction, S3 upload manager, manifest, local cache, StorageEngine composition, `WriteObserver` trait (sync/async modes with bounded-channel backpressure)
 - **Modules**:
   - `memtable/` — `Memtable` trait with two implementations: `ShardedBTreeMemtable` (64-shard `BTreeMap` with `parking_lot::RwLock`), `SkipListMemtable` (lock-free, behind `skiplist-memtable` feature flag)
   - `flush.rs` — `FlushTarget` trait, `FileFlushTarget` (disk), `InMemoryFlushTarget` (testing)
@@ -81,6 +86,7 @@ graph BT
   - `manifest.rs` — S3 manifest with etag-based CAS (conditional put via `PutMode::Update`)
   - `cache.rs` — `LocalCache` with LRU eviction, pinned entries, size tracking
   - `engine.rs` — `StorageEngine` composing all components, `StorageEngineConfig` with `from_env()` for 12-factor config
+  - `observer.rs` — `WriteObserver` trait with `ObserverMode::Sync`/`Async`, bounded `mpsc` channel for async dispatch with backpressure (T9 mitigation)
 - **Concurrency**:
   - *Memtable writes*: 64-shard `BTreeMap` — different partitions write in parallel; same-shard writes serialize on a per-shard `RwLock`. Alternative: `SkipListMemtable` (lock-free, `crossbeam-skiplist`, behind feature flag).
   - *Memtable flush*: Atomic swap via `arc-swap` — current memtable replaced with a fresh one; old memtable flushed to SSTable. Reads check both active and flushing memtable.
@@ -94,7 +100,7 @@ graph BT
 - **Purpose**: Schema management, auth, audit, and system keyspaces
 - **Location**: `ferrosa-schema/`
 - **Dependencies**: `ferrosa-common`, `arc-swap`, `bcrypt`, `argon2`, `uuid`, `serde`, `serde_json`, `indexmap`, `tracing`, `password-hash`
-- **Status**: Implemented — metadata types, schema registry with lock-free snapshots, auth (roles, permissions, RBAC, rate limiting), audit logging (composite sinks), system keyspace queries, secrets provider, production mode validation
+- **Status**: Implemented — metadata types, schema registry with lock-free snapshots, auth (roles, permissions, RBAC, rate limiting), audit logging (composite sinks, graph audit events), system keyspace queries, secrets provider, production mode validation, `TableMetadata` extensions map + `is_system` flag, `graph.*` extension validation (T6), system table protection (T7), `schema_ref()` for lock-free observer reads
 - **Modules**:
   - `metadata/` — `KeyspaceMetadata`, `TableMetadata`, `ColumnMetadata`, replication params, caching params
   - `registry.rs` — `Schema` with `ArcSwap<SchemaSnapshot>` for lock-free reads, `AuthMethod` config
@@ -112,29 +118,47 @@ graph BT
 
 - **Purpose**: CQL native protocol v5 and query execution
 - **Location**: `ferrosa-cql/`
-- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `tokio`, `tokio-util`, `bytes`, `futures`, `arc-swap`, `uuid`, `num-bigint`, `phf`, `md-5`, `tracing`
-- **Status**: Part A implemented (protocol framing, CQL type system, TCP server, SASL PLAIN auth). Parts B-D (parser, query routing, prepared cache, security hardening) are next.
-- **Implemented modules**:
+- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `tokio`, `tokio-util`, `bytes`, `futures`, `arc-swap`, `uuid`, `num-bigint`, `phf`, `md-5`, `moka`, `tracing`
+- **Status**: Parts A-D implemented — protocol framing, CQL type system, TCP server, SASL PLAIN auth, recursive descent parser, full query routing (SELECT/INSERT/UPDATE/DELETE/BATCH/DDL), prepared statement cache (moka W-TinyLFU), connection state machine with security hardening
+- **Modules**:
   - `frame.rs` — CQL v5 binary framing, `CqlCodec` (Tokio `Encoder`/`Decoder`)
   - `types.rs` — `CqlValue` enum with encode/decode for all CQL types
-  - `server.rs` — TCP listener, per-connection Tokio tasks
-  - `connection.rs` — Connection handler, auth flow, request routing
-  - `auth.rs` — SASL PLAIN authentication
+  - `server.rs` — TCP listener, per-connection Tokio tasks, max connection limit
+  - `connection.rs` — Connection state machine (AwaitingStartup → Authenticating → Ready), idle timeout (300s)
+  - `auth.rs` — SASL PLAIN authentication, max 3 attempts per connection
   - `error.rs` — CQL error codes
-- **Key interfaces**: Protocol framing, CQL type system with encode/decode, TCP server with auth
-- **Auth**: SASL PLAIN initially, pluggable auth provider trait
-- **Minimum viable subset**: STARTUP, OPTIONS, QUERY, PREPARE, EXECUTE, REGISTER, RESULT + basic types + system keyspace queries
+  - `lexer.rs` — Zero-allocation tokenizer with `phf` keyword map
+  - `parser.rs` — Hand-written recursive descent parser (LL(2)), nesting depth cap (32), collection element cap (65,536)
+  - `ast.rs` — `Statement` enum (Select, Insert, Update, Delete, CreateKeyspace, CreateTable, AlterTable, DropTable, Use, Batch, Prepare, etc.)
+  - `bridge.rs` — `CqlValue` to `CellValue` conversion, partition key serialization, clustering key encoding
+  - `router.rs` — Query routing to schema/storage, `SharedState`, `SingleNodeClusterState`
+  - `prepared.rs` — `PreparedCache` (moka W-TinyLFU, weight-based, MD5 IDs)
+  - `result.rs` — CQL result encoding
+- **Key interfaces**: Full CQL query lifecycle — frame decode → parse → route → execute → encode result
+- **Auth**: SASL PLAIN with `Schema::authenticate()`, rate limiting, connection state machine
+- **Supported operations**: SELECT, INSERT, UPDATE, DELETE, BATCH, CREATE/ALTER/DROP KEYSPACE/TABLE, CREATE/ALTER/DROP ROLE, GRANT/REVOKE, TRUNCATE, USE, PREPARE/EXECUTE, system table queries
 - **Target**: All standard CQL drivers connect without modification
 
 ### ferrosa-graph
 
-- **Purpose**: Graph query engine with Cypher/GQL support
+- **Purpose**: Graph query engine with Cypher support, adjacency index, HTTP endpoint
 - **Location**: `ferrosa-graph/`
-- **Dependencies**: `phf`
-- **Status**: Early stage — Cypher parser (lexer, parser, AST) implemented. Not yet integrated with storage or CQL layers.
+- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-sstable`, `ferrosa-storage`, `arc-swap`, `axum`, `axum-server` (TLS), `base64`, `hex`, `indexmap`, `phf`, `serde`, `serde_json`, `tokio`, `tower-http`, `tracing`, `uuid`
+- **Status**: Phase 1 implemented — Cypher parser, logical/physical planners, hop-by-hop executor, adjacency index with async observer, HTTP endpoint with auth/TLS, background reconciliation
 - **Modules**:
-  - `parser/` — `lexer.rs` (tokenizer), `parse_impl.rs` (recursive descent parser), `ast.rs` (AST types), `token.rs` (token definitions), `error.rs` (parse errors)
-- **Design**: Data stored in normal CQL tables, accessed via system-managed adjacency index
+  - `parser/` — Cypher lexer, recursive descent parser, AST types
+  - `error.rs` — `GraphError` enum (Parse, Validation, PermissionDenied, ResourceLimit, Timeout, Storage, Schema, Internal)
+  - `adjacency/schema.rs` — Adjacency table schema (`system_graph_<ks>.adjacency`), direction constants
+  - `adjacency/observer.rs` — `AdjacencyIndexObserver` (`WriteObserver` impl, async mode), generates OUT+IN entries per edge write
+  - `adjacency/reconcile.rs` — Background reconciliation task (T5), periodic scan for index/edge divergence
+  - `planner/logical.rs` — Label resolution against schema, per-hop auth checks (T3)
+  - `planner/physical.rs` — `PhysicalPlan::Expand` with anchor selection, hop planning
+  - `executor/expand.rs` — Hop-by-hop traversal, fan-out limits (T4), query timeout, `GraphEngineConfig`
+  - `executor/result.rs` — `GraphResult` and `QueryStats` (serializable)
+  - `engine.rs` — `GraphEngine` composition root: startup wiring, execute/explain/schema APIs, graceful shutdown
+  - `http.rs` — Axum routes (POST `/graph/query`, `/graph/explain`, GET `/graph/schema`, `/graph/health`), Basic auth middleware (T2), error sanitization (T8), TLS enforcement (T11), `CatchPanicLayer`, `RequestBodyLimitLayer`
+- **Security mitigations**: T2 (HTTP auth), T3 (per-hop auth), T4 (timeout + fan-out limits), T5 (reconciliation), T6 (extension validation in schema), T7 (system table protection), T8 (error sanitization), T9 (observer backpressure), T10 (audit events), T11 (TLS)
+- **Design**: Data stored in normal CQL tables with `graph.*` extensions, accessed via system-managed adjacency index per keyspace
 
 ### ferrosa-net
 
@@ -158,8 +182,10 @@ graph BT
 
 - **Purpose**: Compose all crates into the running database
 - **Location**: `ferrosa/` (workspace root binary)
-- **Dependencies**: All crates
-- **Key interfaces**: CLI, configuration loading, service startup/shutdown
+- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `ferrosa-cql`, `ferrosa-graph`, `tokio`, `tracing`, `tracing-subscriber`
+- **Status**: Single-node operation implemented — starts CQL server on port 9042, optionally starts graph HTTP on port 7474
+- **Startup sequence**: tracing init → `StorageEngine::new()` → `Schema::new()` → `CqlServer::start_background()` → optional `GraphEngine` + HTTP (gated by `FERROSA_GRAPH_ENABLED`) → ctrl-c → graceful shutdown
+- **Environment variables**: `FERROSA_CQL_BIND` (default `0.0.0.0:9042`), `FERROSA_AUTH_DISABLED` (default false), `FERROSA_GRAPH_ENABLED` (default false), plus storage/schema env vars
 
 ## Build Order
 
@@ -178,13 +204,13 @@ gantt
     ferrosa-schema          :done, 5, 6
 
     section Protocol
-    ferrosa-cql             :active, 6, 8
-    ferrosa-graph           :active, 6, 7
+    ferrosa-cql             :done, 6, 8
+    ferrosa-graph           :done, 6, 7
     ferrosa-net             :7, 8
 
     section Distributed
     ferrosa-cluster         :8, 10
-    ferrosa binary          :10, 11
+    ferrosa binary          :done, 10, 11
 ```
 
 | Order | Crate | Testable Milestone |
@@ -193,11 +219,11 @@ gantt
 | 2 | ferrosa-sstable | Read real Cassandra SSTables, round-trip BTI — **done** |
 | 3 | ferrosa-storage | Single-node writes + reads with S3 backend — **done** (core engine; follow-on items tracked) |
 | 4 | ferrosa-schema | Schema registry, auth, audit, system keyspaces queryable — **done** |
-| 5 | ferrosa-cql | cqlsh connects and runs basic queries — **Part A done** (framing, types, server, auth) |
-| 5b | ferrosa-graph | Cypher parser produces valid ASTs — **parser done** |
+| 5 | ferrosa-cql | cqlsh connects and runs basic queries — **done** (full CQL lifecycle: parse, route, execute, prepared cache) |
+| 5b | ferrosa-graph | Graph queries via HTTP with auth — **done** (Phase 1: parser, planner, executor, adjacency index, HTTP) |
 | 6 | ferrosa-net | Two nodes exchange messages |
 | 7 | ferrosa-cluster | 3-node cluster at QUORUM |
-| 8 | ferrosa (binary) | Full database, characterization tests pass |
+| 8 | ferrosa (binary) | Single-node binary accepts CQL on 9042 — **done**; distributed mode pending ferrosa-net/cluster |
 
 ## Related Specs
 

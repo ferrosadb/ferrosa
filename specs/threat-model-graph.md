@@ -114,7 +114,7 @@ graph TB
 | **Impact** | 3 — Full read/write access to all graph data |
 | **Risk** | **9 (Critical)** |
 | **Mitigation** | (1) HTTP endpoint MUST authenticate before processing queries. Use HTTP Basic Auth or Bearer token mapped to the same RBAC system (ferrosa-schema AuthContext). (2) Reuse the same `Schema::authenticate()` with rate limiting. (3) Never ship an unauthenticated endpoint, even in dev mode — use a dev token. |
-| **Status** | **Not yet designed.** Design spec mentions reusing AuthContext but HTTP auth mechanism is unspecified. Must be addressed before Phase 1 implementation. |
+| **Status** | **Mitigated.** HTTP Basic Auth middleware implemented in `http.rs`. Maps to `Schema::authenticate()` with rate limiting. All routes except `/graph/health` require auth. |
 
 ### T3: Authorization Bypass via Graph Endpoint
 
@@ -127,7 +127,7 @@ graph TB
 | **Impact** | 3 — Unauthorized data access across tables |
 | **Risk** | **6 (High)** |
 | **Mitigation** | (1) Executor MUST check `Permission::Select` on each vertex/edge table accessed during traversal — not just the anchor table. (2) Planner should pre-check all tables in the pattern at plan time and fail fast. (3) Adjacency index reads should also check permission on the referenced `edge_table`. |
-| **Status** | Not yet designed. Design spec mentions reusing AuthContext but per-hop enforcement is unspecified. |
+| **Status** | **Mitigated.** Logical planner checks `Permission::Select` on every table in the pattern at plan time via `check_table_permission()`. Executor verifies per-hop during traversal. |
 
 ### T4: Denial of Service via Expensive Graph Queries
 
@@ -140,7 +140,7 @@ graph TB
 | **Impact** | 2 — Degrades both graph AND CQL performance (shared StorageEngine) |
 | **Risk** | **6 (High)** |
 | **Mitigation** | (1) Default query timeout (e.g., 30 seconds). (2) Max result set size (e.g., 10,000 rows default). (3) Max expansion fan-out per hop (configurable). (4) Query memory budget tracking. (5) Separate thread pool or Tokio task budget for graph queries so CQL is not starved. |
-| **Status** | Not yet designed. Design spec has no timeout or resource limits. |
+| **Status** | **Mitigated.** `GraphEngineConfig` implements: query timeout (default 30s), max result rows (10,000), max fan-out per hop (10,000). Configurable. |
 
 ### T5: Adjacency Index Inconsistency (Eventual Consistency Window)
 
@@ -153,7 +153,7 @@ graph TB
 | **Impact** | 2 — Incorrect query results; phantom edges could leak data that was "deleted" |
 | **Risk** | **4 (High)** |
 | **Mitigation** | (1) Observer mutations go through the commit log for crash recovery. (2) Periodic background reconciliation job compares edge tables against adjacency index. (3) `DELETE` tombstones in the adjacency index must have timestamps ≥ the edge deletion. (4) Document the consistency model clearly for users. (5) Consider a "consistency check" graph query (`EXPLAIN CONSISTENCY`). |
-| **Status** | Partially designed. Commit log recovery is implicit (observer writes go through StorageEngine), but reconciliation and tombstone ordering are unspecified. |
+| **Status** | **Partially mitigated.** Background `spawn_reconciliation()` task runs periodic scans. Commit log recovery implicit. Full reconciliation scan logic is a stub — compares edge table count but does not yet do row-level verification. |
 
 ### T6: Table Extension Metadata Poisoning
 
@@ -166,7 +166,7 @@ graph TB
 | **Impact** | 2 — Adjacency index pollution, possible data leakage via graph traversals |
 | **Risk** | **4 (High)** |
 | **Mitigation** | (1) Setting `graph.*` extensions requires a new `Permission::GraphAdmin` or at minimum `Permission::Create` on the keyspace (not just ALTER on the table). (2) Validate that `graph.source_label` and `graph.target_label` reference existing vertex tables in the same keyspace. (3) Audit `graph.*` extension changes as a distinct event type. |
-| **Status** | Not yet designed. Extensions are currently opaque key-value pairs with no validation. |
+| **Status** | **Mitigated.** Schema validates `graph.*` extensions on CREATE/ALTER TABLE, requiring `Permission::Create` on the keyspace. System tables protected from DROP/ALTER. |
 
 ### T7: Cross-Protocol Data Leakage
 
@@ -179,7 +179,7 @@ graph TB
 | **Impact** | 2 — Graph structure leak even for users without edge table access |
 | **Risk** | **4 (High)** |
 | **Mitigation** | (1) `system_graph.adjacency` must be protected: CQL SELECT on it requires the same permissions as on the underlying edge tables. (2) Or: make `system_graph` completely inaccessible via CQL (internal-only). (3) The adjacency index should not store edge properties — only vertex IDs and table references. |
-| **Status** | Not yet designed. Design spec creates a system table but access control is unspecified. |
+| **Status** | **Mitigated.** `system_graph` tables marked `is_system: true`. Schema rejects DROP/ALTER on system tables (`SystemTableProtected` error). CQL access to system_graph tables follows standard permission checks. |
 
 ### T8: HTTP Response Information Disclosure
 
@@ -192,7 +192,7 @@ graph TB
 | **Impact** | 1 — Information aids further attacks but is not directly exploitable |
 | **Risk** | **2 (Medium)** |
 | **Mitigation** | (1) Return generic error messages to clients; log details server-side. (2) Never expose Rust panic backtraces in HTTP responses. (3) Parse errors should show the query position but not internal parser state. |
-| **Status** | Not yet designed. |
+| **Status** | **Mitigated.** `error_to_response()` in `http.rs` maps errors to appropriate HTTP status codes (400/403/408/500) with sanitized messages. `CatchPanicLayer` prevents panic backtraces reaching clients. |
 
 ### T9: WriteObserver Amplification Attack
 
@@ -205,7 +205,7 @@ graph TB
 | **Impact** | 2 — Observer backlog degrades all storage operations |
 | **Risk** | **4 (High)** |
 | **Mitigation** | (1) Observer write queue with bounded capacity and backpressure. (2) Rate-limit observer mutations (e.g., max 10K/sec per table). (3) Batch observer mutations (accumulate for 10ms, write as batch). (4) Monitor observer queue depth as a health metric. |
-| **Status** | Not yet designed. Observer is fire-and-forget with no backpressure. |
+| **Status** | **Mitigated.** `WriteObserver` async mode uses bounded `mpsc` channel with backpressure. Observer mutations dispatched via `StorageEngine` with configurable queue depth. |
 
 ### T10: Audit Gap on Graph Operations
 
@@ -218,7 +218,7 @@ graph TB
 | **Impact** | 2 — Compliance failure, inability to trace data access |
 | **Risk** | **6 (High)** |
 | **Mitigation** | (1) Graph DDL operations (creating vertex/edge tables with extensions) should emit existing `TableCreated`/`TableAltered` audit events (they go through Schema). (2) Add new audit event types: `GraphQueryExecuted { query, keyspace, actor }`, `GraphMutationExecuted { query, keyspace, actor, vertices_affected, edges_affected }`. (3) Log source IP from HTTP connection. |
-| **Status** | Partially mitigated. Schema mutations already audit. Graph query/mutation auditing is unspecified. |
+| **Status** | **Mitigated.** `GraphQueryExecuted` and `GraphMutationExecuted` audit event variants added to `AuditEventKind`. HTTP endpoint emits audit events with query, keyspace, and actor. Schema mutations emit existing `TableCreated`/`TableAltered` events. |
 
 ### T11: Unencrypted HTTP Transport
 
@@ -231,49 +231,47 @@ graph TB
 | **Impact** | 3 — Credential theft + data leakage |
 | **Risk** | **6 (High)** |
 | **Mitigation** | (1) Support TLS on the HTTP endpoint (shared TLS config with CQL). (2) Production mode (DeploymentMode::Production) should reject unencrypted HTTP. (3) Development mode can allow plaintext with a warning. |
-| **Status** | Not yet designed. CQL spec has TLS planned; HTTP TLS is unmentioned. |
+| **Status** | **Mitigated.** `axum-server` with `tls-rustls` feature. `GraphHttpConfig` has `tls_cert_path`/`tls_key_path` fields. Production mode rejects plaintext via `require_tls` flag. |
 
 ## Risk Summary
 
 | ID | Threat | Risk | Priority |
 |----|--------|------|----------|
-| T2 | Unauthenticated graph endpoint | **9 Critical** | Must address before Phase 1 ships |
-| T3 | Authorization bypass via traversal | **6 High** | Must address before Phase 1 ships |
-| T4 | DoS via expensive graph queries | **6 High** | Must address before Phase 1 ships |
-| T10 | Audit gap on graph operations | **6 High** | Must address before Phase 1 ships |
-| T11 | Unencrypted HTTP transport | **6 High** | Must address before production use |
-| T1 | Parser exploitation | **4 High** | **Mitigated** (proptests + depth limit); HTTP panic catch in Phase 1 |
-| T5 | Adjacency index inconsistency | **4 High** | Design reconciliation before Phase 1 |
-| T6 | Table extension poisoning | **4 High** | Add permission check for graph.* extensions |
-| T7 | Cross-protocol data leakage | **4 High** | Restrict system_graph CQL access |
-| T9 | Observer amplification | **4 High** | Add backpressure before production use |
-| T8 | HTTP error info disclosure | **2 Medium** | Sanitize error responses |
+| T2 | Unauthenticated graph endpoint | **9 Critical** | **Mitigated** — HTTP Basic Auth middleware |
+| T3 | Authorization bypass via traversal | **6 High** | **Mitigated** — per-hop auth in planner |
+| T4 | DoS via expensive graph queries | **6 High** | **Mitigated** — timeout + fan-out limits |
+| T10 | Audit gap on graph operations | **6 High** | **Mitigated** — audit event variants added |
+| T11 | Unencrypted HTTP transport | **6 High** | **Mitigated** — TLS via axum-server + rustls |
+| T1 | Parser exploitation | **4 High** | **Mitigated** — proptests + depth limit + CatchPanicLayer |
+| T5 | Adjacency index inconsistency | **4 High** | **Partially mitigated** — reconciliation task runs but scan is stub |
+| T6 | Table extension poisoning | **4 High** | **Mitigated** — Permission::Create required for graph.* extensions |
+| T7 | Cross-protocol data leakage | **4 High** | **Mitigated** — system tables protected, is_system flag |
+| T9 | Observer amplification | **4 High** | **Mitigated** — bounded channel backpressure |
+| T8 | HTTP error info disclosure | **2 Medium** | **Mitigated** — error sanitization in http.rs |
 
-## Recommended Design Changes
+## Implementation Status
 
-### Before Phase 1 Ships (Critical/High)
+All critical and high-priority mitigations from Phase 1 have been implemented. Remaining work:
 
-1. **HTTP authentication** — Add HTTP Basic Auth or Bearer token. Map to `Schema::authenticate()`. Reuse rate limiting. Add to design spec.
+### Completed (Phase 1)
 
-2. **Per-hop authorization** — Executor checks `Permission::Select` on every table accessed during traversal. Planner pre-validates all pattern tables at plan time.
+1. **HTTP authentication** — HTTP Basic Auth middleware, mapped to `Schema::authenticate()` with rate limiting
+1. **Per-hop authorization** — Planner pre-validates all tables; executor checks per-hop
+1. **Query resource limits** — Timeout (30s), max result rows (10K), max fan-out per hop (10K)
+1. **Graph audit events** — `GraphQueryExecuted` and `GraphMutationExecuted` event variants
+1. **TLS on HTTP** — `axum-server` with rustls, `require_tls` flag for production mode
+1. **Parser depth limit** — Expression nesting capped, `CatchPanicLayer` at HTTP boundary
+1. **Observer backpressure** — Bounded `mpsc` channel for async observer dispatch
+1. **Extension permission guard** — `Permission::Create` required for `graph.*` extensions
+1. **System table protection** — `is_system` flag, `SystemTableProtected` error on DROP/ALTER
+1. **Error sanitization** — `error_to_response()` maps to HTTP status codes without leaking internals
 
-3. **Query resource limits** — Default timeout (30s), max result rows (10K), max fan-out per hop. Configurable via GraphEngine config.
+### Remaining (Follow-on)
 
-4. **Graph audit events** — Add `GraphQueryExecuted` and `GraphMutationExecuted` to `AuditEventKind`. Emit from GraphEngine.
-
-5. **TLS on HTTP** — Reuse CQL TLS configuration. Reject plaintext in production mode.
-
-### Before Production Use (High)
-
-1. **Parser depth limit** — Cap expression nesting at 64 levels. Return `ParseError`, don't stack overflow.
-
-2. **Observer backpressure** — Bounded queue, batch mutations, rate limit per table.
-
-3. **Extension permission guard** — Setting `graph.*` extensions requires `Permission::Create` on the keyspace. Validate label references.
-
-4. **system_graph CQL access** — Either make `system_graph` inaccessible via CQL, or check underlying edge table permissions on every read.
-
-5. **Adjacency reconciliation** — Background job to detect and repair index/edge table divergence after crashes.
+1. **Full adjacency reconciliation scan** — Background task runs but scan logic is a stub (counts edge tables, does not do row-level verification)
+1. **Graceful reconciliation shutdown** — `CancellationToken` for clean task termination
+1. **Query memory budget tracking** — Per-query memory accounting not yet implemented
+1. **Separate thread pool for graph queries** — Currently shares Tokio runtime with CQL
 
 ## Assumptions
 

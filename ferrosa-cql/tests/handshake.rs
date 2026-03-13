@@ -448,6 +448,160 @@ async fn prepare_and_execute() {
     assert_result(&resp);
 }
 
+/// Exercises the full set of system table queries that cqlsh sends during
+/// startup introspection. This is the sequence that caused "'local' not found
+/// in keyspace 'system'" and similar errors.
+#[tokio::test]
+async fn cqlsh_introspection_queries_all_succeed() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // cqlsh startup introspection queries — these must all return RESULT (Rows).
+    let introspection_queries = [
+        "SELECT * FROM system.local",
+        "SELECT * FROM system.peers",
+        "SELECT * FROM system.peers_v2",
+        "SELECT * FROM system_schema.keyspaces",
+        "SELECT * FROM system_schema.tables",
+        "SELECT * FROM system_schema.columns",
+        "SELECT * FROM system_schema.types",
+        "SELECT * FROM system_schema.functions",
+        "SELECT * FROM system_schema.aggregates",
+        "SELECT * FROM system_schema.triggers",
+        "SELECT * FROM system_schema.views",
+        "SELECT * FROM system_schema.indexes",
+    ];
+
+    for cql in &introspection_queries {
+        let query = encode_query_body(cql);
+        send_raw_frame(&mut stream, Opcode::Query, &query).await;
+        let resp = read_frame(&mut stream).await;
+        assert_result(&resp);
+
+        // Verify it's a Rows result (kind = 0x0002)
+        let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+        assert_eq!(kind, 0x0002, "{cql} should return Rows result");
+    }
+}
+
+/// Verifies system.local returns the `tokens` column (set<varchar>).
+/// Regression: cqlsh prints "'local' not found in keyspace 'system'" when
+/// the tokens column is missing from system_schema.columns metadata.
+#[tokio::test]
+async fn cqlsh_system_local_has_tokens_column() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Query system_schema.columns for system.local columns
+    let query = encode_query_body("SELECT * FROM system_schema.columns");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // The response body should contain "tokens" somewhere in the row data.
+    // Simple check: the bytes for "tokens" must appear in the result.
+    let body_str = String::from_utf8_lossy(&resp.body);
+    assert!(
+        body_str.contains("tokens"),
+        "system_schema.columns must include a 'tokens' entry for system.local"
+    );
+}
+
+/// Full cqlsh-like workflow: connect, introspect, create schema, write, read.
+#[tokio::test]
+async fn cqlsh_full_workflow() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Phase 1: Introspection (what cqlsh does on startup)
+    for cql in &[
+        "SELECT * FROM system.local",
+        "SELECT * FROM system_schema.keyspaces",
+        "SELECT * FROM system_schema.tables",
+        "SELECT * FROM system_schema.columns",
+    ] {
+        let query = encode_query_body(cql);
+        send_raw_frame(&mut stream, Opcode::Query, &query).await;
+        let resp = read_frame(&mut stream).await;
+        assert_result(&resp);
+    }
+
+    // Phase 2: DDL
+    let ddl_queries = [
+        "CREATE KEYSPACE smoke_ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+        "USE smoke_ks",
+        "CREATE TABLE users (id int PRIMARY KEY, name text, email text)",
+        "CREATE TABLE events (user_id int, ts timestamp, data text, PRIMARY KEY (user_id, ts))",
+    ];
+    for cql in &ddl_queries {
+        let query = encode_query_body(cql);
+        send_raw_frame(&mut stream, Opcode::Query, &query).await;
+        let resp = read_frame(&mut stream).await;
+        assert_result(&resp);
+    }
+
+    // Phase 3: DML writes
+    let insert_queries = [
+        "INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')",
+        "INSERT INTO users (id, name, email) VALUES (2, 'Bob', 'bob@example.com')",
+        "INSERT INTO events (user_id, ts, data) VALUES (1, 1000, 'login')",
+        "INSERT INTO events (user_id, ts, data) VALUES (1, 2000, 'logout')",
+    ];
+    for cql in &insert_queries {
+        let query = encode_query_body(cql);
+        send_raw_frame(&mut stream, Opcode::Query, &query).await;
+        let resp = read_frame(&mut stream).await;
+        assert_result(&resp);
+    }
+
+    // Phase 4: DML reads
+    let select_queries = [
+        "SELECT * FROM users WHERE id = 1",
+        "SELECT * FROM users WHERE id = 2",
+        "SELECT * FROM events WHERE user_id = 1",
+    ];
+    for cql in &select_queries {
+        let query = encode_query_body(cql);
+        send_raw_frame(&mut stream, Opcode::Query, &query).await;
+        let resp = read_frame(&mut stream).await;
+        assert_result(&resp);
+        let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+        assert_eq!(kind, 0x0002, "{cql} should return Rows");
+        // Verify at least 1 row returned (row count at varying offset, but body should be non-trivial)
+        assert!(resp.body.len() > 20, "{cql} should return non-empty rows");
+    }
+
+    // Phase 5: UPDATE and DELETE
+    let mutate_queries = [
+        "UPDATE users SET name = 'Alice Updated' WHERE id = 1",
+        "DELETE FROM events WHERE user_id = 1 AND ts = 1000",
+    ];
+    for cql in &mutate_queries {
+        let query = encode_query_body(cql);
+        send_raw_frame(&mut stream, Opcode::Query, &query).await;
+        let resp = read_frame(&mut stream).await;
+        assert_result(&resp);
+    }
+
+    // Phase 6: Verify update took effect
+    let query = encode_query_body("SELECT * FROM users WHERE id = 1");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    // Should contain "Alice Updated" in the response
+    let body_str = String::from_utf8_lossy(&resp.body);
+    assert!(
+        body_str.contains("Alice Updated"),
+        "updated name should appear in SELECT result"
+    );
+}
+
 /// M7 / T5: QUERY before STARTUP must be rejected with ERROR(Protocol).
 /// Regression test for Critical-rated auth bypass threat (T5, risk 9).
 #[tokio::test]

@@ -52,58 +52,174 @@ pub struct ColumnRow {
 }
 
 /// Query `system_schema.keyspaces` from a snapshot.
+///
+/// Includes virtual system keyspaces (`system`, `system_schema`, `system_auth`)
+/// alongside user-created keyspaces. CQL drivers and cqlsh expect these to appear
+/// in `system_schema.keyspaces` for introspection.
 pub fn query_keyspaces(snap: &SchemaSnapshot) -> Vec<KeyspaceRow> {
-    snap.keyspaces
-        .values()
-        .map(|ks| {
-            let mut replication = ks.replication.options.clone();
-            replication.insert("class".to_string(), ks.replication.strategy.clone());
-            KeyspaceRow {
-                keyspace_name: ks.name.clone(),
-                durable_writes: ks.durable_writes,
-                replication,
-            }
-        })
-        .collect()
+    let mut rows: Vec<KeyspaceRow> = vec![
+        system_keyspace_row("system"),
+        system_keyspace_row("system_schema"),
+        system_keyspace_row("system_auth"),
+    ];
+    rows.extend(snap.keyspaces.values().map(|ks| {
+        let mut replication = ks.replication.options.clone();
+        replication.insert("class".to_string(), ks.replication.strategy.clone());
+        KeyspaceRow {
+            keyspace_name: ks.name.clone(),
+            durable_writes: ks.durable_writes,
+            replication,
+        }
+    }));
+    rows
+}
+
+fn system_keyspace_row(name: &str) -> KeyspaceRow {
+    let mut replication = HashMap::new();
+    replication.insert("class".to_string(), "LocalStrategy".to_string());
+    KeyspaceRow {
+        keyspace_name: name.to_string(),
+        durable_writes: true,
+        replication,
+    }
 }
 
 /// Query `system_schema.tables` from a snapshot.
+///
+/// Includes virtual system tables alongside user tables so that CQL drivers
+/// and cqlsh can discover them during introspection.
 pub fn query_tables(snap: &SchemaSnapshot) -> Vec<TableRow> {
-    snap.tables
-        .values()
-        .map(|t| TableRow {
+    let mut rows = system_table_rows();
+    rows.extend(snap.tables.values().map(|t| TableRow {
+        keyspace_name: t.keyspace.clone(),
+        table_name: t.name.clone(),
+        id: t.id,
+    }));
+    rows
+}
+
+/// Query `system_schema.columns` from a snapshot.
+///
+/// Includes columns for virtual system tables alongside user table columns.
+pub fn query_columns(snap: &SchemaSnapshot) -> Vec<ColumnRow> {
+    let mut rows = system_column_rows();
+    rows.extend(snap.tables.values().flat_map(|t| {
+        t.columns.values().map(move |c| ColumnRow {
             keyspace_name: t.keyspace.clone(),
             table_name: t.name.clone(),
-            id: t.id,
+            column_name: c.name.clone(),
+            kind: match c.kind {
+                ColumnKind::PartitionKey => "partition_key".to_string(),
+                ColumnKind::Clustering => "clustering".to_string(),
+                ColumnKind::Regular => "regular".to_string(),
+                ColumnKind::Static => "static".to_string(),
+            },
+            position: c.position,
+            column_type: c.column_type.clone(),
+            clustering_order: match c.clustering_order {
+                crate::metadata::column::ClusteringOrder::Asc => "asc".to_string(),
+                crate::metadata::column::ClusteringOrder::Desc => "desc".to_string(),
+                crate::metadata::column::ClusteringOrder::None => "none".to_string(),
+            },
+        })
+    }));
+    rows
+}
+
+/// Virtual system table entries for `system_schema.tables`.
+fn system_table_rows() -> Vec<TableRow> {
+    let tables: &[(&str, &str)] = &[
+        ("system", "local"),
+        ("system", "peers"),
+        ("system", "peers_v2"),
+        ("system_schema", "keyspaces"),
+        ("system_schema", "tables"),
+        ("system_schema", "columns"),
+        ("system_schema", "types"),
+        ("system_schema", "functions"),
+        ("system_schema", "aggregates"),
+        ("system_schema", "triggers"),
+        ("system_schema", "views"),
+        ("system_schema", "indexes"),
+        ("system_auth", "roles"),
+        ("system_auth", "role_members"),
+        ("system_auth", "role_permissions"),
+    ];
+    tables
+        .iter()
+        .map(|(ks, tbl)| TableRow {
+            keyspace_name: ks.to_string(),
+            table_name: tbl.to_string(),
+            id: Uuid::new_v4(),
         })
         .collect()
 }
 
-/// Query `system_schema.columns` from a snapshot.
-pub fn query_columns(snap: &SchemaSnapshot) -> Vec<ColumnRow> {
-    snap.tables
-        .values()
-        .flat_map(|t| {
-            t.columns.values().map(move |c| ColumnRow {
-                keyspace_name: t.keyspace.clone(),
-                table_name: t.name.clone(),
-                column_name: c.name.clone(),
-                kind: match c.kind {
-                    ColumnKind::PartitionKey => "partition_key".to_string(),
-                    ColumnKind::Clustering => "clustering".to_string(),
-                    ColumnKind::Regular => "regular".to_string(),
-                    ColumnKind::Static => "static".to_string(),
-                },
-                position: c.position,
-                column_type: c.column_type.clone(),
-                clustering_order: match c.clustering_order {
-                    crate::metadata::column::ClusteringOrder::Asc => "asc".to_string(),
-                    crate::metadata::column::ClusteringOrder::Desc => "desc".to_string(),
-                    crate::metadata::column::ClusteringOrder::None => "none".to_string(),
-                },
-            })
-        })
-        .collect()
+/// Virtual system column entries for `system_schema.columns`.
+///
+/// Provides minimal column metadata for system tables that cqlsh queries
+/// during startup. Only includes the columns our router actually returns.
+fn system_column_rows() -> Vec<ColumnRow> {
+    let mut rows = Vec::new();
+
+    // system.local columns (matches our route_select handler)
+    let local_cols: &[(&str, &str, &str, i32)] = &[
+        ("key", "partition_key", "text", 0),
+        ("cluster_name", "regular", "text", -1),
+        ("data_center", "regular", "text", -1),
+        ("rack", "regular", "text", -1),
+        ("host_id", "regular", "uuid", -1),
+        ("partitioner", "regular", "text", -1),
+        ("native_protocol_version", "regular", "text", -1),
+        ("cql_version", "regular", "text", -1),
+        ("release_version", "regular", "text", -1),
+        ("schema_version", "regular", "uuid", -1),
+        ("rpc_port", "regular", "int", -1),
+        ("listen_address", "regular", "inet", -1),
+        ("broadcast_address", "regular", "inet", -1),
+        ("rpc_address", "regular", "inet", -1),
+        ("bootstrapped", "regular", "text", -1),
+        ("tokens", "regular", "set<varchar>", -1),
+    ];
+    for (name, kind, cql_type, pos) in local_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system".to_string(),
+            table_name: "local".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: "none".to_string(),
+        });
+    }
+
+    // system.peers / peers_v2 columns
+    let peer_cols: &[(&str, &str, &str, i32)] = &[
+        ("peer", "partition_key", "inet", 0),
+        ("peer_port", "regular", "int", -1),
+        ("data_center", "regular", "text", -1),
+        ("rack", "regular", "text", -1),
+        ("host_id", "regular", "uuid", -1),
+        ("native_address", "regular", "inet", -1),
+        ("native_port", "regular", "int", -1),
+        ("schema_version", "regular", "uuid", -1),
+        ("release_version", "regular", "text", -1),
+    ];
+    for table in &["peers", "peers_v2"] {
+        for (name, kind, cql_type, pos) in peer_cols {
+            rows.push(ColumnRow {
+                keyspace_name: "system".to_string(),
+                table_name: table.to_string(),
+                column_name: name.to_string(),
+                kind: kind.to_string(),
+                position: *pos,
+                column_type: cql_type.to_string(),
+                clustering_order: "none".to_string(),
+            });
+        }
+    }
+
+    rows
 }
 
 #[cfg(test)]
@@ -161,11 +277,13 @@ mod tests {
         snap.keyspaces
             .insert("ks1".to_string(), test_keyspace_meta("ks1"));
         let rows = query_keyspaces(&snap);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].keyspace_name, "ks1");
-        assert!(rows[0].durable_writes);
+        // System keyspaces (system, system_schema, system_auth) + user keyspace
+        assert_eq!(rows.len(), 4);
+        let user_rows: Vec<_> = rows.iter().filter(|r| r.keyspace_name == "ks1").collect();
+        assert_eq!(user_rows.len(), 1);
+        assert!(user_rows[0].durable_writes);
         assert_eq!(
-            rows[0].replication.get("class"),
+            user_rows[0].replication.get("class"),
             Some(&"SimpleStrategy".to_string())
         );
     }
@@ -180,9 +298,11 @@ mod tests {
             test_table_meta("ks1", "t1"),
         );
         let rows = query_tables(&snap);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].keyspace_name, "ks1");
-        assert_eq!(rows[0].table_name, "t1");
+        let user_rows: Vec<_> = rows.iter().filter(|r| r.keyspace_name == "ks1").collect();
+        assert_eq!(user_rows.len(), 1);
+        assert_eq!(user_rows[0].table_name, "t1");
+        // Should also include system tables
+        assert!(rows.len() > 1);
     }
 
     #[test]
@@ -201,7 +321,8 @@ mod tests {
         snap.tables
             .insert(("ks1".to_string(), "t1".to_string()), table);
         let rows = query_columns(&snap);
-        assert_eq!(rows.len(), 2);
+        let user_rows: Vec<_> = rows.iter().filter(|r| r.keyspace_name == "ks1").collect();
+        assert_eq!(user_rows.len(), 2);
     }
 
     #[test]
@@ -224,6 +345,7 @@ mod tests {
         snap.tables
             .insert(("ks1".to_string(), "t1".to_string()), table);
         let rows = query_columns(&snap);
+        let rows: Vec<_> = rows.iter().filter(|r| r.keyspace_name == "ks1").collect();
         assert_eq!(rows.len(), 4);
 
         let pk_row = rows.iter().find(|r| r.column_name == "pk").unwrap();
@@ -234,5 +356,24 @@ mod tests {
         assert_eq!(s_row.kind, "static");
         let r_row = rows.iter().find(|r| r.column_name == "r").unwrap();
         assert_eq!(r_row.kind, "regular");
+    }
+
+    /// Regression test: cqlsh expects `tokens` in system_schema.columns for
+    /// system.local. Without it, cqlsh fails to validate system.local queries
+    /// and prints "'local' not found in keyspace 'system'".
+    #[test]
+    fn system_local_columns_include_tokens() {
+        let snap = SchemaSnapshot::new();
+        let rows = query_columns(&snap);
+        let local_cols: Vec<_> = rows
+            .iter()
+            .filter(|r| r.keyspace_name == "system" && r.table_name == "local")
+            .collect();
+        let tokens_col = local_cols
+            .iter()
+            .find(|r| r.column_name == "tokens")
+            .expect("system.local must have a 'tokens' column");
+        assert_eq!(tokens_col.column_type, "set<varchar>");
+        assert_eq!(tokens_col.kind, "regular");
     }
 }
