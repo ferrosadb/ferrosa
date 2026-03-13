@@ -1,0 +1,11 @@
+[package]
+name = "ferrosa-graph"
+version = "0.1.0"
+edition = "2021"
+description = "Graph query engine for ferrosa — Cypher/GQL endpoint"
+
+[dependencies]
+phf = { version = "0.11", features = ["macros"] }
+
+[dev-dependencies]
+proptest = "1"
