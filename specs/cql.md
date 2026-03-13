@@ -29,12 +29,14 @@ ferrosa-cql
 ├── tokio            (async runtime, TCP, task spawning)
 ├── tokio-util       (Codec/Framed for protocol framing)
 ├── bytes            (zero-copy byte buffers)
+├── futures          (stream combinators)
 ├── arc-swap         (lock-free schema snapshot access)
-├── moka             (lock-free prepared statement cache)
 ├── phf              (compile-time perfect hash for keywords)
 ├── md-5             (MD5 for prepared statement IDs)
 ├── uuid             (UUID type support)
-└── num-bigint       (varint/decimal support)
+├── num-bigint       (varint/decimal support)
+├── tracing          (structured logging)
+└── moka             (lock-free prepared statement cache — Part C, not yet added)
 ```
 
 ## Architecture
@@ -223,26 +225,26 @@ ferrosa-cql/
 ├── Cargo.toml
 └── src/
     ├── lib.rs           # Public API: CqlServer, start()
-    ├── frame.rs         # Frame header, CqlCodec, opcodes
-    ├── types.rs         # CqlValue enum, encode/decode, type IDs
-    ├── bridge.rs        # CqlValue ↔ CellValue conversion
-    ├── lexer.rs         # Zero-alloc tokenizer, keyword map
-    ├── parser.rs        # Recursive descent parser
-    ├── ast.rs           # Statement enum, AST nodes
-    ├── router.rs        # Query routing
-    ├── prepared.rs      # PreparedPlan, moka cache
-    ├── auth.rs          # SASL PLAIN handshake
-    ├── error.rs         # CqlError enum, error codes
-    ├── server.rs        # TCP listener, backpressure
-    └── connection.rs    # Per-connection task
+    ├── frame.rs         # Frame header, CqlCodec, opcodes          (Part A — done)
+    ├── types.rs         # CqlValue enum, encode/decode, type IDs   (Part A — done)
+    ├── auth.rs          # SASL PLAIN handshake                     (Part A — done)
+    ├── error.rs         # CqlError enum, error codes               (Part A — done)
+    ├── server.rs        # TCP listener, backpressure               (Part A — done)
+    ├── connection.rs    # Per-connection task                      (Part A — done)
+    ├── bridge.rs        # CqlValue ↔ CellValue conversion         (Part B — planned)
+    ├── lexer.rs         # Zero-alloc tokenizer, keyword map        (Part B — planned)
+    ├── parser.rs        # Recursive descent parser                 (Part B — planned)
+    ├── ast.rs           # Statement enum, AST nodes                (Part B — planned)
+    ├── router.rs        # Query routing                            (Part B — planned)
+    └── prepared.rs      # PreparedPlan, moka cache                 (Part C — planned)
 ```
 
 ## Implementation Parts
 
-- **Part A**: Protocol + Types (frame layer, CQL type system, TCP server with auth)
-- **Part B**: Parser + Execution (hand-written recursive descent, query routing)
-- **Part C**: Prepared statements + System queries (moka cache, system keyspace routing)
-- **Part D**: Threat model + security hardening (STRIDE analysis)
+- **Part A**: Protocol + Types (frame layer, CQL type system, TCP server with auth) — **done**
+- **Part B**: Parser + Execution (hand-written recursive descent, query routing) — not started
+- **Part C**: Prepared statements + System queries (moka cache, system keyspace routing) — not started
+- **Part D**: Threat model + security hardening (STRIDE analysis) — not started
 
 ## Testing Strategy
 
