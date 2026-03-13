@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120">
+  <defs>
+    <linearGradient id="fe-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e2725b"/>
+      <stop offset="100%" stop-color="#d4a574"/>
+    </linearGradient>
+    <linearGradient id="ring-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e2725b" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#d4a574" stop-opacity="0.08"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Mark: Fe inside rounded square with subtle orbital ring -->
+  <g transform="translate(10, 10)">
+    <!-- Outer orbital ring (partial) -->
+    <ellipse cx="50" cy="50" rx="48" ry="48" fill="none" stroke="url(#ring-grad)" stroke-width="1.5"
+             stroke-dasharray="220 82" transform="rotate(-20, 50, 50)"/>
+
+    <!-- Rounded square frame -->
+    <rect x="12" y="12" width="76" height="76" rx="16" ry="16"
+          fill="none" stroke="url(#fe-grad)" stroke-width="2.5"/>
+
+    <!-- Fe text -->
+    <text x="50" y="62" text-anchor="middle"
+          font-family="'Georgia', 'Times New Roman', serif"
+          font-size="42" font-weight="700" fill="url(#fe-grad)"
+          letter-spacing="-1">Fe</text>
+
+    <!-- Atomic number nod (26 = iron) -->
+    <text x="24" y="28" text-anchor="start"
+          font-family="'Inter', -apple-system, sans-serif"
+          font-size="11" font-weight="600" fill="#6b6b7a">26</text>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="130" y="72" font-family="'Inter', -apple-system, BlinkMacSystemFont, sans-serif"
+        font-size="48" font-weight="800" fill="#e8e8ed" letter-spacing="-2">ferro<tspan fill="#e2725b">sa</tspan></text>
+
+  <!-- Tagline -->
+  <text x="132" y="96" font-family="'Inter', -apple-system, BlinkMacSystemFont, sans-serif"
+        font-size="13" font-weight="500" fill="#6b6b7a" letter-spacing="0.5">The distributed database, forged in Rust</text>
+</svg>

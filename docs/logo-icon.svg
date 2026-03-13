@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="ig" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e2725b"/>
+      <stop offset="100%" stop-color="#d4a574"/>
+    </linearGradient>
+    <linearGradient id="rg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e2725b" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#d4a574" stop-opacity="0.08"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Orbital ring -->
+  <ellipse cx="50" cy="50" rx="47" ry="47" fill="none" stroke="url(#rg)" stroke-width="1.5"
+           stroke-dasharray="216 80" transform="rotate(-20, 50, 50)"/>
+
+  <!-- Rounded square -->
+  <rect x="14" y="14" width="72" height="72" rx="15" ry="15"
+        fill="none" stroke="url(#ig)" stroke-width="2.5"/>
+
+  <!-- Fe -->
+  <text x="50" y="61" text-anchor="middle"
+        font-family="Georgia, 'Times New Roman', serif"
+        font-size="40" font-weight="700" fill="url(#ig)"
+        letter-spacing="-1">Fe</text>
+
+  <!-- 26 -->
+  <text x="26" y="30" font-family="'Inter', sans-serif"
+        font-size="10" font-weight="600" fill="#6b6b7a">26</text>
+</svg>

@@ -1,0 +1,1247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — Cassandra Reimagined in Rust, Backed by S3</title>
+  <meta name="description" content="Ferrosa is a drop-in Cassandra replacement built in Rust with S3-backed storage. Zero GC pauses, ephemeral nodes, native graph queries, and 10x lower storage costs.">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #111118;
+      --bg-card: #16161f;
+      --bg-card-hover: #1c1c28;
+      --text-primary: #e8e8ed;
+      --text-secondary: #9494a3;
+      --text-muted: #6b6b7a;
+      --accent: #e2725b;
+      --accent-glow: rgba(226, 114, 91, 0.15);
+      --accent-secondary: #f4a261;
+      --accent-cool: #7c9cf5;
+      --accent-green: #6bc9a0;
+      --border: #1e1e2a;
+      --border-hover: #2e2e3e;
+      --code-bg: #0d0d14;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Navigation ── */
+    nav {
+      position: fixed;
+      top: 0;
+      width: 100%;
+      z-index: 100;
+      background: rgba(10, 10, 15, 0.85);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+    }
+
+    nav .nav-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+    }
+
+    nav .logo {
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+      text-decoration: none;
+    }
+
+    nav .logo span { color: var(--accent); }
+
+    nav .nav-links {
+      display: flex;
+      gap: 2rem;
+      list-style: none;
+    }
+
+    nav .nav-links a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+
+    nav .nav-links a:hover { color: var(--text-primary); }
+
+    nav .nav-cta {
+      background: var(--accent);
+      color: #fff;
+      padding: 0.5rem 1.25rem;
+      border-radius: 6px;
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 600;
+      transition: opacity 0.2s;
+    }
+
+    nav .nav-cta:hover { opacity: 0.9; }
+
+    /* ── Sections ── */
+    section {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 6rem 2rem;
+    }
+
+    /* ── Hero ── */
+    .hero {
+      padding-top: 10rem;
+      padding-bottom: 6rem;
+      text-align: center;
+      position: relative;
+    }
+
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -60%);
+      width: 600px;
+      height: 600px;
+      background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      padding: 0.375rem 1rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      margin-bottom: 2rem;
+    }
+
+    .hero-badge .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .hero h1 {
+      font-size: clamp(2.5rem, 6vw, 4.5rem);
+      font-weight: 800;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      margin-bottom: 1.5rem;
+      position: relative;
+    }
+
+    .hero h1 .gradient {
+      background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .hero p {
+      font-size: 1.25rem;
+      color: var(--text-secondary);
+      max-width: 640px;
+      margin: 0 auto 2.5rem;
+      line-height: 1.7;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      padding: 0.75rem 2rem;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 1rem;
+      transition: transform 0.15s, box-shadow 0.15s;
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 30px var(--accent-glow);
+    }
+
+    .btn-secondary {
+      background: var(--bg-card);
+      color: var(--text-primary);
+      padding: 0.75rem 2rem;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 1rem;
+      border: 1px solid var(--border);
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--border-hover);
+      background: var(--bg-card-hover);
+    }
+
+    /* ── Stats bar ── */
+    .stats-bar {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1px;
+      background: var(--border);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-top: 4rem;
+    }
+
+    .stat {
+      background: var(--bg-secondary);
+      padding: 1.75rem 1.5rem;
+      text-align: center;
+    }
+
+    .stat-value {
+      font-size: 2rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+    }
+
+    .stat-value .unit { color: var(--accent); }
+
+    .stat-label {
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      margin-top: 0.25rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    /* ── Section headers ── */
+    .section-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1rem;
+    }
+
+    .section-title {
+      font-size: clamp(1.75rem, 4vw, 2.75rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+      line-height: 1.15;
+    }
+
+    .section-subtitle {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      max-width: 640px;
+      line-height: 1.7;
+    }
+
+    .section-subtitle.centered {
+      margin: 0 auto;
+      text-align: center;
+    }
+
+    .section-title.centered { text-align: center; }
+    .section-label.centered { text-align: center; }
+
+    /* ── Problem section ── */
+    .problem {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .problem section { padding: 5rem 2rem; }
+
+    .pain-points {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.5rem;
+      margin-top: 3rem;
+    }
+
+    .pain-card {
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.75rem;
+      transition: border-color 0.2s;
+    }
+
+    .pain-card:hover { border-color: var(--border-hover); }
+
+    .pain-icon {
+      font-size: 1.5rem;
+      margin-bottom: 1rem;
+    }
+
+    .pain-card h3 {
+      font-size: 1.0625rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+    }
+
+    .pain-card p {
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+      line-height: 1.6;
+    }
+
+    /* ── Feature grid ── */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 1.5rem;
+      margin-top: 3rem;
+    }
+
+    .feature-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2.25rem;
+      transition: border-color 0.2s, transform 0.15s;
+    }
+
+    .feature-card:hover {
+      border-color: var(--border-hover);
+      transform: translateY(-2px);
+    }
+
+    .feature-card.highlight {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 3rem;
+      align-items: center;
+    }
+
+    .feature-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.25rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .feature-icon.rust { background: rgba(226, 114, 91, 0.12); }
+    .feature-icon.s3 { background: rgba(244, 162, 97, 0.12); }
+    .feature-icon.cql { background: rgba(124, 156, 245, 0.12); }
+    .feature-icon.graph { background: rgba(107, 201, 160, 0.12); }
+    .feature-icon.lock { background: rgba(200, 130, 240, 0.12); }
+    .feature-icon.observe { background: rgba(240, 200, 100, 0.12); }
+
+    .feature-card h3 {
+      font-size: 1.1875rem;
+      font-weight: 700;
+      margin-bottom: 0.625rem;
+    }
+
+    .feature-card p {
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+      line-height: 1.65;
+    }
+
+    .feature-card .metric {
+      display: inline-block;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.25rem 0.625rem;
+      font-size: 0.8125rem;
+      font-family: var(--font-mono);
+      color: var(--accent);
+      margin-top: 0.75rem;
+    }
+
+    /* ── Code demo ── */
+    .code-demo {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .code-tabs {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .code-tab {
+      padding: 0.75rem 1.25rem;
+      font-size: 0.8125rem;
+      font-family: var(--font-mono);
+      color: var(--text-muted);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: color 0.2s, border-color 0.2s;
+      background: none;
+      border-top: none;
+      border-left: none;
+      border-right: none;
+    }
+
+    .code-tab.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    .code-tab:hover { color: var(--text-secondary); }
+
+    .code-block {
+      padding: 1.5rem;
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      line-height: 1.8;
+      overflow-x: auto;
+      display: none;
+    }
+
+    .code-block.active { display: block; }
+
+    .code-block .kw { color: #c792ea; }
+    .code-block .fn { color: #82aaff; }
+    .code-block .str { color: #c3e88d; }
+    .code-block .cm { color: #546e7a; }
+    .code-block .num { color: #f78c6c; }
+    .code-block .type { color: #ffcb6b; }
+    .code-block .op { color: #89ddff; }
+
+    /* ── Comparison table ── */
+    .comparison {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .comparison-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 3rem;
+      font-size: 0.9375rem;
+    }
+
+    .comparison-table th,
+    .comparison-table td {
+      text-align: left;
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .comparison-table thead th {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .comparison-table thead th:first-child { color: var(--text-secondary); }
+
+    .comparison-table thead th.ferrosa-col {
+      color: var(--accent);
+    }
+
+    .comparison-table tbody td:first-child {
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .comparison-table tbody td {
+      color: var(--text-secondary);
+    }
+
+    .comparison-table tbody td.ferrosa-col {
+      color: var(--accent-green);
+      font-weight: 600;
+    }
+
+    .comparison-table tbody tr:hover {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .check { color: var(--accent-green); }
+    .cross { color: var(--text-muted); }
+
+    /* ── Architecture ── */
+    .arch-diagram {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 3rem;
+      margin-top: 3rem;
+      text-align: center;
+    }
+
+    .arch-layers {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      max-width: 700px;
+      margin: 0 auto;
+    }
+
+    .arch-layer {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.5rem;
+      transition: border-color 0.2s;
+    }
+
+    .arch-layer:hover { border-color: var(--accent); }
+
+    .arch-layer-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      min-width: 100px;
+    }
+
+    .arch-layer-items {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+
+    .arch-item {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.375rem 0.75rem;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+
+    .arch-arrow {
+      color: var(--text-muted);
+      font-size: 1.25rem;
+      text-align: center;
+    }
+
+    /* ── Use cases ── */
+    .use-cases {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.5rem;
+      margin-top: 3rem;
+    }
+
+    .use-case {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2rem;
+      transition: border-color 0.2s;
+    }
+
+    .use-case:hover { border-color: var(--border-hover); }
+
+    .use-case-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 0.75rem;
+    }
+
+    .use-case-label.migrate { color: var(--accent); }
+    .use-case-label.cloud { color: var(--accent-secondary); }
+    .use-case-label.graph-uc { color: var(--accent-green); }
+
+    .use-case h3 {
+      font-size: 1.125rem;
+      font-weight: 700;
+      margin-bottom: 0.625rem;
+    }
+
+    .use-case p {
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+      line-height: 1.65;
+    }
+
+    /* ── CTA section ── */
+    .cta-section {
+      text-align: center;
+      padding: 6rem 2rem;
+    }
+
+    .cta-section h2 {
+      font-size: clamp(2rem, 4vw, 3rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+    }
+
+    .cta-section p {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      margin-bottom: 2.5rem;
+      max-width: 500px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    .cta-actions {
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    /* ── Footer ── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 3rem 2rem;
+    }
+
+    footer .footer-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    footer .footer-left {
+      font-size: 0.875rem;
+      color: var(--text-muted);
+    }
+
+    footer .footer-links {
+      display: flex;
+      gap: 1.5rem;
+      list-style: none;
+    }
+
+    footer .footer-links a {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.875rem;
+      transition: color 0.2s;
+    }
+
+    footer .footer-links a:hover { color: var(--text-secondary); }
+
+    /* ── Responsive ── */
+    @media (max-width: 768px) {
+      .stats-bar { grid-template-columns: repeat(2, 1fr); }
+      .feature-card.highlight {
+        grid-template-columns: 1fr;
+        gap: 1.5rem;
+      }
+      .features-grid { grid-template-columns: 1fr; }
+      nav .nav-links { display: none; }
+      .comparison-table { font-size: 0.8125rem; }
+      .comparison-table th,
+      .comparison-table td { padding: 0.75rem 0.75rem; }
+      footer .footer-inner { flex-direction: column; gap: 1rem; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════ Navigation ═══════════════════ -->
+<nav>
+  <div class="nav-inner">
+    <a href="#" class="logo" style="display:flex;align-items:center;gap:0.5rem;">
+      <img src="favicon.svg" alt="Fe" width="28" height="28">
+      ferro<span>sa</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#features">Features</a></li>
+      <li><a href="#compare">Compare</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#use-cases">Use Cases</a></li>
+      <li><a href="brand.html">Brand</a></li>
+      <li><a href="https://github.com/ferrosa/ferrosa">GitHub</a></li>
+    </ul>
+    <a href="#get-started" class="nav-cta">Get Started</a>
+  </div>
+</nav>
+
+<!-- ═══════════════════ Hero ═══════════════════ -->
+<section class="hero">
+  <div class="hero-badge">
+    <span class="dot"></span>
+    Open source &middot; Apache 2.0
+  </div>
+  <h1>
+    Cassandra. <span class="gradient">Reimagined.</span><br>
+    Rust-native. S3-backed.
+  </h1>
+  <p>
+    Drop-in CQL compatibility. No GC pauses. Ephemeral nodes that recover in seconds.
+    Storage costs that shrink by 10x. One database for tables <em>and</em> graphs.
+  </p>
+  <div class="hero-actions">
+    <a href="#get-started" class="btn-primary">Get Started</a>
+    <a href="#features" class="btn-secondary">See How It Works</a>
+  </div>
+
+  <div class="stats-bar">
+    <div class="stat">
+      <div class="stat-value">0<span class="unit">ms</span></div>
+      <div class="stat-label">GC Pauses</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">&lt;10<span class="unit">s</span></div>
+      <div class="stat-label">Node Recovery</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">10<span class="unit">x</span></div>
+      <div class="stat-label">Lower Storage Cost</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">0</div>
+      <div class="stat-label">Driver Changes</div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ Problem ═══════════════════ -->
+<div class="problem">
+  <section>
+    <p class="section-label">The Problem</p>
+    <h2 class="section-title">Running Cassandra in the cloud<br>shouldn't feel like this</h2>
+    <p class="section-subtitle">
+      You chose Cassandra for its proven distributed architecture. But the JVM overhead,
+      operational burden, and storage costs keep growing.
+    </p>
+
+    <div class="pain-points">
+      <div class="pain-card">
+        <div class="pain-icon">⏱</div>
+        <h3>GC Pauses Kill Your P99</h3>
+        <p>Java's garbage collector causes unpredictable tail latency spikes. No amount of JVM tuning eliminates the problem — it just moves it.</p>
+      </div>
+      <div class="pain-card">
+        <div class="pain-icon">⏳</div>
+        <h3>Hours to Replace a Node</h3>
+        <p>When a node dies, streaming hundreds of gigabytes from replicas takes hours. Your cluster runs degraded the entire time.</p>
+      </div>
+      <div class="pain-card">
+        <div class="pain-icon">💸</div>
+        <h3>Storage Costs Scale Linearly</h3>
+        <p>Every replica needs its own EBS volumes. At petabyte scale, you're paying $0.10–0.25/GB/month for attached storage across every node.</p>
+      </div>
+      <div class="pain-card">
+        <div class="pain-icon">🔧</div>
+        <h3>Ops Expertise Required</h3>
+        <p>Compaction tuning, repair scheduling, bootstrap orchestration, heap sizing — Cassandra demands a dedicated team to keep it healthy.</p>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- ═══════════════════ Features ═══════════════════ -->
+<section id="features">
+  <p class="section-label centered">Core Capabilities</p>
+  <h2 class="section-title centered">Everything you need.<br>Nothing you don't.</h2>
+  <p class="section-subtitle centered">
+    Ferrosa keeps the architecture that made Cassandra great and replaces everything that held it back.
+  </p>
+
+  <div class="features-grid">
+    <!-- S3 Storage — full width highlight -->
+    <div class="feature-card highlight">
+      <div>
+        <div class="feature-icon s3">☁</div>
+        <h3>S3-Backed Storage</h3>
+        <p>
+          Durable storage lives in S3. Local NVMe is a hot cache, not a commitment.
+          Nodes are ephemeral — lose one, spin up a replacement, and it's serving reads
+          from S3 in seconds instead of streaming for hours.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          Works with AWS S3, MinIO, Cloudflare R2, or any S3-compatible endpoint.
+          No vendor lock-in.
+        </p>
+        <span class="metric">S3: ~$0.023/GB/mo vs EBS: ~$0.10–0.25/GB/mo</span>
+      </div>
+      <div class="arch-diagram" style="margin-top: 0; border: none; background: var(--bg-primary);">
+        <div class="arch-layers">
+          <div class="arch-layer">
+            <span class="arch-layer-label">Write</span>
+            <div class="arch-layer-items">
+              <span class="arch-item">Commit Log</span>
+              <span class="arch-item">→ Memtable</span>
+              <span class="arch-item">→ ACK</span>
+            </div>
+          </div>
+          <div class="arch-layer">
+            <span class="arch-layer-label">Flush</span>
+            <div class="arch-layer-items">
+              <span class="arch-item">Memtable</span>
+              <span class="arch-item">→ SSTable (local)</span>
+            </div>
+          </div>
+          <div class="arch-layer">
+            <span class="arch-layer-label">Upload</span>
+            <div class="arch-layer-items">
+              <span class="arch-item">SSTable</span>
+              <span class="arch-item">→ S3 (async)</span>
+            </div>
+          </div>
+          <div class="arch-layer">
+            <span class="arch-layer-label">Read</span>
+            <div class="arch-layer-items">
+              <span class="arch-item">Cache hit?</span>
+              <span class="arch-item">→ local NVMe</span>
+              <span class="arch-item">→ S3 fallback</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Rust -->
+    <div class="feature-card">
+      <div class="feature-icon rust">⚙</div>
+      <h3>Rust-Native Performance</h3>
+      <p>
+        No JVM. No garbage collector. No stop-the-world pauses.
+        Lock-free reads via ArcSwap, 64-shard memtables with nanosecond-level write locks,
+        async I/O on Tokio. Predictable latency from the first request to the billionth.
+      </p>
+      <span class="metric">P99 latency: no GC tail</span>
+    </div>
+
+    <!-- CQL -->
+    <div class="feature-card">
+      <div class="feature-icon cql">⌨</div>
+      <h3>Drop-In CQL Compatibility</h3>
+      <p>
+        CQL protocol v5 — the same wire protocol your drivers already speak.
+        Python, Java, Go, Node.js drivers connect without code changes.
+        DDL, DML, prepared statements, batch operations, system keyspaces — all there.
+      </p>
+      <span class="metric">0 driver changes required</span>
+    </div>
+
+    <!-- Graph -->
+    <div class="feature-card">
+      <div class="feature-icon graph">◈</div>
+      <h3>Native Graph Queries</h3>
+      <p>
+        Cypher queries on your CQL tables. No separate graph database.
+        Vertices and edges are normal tables with schema extensions.
+        Multi-hop traversals, pattern matching, and path queries — one database, two query languages.
+      </p>
+      <span class="metric">MATCH (a)-[:KNOWS]->(b) RETURN b</span>
+    </div>
+
+    <!-- Lock-free -->
+    <div class="feature-card">
+      <div class="feature-icon lock">⚡</div>
+      <h3>Lock-Free Architecture</h3>
+      <p>
+        Readers never block. ArcSwap provides wait-free atomic view loading.
+        Writers touch one of 64 shards for nanoseconds. No global locks, no contention,
+        no coordination overhead on the hot path.
+      </p>
+      <span class="metric">64 shards · wait-free reads</span>
+    </div>
+
+    <!-- Observability -->
+    <div class="feature-card">
+      <div class="feature-icon observe">📊</div>
+      <h3>Built-In Observability</h3>
+      <p>
+        Query cluster state with CQL — connections, storage stats, active queries, topology.
+        SUBSCRIBE for streaming updates. Prometheus metrics at /metrics.
+        CLI tool with live TUI dashboards. No external agents required.
+      </p>
+      <span class="metric">SELECT * FROM system_observability.*</span>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ Code Demo ═══════════════════ -->
+<section>
+  <p class="section-label centered">See It In Action</p>
+  <h2 class="section-title centered">Same CQL. Same drivers.<br>Better everything else.</h2>
+  <p class="section-subtitle centered" style="margin-bottom: 3rem;">
+    Your existing application code works unchanged. Just point your driver at Ferrosa.
+  </p>
+
+  <div class="code-demo">
+    <div class="code-tabs">
+      <button class="code-tab active" onclick="showTab('cql')">CQL</button>
+      <button class="code-tab" onclick="showTab('cypher')">Cypher</button>
+      <button class="code-tab" onclick="showTab('python')">Python Driver</button>
+      <button class="code-tab" onclick="showTab('observe')">Observability</button>
+    </div>
+
+    <pre class="code-block active" id="tab-cql"><span class="cm">-- Create a keyspace with S3-backed replication</span>
+<span class="kw">CREATE KEYSPACE</span> <span class="type">social</span> <span class="kw">WITH</span> replication = {
+  <span class="str">'class'</span>: <span class="str">'SimpleStrategy'</span>,
+  <span class="str">'replication_factor'</span>: <span class="num">3</span>
+};
+
+<span class="cm">-- Tables work exactly like Cassandra</span>
+<span class="kw">CREATE TABLE</span> <span class="type">social.users</span> (
+  user_id <span class="type">uuid</span> <span class="kw">PRIMARY KEY</span>,
+  name <span class="type">text</span>,
+  email <span class="type">text</span>,
+  created_at <span class="type">timestamp</span>
+);
+
+<span class="cm">-- Inserts, selects, updates — all standard CQL</span>
+<span class="kw">INSERT INTO</span> social.users (user_id, name, email, created_at)
+<span class="kw">VALUES</span> (<span class="fn">uuid()</span>, <span class="str">'Alice'</span>, <span class="str">'alice@example.com'</span>, <span class="fn">toTimestamp</span>(<span class="fn">now()</span>));
+
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> social.users <span class="kw">WHERE</span> user_id <span class="op">=</span> <span class="num">?</span>;</pre>
+
+    <pre class="code-block" id="tab-cypher"><span class="cm">-- Graph queries on the same data — no separate database</span>
+<span class="cm">-- Mark tables as graph entities via schema extensions</span>
+
+<span class="kw">ALTER TABLE</span> social.users
+  <span class="kw">WITH</span> extensions = {<span class="str">'graph.type'</span>: <span class="str">'vertex'</span>, <span class="str">'graph.label'</span>: <span class="str">'Person'</span>};
+
+<span class="kw">ALTER TABLE</span> social.follows
+  <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'edge'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'FOLLOWS'</span>,
+    <span class="str">'graph.source'</span>: <span class="str">'Person'</span>,
+    <span class="str">'graph.target'</span>: <span class="str">'Person'</span>
+  };
+
+<span class="cm">-- Then query with Cypher via HTTP/JSON endpoint</span>
+<span class="kw">MATCH</span> (a:<span class="type">Person</span> {name: <span class="str">'Alice'</span>})-[:<span class="type">FOLLOWS</span>]->(b:<span class="type">Person</span>)
+<span class="kw">RETURN</span> b.name, b.email;
+
+<span class="cm">-- Multi-hop: friends of friends</span>
+<span class="kw">MATCH</span> (a:<span class="type">Person</span>)-[:<span class="type">FOLLOWS</span>*<span class="num">2</span>]->(c:<span class="type">Person</span>)
+<span class="kw">WHERE</span> a.name <span class="op">=</span> <span class="str">'Alice'</span>
+<span class="kw">RETURN DISTINCT</span> c.name;</pre>
+
+    <pre class="code-block" id="tab-python"><span class="cm"># Your existing Python code — just change the contact point</span>
+<span class="kw">from</span> cassandra.cluster <span class="kw">import</span> Cluster
+
+<span class="cm"># Before: Cassandra</span>
+<span class="cm"># cluster = Cluster(['cassandra-node-1.prod'])</span>
+
+<span class="cm"># After: Ferrosa — same driver, same API</span>
+cluster = Cluster([<span class="str">'ferrosa-node-1.prod'</span>])
+session = cluster.connect(<span class="str">'social'</span>)
+
+<span class="cm"># Prepared statements work identically</span>
+stmt = session.prepare(<span class="str">"""
+    SELECT name, email FROM users WHERE user_id = ?
+"""</span>)
+
+user = session.execute(stmt, [user_id])
+<span class="fn">print</span>(user.one().name)
+
+<span class="cm"># Batch operations, async queries, retry policies —</span>
+<span class="cm"># everything your driver supports works unchanged.</span></pre>
+
+    <pre class="code-block" id="tab-observe"><span class="cm">-- Built-in observability via CQL virtual tables</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.active_queries;
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.storage_stats;
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.connections;
+
+<span class="cm">-- Stream live updates with SUBSCRIBE</span>
+<span class="kw">SUBSCRIBE</span> system_observability.connections
+  <span class="kw">EVERY</span> <span class="num">5</span>s;
+
+<span class="cm">-- Or subscribe to your own data for CDC-style streaming</span>
+<span class="kw">SUBSCRIBE</span> social.users;
+
+<span class="cm">-- Prometheus metrics available at /metrics</span>
+<span class="cm">-- CLI: ferrosa-ctl status, ferrosa-ctl monitor (live TUI)</span></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ Comparison ═══════════════════ -->
+<div class="comparison" id="compare">
+  <section>
+    <p class="section-label centered">How We Compare</p>
+    <h2 class="section-title centered">Ferrosa vs. the alternatives</h2>
+    <p class="section-subtitle centered">
+      The performance of ScyllaDB. The compatibility of Cassandra. The cost of object storage.
+    </p>
+
+    <table class="comparison-table">
+      <thead>
+        <tr>
+          <th></th>
+          <th class="ferrosa-col">Ferrosa</th>
+          <th>Cassandra</th>
+          <th>ScyllaDB</th>
+          <th>DynamoDB</th>
+          <th>Keyspaces</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Language</td>
+          <td class="ferrosa-col">Rust</td>
+          <td>Java</td>
+          <td>C++</td>
+          <td>Proprietary</td>
+          <td>Managed</td>
+        </tr>
+        <tr>
+          <td>GC Pauses</td>
+          <td class="ferrosa-col">None</td>
+          <td>Yes (JVM)</td>
+          <td>None</td>
+          <td>N/A</td>
+          <td>N/A</td>
+        </tr>
+        <tr>
+          <td>Memory Safety</td>
+          <td class="ferrosa-col">Guaranteed</td>
+          <td>GC-managed</td>
+          <td>Manual (C++)</td>
+          <td>N/A</td>
+          <td>N/A</td>
+        </tr>
+        <tr>
+          <td>CQL Compatible</td>
+          <td class="ferrosa-col"><span class="check">✓</span> v5</td>
+          <td><span class="check">✓</span></td>
+          <td><span class="check">✓</span></td>
+          <td><span class="cross">✗</span></td>
+          <td>Partial</td>
+        </tr>
+        <tr>
+          <td>S3-Native Storage</td>
+          <td class="ferrosa-col"><span class="check">✓</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>Graph Queries</td>
+          <td class="ferrosa-col"><span class="check">✓</span> Cypher</td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>Node Recovery</td>
+          <td class="ferrosa-col">Seconds</td>
+          <td>Hours</td>
+          <td>Hours</td>
+          <td>Automatic</td>
+          <td>Automatic</td>
+        </tr>
+        <tr>
+          <td>Storage Cost (PB)</td>
+          <td class="ferrosa-col">~$23K/mo</td>
+          <td>~$100–250K/mo</td>
+          <td>~$100–250K/mo</td>
+          <td>~$250K/mo</td>
+          <td>~$250K/mo</td>
+        </tr>
+        <tr>
+          <td>Vendor Lock-In</td>
+          <td class="ferrosa-col">None</td>
+          <td>None</td>
+          <td>Cloud tier</td>
+          <td>Full (AWS)</td>
+          <td>Full (AWS)</td>
+        </tr>
+        <tr>
+          <td>Open Source</td>
+          <td class="ferrosa-col"><span class="check">✓</span> Apache 2.0</td>
+          <td><span class="check">✓</span></td>
+          <td>Partial (AGPL)</td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+</div>
+
+<!-- ═══════════════════ Architecture ═══════════════════ -->
+<section id="architecture">
+  <p class="section-label centered">Under the Hood</p>
+  <h2 class="section-title centered">Modular Rust crates.<br>Compose what you need.</h2>
+  <p class="section-subtitle centered">
+    Each layer is an independent, tested crate. Use the full stack or embed individual components.
+  </p>
+
+  <div class="arch-diagram">
+    <div class="arch-layers">
+      <div class="arch-layer">
+        <span class="arch-layer-label">Protocol</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">ferrosa-cql</span>
+          <span class="arch-item">ferrosa-net</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Query</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">CQL Parser</span>
+          <span class="arch-item">Cypher Engine</span>
+          <span class="arch-item">Prepared Cache</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Schema</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">ferrosa-schema</span>
+          <span class="arch-item">RBAC</span>
+          <span class="arch-item">Graph Extensions</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Storage</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">Memtable</span>
+          <span class="arch-item">Commit Log</span>
+          <span class="arch-item">SSTable (BTI)</span>
+          <span class="arch-item">Compaction</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Durability</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">Local NVMe Cache</span>
+          <span class="arch-item">S3 / MinIO / R2</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Cluster</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">Raft (openraft)</span>
+          <span class="arch-item">Token Ring</span>
+          <span class="arch-item">Tunable CL</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ Use Cases ═══════════════════ -->
+<section id="use-cases">
+  <p class="section-label centered">Built For</p>
+  <h2 class="section-title centered">From migration to greenfield</h2>
+
+  <div class="use-cases">
+    <div class="use-case">
+      <p class="use-case-label migrate">Migration</p>
+      <h3>Move off Cassandra without rewriting</h3>
+      <p>
+        Same CQL protocol, same drivers, same consistency model. Import existing SSTables directly.
+        Migrate one keyspace at a time with dual-read verification. Your application never knows the difference.
+      </p>
+    </div>
+    <div class="use-case">
+      <p class="use-case-label cloud">Cloud-Native</p>
+      <h3>Kubernetes-ready from day one</h3>
+      <p>
+        Ephemeral pods backed by S3. No persistent volumes to manage. Nodes scale horizontally
+        without bootstrap streaming. Spot instances become viable for database workloads when
+        local disk isn't the source of truth.
+      </p>
+    </div>
+    <div class="use-case">
+      <p class="use-case-label graph-uc">Graph + Relational</p>
+      <h3>One database for tables and relationships</h3>
+      <p>
+        Stop running Cassandra alongside Neo4j. Ferrosa speaks CQL for your transactional workloads
+        and Cypher for graph traversals — same tables, same cluster, same operational surface.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ Get Started ═══════════════════ -->
+<section class="cta-section" id="get-started">
+  <h2>Ready to leave GC pauses behind?</h2>
+  <p>
+    Ferrosa is open source under the Apache 2.0 license.
+    Get started in minutes.
+  </p>
+  <div class="cta-actions">
+    <a href="https://github.com/ferrosa/ferrosa" class="btn-primary">View on GitHub</a>
+    <a href="getting-started.html" class="btn-secondary">Read the Docs</a>
+  </div>
+</section>
+
+<!-- ═══════════════════ Footer ═══════════════════ -->
+<footer>
+  <div class="footer-inner">
+    <div class="footer-left">
+      &copy; 2026 Ferrosa Contributors &middot; Apache 2.0 License
+    </div>
+    <ul class="footer-links">
+      <li><a href="https://github.com/ferrosa/ferrosa">GitHub</a></li>
+      <li><a href="getting-started.html">Docs</a></li>
+      <li><a href="cql-compatibility.html">CQL Reference</a></li>
+      <li><a href="migration.html">Migration Guide</a></li>
+    </ul>
+  </div>
+</footer>
+
+<script>
+function showTab(name) {
+  document.querySelectorAll('.code-block').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.code-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  event.target.classList.add('active');
+}
+</script>
+
+</body>
+</html>
