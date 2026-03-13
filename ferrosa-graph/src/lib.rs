@@ -9,7 +9,9 @@
 //! - [`parser`] — Cypher lexer, parser, and AST types.
 
 pub mod adjacency;
+pub mod engine;
 pub mod error;
 pub mod executor;
+pub mod http;
 pub mod parser;
 pub mod planner;
