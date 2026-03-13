@@ -10,6 +10,22 @@
 
 **Spec:** `docs/superpowers/specs/2026-03-12-ferrosa-cql-part-bc-design.md`
 
+**Threat Model:** `specs/threat-model-cql-bc.md` — mitigations M1-M12 must be baked into the implementation:
+
+| Mitigation | Constant | Task |
+|------------|----------|------|
+| M1: Query length limit | `MAX_QUERY_LENGTH = 1_048_576` (1 MiB) | Task 2 (lexer) |
+| M2: Parser nesting depth | `MAX_NESTING_DEPTH = 32` | Task 3 (parser) |
+| M3: Proptest fuzz | `parser_never_panics` | Task 3 (parser) |
+| M4: No unwrap on user data | Code review gate | All tasks |
+| M5: Range-checked narrowing | `i32::try_from(n)` etc. | Task 5 (bridge) |
+| M6: Collection element limit | `MAX_COLLECTION_ELEMENTS = 65_536` | Task 3 (parser) |
+| M7: Connection state machine | `ConnectionPhase` enum | Task 9 (connection) |
+| M8: Permission checks | `check_permission()` in every `route_*` | Task 8 (router) |
+| M9: Cache weight limit | moka 10 MiB (existing) | Task 7 |
+| M11: Idle timeout | `IDLE_TIMEOUT_SECS = 300` | Task 9 (connection) |
+| M12: Batch size limit | `MAX_BATCH_STATEMENTS = 500` | Task 8 (router) |
+
 ---
 
 ## File Structure
@@ -305,6 +321,8 @@ git commit -m "feat(cql): add AST types for CQL parser"
 
 Mirror the pattern from `ferrosa-graph/src/parser/lexer.rs`: zero-alloc `Lexer<'input>` with `Token<'input>`, `phf` keyword map, `peek()`/`next_token()`/`expect()`/`eat()`.
 
+**Security (M1):** Lexer constructor must reject input longer than `MAX_QUERY_LENGTH` (1 MiB). This prevents parser DoS before any tokenization begins.
+
 - [ ] **Step 1: Add module declaration**
 
 Add `pub mod lexer;` to `lib.rs`.
@@ -467,6 +485,8 @@ git commit -m "feat(cql): add zero-alloc CQL lexer with phf keyword map"
 - Modify: `ferrosa-cql/src/lib.rs`
 
 Mirror `ferrosa-graph/src/parser/parse_impl.rs` pattern: one function per grammar rule, LL(2), no backtracking.
+
+**Security:** Parser must enforce: **(M2)** nesting depth counter (max 32) — increment on entering `parse_term()` for collection/tuple literals and `parse_cql_type_name()` for parameterized types, decrement on exit, return SyntaxError if exceeded. **(M6)** Collection element limit (max 65,536) — in list/set/map/tuple literal parsing loops, count elements and return SyntaxError if exceeded. **(M4)** No `unwrap()` on any user-derived data.
 
 - [ ] **Step 1: Add module declaration**
 
@@ -776,6 +796,8 @@ git commit -m "chore(cql): add moka, ferrosa-sstable, indexmap dependencies"
 - Modify: `ferrosa-cql/src/lib.rs`
 
 Stateless pure functions converting between protocol types and storage types.
+
+**Security (M5):** All narrowing conversions must be range-checked. Use `i32::try_from(n)`, `i16::try_from(n)`, `i8::try_from(n)` — never `as`. For `f64` → `f32`, check that `(f as f32).is_finite()` when `f.is_finite()`. Return `CqlError::Invalid("value out of range for <type>")` on failure.
 
 - [ ] **Step 1: Add module declaration**
 
@@ -1218,6 +1240,8 @@ git commit -m "feat(cql): add prepared statement cache with moka W-TinyLFU"
 
 This is the largest and most complex task. It ties together parser output, bridge, schema, storage, prepared cache, system queries, and result encoding.
 
+**Security (M8):** Every `route_*` function MUST call `schema.check_permission(auth, permission, resource)` before accessing storage or mutating schema. SELECT → `Permission::Select`, INSERT/UPDATE → `Permission::Modify`, DELETE → `Permission::Modify`, CREATE/ALTER/DROP → `Permission::Create`/`Permission::Alter`/`Permission::Drop`. **(M12):** `route_batch()` must reject batches with > 500 statements: `if b.statements.len() > MAX_BATCH_STATEMENTS { return Err(CqlError::Invalid(...)) }`.
+
 - [ ] **Step 1: Add module declaration**
 
 Add `pub mod router;` to `lib.rs`.
@@ -1480,6 +1504,8 @@ git commit -m "feat(cql): add query router with full DML/DDL/system query dispat
 
 - Modify: `ferrosa-cql/src/connection.rs`
 - Modify: `ferrosa-cql/src/server.rs`
+
+**Security (M7):** Connection handler MUST enforce a state machine: `AwaitingStartup → Authenticating → Ready`. Only STARTUP/OPTIONS allowed in `AwaitingStartup`. Only AUTH_RESPONSE allowed in `Authenticating`. QUERY/PREPARE/EXECUTE/BATCH/REGISTER only allowed in `Ready`. Wrong-phase opcodes → ERROR(Protocol). **(M11):** Idle timeout of 300 seconds. Use `tokio::time::timeout()` around the frame read loop — if no complete frame arrives within the timeout, drop the connection.
 
 - [ ] **Step 1: Update server.rs to use SharedState**
 
