@@ -8,4 +8,5 @@
 //!
 //! - [`parser`] — Cypher lexer, parser, and AST types.
 
+pub mod error;
 pub mod parser;
