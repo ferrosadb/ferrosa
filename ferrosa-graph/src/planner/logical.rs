@@ -108,6 +108,8 @@ fn permission_for_statement(stmt: &Statement) -> Permission {
         Statement::Create { .. } => Permission::Modify,
         Statement::Set { .. } => Permission::Modify,
         Statement::Delete { .. } => Permission::Modify,
+        Statement::Subscribe { .. } => Permission::Select,
+        Statement::Unsubscribe { .. } => Permission::Select,
     }
 }
 
@@ -129,6 +131,21 @@ pub fn validate(
         Statement::Create { patterns } => patterns,
         Statement::Set { pattern, .. } => pattern,
         Statement::Delete { pattern, .. } => pattern,
+        Statement::Subscribe { inner, .. } => match inner.as_ref() {
+            Statement::Match { pattern, .. } => pattern,
+            _ => {
+                return Err(GraphError::Validation(
+                    "SUBSCRIBE requires a MATCH query".to_string(),
+                ))
+            }
+        },
+        Statement::Unsubscribe { .. } => {
+            return Ok(LogicalPlan {
+                bindings,
+                statement,
+                keyspace: keyspace.to_string(),
+            });
+        }
     };
 
     for pat in patterns {

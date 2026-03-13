@@ -6,6 +6,8 @@
 //! Expression nesting is capped at [`MAX_EXPR_DEPTH`] (64) to prevent
 //! stack overflow from adversarial input (threat model T1).
 
+use std::time::Duration;
+
 use crate::parser::ast::*;
 use crate::parser::error::{ParseError, ParseResult, Span};
 use crate::parser::lexer::Lexer;
@@ -60,6 +62,49 @@ impl<'input> Parser<'input> {
         match &tok.kind {
             TokenKind::Keyword(Keyword::Match) => self.parse_match(),
             TokenKind::Keyword(Keyword::Create) => self.parse_create(),
+            TokenKind::Keyword(Keyword::Subscribe) => {
+                self.lexer.next_token()?; // consume SUBSCRIBE
+                                          // Inner must be a MATCH statement
+                let tok = self.lexer.peek()?;
+                if !matches!(tok.kind, TokenKind::Keyword(Keyword::Match)) {
+                    return Err(ParseError::new(
+                        "SUBSCRIBE requires a MATCH query".to_string(),
+                        tok.span,
+                    ));
+                }
+                let inner = self.parse_match()?;
+
+                // Optional EVERY <duration>
+                let interval = if self.lexer.eat(&TokenKind::Keyword(Keyword::Every))? {
+                    Some(self.parse_duration()?)
+                } else {
+                    None
+                };
+
+                // Optional DELTA
+                let delta = self.lexer.eat(&TokenKind::Keyword(Keyword::Delta))?;
+
+                Ok(Statement::Subscribe {
+                    inner: Box::new(inner),
+                    interval,
+                    delta,
+                })
+            }
+            TokenKind::Keyword(Keyword::Unsubscribe) => {
+                self.lexer.next_token()?; // consume UNSUBSCRIBE
+                let tok = self.lexer.peek()?;
+                let stream_id = if matches!(tok.kind, TokenKind::Integer(_)) {
+                    let tok = self.lexer.next_token()?;
+                    if let TokenKind::Integer(n) = tok.kind {
+                        Some(n as u16)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Ok(Statement::Unsubscribe { stream_id })
+            }
             _ => Err(ParseError::new(
                 format!("expected MATCH or CREATE, got {:?}", tok.kind),
                 tok.span,
@@ -787,6 +832,61 @@ impl<'input> Parser<'input> {
         }
         Ok(vars)
     }
+
+    fn parse_duration(&mut self) -> ParseResult<Duration> {
+        let tok = self.lexer.next_token()?;
+        let value = match tok.kind {
+            TokenKind::Integer(n) => n,
+            _ => {
+                return Err(ParseError::new(
+                    format!("expected integer for duration, got {:?}", tok.kind),
+                    tok.span,
+                ));
+            }
+        };
+
+        let unit_tok = self.lexer.next_token()?;
+        let unit = match &unit_tok.kind {
+            TokenKind::Ident(s) => *s,
+            TokenKind::Keyword(_) => {
+                return Err(ParseError::new(
+                    format!("expected duration unit (s, ms, m), got {:?}", unit_tok.kind),
+                    unit_tok.span,
+                ));
+            }
+            _ => {
+                return Err(ParseError::new(
+                    format!("expected duration unit (s, ms, m), got {:?}", unit_tok.kind),
+                    unit_tok.span,
+                ));
+            }
+        };
+
+        let duration = match unit {
+            "s" => Duration::from_secs(value as u64),
+            "ms" => Duration::from_millis(value as u64),
+            "m" => Duration::from_secs(value as u64 * 60),
+            _ => {
+                return Err(ParseError::new(
+                    format!("unknown duration unit: '{unit}', expected s, ms, or m"),
+                    unit_tok.span,
+                ));
+            }
+        };
+
+        // Enforce minimum 500ms
+        if duration < Duration::from_millis(500) {
+            return Err(ParseError::new(
+                format!(
+                    "subscription interval must be at least 500ms, got {}ms",
+                    duration.as_millis()
+                ),
+                tok.span,
+            ));
+        }
+
+        Ok(duration)
+    }
 }
 
 /// Parse a complete Cypher statement from source text.
@@ -1289,6 +1389,96 @@ mod tests {
         assert!(
             err.message.contains("nesting depth"),
             "expected depth error, got: {}",
+            err.message
+        );
+    }
+
+    // --- SUBSCRIBE / UNSUBSCRIBE ---
+
+    #[test]
+    fn parse_graph_subscribe_match() {
+        let stmt = parse("SUBSCRIBE MATCH (u:User)-[:FOLLOWS]->(f) RETURN u, f").unwrap();
+        match stmt {
+            Statement::Subscribe {
+                interval, delta, ..
+            } => {
+                assert!(interval.is_none());
+                assert!(!delta);
+            }
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_graph_subscribe_every_delta() {
+        let stmt = parse("SUBSCRIBE MATCH (u:User) RETURN u EVERY 5 s DELTA").unwrap();
+        match stmt {
+            Statement::Subscribe {
+                interval, delta, ..
+            } => {
+                assert_eq!(interval, Some(Duration::from_secs(5)));
+                assert!(delta);
+            }
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_graph_subscribe_rejects_create() {
+        assert!(parse("SUBSCRIBE CREATE (u:User {name: 'test'})").is_err());
+    }
+
+    #[test]
+    fn existing_match_still_parses() {
+        let stmt = parse("MATCH (u:User) RETURN u").unwrap();
+        assert!(matches!(stmt, Statement::Match { .. }));
+    }
+
+    #[test]
+    fn parse_unsubscribe_bare() {
+        let stmt = parse("UNSUBSCRIBE").unwrap();
+        assert!(matches!(stmt, Statement::Unsubscribe { stream_id: None }));
+    }
+
+    #[test]
+    fn parse_unsubscribe_with_id() {
+        let stmt = parse("UNSUBSCRIBE 42").unwrap();
+        match stmt {
+            Statement::Unsubscribe { stream_id } => {
+                assert_eq!(stream_id, Some(42));
+            }
+            _ => panic!("expected Unsubscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_subscribe_every_ms() {
+        let stmt = parse("SUBSCRIBE MATCH (n) RETURN n EVERY 500 ms").unwrap();
+        match stmt {
+            Statement::Subscribe { interval, .. } => {
+                assert_eq!(interval, Some(Duration::from_millis(500)));
+            }
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_subscribe_every_minutes() {
+        let stmt = parse("SUBSCRIBE MATCH (n) RETURN n EVERY 2 m").unwrap();
+        match stmt {
+            Statement::Subscribe { interval, .. } => {
+                assert_eq!(interval, Some(Duration::from_secs(120)));
+            }
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_subscribe_rejects_short_interval() {
+        let err = parse("SUBSCRIBE MATCH (n) RETURN n EVERY 100 ms").unwrap_err();
+        assert!(
+            err.message.contains("at least 500ms"),
+            "expected minimum interval error, got: {}",
             err.message
         );
     }

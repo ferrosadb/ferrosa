@@ -33,6 +33,10 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "FALSE" => Keyword::False,
     "NULL" => Keyword::Null,
     "IS" => Keyword::Is,
+    "SUBSCRIBE" => Keyword::Subscribe,
+    "UNSUBSCRIBE" => Keyword::Unsubscribe,
+    "EVERY" => Keyword::Every,
+    "DELTA" => Keyword::Delta,
 };
 
 /// Check if two token kinds match. For keywords, this compares the

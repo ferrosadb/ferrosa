@@ -4,6 +4,8 @@
 //! to a production rule in the grammar. The AST is produced by the parser
 //! and consumed by the planner (in a later phase).
 
+use std::time::Duration;
+
 /// Direction of a relationship in a pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -170,6 +172,14 @@ pub enum Statement {
         detach: bool,
         variables: Vec<String>,
     },
+    /// `SUBSCRIBE MATCH pattern ... [EVERY duration] [DELTA]`
+    Subscribe {
+        inner: Box<Statement>,
+        interval: Option<Duration>,
+        delta: bool,
+    },
+    /// `UNSUBSCRIBE [stream_id]`
+    Unsubscribe { stream_id: Option<u16> },
 }
 
 #[cfg(test)]

@@ -70,6 +70,12 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
         Statement::Delete { .. } => Err(GraphError::Validation(
             "DELETE is not yet supported in graph query planner".to_string(),
         )),
+        Statement::Subscribe { .. } => Err(GraphError::Validation(
+            "SUBSCRIBE is not yet supported in graph query planner".to_string(),
+        )),
+        Statement::Unsubscribe { .. } => Err(GraphError::Validation(
+            "UNSUBSCRIBE is not yet supported in graph query planner".to_string(),
+        )),
     }
 }
 
