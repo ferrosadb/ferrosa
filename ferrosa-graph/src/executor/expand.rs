@@ -668,8 +668,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = test_storage_engine(tmp.path());
 
-        let mut config = GraphEngineConfig::default();
-        config.max_result_rows = 5;
+        let config = GraphEngineConfig {
+            max_result_rows: 5,
+            ..Default::default()
+        };
 
         let result = execute(
             plan,
