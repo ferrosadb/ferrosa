@@ -63,7 +63,7 @@ graph TB
             Prepared[Prepared Cache<br/>moka W-TinyLFU]
         end
 
-        subgraph "Bridge"
+        subgraph "Type Bridge"
             Bridge["CqlValue ↔ CellValue<br/>Key serialization"]
         end
     end
