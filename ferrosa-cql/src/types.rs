@@ -91,7 +91,10 @@ pub enum CqlValue {
     Blob(Vec<u8>),
     Boolean(bool),
     Counter(i64),
-    Decimal { scale: i32, unscaled: BigInt },
+    Decimal {
+        scale: i32,
+        unscaled: BigInt,
+    },
     Double(u64), // f64 bits for Eq/Ord
     Float(u32),  // f32 bits for Eq/Ord
     Int(i32),
@@ -105,6 +108,17 @@ pub enum CqlValue {
     Time(i64),
     Smallint(i16),
     Tinyint(i8),
+    /// Ordered list of values.
+    List(Vec<CqlValue>),
+    /// Set of values. Uses Vec (not BTreeSet) to preserve exact wire order
+    /// without re-sorting. The CQL protocol sends sets pre-sorted and
+    /// pre-deduplicated. The bridge layer converts to BTreeSet if needed.
+    Set(Vec<CqlValue>),
+    /// Map of key-value pairs. Uses Vec (not BTreeMap) to preserve wire
+    /// order. Same rationale as Set.
+    Map(Vec<(CqlValue, CqlValue)>),
+    /// Tuple -- fixed number of typed elements, some potentially null.
+    Tuple(Vec<Option<CqlValue>>),
 }
 
 impl PartialOrd for CqlValue {
@@ -149,6 +163,9 @@ impl Ord for CqlValue {
                     unscaled: ub,
                 },
             ) => sa.cmp(sb).then_with(|| ua.cmp(ub)),
+            (Self::List(a), Self::List(b)) | (Self::Set(a), Self::Set(b)) => a.cmp(b),
+            (Self::Map(a), Self::Map(b)) => a.cmp(b),
+            (Self::Tuple(a), Self::Tuple(b)) => a.cmp(b),
             _ => Ordering::Equal, // same discriminant, unreachable
         }
     }
@@ -178,6 +195,10 @@ impl CqlValue {
             Self::Time(_) => 17,
             Self::Smallint(_) => 18,
             Self::Tinyint(_) => 19,
+            Self::List(_) => 20,
+            Self::Set(_) => 21,
+            Self::Map(_) => 22,
+            Self::Tuple(_) => 23,
         }
     }
 
@@ -206,6 +227,43 @@ impl CqlValue {
             Self::Time(t) => t.to_be_bytes().to_vec(),
             Self::Smallint(n) => n.to_be_bytes().to_vec(),
             Self::Tinyint(n) => n.to_be_bytes().to_vec(),
+            Self::List(items) | Self::Set(items) => {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&(items.len() as i32).to_be_bytes());
+                for item in items {
+                    let encoded = item.encode_value();
+                    buf.extend_from_slice(&(encoded.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(&encoded);
+                }
+                buf
+            }
+            Self::Map(entries) => {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&(entries.len() as i32).to_be_bytes());
+                for (k, v) in entries {
+                    let ek = k.encode_value();
+                    buf.extend_from_slice(&(ek.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(&ek);
+                    let ev = v.encode_value();
+                    buf.extend_from_slice(&(ev.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(&ev);
+                }
+                buf
+            }
+            Self::Tuple(elements) => {
+                let mut buf = Vec::new();
+                for elem in elements {
+                    match elem {
+                        Some(val) => {
+                            let encoded = val.encode_value();
+                            buf.extend_from_slice(&(encoded.len() as i32).to_be_bytes());
+                            buf.extend_from_slice(&encoded);
+                        }
+                        None => buf.extend_from_slice(&(-1i32).to_be_bytes()),
+                    }
+                }
+                buf
+            }
             Self::Null => vec![],
         }
     }
@@ -328,12 +386,99 @@ impl CqlValue {
                 let unscaled = BigInt::from_signed_bytes_be(&bytes[4..]);
                 Ok(Self::Decimal { scale, unscaled })
             }
-            _ => Err(CqlError::Invalid(format!(
-                "unsupported type for decode: {:?}",
-                cql_type
-            ))),
+            CqlType::List(elem_type) => {
+                let (count, mut pos) = read_collection_header(bytes)?;
+                let mut items = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let (val, next_pos) = read_collection_element(bytes, pos, elem_type)?;
+                    items.push(val);
+                    pos = next_pos;
+                }
+                Ok(Self::List(items))
+            }
+            CqlType::Set(elem_type) => {
+                let (count, mut pos) = read_collection_header(bytes)?;
+                let mut items = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let (val, next_pos) = read_collection_element(bytes, pos, elem_type)?;
+                    items.push(val);
+                    pos = next_pos;
+                }
+                Ok(Self::Set(items))
+            }
+            CqlType::Map(key_type, val_type) => {
+                let (count, mut pos) = read_collection_header(bytes)?;
+                let mut entries = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let (k, kpos) = read_collection_element(bytes, pos, key_type)?;
+                    let (v, vpos) = read_collection_element(bytes, kpos, val_type)?;
+                    entries.push((k, v));
+                    pos = vpos;
+                }
+                Ok(Self::Map(entries))
+            }
+            CqlType::Tuple(elem_types) => {
+                let mut elements = Vec::with_capacity(elem_types.len());
+                let mut pos = 0;
+                for et in elem_types {
+                    if pos + 4 > bytes.len() {
+                        return Err(CqlError::Invalid("tuple truncated".into()));
+                    }
+                    let len = i32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                    if len < 0 {
+                        elements.push(None);
+                    } else {
+                        let end = pos + len as usize;
+                        if end > bytes.len() {
+                            return Err(CqlError::Invalid("tuple element truncated".into()));
+                        }
+                        elements.push(Some(CqlValue::decode_value(et, &bytes[pos..end])?));
+                        pos = end;
+                    }
+                }
+                Ok(Self::Tuple(elements))
+            }
         }
     }
+}
+
+/// Read the 4-byte element count from a collection header.
+fn read_collection_header(bytes: &[u8]) -> Result<(i32, usize), CqlError> {
+    if bytes.len() < 4 {
+        return Err(CqlError::Invalid("collection too short for count".into()));
+    }
+    let count = i32::from_be_bytes(bytes[..4].try_into().unwrap());
+    if count < 0 {
+        return Err(CqlError::Invalid("negative collection count".into()));
+    }
+    Ok((count, 4))
+}
+
+/// Read one length-prefixed element from a collection at `pos`.
+fn read_collection_element(
+    bytes: &[u8],
+    pos: usize,
+    elem_type: &CqlType,
+) -> Result<(CqlValue, usize), CqlError> {
+    if pos + 4 > bytes.len() {
+        return Err(CqlError::Invalid(
+            "collection truncated at element length".into(),
+        ));
+    }
+    let len = i32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap());
+    if len < 0 {
+        return Ok((CqlValue::Null, pos + 4));
+    }
+    let len = len as usize;
+    let end = pos + 4 + len;
+    if end > bytes.len() {
+        return Err(CqlError::Invalid(
+            "collection truncated at element data".into(),
+        ));
+    }
+    let val = CqlValue::decode_value(elem_type, &bytes[pos + 4..end])?;
+    Ok((val, end))
 }
 
 #[cfg(test)]
@@ -434,6 +579,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn encode_decode_float() {
         let val = CqlValue::Float(3.14f32.to_bits());
         let bytes = val.encode_value();
@@ -590,5 +736,81 @@ mod tests {
         let neg = CqlValue::Float((-1.0f32).to_bits());
         let pos = CqlValue::Float(1.0f32.to_bits());
         assert!(neg < pos);
+    }
+
+    // === Task 7: Collection encode/decode tests ===
+
+    #[test]
+    fn encode_decode_list_of_ints() {
+        let val = CqlValue::List(vec![CqlValue::Int(1), CqlValue::Int(2), CqlValue::Int(3)]);
+        let bytes = val.encode_value();
+        let decoded =
+            CqlValue::decode_value(&CqlType::List(Box::new(CqlType::Int)), &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_empty_list() {
+        let val = CqlValue::List(vec![]);
+        let bytes = val.encode_value();
+        let decoded =
+            CqlValue::decode_value(&CqlType::List(Box::new(CqlType::Int)), &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_set_of_text() {
+        let val = CqlValue::Set(vec![CqlValue::Text("a".into()), CqlValue::Text("b".into())]);
+        let bytes = val.encode_value();
+        let decoded =
+            CqlValue::decode_value(&CqlType::Set(Box::new(CqlType::Varchar)), &bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_map_text_to_int() {
+        let val = CqlValue::Map(vec![
+            (CqlValue::Text("x".into()), CqlValue::Int(10)),
+            (CqlValue::Text("y".into()), CqlValue::Int(20)),
+        ]);
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(
+            &CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Int)),
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_nested_list_of_maps() {
+        let inner = CqlValue::Map(vec![(CqlValue::Text("k".into()), CqlValue::Int(1))]);
+        let val = CqlValue::List(vec![inner]);
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(
+            &CqlType::List(Box::new(CqlType::Map(
+                Box::new(CqlType::Varchar),
+                Box::new(CqlType::Int),
+            ))),
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn encode_decode_tuple() {
+        let val = CqlValue::Tuple(vec![
+            Some(CqlValue::Int(42)),
+            None,
+            Some(CqlValue::Text("hello".into())),
+        ]);
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(
+            &CqlType::Tuple(vec![CqlType::Int, CqlType::Varchar, CqlType::Varchar]),
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(decoded, val);
     }
 }
