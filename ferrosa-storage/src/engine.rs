@@ -446,13 +446,62 @@ impl StorageEngine {
     pub fn poll_compactions(&self) {
         let results = self.compaction_executor.poll_results();
         for result in results {
-            // Register the output SSTable in the local cache.
+            let input_count = result.task.inputs.len();
+            let table_id = &result.task.table_id;
+
+            // Open the compacted output SSTable.
+            let gen = &result.output.id;
+            let dir = &result.output.path;
+            let reader = match Self::open_sstable_from_dir(dir, gen) {
+                Ok(r) => Arc::new(r),
+                Err(e) => {
+                    eprintln!("[compaction] failed to open output SSTable: {e}");
+                    continue;
+                }
+            };
+
+            // Swap: remove input SSTables, insert output.
+            let tables = self.tables.read();
+            if let Some(state) = tables.get(table_id) {
+                if let Err(e) = state.store.swap_compacted_sstables(input_count, reader) {
+                    eprintln!("[compaction] swap failed: {e}");
+                }
+            }
+
+            // Register in local cache.
             self.local_cache.register(
                 &result.output.id,
                 result.output.path.clone(),
                 result.output.size_bytes,
             );
         }
+    }
+
+    /// Opens an SSTable from component files in a directory.
+    fn open_sstable_from_dir(
+        dir: &std::path::Path,
+        gen: &str,
+    ) -> ferrosa_common::Result<
+        ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt>,
+    > {
+        use ferrosa_sstable::io::FileReadAt;
+        use ferrosa_sstable::reader::SSTableComponents;
+
+        let data = FileReadAt::open(dir.join(format!("{gen}-Data.db")))?;
+        let partitions = FileReadAt::open(dir.join(format!("{gen}-Partitions.db")))?;
+        let rows = FileReadAt::open(dir.join(format!("{gen}-Rows.db")))?;
+        let filter = std::fs::read(dir.join(format!("{gen}-Filter.db")))?;
+        let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db")))?;
+        let compression_info = std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
+
+        ferrosa_sstable::reader::SSTableReader::open(SSTableComponents {
+            data,
+            partitions,
+            rows,
+            filter,
+            compression_info,
+            statistics,
+        })
     }
 
     /// Returns the number of SSTables for a table.
