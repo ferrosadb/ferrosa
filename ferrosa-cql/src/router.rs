@@ -6,7 +6,7 @@
 //!
 //! Security mitigations:
 //! - **M8**: Every `route_*` function checks permissions via `Schema::check_permission`.
-//! - **M12**: Batch size is capped at [`MAX_BATCH_STATEMENTS`] (500).
+//! - **M12**: Batch size is capped at `MAX_BATCH_STATEMENTS` (500).
 
 use std::collections::HashSet;
 use std::sync::Arc;

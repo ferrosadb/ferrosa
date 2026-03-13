@@ -525,7 +525,7 @@ pub fn build_delete_row(
 // Function 6: partition_to_rows
 // ---------------------------------------------------------------------------
 
-/// Convert a storage [`Partition`] back to result rows for CQL RESULT encoding.
+/// Convert a storage `Partition` back to result rows for CQL RESULT encoding.
 ///
 /// Each returned row is a `Vec<Option<CqlValue>>` with one entry per column
 /// in `column_names`. Tombstone rows and cells are represented as `None`.

@@ -4,9 +4,9 @@
 //! the token stream produced by `Lexer`.
 //!
 //! Security mitigations:
-//! - **M2**: Nesting depth capped at [`MAX_NESTING_DEPTH`] (32).
+//! - **M2**: Nesting depth capped at `MAX_NESTING_DEPTH` (32).
 //! - **M4**: No `unwrap()` on user-derived data — all fallible paths return `Result`.
-//! - **M6**: Collection element count capped at [`MAX_COLLECTION_ELEMENTS`] (65,536).
+//! - **M6**: Collection element count capped at `MAX_COLLECTION_ELEMENTS` (65,536).
 
 use crate::ast::*;
 use crate::error::CqlError;
