@@ -4,7 +4,7 @@
 //! virtual table queryable through the CQL native protocol under
 //! `system_observability.storage_stats`.
 //!
-//! The actual wiring to [`StorageEngine`] is deferred behind the
+//! The actual wiring to `StorageEngine` is deferred behind the
 //! [`StorageStatsProvider`] trait so that this module compiles and tests pass
 //! before the engine exposes metrics.
 
@@ -39,8 +39,8 @@ pub struct StorageStats {
 
 /// A source of [`StorageStats`] data.
 ///
-/// [`StorageEngine`] will implement this trait once its internal metrics are
-/// exposed. Tests use [`MockStatsProvider`].
+/// `StorageEngine` will implement this trait once its internal metrics are
+/// exposed. Tests use `MockStatsProvider`.
 pub trait StorageStatsProvider: Send + Sync {
     /// Collect current storage statistics for all (keyspace, table) pairs.
     fn collect_stats(&self) -> Vec<StorageStats>;

@@ -216,14 +216,14 @@ mod tests {
                 data_type: DataType::Double,
             }],
             rows: vec![VirtualRow {
-                cells: vec![CellValue::live(3.14f64.to_be_bytes().to_vec(), 1)],
+                cells: vec![CellValue::live(1.5f64.to_be_bytes().to_vec(), 1)],
             }],
         };
         registry.register(Arc::new(table));
 
         let result = virtual_table_to_json(&registry, "test_table");
         let rows = result.as_array().unwrap();
-        assert!((rows[0]["ratio"].as_f64().unwrap() - 3.14).abs() < f64::EPSILON);
+        assert!((rows[0]["ratio"].as_f64().unwrap() - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! virtual tables: metrics, active queries, cluster topology, etc.
 //!
 //! Virtual tables are read-only and do not participate in replication or
-//! compaction. They are registered in the [`VirtualTableRegistry`] (Task 3)
+//! compaction. They are registered in the `VirtualTableRegistry` (Task 3)
 //! and served via the CQL native protocol as regular `SELECT` queries.
 
 use ferrosa_common::{CellValue, DataType};
