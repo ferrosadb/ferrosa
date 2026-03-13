@@ -101,7 +101,7 @@ graph TB
 | **Impact** | 2 — Panic crashes the connection task; crafted AST could bypass authorization |
 | **Risk** | **4 (High)** |
 | **Mitigation** | (1) Proptest fuzz testing on all parser entry points (already in plan). (2) Limit expression nesting depth (max 64 levels) to prevent stack overflow. (3) Catch panics at the HTTP handler boundary (tokio task). (4) Parser produces AST only — planner validates against schema before execution. |
-| **Status** | Partially mitigated (proptests in plan; depth limit and panic catch needed) |
+| **Status** | **Mitigated.** Proptests implemented, expression depth capped at 64 (returns ParseError). Remaining: catch panics at HTTP handler boundary (Phase 1). |
 
 ### T2: Unauthenticated Graph Endpoint Access
 
@@ -242,7 +242,7 @@ graph TB
 | T4 | DoS via expensive graph queries | **6 High** | Must address before Phase 1 ships |
 | T10 | Audit gap on graph operations | **6 High** | Must address before Phase 1 ships |
 | T11 | Unencrypted HTTP transport | **6 High** | Must address before production use |
-| T1 | Parser exploitation | **4 High** | Partially mitigated (proptests); add depth limit |
+| T1 | Parser exploitation | **4 High** | **Mitigated** (proptests + depth limit); HTTP panic catch in Phase 1 |
 | T5 | Adjacency index inconsistency | **4 High** | Design reconciliation before Phase 1 |
 | T6 | Table extension poisoning | **4 High** | Add permission check for graph.* extensions |
 | T7 | Cross-protocol data leakage | **4 High** | Restrict system_graph CQL access |
