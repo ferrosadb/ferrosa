@@ -110,6 +110,7 @@ pub struct StorageEngine {
     compaction_executor: CompactionExecutor,
     upload_manager: Option<UploadManager>,
     local_cache: LocalCache,
+    observers: RwLock<Vec<Arc<dyn crate::observer::WriteObserver>>>,
 }
 
 /// Per-table state: schema + store.
@@ -160,6 +161,7 @@ impl StorageEngine {
             compaction_executor,
             upload_manager,
             local_cache,
+            observers: RwLock::new(Vec::new()),
         })
     }
 
@@ -183,6 +185,44 @@ impl StorageEngine {
         let state = TableState { schema, store };
         self.tables.write().insert(table_id, state);
         Ok(())
+    }
+
+    /// Registers an observer that will be notified when mutations are written.
+    ///
+    /// Sync observers are called inline on the write path. Async observers
+    /// receive mutations through a bounded channel (see Task 2.3).
+    pub fn register_observer(&self, observer: Arc<dyn crate::observer::WriteObserver>) {
+        self.observers.write().push(observer);
+    }
+
+    /// Dispatches a mutation to all sync observers watching the given table.
+    ///
+    /// Derived mutations produced by observers go through the commit log for
+    /// durability and are written to the target table's memtable.
+    fn dispatch_sync_observers(&self, table_id: &TableId, mutation: &Mutation) {
+        let observers = self.observers.read();
+        for obs in observers.iter() {
+            if obs.mode() == crate::observer::ObserverMode::Sync {
+                let watched = obs.tables();
+                if watched.iter().any(|t| t == table_id) {
+                    let derived = obs.on_write(table_id, mutation);
+                    for dm in derived {
+                        // Durability: go through commit log.
+                        if let Err(e) = self.commit_log.append(&dm) {
+                            eprintln!("[observer] commit log append failed: {e}");
+                            continue;
+                        }
+                        let dtid = TableId::new(&dm.keyspace, &dm.table);
+                        let tables = self.tables.read();
+                        if let Some(state) = tables.get(&dtid) {
+                            for row in &dm.rows {
+                                let _ = state.store.write(&dm.key, row.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Writes a row to the commit log and the table's memtable.
@@ -212,6 +252,10 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
         state.store.write(key, row)?;
+        drop(tables);
+
+        // 3. Notify observers after successful commit log + memtable write.
+        self.dispatch_sync_observers(table_id, &mutation);
 
         Ok(())
     }
@@ -230,13 +274,8 @@ impl StorageEngine {
             return Ok(());
         }
 
-        let tables = self.tables.read();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
-
+        // Collect committed mutations for observer dispatch after each write.
         for (key, row, timestamp) in mutations {
-            // Append to commit log.
             let mutation = Mutation {
                 keyspace: table_id.keyspace.clone(),
                 table: table_id.table.clone(),
@@ -244,10 +283,23 @@ impl StorageEngine {
                 rows: vec![row.clone()],
                 timestamp,
             };
+
+            // Append to commit log.
             self.commit_log.append(&mutation)?;
 
-            // Write to memtable.
-            state.store.write(&key, row)?;
+            // Write to memtable (scoped read lock).
+            {
+                let tables = self.tables.read();
+                let state = tables.get(table_id).ok_or_else(|| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "table not registered: {table_id}"
+                    ))
+                })?;
+                state.store.write(&key, row)?;
+            }
+
+            // Notify observers after successful commit log + memtable write.
+            self.dispatch_sync_observers(table_id, &mutation);
         }
 
         Ok(())
@@ -690,5 +742,80 @@ mod tests {
         engine.flush_if_needed().unwrap();
 
         assert_eq!(engine.sstable_count(&tid), 1);
+    }
+
+    /// A test observer that counts `on_write` calls.
+    struct CountingObserver {
+        watched: Vec<TableId>,
+        call_count: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingObserver {
+        fn new(watched: Vec<TableId>) -> Self {
+            Self {
+                watched,
+                call_count: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn count(&self) -> u64 {
+            self.call_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::observer::WriteObserver for CountingObserver {
+        fn mode(&self) -> crate::observer::ObserverMode {
+            crate::observer::ObserverMode::Sync
+        }
+
+        fn tables(&self) -> Vec<TableId> {
+            self.watched.clone()
+        }
+
+        fn on_write(&self, _table: &TableId, _mutation: &Mutation) -> Vec<Mutation> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn sync_observer_fires_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+        let observer = Arc::new(CountingObserver::new(vec![tid.clone()]));
+        engine.register_observer(observer.clone());
+
+        let key = make_key("k1");
+        engine
+            .write(&tid, &key, make_row(b"val", 1000), 1000)
+            .unwrap();
+
+        assert_eq!(observer.count(), 1);
+    }
+
+    #[test]
+    fn sync_observer_only_fires_for_watched_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        // Observer watches table_a, but we write to test_table.
+        let table_a = TableId::new("other_ks", "other_table");
+        let observer = Arc::new(CountingObserver::new(vec![table_a]));
+        engine.register_observer(observer.clone());
+
+        let tid = table_id();
+        let key = make_key("k1");
+        engine
+            .write(&tid, &key, make_row(b"val", 1000), 1000)
+            .unwrap();
+
+        assert_eq!(observer.count(), 0);
     }
 }
