@@ -52,6 +52,19 @@ pub fn reconcile_once(
     metrics
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconcile_metrics_default_is_zero() {
+        let m = ReconcileMetrics::default();
+        assert_eq!(m.entries_checked, 0);
+        assert_eq!(m.entries_repaired, 0);
+        assert_eq!(m.orphans_removed, 0);
+    }
+}
+
 /// Spawn the background reconciliation loop.
 pub fn spawn_reconciliation(
     schema: Arc<Schema>,

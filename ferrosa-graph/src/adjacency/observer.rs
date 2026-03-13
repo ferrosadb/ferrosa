@@ -54,15 +54,14 @@ impl WriteObserver for AdjacencyIndexObserver {
             None => return vec![],
         };
 
-        // Read edge extensions - verify this is actually an edge table
-        let _source_col = match meta.extensions.get("graph.source") {
-            Some(s) => s,
-            None => return vec![],
-        };
-        let _target_col = match meta.extensions.get("graph.target") {
-            Some(s) => s,
-            None => return vec![],
-        };
+        // Verify this is a valid edge table with source and target extensions.
+        // Phase 1 uses partition key as source and clustering as target;
+        // full column-name mapping will use these values in a later phase.
+        if !meta.extensions.contains_key("graph.source")
+            || !meta.extensions.contains_key("graph.target")
+        {
+            return vec![];
+        }
 
         let adj_ks = adjacency_keyspace_name(&self.keyspace);
         let edge_label = table.table.clone();
