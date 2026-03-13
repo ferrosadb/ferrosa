@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — Brand Guidelines</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #111118;
+      --bg-card: #16161f;
+      --bg-card-hover: #1c1c28;
+      --text-primary: #e8e8ed;
+      --text-secondary: #9494a3;
+      --text-muted: #6b6b7a;
+      --accent: #e2725b;
+      --accent-warm: #d4a574;
+      --accent-green: #6bc9a0;
+      --accent-cool: #7c9cf5;
+      --border: #1e1e2a;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-serif: 'Georgia', 'Times New Roman', serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 6rem 2rem;
+    }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.5rem;
+    }
+
+    h1 span { color: var(--accent); }
+
+    .subtitle {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      margin-bottom: 4rem;
+    }
+
+    h2 {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1.5rem;
+      margin-top: 4rem;
+    }
+
+    h3 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+    }
+
+    p {
+      color: var(--text-secondary);
+      margin-bottom: 1rem;
+      max-width: 640px;
+      line-height: 1.7;
+    }
+
+    /* Logo display */
+    .logo-showcase {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .logo-card {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+    }
+
+    .logo-card .preview {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .logo-card .preview.dark { background: var(--bg-primary); }
+    .logo-card .preview.light { background: #f5f5f7; }
+
+    .logo-card .preview img,
+    .logo-card .preview svg { max-width: 100%; height: auto; }
+
+    .logo-card .label {
+      padding: 0.875rem 1.25rem;
+      background: var(--bg-card);
+      border-top: 1px solid var(--border);
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .logo-card .label code {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+
+    /* Color palette */
+    .palette {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+
+    .swatch {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .swatch-color {
+      height: 100px;
+      display: flex;
+      align-items: flex-end;
+      padding: 0.75rem;
+    }
+
+    .swatch-info {
+      padding: 0.875rem 1rem;
+      background: var(--bg-card);
+    }
+
+    .swatch-name {
+      font-size: 0.875rem;
+      font-weight: 600;
+      margin-bottom: 0.25rem;
+    }
+
+    .swatch-hex {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    .swatch-role {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-top: 0.25rem;
+    }
+
+    /* Typography samples */
+    .type-sample {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 2rem;
+      margin-bottom: 1rem;
+    }
+
+    .type-label {
+      font-size: 0.6875rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
+      margin-bottom: 0.75rem;
+    }
+
+    .type-display {
+      font-size: 2rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.25rem;
+    }
+
+    .type-body { font-size: 1rem; color: var(--text-secondary); }
+    .type-mono { font-family: var(--font-mono); font-size: 0.875rem; color: var(--accent); }
+    .type-serif { font-family: var(--font-serif); }
+
+    /* Spacing/usage rules */
+    .rules {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.5rem;
+      margin-top: 1.5rem;
+    }
+
+    .rule-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.75rem;
+    }
+
+    .rule-card h4 {
+      font-size: 0.9375rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+    }
+
+    .rule-card p {
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+      line-height: 1.6;
+      margin-bottom: 0;
+    }
+
+    .do { border-left: 3px solid var(--accent-green); }
+    .dont { border-left: 3px solid #e25b5b; }
+
+    /* Voice & tone */
+    .voice-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-top: 1.5rem;
+    }
+
+    .voice-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      text-align: center;
+    }
+
+    .voice-card .emoji { font-size: 1.5rem; margin-bottom: 0.75rem; }
+
+    .voice-card h4 {
+      font-size: 0.9375rem;
+      font-weight: 700;
+      margin-bottom: 0.375rem;
+    }
+
+    .voice-card p {
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      margin: 0 auto;
+      max-width: 200px;
+    }
+
+    /* Favicon grid */
+    .favicon-grid {
+      display: flex;
+      align-items: center;
+      gap: 2rem;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 2rem;
+      margin-bottom: 1rem;
+    }
+
+    .favicon-grid .fav {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .favicon-grid .fav span {
+      font-size: 0.6875rem;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    .back-link {
+      display: inline-block;
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      margin-bottom: 2rem;
+    }
+
+    .back-link:hover { text-decoration: underline; }
+
+    @media (max-width: 640px) {
+      .logo-showcase { grid-template-columns: 1fr; }
+      .palette { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <a href="index.html" class="back-link">&larr; Back to homepage</a>
+
+  <h1>Brand <span>Guidelines</span></h1>
+  <p class="subtitle">Visual identity for the Ferrosa project. Use these assets and guidelines for documentation, presentations, and community materials.</p>
+
+  <!-- ── Logo ── -->
+  <h2>Logo</h2>
+  <p>The Ferrosa logo combines an "Fe" monogram — iron's chemical symbol — inside a periodic-table-inspired frame, with an orbital ring suggesting distributed data flow. The atomic number 26 anchors it in physical reality.</p>
+
+  <div class="logo-showcase">
+    <div class="logo-card">
+      <div class="preview dark">
+        <img src="logo.svg" alt="Ferrosa logo" width="360">
+      </div>
+      <div class="label">
+        Full logo — dark background
+        <code>logo.svg</code>
+      </div>
+    </div>
+    <div class="logo-card">
+      <div class="preview dark" style="padding: 2rem;">
+        <img src="logo-icon.svg" alt="Ferrosa icon" width="80">
+      </div>
+      <div class="label">
+        Icon mark — standalone
+        <code>logo-icon.svg</code>
+      </div>
+    </div>
+  </div>
+
+  <h3>Favicon</h3>
+  <p>The favicon is a compact version of the Fe mark optimized for small sizes.</p>
+
+  <div class="favicon-grid">
+    <div class="fav">
+      <img src="favicon.svg" width="64" height="64" alt="64px">
+      <span>64px</span>
+    </div>
+    <div class="fav">
+      <img src="favicon.svg" width="32" height="32" alt="32px">
+      <span>32px</span>
+    </div>
+    <div class="fav">
+      <img src="favicon.svg" width="16" height="16" alt="16px">
+      <span>16px</span>
+    </div>
+  </div>
+
+  <!-- ── Colors ── -->
+  <h2>Color Palette</h2>
+  <p>The palette draws from iron's natural spectrum — terracotta oxide, warm copper patina — set against deep charcoal backgrounds. Cool accents provide contrast for UI elements.</p>
+
+  <h3>Primary</h3>
+  <div class="palette">
+    <div class="swatch">
+      <div class="swatch-color" style="background: #e2725b;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Terracotta</div>
+        <div class="swatch-hex">#e2725b</div>
+        <div class="swatch-role">Primary accent, CTAs, links</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #d4a574;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Copper</div>
+        <div class="swatch-hex">#d4a574</div>
+        <div class="swatch-role">Gradient endpoint, warm highlight</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #f4a261;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Amber</div>
+        <div class="swatch-hex">#f4a261</div>
+        <div class="swatch-role">Secondary accent, warnings</div>
+      </div>
+    </div>
+  </div>
+
+  <h3>Neutral</h3>
+  <div class="palette">
+    <div class="swatch">
+      <div class="swatch-color" style="background: #0a0a0f;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Void</div>
+        <div class="swatch-hex">#0a0a0f</div>
+        <div class="swatch-role">Page background</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #111118;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Charcoal</div>
+        <div class="swatch-hex">#111118</div>
+        <div class="swatch-role">Section background</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #16161f;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Slate</div>
+        <div class="swatch-hex">#16161f</div>
+        <div class="swatch-role">Cards, elevated surfaces</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #1e1e2a;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Border</div>
+        <div class="swatch-hex">#1e1e2a</div>
+        <div class="swatch-role">Borders, dividers</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #e8e8ed;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Ash</div>
+        <div class="swatch-hex">#e8e8ed</div>
+        <div class="swatch-role">Primary text</div>
+      </div>
+    </div>
+  </div>
+
+  <h3>Semantic</h3>
+  <div class="palette">
+    <div class="swatch">
+      <div class="swatch-color" style="background: #6bc9a0;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Verdigris</div>
+        <div class="swatch-hex">#6bc9a0</div>
+        <div class="swatch-role">Success, positive, checks</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #7c9cf5;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Steel Blue</div>
+        <div class="swatch-hex">#7c9cf5</div>
+        <div class="swatch-role">Info, CQL/code accent</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #c882f0;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Amethyst</div>
+        <div class="swatch-hex">#c882f0</div>
+        <div class="swatch-role">Lock-free/concurrency accent</div>
+      </div>
+    </div>
+    <div class="swatch">
+      <div class="swatch-color" style="background: #e25b5b;"></div>
+      <div class="swatch-info">
+        <div class="swatch-name">Rust Red</div>
+        <div class="swatch-hex">#e25b5b</div>
+        <div class="swatch-role">Errors, destructive actions</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Typography ── -->
+  <h2>Typography</h2>
+
+  <div class="type-sample">
+    <div class="type-label">Sans-Serif — Headings &amp; Body</div>
+    <div class="type-display">Inter — The distributed database</div>
+    <div class="type-body">Used for all UI text, headings, body copy, and navigation. Weight 400 for body, 600 for labels, 700–800 for headings.</div>
+  </div>
+
+  <div class="type-sample">
+    <div class="type-label">Serif — Logo &amp; Fe Monogram</div>
+    <div class="type-display type-serif" style="font-size: 3rem;">Fe</div>
+    <div class="type-body">Georgia or Times New Roman. Used exclusively in the logo mark for the periodic-table chemistry reference.</div>
+  </div>
+
+  <div class="type-sample">
+    <div class="type-label">Monospace — Code &amp; Metrics</div>
+    <div class="type-mono" style="font-size: 1rem;">SELECT * FROM system_observability.storage_stats;</div>
+    <div class="type-body" style="margin-top: 0.5rem;">JetBrains Mono or Fira Code. Used for code samples, terminal output, metrics, and technical labels.</div>
+  </div>
+
+  <!-- ── Voice & Tone ── -->
+  <h2>Voice &amp; Tone</h2>
+  <p>Ferrosa's voice is confident and direct. We talk about real engineering tradeoffs, not marketing fluff. We respect the user's intelligence.</p>
+
+  <div class="voice-grid">
+    <div class="voice-card">
+      <div class="emoji">&#9881;</div>
+      <h4>Technical</h4>
+      <p>Lead with specifics. "Lock-free reads via ArcSwap" not "blazing fast performance."</p>
+    </div>
+    <div class="voice-card">
+      <div class="emoji">&#9889;</div>
+      <h4>Direct</h4>
+      <p>Short sentences. Active voice. State the benefit, then the mechanism.</p>
+    </div>
+    <div class="voice-card">
+      <div class="emoji">&#9878;</div>
+      <h4>Honest</h4>
+      <p>Acknowledge tradeoffs. S3 adds read latency on cache miss — we say so.</p>
+    </div>
+    <div class="voice-card">
+      <div class="emoji">&#128736;</div>
+      <h4>Builder-First</h4>
+      <p>Written for engineers who will evaluate the code, not executives reading a slide deck.</p>
+    </div>
+  </div>
+
+  <!-- ── Usage Rules ── -->
+  <h2>Logo Usage</h2>
+
+  <div class="rules">
+    <div class="rule-card do">
+      <h4>Do</h4>
+      <p>Use the full logo on dark backgrounds (#0a0a0f to #16161f). Maintain clear space equal to the height of the "Fe" mark on all sides. Use the icon mark alone when space is tight (favicons, avatars, badges).</p>
+    </div>
+    <div class="rule-card dont">
+      <h4>Don't</h4>
+      <p>Don't place the logo on busy backgrounds or light surfaces without inverting colors. Don't stretch, rotate, or recolor the gradient. Don't add effects like drop shadows or outer glows.</p>
+    </div>
+    <div class="rule-card do">
+      <h4>Minimum Size</h4>
+      <p>Full logo: 120px wide minimum. Icon mark: 24px minimum. Favicon: 16px (use favicon.svg which is optimized for small sizes).</p>
+    </div>
+    <div class="rule-card do">
+      <h4>Co-Branding</h4>
+      <p>When shown alongside partner logos, maintain equal visual weight. Separate with a vertical divider (1px, var(--border) color) with 24px horizontal padding.</p>
+    </div>
+  </div>
+
+  <!-- ── Naming ── -->
+  <h2>Naming</h2>
+  <div class="rules">
+    <div class="rule-card do">
+      <h4>Correct</h4>
+      <p><strong>Ferrosa</strong> (capitalized, not all-caps). Lowercase "ferrosa" in code contexts (package names, CLI). "The Ferrosa Project" for the community. Crate names use <code>ferrosa-</code> prefix.</p>
+    </div>
+    <div class="rule-card dont">
+      <h4>Incorrect</h4>
+      <p>FERROSA, FerrosaDB, Ferrosa DB (two words), ferrosa.io (not a domain we control). Never abbreviate to "Ferro" or "FSA."</p>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>

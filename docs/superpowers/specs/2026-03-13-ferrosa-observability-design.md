@@ -22,6 +22,10 @@ pub trait VirtualTable: Send + Sync {
     // is currently cached (may be empty before first collection).
     async fn read(&self, predicate: Option<&RowPredicate>) -> Vec<VirtualRow>;
 
+    // Primary key column indices — used by delta mode to identify
+    // row identity for INSERT/UPDATE/DELETE classification
+    fn primary_key_columns(&self) -> &[usize];
+
     // Push: SUBSCRIBE support
     fn subscription_mode(&self) -> SubscriptionMode;
 }
@@ -32,8 +36,12 @@ pub struct VirtualRow {
     pub cells: Vec<CellValue>,  // reuses ferrosa-common::CellValue
 }
 
-/// Column filter for virtual table reads.
+/// Column filters for virtual table reads. Conjunction (AND) of predicates.
 pub struct RowPredicate {
+    pub filters: Vec<ColumnFilter>,
+}
+
+pub struct ColumnFilter {
     pub column: String,
     pub op: PredicateOp,
     pub value: CellValue,
@@ -49,7 +57,20 @@ pub enum PredicateOp {
 
 pub struct VirtualColumnDef {
     pub name: String,
-    pub data_type: CellValueType,
+    pub data_type: DataType,  // new enum in ferrosa-common
+}
+
+/// New type added to ferrosa-common alongside CellValue.
+/// Represents the CQL-level type system for column definitions.
+pub enum DataType {
+    Text,
+    Int,
+    BigInt,
+    Double,
+    Boolean,
+    Uuid,
+    Timestamp,
+    Blob,
 }
 
 pub enum SubscriptionMode {
@@ -103,35 +124,62 @@ The graph executor's hop-by-hop expansion recognizes virtual table sources and c
 
 ## SUBSCRIBE Mechanism
 
-### CQL Extension
+SUBSCRIBE is a general-purpose streaming query extension for both CQL and graph queries. It works with virtual tables (observability) and regular tables (reactive data queries).
+
+### Modes
+
+| Mode | Trigger | Syntax | Use Case |
+|------|---------|--------|----------|
+| Change-driven (default) | WriteObserver detects matching mutation | `SUBSCRIBE SELECT ...` | Reactive applications, live dashboards on real data |
+| Polling | Timer-based re-execution | `SUBSCRIBE SELECT ... EVERY 5s` | Virtual tables, periodic snapshots |
+
+### Result Delivery
+
+| Mode | Behavior | Syntax |
+|------|----------|--------|
+| Full (default) | Re-executes query, sends complete result set | `SUBSCRIBE SELECT ...` |
+| Delta | Sends only changed rows with `change_type` column (`INSERT`, `UPDATE`, `DELETE`) | `SUBSCRIBE SELECT ... DELTA` |
+
+### CQL Syntax
 
 ```sql
+-- Change-driven, full result set (default)
+SUBSCRIBE SELECT * FROM users WHERE active = true;
+
+-- Change-driven, delta mode
+SUBSCRIBE SELECT * FROM users WHERE active = true DELTA;
+
+-- Polling fallback, full result set
+SUBSCRIBE SELECT * FROM users WHERE active = true EVERY 5s;
+
+-- Polling fallback, delta mode
+SUBSCRIBE SELECT * FROM users WHERE active = true EVERY 5s DELTA;
+
+-- Virtual tables (same syntax)
 SUBSCRIBE SELECT * FROM system_observability.host_metrics EVERY 5s;
-SUBSCRIBE SELECT * FROM system_observability.connections EVERY 1s;
-UNSUBSCRIBE;  -- on same connection, stops streaming
+
+-- Cancel specific or all subscriptions
+UNSUBSCRIBE <stream_id>;
+UNSUBSCRIBE;
 ```
 
-- New `SUBSCRIBE` statement type in the CQL parser, carrying the inner SELECT + interval
-- Server enforces a minimum interval floor (500ms) to prevent abuse
+- New `SUBSCRIBE` statement type in the CQL parser, carrying the inner SELECT + optional interval + optional delta flag
+- Server enforces a minimum interval floor (500ms) for polling mode to prevent abuse
 - Maximum 8 concurrent subscriptions per connection
 
-### SUBSCRIBE Wire Protocol
-
-SUBSCRIBE responses reuse the existing CQL stream ID for the duration of the subscription. Each tick sends a standard `ROWS` result frame on the original stream ID with a custom flag (0x10, `HAS_MORE_PAGES` repurposed as `STREAMING`) indicating more frames will follow. The final frame (on UNSUBSCRIBE or disconnect) omits this flag.
-
-**UNSUBSCRIBE** takes an optional stream ID: `UNSUBSCRIBE <stream_id>` cancels a specific subscription, bare `UNSUBSCRIBE` cancels all subscriptions on the connection.
-
-**Driver compatibility:** SUBSCRIBE is a Ferrosa extension. Standard CQL drivers will not understand the streaming response. Consumers are `ferrosa-ctl`, the web interface, and custom clients that opt in. Standard SELECT against virtual tables works with any CQL driver.
-
-### Graph Query Extension
+### Graph Query Syntax
 
 Backward-compatible prefix keyword on existing graph queries:
 
 ```
-SUBSCRIBE MATCH (h:Host)-[:RUNS]->(p:Process)
-  WHERE h.cpu_percent > 80
-  RETURN h.name, p.name, h.cpu_percent
-  EVERY 5s;
+-- Change-driven (default)
+SUBSCRIBE MATCH (u:User {active: true})-[:FOLLOWS]->(f) RETURN u, f;
+
+-- Delta mode
+SUBSCRIBE MATCH (u:User {active: true})-[:FOLLOWS]->(f) RETURN u, f DELTA;
+
+-- Polling fallback
+SUBSCRIBE MATCH (u:User {active: true})-[:FOLLOWS]->(f) RETURN u, f EVERY 5s;
 ```
 
 AST representation:
@@ -142,14 +190,58 @@ pub enum GraphStatement {
     Create(CreateMutation),
     Subscribe {
         inner: Box<MatchQuery>,  // only read queries can be subscribed to
-        interval: Duration,
+        interval: Option<Duration>,  // None = change-driven, Some = polling
+        delta: bool,
     },
     Unsubscribe { stream_id: Option<u16> },
     // ...
 }
 ```
 
-The parser rejects `SUBSCRIBE CREATE ...` and `SUBSCRIBE SUBSCRIBE ...` at parse time — only `MATCH` queries are valid subscription targets.
+The parser rejects `SUBSCRIBE CREATE ...` and `SUBSCRIBE SUBSCRIBE ...` at parse time — only read queries (SELECT / MATCH) are valid subscription targets.
+
+**Virtual table SUBSCRIBE without EVERY:** Virtual tables have no `WriteObserver` — they are not backed by storage mutations. A bare `SUBSCRIBE SELECT * FROM system_observability.connections` (no `EVERY`) implicitly falls back to polling at the table's `SubscriptionMode` default interval. For `Pollable` tables, the default is 1 second. For `DemandDriven` tables, it uses the `default_interval`. If the table's `SubscriptionMode` is `None`, the server returns an error.
+
+**Graph SUBSCRIBE table dependencies:** When a graph SUBSCRIBE is registered, the graph planner produces a "table dependency set" — the set of underlying CQL tables the query touches (vertex tables, edge tables, adjacency index tables). This set is registered with the `SubscriptionObserver` so that a write to any of these tables triggers re-execution. The planner already resolves labels to table IDs during planning; the dependency set is a byproduct of this resolution.
+
+**Schema change behavior:** If a subscribed table is altered (column added/dropped) or dropped, the server cancels all affected subscriptions and sends an ERROR frame on each subscription's stream ID with error code `ConfigError` and a message indicating the schema change. The client can re-subscribe if the schema change is compatible.
+
+### Change-Driven Implementation via WriteObserver
+
+Change-driven subscriptions use the existing `WriteObserver` infrastructure:
+
+1. **Registration:** On `SUBSCRIBE` (without `EVERY`), a `SubscriptionObserver` registers the subscription's filter — table ID + predicate columns + partition key scope.
+2. **Observer mode:** `SubscriptionObserver` implements `WriteObserver` with `ObserverMode::Async`. One `SubscriptionObserver` instance handles all active change-driven subscriptions.
+3. **Filter matching in `on_write()`:** For each mutation, checks table ID and affected columns against registered filters. This is a cheap check — no query execution in the write path. Column ordinal-to-name resolution uses a `Schema::schema_ref()` snapshot (lock-free read via ArcSwap).
+4. **Async re-execution:** When a filter matches, the async drain task re-executes the subscription's query and pushes the result set (or delta) to the subscriber's streaming connection. The drain task coalesces mutations: after draining the channel, it re-executes each affected subscription at most once per drain cycle, not once per mutation.
+5. **Backpressure:** Bounded channel (existing WriteObserver infrastructure). If a subscription can't keep up with write rate, mutations are dropped and the subscriber gets the next consistent snapshot when the queue drains.
+
+**WriteObserver trait extension:** The current `WriteObserver::tables()` returns a static `Vec<TableId>`. `SubscriptionObserver` needs a dynamic table set that changes as subscriptions come and go. The trait gains a new method:
+
+```rust
+/// Returns true if this observer is interested in mutations to the given table.
+/// Default implementation delegates to tables().contains(table).
+/// SubscriptionObserver overrides with a concurrent hash set lookup.
+fn watches_table(&self, table: &TableId) -> bool {
+    self.tables().contains(table)
+}
+```
+
+The `StorageEngine` dispatch logic calls `watches_table()` instead of checking `tables()` directly.
+
+**Delta mode specifics:** The async drain task compares the new result set against the subscription's last-sent result set and emits only changed rows with a `change_type` column. Row identity is determined by primary key columns. For full mode, it sends the complete re-executed result set.
+
+**Delta mode memory bounds:** Delta subscriptions retain the last-sent result set keyed by primary key. Maximum retained result set size is 10,000 rows per subscription. Subscriptions on result sets exceeding this limit automatically fall back to full mode with a warning sent to the client. This bounds memory to approximately 10,000 rows x 8 subscriptions x ~1KB/row = ~80MB worst case per connection.
+
+### Wire Protocol
+
+SUBSCRIBE responses reuse the existing CQL stream ID for the duration of the subscription. Each push sends a standard `ROWS` result frame on the original stream ID with a custom flag (0x10, `HAS_MORE_PAGES` repurposed as `STREAMING`) indicating more frames will follow. The final frame (on UNSUBSCRIBE or disconnect) omits this flag.
+
+For delta mode, the result set includes an additional first column `change_type` (text: `INSERT`, `UPDATE`, `DELETE`) not present in the original query's column spec.
+
+**UNSUBSCRIBE** takes an optional stream ID: `UNSUBSCRIBE <stream_id>` cancels a specific subscription, bare `UNSUBSCRIBE` cancels all subscriptions on the connection.
+
+**Driver compatibility:** SUBSCRIBE is a Ferrosa extension. Standard CQL drivers will not understand the streaming response. Consumers are `ferrosa-ctl`, the web interface, and custom clients that opt in. Standard SELECT against virtual tables works with any CQL driver.
 
 No changes to existing grammar rules. `SUBSCRIBE` is a new production that delegates to the existing query parser for its body. The executor checks if the statement is wrapped in `Subscribe` and, if so, loops on a timer pushing results instead of returning once.
 
@@ -278,19 +370,19 @@ Virtual table access uses the existing permission system:
 
 ## Relationship to CQL REGISTER/EVENT
 
-CQL v5 already has `REGISTER`/`EVENT` for schema changes, topology changes, and status changes. `SUBSCRIBE` is more general — it streams arbitrary query results at intervals. The two coexist: `REGISTER` remains for push-based event notifications (fires on change), while `SUBSCRIBE` is for periodic polling of virtual table state. A `SUBSCRIBE` on `cluster_peers` gives a periodic snapshot; a `REGISTER` for `STATUS_CHANGE` fires only when a peer goes up/down.
+CQL v5 already has `REGISTER`/`EVENT` for schema changes, topology changes, and status changes. `SUBSCRIBE` is more general — it streams arbitrary query results (change-driven or polled). The two coexist: `REGISTER` remains for lightweight event notifications (fires on change, sends only the event type and metadata), while `SUBSCRIBE` streams full or delta result sets. A `REGISTER` for `STATUS_CHANGE` fires a single event when a peer goes up/down; a `SUBSCRIBE` on `cluster_peers` delivers the complete peer table on each change or at each interval.
 
 ## Crate Responsibilities
 
 | Crate | New Responsibilities |
 |-------|---------------------|
 | `ferrosa-schema` | `VirtualTable` trait, `VirtualTableRegistry`, `system_observability` keyspace + table definitions |
-| `ferrosa-storage` | Implements `storage_stats` virtual table |
-| `ferrosa-cql` | `SUBSCRIBE`/`UNSUBSCRIBE` parsing, streaming frame type, query executor calls virtual table `read()`, implements `connections` and `active_queries` tables |
+| `ferrosa-storage` | Implements `storage_stats` virtual table, hosts `SubscriptionObserver` (implements `WriteObserver`) for change-driven subscriptions |
+| `ferrosa-cql` | `SUBSCRIBE`/`UNSUBSCRIBE` parsing (with `EVERY`/`DELTA` modifiers), streaming frame type, query executor calls virtual table `read()`, implements `connections` and `active_queries` tables |
 | `ferrosa-cql` (client module) | Thin CQL client: frame codec reuse, connection establishment, STARTUP handshake, auth — used by `ferrosa-ctl` |
 | `ferrosa-net` | **Not yet created.** `SubscriptionManager`, internode metrics collection protocol, Prometheus `/metrics` endpoint, web interface (HTTPS + embedded JS), demand-driven peer coordination |
 | `ferrosa-cluster` | **Not yet created.** Implements `cluster_peers`, `cluster_topology`, `host_metrics` virtual tables |
-| `ferrosa-graph` | Graph executor recognizes virtual table sources, `SUBSCRIBE`/`UNSUBSCRIBE` parsing for graph queries |
+| `ferrosa-graph` | Graph executor recognizes virtual table sources, `SUBSCRIBE`/`UNSUBSCRIBE` parsing (with `EVERY`/`DELTA` modifiers) for graph queries |
 | `ferrosa-ctl` | **New crate** — CLI binary with subcommands + `ratatui` TUI monitor mode |
 
 ## Dependency Flow
