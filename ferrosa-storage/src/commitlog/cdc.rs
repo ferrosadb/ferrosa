@@ -309,6 +309,49 @@ mod tests {
         assert_eq!(results[0].table, "t3");
     }
 
+    #[test]
+    fn reader_follows_across_segment_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Small segments to force rotation.
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+
+        // Append enough mutations to span multiple segments.
+        let mut expected_count = 0;
+        for i in 0..10 {
+            if cl.append(&test_mutation("ks", &format!("t{i}"))).is_ok() {
+                expected_count += 1;
+            }
+        }
+        cl.shutdown().unwrap();
+
+        // Verify multiple segment files exist.
+        let segment_count = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("commitlog-") && n.ends_with(".log"))
+            })
+            .count();
+        assert!(
+            segment_count >= 2,
+            "need multiple segments, got {segment_count}"
+        );
+
+        let mut reader = CdcReader::new(dir.path(), dir.path(), None).unwrap();
+        let mut results = Vec::new();
+        while let Some((mutation, _)) = reader.next_mutation().unwrap() {
+            results.push(mutation);
+        }
+        assert_eq!(results.len(), expected_count);
+    }
+
     fn test_mutation(ks: &str, table: &str) -> Mutation {
         use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
         use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
