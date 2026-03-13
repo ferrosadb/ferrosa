@@ -560,14 +560,15 @@ impl StorageEngine {
     /// Collects SSTable metadata for compaction strategy evaluation.
     fn collect_sstable_metadata(
         &self,
-        _table_id: &TableId,
+        table_id: &TableId,
         state: &TableState,
     ) -> Vec<crate::compaction::metadata::SSTableMetadata> {
-        // For now, return empty — full metadata collection requires
-        // iterating the SSTable list and reading stats from each.
-        // This will be wired up when SSTableReader exposes stats.
-        let _ = state.store.sstable_count();
-        Vec::new()
+        let table_dir = self
+            .config
+            .data_dir
+            .join("sstables")
+            .join(table_id.to_string());
+        state.store.sstable_metadata(&table_dir)
     }
 
     /// Returns a reference to the local cache.

@@ -295,6 +295,36 @@ impl<F: FlushTarget> TableStore<F> {
         }));
         Ok(())
     }
+
+    /// Collect metadata for all current SSTables.
+    ///
+    /// Used by the compaction strategy to decide which SSTables to merge.
+    /// The `table_dir` is the directory where this table's SSTable files
+    /// reside (e.g., `{data_dir}/sstables/{table_id}`).
+    pub fn sstable_metadata(
+        &self,
+        table_dir: &std::path::Path,
+    ) -> Vec<crate::compaction::metadata::SSTableMetadata> {
+        let guard = self.view.load();
+        guard
+            .sstables
+            .iter()
+            .enumerate()
+            .map(|(i, sst)| {
+                let header = sst.header();
+                crate::compaction::metadata::SSTableMetadata {
+                    id: format!("{}", i + 1),
+                    path: table_dir.to_path_buf(),
+                    size_bytes: 0, // Approximate; exact tracking is a future optimization
+                    min_token: 0,
+                    max_token: 0,
+                    min_timestamp: header.min_timestamp,
+                    max_timestamp: i64::MAX, // SerializationHeader only has min; sentinel until full stats tracking
+                    partition_count: sst.key_count(),
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
