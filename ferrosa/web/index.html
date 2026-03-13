@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — Operations Console</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --border:    #30363d;
+      --text:      #c9d1d9;
+      --muted:     #8b949e;
+      --accent:    #58a6ff;
+      --green:     #3fb950;
+      --red:       #f85149;
+      --yellow:    #d29922;
+      --header-h:  52px;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    /* ── Header ──────────────────────────────────────────── */
+    header {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      height: var(--header-h);
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 24px;
+      gap: 16px;
+      z-index: 100;
+    }
+
+    .logo {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -0.3px;
+    }
+
+    .logo span { color: var(--muted); font-weight: 400; }
+
+    #status-pill {
+      margin-left: auto;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+      background: var(--border);
+      color: var(--muted);
+      transition: background 0.3s, color 0.3s;
+    }
+
+    #status-pill.ok   { background: rgba(63,185,80,0.15);  color: var(--green); }
+    #status-pill.err  { background: rgba(248,81,73,0.15);  color: var(--red); }
+
+    #refresh-countdown {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    /* ── Main layout ─────────────────────────────────────── */
+    main {
+      margin-top: var(--header-h);
+      padding: 24px;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(480px, 1fr));
+      gap: 20px;
+      max-width: 1600px;
+    }
+
+    /* ── Cards ───────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .card-title {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--muted);
+    }
+
+    .card-badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: var(--bg);
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+
+    .card-body {
+      padding: 0;
+      overflow-x: auto;
+    }
+
+    /* ── Tables ──────────────────────────────────────────── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    thead th {
+      padding: 8px 18px;
+      text-align: left;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+      color: var(--muted);
+      text-transform: uppercase;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      transition: background 0.1s;
+    }
+
+    tbody tr:last-child { border-bottom: none; }
+
+    tbody tr:hover { background: rgba(255,255,255,0.03); }
+
+    tbody td {
+      padding: 9px 18px;
+      font-size: 13px;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* ── State helpers ───────────────────────────────────── */
+    .state-ok   { color: var(--green); }
+    .state-warn { color: var(--yellow); }
+    .state-err  { color: var(--red); }
+
+    /* ── Empty / loading / error states ─────────────────── */
+    .placeholder {
+      padding: 32px 18px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .placeholder.loading::before {
+      content: "";
+      display: inline-block;
+      width: 14px; height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      margin-right: 8px;
+      vertical-align: middle;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Cluster overview card ───────────────────────────── */
+    .overview-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    }
+
+    .overview-stat {
+      padding: 18px;
+      border-right: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .overview-stat:last-child,
+    .overview-stat:nth-last-child(-n+2):nth-child(odd) {
+      border-bottom: none;
+    }
+
+    .stat-label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      margin-bottom: 4px;
+    }
+
+    .stat-value {
+      font-size: 24px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+
+    .stat-value.accent { color: var(--accent); }
+    .stat-value.green  { color: var(--green); }
+
+    /* Full-width cards span all columns */
+    .card.full-width { grid-column: 1 / -1; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">ferrosa <span>operations console</span></div>
+  <span id="refresh-countdown">Refreshing in 5s</span>
+  <span id="status-pill">Connecting&#8230;</span>
+</header>
+
+<main id="main">
+
+  <!-- Cluster Overview -->
+  <div class="card full-width" id="card-overview">
+    <div class="card-header">
+      <span class="card-title">Cluster Overview</span>
+      <span class="card-badge" id="badge-tables">&#8212;</span>
+    </div>
+    <div class="card-body" id="body-overview">
+      <div class="placeholder loading">Loading cluster data&#8230;</div>
+    </div>
+  </div>
+
+  <!-- Active Connections -->
+  <div class="card" id="card-connections">
+    <div class="card-header">
+      <span class="card-title">Active Connections</span>
+      <span class="card-badge" id="badge-connections">&#8212;</span>
+    </div>
+    <div class="card-body" id="body-connections">
+      <div class="placeholder loading">Loading&#8230;</div>
+    </div>
+  </div>
+
+  <!-- Storage Stats -->
+  <div class="card" id="card-storage">
+    <div class="card-header">
+      <span class="card-title">Storage Stats</span>
+      <span class="card-badge" id="badge-storage">&#8212;</span>
+    </div>
+    <div class="card-body" id="body-storage">
+      <div class="placeholder loading">Loading&#8230;</div>
+    </div>
+  </div>
+
+  <!-- Active Queries -->
+  <div class="card full-width" id="card-queries">
+    <div class="card-header">
+      <span class="card-title">Active Queries</span>
+      <span class="card-badge" id="badge-queries">&#8212;</span>
+    </div>
+    <div class="card-body" id="body-queries">
+      <div class="placeholder loading">Loading&#8230;</div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+"use strict";
+
+// ── Config ────────────────────────────────────────────────
+var REFRESH_INTERVAL_MS = 5000;
+
+// ── Countdown ─────────────────────────────────────────────
+var countdown = REFRESH_INTERVAL_MS / 1000;
+var countdownEl = document.getElementById("refresh-countdown");
+var statusPill  = document.getElementById("status-pill");
+
+function tickCountdown() {
+  countdown -= 1;
+  if (countdown <= 0) {
+    countdown = REFRESH_INTERVAL_MS / 1000;
+    refreshAll();
+  }
+  countdownEl.textContent = "Refreshing in " + countdown + "s";
+}
+setInterval(tickCountdown, 1000);
+
+// ── Status pill ───────────────────────────────────────────
+function setStatus(ok) {
+  if (ok) {
+    statusPill.textContent = "Connected";
+    statusPill.className = "ok";
+  } else {
+    statusPill.textContent = "Error";
+    statusPill.className = "err";
+  }
+}
+
+// ── Fetch helper ──────────────────────────────────────────
+function fetchJSON(url) {
+  return fetch(url).then(function(res) {
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  });
+}
+
+// ── Generic table renderer ────────────────────────────────
+// rows: array of objects (key-value pairs per row)
+function renderTable(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return '<div class="placeholder">No data</div>';
+  }
+
+  var columns = Object.keys(rows[0]);
+
+  var headerCells = columns.map(function(c) {
+    return "<th>" + escHtml(c) + "</th>";
+  }).join("");
+
+  var bodyRows = rows.map(function(row) {
+    var cells = columns.map(function(col) {
+      var val = row[col];
+      var display;
+      if (val === null || val === undefined) {
+        display = '<span style="color:var(--muted)">&#8212;</span>';
+      } else {
+        display = escHtml(String(val));
+      }
+
+      // Colorize known state/status columns
+      if (col === "state" || col === "status") {
+        var v = String(val).toLowerCase();
+        if (v === "ready" || v === "up") {
+          display = '<span class="state-ok">' + escHtml(String(val)) + "</span>";
+        } else if (v === "down" || v === "error") {
+          display = '<span class="state-err">' + escHtml(String(val)) + "</span>";
+        } else {
+          display = '<span class="state-warn">' + escHtml(String(val)) + "</span>";
+        }
+      }
+
+      // Highlight long-running queries (elapsed_ms > 5000)
+      if (col === "elapsed_ms" && Number(val) > 5000) {
+        display = '<span class="state-warn">' + escHtml(String(val)) + "</span>";
+      }
+
+      return "<td>" + display + "</td>";
+    }).join("");
+    return "<tr>" + cells + "</tr>";
+  }).join("");
+
+  return (
+    "<table>" +
+    "<thead><tr>" + headerCells + "</tr></thead>" +
+    "<tbody>" + bodyRows + "</tbody>" +
+    "</table>"
+  );
+}
+
+// ── Cluster overview renderer ─────────────────────────────
+function renderOverview(tables, connections, storage) {
+  var tableCount = Array.isArray(tables) ? tables.length : "&#8212;";
+  var connCount  = Array.isArray(connections) ? connections.length : "&#8212;";
+
+  var totalSStableBytes = 0;
+  var totalMemBytes = 0;
+  if (Array.isArray(storage)) {
+    storage.forEach(function(row) {
+      totalSStableBytes += Number(row.sstable_size_bytes) || 0;
+      totalMemBytes     += Number(row.memtable_size_bytes) || 0;
+    });
+  }
+
+  function fmtBytes(n) {
+    if (n === 0) return "0 B";
+    var units = ["B", "KB", "MB", "GB", "TB"];
+    var i = Math.min(Math.floor(Math.log2(n) / 10), units.length - 1);
+    return (n / Math.pow(1024, i)).toFixed(1) + "\u00a0" + units[i];
+  }
+
+  var stats = [
+    { label: "Virtual Tables", value: tableCount, cls: "accent" },
+    { label: "Connections",    value: connCount,  cls: Number(connCount) > 0 ? "green" : "" },
+    { label: "SSTable Data",   value: fmtBytes(totalSStableBytes), cls: "" },
+    { label: "Memtable",       value: fmtBytes(totalMemBytes),     cls: "" },
+  ];
+
+  return '<div class="overview-grid">' +
+    stats.map(function(s) {
+      return (
+        '<div class="overview-stat">' +
+        '<div class="stat-label">' + escHtml(s.label) + "</div>" +
+        '<div class="stat-value ' + s.cls + '">' + s.value + "</div>" +
+        "</div>"
+      );
+    }).join("") +
+    "</div>";
+}
+
+// ── HTML escape ───────────────────────────────────────────
+function escHtml(str) {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// ── Helpers ───────────────────────────────────────────────
+function setBody(id, html) {
+  document.getElementById(id).innerHTML = html;
+}
+
+function setBadge(id, value) {
+  document.getElementById(id).textContent = value === null ? "\u2014" : String(value);
+}
+
+function placeholderErr(msg) {
+  return '<div class="placeholder" style="color:var(--red)">' + escHtml(msg) + "</div>";
+}
+
+// ── Main refresh ──────────────────────────────────────────
+function refreshAll() {
+  var anyError = false;
+
+  var tablesPromise      = fetchJSON("/api/tables");
+  var connectionsPromise = fetchJSON("/api/connections");
+  var storagePromise     = fetchJSON("/api/storage_stats");
+  var queriesPromise     = fetchJSON("/api/active_queries");
+
+  Promise.allSettled([tablesPromise, connectionsPromise, storagePromise, queriesPromise])
+    .then(function(results) {
+      var tablesResult      = results[0];
+      var connectionsResult = results[1];
+      var storageResult     = results[2];
+      var queriesResult     = results[3];
+
+      var tables      = tablesResult.status      === "fulfilled" ? tablesResult.value      : null;
+      var connections = connectionsResult.status === "fulfilled" ? connectionsResult.value : null;
+      var storage     = storageResult.status     === "fulfilled" ? storageResult.value     : null;
+      var queries     = queriesResult.status     === "fulfilled" ? queriesResult.value     : null;
+
+      if (!tables)      anyError = true;
+      if (!connections) anyError = true;
+      if (!storage)     anyError = true;
+      if (!queries)     anyError = true;
+
+      // Cluster overview
+      setBody("body-overview", renderOverview(tables, connections, storage));
+      setBadge("badge-tables", Array.isArray(tables) ? tables.length : null);
+
+      // Connections
+      if (connections !== null) {
+        setBody("body-connections", renderTable(connections));
+        setBadge("badge-connections", connections.length);
+      } else {
+        setBody("body-connections", placeholderErr(
+          (connectionsResult.reason && connectionsResult.reason.message) || "Fetch failed"
+        ));
+        setBadge("badge-connections", null);
+      }
+
+      // Storage stats
+      if (storage !== null) {
+        setBody("body-storage", renderTable(storage));
+        setBadge("badge-storage", storage.length);
+      } else {
+        setBody("body-storage", placeholderErr(
+          (storageResult.reason && storageResult.reason.message) || "Fetch failed"
+        ));
+        setBadge("badge-storage", null);
+      }
+
+      // Active queries
+      if (queries !== null) {
+        setBody("body-queries", renderTable(queries));
+        setBadge("badge-queries", queries.length);
+      } else {
+        setBody("body-queries", placeholderErr(
+          (queriesResult.reason && queriesResult.reason.message) || "Fetch failed"
+        ));
+        setBadge("badge-queries", null);
+      }
+
+      setStatus(!anyError);
+    });
+}
+
+// ── Boot ──────────────────────────────────────────────────
+refreshAll();
+</script>
+</body>
+</html>
