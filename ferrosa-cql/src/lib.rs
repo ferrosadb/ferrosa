@@ -18,13 +18,17 @@
 pub mod ast;
 pub mod auth;
 pub mod bridge;
+pub mod client;
 pub mod connection;
 pub mod error;
 pub mod frame;
 pub mod lexer;
 pub mod parser;
 pub mod prepared;
+pub mod prometheus;
 pub mod result;
 pub mod router;
 pub mod server;
+pub mod subscribe;
 pub mod types;
+pub mod virtual_tables;

@@ -12,7 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
@@ -30,7 +30,9 @@ use crate::parser;
 use crate::prepared::{PreparedCache, PreparedPlan};
 use crate::result;
 use crate::router::{RequestContext, RouteResult, SharedState};
+use crate::subscribe::SubscriptionState;
 use crate::types::CqlType;
+use crate::virtual_tables::connections::{ConnectionInfo, ConnectionTracker};
 
 use ferrosa_schema::AuthContext;
 
@@ -50,6 +52,21 @@ enum ConnectionPhase {
     Ready,
 }
 
+/// RAII guard that deregisters a connection from the tracker on drop.
+///
+/// This ensures the connection is always removed from the tracker, even if
+/// the handler panics or returns early due to an error.
+pub(crate) struct ConnectionGuard {
+    tracker: Arc<ConnectionTracker>,
+    peer: SocketAddr,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.tracker.deregister(&self.peer);
+    }
+}
+
 /// Handle a single CQL connection.
 ///
 /// This function owns the TCP connection and processes frames until the client
@@ -63,11 +80,30 @@ pub async fn handle_connection(
 ) {
     debug!("new connection from {peer}");
 
+    // Register this connection with the tracker and create a drop guard.
+    state.connection_tracker.register(
+        peer,
+        ConnectionInfo {
+            peer_address: peer.ip().to_string(),
+            peer_port: peer.port(),
+            state: "startup".to_owned(),
+            username: None,
+            connected_at: Instant::now(),
+            requests_served: 0,
+            protocol_version: 5,
+        },
+    );
+    let _guard = ConnectionGuard {
+        tracker: state.connection_tracker.clone(),
+        peer,
+    };
+
     let codec = CqlCodec::new(max_frame_size);
     let mut framed = Framed::new(stream, codec);
     let mut phase = ConnectionPhase::AwaitingStartup;
     let mut auth_context: Option<AuthContext> = None;
     let mut current_keyspace: Option<String> = None;
+    let mut subscription_state = SubscriptionState::new(8);
 
     loop {
         // M11: idle timeout — drop connection if no frame arrives within IDLE_TIMEOUT.
@@ -91,6 +127,10 @@ pub async fn handle_connection(
 
         let stream_id = maybe_frame.header.stream_id;
 
+        // Snapshot phase discriminant before handling, so we can detect transitions.
+        let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);
+        let was_ready = matches!(phase, ConnectionPhase::Ready);
+
         match handle_frame(
             &mut phase,
             &mut auth_context,
@@ -100,6 +140,24 @@ pub async fn handle_connection(
             &maybe_frame,
         ) {
             HandleResult::Reply(opcode, body) => {
+                // Track phase transitions and requests.
+                if was_awaiting_startup && matches!(phase, ConnectionPhase::Authenticating { .. }) {
+                    // STARTUP sent, auth required — entered Authenticating phase.
+                    state
+                        .connection_tracker
+                        .update_state(&peer, "authenticating");
+                } else if !was_ready && matches!(phase, ConnectionPhase::Ready) {
+                    // Transitioned to Ready — update state and username if auth completed.
+                    state.connection_tracker.update_state(&peer, "ready");
+                    if let Some(ctx) = auth_context.as_ref() {
+                        state.connection_tracker.update_username(&peer, &ctx.role);
+                    }
+                }
+                if was_ready {
+                    // Count every request handled in the Ready phase.
+                    state.connection_tracker.increment_requests(&peer);
+                }
+
                 let body_bytes = body.freeze();
                 let frame = CqlFrame {
                     header: FrameHeader {
@@ -135,6 +193,9 @@ pub async fn handle_connection(
             }
         }
     }
+
+    // Cancel all active subscriptions on disconnect.
+    subscription_state.cancel_all();
 
     debug!("connection handler for {peer} finished");
 }
@@ -687,5 +748,66 @@ fn extract_keyspace_table(
             d.table.clone(),
         ),
         _ => (default_ks, String::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_guard_deregisters_on_drop() {
+        let tracker = Arc::new(ConnectionTracker::new());
+        let addr: SocketAddr = "127.0.0.1:9042".parse().unwrap();
+        tracker.register(
+            addr,
+            ConnectionInfo {
+                peer_address: "127.0.0.1".to_owned(),
+                peer_port: 9042,
+                state: "startup".to_owned(),
+                username: None,
+                connected_at: Instant::now(),
+                requests_served: 0,
+                protocol_version: 5,
+            },
+        );
+        assert_eq!(tracker.active_count(), 1);
+        {
+            let _guard = ConnectionGuard {
+                tracker: tracker.clone(),
+                peer: addr,
+            };
+        }
+        assert_eq!(tracker.active_count(), 0);
+    }
+
+    #[test]
+    fn connection_guard_deregisters_on_panic_unwind() {
+        let tracker = Arc::new(ConnectionTracker::new());
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        tracker.register(
+            addr,
+            ConnectionInfo {
+                peer_address: "127.0.0.1".to_owned(),
+                peer_port: 12345,
+                state: "startup".to_owned(),
+                username: None,
+                connected_at: Instant::now(),
+                requests_served: 0,
+                protocol_version: 5,
+            },
+        );
+        assert_eq!(tracker.active_count(), 1);
+
+        let tracker_clone = tracker.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = ConnectionGuard {
+                tracker: tracker_clone,
+                peer: addr,
+            };
+            panic!("simulated panic");
+        }));
+        assert!(result.is_err());
+        assert_eq!(tracker.active_count(), 0);
     }
 }

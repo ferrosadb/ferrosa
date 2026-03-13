@@ -14,12 +14,13 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use indexmap::IndexMap;
 
+use ferrosa_common::DataType;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local, query_peers, query_role_members,
     query_role_permissions, query_roles, query_tables, AuthContext, ClusterState,
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, KeyspaceMetadata,
     KeyspaceUpdates, NodeConfig, PeerInfo, Permission, ReplicationParams, Resource, RoleMetadata,
-    RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
+    RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates, VirtualColumnDef, VirtualRow,
 };
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
@@ -30,6 +31,8 @@ use crate::error::CqlError;
 use crate::prepared::PreparedCache;
 use crate::result;
 use crate::types::{CqlType, CqlValue};
+use crate::virtual_tables::active_queries::QueryTracker;
+use crate::virtual_tables::connections::ConnectionTracker;
 
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
 const MAX_BATCH_STATEMENTS: usize = 500;
@@ -41,6 +44,8 @@ pub struct SharedState {
     pub node_config: Arc<NodeConfig>,
     pub cluster_state: Arc<dyn ClusterState>,
     pub prepared_cache: Arc<PreparedCache>,
+    pub connection_tracker: Arc<ConnectionTracker>,
+    pub query_tracker: Arc<QueryTracker>,
 }
 
 /// Per-request context: authentication and current keyspace.
@@ -74,6 +79,16 @@ pub fn route(
     ctx: &RequestContext<'_>,
     stmt: Statement,
 ) -> Result<RouteResult, CqlError> {
+    // Track the query for observability; the guard calls complete() on drop.
+    let query_desc: String = format!("{:?}", &stmt).chars().take(200).collect();
+    let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
+    let _guard = state.query_tracker.begin_guarded(
+        &query_desc,
+        keyspace,
+        "",             // client address not yet available in RequestContext
+        &ctx.auth.role, // authenticated role name
+    );
+
     match stmt {
         Statement::Select(s) => route_select(state, ctx, s).map(RouteResult::Result),
         Statement::Insert(i) => route_insert(state, ctx, i).map(RouteResult::Result),
@@ -100,6 +115,9 @@ pub fn route(
             Ok(RouteResult::SetKeyspace(u.keyspace, body))
         }
         Statement::Truncate(t) => route_truncate(state, ctx, t).map(RouteResult::Result),
+        Statement::Subscribe { .. } | Statement::Unsubscribe { .. } => Err(CqlError::Invalid(
+            "SUBSCRIBE/UNSUBSCRIBE not yet supported".to_string(),
+        )),
     }
 }
 
@@ -409,6 +427,13 @@ fn route_select(
             &[],
         )),
         _ => {
+            // Virtual table: check registry before storage lookup.
+            if let Some(vtable) = state.schema.virtual_tables().get(ks, &s.table) {
+                let rows = vtable.read(None);
+                let columns = vtable.columns();
+                return encode_virtual_rows(ks, &s.table, columns, &rows);
+            }
+
             // User table: permission check + bridge + storage
             route_select_user_table(state, ctx, ks, &s)
         }
@@ -502,6 +527,90 @@ fn route_select_user_table(
             &[],
         )),
     }
+}
+
+// ── Virtual table helpers ────────────────────────────────────────────────
+
+/// Convert a `DataType` (from ferrosa-common) to the CQL protocol `CqlType`.
+fn data_type_to_cql_type(dt: &DataType) -> CqlType {
+    match dt {
+        DataType::Text => CqlType::Varchar,
+        DataType::Int => CqlType::Int,
+        DataType::BigInt => CqlType::Bigint,
+        DataType::Double => CqlType::Double,
+        DataType::Boolean => CqlType::Boolean,
+        DataType::Uuid => CqlType::Uuid,
+        DataType::Timestamp => CqlType::Timestamp,
+        DataType::Blob => CqlType::Blob,
+        // DataType is #[non_exhaustive]; treat unknown variants as blob.
+        _ => CqlType::Blob,
+    }
+}
+
+/// Convert a `CellValue` (raw bytes) to a typed `CqlValue` using the column's `DataType`.
+///
+/// Returns `None` (CQL null) for tombstones or cells with no value.
+fn cell_to_cql_value(cell: &ferrosa_common::CellValue, dt: &DataType) -> Option<CqlValue> {
+    let bytes = cell.value.as_ref()?;
+    Some(match dt {
+        DataType::Text => CqlValue::Text(String::from_utf8_lossy(bytes).into_owned()),
+        DataType::Int => {
+            let arr: [u8; 4] = bytes.as_slice().try_into().unwrap_or([0; 4]);
+            CqlValue::Int(i32::from_be_bytes(arr))
+        }
+        DataType::BigInt => {
+            let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
+            CqlValue::Bigint(i64::from_be_bytes(arr))
+        }
+        DataType::Double => {
+            let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
+            CqlValue::Double(u64::from_be_bytes(arr))
+        }
+        DataType::Boolean => CqlValue::Boolean(!bytes.is_empty() && bytes[0] != 0),
+        DataType::Uuid => {
+            let arr: [u8; 16] = bytes.as_slice().try_into().unwrap_or([0; 16]);
+            CqlValue::Uuid(uuid::Uuid::from_bytes(arr))
+        }
+        DataType::Timestamp => {
+            let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
+            CqlValue::Timestamp(i64::from_be_bytes(arr))
+        }
+        DataType::Blob => CqlValue::Blob(bytes.clone()),
+        // DataType is #[non_exhaustive]; treat unknown as blob.
+        _ => CqlValue::Blob(bytes.clone()),
+    })
+}
+
+/// Encode virtual table rows as a CQL ROWS result body.
+///
+/// Converts `VirtualRow` cells (raw `CellValue` bytes) into typed `CqlValue`s
+/// using the column definitions, then delegates to `result::encode_rows`.
+fn encode_virtual_rows(
+    keyspace: &str,
+    table: &str,
+    columns: &[VirtualColumnDef],
+    rows: &[VirtualRow],
+) -> Result<BytesMut, CqlError> {
+    let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let col_types: Vec<CqlType> = columns
+        .iter()
+        .map(|c| data_type_to_cql_type(&c.data_type))
+        .collect();
+
+    let cql_rows: Vec<Vec<Option<CqlValue>>> = rows
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .zip(columns.iter())
+                .map(|(cell, col)| cell_to_cql_value(cell, &col.data_type))
+                .collect()
+        })
+        .collect();
+
+    Ok(result::encode_rows(
+        &col_names, &col_types, keyspace, table, &cql_rows,
+    ))
 }
 
 // ── INSERT ───────────────────────────────────────────────────────────────
@@ -1393,6 +1502,8 @@ mod tests {
             node_config,
             cluster_state: Arc::new(SingleNodeClusterState),
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
+            connection_tracker: Arc::new(ConnectionTracker::new()),
+            query_tracker: Arc::new(QueryTracker::new()),
         };
         (state, dir)
     }
@@ -1661,6 +1772,20 @@ mod tests {
     }
 
     #[test]
+    fn router_tracks_query_count() {
+        let (state, _dir) = setup();
+        assert_eq!(state.query_tracker.total_executed(), 0);
+        // Execute a simple query
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
+        let _ = route(&state, &ctx, stmt);
+        assert_eq!(state.query_tracker.total_executed(), 1);
+    }
+
+    #[test]
     fn truncate_returns_void() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
@@ -1681,6 +1806,86 @@ mod tests {
         let result = route(&state, &ctx, stmt).unwrap();
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0001i32.to_be_bytes()),
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[test]
+    fn select_virtual_table_routes_through_registry() {
+        use ferrosa_common::{CellValue, DataType};
+        use ferrosa_schema::{
+            RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow, VirtualTable,
+        };
+
+        /// Stub virtual table that returns one row with two columns.
+        struct StubVTable;
+
+        impl VirtualTable for StubVTable {
+            fn name(&self) -> &str {
+                "test_vtable"
+            }
+
+            fn keyspace(&self) -> &str {
+                "test_ks"
+            }
+
+            fn columns(&self) -> &[VirtualColumnDef] {
+                // Use a leaked slice so we can return &[VirtualColumnDef]
+                // from a trait method without self-referential lifetime issues.
+                static COLS: std::sync::OnceLock<Vec<VirtualColumnDef>> =
+                    std::sync::OnceLock::new();
+                COLS.get_or_init(|| {
+                    vec![
+                        VirtualColumnDef {
+                            name: "name".into(),
+                            data_type: DataType::Text,
+                        },
+                        VirtualColumnDef {
+                            name: "value".into(),
+                            data_type: DataType::Int,
+                        },
+                    ]
+                })
+            }
+
+            fn primary_key_columns(&self) -> &[usize] {
+                &[0]
+            }
+
+            fn read(&self, _: Option<&RowPredicate>) -> Vec<VirtualRow> {
+                vec![VirtualRow {
+                    cells: vec![
+                        CellValue::live(b"hello".to_vec(), 0),
+                        CellValue::live(42i32.to_be_bytes().to_vec(), 0),
+                    ],
+                }]
+            }
+
+            fn subscription_mode(&self) -> SubscriptionMode {
+                SubscriptionMode::Pollable
+            }
+        }
+
+        let (state, _dir) = setup();
+
+        // Register the stub virtual table in the schema's registry.
+        state.schema.virtual_tables().register(Arc::new(StubVTable));
+
+        // Create the keyspace so the parser doesn't complain about qualified name.
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse("SELECT * FROM test_ks.test_vtable").unwrap();
+        let result = route(&state, &ctx, stmt).unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                // Should be a Rows result (kind = 0x0002)
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+                // The result should contain data (more than just the header)
+                assert!(b.len() > 4);
+            }
             _ => panic!("expected Result"),
         }
     }

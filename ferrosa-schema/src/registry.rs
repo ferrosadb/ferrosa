@@ -22,6 +22,7 @@ use crate::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
 use crate::metadata::table::{TableMetadata, TableUpdates};
 use crate::secrets::SecretsProvider;
 use crate::startup::DeploymentMode;
+use crate::virtual_registry::VirtualTableRegistry;
 
 /// An immutable point-in-time snapshot of all schema state.
 ///
@@ -112,6 +113,8 @@ pub struct Schema {
     audit_sink: Box<dyn AuditSink>,
     /// Roles whose password is the default and must be changed.
     default_password_roles: Mutex<HashSet<String>>,
+    /// Registry of virtual tables (e.g. system_observability views).
+    virtual_table_registry: Arc<VirtualTableRegistry>,
 }
 
 impl Schema {
@@ -161,6 +164,7 @@ impl Schema {
             rate_limiter: AuthRateLimiter::new(config.rate_limit),
             audit_sink: config.audit_sink,
             default_password_roles: Mutex::new(default_password_roles),
+            virtual_table_registry: Arc::new(VirtualTableRegistry::new()),
         };
 
         // Emit bootstrap audit event
@@ -184,6 +188,11 @@ impl Schema {
     /// use this instead of `snapshot()` to avoid `Arc` cloning on each call.
     pub fn schema_ref(&self) -> &ArcSwap<SchemaSnapshot> {
         &self.inner
+    }
+
+    /// Return a reference to the virtual table registry.
+    pub fn virtual_tables(&self) -> &VirtualTableRegistry {
+        &self.virtual_table_registry
     }
 
     /// Authenticate a user with username and password.
@@ -874,6 +883,35 @@ impl Schema {
             auth,
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Schema {
+    /// Construct a minimal `Schema` suitable for unit tests.
+    ///
+    /// Uses bcrypt cost 4, permissive password policy, a no-op audit sink,
+    /// and the `EnvSecretsProvider`. Clears `FERROSA_SUPERUSER_PASSWORD`
+    /// from the environment before constructing so tests are hermetic.
+    pub fn new_for_test() -> Self {
+        use crate::audit::TestAuditSink;
+        use crate::auth::password::{PasswordHasher, PasswordPolicy};
+        use crate::auth::rate_limit::RateLimitConfig;
+        use crate::secrets::EnvSecretsProvider;
+
+        unsafe {
+            std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
+        }
+        Schema::new(SchemaConfig {
+            hasher: PasswordHasher::Bcrypt { cost: 4 },
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(TestAuditSink::new()),
+            secrets: Box::new(EnvSecretsProvider),
+            mode: DeploymentMode::Development,
+        })
+        .expect("test schema construction must not fail")
     }
 }
 
@@ -1986,5 +2024,12 @@ mod tests {
         let snap = schema.snapshot();
         // The grants entry should be completely removed
         assert!(!snap.grants.contains_key("full_revoke"));
+    }
+
+    #[test]
+    fn schema_exposes_virtual_table_registry() {
+        let schema = Schema::new_for_test();
+        let registry = schema.virtual_tables();
+        assert!(registry.get("system_observability", "anything").is_none());
     }
 }

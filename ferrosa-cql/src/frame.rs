@@ -17,6 +17,10 @@ pub const HEADER_SIZE: usize = 9;
 /// Default maximum frame body size: 256 MiB.
 pub const DEFAULT_MAX_FRAME_SIZE: u32 = 256 * 1024 * 1024;
 
+/// Custom flag indicating a streaming SUBSCRIBE response frame.
+/// Uses bit 4 (0x10) which is unused in the CQL v5 spec.
+pub const STREAMING_FLAG: u8 = 0x10;
+
 /// CQL protocol opcodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -84,6 +88,20 @@ impl FrameHeader {
         buf.put_i16(self.stream_id);
         buf.put_u8(self.opcode as u8);
         buf.put_u32(self.length);
+    }
+
+    /// Create a response header with the STREAMING flag set.
+    ///
+    /// Used for SUBSCRIBE response frames that deliver continuous
+    /// streaming results to the client.
+    pub fn streaming_response(stream_id: i16, opcode: Opcode) -> Self {
+        Self {
+            version: VERSION_RESPONSE,
+            flags: STREAMING_FLAG,
+            stream_id,
+            opcode,
+            length: 0, // set when body is encoded
+        }
     }
 
     /// Decode a header from the first 9 bytes of `buf`.
@@ -329,5 +347,43 @@ mod tests {
         assert_eq!(buf.len(), 14);
         let decoded_header = FrameHeader::decode(&buf).unwrap();
         assert_eq!(decoded_header.length, 5);
+    }
+
+    // --- Task 14: STREAMING flag tests ---
+
+    #[test]
+    fn streaming_flag_constant() {
+        assert_eq!(STREAMING_FLAG, 0x10);
+    }
+
+    #[test]
+    fn streaming_response_header_has_flag() {
+        let header = FrameHeader::streaming_response(42, Opcode::Result);
+        assert_ne!(header.flags & STREAMING_FLAG, 0);
+        assert_eq!(header.stream_id, 42);
+        assert_eq!(header.version, VERSION_RESPONSE);
+    }
+
+    #[test]
+    fn normal_response_header_no_streaming_flag() {
+        let header = FrameHeader {
+            version: VERSION_RESPONSE,
+            flags: 0,
+            stream_id: 1,
+            opcode: Opcode::Result,
+            length: 0,
+        };
+        assert_eq!(header.flags & STREAMING_FLAG, 0);
+    }
+
+    #[test]
+    fn streaming_response_roundtrip() {
+        let header = FrameHeader::streaming_response(7, Opcode::Result);
+        let mut buf = BytesMut::with_capacity(HEADER_SIZE);
+        header.encode(&mut buf);
+        let decoded = FrameHeader::decode(&buf).unwrap();
+        assert_ne!(decoded.flags & STREAMING_FLAG, 0);
+        assert_eq!(decoded.stream_id, 7);
+        assert_eq!(decoded.opcode, Opcode::Result);
     }
 }

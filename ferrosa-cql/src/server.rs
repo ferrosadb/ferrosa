@@ -129,6 +129,8 @@ mod tests {
     use crate::frame::{FrameHeader, Opcode, HEADER_SIZE};
     use crate::prepared::PreparedCache;
     use crate::router::SingleNodeClusterState;
+    use crate::virtual_tables::active_queries::QueryTracker;
+    use crate::virtual_tables::connections::ConnectionTracker;
     use ferrosa_schema::NodeConfig;
     use ferrosa_schema::{
         AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
@@ -191,6 +193,8 @@ mod tests {
             node_config,
             cluster_state: Arc::new(SingleNodeClusterState),
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
+            connection_tracker: Arc::new(ConnectionTracker::new()),
+            query_tracker: Arc::new(QueryTracker::new()),
         });
         (state, dir)
     }

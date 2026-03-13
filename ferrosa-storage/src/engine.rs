@@ -248,22 +248,19 @@ impl StorageEngine {
     fn dispatch_sync_observers(&self, table_id: &TableId, mutation: &Mutation) {
         let observers = self.observers.read();
         for obs in observers.iter() {
-            if obs.mode() == crate::observer::ObserverMode::Sync {
-                let watched = obs.tables();
-                if watched.iter().any(|t| t == table_id) {
-                    let derived = obs.on_write(table_id, mutation);
-                    for dm in derived {
-                        // Durability: go through commit log.
-                        if let Err(e) = self.commit_log.append(&dm) {
-                            eprintln!("[observer] commit log append failed: {e}");
-                            continue;
-                        }
-                        let dtid = TableId::new(&dm.keyspace, &dm.table);
-                        let tables = self.tables.read();
-                        if let Some(state) = tables.get(&dtid) {
-                            for row in &dm.rows {
-                                let _ = state.store.write(&dm.key, row.clone());
-                            }
+            if obs.mode() == crate::observer::ObserverMode::Sync && obs.watches_table(table_id) {
+                let derived = obs.on_write(table_id, mutation);
+                for dm in derived {
+                    // Durability: go through commit log.
+                    if let Err(e) = self.commit_log.append(&dm) {
+                        eprintln!("[observer] commit log append failed: {e}");
+                        continue;
+                    }
+                    let dtid = TableId::new(&dm.keyspace, &dm.table);
+                    let tables = self.tables.read();
+                    if let Some(state) = tables.get(&dtid) {
+                        for row in &dm.rows {
+                            let _ = state.store.write(&dm.key, row.clone());
                         }
                     }
                 }
@@ -278,8 +275,7 @@ impl StorageEngine {
     fn dispatch_async_observers(&self, table_id: &TableId, mutation: &Mutation) {
         let async_obs = self.async_observers.read();
         for state in async_obs.iter() {
-            let watched = state.observer.tables();
-            if watched.iter().any(|t| t == table_id)
+            if state.observer.watches_table(table_id)
                 && state
                     .sender
                     .try_send((table_id.clone(), mutation.clone()))

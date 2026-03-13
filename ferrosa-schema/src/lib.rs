@@ -13,6 +13,8 @@ pub mod registry;
 pub mod secrets;
 pub mod startup;
 pub mod system;
+pub mod virtual_registry;
+pub mod virtual_table;
 
 pub use audit::{
     AuditContext, AuditEvent, AuditEventKind, AuditLogEntry, AuditSink, CompositeSink,
@@ -41,4 +43,9 @@ pub use system::local::{query_local, LocalInfo, NodeConfig};
 pub use system::peers::{query_peers, ClusterState, PeerInfo};
 pub use system::schema_tables::{
     query_columns, query_keyspaces, query_tables, ColumnRow, KeyspaceRow, TableRow,
+};
+pub use virtual_registry::VirtualTableRegistry;
+pub use virtual_table::{
+    ColumnFilter, PredicateOp, RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow,
+    VirtualTable,
 };

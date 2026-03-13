@@ -3,6 +3,7 @@
 //! These types represent parsed CQL statements. The parser produces
 //! `Statement` values; the router dispatches them to schema/storage.
 
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Top-level parsed statement.
@@ -26,6 +27,14 @@ pub enum Statement {
     Revoke(RevokeStatement),
     Use(UseStatement),
     Truncate(TruncateStatement),
+    Subscribe {
+        inner: Box<Statement>,
+        interval: Option<Duration>,
+        delta: bool,
+    },
+    Unsubscribe {
+        stream_id: Option<u16>,
+    },
 }
 
 /// A value expression in DML statements.
@@ -256,4 +265,47 @@ pub struct RevokeStatement {
     pub permissions: Vec<String>,
     pub resource: GrantResource,
     pub role: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn construct_subscribe_statement() {
+        let inner = Statement::Select(SelectStatement {
+            keyspace: None,
+            table: "users".to_string(),
+            columns: vec![SelectColumn::Star],
+            where_clauses: vec![],
+            order_by: vec![],
+            limit: None,
+            allow_filtering: false,
+        });
+        let stmt = Statement::Subscribe {
+            inner: Box::new(inner),
+            interval: None,
+            delta: false,
+        };
+        assert!(matches!(stmt, Statement::Subscribe { .. }));
+    }
+
+    #[test]
+    fn construct_unsubscribe_statement() {
+        let stmt = Statement::Unsubscribe {
+            stream_id: Some(42),
+        };
+        assert!(matches!(
+            stmt,
+            Statement::Unsubscribe {
+                stream_id: Some(42)
+            }
+        ));
+
+        let stmt_all = Statement::Unsubscribe { stream_id: None };
+        assert!(matches!(
+            stmt_all,
+            Statement::Unsubscribe { stream_id: None }
+        ));
+    }
 }

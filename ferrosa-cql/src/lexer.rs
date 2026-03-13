@@ -102,6 +102,10 @@ pub enum Keyword {
     Writetime,
     All,
     Permissions,
+    Subscribe,
+    Unsubscribe,
+    Every,
+    Delta,
 }
 
 /// Compile-time keyword map. Case-insensitive lookup is done by
@@ -194,6 +198,10 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "WRITETIME" => Keyword::Writetime,
     "ALL" => Keyword::All,
     "PERMISSIONS" => Keyword::Permissions,
+    "SUBSCRIBE" => Keyword::Subscribe,
+    "UNSUBSCRIBE" => Keyword::Unsubscribe,
+    "EVERY" => Keyword::Every,
+    "DELTA" => Keyword::Delta,
 };
 
 /// Token kind produced by the lexer.
@@ -1042,5 +1050,27 @@ mod tests {
             CqlError::Invalid(msg) => assert!(msg.contains("query too long")),
             other => panic!("expected Invalid, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn lexer_recognizes_subscribe_keywords() {
+        let tokens = lex_all("SUBSCRIBE SELECT * FROM t EVERY 5s DELTA");
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, TokenKind::Keyword(Keyword::Subscribe))));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, TokenKind::Keyword(Keyword::Every))));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, TokenKind::Keyword(Keyword::Delta))));
+    }
+
+    #[test]
+    fn lexer_recognizes_unsubscribe() {
+        let tokens = lex_all("UNSUBSCRIBE");
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, TokenKind::Keyword(Keyword::Unsubscribe))));
     }
 }

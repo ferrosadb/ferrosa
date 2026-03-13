@@ -26,6 +26,10 @@ pub enum Keyword {
     False,
     Null,
     Is,
+    Subscribe,
+    Unsubscribe,
+    Every,
+    Delta,
 }
 
 /// A token produced by the lexer.
