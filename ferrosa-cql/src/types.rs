@@ -814,3 +814,57 @@ mod tests {
         assert_eq!(decoded, val);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::net::IpAddr;
+
+    fn arb_scalar_value() -> impl Strategy<Value = (CqlType, CqlValue)> {
+        prop_oneof![
+            any::<i32>().prop_map(|n| (CqlType::Int, CqlValue::Int(n))),
+            any::<i64>().prop_map(|n| (CqlType::Bigint, CqlValue::Bigint(n))),
+            any::<i64>().prop_map(|n| (CqlType::Counter, CqlValue::Counter(n))),
+            any::<i16>().prop_map(|n| (CqlType::Smallint, CqlValue::Smallint(n))),
+            any::<i8>().prop_map(|n| (CqlType::Tinyint, CqlValue::Tinyint(n))),
+            any::<bool>().prop_map(|b| (CqlType::Boolean, CqlValue::Boolean(b))),
+            any::<u32>().prop_map(|n| (CqlType::Float, CqlValue::Float(n))),
+            any::<u64>().prop_map(|n| (CqlType::Double, CqlValue::Double(n))),
+            any::<u32>().prop_map(|n| (CqlType::Date, CqlValue::Date(n))),
+            any::<i64>().prop_map(|n| (CqlType::Time, CqlValue::Time(n))),
+            any::<i64>().prop_map(|n| (CqlType::Timestamp, CqlValue::Timestamp(n))),
+            "[ -~]{0,100}".prop_map(|s| (CqlType::Varchar, CqlValue::Text(s))),
+            "[ -~]{0,100}".prop_map(|s| (CqlType::Ascii, CqlValue::Ascii(s))),
+            prop::collection::vec(any::<u8>(), 0..100)
+                .prop_map(|b| (CqlType::Blob, CqlValue::Blob(b))),
+            prop::array::uniform16(any::<u8>())
+                .prop_map(|b| (CqlType::Uuid, CqlValue::Uuid(uuid::Uuid::from_bytes(b)))),
+            prop::array::uniform16(any::<u8>()).prop_map(|b| (
+                CqlType::Timeuuid,
+                CqlValue::Timeuuid(uuid::Uuid::from_bytes(b))
+            )),
+            (0..4u8).prop_map(|v| {
+                let ip: IpAddr = if v < 2 {
+                    IpAddr::V4(std::net::Ipv4Addr::new(v, v, v, v))
+                } else {
+                    IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                };
+                (CqlType::Inet, CqlValue::Inet(ip))
+            }),
+            any::<i64>().prop_map(|n| {
+                use num_bigint::BigInt;
+                (CqlType::Varint, CqlValue::Varint(BigInt::from(n)))
+            }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn scalar_roundtrip((cql_type, value) in arb_scalar_value()) {
+            let encoded = value.encode_value();
+            let decoded = CqlValue::decode_value(&cql_type, &encoded).unwrap();
+            prop_assert_eq!(decoded, value);
+        }
+    }
+}
