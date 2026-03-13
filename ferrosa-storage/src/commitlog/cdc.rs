@@ -74,6 +74,9 @@ struct CdcPosition {
 mod tests {
     use super::*;
     use crate::commitlog::config::CommitLogPosition;
+    // Used by reader_yields_mutations_from_segment (commented out until CdcReader is implemented).
+    #[allow(unused_imports)]
+    use crate::commitlog::{CommitLog, CommitLogConfig};
 
     #[test]
     fn checkpoint_round_trip() {
@@ -92,5 +95,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loaded = CdcCheckpoint::load(dir.path()).unwrap();
         assert_eq!(loaded, None);
+    }
+
+    // TODO: Uncomment when CdcReader is implemented (Chunk 1, Task 3).
+    // #[test]
+    // fn reader_yields_mutations_from_segment() {
+    //     let dir = tempfile::tempdir().unwrap();
+    //     let config = CommitLogConfig::test_config(dir.path());
+    //     let cl = CommitLog::new(config).unwrap();
+    //
+    //     let m1 = test_mutation("ks", "t1");
+    //     let m2 = test_mutation("ks", "t2");
+    //     cl.append(&m1).unwrap();
+    //     cl.append(&m2).unwrap();
+    //     cl.shutdown().unwrap();
+    //
+    //     let mut reader = CdcReader::new(dir.path(), dir.path(), None).unwrap();
+    //     let mut results = Vec::new();
+    //     while let Some((mutation, _pos)) = reader.next_mutation().unwrap() {
+    //         results.push(mutation);
+    //     }
+    //     assert_eq!(results.len(), 2);
+    //     assert_eq!(results[0].table, "t1");
+    //     assert_eq!(results[1].table, "t2");
+    // }
+
+    #[allow(dead_code)]
+    fn test_mutation(ks: &str, table: &str) -> super::super::mutation::Mutation {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        super::super::mutation::Mutation {
+            keyspace: ks.to_string(),
+            table: table.to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
+            rows: vec![Row {
+                clustering: vec![1, 2, 3],
+                cells: vec![(0, CellValue::live(b"v".to_vec(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            }],
+            timestamp: 1000,
+        }
     }
 }

@@ -198,4 +198,104 @@ mod tests {
         let mem = SkipListMemtable::new();
         assert!(mem.get(&make_key("missing")).unwrap().is_none());
     }
+
+    #[test]
+    fn merge_on_write_newer_wins() {
+        let mem = SkipListMemtable::new();
+        let schema = test_schema();
+        let key = make_key("pk1");
+        mem.put(&key, make_row(0, b"old", 1000), &schema).unwrap();
+        mem.put(&key, make_row(0, b"new", 2000), &schema).unwrap();
+        let partition = mem.get(&key).unwrap().unwrap();
+        assert_eq!(
+            partition.rows[0].cells[0].1.value.as_deref(),
+            Some(b"new".as_slice())
+        );
+        assert_eq!(partition.rows[0].cells[0].1.timestamp, 2000);
+        assert_eq!(mem.partition_count(), 1);
+    }
+
+    #[test]
+    fn merge_on_write_older_loses() {
+        let mem = SkipListMemtable::new();
+        let schema = test_schema();
+        let key = make_key("pk1");
+        mem.put(&key, make_row(0, b"new", 2000), &schema).unwrap();
+        mem.put(&key, make_row(0, b"old", 1000), &schema).unwrap();
+        let partition = mem.get(&key).unwrap().unwrap();
+        assert_eq!(
+            partition.rows[0].cells[0].1.value.as_deref(),
+            Some(b"new".as_slice())
+        );
+    }
+
+    #[test]
+    fn different_columns_merge() {
+        let mem = SkipListMemtable::new();
+        let schema = test_schema();
+        let key = make_key("pk1");
+        mem.put(&key, make_row(0, b"v0", 1000), &schema).unwrap();
+        mem.put(&key, make_row(1, b"v1", 1000), &schema).unwrap();
+        let partition = mem.get(&key).unwrap().unwrap();
+        assert_eq!(partition.rows[0].cells.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_returns_sorted() {
+        let mem = SkipListMemtable::new();
+        let schema = test_schema();
+        for i in 0..20 {
+            let key = make_key(&format!("key_{i}"));
+            mem.put(&key, make_row(0, format!("v{i}").as_bytes(), 1000), &schema)
+                .unwrap();
+        }
+        let snapshot = mem.snapshot();
+        assert_eq!(snapshot.len(), 20);
+        for window in snapshot.windows(2) {
+            assert!(window[0].key <= window[1].key);
+        }
+    }
+
+    #[test]
+    fn partition_count_and_size() {
+        let mem = SkipListMemtable::new();
+        let schema = test_schema();
+        assert_eq!(mem.partition_count(), 0);
+        assert_eq!(mem.size_bytes(), 0);
+        mem.put(&make_key("k1"), make_row(0, b"v1", 1000), &schema)
+            .unwrap();
+        assert_eq!(mem.partition_count(), 1);
+        assert!(mem.size_bytes() > 0);
+    }
+
+    #[test]
+    fn concurrent_puts_no_data_loss() {
+        use std::thread;
+        let mem = Arc::new(SkipListMemtable::new());
+        let schema = Arc::new(test_schema());
+        let num_threads = 8;
+        let keys_per_thread = 50;
+        let handles: Vec<_> = (0..num_threads)
+            .map(|t| {
+                let mem = Arc::clone(&mem);
+                let schema = Arc::clone(&schema);
+                thread::spawn(move || {
+                    for k in 0..keys_per_thread {
+                        let key = make_key(&format!("t{t}_k{k}"));
+                        let row = make_row(0, format!("v{t}_{k}").as_bytes(), 1000 + t as i64);
+                        mem.put(&key, row, &schema).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(mem.partition_count(), num_threads * keys_per_thread);
+        for t in 0..num_threads {
+            for k in 0..keys_per_thread {
+                assert!(mem.get(&make_key(&format!("t{t}_k{k}"))).unwrap().is_some());
+            }
+        }
+    }
 }
