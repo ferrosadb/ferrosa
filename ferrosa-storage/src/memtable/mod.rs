@@ -5,6 +5,8 @@
 //! persistent structures) without changing any consumer code.
 
 pub mod sharded;
+#[cfg(feature = "skiplist-memtable")]
+pub mod skiplist;
 
 use std::sync::Arc;
 
