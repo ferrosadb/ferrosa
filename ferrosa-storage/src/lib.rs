@@ -23,6 +23,7 @@ pub mod memtable;
 pub mod merge;
 pub mod observer;
 pub mod store;
+pub mod subscription_observer;
 pub mod upload;
 pub mod virtual_tables;
 
@@ -44,4 +45,7 @@ pub use memtable::Memtable;
 pub use merge::merge_partitions;
 pub use observer::{ObserverConfig, ObserverMode, WriteObserver};
 pub use store::TableStore;
+pub use subscription_observer::{
+    SubscriptionConfig, SubscriptionFilter, SubscriptionId, SubscriptionObserver,
+};
 pub use upload::{ObjectStoreConfig, UploadManager};
