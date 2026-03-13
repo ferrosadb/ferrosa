@@ -7,6 +7,12 @@
 //! ## Modules
 //!
 //! - [`parser`] — Cypher lexer, parser, and AST types.
+//! - [`error`] — Graph engine error types.
+//! - [`adjacency`] — Adjacency index schema and observer.
+//! - [`planner`] — Logical and physical query planners.
+//! - [`executor`] — Query execution engine.
+//! - [`engine`] — GraphEngine composition type.
+//! - [`http`] — HTTP/JSON endpoint.
 
 pub mod adjacency;
 pub mod engine;
