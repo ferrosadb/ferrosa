@@ -1,6 +1,6 @@
 # SSTable Format Specification
 
-> Last updated: 2026-03-11
+> Last updated: 2026-03-12
 > Status: Approved
 
 ## Overview
@@ -26,7 +26,8 @@ The initial implementation targets the **BTI (Big Trie-Indexed)** format — Cas
 ferrosa-sstable
 ├── ferrosa-common  (Token, DecoratedKey, CellValue, Murmur3, Error)
 ├── lz4_flex        (LZ4 compression)
-└── zstd            (Zstd compression)
+├── zstd            (Zstd compression)
+└── crc32fast       (CRC32 checksums for Statistics.db)
 ```
 
 No async runtime dependency. All I/O goes through the abstract `ReadAt`/`WriteAt` traits, which are synchronous. Async wrappers (for S3) live in ferrosa-storage.
@@ -462,17 +463,12 @@ Contains four metadata components, each CRC32-checksummed. All BTI version flags
 #### File Structure
 
 ```
-[component_count: i32]
-[crc32 of count: i32]
-[toc: (ordinal: i32, offset: i32) * component_count]
-[crc32 of toc: i32]
-[component_0 bytes] [crc32: i32]
-[component_1 bytes] [crc32: i32]
-[component_2 bytes] [crc32: i32]
-[component_3 bytes] [crc32: i32]
+[component_count: u32]
+For each component:
+  [ordinal: u32] [data_length: u32] [data: data_length bytes] [crc32: u32]
 ```
 
-Components are ordered by ordinal. Each component's data length is derived from offset differences (subtract 4 for the CRC32 suffix).
+Components are ordered by ordinal. Each component is self-describing with its own length prefix and CRC32 checksum. The CRC32 covers only the component data bytes (not the ordinal or length fields).
 
 #### Component 0: ValidationMetadata
 
@@ -628,9 +624,16 @@ impl<R: ReadAt> SSTableReader<R> {
     /// Open an SSTable from its component file handles.
     pub fn open(components: SSTableComponents<R>) -> Result<Self>;
 
-    /// Look up a partition by decorated key.
-    /// Returns None if the partition doesn't exist in this SSTable.
-    pub fn get_partition(&self, key: &DecoratedKey) -> Result<Option<Partition>>;
+    /// Look up a partition by its byte-comparable encoded key.
+    ///
+    /// `encoded_key` is produced by `byte_comparable::encode()`.
+    /// `filter_hash` enables trie-level bloom filter rejection.
+    /// Returns None if the partition is not found.
+    pub fn get_partition(
+        &self,
+        encoded_key: &[u8],
+        filter_hash: Option<u8>,
+    ) -> Result<Option<Partition>>;
 
     /// Returns the number of partitions in this SSTable.
     pub fn key_count(&self) -> u64;
@@ -653,6 +656,8 @@ impl<R: ReadAt> SSTableReader<R> {
 - `statistics(&self) -> &SSTableStatistics` — aggregate statistics accessor
 
 ### Writing
+
+The writer accumulates all component data in memory (`Vec<u8>` buffers) rather than streaming through `WriteAt`. This simplifies the implementation and allows the caller to write the buffers to any backing store (file system, S3, etc.).
 
 ```rust
 /// SSTable writer that accumulates partitions and produces all component files.
@@ -705,7 +710,6 @@ pub struct WriteOptions {
 }
 
 pub enum Compression {
-    None,
     Lz4,
     Zstd { level: i32 },
 }
