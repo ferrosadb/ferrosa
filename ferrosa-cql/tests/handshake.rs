@@ -444,6 +444,34 @@ async fn prepare_and_execute() {
     assert_result(&resp);
 }
 
+/// M7 / T5: QUERY before STARTUP must be rejected with ERROR(Protocol).
+/// Regression test for Critical-rated auth bypass threat (T5, risk 9).
+#[tokio::test]
+async fn query_before_startup_returns_protocol_error() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // Send QUERY directly without STARTUP — should be rejected
+    let query = b"SELECT * FROM system.local";
+    let mut body = Vec::new();
+    body.extend_from_slice(&(query.len() as i32).to_be_bytes());
+    body.extend_from_slice(query);
+    body.extend_from_slice(&1u16.to_be_bytes()); // consistency ONE
+    body.push(0); // flags
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(
+        resp.opcode,
+        Opcode::Error,
+        "must get ERROR for query before STARTUP"
+    );
+    let error_code = i32::from_be_bytes(resp.body[..4].try_into().unwrap());
+    assert_eq!(error_code, 0x000A, "must be Protocol error (0x000A)");
+}
+
 #[tokio::test]
 async fn stream_id_preserved() {
     let (state, _dir) = setup_state();
