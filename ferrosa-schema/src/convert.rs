@@ -337,6 +337,7 @@ mod tests {
             params: TableParams::default(),
             flags: HashSet::new(),
             extensions: HashMap::new(),
+            is_system: false,
         };
 
         let schema = table.to_storage_schema();
@@ -400,6 +401,7 @@ mod tests {
             params: TableParams::default(),
             flags: HashSet::new(),
             extensions: HashMap::new(),
+            is_system: false,
         };
 
         let schema = table.to_storage_schema();

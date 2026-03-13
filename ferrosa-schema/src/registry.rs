@@ -1233,6 +1233,7 @@ mod tests {
             params: TableParams::default(),
             flags,
             extensions: HashMap::new(),
+            is_system: false,
         }
     }
 

@@ -29,6 +29,9 @@ pub struct TableMetadata {
     pub flags: HashSet<TableFlag>,
     /// Opaque key-value extensions on the table (e.g., graph.type, graph.label).
     pub extensions: HashMap<String, String>,
+    /// Whether this is a system-managed table (protected from user DDL).
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 /// Flags describing table characteristics.
@@ -281,6 +284,7 @@ mod tests {
             params: TableParams::default(),
             flags,
             extensions: HashMap::new(),
+            is_system: false,
         };
 
         assert_eq!(table.keyspace, "my_ks");
@@ -321,6 +325,7 @@ mod tests {
             params: TableParams::default(),
             flags,
             extensions: HashMap::new(),
+            is_system: false,
         };
 
         let json = serde_json::to_string(&table).expect("serialize");
@@ -378,6 +383,7 @@ mod tests {
             params: TableParams::default(),
             flags: HashSet::new(),
             extensions: HashMap::new(),
+            is_system: false,
         };
         assert!(table.extensions.is_empty());
     }
@@ -398,6 +404,7 @@ mod tests {
             params: TableParams::default(),
             flags: HashSet::new(),
             extensions,
+            is_system: false,
         };
 
         let json = serde_json::to_string(&table).expect("serialize");
@@ -412,6 +419,28 @@ mod tests {
             table.extensions.get("graph.label"),
             deserialized.extensions.get("graph.label")
         );
+    }
+
+    #[test]
+    fn table_metadata_is_system_default_false() {
+        let table = TableMetadata {
+            keyspace: "ks".to_string(),
+            name: "t".to_string(),
+            id: Uuid::new_v4(),
+            columns: IndexMap::new(),
+            partition_key: vec![],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        };
+        assert!(!table.is_system);
+
+        // Verify serde(default) works: deserializing JSON without is_system yields false
+        let json = r#"{"keyspace":"ks","name":"t","id":"00000000-0000-0000-0000-000000000000","columns":{},"partition_key":[],"clustering_key":[],"params":{"bloom_filter_fp_chance":0.01,"caching":{"keys":"ALL","rows_per_partition":"NONE"},"comment":"","compaction":{},"compression":{},"crc_check_chance":1.0,"default_time_to_live":0,"gc_grace_seconds":864000,"max_index_interval":2048,"min_index_interval":128,"memtable_flush_period_in_ms":0,"speculative_retry":"99PERCENTILE","additional_write_policy":"99PERCENTILE","cdc":false,"read_repair":"BLOCKING","allow_auto_snapshot":true,"incremental_backups":true},"flags":[],"extensions":{}}"#;
+        let deserialized: TableMetadata = serde_json::from_str(json).expect("deserialize");
+        assert!(!deserialized.is_system);
     }
 
     #[test]

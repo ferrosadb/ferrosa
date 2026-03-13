@@ -85,6 +85,7 @@ fn test_table(keyspace: &str, name: &str) -> TableMetadata {
         params: TableParams::default(),
         flags: HashSet::new(),
         extensions: HashMap::new(),
+        is_system: false,
     }
 }
 

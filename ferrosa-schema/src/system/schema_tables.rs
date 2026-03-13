@@ -140,6 +140,7 @@ mod tests {
             params: TableParams::default(),
             flags: HashSet::new(),
             extensions: std::collections::HashMap::new(),
+            is_system: false,
         }
     }
 
