@@ -10,6 +10,7 @@ ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 arc-swap = "1.7"
+hex = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 phf = { version = "0.11", features = ["macros"] }
 serde = { version = "1", features = ["derive"] }
