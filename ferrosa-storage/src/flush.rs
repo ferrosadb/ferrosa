@@ -159,6 +159,38 @@ impl FileFlushTarget {
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
     }
+
+    /// Create a file flush target that starts after the highest existing generation.
+    ///
+    /// Scans the directory for existing SSTable files (`{gen}-Data.db`) and
+    /// starts the generation counter at `max_gen + 1`. Used by the compaction
+    /// executor to avoid overwriting SSTables from prior flushes.
+    pub fn new_starting_at(base_dir: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&base_dir)?;
+        let max_gen = Self::scan_max_generation(&base_dir);
+        Ok(Self {
+            base_dir,
+            generation: AtomicU64::new(max_gen),
+        })
+    }
+
+    /// Scan a directory for the highest SSTable generation number.
+    fn scan_max_generation(dir: &std::path::Path) -> u64 {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                if name.ends_with("-Data.db") {
+                    name.split('-').next()?.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 impl FlushTarget for FileFlushTarget {

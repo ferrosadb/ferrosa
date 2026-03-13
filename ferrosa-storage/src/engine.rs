@@ -500,7 +500,7 @@ impl StorageEngine {
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) {
         let metadata = self.collect_sstable_metadata(table_id, state);
         let strategy = SizeTieredStrategy::new(self.config.compaction.clone());
-        let tasks = strategy.select(&metadata);
+        let tasks = strategy.select(&metadata, &state.schema, table_id);
         for task in tasks {
             if let Err(e) = self.compaction_executor.submit(task) {
                 eprintln!("[storage-engine] compaction submit failed for {table_id}: {e}");

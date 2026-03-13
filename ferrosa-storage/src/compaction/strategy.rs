@@ -7,12 +7,20 @@
 
 use std::path::PathBuf;
 
+use ferrosa_common::schema::TableSchema;
+
 use super::metadata::{CompactionTask, SSTableMetadata};
+use crate::TableId;
 
 /// Selects which SSTables should be compacted together.
 pub trait CompactionStrategy: Send + Sync {
     /// Given the current set of SSTables, return compaction tasks (if any).
-    fn select(&self, sstables: &[SSTableMetadata]) -> Vec<CompactionTask>;
+    fn select(
+        &self,
+        sstables: &[SSTableMetadata],
+        schema: &TableSchema,
+        table_id: &TableId,
+    ) -> Vec<CompactionTask>;
 }
 
 /// Configuration for STCS, populated from `FERROSA_COMPACTION_*` env vars.
@@ -117,7 +125,12 @@ impl SizeTieredStrategy {
 }
 
 impl CompactionStrategy for SizeTieredStrategy {
-    fn select(&self, sstables: &[SSTableMetadata]) -> Vec<CompactionTask> {
+    fn select(
+        &self,
+        sstables: &[SSTableMetadata],
+        schema: &TableSchema,
+        table_id: &TableId,
+    ) -> Vec<CompactionTask> {
         let buckets = self.bucket_sstables(sstables);
         let mut tasks = Vec::new();
 
@@ -129,6 +142,8 @@ impl CompactionStrategy for SizeTieredStrategy {
                 tasks.push(CompactionTask {
                     inputs,
                     output_dir: self.config.output_dir.clone(),
+                    schema: schema.clone(),
+                    table_id: table_id.clone(),
                 });
             }
         }
@@ -155,6 +170,7 @@ fn bucket_median(bucket: &[&SSTableMetadata]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrosa_common::schema::TableSchema;
     use std::path::PathBuf;
 
     fn make_metadata(id: &str, size: u64) -> SSTableMetadata {
@@ -180,6 +196,21 @@ mod tests {
         }
     }
 
+    fn test_table_schema() -> TableSchema {
+        TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![],
+        }
+    }
+
+    fn test_table_id() -> crate::TableId {
+        crate::TableId::new("test_ks", "test_table")
+    }
+
     #[test]
     fn four_similar_sizes_trigger_compaction() {
         let strategy = SizeTieredStrategy::new(test_config());
@@ -190,7 +221,7 @@ mod tests {
             make_metadata("d", 1050),
         ];
 
-        let tasks = strategy.select(&sstables);
+        let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].inputs.len(), 4);
     }
@@ -211,7 +242,7 @@ mod tests {
             make_metadata("l4", 10500),
         ];
 
-        let tasks = strategy.select(&sstables);
+        let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
         assert_eq!(tasks.len(), 2);
     }
 
@@ -224,7 +255,7 @@ mod tests {
             make_metadata("c", 900),
         ];
 
-        let tasks = strategy.select(&sstables);
+        let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
         assert!(tasks.is_empty());
     }
 
@@ -244,7 +275,7 @@ mod tests {
             make_metadata("e", 950),
         ];
 
-        let tasks = strategy.select(&sstables);
+        let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].inputs.len(), 3); // capped at max_threshold
     }
@@ -252,7 +283,7 @@ mod tests {
     #[test]
     fn empty_input_no_tasks() {
         let strategy = SizeTieredStrategy::new(test_config());
-        let tasks = strategy.select(&[]);
+        let tasks = strategy.select(&[], &test_table_schema(), &test_table_id());
         assert!(tasks.is_empty());
     }
 
@@ -268,8 +299,8 @@ mod tests {
             make_metadata("f", 5500),
         ];
 
-        let tasks1 = strategy.select(&sstables);
-        let tasks2 = strategy.select(&sstables);
+        let tasks1 = strategy.select(&sstables, &test_table_schema(), &test_table_id());
+        let tasks2 = strategy.select(&sstables, &test_table_schema(), &test_table_id());
 
         assert_eq!(tasks1.len(), tasks2.len());
         for (t1, t2) in tasks1.iter().zip(tasks2.iter()) {

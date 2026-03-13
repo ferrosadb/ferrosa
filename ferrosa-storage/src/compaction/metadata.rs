@@ -2,6 +2,10 @@
 
 use std::path::PathBuf;
 
+use ferrosa_common::schema::TableSchema;
+
+use crate::TableId;
+
 /// Lightweight metadata about an SSTable, used for compaction strategy decisions
 /// without reading the SSTable itself.
 #[derive(Debug, Clone)]
@@ -31,4 +35,9 @@ pub struct CompactionTask {
     pub inputs: Vec<SSTableMetadata>,
     /// Directory to write the output SSTable.
     pub output_dir: PathBuf,
+    /// Schema of the table being compacted; used to build the SerializationHeader.
+    pub schema: TableSchema,
+    /// Identifies which table this compaction is for, so `poll_compactions()`
+    /// can route the result to the correct `TableStore`.
+    pub table_id: TableId,
 }
