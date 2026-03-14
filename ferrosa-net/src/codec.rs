@@ -22,6 +22,16 @@ pub enum Lane {
     Bulk = 2,
 }
 
+impl Lane {
+    pub fn timeout(&self) -> std::time::Duration {
+        match self {
+            Self::Raft => std::time::Duration::from_secs(1),
+            Self::Data => std::time::Duration::from_secs(10),
+            Self::Bulk => std::time::Duration::from_secs(60),
+        }
+    }
+}
+
 impl TryFrom<u8> for Lane {
     type Error = NetError;
     fn try_from(value: u8) -> Result<Self> {
