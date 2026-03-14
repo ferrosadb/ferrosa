@@ -140,7 +140,9 @@ pub async fn handle_connection(
             auth_disabled,
             &maybe_frame,
             &mut pending_compression,
-        ) {
+        )
+        .await
+        {
             HandleResult::Reply(opcode, body) => {
                 // Track phase transitions and requests.
                 if was_awaiting_startup && matches!(phase, ConnectionPhase::Authenticating { .. }) {
@@ -227,7 +229,7 @@ enum HandleResult {
 }
 
 /// Dispatch a single frame based on the current connection phase.
-fn handle_frame(
+async fn handle_frame(
     phase: &mut ConnectionPhase,
     auth_context: &mut Option<AuthContext>,
     current_keyspace: &mut Option<String>,
@@ -261,10 +263,12 @@ fn handle_frame(
             }
         },
         ConnectionPhase::Ready => match frame.header.opcode {
-            Opcode::Query => handle_query(auth_context, current_keyspace, state, &frame.body),
+            Opcode::Query => handle_query(auth_context, current_keyspace, state, &frame.body).await,
             Opcode::Prepare => handle_prepare(auth_context, current_keyspace, state, &frame.body),
-            Opcode::Execute => handle_execute(auth_context, current_keyspace, state, &frame.body),
-            Opcode::Batch => handle_batch(auth_context, current_keyspace, state, &frame.body),
+            Opcode::Execute => {
+                handle_execute(auth_context, current_keyspace, state, &frame.body).await
+            }
+            Opcode::Batch => handle_batch(auth_context, current_keyspace, state, &frame.body).await,
             Opcode::Register => handle_register(),
             Opcode::Options => handle_options(),
             _ => {
@@ -445,7 +449,7 @@ fn increment_auth_attempts_and_reply(phase: &mut ConnectionPhase, err: CqlError)
 
 // ── QUERY ────────────────────────────────────────────────────────────────
 
-fn handle_query(
+async fn handle_query(
     auth_context: &mut Option<AuthContext>,
     current_keyspace: &mut Option<String>,
     state: &SharedState,
@@ -483,7 +487,7 @@ fn handle_query(
     // Build an auth context for routing (use a default if auth was disabled).
     let ctx = build_request_context(auth_context, current_keyspace);
 
-    match crate::router::route(state, &ctx, stmt) {
+    match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
         Ok(RouteResult::SetKeyspace(ks, body)) => {
             *current_keyspace = Some(ks);
@@ -573,7 +577,7 @@ fn handle_prepare(
 
 // ── EXECUTE ──────────────────────────────────────────────────────────────
 
-fn handle_execute(
+async fn handle_execute(
     auth_context: &mut Option<AuthContext>,
     current_keyspace: &mut Option<String>,
     state: &SharedState,
@@ -606,7 +610,7 @@ fn handle_execute(
     // Re-route the stored statement (simplified: no bound value substitution).
     let ctx = build_request_context(auth_context, current_keyspace);
 
-    match crate::router::route(state, &ctx, plan.statement.clone()) {
+    match crate::router::route(state, &ctx, plan.statement.clone()).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
         Ok(RouteResult::SetKeyspace(ks, body)) => {
             *current_keyspace = Some(ks);
@@ -618,7 +622,7 @@ fn handle_execute(
 
 // ── BATCH ────────────────────────────────────────────────────────────────
 
-fn handle_batch(
+async fn handle_batch(
     auth_context: &mut Option<AuthContext>,
     current_keyspace: &mut Option<String>,
     state: &SharedState,
@@ -722,7 +726,7 @@ fn handle_batch(
     // Route each statement.
     for stmt in statements {
         let ctx = build_request_context(auth_context, current_keyspace);
-        match crate::router::route(state, &ctx, stmt) {
+        match crate::router::route(state, &ctx, stmt).await {
             Ok(RouteResult::SetKeyspace(ks, _)) => {
                 *current_keyspace = Some(ks);
             }

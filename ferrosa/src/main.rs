@@ -68,7 +68,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: storage.clone(),
         schema: schema.clone(),
         node_config,
-        cluster_state: Arc::new(ferrosa_cql::router::SingleNodeClusterState),
+        cluster_state: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrosa_cluster::ClusterStateHolder::Standalone,
+        )),
+        write_path: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrosa_cluster::WritePath::direct(storage.clone()),
+        )),
         prepared_cache: Arc::new(ferrosa_cql::prepared::PreparedCache::new(64 * 1024 * 1024)),
         connection_tracker,
         query_tracker,

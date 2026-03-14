@@ -9,6 +9,8 @@ name = "ferrosa"
 path = "src/main.rs"
 
 [dependencies]
+arc-swap = "1.7"
+ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-storage = { path = "../ferrosa-storage" }

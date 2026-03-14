@@ -11,15 +11,17 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use bytes::BytesMut;
 use indexmap::IndexMap;
 
+use ferrosa_cluster::WritePath;
 use ferrosa_common::DataType;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local, query_peers, query_role_members,
-    query_role_permissions, query_roles, query_tables, AuthContext, ClusterState,
+    query_role_permissions, query_roles, query_tables, AuthContext,
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, KeyspaceMetadata,
-    KeyspaceUpdates, NodeConfig, PeerInfo, Permission, ReplicationParams, Resource, RoleMetadata,
+    KeyspaceUpdates, NodeConfig, Permission, ReplicationParams, Resource, RoleMetadata,
     RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates, VirtualColumnDef, VirtualRow,
 };
 use ferrosa_storage::StorageEngine;
@@ -42,7 +44,8 @@ pub struct SharedState {
     pub engine: Arc<StorageEngine>,
     pub schema: Arc<Schema>,
     pub node_config: Arc<NodeConfig>,
-    pub cluster_state: Arc<dyn ClusterState>,
+    pub cluster_state: Arc<ArcSwap<ferrosa_cluster::ClusterStateHolder>>,
+    pub write_path: Arc<ArcSwap<WritePath>>,
     pub prepared_cache: Arc<PreparedCache>,
     pub connection_tracker: Arc<ConnectionTracker>,
     pub query_tracker: Arc<QueryTracker>,
@@ -52,15 +55,6 @@ pub struct SharedState {
 pub struct RequestContext<'a> {
     pub auth: &'a AuthContext,
     pub current_keyspace: &'a Option<String>,
-}
-
-/// A single-node cluster state that reports no peers.
-pub struct SingleNodeClusterState;
-
-impl ClusterState for SingleNodeClusterState {
-    fn peers(&self) -> Vec<PeerInfo> {
-        vec![]
-    }
 }
 
 /// Result of routing a statement.
@@ -74,7 +68,7 @@ pub enum RouteResult {
 // ── Main dispatch ────────────────────────────────────────────────────────
 
 /// Route a parsed statement to the appropriate handler.
-pub fn route(
+pub async fn route(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     stmt: Statement,
@@ -91,10 +85,10 @@ pub fn route(
 
     match stmt {
         Statement::Select(s) => route_select(state, ctx, s).map(RouteResult::Result),
-        Statement::Insert(i) => route_insert(state, ctx, i).map(RouteResult::Result),
-        Statement::Update(u) => route_update(state, ctx, u).map(RouteResult::Result),
-        Statement::Delete(d) => route_delete(state, ctx, d).map(RouteResult::Result),
-        Statement::Batch(b) => route_batch(state, ctx, b).map(RouteResult::Result),
+        Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
+        Statement::Update(u) => route_update(state, ctx, u).await.map(RouteResult::Result),
+        Statement::Delete(d) => route_delete(state, ctx, d).await.map(RouteResult::Result),
+        Statement::Batch(b) => route_batch(state, ctx, b).await.map(RouteResult::Result),
         Statement::CreateKeyspace(ck) => {
             route_create_keyspace(state, ctx, ck).map(RouteResult::Result)
         }
@@ -209,7 +203,7 @@ fn route_select(
             ))
         }
         ("system", "peers" | "peers_v2") => {
-            let peers = query_peers(&state.schema, state.cluster_state.as_ref());
+            let peers = query_peers(&state.schema, state.cluster_state.load().as_ref());
             let col_names: Vec<String> = vec![
                 "peer",
                 "peer_port",
@@ -615,7 +609,7 @@ fn encode_virtual_rows(
 
 // ── INSERT ───────────────────────────────────────────────────────────────
 
-fn route_insert(
+async fn route_insert(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: InsertStatement,
@@ -680,14 +674,16 @@ fn route_insert(
     let table_id = TableId::new(ks, &s.table);
 
     state
-        .engine
-        .write(&table_id, &decorated_key, row, timestamp)?;
+        .write_path
+        .load()
+        .write(&table_id, &decorated_key, row, timestamp)
+        .await?;
     Ok(result::encode_void())
 }
 
 // ── UPDATE ───────────────────────────────────────────────────────────────
 
-fn route_update(
+async fn route_update(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: UpdateStatement,
@@ -759,14 +755,16 @@ fn route_update(
     let table_id = TableId::new(ks, &s.table);
 
     state
-        .engine
-        .write(&table_id, &decorated_key, row, timestamp)?;
+        .write_path
+        .load()
+        .write(&table_id, &decorated_key, row, timestamp)
+        .await?;
     Ok(result::encode_void())
 }
 
 // ── DELETE ────────────────────────────────────────────────────────────────
 
-fn route_delete(
+async fn route_delete(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: DeleteStatement,
@@ -838,14 +836,16 @@ fn route_delete(
     let table_id = TableId::new(ks, &s.table);
 
     state
-        .engine
-        .write(&table_id, &decorated_key, row, timestamp)?;
+        .write_path
+        .load()
+        .write(&table_id, &decorated_key, row, timestamp)
+        .await?;
     Ok(result::encode_void())
 }
 
 // ── BATCH ────────────────────────────────────────────────────────────────
 
-fn route_batch(
+async fn route_batch(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     b: BatchStatement,
@@ -862,13 +862,13 @@ fn route_batch(
     for stmt in b.statements {
         match stmt {
             Statement::Insert(s) => {
-                route_insert(state, ctx, s)?;
+                route_insert(state, ctx, s).await?;
             }
             Statement::Update(s) => {
-                route_update(state, ctx, s)?;
+                route_update(state, ctx, s).await?;
             }
             Statement::Delete(s) => {
-                route_delete(state, ctx, s)?;
+                route_delete(state, ctx, s).await?;
             }
             _ => {
                 return Err(CqlError::Invalid(
@@ -1497,10 +1497,13 @@ mod tests {
         });
 
         let state = SharedState {
-            engine,
+            engine: engine.clone(),
             schema,
             node_config,
-            cluster_state: Arc::new(SingleNodeClusterState),
+            cluster_state: Arc::new(ArcSwap::from_pointee(
+                ferrosa_cluster::ClusterStateHolder::Standalone,
+            )),
+            write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine))),
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
@@ -1516,8 +1519,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_keyspace_then_table_then_insert_then_select() {
+    #[tokio::test]
+    async fn create_keyspace_then_table_then_insert_then_select() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -1529,7 +1532,7 @@ mod tests {
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
         )
         .unwrap();
-        let result = route(&state, &ctx, stmt).unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0005i32.to_be_bytes()),
             _ => panic!("expected Result"),
@@ -1538,7 +1541,7 @@ mod tests {
         // CREATE TABLE
         let stmt =
             crate::parser::parse("CREATE TABLE ks.users (id int PRIMARY KEY, name text)").unwrap();
-        let result = route(&state, &ctx, stmt).unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0005i32.to_be_bytes()),
             _ => panic!("expected Result"),
@@ -1547,7 +1550,7 @@ mod tests {
         // INSERT
         let stmt =
             crate::parser::parse("INSERT INTO ks.users (id, name) VALUES (1, 'alice')").unwrap();
-        let result = route(&state, &ctx, stmt).unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0001i32.to_be_bytes()),
             _ => panic!("expected Result"),
@@ -1555,22 +1558,22 @@ mod tests {
 
         // SELECT
         let stmt = crate::parser::parse("SELECT * FROM ks.users WHERE id = 1").unwrap();
-        let result = route(&state, &ctx, stmt).unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
     }
 
-    #[test]
-    fn use_sets_default_keyspace() {
+    #[tokio::test]
+    async fn use_sets_default_keyspace() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
         };
         let stmt = crate::parser::parse("USE my_ks").unwrap();
-        match route(&state, &ctx, stmt).unwrap() {
+        match route(&state, &ctx, stmt).await.unwrap() {
             RouteResult::SetKeyspace(ks, body) => {
                 assert_eq!(ks, "my_ks");
                 assert_eq!(&body[0..4], &0x0003i32.to_be_bytes());
@@ -1579,15 +1582,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn select_system_local() {
+    #[tokio::test]
+    async fn select_system_local() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
-        let result = route(&state, &ctx, stmt).unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => {
                 // Result kind = Rows (0x0002)
@@ -1607,15 +1610,15 @@ mod tests {
     /// Regression test: cqlsh expects `tokens` column (set<varchar>) in
     /// system.local. Without it, cqlsh prints "'local' not found in
     /// keyspace 'system'" during startup introspection.
-    #[test]
-    fn select_system_local_includes_tokens_column() {
+    #[tokio::test]
+    async fn select_system_local_includes_tokens_column() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
-        let result = route(&state, &ctx, stmt).unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
         let b = match &result {
             RouteResult::Result(b) => b,
             _ => panic!("expected Result"),
@@ -1659,19 +1662,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn no_keyspace_returns_invalid() {
+    #[tokio::test]
+    async fn no_keyspace_returns_invalid() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
         };
         let stmt = crate::parser::parse("SELECT * FROM users WHERE id = 1").unwrap();
-        assert!(route(&state, &ctx, stmt).is_err());
+        assert!(route(&state, &ctx, stmt).await.is_err());
     }
 
-    #[test]
-    fn batch_too_large_rejected() {
+    #[tokio::test]
+    async fn batch_too_large_rejected() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -1696,33 +1699,33 @@ mod tests {
             statements: stmts,
             using_timestamp: None,
         });
-        assert!(route(&state, &ctx, batch).is_err());
+        assert!(route(&state, &ctx, batch).await.is_err());
     }
 
-    #[test]
-    fn select_system_peers_empty() {
+    #[tokio::test]
+    async fn select_system_peers_empty() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.peers").unwrap();
-        let result = route(&state, &ctx, stmt).unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
     }
 
-    #[test]
-    fn select_system_schema_keyspaces() {
+    #[tokio::test]
+    async fn select_system_schema_keyspaces() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
         };
         let stmt = crate::parser::parse("SELECT * FROM system_schema.keyspaces").unwrap();
-        let result = route(&state, &ctx, stmt).unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
@@ -1771,8 +1774,8 @@ mod tests {
         assert!(parse_permissions(&["BANANA".into()]).is_err());
     }
 
-    #[test]
-    fn router_tracks_query_count() {
+    #[tokio::test]
+    async fn router_tracks_query_count() {
         let (state, _dir) = setup();
         assert_eq!(state.query_tracker.total_executed(), 0);
         // Execute a simple query
@@ -1781,12 +1784,12 @@ mod tests {
             current_keyspace: &None,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
-        let _ = route(&state, &ctx, stmt);
+        let _ = route(&state, &ctx, stmt).await;
         assert_eq!(state.query_tracker.total_executed(), 1);
     }
 
-    #[test]
-    fn truncate_returns_void() {
+    #[tokio::test]
+    async fn truncate_returns_void() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -1797,21 +1800,21 @@ mod tests {
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
         ).unwrap();
-        route(&state, &ctx, stmt).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
 
         let stmt = crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY)").unwrap();
-        route(&state, &ctx, stmt).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
 
         let stmt = crate::parser::parse("TRUNCATE ks.t").unwrap();
-        let result = route(&state, &ctx, stmt).unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0001i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
     }
 
-    #[test]
-    fn select_virtual_table_routes_through_registry() {
+    #[tokio::test]
+    async fn select_virtual_table_routes_through_registry() {
         use ferrosa_common::{CellValue, DataType};
         use ferrosa_schema::{
             RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow, VirtualTable,
@@ -1878,7 +1881,7 @@ mod tests {
         };
 
         let stmt = crate::parser::parse("SELECT * FROM test_ks.test_vtable").unwrap();
-        let result = route(&state, &ctx, stmt).unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => {
                 // Should be a Rows result (kind = 0x0002)
