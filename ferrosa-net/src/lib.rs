@@ -10,5 +10,6 @@ pub mod discovery;
 pub mod error;
 pub mod handshake;
 pub mod message;
+pub mod peer;
 pub mod pool;
 pub mod rpc;
