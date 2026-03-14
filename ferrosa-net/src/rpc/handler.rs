@@ -1,0 +1,86 @@
+// ferrosa-net/src/rpc/handler.rs
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::codec::MsgType;
+use crate::message::Message;
+
+/// Peer identifier: (host_id, socket_addr).
+pub type PeerId = (uuid::Uuid, std::net::SocketAddr);
+
+/// Trait for handling incoming RPC messages.
+#[async_trait::async_trait]
+pub trait RpcHandler: Send + Sync {
+    /// Handle a message from a peer. Returns None for fire-and-forget.
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message>;
+}
+
+/// Registry mapping MsgType → handler.
+pub struct HandlerRegistry {
+    handlers: HashMap<MsgType, Arc<dyn RpcHandler>>,
+}
+
+impl Default for HandlerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HandlerRegistry {
+    pub fn new() -> Self {
+        Self {
+            handlers: HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, msg_type: MsgType, handler: Arc<dyn RpcHandler>) {
+        self.handlers.insert(msg_type, handler);
+    }
+
+    pub async fn dispatch(&self, from: PeerId, msg_type: MsgType, msg: Message) -> Option<Message> {
+        match self.handlers.get(&msg_type) {
+            Some(handler) => handler.handle(from, msg).await,
+            None => {
+                tracing::warn!(?msg_type, "no handler registered");
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EchoPingHandler;
+
+    #[async_trait::async_trait]
+    impl RpcHandler for EchoPingHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            match msg {
+                Message::Ping { nonce } => Some(Message::Pong { nonce }),
+                _ => None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_dispatches_to_registered_handler() {
+        let mut registry = HandlerRegistry::new();
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+
+        let peer_id = (uuid::Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let msg = Message::Ping { nonce: 42 };
+        let response = registry.dispatch(peer_id, MsgType::Ping, msg).await;
+        assert!(matches!(response, Some(Message::Pong { nonce: 42 })));
+    }
+
+    #[tokio::test]
+    async fn registry_returns_none_for_unregistered_type() {
+        let registry = HandlerRegistry::new();
+        let peer_id = (uuid::Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let msg = Message::Ping { nonce: 1 };
+        let response = registry.dispatch(peer_id, MsgType::Ping, msg).await;
+        assert!(response.is_none());
+    }
+}

@@ -6,16 +6,16 @@
 ## Overview
 
 Ferrosa is a fully functional **single-node CQL-compatible database** with graph query
-support and built-in observability. The path to distributed operation requires ferrosa-net
-and ferrosa-cluster, which are the two major unstarted crates.
+support and built-in observability. The internode transport layer (ferrosa-net Phase 1) is
+complete. The path to distributed operation requires ferrosa-cluster.
 
 | Metric | Value |
 |--------|-------|
-| Crates | 8 of 10 planned |
-| Source files | ~135 |
-| Source LOC | ~46,000 |
-| Test functions | ~1,040 |
-| Integration test files | 18 |
+| Crates | 9 of 10 planned |
+| Source files | ~150 |
+| Source LOC | ~48,300 |
+| Test functions | ~1,083 |
+| Integration test files | 19 |
 
 ## Maturity Assessment
 
@@ -23,13 +23,13 @@ and ferrosa-cluster, which are the two major unstarted crates.
                Spec'd   Coded   Tested   Prod-ready
 common         ██████   ██████  ██████   ████░░
 sstable        ██████   ██████  ██████   ████░░
-storage        ██████   █████░  █████░   ███░░░
+storage        ██████   ██████  █████░   ███░░░
 schema         ████░░   █████░  █████░   ███░░░
 cql            ██████   ██████  ██████   ████░░
 graph          █████░   ██████  ████░░   ███░░░
 ctl            ██████   ██████  ███░░░   ███░░░
 binary         █████░   ██████  ███░░░   ██░░░░
-net            ░░░░░░   ░░░░░░  ░░░░░░   ░░░░░░
+net            █████░   ████░░  ████░░   ██░░░░
 cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░░░░░░
 ```
 
@@ -67,11 +67,13 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   manager, manifest with etag CAS, local LRU cache, WriteObserver trait,
   SubscriptionObserver.
 - **Remaining:**
-  - [ ] Commit log replay integration (spec exists, WIP in worktree)
-  - [ ] Compaction execution merge I/O (spec exists, WIP in worktree)
+  - [x] ~~Commit log replay integration~~ (merged PR #38)
+  - [x] ~~Compaction execution merge I/O~~ (merged PR #38)
   - [ ] LCS and TWCS compaction strategies
   - [ ] Disk backpressure
   - [ ] `io_uring` I/O backend
+  - [ ] Manifest CAS retry loop (T23 — designed, needs wiring)
+  - [ ] S3 bucket policy validation at startup (T22 — verify encryption enabled)
 
 ### ferrosa-schema — Mostly Complete (Chunk A)
 
@@ -101,6 +103,8 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   tables, SUBSCRIBE/UNSUBSCRIBE extensions, Prometheus text exposition, CqlClient,
   LZ4 and Snappy frame compression with negotiation.
 - **Remaining:**
+  - [ ] CQL TLS via rustls (T02/T03 — Critical, plaintext traffic)
+  - [ ] Per-IP rate limiting for connection/query flood (T04)
   - [ ] EVENT push notifications
   - [ ] ALLOW FILTERING support
   - [ ] Logged batch atomicity
@@ -118,6 +122,7 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   index with WriteObserver, background reconciliation, HTTP/JSON endpoint with
   auth, TLS, error sanitization, audit logging.
 - **Future (Phases 2-3):**
+  - [ ] Full adjacency reconciliation scan (T5 — stub, needs row-level verification)
   - [ ] WCO (worst-case optimal) joins
   - [ ] Leapfrog triejoin
   - [ ] Variable-length paths
@@ -146,32 +151,48 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   - [ ] Graceful shutdown sequencing
   - [ ] Configuration file support (currently env vars only)
 
-### ferrosa-net — Not Started
+### ferrosa-net — Phase 1 Complete (PR #39)
 
-- **Purpose:** Custom internode protocol, TLS, connection management
-- **Prerequisites:** Single-node functionality stable
-- **Spec:** Not yet written
+- **LOC:** 2,317 (14 files) | **Tests:** 43 (40 unit + 3 integration)
+- **Modules:** `codec`, `config`, `discovery` (seeds), `error`, `handshake`, `message`,
+  `peer`, `pool`, `rpc` (handler, server, client)
+- **What's done:** 12-byte binary wire protocol with 3 priority lanes (Raft/Data/Bulk),
+  21 message types, PSK-authenticated handshake (HMAC-SHA256), RPC server with connection
+  limits + handshake timeout, RPC client with request-response and fire-and-forget,
+  `PriorityPool` (3 TCP connections per peer), static seed discovery, `PeerManager` with
+  heartbeat-based failure detection. Proptest fuzzing for message decode. No dependency
+  on ferrosa-common.
+- **Remaining (Phase 2):**
+  - [ ] TLS via rustls for internode encryption
+  - [ ] Connection reconnection and backoff
+  - [ ] Graceful shutdown / drain
+  - [ ] Compression (LZ4/Snappy frame-level)
+  - [ ] Metrics and tracing integration
+- **Spec:** [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
+- **Threat Model:** [Net/Cluster Threats](threat-model-net-cluster.md)
 
-### ferrosa-cluster — Not Started
+### ferrosa-cluster — Not Started (Spec Written)
 
-- **Purpose:** Raft metadata (openraft), tunable consistency levels, request routing,
-  repair, hinted handoff
+- **Purpose:** Raft metadata (openraft), token ring, tunable consistency levels,
+  coordinator pattern, pair mode, hinted handoff, node lifecycle
 - **Prerequisites:** ferrosa-net
-- **Spec:** Not yet written
+- **Spec:** [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 
 ## Active Work in Progress
 
 | Item | Location | State |
 |------|----------|-------|
-| Storage replay + compaction execution | `.worktrees/storage-replay-compaction` | Uncommitted changes in 7 files |
+| ~~Storage replay + compaction execution~~ | ~~`.worktrees/storage-replay-compaction`~~ | Merged (PR #38) |
+| ~~ferrosa-net Phase 1~~ | ~~`ferrosa-net/`~~ | Complete (PR #39) |
+| ferrosa-cluster | Not started | Next up |
 
 ## Path to Distributed Operation
 
 The critical path from single-node to multi-node:
 
-1. **ferrosa-storage:** Commit log replay + compaction execution (WIP)
+1. ~~**ferrosa-storage:** Commit log replay + compaction execution~~ (Done — PR #38)
 1. **ferrosa-schema:** System table persistence (Chunk B)
-1. **ferrosa-net:** Internode protocol design and implementation
+1. ~~**ferrosa-net:** Internode transport (Phase 1)~~ (Done — PR #39)
 1. **ferrosa-cluster:** Raft metadata, ring topology, request routing
 1. **ferrosa-cluster:** Tunable consistency levels (ONE, QUORUM, ALL)
 1. **ferrosa-cluster:** Hinted handoff and repair

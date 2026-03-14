@@ -1,0 +1,26 @@
+[package]
+name = "ferrosa-net"
+description = "Internode transport, RPC service, and failure detection for Ferrosa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arc-swap = "1.7"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+hmac = "0.12"
+lz4_flex = "0.11"
+rand = "0.8"
+sha2 = "0.10"
+snap = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["full", "test-util"] }
