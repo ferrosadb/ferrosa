@@ -302,6 +302,65 @@ impl CommitLog {
         Ok(())
     }
 
+    /// Replay mutations from a given position forward.
+    ///
+    /// Walks closed segments and the active segment, returning entries
+    /// after the given position. Returns empty vec if the requested
+    /// segment has been recycled (caller should trigger full bootstrap).
+    pub fn replay_from(
+        &self,
+        position: CommitLogPosition,
+    ) -> ferrosa_common::Result<Vec<Mutation>> {
+        let mut mutations = Vec::new();
+
+        // Collect segment paths to read: closed segments with id >= position.segment_id.
+        let closed = self.closed_segments.lock();
+        let mut segment_paths: Vec<(u64, std::path::PathBuf)> = closed
+            .iter()
+            .filter(|s| s.id >= position.segment_id)
+            .map(|s| (s.id, s.path().to_path_buf()))
+            .collect();
+        drop(closed);
+
+        // Check if the requested segment exists. If all closed segments have
+        // lower IDs and the active segment is newer, the requested segment
+        // was recycled — return empty to signal full bootstrap needed.
+        let active = self.active.load();
+        let active_id = active.id;
+        let active_path = active.path().to_path_buf();
+
+        if position.segment_id > 0 && segment_paths.is_empty() && active_id > position.segment_id {
+            // Requested segment was recycled.
+            return Ok(vec![]);
+        }
+
+        // Add active segment if it has data and its ID >= requested.
+        if active_id >= position.segment_id {
+            // Flush active segment to disk so SegmentReader can read it.
+            active.flush_to_disk()?;
+            segment_paths.push((active_id, active_path));
+        }
+
+        // Sort by segment ID for replay order.
+        segment_paths.sort_by_key(|(id, _)| *id);
+
+        for (_, path) in &segment_paths {
+            if !path.exists() {
+                continue;
+            }
+            let mut reader = SegmentReader::open(path)?;
+            let entries = reader.read_all()?;
+
+            for (pos, mutation) in entries {
+                if pos > position {
+                    mutations.push(mutation);
+                }
+            }
+        }
+
+        Ok(mutations)
+    }
+
     /// Shuts down the commit log cleanly.
     ///
     /// Stops the sync strategy and flushes the active segment to disk.
