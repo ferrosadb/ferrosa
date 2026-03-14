@@ -46,7 +46,7 @@ docker compose up -d --build
 # 2. Wait for CQL to be ready
 info "Waiting for node1 CQL (port 9042)..."
 for i in $(seq 1 60); do
-    if cqlsh localhost 9042 -e "SELECT now() FROM system.local" >/dev/null 2>&1; then
+    if cqlsh localhost 9042 -e "SELECT cluster_name FROM system.local" >/dev/null 2>&1; then
         pass "node1 CQL is ready"
         break
     fi
@@ -58,7 +58,7 @@ done
 
 info "Waiting for node2 CQL (port 9043)..."
 for i in $(seq 1 60); do
-    if cqlsh localhost 9043 -e "SELECT now() FROM system.local" >/dev/null 2>&1; then
+    if cqlsh localhost 9043 -e "SELECT cluster_name FROM system.local" >/dev/null 2>&1; then
         pass "node2 CQL is ready"
         break
     fi
