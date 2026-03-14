@@ -22,7 +22,8 @@ pub struct ServerConfig {
     pub max_connections: usize,
     pub max_frame_size: u32,
     /// Max concurrent in-flight requests per connection (default 128).
-    /// TODO: Enforce in connection handler — reject with ERROR(Overloaded).
+    /// Enforced via a semaphore in the connection handler — exceeding this
+    /// limit returns ERROR(Overloaded) to the client.
     pub max_in_flight_per_connection: usize,
     /// If true, skip auth (STARTUP returns READY directly).
     pub auth_disabled: bool,
@@ -62,6 +63,7 @@ impl CqlServer {
         let addr = listener.local_addr()?;
         let max_connections = self.config.max_connections;
         let max_frame_size = self.config.max_frame_size;
+        let max_in_flight = self.config.max_in_flight_per_connection;
         let auth_disabled = self.config.auth_disabled;
         let active = self.active_connections.clone();
         let state = self.state.clone();
@@ -100,6 +102,7 @@ impl CqlServer {
                                 stream,
                                 peer,
                                 max_frame_size,
+                                max_in_flight,
                                 auth_disabled,
                                 state,
                             )
