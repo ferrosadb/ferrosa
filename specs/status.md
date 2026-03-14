@@ -13,10 +13,10 @@ including DDL replication, write forwarding, failover, and catch-up.
 | Metric | Value |
 |--------|-------|
 | Crates | 11 of 11 planned |
-| Source files | ~180 |
-| Source LOC | ~56,700 |
-| Test functions | ~1,082 |
-| Integration test files | 20 |
+| Source files | ~194 |
+| Source LOC | ~68,000 |
+| Test functions | ~1,250 |
+| Integration test files | 22 |
 
 ## Maturity Assessment
 
@@ -62,12 +62,14 @@ cluster        █████░   ████░░  ███░░░   █
 
 - **LOC:** 9,278 (29 files) | **Tests:** 204
 - **Modules:** `cache`, `commitlog` (7 submodules), `compaction` (3 submodules),
-  `engine`, `flush`, `manifest`, `memtable` (2 impls), `merge`, `observer`, `store`,
-  `subscription_observer`, `upload`, `virtual_tables`
+  `engine`, `flush`, `index` (tracker, scheduler, virtual_table), `manifest`,
+  `memtable` (2 impls), `merge`, `observer`, `store`, `subscription_observer`,
+  `upload`, `virtual_tables`
 - **What's done:** Memtable (sharded BTree + skiplist), commit log (CAS-allocated
   segments, 3 sync modes, CDC, `force_sync` for catch-up), flush, merge, compaction
   (STCS strategy), S3 upload manager, manifest with etag CAS, local LRU cache,
-  WriteObserver trait, SubscriptionObserver.
+  WriteObserver trait, SubscriptionObserver. Index support: `IndexStateTracker`,
+  `IndexBuildScheduler`, index virtual table, `UploadTask::IndexFiles` variant.
 - **Remaining:**
   - [x] ~~Commit log replay integration~~ (merged PR #38)
   - [x] ~~Compaction execution merge I/O~~ (merged PR #38)
@@ -86,7 +88,9 @@ cluster        █████░   ████░░  ███░░░   █
 - **What's done:** Schema registry with `ArcSwap` lock-free snapshots, full RBAC auth
   (bcrypt/argon2), column-level permissions, rate limiting, audit logging (log + table
   sinks), system keyspace queries, VirtualTable trait + registry. Schema replication:
-  `apply_snapshot()`, idempotent `*_internal()` methods for pair mode.
+  `apply_snapshot()`, idempotent `*_internal()` methods for pair mode. `IndexMetadata`
+  for secondary index definitions, `system_schema.indexes` virtual table, cascade
+  cleanup on `DROP TABLE` (removes associated indexes).
 - **Remaining (Chunks B-F):**
   - [ ] DDL validation rules
   - [ ] System table persistence to SSTable
@@ -94,24 +98,28 @@ cluster        █████░   ████░░  ███░░░   █
   - [ ] Role hierarchy with inheritance
   - [ ] Audit sink composition
 
-### ferrosa-index — Phase 1 Complete
+### ferrosa-index — Phase 1 Complete (PR #44)
 
-- **LOC:** ~3,200 (18 files) | **Tests:** ~85
-- **Modules:** `btree`, `composite`, `hash`, `lifecycle`, `manager`, `phonetic`,
-  `registry`, `traits`, `types`, `vector` (hnsw, ivfflat)
-- **What's done:** Pluggable secondary index framework behind a single `SecondaryIndex`
-  trait. Six index types: B-tree (range scans), hash (O(1) equality), composite
-  (multi-column), phonetic (Soundex, Metaphone, Double Metaphone, Caverphone), and
-  two vector methods (HNSW, IVFFlat) for approximate nearest neighbor search.
-  Storage-attached: indexes build asynchronously after SSTable flush with zero write-path
-  impact. Per-index staleness tracking, operational metrics via
-  `system_views.secondary_indexes`, CQL-compatible DDL with `CREATE INDEX ... USING 'type'`
-  syntax. Filtered indexes for partial coverage.
+- **LOC:** ~5,800 (14 files) | **Tests:** 110
+- **Modules:** `btree`, `hash`, `composite`, `filtered`, `phonetic` (soundex, metaphone,
+  double_metaphone, caverphone), `vector` (hnsw, ivfflat)
+- **What's done:** Pluggable secondary index framework with `IndexBuilder`/`IndexReader`/`IndexFactory`
+  traits. 8 index types: B-tree (range scans), hash (O(1) equality), composite
+  (multi-column), filtered (partial coverage), phonetic (Soundex, Metaphone, Double Metaphone,
+  Caverphone), and two vector methods (HNSW, IVFFlat) for approximate nearest neighbor search.
+  Distance functions (L2, cosine, inner product). Storage-attached: indexes build asynchronously
+  after SSTable flush with zero write-path impact. Per-index staleness tracking, operational
+  metrics via `system_views.secondary_indexes`, CQL-compatible DDL with
+  `CREATE INDEX ... USING 'type'` syntax.
 - **Remaining:**
-  - [ ] Integration with storage engine flush pipeline
-  - [ ] Index-aware query planner in ferrosa-cql
+  - [ ] Query path integration (index-aware query planner in ferrosa-cql)
+  - [ ] `SOUNDS LIKE` / `ANN OF` CQL syntax
+  - [ ] Clustered indexes
+  - [ ] GPU offloading for vector operations
+  - [ ] Binary serialization for index persistence
   - [ ] Compaction-triggered index rebuild
   - [ ] Distributed index coordination in cluster mode
+- **Spec:** [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md)
 
 ### ferrosa-cql — Complete (Parts A-D + Compression)
 
@@ -124,7 +132,8 @@ cluster        █████░   ████░░  ███░░░   █
   prepared statement cache (moka W-TinyLFU), ConnectionTracker/QueryTracker virtual
   tables, SUBSCRIBE/UNSUBSCRIBE extensions, Prometheus text exposition, CqlClient,
   LZ4 and Snappy frame compression with negotiation. DDL routes through `DdlPath`
-  for pair mode replication.
+  for pair mode replication. `CREATE INDEX` / `DROP INDEX` parser support and router
+  integration, `resolve_index_type()` for mapping index USING clause to index factory.
 - **Remaining:**
   - [ ] CQL TLS via rustls (T02/T03 — Critical, plaintext traffic)
   - [ ] Per-IP rate limiting for connection/query flood (T04)
@@ -174,7 +183,8 @@ cluster        █████░   ████░░  ███░░░   █
   Background maintenance loop (auto-flush, compaction polling, commit log GC).
   Graceful shutdown with configurable timeout (drains in-flight requests).
   Per-connection request limiting for backpressure under load. Exponential backoff
-  reconnection for internode links. Ships as .deb with systemd service unit.
+  reconnection for internode links. Ships as .deb via `scripts/build-deb.sh` with
+  systemd service unit.
 - **Remaining:**
   - [x] ~~Graceful shutdown sequencing~~ (done)
   - [ ] Configuration file support (currently env vars only)
@@ -230,6 +240,7 @@ cluster        █████░   ████░░  ███░░░   █
   - [x] ~~AlterKeyspace/AlterTable DDL forwarding~~ (done)
   - [x] ~~`StorageEngine::unregister_table()` for drop replication cleanup~~ (done)
   - [x] ~~Role/auth DDL forwarding (CreateRole, AlterRole, DropRole, Grant, Revoke)~~ (done)
+  - [x] ~~CreateIndex/DropIndex DdlOperation variants~~ (done)
 - **Spec:** [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 - **Schema Replication Spec:** [Schema Replication](../superpowers/specs/2026-03-14-schema-replication-design.md)
 - **Threat Models:** [Net/Cluster](threat-model-net-cluster.md), [Schema Replication](threat-model-schema-replication.md)
