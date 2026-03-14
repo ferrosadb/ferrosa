@@ -81,6 +81,13 @@ Source under `cassandra/src/java/org/apache/cassandra/`:
 - **Executors**: Use `ExecutorFactory.Global`, not `java.util.concurrent.Executors`
 - Suppress with: `// checkstyle: permit this import`
 
+## Directory Layout Rules
+
+- **`docs/`** — PUBLIC marketing site served via GitHub Pages (ferrosadb.com). Contains only HTML, CSS, SVG, and `CNAME`. **NEVER put internal specs, plans, rustdoc output, or non-public content here.** Changes to `docs/` trigger the Pages deployment workflow.
+- **`superpowers/`** — Internal specs (`superpowers/specs/`) and implementation plans (`superpowers/plans/`). Not publicly served.
+- **`specs/`** — Architecture specs, threat models, status docs. Not publicly served.
+- **`.github/workflows/docs.yml`** — Deploys `docs/` to GitHub Pages. Must ONLY deploy from `docs/`. Never deploy rustdoc (`target/doc/`) or any generated content to Pages.
+
 ## Key Design Decisions
 
 - **Storage**: Write-behind async S3 — local ephemeral disk as cache, S3 as durable store
