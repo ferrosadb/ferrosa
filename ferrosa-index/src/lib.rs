@@ -5,7 +5,9 @@ pub mod hash;
 pub mod phonetic;
 pub mod vector;
 
+use ferrosa_common::CellValue;
 use serde::{Deserialize, Serialize};
+use std::ops::Bound;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,6 +120,61 @@ pub enum FilterOp {
     GtEq,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum IndexError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("index build error: {0}")]
+    Build(String),
+    #[error("index query error: {0}")]
+    Query(String),
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
+}
+
+pub type IndexResult<T> = std::result::Result<T, IndexError>;
+
+/// Build-side: called during background index construction.
+/// IMPORTANT: Implementations must check cell.value.is_some() for the
+/// indexed column(s) and skip tombstoned cells (where value is None).
+pub trait IndexBuilder: Send {
+    fn add_row(
+        &mut self,
+        partition_key: &[u8],
+        clustering_key: &[u8],
+        cells: &[(u16, CellValue)],
+    ) -> IndexResult<()>;
+    fn finish(self: Box<Self>) -> IndexResult<IndexFiles>;
+}
+
+/// Read-side: query an index built for one SSTable.
+pub trait IndexReader: Send + Sync {
+    fn lookup(&self, key: &IndexKey) -> IndexResult<Vec<RowPosition>>;
+    fn range(
+        &self,
+        start: Bound<&IndexKey>,
+        end: Bound<&IndexKey>,
+    ) -> IndexResult<Vec<RowPosition>>;
+    fn nearest(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<u16>,
+    ) -> IndexResult<Vec<(RowPosition, f32)>>;
+    fn capabilities(&self) -> IndexCapabilities;
+}
+
+/// Factory: registered per IndexType, creates builders and readers.
+pub trait IndexFactory: Send + Sync {
+    fn create_builder(&self, config: &IndexConfig) -> IndexResult<Box<dyn IndexBuilder>>;
+    fn open_reader(&self, files: &IndexFiles) -> IndexResult<Box<dyn IndexReader>>;
+    fn merge(
+        &self,
+        readers: Vec<Box<dyn IndexReader>>,
+        builder: Box<dyn IndexBuilder>,
+    ) -> IndexResult<IndexFiles>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +275,13 @@ mod tests {
         let json = serde_json::to_string(&filtered).unwrap();
         let back: IndexType = serde_json::from_str(&json).unwrap();
         assert_eq!(filtered, back);
+    }
+
+    #[test]
+    fn trait_objects_are_object_safe() {
+        use std::sync::Arc;
+        fn _assert_builder_object_safe(_: Box<dyn IndexBuilder>) {}
+        fn _assert_reader_send_sync(_: Arc<dyn IndexReader>) {}
+        fn _assert_factory_object_safe(_: Box<dyn IndexFactory>) {}
     }
 }
