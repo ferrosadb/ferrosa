@@ -1,17 +1,21 @@
 //! Secondary index implementations for Ferrosa.
 //!
-//! This crate provides B-tree, hash, and composite secondary indexes that map
-//! column values to row positions within SSTables. Each index type implements
-//! the [`IndexBuilder`], [`IndexReader`], and [`IndexFactory`] traits.
+//! This crate provides B-tree, hash, composite, and phonetic secondary indexes
+//! that map column values to row positions within SSTables. Each index type
+//! implements the [`IndexBuilder`], [`IndexReader`], and [`IndexFactory`]
+//! traits.
 //!
 //! Index types:
 //! - **B-tree** ([`btree`]): Sorted index supporting point lookups and range scans.
 //! - **Hash** ([`hash`]): Hash-based index for O(1) point lookups.
 //! - **Composite** ([`composite`]): Multi-column index supporting full-key and prefix lookups.
+//! - **Phonetic** ([`phonetic`]): Fuzzy name matching via Soundex, Metaphone, Double Metaphone,
+//!   or Caverphone encoding.
 
 pub mod btree;
 pub mod composite;
 pub mod hash;
+pub mod phonetic;
 
 use ferrosa_common::CellValue;
 use std::fmt;
@@ -70,6 +74,7 @@ pub enum IndexType {
     BTree,
     Hash,
     Composite,
+    Phonetic,
 }
 
 impl fmt::Display for IndexType {
@@ -78,6 +83,7 @@ impl fmt::Display for IndexType {
             IndexType::BTree => write!(f, "btree"),
             IndexType::Hash => write!(f, "hash"),
             IndexType::Composite => write!(f, "composite"),
+            IndexType::Phonetic => write!(f, "phonetic"),
         }
     }
 }
@@ -133,6 +139,7 @@ pub struct IndexCapabilities(u32);
 impl IndexCapabilities {
     pub const POINT_LOOKUP: Self = Self(0b0001);
     pub const RANGE_SCAN: Self = Self(0b0010);
+    pub const PHONETIC: Self = Self(0b0100);
 
     /// Returns true if `self` includes all capabilities in `other`.
     pub fn contains(self, other: Self) -> bool {
