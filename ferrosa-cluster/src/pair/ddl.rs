@@ -34,7 +34,16 @@ pub enum DdlOperation {
     CreateKeyspace(KeyspaceMetadata),
     DropKeyspace(String),
     CreateTable(Box<TableMetadata>),
-    DropTable { keyspace: String, table: String },
+    DropTable {
+        keyspace: String,
+        table: String,
+    },
+    CreateIndex(IndexMetadata),
+    DropIndex {
+        keyspace: String,
+        table: String,
+        index: String,
+    },
 }
 
 impl DdlOperation {
@@ -123,6 +132,20 @@ impl DdlCoordinator {
                 self.schema
                     .drop_table_internal(keyspace, table)
                     .map_err(|e| ClusterError::Internal(format!("drop_table: {e}")))?;
+            }
+            DdlOperation::CreateIndex(ref idx) => {
+                self.schema
+                    .create_index_internal(idx.clone())
+                    .map_err(|e| ClusterError::Internal(format!("create_index: {e}")))?;
+            }
+            DdlOperation::DropIndex {
+                ref keyspace,
+                ref table,
+                ref index,
+            } => {
+                self.schema
+                    .drop_index_internal(keyspace, table, index)
+                    .map_err(|e| ClusterError::Internal(format!("drop_index: {e}")))?;
             }
         }
         Ok(())

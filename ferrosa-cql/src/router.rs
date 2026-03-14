@@ -8,7 +8,7 @@
 //! - **M8**: Every `route_*` function checks permissions via `Schema::check_permission`.
 //! - **M12**: Batch size is capped at `MAX_BATCH_STATEMENTS` (500).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -18,12 +18,14 @@ use indexmap::IndexMap;
 use ferrosa_cluster::pair::ddl::DdlOperation;
 use ferrosa_cluster::{DdlPath, WritePath};
 use ferrosa_common::DataType;
+use ferrosa_index::{DistanceMetric, IndexType, PhoneticAlgorithm, VectorMethod};
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local, query_peers, query_role_members,
     query_role_permissions, query_roles, query_tables, AuthContext,
-    ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, KeyspaceMetadata,
-    KeyspaceUpdates, NodeConfig, Permission, ReplicationParams, Resource, RoleMetadata,
-    RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates, VirtualColumnDef, VirtualRow,
+    ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, IndexMetadata,
+    KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams, Resource,
+    RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates, VirtualColumnDef,
+    VirtualRow,
 };
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
@@ -117,12 +119,12 @@ pub async fn route(
             Ok(RouteResult::SetKeyspace(u.keyspace, body))
         }
         Statement::Truncate(t) => route_truncate(state, ctx, t).map(RouteResult::Result),
-        Statement::CreateIndex(_ci) => Err(CqlError::Invalid(
-            "CREATE INDEX routing not yet implemented".to_string(),
-        )),
-        Statement::DropIndex(_di) => Err(CqlError::Invalid(
-            "DROP INDEX routing not yet implemented".to_string(),
-        )),
+        Statement::CreateIndex(ci) => route_create_index(state, ctx, ci)
+            .await
+            .map(RouteResult::Result),
+        Statement::DropIndex(di) => route_drop_index(state, ctx, di)
+            .await
+            .map(RouteResult::Result),
         Statement::Subscribe { .. } | Statement::Unsubscribe { .. } => Err(CqlError::Invalid(
             "SUBSCRIBE/UNSUBSCRIBE not yet supported".to_string(),
         )),
@@ -1203,6 +1205,212 @@ async fn route_drop_table(
     ))
 }
 
+// ── DDL: Index ───────────────────────────────────────────────────────────
+
+/// Resolve the USING string to an IndexType.
+fn resolve_index_type(
+    using: Option<&str>,
+    columns: &[String],
+    options: &HashMap<String, String>,
+) -> Result<IndexType, CqlError> {
+    match using {
+        None | Some("btree") => Ok(IndexType::BTree),
+        Some("hash") => Ok(IndexType::Hash),
+        Some("composite") => Ok(IndexType::Composite {
+            columns: columns.to_vec(),
+        }),
+        Some("phonetic") => {
+            let algorithm = match options.get("algorithm").map(|s| s.as_str()) {
+                Some("soundex") | None => PhoneticAlgorithm::Soundex,
+                Some("metaphone") => PhoneticAlgorithm::Metaphone,
+                Some("double_metaphone") => PhoneticAlgorithm::DoubleMetaphone,
+                Some("caverphone") => PhoneticAlgorithm::Caverphone,
+                Some(other) => {
+                    return Err(CqlError::Invalid(format!(
+                        "unknown phonetic algorithm: {other}"
+                    )))
+                }
+            };
+            Ok(IndexType::Phonetic { algorithm })
+        }
+        Some("vector") => {
+            let dimensions: u32 = options
+                .get("dimensions")
+                .ok_or_else(|| {
+                    CqlError::Invalid("vector index requires 'dimensions' option".to_string())
+                })?
+                .parse()
+                .map_err(|_| CqlError::Invalid("invalid dimensions value".to_string()))?;
+
+            let metric = match options.get("metric").map(|s| s.as_str()) {
+                Some("cosine") | None => DistanceMetric::Cosine,
+                Some("l2") => DistanceMetric::L2,
+                Some("inner_product") => DistanceMetric::InnerProduct,
+                Some(other) => {
+                    return Err(CqlError::Invalid(format!(
+                        "unknown distance metric: {other}"
+                    )))
+                }
+            };
+
+            let method = match options.get("method").map(|s| s.as_str()) {
+                Some("hnsw") | None => {
+                    let m = options
+                        .get("m")
+                        .map(|s| s.parse().unwrap_or(16))
+                        .unwrap_or(16);
+                    let ef_construction = options
+                        .get("ef_construction")
+                        .map(|s| s.parse().unwrap_or(200))
+                        .unwrap_or(200);
+                    VectorMethod::Hnsw { m, ef_construction }
+                }
+                Some("ivfflat") => {
+                    let lists = options
+                        .get("lists")
+                        .map(|s| s.parse().unwrap_or(100))
+                        .unwrap_or(100);
+                    VectorMethod::IvfFlat { lists }
+                }
+                Some(other) => {
+                    return Err(CqlError::Invalid(format!("unknown vector method: {other}")))
+                }
+            };
+
+            Ok(IndexType::Vector {
+                method,
+                metric,
+                dimensions,
+            })
+        }
+        Some(other) => Err(CqlError::Invalid(format!("unknown index type: {other}"))),
+    }
+}
+
+async fn route_create_index(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: CreateIndexStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    // Permission check (M8) — ALTER on the table
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Alter,
+        &Resource::Table(ks.to_string(), s.table.clone()),
+    )?;
+
+    // Convert options Vec to HashMap
+    let options_map: HashMap<String, String> = s.options.iter().cloned().collect();
+
+    // Resolve index type
+    let index_type = resolve_index_type(s.using.as_deref(), &s.columns, &options_map)?;
+
+    // Generate index name if not provided
+    let index_name = s
+        .name
+        .unwrap_or_else(|| format!("{}_{}_idx", s.table, s.columns.join("_")));
+
+    let index_meta = IndexMetadata {
+        keyspace: ks.to_string(),
+        table: s.table.clone(),
+        name: index_name.clone(),
+        index_type,
+        target_columns: s.columns.clone(),
+        filter_predicate: None,
+        options: options_map,
+    };
+
+    match &**state.ddl_path.load() {
+        DdlPath::Direct { .. } => {
+            state.schema.create_index(index_meta, ctx.auth)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::CreateIndex(index_meta);
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "CREATED",
+        "INDEX",
+        &[ks, &index_name],
+    ))
+}
+
+async fn route_drop_index(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: DropIndexStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    // Look up which table owns this index by scanning the schema snapshot
+    let snap = state.schema.snapshot();
+    let table_name = snap
+        .indexes
+        .keys()
+        .find(|(k, _t, n)| k == ks && n == &s.name)
+        .map(|(_, t, _)| t.clone());
+
+    let table_name = match table_name {
+        Some(t) => t,
+        None => {
+            if s.if_exists {
+                return Ok(result::encode_schema_change(
+                    "DROPPED",
+                    "INDEX",
+                    &[ks, &s.name],
+                ));
+            }
+            return Err(CqlError::Invalid(format!(
+                "index '{}' not found in keyspace '{}'",
+                s.name, ks
+            )));
+        }
+    };
+
+    // Permission check (M8) — ALTER on the parent table
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Alter,
+        &Resource::Table(ks.to_string(), table_name.clone()),
+    )?;
+
+    match &**state.ddl_path.load() {
+        DdlPath::Direct { .. } => {
+            state
+                .schema
+                .drop_index(ks, &table_name, &s.name, ctx.auth)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::DropIndex {
+                keyspace: ks.to_string(),
+                table: table_name.clone(),
+                index: s.name.clone(),
+            };
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "DROPPED",
+        "INDEX",
+        &[ks, &s.name],
+    ))
+}
+
 // ── DDL: Role ────────────────────────────────────────────────────────────
 
 fn route_create_role(
@@ -1964,5 +2172,46 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_index_type tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn resolve_index_type_defaults_to_btree() {
+        let result = resolve_index_type(None, &["col".to_string()], &HashMap::new());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), IndexType::BTree);
+    }
+
+    #[test]
+    fn resolve_index_type_vector_hnsw() {
+        let mut opts = HashMap::new();
+        opts.insert("method".to_string(), "hnsw".to_string());
+        opts.insert("metric".to_string(), "cosine".to_string());
+        opts.insert("dimensions".to_string(), "768".to_string());
+        let result = resolve_index_type(Some("vector"), &["embed".to_string()], &opts);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            IndexType::Vector {
+                method,
+                metric,
+                dimensions,
+            } => {
+                assert!(matches!(method, VectorMethod::Hnsw { .. }));
+                assert_eq!(metric, DistanceMetric::Cosine);
+                assert_eq!(dimensions, 768);
+            }
+            other => panic!("expected Vector, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_index_type_vector_missing_dimensions_errors() {
+        let mut opts = HashMap::new();
+        opts.insert("method".to_string(), "hnsw".to_string());
+        let result = resolve_index_type(Some("vector"), &["embed".to_string()], &opts);
+        assert!(result.is_err());
     }
 }
