@@ -1023,7 +1023,19 @@ async fn route_drop_keyspace(
 
     match &**state.ddl_path.load() {
         DdlPath::Direct { .. } => {
+            // Collect tables before drop so we can unregister from storage.
+            let table_ids: Vec<_> = state
+                .schema
+                .snapshot()
+                .tables
+                .keys()
+                .filter(|(ks, _)| ks == &s.name)
+                .map(|(ks, tbl)| ferrosa_storage::TableId::new(ks, tbl))
+                .collect();
             state.schema.drop_keyspace(&s.name, ctx.auth)?;
+            for tid in &table_ids {
+                let _ = state.engine.unregister_table(tid);
+            }
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropKeyspace(s.name.clone());
@@ -1226,6 +1238,8 @@ async fn route_drop_table(
     match &**state.ddl_path.load() {
         DdlPath::Direct { .. } => {
             state.schema.drop_table(ks, &s.table, ctx.auth)?;
+            let tid = ferrosa_storage::TableId::new(ks, &s.table);
+            let _ = state.engine.unregister_table(&tid);
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropTable {
