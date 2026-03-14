@@ -1,0 +1,178 @@
+name: Release
+
+# Triggered by pushing a version tag (e.g., v0.1.0, v0.2.0)
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # ── Run tests before releasing ────────────────────────────────
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # ── Build release binaries ────────────────────────────────────
+      - name: Build release binaries
+        run: cargo build --release -p ferrosa -p ferrosa-ctl
+
+      # ── Build .deb package ────────────────────────────────────────
+      - name: Build Debian package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCH="amd64"
+          PKG_DIR="dist/ferrosa_${VERSION}_${ARCH}"
+          DEB_FILE="dist/ferrosa_${VERSION}_${ARCH}.deb"
+
+          # Debian control
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          cat > "${PKG_DIR}/DEBIAN/control" <<CTRL
+          Package: ferrosa
+          Version: ${VERSION}
+          Section: database
+          Priority: optional
+          Architecture: ${ARCH}
+          Depends: ca-certificates
+          Maintainer: Ferrosa Team <ferrosa@ferrosadb.com>
+          Homepage: https://ferrosadb.com
+          Description: CQL-compatible distributed database with S3-backed storage
+           Ferrosa is a Rust reimplementation of Apache Cassandra with S3-backed
+           storage, pluggable secondary indexes, built-in graph queries, and
+           pair-mode high availability with automatic failover.
+          CTRL
+          # Fix indentation (heredoc adds leading spaces)
+          sed -i 's/^          //' "${PKG_DIR}/DEBIAN/control"
+
+          # Post-install script
+          cat > "${PKG_DIR}/DEBIAN/postinst" <<'POSTINST'
+          #!/bin/sh
+          set -e
+          if ! id -u ferrosa >/dev/null 2>&1; then
+              useradd --system --no-create-home --shell /usr/sbin/nologin ferrosa
+          fi
+          mkdir -p /var/lib/ferrosa && chown ferrosa:ferrosa /var/lib/ferrosa
+          mkdir -p /var/log/ferrosa && chown ferrosa:ferrosa /var/log/ferrosa
+          POSTINST
+          sed -i 's/^          //' "${PKG_DIR}/DEBIAN/postinst"
+          chmod 755 "${PKG_DIR}/DEBIAN/postinst"
+
+          # Binaries
+          mkdir -p "${PKG_DIR}/usr/bin"
+          cp target/release/ferrosa "${PKG_DIR}/usr/bin/"
+          cp target/release/ferrosa-ctl "${PKG_DIR}/usr/bin/"
+          strip "${PKG_DIR}/usr/bin/ferrosa"
+          strip "${PKG_DIR}/usr/bin/ferrosa-ctl"
+
+          # Marketing docs
+          mkdir -p "${PKG_DIR}/usr/share/ferrosa/docs"
+          cp -r docs/*.html docs/*.svg "${PKG_DIR}/usr/share/ferrosa/docs/" 2>/dev/null || true
+          cp docs/CNAME "${PKG_DIR}/usr/share/ferrosa/docs/" 2>/dev/null || true
+
+          # Smoke tests
+          mkdir -p "${PKG_DIR}/usr/share/ferrosa/tests"
+          cp tests/docker-smoke.sh "${PKG_DIR}/usr/share/ferrosa/tests/" 2>/dev/null || true
+          cp tests/cqlsh_smoke_test.sh "${PKG_DIR}/usr/share/ferrosa/tests/" 2>/dev/null || true
+          cp docker-compose.yml "${PKG_DIR}/usr/share/ferrosa/tests/" 2>/dev/null || true
+          cp Dockerfile "${PKG_DIR}/usr/share/ferrosa/tests/" 2>/dev/null || true
+
+          # Systemd service
+          mkdir -p "${PKG_DIR}/lib/systemd/system"
+          cat > "${PKG_DIR}/lib/systemd/system/ferrosa.service" <<SERVICE
+          [Unit]
+          Description=Ferrosa Database Server
+          After=network-online.target
+          Wants=network-online.target
+          Documentation=https://ferrosadb.com
+
+          [Service]
+          Type=simple
+          User=ferrosa
+          Group=ferrosa
+          ExecStart=/usr/bin/ferrosa
+          Restart=on-failure
+          RestartSec=5s
+          LimitNOFILE=65536
+          LimitMEMLOCK=infinity
+          Environment=FERROSA_DATA_DIR=/var/lib/ferrosa
+          Environment=FERROSA_LOG_DIR=/var/log/ferrosa
+          Environment=RUST_LOG=info
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+          sed -i 's/^          //' "${PKG_DIR}/lib/systemd/system/ferrosa.service"
+
+          # Empty dirs
+          mkdir -p "${PKG_DIR}/etc/ferrosa"
+          mkdir -p "${PKG_DIR}/var/lib/ferrosa"
+
+          # Copyright
+          mkdir -p "${PKG_DIR}/usr/share/doc/ferrosa"
+          echo "Copyright 2026 Ferrosa Contributors. All rights reserved." \
+              > "${PKG_DIR}/usr/share/doc/ferrosa/copyright"
+
+          # Build .deb
+          dpkg-deb --build --root-owner-group "$PKG_DIR" "$DEB_FILE"
+          echo "deb_file=${DEB_FILE}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        id: package
+
+      # ── Upload as workflow artifact ───────────────────────────────
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrosa-deb
+          path: ${{ steps.package.outputs.deb_file }}
+          retention-days: 90
+
+      # ── Publish to public repo (ferrosadb/ferrosadb) ──────────────
+      - name: Create release on public repo
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+        run: |
+          VERSION="${{ steps.package.outputs.version }}"
+          DEB_FILE="${{ steps.package.outputs.deb_file }}"
+
+          # Generate release notes
+          NOTES=$(cat <<NOTES
+          ## Ferrosa v${VERSION}
+
+          CQL-compatible distributed database with S3-backed storage, built in Rust.
+
+          ### Installation (Debian/Ubuntu)
+
+          \`\`\`bash
+          wget https://github.com/ferrosadb/ferrosadb/releases/download/v${VERSION}/ferrosa_${VERSION}_amd64.deb
+          sudo dpkg -i ferrosa_${VERSION}_amd64.deb
+          sudo systemctl start ferrosa
+          cqlsh localhost 9042
+          \`\`\`
+
+          ### What's Included
+
+          - \`/usr/bin/ferrosa\` — database server
+          - \`/usr/bin/ferrosa-ctl\` — CLI admin tool
+          - \`/lib/systemd/system/ferrosa.service\` — systemd unit
+          - \`/usr/share/ferrosa/docs/\` — documentation
+          - \`/usr/share/ferrosa/tests/\` — smoke tests
+          NOTES
+          )
+
+          gh release create "v${VERSION}" "$DEB_FILE" \
+            --repo ferrosadb/ferrosadb \
+            --title "Ferrosa v${VERSION}" \
+            --notes "$NOTES"
