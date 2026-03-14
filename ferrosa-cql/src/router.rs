@@ -117,6 +117,12 @@ pub async fn route(
             Ok(RouteResult::SetKeyspace(u.keyspace, body))
         }
         Statement::Truncate(t) => route_truncate(state, ctx, t).map(RouteResult::Result),
+        Statement::CreateIndex(_ci) => Err(CqlError::Invalid(
+            "CREATE INDEX routing not yet implemented".to_string(),
+        )),
+        Statement::DropIndex(_di) => Err(CqlError::Invalid(
+            "DROP INDEX routing not yet implemented".to_string(),
+        )),
         Statement::Subscribe { .. } | Statement::Unsubscribe { .. } => Err(CqlError::Invalid(
             "SUBSCRIBE/UNSUBSCRIBE not yet supported".to_string(),
         )),

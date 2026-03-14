@@ -27,6 +27,8 @@ pub enum Statement {
     Revoke(RevokeStatement),
     Use(UseStatement),
     Truncate(TruncateStatement),
+    CreateIndex(CreateIndexStatement),
+    DropIndex(DropIndexStatement),
     Subscribe {
         inner: Box<Statement>,
         interval: Option<Duration>,
@@ -186,6 +188,25 @@ pub struct AlterTableStatement {
 pub struct DropTableStatement {
     pub keyspace: Option<String>,
     pub table: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexStatement {
+    pub name: Option<String>,
+    pub keyspace: Option<String>,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub using: Option<String>,
+    pub filter: Option<String>,
+    pub options: Vec<(String, String)>,
+    pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropIndexStatement {
+    pub keyspace: Option<String>,
+    pub name: String,
     pub if_exists: bool,
 }
 
