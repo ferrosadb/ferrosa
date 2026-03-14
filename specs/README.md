@@ -12,17 +12,18 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | ferrosa-sstable | Done |
 | ferrosa-storage | Done (core engine + observers + subscription observer + storage stats) |
 | ferrosa-schema | Done (DDL, auth, audit, system KS, graph extensions, virtual tables) |
-| ferrosa-cql | Done (Parts A-D + observability: virtual tables, subscriptions, prometheus) |
+| ferrosa-cql | Done (Parts A-D + observability + LZ4/Snappy frame compression) |
 | ferrosa-graph | Done (Phase 1: parser, planner, executor, adjacency index, HTTP endpoint) |
 | ferrosa-net | Not started |
 | ferrosa-cluster | Not started |
 | ferrosa-ctl | Done (CLI + TUI monitoring dashboard) |
-| ferrosa (binary) | Done (single-node: CQL on 9042, optional graph on 7474, web console on 9090) |
+| ferrosa (binary) | Done (single-node: CQL on 9042, optional graph on 7474, web console on 9090, smoke tests) |
 
 ## Specs Index
 
 | Spec | Description | Status |
 |------|-------------|--------|
+| [Status](status.md) | Development status, maturity assessment, remaining work | Living |
 | [Overview](overview.md) | High-level system overview and design principles | Approved |
 | [Components](components.md) | Crate architecture, dependency graph, responsibilities | Approved |
 | [Data Flow](data-flow.md) | Write path, read path, compaction, S3 lifecycle | Approved |

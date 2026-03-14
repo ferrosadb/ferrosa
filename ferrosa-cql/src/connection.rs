@@ -25,7 +25,7 @@ use crate::auth::{
     encode_auth_success, encode_authenticate_response, parse_sasl_plain, MAX_AUTH_ATTEMPTS,
 };
 use crate::error::CqlError;
-use crate::frame::{CqlCodec, CqlFrame, FrameHeader, Opcode, VERSION_RESPONSE};
+use crate::frame::{Compression, CqlCodec, CqlFrame, FrameHeader, Opcode, VERSION_RESPONSE};
 use crate::parser;
 use crate::prepared::{PreparedCache, PreparedPlan};
 use crate::result;
@@ -104,6 +104,7 @@ pub async fn handle_connection(
     let mut auth_context: Option<AuthContext> = None;
     let mut current_keyspace: Option<String> = None;
     let mut subscription_state = SubscriptionState::new(8);
+    let mut pending_compression: Option<Compression> = None;
 
     loop {
         // M11: idle timeout — drop connection if no frame arrives within IDLE_TIMEOUT.
@@ -138,6 +139,7 @@ pub async fn handle_connection(
             &state,
             auth_disabled,
             &maybe_frame,
+            &mut pending_compression,
         ) {
             HandleResult::Reply(opcode, body) => {
                 // Track phase transitions and requests.
@@ -171,6 +173,19 @@ pub async fn handle_connection(
                 };
                 if framed.send(frame).await.is_err() {
                     break;
+                }
+
+                // After sending READY or AUTH_SUCCESS, enable compression if negotiated.
+                // STARTUP/READY frames themselves are NOT compressed; only subsequent frames.
+                if (opcode == Opcode::Ready || opcode == Opcode::AuthSuccess)
+                    && pending_compression.is_some()
+                {
+                    let compression = pending_compression.take().unwrap();
+                    debug!(
+                        "enabling {} compression for {peer}",
+                        compression.protocol_name()
+                    );
+                    framed.codec_mut().set_compression(compression);
                 }
             }
             HandleResult::Close(opcode, body) => {
@@ -219,10 +234,13 @@ fn handle_frame(
     state: &SharedState,
     auth_disabled: bool,
     frame: &CqlFrame,
+    pending_compression: &mut Option<Compression>,
 ) -> HandleResult {
     match phase {
         ConnectionPhase::AwaitingStartup => match frame.header.opcode {
-            Opcode::Startup => handle_startup(phase, auth_disabled, &frame.body),
+            Opcode::Startup => {
+                handle_startup(phase, auth_disabled, &frame.body, pending_compression)
+            }
             Opcode::Options => handle_options(),
             _ => {
                 let err = CqlError::Protocol(format!(
@@ -262,7 +280,12 @@ fn handle_frame(
 
 // ── STARTUP ─────────────────────────────────────────────────────────────
 
-fn handle_startup(phase: &mut ConnectionPhase, auth_disabled: bool, body: &Bytes) -> HandleResult {
+fn handle_startup(
+    phase: &mut ConnectionPhase,
+    auth_disabled: bool,
+    body: &Bytes,
+    pending_compression: &mut Option<Compression>,
+) -> HandleResult {
     // Parse the string map from the STARTUP body.
     if body.len() < 2 {
         let err = CqlError::Protocol("STARTUP body too short".into());
@@ -273,6 +296,7 @@ fn handle_startup(phase: &mut ConnectionPhase, auth_disabled: bool, body: &Bytes
     let n_pairs = cursor.get_u16() as usize;
 
     let mut cql_version: Option<String> = None;
+    let mut compression_name: Option<String> = None;
     for _ in 0..n_pairs {
         if cursor.remaining() < 2 {
             let err = CqlError::Protocol("STARTUP body truncated".into());
@@ -298,14 +322,27 @@ fn handle_startup(phase: &mut ConnectionPhase, auth_disabled: bool, body: &Bytes
         let val = std::str::from_utf8(&cursor[..val_len]).unwrap_or("");
         cursor.advance(val_len);
 
-        if key == "CQL_VERSION" {
-            cql_version = Some(val.to_string());
+        match key {
+            "CQL_VERSION" => cql_version = Some(val.to_string()),
+            "COMPRESSION" => compression_name = Some(val.to_string()),
+            _ => {} // Ignore unknown keys per CQL spec.
         }
     }
 
     if cql_version.is_none() {
         let err = CqlError::Protocol("STARTUP missing CQL_VERSION".into());
         return HandleResult::Reply(Opcode::Error, err.encode_body());
+    }
+
+    // Validate and store the requested compression algorithm.
+    if let Some(name) = compression_name {
+        match Compression::from_protocol_name(&name) {
+            Some(algo) => *pending_compression = Some(algo),
+            None => {
+                let err = CqlError::Protocol(format!("unsupported compression algorithm: {name}"));
+                return HandleResult::Reply(Opcode::Error, err.encode_body());
+            }
+        }
     }
 
     if auth_disabled {
@@ -341,7 +378,13 @@ fn handle_options() -> HandleResult {
     let key = b"COMPRESSION";
     body.put_u16(key.len() as u16);
     body.put_slice(key);
-    body.put_u16(0); // 0 values (no compression supported)
+    body.put_u16(2); // 2 values
+    let val1 = b"lz4";
+    body.put_u16(val1.len() as u16);
+    body.put_slice(val1);
+    let val2 = b"snappy";
+    body.put_u16(val2.len() as u16);
+    body.put_slice(val2);
 
     HandleResult::Reply(Opcode::Supported, body)
 }
@@ -809,5 +852,98 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_eq!(tracker.active_count(), 0);
+    }
+
+    #[test]
+    fn handle_options_advertises_compression() {
+        let result = handle_options();
+        match result {
+            HandleResult::Reply(opcode, body) => {
+                assert_eq!(opcode, Opcode::Supported);
+                // Parse the string-multimap to verify COMPRESSION key.
+                let mut cursor = &body[..];
+                let n_keys = cursor.get_u16();
+                assert_eq!(n_keys, 2);
+
+                // First key: CQL_VERSION
+                let key_len = cursor.get_u16() as usize;
+                let key = std::str::from_utf8(&cursor[..key_len]).unwrap();
+                cursor.advance(key_len);
+                assert_eq!(key, "CQL_VERSION");
+                let n_vals = cursor.get_u16();
+                assert_eq!(n_vals, 1);
+                let val_len = cursor.get_u16() as usize;
+                cursor.advance(val_len); // skip value
+
+                // Second key: COMPRESSION
+                let key_len = cursor.get_u16() as usize;
+                let key = std::str::from_utf8(&cursor[..key_len]).unwrap();
+                cursor.advance(key_len);
+                assert_eq!(key, "COMPRESSION");
+                let n_vals = cursor.get_u16();
+                assert_eq!(n_vals, 2);
+                let val_len = cursor.get_u16() as usize;
+                let val1 = std::str::from_utf8(&cursor[..val_len]).unwrap();
+                cursor.advance(val_len);
+                let val_len = cursor.get_u16() as usize;
+                let val2 = std::str::from_utf8(&cursor[..val_len]).unwrap();
+                assert_eq!(val1, "lz4");
+                assert_eq!(val2, "snappy");
+            }
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
+    fn handle_startup_with_compression() {
+        // Build a STARTUP body with CQL_VERSION and COMPRESSION keys.
+        let mut body = BytesMut::new();
+        body.put_u16(2); // 2 key-value pairs
+
+        let key = b"CQL_VERSION";
+        body.put_u16(key.len() as u16);
+        body.put_slice(key);
+        let val = b"3.0.0";
+        body.put_u16(val.len() as u16);
+        body.put_slice(val);
+
+        let key = b"COMPRESSION";
+        body.put_u16(key.len() as u16);
+        body.put_slice(key);
+        let val = b"lz4";
+        body.put_u16(val.len() as u16);
+        body.put_slice(val);
+
+        let mut phase = ConnectionPhase::AwaitingStartup;
+        let mut pending = None;
+        let result = handle_startup(&mut phase, true, &body.freeze(), &mut pending);
+        assert!(matches!(result, HandleResult::Reply(Opcode::Ready, _)));
+        assert_eq!(pending, Some(Compression::Lz4));
+    }
+
+    #[test]
+    fn handle_startup_with_invalid_compression() {
+        let mut body = BytesMut::new();
+        body.put_u16(2);
+
+        let key = b"CQL_VERSION";
+        body.put_u16(key.len() as u16);
+        body.put_slice(key);
+        let val = b"3.0.0";
+        body.put_u16(val.len() as u16);
+        body.put_slice(val);
+
+        let key = b"COMPRESSION";
+        body.put_u16(key.len() as u16);
+        body.put_slice(key);
+        let val = b"zstd";
+        body.put_u16(val.len() as u16);
+        body.put_slice(val);
+
+        let mut phase = ConnectionPhase::AwaitingStartup;
+        let mut pending = None;
+        let result = handle_startup(&mut phase, true, &body.freeze(), &mut pending);
+        assert!(matches!(result, HandleResult::Reply(Opcode::Error, _)));
+        assert!(pending.is_none());
     }
 }
