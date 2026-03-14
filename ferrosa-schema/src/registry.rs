@@ -245,6 +245,7 @@ impl Schema {
     /// Create a keyspace without auth checks. Idempotent — succeeds silently
     /// if keyspace already exists.
     pub fn create_keyspace_internal(&self, ks: KeyspaceMetadata) -> crate::Result<()> {
+        crate::validation::validate_keyspace(&ks)?;
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         if snap.keyspaces.contains_key(&ks.name) {
@@ -259,6 +260,7 @@ impl Schema {
     /// Create a table without auth checks. Idempotent — succeeds silently
     /// if table already exists.
     pub fn create_table_internal(&self, table: TableMetadata) -> crate::Result<()> {
+        crate::validation::validate_table(&table)?;
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (table.keyspace.clone(), table.name.clone());

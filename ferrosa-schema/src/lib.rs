@@ -13,6 +13,7 @@ pub mod registry;
 pub mod secrets;
 pub mod startup;
 pub mod system;
+pub mod validation;
 pub mod virtual_registry;
 pub mod virtual_table;
 
