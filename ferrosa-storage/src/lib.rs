@@ -18,6 +18,7 @@ pub mod commitlog;
 pub mod compaction;
 pub mod engine;
 pub mod flush;
+pub mod index;
 pub mod manifest;
 pub mod memtable;
 pub mod merge;
