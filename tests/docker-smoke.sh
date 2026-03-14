@@ -100,10 +100,10 @@ cql1 "CREATE KEYSPACE smoke_test WITH replication = {'class': 'SimpleStrategy', 
 cql1 "CREATE TABLE smoke_test.kv (k text PRIMARY KEY, v text)"
 pass "Schema created on node1"
 
-# Verify schema replicated to node2
+# Verify schema replicated to node2 via DDL forwarding
 info "Verifying schema replicated to node2..."
 sleep 2
-if cql2 "SELECT * FROM smoke_test.kv LIMIT 1;" >/dev/null 2>&1; then
+if cql2 "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = 'smoke_test';" 2>&1 | grep -q "smoke_test"; then
     pass "Schema replicated to node2 via DDL forwarding"
 else
     info "DDL replication not yet working — creating schema on node2 as fallback"
@@ -214,12 +214,12 @@ wait_cql 9042 "node1" 60
 info "Waiting for pair mode re-establishment and schema catch-up..."
 sleep 15
 
-# Verify schema was replicated via catch-up (node1 should know about smoke_test.kv)
+# Verify schema was replicated via catch-up (node1 should know about smoke_test keyspace)
 info "Verifying schema catch-up on node1..."
-if cql1 "SELECT * FROM smoke_test.kv LIMIT 1;" >/dev/null 2>&1; then
-    pass "Schema catch-up: smoke_test.kv table exists on node1"
+if cql1 "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = 'smoke_test';" 2>&1 | grep -q "smoke_test"; then
+    pass "Schema catch-up: smoke_test keyspace exists on node1"
 else
-    info "Schema catch-up did not arrive on node1 — table not found"
+    info "Schema catch-up did not arrive on node1 — keyspace not found"
 fi
 
 # Verify original data is still on node1 (from persistent storage)

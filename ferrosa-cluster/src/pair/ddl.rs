@@ -17,7 +17,7 @@ use ferrosa_net::peer::PeerManager;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 use ferrosa_schema::metadata::keyspace::KeyspaceMetadata;
 use ferrosa_schema::metadata::table::TableMetadata;
-use ferrosa_schema::{is_system_keyspace, Schema, SchemaSnapshot};
+use ferrosa_schema::{is_system_keyspace, GrantEntry, RoleMetadata, Schema, SchemaSnapshot};
 use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::{ClusterError, Result};
@@ -231,6 +231,52 @@ impl RpcHandler for PairDdlForwardHandler {
 }
 
 // ---------------------------------------------------------------------------
+// WireSchemaSnapshot — JSON-safe snapshot format
+// ---------------------------------------------------------------------------
+
+/// JSON-serializable version of `SchemaSnapshot`.
+///
+/// `SchemaSnapshot` uses `HashMap<(String, String), TableMetadata>` for tables,
+/// which serde_json can't serialize (tuple keys aren't valid JSON keys).
+/// This struct converts tables to a `Vec` for wire transmission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireSchemaSnapshot {
+    pub version: Uuid,
+    pub keyspaces: std::collections::HashMap<String, KeyspaceMetadata>,
+    pub tables: Vec<((String, String), TableMetadata)>,
+    pub roles: std::collections::HashMap<String, RoleMetadata>,
+    pub grants: std::collections::HashMap<String, Vec<GrantEntry>>,
+}
+
+impl WireSchemaSnapshot {
+    /// Convert from a `SchemaSnapshot` for wire transmission.
+    pub fn from_snapshot(snap: &SchemaSnapshot) -> Self {
+        Self {
+            version: snap.version,
+            keyspaces: snap.keyspaces.clone(),
+            tables: snap
+                .tables
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            roles: snap.roles.clone(),
+            grants: snap.grants.clone(),
+        }
+    }
+
+    /// Convert to a `SchemaSnapshot` for local application.
+    pub fn into_snapshot(self) -> SchemaSnapshot {
+        SchemaSnapshot {
+            version: self.version,
+            keyspaces: self.keyspaces,
+            tables: self.tables.into_iter().collect(),
+            roles: self.roles,
+            grants: self.grants,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PairSchemaSyncHandler
 // ---------------------------------------------------------------------------
 
@@ -257,13 +303,14 @@ impl RpcHandler for PairSchemaSyncHandler {
             _ => return None,
         };
 
-        let snapshot: SchemaSnapshot = match serde_json::from_slice(&body) {
+        let wire: WireSchemaSnapshot = match serde_json::from_slice(&body) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("failed to decode PairSchemaSync: {e}");
                 return None;
             }
         };
+        let snapshot = wire.into_snapshot();
 
         // Register each non-system table with the storage engine.
         for ((keyspace, _table_name), table) in &snapshot.tables {

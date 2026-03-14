@@ -351,8 +351,12 @@ impl ModeController {
                 }
 
                 // Send schema snapshot before mutation replay.
+                // SchemaSnapshot has HashMap<(String,String), _> which serde_json
+                // can't serialize (tuple keys aren't valid JSON keys). Use bincode-
+                // style workaround: serialize tables as a Vec of (key, value) pairs.
                 let snap = schema.snapshot();
-                match serde_json::to_vec(&*snap) {
+                let wire_snap = crate::pair::ddl::WireSchemaSnapshot::from_snapshot(&snap);
+                match serde_json::to_vec(&wire_snap) {
                     Ok(json) => {
                         match pm
                             .send(
