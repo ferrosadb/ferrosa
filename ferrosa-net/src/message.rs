@@ -5,9 +5,12 @@ use uuid::Uuid;
 use crate::codec::MsgType;
 use crate::error::{NetError, Result};
 
-fn put_string(buf: &mut BytesMut, s: &str) {
-    buf.put_u16(s.len() as u16);
+fn put_string(buf: &mut BytesMut, s: &str) -> Result<()> {
+    let len = u16::try_from(s.len())
+        .map_err(|_| NetError::Protocol("string exceeds u16::MAX bytes".into()))?;
+    buf.put_u16(len);
     buf.put_slice(s.as_bytes());
+    Ok(())
 }
 
 fn get_string(buf: &mut Bytes) -> Result<String> {
@@ -137,7 +140,7 @@ impl Message {
     }
 
     /// Encode message body to bytes. Does NOT include the frame header.
-    pub fn encode(&self, buf: &mut BytesMut) {
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<()> {
         match self {
             Self::Handshake {
                 cluster_name,
@@ -146,7 +149,7 @@ impl Message {
                 supported_compression,
                 auth_token,
             } => {
-                put_string(buf, cluster_name);
+                put_string(buf, cluster_name)?;
                 put_uuid(buf, host_id);
                 buf.put_u8(*protocol_version);
                 buf.put_u8(supported_compression.len() as u8);
@@ -164,7 +167,7 @@ impl Message {
                 buf.put_u8(*protocol_version);
                 buf.put_u8(*chosen_compression);
                 buf.put_u8(if *accepted { 1 } else { 0 });
-                put_string(buf, reason);
+                put_string(buf, reason)?;
             }
             Self::Ping { nonce } | Self::Pong { nonce } => buf.put_u64(*nonce),
             Self::PairCatchUp {
@@ -198,6 +201,7 @@ impl Message {
             | Self::PairWriteAck(b)
             | Self::PairCatchUpResponse(b) => buf.put_slice(b),
         }
+        Ok(())
     }
 
     /// Decode message body from bytes given the message type from the frame header.
@@ -312,7 +316,7 @@ mod tests {
     fn ping_roundtrip() {
         let msg = Message::Ping { nonce: 42 };
         let mut buf = BytesMut::new();
-        msg.encode(&mut buf);
+        msg.encode(&mut buf).unwrap();
         let decoded = Message::decode(MsgType::Ping, &mut buf.freeze()).unwrap();
         assert_eq!(decoded, Message::Ping { nonce: 42 });
     }
@@ -327,7 +331,7 @@ mod tests {
             auth_token: vec![0xAB; 32],
         };
         let mut buf = BytesMut::new();
-        msg.encode(&mut buf);
+        msg.encode(&mut buf).unwrap();
         let decoded = Message::decode(MsgType::Handshake, &mut buf.freeze()).unwrap();
         assert_eq!(decoded, msg);
     }
@@ -339,7 +343,7 @@ mod tests {
             last_offset: 4096,
         };
         let mut buf = BytesMut::new();
-        msg.encode(&mut buf);
+        msg.encode(&mut buf).unwrap();
         let decoded = Message::decode(MsgType::PairCatchUp, &mut buf.freeze()).unwrap();
         assert_eq!(decoded, msg);
     }
