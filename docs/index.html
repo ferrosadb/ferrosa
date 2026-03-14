@@ -997,6 +997,19 @@
       </p>
       <span class="metric">auto-flush · compaction · backpressure · graceful shutdown</span>
     </div>
+
+    <!-- WASM User-Defined Functions -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(180, 130, 255, 0.12);">&#x2699;</div>
+      <h3>WebAssembly Functions <span style="font-size: 0.7em; color: var(--accent-secondary); font-weight: 600;">COMING SOON</span></h3>
+      <p>
+        User-defined functions execute as sandboxed WebAssembly — no Java, no JavaScript.
+        Upload a compiled WASM binary to a table, reference it in CREATE FUNCTION with an AS clause.
+        Write functions in Rust (preferred), C, Go, or any language that compiles to WASM.
+        Memory-limited, CPU-time-limited, no network or filesystem access. Deterministic execution guaranteed.
+      </p>
+      <span class="metric">WASM sandbox · Rust-native · deterministic · no GC runtime</span>
+    </div>
   </div>
 </section>
 
@@ -1225,6 +1238,14 @@ user = session.execute(stmt, [user_id])
           <td>CDC (external)</td>
           <td>DynamoDB Streams</td>
           <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>UDF Language</td>
+          <td class="ferrosa-col">WASM (any language)</td>
+          <td>Java</td>
+          <td>Lua / WASM</td>
+          <td>N/A</td>
+          <td>N/A</td>
         </tr>
         <tr>
           <td>Built-in Observability</td>
