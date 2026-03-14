@@ -22,10 +22,10 @@ use ferrosa_index::{DistanceMetric, IndexType, PhoneticAlgorithm, VectorMethod};
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local, query_peers, query_role_members,
     query_role_permissions, query_roles, query_tables, AuthContext,
-    ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry, IndexMetadata,
-    KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams, Resource,
-    RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates, VirtualColumnDef,
-    VirtualRow,
+    ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
+    IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
+    Resource, RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
+    VirtualColumnDef, VirtualRow,
 };
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;

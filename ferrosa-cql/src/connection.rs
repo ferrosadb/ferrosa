@@ -71,10 +71,15 @@ impl Drop for ConnectionGuard {
 ///
 /// This function owns the TCP connection and processes frames until the client
 /// disconnects, an error occurs, or the idle timeout fires.
+///
+/// In-flight request limiting: a semaphore bounds the number of concurrent
+/// requests being processed. When the limit is reached, new requests receive
+/// ERROR(Overloaded) without consuming a permit.
 pub async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
     max_frame_size: u32,
+    max_in_flight: usize,
     auth_disabled: bool,
     state: Arc<SharedState>,
 ) {
@@ -106,6 +111,11 @@ pub async fn handle_connection(
     let mut subscription_state = SubscriptionState::new(8);
     let mut pending_compression: Option<Compression> = None;
 
+    // In-flight request limiter: bounds concurrent requests on this connection.
+    // Currently the handler is sequential (one frame at a time), so this acts as
+    // a guard for future concurrent frame handling (CQL v5 stream multiplexing).
+    let in_flight = tokio::sync::Semaphore::new(max_in_flight);
+
     loop {
         // M11: idle timeout — drop connection if no frame arrives within IDLE_TIMEOUT.
         let maybe_frame = match timeout(IDLE_TIMEOUT, framed.next()).await {
@@ -127,6 +137,39 @@ pub async fn handle_connection(
         };
 
         let stream_id = maybe_frame.header.stream_id;
+
+        // Check in-flight limit for request opcodes (QUERY, EXECUTE, BATCH).
+        let is_request = matches!(
+            maybe_frame.header.opcode,
+            Opcode::Query | Opcode::Execute | Opcode::Batch
+        );
+        let _permit = if is_request {
+            match in_flight.try_acquire() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    // At capacity — respond with ERROR(Overloaded).
+                    debug!("in-flight limit reached for {peer}, rejecting request");
+                    let err = CqlError::Overloaded;
+                    let body = err.encode_body().freeze();
+                    let frame = CqlFrame {
+                        header: FrameHeader {
+                            version: VERSION_RESPONSE,
+                            flags: 0,
+                            stream_id,
+                            opcode: Opcode::Error,
+                            length: 0,
+                        },
+                        body,
+                    };
+                    if framed.send(frame).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
 
         // Snapshot phase discriminant before handling, so we can detect transitions.
         let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);

@@ -273,6 +273,42 @@ impl CommitLog {
         Ok(())
     }
 
+    /// Discards closed segments that have no remaining dirty tables.
+    ///
+    /// This is a lightweight GC pass for the maintenance loop. Unlike
+    /// `discard_completed()` which marks specific table positions, this method
+    /// only removes segments where the tracker already shows zero dirty tables
+    /// (i.e., all tables were previously discarded via `discard_completed()`).
+    ///
+    /// Returns the number of segments cleaned up.
+    pub fn discard_completed_segments(&self) -> ferrosa_common::Result<usize> {
+        let mut segments_to_delete = Vec::new();
+
+        {
+            let mut tracker = self.segment_tracker.lock();
+            let segment_ids: Vec<u64> = tracker.keys().copied().collect();
+            for seg_id in segment_ids {
+                if tracker.get(&seg_id).is_some_and(|tables| tables.is_empty()) {
+                    tracker.remove(&seg_id);
+                    segments_to_delete.push(seg_id);
+                }
+            }
+        }
+
+        let count = segments_to_delete.len();
+        if !segments_to_delete.is_empty() {
+            let mut closed = self.closed_segments.lock();
+            for seg_id in &segments_to_delete {
+                if let Some(idx) = closed.iter().position(|s| s.id == *seg_id) {
+                    let segment = closed.remove(idx);
+                    let _ = fs::remove_file(segment.path());
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
     /// Forces rotation of the active segment.
     ///
     /// Allocates a new segment, atomically swaps it in via `ArcSwap`, and moves

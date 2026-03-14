@@ -749,6 +749,19 @@ impl StorageEngine {
     pub fn upload_manager(&self) -> Option<&UploadManager> {
         self.upload_manager.as_ref()
     }
+
+    /// Returns true if S3 object storage is configured.
+    pub fn has_s3(&self) -> bool {
+        self.upload_manager.is_some()
+    }
+
+    /// Discards commit log segments that have no remaining dirty tables.
+    ///
+    /// Called from the background maintenance loop. Returns the number of
+    /// segments cleaned up.
+    pub fn discard_completed_commit_log_segments(&self) -> ferrosa_common::Result<usize> {
+        self.commit_log.discard_completed_segments()
+    }
 }
 
 #[cfg(test)]
