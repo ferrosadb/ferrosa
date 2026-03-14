@@ -611,119 +611,6 @@
       line-height: 1.65;
     }
 
-    /* ── Progress section ── */
-    .progress-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-      gap: 1rem;
-      margin-top: 3rem;
-    }
-
-    .progress-card {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 1.5rem;
-      transition: border-color 0.2s;
-    }
-
-    .progress-card:hover { border-color: var(--border-hover); }
-
-    .progress-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 0.75rem;
-    }
-
-    .progress-card h4 {
-      font-size: 0.9375rem;
-      font-weight: 700;
-      font-family: var(--font-mono);
-    }
-
-    .progress-badge {
-      font-size: 0.6875rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      padding: 0.1875rem 0.5rem;
-      border-radius: 100px;
-    }
-
-    .progress-badge.complete {
-      background: rgba(107, 201, 160, 0.15);
-      color: var(--accent-green);
-    }
-
-    .progress-badge.active {
-      background: rgba(226, 114, 91, 0.15);
-      color: var(--accent);
-    }
-
-    .progress-badge.planned {
-      background: rgba(148, 148, 163, 0.1);
-      color: var(--text-muted);
-    }
-
-    .progress-bar-track {
-      height: 4px;
-      background: var(--bg-primary);
-      border-radius: 2px;
-      margin-bottom: 0.625rem;
-      overflow: hidden;
-    }
-
-    .progress-bar-fill {
-      height: 100%;
-      border-radius: 2px;
-      background: var(--accent-green);
-      transition: width 0.6s ease;
-    }
-
-    .progress-bar-fill.active-fill {
-      background: linear-gradient(90deg, var(--accent-green), var(--accent));
-    }
-
-    .progress-desc {
-      font-size: 0.8125rem;
-      color: var(--text-muted);
-      line-height: 1.5;
-    }
-
-    .progress-stats {
-      display: flex;
-      gap: 1rem;
-      margin-top: 3rem;
-      justify-content: center;
-      flex-wrap: wrap;
-    }
-
-    .progress-stat {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 1.25rem 1.75rem;
-      text-align: center;
-    }
-
-    .progress-stat .val {
-      font-size: 1.75rem;
-      font-weight: 800;
-      color: var(--text-primary);
-      letter-spacing: -0.02em;
-    }
-
-    .progress-stat .val .unit { color: var(--accent); font-size: 1.25rem; }
-
-    .progress-stat .lbl {
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      margin-top: 0.125rem;
-    }
-
     /* ── CTA section ── */
     .cta-section {
       text-align: center;
@@ -817,7 +704,7 @@
       <li><a href="#compare">Compare</a></li>
       <li><a href="#architecture">Architecture</a></li>
       <li><a href="#use-cases">Use Cases</a></li>
-      <li><a href="#progress">Status</a></li>
+      <li><a href="#progress">Scaling</a></li>
       <li><a href="brand.html">Brand</a></li>
       <li><a href="https://github.com/bkearns/ferrosa">GitHub</a></li>
     </ul>
@@ -917,8 +804,7 @@
         <p>
           Durable storage lives in S3. Local NVMe is a hot cache, not a commitment.
           Nodes are ephemeral — lose one, spin up a replacement, and it's serving reads
-          from S3 in seconds instead of streaming for hours. Real STCS compaction with
-          merge I/O, commit log with CDC, and manifest-tracked S3 uploads.
+          from S3 in seconds instead of streaming for hours.
         </p>
         <p style="margin-top: 0.75rem;">
           Works with AWS S3, MinIO, Cloudflare R2, or any S3-compatible endpoint.
@@ -969,7 +855,7 @@
       <p>
         No JVM. No garbage collector. No stop-the-world pauses.
         Lock-free reads via ArcSwap, sharded memtables with nanosecond-level write locks,
-        async I/O on Tokio. 48K lines of Rust across 10 crates, backed by 1,083 tests.
+        async I/O on Tokio. Predictable latency from the first request to the billionth.
       </p>
       <span class="metric">P99 latency: no GC tail</span>
     </div>
@@ -981,8 +867,7 @@
       <p>
         CQL protocol v5 — the same wire protocol your drivers already speak.
         Python, Java, Go, Node.js drivers connect without code changes.
-        DDL, DML, prepared statements, batch operations, LZ4/Snappy frame compression,
-        SASL auth, system keyspaces — all there.
+        DDL, DML, prepared statements, batch operations, system keyspaces — all there.
       </p>
       <span class="metric">0 driver changes required</span>
     </div>
@@ -1008,14 +893,12 @@
         <p>
           SUBSCRIBE to any CQL or Cypher query for real-time change streaming.
           Interval polling with EVERY, or push-on-write with DELTA mode.
-          SubscriptionObserver hooks directly into the commit log — no external
-          Kafka, Debezium, or CDC connector pipeline needed.
+          No external Kafka, Debezium, or CDC connector pipeline needed —
+          change data capture is built into the storage engine.
         </p>
         <p style="margin-top: 0.75rem;">
-          Fully backward compatible. SUBSCRIBE uses native CQL v5 framing with
-          a STREAMING response flag — existing drivers work unchanged, no client
-          modifications required. Subscribe to CQL tables, graph traversals,
-          or observability virtual tables with the same syntax.
+          Fully backward compatible with existing CQL drivers. Subscribe to
+          tables, graph traversals, or observability views with the same syntax.
         </p>
         <span class="metric">SUBSCRIBE social.users EVERY 5s</span>
       </div>
@@ -1028,11 +911,7 @@
 
 <span class="cm">-- Subscribe to a graph traversal</span>
 <span class="kw">SUBSCRIBE</span> <span class="kw">MATCH</span> (a:<span class="type">Person</span>)-[:<span class="type">FOLLOWS</span>]->(b)
-<span class="kw">RETURN</span> b.name <span class="kw">EVERY</span> <span class="num">10</span>s;
-
-<span class="cm">-- Monitor cluster state in real time</span>
-<span class="kw">SUBSCRIBE</span> system_observability.connections
-  <span class="kw">EVERY</span> <span class="num">5</span>s;</pre>
+<span class="kw">RETURN</span> b.name <span class="kw">EVERY</span> <span class="num">10</span>s;</pre>
       </div>
     </div>
 
@@ -1042,10 +921,10 @@
       <h3>Lock-Free Architecture</h3>
       <p>
         Readers never block. ArcSwap provides wait-free atomic view loading.
-        Writers touch sharded memtables for nanoseconds. Custom internode protocol
-        with 3 priority lanes (Raft, data, bulk) and PSK-authenticated handshake.
+        Writers touch sharded memtables for nanoseconds. No global locks, no contention,
+        no coordination overhead on the hot path.
       </p>
-      <span class="metric">wait-free reads · 3 priority lanes</span>
+      <span class="metric">wait-free reads · zero contention</span>
     </div>
 
     <!-- Observability -->
@@ -1055,7 +934,7 @@
       <p>
         Query cluster state with CQL — connections, storage stats, active queries, topology.
         SUBSCRIBE for streaming updates. Prometheus metrics at /metrics.
-        ferrosa-ctl with live ratatui TUI dashboard. Web console on :9090.
+        CLI tool with live TUI dashboards. Web console included. No external agents required.
       </p>
       <span class="metric">SELECT * FROM system_observability.*</span>
     </div>
@@ -1388,123 +1267,43 @@ user = session.execute(stmt, [user_id])
   </div>
 </section>
 
-<!-- ═══════════════════ Progress ═══════════════════ -->
+<!-- ═══════════════════ Scaling ═══════════════════ -->
 <div class="comparison" id="progress">
   <section>
-    <p class="section-label centered">Development Status</p>
-    <h2 class="section-title centered">Shipping crates, not slideware</h2>
+    <p class="section-label centered">Grow With You</p>
+    <h2 class="section-title centered">One binary. Every scale.</h2>
     <p class="section-subtitle centered">
-      Ferrosa is a fully functional single-node CQL database today. Multi-node clustering is next.
+      Start on your laptop, ship to production. No re-architecture, no migration between tiers.
+      The same Ferrosa binary handles every stage of your growth.
     </p>
 
-    <div class="progress-stats">
-      <div class="progress-stat">
-        <div class="val">10</div>
-        <div class="lbl">Rust Crates</div>
+    <div class="use-cases" style="margin-top: 3rem;">
+      <div class="use-case">
+        <p class="use-case-label migrate">1 Node</p>
+        <h3>Development &amp; prototyping</h3>
+        <p>
+          Run a single Ferrosa node locally. Full CQL compatibility, graph queries, and SUBSCRIBE
+          all work out of the box. No cluster setup, no coordination overhead.
+          Your application code stays exactly the same as you scale up.
+        </p>
       </div>
-      <div class="progress-stat">
-        <div class="val">48<span class="unit">K</span></div>
-        <div class="lbl">Lines of Code</div>
+      <div class="use-case">
+        <p class="use-case-label cloud">2 Nodes</p>
+        <h3>High availability with pair mode</h3>
+        <p>
+          Add a second node and Ferrosa automatically enters pair mode — synchronous replication
+          with instant failover. Perfect for production workloads that need HA without the
+          complexity of a full distributed cluster.
+        </p>
       </div>
-      <div class="progress-stat">
-        <div class="val">1,083</div>
-        <div class="lbl">Tests</div>
-      </div>
-      <div class="progress-stat">
-        <div class="val">150<span class="unit">+</span></div>
-        <div class="lbl">Source Files</div>
-      </div>
-    </div>
-
-    <div class="progress-grid">
-      <div class="progress-card">
-        <div class="progress-header">
-          <h4>ferrosa-common</h4>
-          <span class="progress-badge complete">Complete</span>
-        </div>
-        <div class="progress-bar-track"><div class="progress-bar-fill" style="width: 95%"></div></div>
-        <div class="progress-desc">Token, PartitionKey, DecoratedKey, CellValue, Murmur3 partitioner. Property tests.</div>
-      </div>
-
-      <div class="progress-card">
-        <div class="progress-header">
-          <h4>ferrosa-sstable</h4>
-          <span class="progress-badge complete">Complete</span>
-        </div>
-        <div class="progress-bar-track"><div class="progress-bar-fill" style="width: 95%"></div></div>
-        <div class="progress-desc">Full BTI read/write. On-disk trie, Bloom filter, LZ4/Zstd compression, Cassandra compat.</div>
-      </div>
-
-      <div class="progress-card">
-        <div class="progress-header">
-          <h4>ferrosa-storage</h4>
-          <span class="progress-badge complete">Mostly Complete</span>
-        </div>
-        <div class="progress-bar-track"><div class="progress-bar-fill active-fill" style="width: 85%"></div></div>
-        <div class="progress-desc">Sharded memtable, commit log with CDC, STCS compaction with real merge I/O, S3 upload manager, local LRU cache.</div>
-      </div>
-
-      <div class="progress-card">
-        <div class="progress-header">
-          <h4>ferrosa-schema</h4>
-          <span class="progress-badge complete">Mostly Complete</span>
-        </div>
-        <div class="progress-bar-track"><div class="progress-bar-fill active-fill" style="width: 80%"></div></div>
-        <div class="progress-desc">Schema registry with ArcSwap lock-free reads, RBAC auth (bcrypt/argon2), column-level permissions, audit logging.</div>
-      </div>
-
-      <div class="progress-card">
-        <div class="progress-header">
-          <h4>ferrosa-cql</h4>
-          <span class="progress-badge complete">Complete</span>
-        </div>
-        <div class="progress-bar-track"><div class="progress-bar-fill" style="width: 95%"></div></div>
-        <div class="progress-desc">CQL v5 framing, SASL auth, LL(2) parser, prepared statement cache, LZ4/Snappy compression, SUBSCRIBE extensions.</div>
-      </div>
-
-      <div class="progress-card">
-        <div class="progress-header">
-          <h4>ferrosa-graph</h4>
-          <span class="progress-badge complete">Phase 1</span>
-        </div>
-        <div class="progress-bar-track"><div class="progress-bar-fill active-fill" style="width: 75%"></div></div>
-        <div class="progress-desc">Cypher parser, logical/physical planner, expand executor, adjacency index, HTTP/JSON endpoint with auth and TLS.</div>
-      </div>
-
-      <div class="progress-card">
-        <div class="progress-header">
-          <h4>ferrosa-net</h4>
-          <span class="progress-badge complete">Phase 1</span>
-        </div>
-        <div class="progress-bar-track"><div class="progress-bar-fill active-fill" style="width: 70%"></div></div>
-        <div class="progress-desc">Binary wire protocol with 3 priority lanes, PSK-authenticated handshake, RPC server/client, heartbeat failure detection.</div>
-      </div>
-
-      <div class="progress-card">
-        <div class="progress-header">
-          <h4>ferrosa-ctl</h4>
-          <span class="progress-badge complete">Complete</span>
-        </div>
-        <div class="progress-bar-track"><div class="progress-bar-fill" style="width: 90%"></div></div>
-        <div class="progress-desc">CLI admin tool. Commands: query, describe, monitor, metrics. TUI dashboard with ratatui.</div>
-      </div>
-
-      <div class="progress-card">
-        <div class="progress-header">
-          <h4>ferrosa (binary)</h4>
-          <span class="progress-badge complete">Single-Node</span>
-        </div>
-        <div class="progress-bar-track"><div class="progress-bar-fill active-fill" style="width: 80%"></div></div>
-        <div class="progress-desc">CQL on :9042, graph HTTP on :7474, web console on :9090. Integration smoke tests for full lifecycle.</div>
-      </div>
-
-      <div class="progress-card">
-        <div class="progress-header">
-          <h4>ferrosa-cluster</h4>
-          <span class="progress-badge active">In Progress</span>
-        </div>
-        <div class="progress-bar-track"><div class="progress-bar-fill active-fill" style="width: 10%"></div></div>
-        <div class="progress-desc">Raft metadata, token ring, tunable consistency levels, coordinator pattern. ConsistencyLevel with blockFor() landed.</div>
+      <div class="use-case">
+        <p class="use-case-label graph-uc">3+ Nodes</p>
+        <h3>Full ring with multi-DC replication</h3>
+        <p>
+          Scale to any number of nodes across multiple data centers. Raft consensus for
+          metadata, tunable consistency levels (ONE through ALL), and automatic
+          token ring rebalancing. Petabyte-scale with S3-backed storage economics.
+        </p>
       </div>
     </div>
   </section>
