@@ -107,7 +107,7 @@ impl StorageEngineConfig {
 pub struct StorageEngine {
     config: StorageEngineConfig,
     tables: RwLock<HashMap<TableId, TableState>>,
-    commit_log: CommitLog,
+    pub(crate) commit_log: CommitLog,
     compaction_executor: CompactionExecutor,
     upload_manager: Option<UploadManager>,
     local_cache: LocalCache,
@@ -179,9 +179,87 @@ impl StorageEngine {
         })
     }
 
+    /// Opens an existing storage engine directory and replays uncommitted
+    /// mutations from the commit log.
+    ///
+    /// Returns the engine and the list of mutations that need to be replayed.
+    /// Call [`replay_mutations`](Self::replay_mutations) with the returned
+    /// mutations after registering all table schemas.
+    pub fn open(
+        config: StorageEngineConfig,
+        runtime: Option<&tokio::runtime::Handle>,
+    ) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
+        std::fs::create_dir_all(&config.data_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("failed to create data dir: {e}"))
+        })?;
+        std::fs::create_dir_all(&config.commit_log.log_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
+        })?;
+
+        let (commit_log, pending_mutations) =
+            crate::commitlog::CommitLog::open_and_replay(config.commit_log.clone())?;
+
+        let compaction_executor = CompactionExecutor::new();
+
+        let upload_manager = match (&config.object_store, runtime) {
+            (Some(os_config), Some(rt)) => {
+                let store = os_config.build_object_store()?;
+                Some(UploadManager::new(
+                    Arc::from(store),
+                    os_config.prefix.clone(),
+                    os_config.upload_queue_depth,
+                    rt,
+                ))
+            }
+            _ => None,
+        };
+
+        let local_cache =
+            LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
+
+        let engine = Self {
+            config,
+            tables: RwLock::new(HashMap::new()),
+            commit_log,
+            compaction_executor,
+            upload_manager,
+            local_cache,
+            observers: RwLock::new(Vec::new()),
+            async_observers: RwLock::new(Vec::new()),
+            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+        };
+
+        Ok((engine, pending_mutations))
+    }
+
+    /// Replays a set of pending mutations into their respective table memtables.
+    ///
+    /// This is called after [`open`](Self::open) and after all table schemas
+    /// have been registered via [`register_table`](Self::register_table).
+    /// Mutations for unregistered tables are silently skipped.
+    pub fn replay_mutations(&self, mutations: Vec<Mutation>) -> ferrosa_common::Result<()> {
+        for mutation in mutations {
+            let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+            let tables = self.tables.read();
+            if let Some(state) = tables.get(&table_id) {
+                for row in &mutation.rows {
+                    // Use best-effort replay: log but don't fail on individual row errors.
+                    if let Err(e) = state.store.write(&mutation.key, row.clone()) {
+                        eprintln!("[replay] failed to replay row for {table_id}: {e}");
+                    }
+                }
+            }
+            // Tables not yet registered are silently skipped.
+        }
+        Ok(())
+    }
+
     /// Registers a table schema so the engine can accept writes for it.
     ///
     /// Creates the per-table `FileFlushTarget` directory and `TableStore`.
+    /// If the directory already contains SSTable files from a previous run,
+    /// they are opened and loaded into the store so reads work immediately
+    /// after re-opening the engine (crash recovery path).
     pub fn register_table(&self, schema: TableSchema) -> ferrosa_common::Result<()> {
         let table_id = TableId::new(&schema.keyspace, &schema.table);
         let table_dir = self
@@ -193,12 +271,68 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("failed to create table dir: {e}"))
         })?;
 
-        let flush_target = FileFlushTarget::new(table_dir)?;
-        let store = TableStore::new(schema.clone(), flush_target, WriteOptions::default());
+        // Load any SSTables that already exist on disk (e.g., after crash recovery).
+        let existing_sstables = Self::load_existing_sstables(&table_dir);
+
+        let flush_target = FileFlushTarget::new_starting_at(table_dir)?;
+        let store = if existing_sstables.is_empty() {
+            TableStore::new(schema.clone(), flush_target, WriteOptions::default())
+        } else {
+            TableStore::new_with_sstables(
+                schema.clone(),
+                flush_target,
+                WriteOptions::default(),
+                existing_sstables,
+            )
+        };
 
         let state = TableState { schema, store };
         self.tables.write().insert(table_id, state);
         Ok(())
+    }
+
+    /// Scans a table directory for existing SSTable files and opens them.
+    ///
+    /// Returns readers ordered newest-first (by generation number descending).
+    /// Files that fail to open are silently skipped — a corrupted SSTable is
+    /// better handled at compaction time than at startup.
+    fn load_existing_sstables(
+        table_dir: &std::path::Path,
+    ) -> Vec<Arc<ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt>>> {
+        // Collect all generation numbers by looking for Data.db files.
+        let mut generations: Vec<u64> = std::fs::read_dir(table_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                if name.ends_with("-Data.db") {
+                    name.split('-').next()?.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort descending — newest generation first.
+        generations.sort_by(|a, b| b.cmp(a));
+
+        generations
+            .into_iter()
+            .filter_map(|gen| {
+                let gen_str = gen.to_string();
+                match Self::open_sstable_from_dir(table_dir, &gen_str) {
+                    Ok(reader) => Some(Arc::new(reader)),
+                    Err(e) => {
+                        eprintln!(
+                            "[storage-engine] skipping corrupt SSTable gen {gen} in {}: {e}",
+                            table_dir.display()
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Registers an observer that will be notified when mutations are written.
@@ -1026,5 +1160,160 @@ mod tests {
             "expected >= 3 drops, got {}",
             engine.observer_drop_count()
         );
+    }
+
+    #[test]
+    fn full_lifecycle_write_flush_replay_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+
+        // Phase 1: Write data across multiple flush cycles.
+        {
+            let mut config = StorageEngineConfig::test_config(dir.path());
+            config.compaction.min_threshold = 4;
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+
+            // 4 flush cycles → 4 SSTables → triggers STCS
+            for batch in 0..4 {
+                for i in 0..3 {
+                    let key_name = format!("batch{batch}_key{i}");
+                    let ts = (batch * 1000 + i) as i64;
+                    engine
+                        .write(
+                            &tid,
+                            &make_key(&key_name),
+                            make_row(key_name.as_bytes(), ts),
+                            ts,
+                        )
+                        .unwrap();
+                }
+                engine.flush(&tid).unwrap();
+            }
+
+            assert_eq!(engine.sstable_count(&tid), 4);
+
+            // Write one more (not flushed) — this must survive via replay.
+            engine
+                .write(
+                    &tid,
+                    &make_key("unflushed"),
+                    make_row(b"survive", 9999),
+                    9999,
+                )
+                .unwrap();
+
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        // Phase 2: Re-open, replay, verify all data present.
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let (engine, pending) = StorageEngine::open(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.replay_mutations(pending).unwrap();
+
+            // The unflushed mutation should be present from replay.
+            let result = engine.read(&tid, &make_key("unflushed")).unwrap();
+            assert!(result.is_some(), "unflushed mutation should survive replay");
+
+            // All flushed data should also be readable.
+            for batch in 0..4 {
+                for i in 0..3 {
+                    let key_name = format!("batch{batch}_key{i}");
+                    let r = engine.read(&tid, &make_key(&key_name)).unwrap();
+                    assert!(r.is_some(), "flushed key {key_name} should be readable");
+                }
+            }
+
+            engine.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn replay_tolerates_corrupt_segment() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Phase 1: Write data.
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+
+            let tid = table_id();
+            engine
+                .write(&tid, &make_key("good"), make_row(b"val", 1000), 1000)
+                .unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        // Corrupt one of the segment files by overwriting bytes in the middle.
+        let log_dir = dir.path();
+        for entry in std::fs::read_dir(log_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("log") {
+                let mut data = std::fs::read(&path).unwrap();
+                if data.len() > 100 {
+                    // Corrupt some bytes in the data section (after the header).
+                    for b in &mut data[80..90] {
+                        *b = 0xFF;
+                    }
+                    std::fs::write(&path, &data).unwrap();
+                }
+            }
+        }
+
+        // Phase 2: Replay should skip the corrupted entry.
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let (engine, pending) = StorageEngine::open(config, None).unwrap();
+            // Replay should not panic — corrupted entries are silently skipped.
+            engine.register_table(test_schema()).unwrap();
+            engine.replay_mutations(pending).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_read_during_compaction() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 2;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+
+        // Create 2 SSTables.
+        engine
+            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine
+            .write(&tid, &make_key("k2"), make_row(b"v2", 2000), 2000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Start a concurrent reader that continuously reads.
+        let eng = Arc::clone(&engine);
+        let reader_tid = tid.clone();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..100 {
+                // These reads must always succeed — ArcSwap provides
+                // atomic visibility regardless of concurrent compaction.
+                let r1 = eng.read(&reader_tid, &make_key("k1")).unwrap();
+                assert!(r1.is_some(), "k1 must always be readable");
+                let r2 = eng.read(&reader_tid, &make_key("k2")).unwrap();
+                assert!(r2.is_some(), "k2 must always be readable");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+
+        // Trigger compaction while reader is active.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        engine.poll_compactions();
+
+        handle.join().unwrap();
     }
 }

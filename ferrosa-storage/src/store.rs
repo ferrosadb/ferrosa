@@ -92,6 +92,31 @@ impl<F: FlushTarget> TableStore<F> {
         }
     }
 
+    /// Create a `TableStore` with an initial set of SSTable readers already loaded.
+    ///
+    /// Used during crash recovery to populate the store with SSTables that
+    /// were flushed before the crash. The readers must be ordered newest first.
+    pub fn new_with_sstables(
+        schema: TableSchema,
+        flush_target: F,
+        options: WriteOptions,
+        initial_sstables: Vec<Arc<SSTableReader<F::Reader>>>,
+    ) -> Self {
+        let active: Arc<dyn Memtable> = new_memtable();
+        let initial_view = StoreView {
+            active,
+            flushing: None,
+            sstables: Arc::new(initial_sstables),
+        };
+        Self {
+            schema,
+            view: ArcSwap::from_pointee(initial_view),
+            flush_guard: Mutex::new(()),
+            flush_target,
+            options,
+        }
+    }
+
     /// Write a row into the active memtable.
     ///
     /// Loads the current view atomically, then delegates to the memtable's
