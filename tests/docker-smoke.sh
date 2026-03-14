@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end Docker smoke test for two-node pair mode with MinIO.
+# End-to-end Docker smoke test for two-node pair mode with RustFS.
 #
 # Prerequisites:
 #   - Docker and Docker Compose installed
@@ -124,7 +124,7 @@ echo ""
 echo -e "${GREEN}All smoke tests passed!${NC}"
 echo ""
 info "Services still running. Use 'docker compose down -v' to stop."
-info "MinIO console: http://localhost:9001 (minioadmin/minioadmin)"
+info "RustFS console: http://localhost:9001 (rustfsadmin/rustfsadmin)"
 info "Node1 CQL: cqlsh localhost 9042"
 info "Node2 CQL: cqlsh localhost 9043"
 

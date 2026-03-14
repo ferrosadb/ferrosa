@@ -1,28 +1,29 @@
 services:
-  minio:
-    image: minio/minio
+  rustfs:
+    image: rustfs/rustfs:latest
     command: server /data --console-address ":9001"
     ports:
+      - "9000:9000"
       - "9001:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin  # pragma: allowlist secret
+      RUSTFS_ROOT_USER: rustfsadmin
+      RUSTFS_ROOT_PASSWORD: rustfsadmin  # pragma: allowlist secret
     volumes:
-      - minio-data:/data
+      - rustfs-data:/data
 
-  minio-init:
-    image: minio/mc
+  rustfs-init:
+    image: rustfs/rustfs:latest
     depends_on:
-      - minio
+      - rustfs
     entrypoint: >
-      sh -c "sleep 2 &&
-             mc alias set local http://minio:9000 minioadmin minioadmin &&
-             mc mb local/ferrosa-data --ignore-existing"
+      sh -c "sleep 3 &&
+             rustfs-cli alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+             rustfs-cli mb local/ferrosa-data --ignore-existing"
 
   node1:
     build: .
     depends_on:
-      - minio-init
+      - rustfs-init
     ports:
       - "9042:9042"
       - "9090:9090"
@@ -33,18 +34,18 @@ services:
       FERROSA_INTERNODE_BROADCAST: "node1:7000"
       FERROSA_SEED: "node2:7000"
       FERROSA_CLUSTER_NAME: ferrosa-dev
-      FERROSA_S3_ENDPOINT: "http://minio:9000"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
       FERROSA_S3_BUCKET: ferrosa-data
       FERROSA_S3_ALLOW_HTTP: "true"
-      FERROSA_S3_ACCESS_KEY_ID: minioadmin
-      FERROSA_S3_SECRET_ACCESS_KEY: minioadmin  # pragma: allowlist secret
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
     volumes:
       - node1-data:/var/lib/ferrosa
 
   node2:
     build: .
     depends_on:
-      - minio-init
+      - rustfs-init
     ports:
       - "9043:9042"
     environment:
@@ -54,15 +55,15 @@ services:
       FERROSA_INTERNODE_BROADCAST: "node2:7000"
       FERROSA_SEED: "node1:7000"
       FERROSA_CLUSTER_NAME: ferrosa-dev
-      FERROSA_S3_ENDPOINT: "http://minio:9000"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
       FERROSA_S3_BUCKET: ferrosa-data
       FERROSA_S3_ALLOW_HTTP: "true"
-      FERROSA_S3_ACCESS_KEY_ID: minioadmin
-      FERROSA_S3_SECRET_ACCESS_KEY: minioadmin  # pragma: allowlist secret
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
     volumes:
       - node2-data:/var/lib/ferrosa
 
 volumes:
-  minio-data:
+  rustfs-data:
   node1-data:
   node2-data:
