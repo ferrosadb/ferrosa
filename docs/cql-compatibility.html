@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — CQL Compatibility Reference</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #111118;
+      --bg-card: #16161f;
+      --bg-card-hover: #1c1c28;
+      --text-primary: #e8e8ed;
+      --text-secondary: #9494a3;
+      --text-muted: #6b6b7a;
+      --accent: #e2725b;
+      --accent-warm: #d4a574;
+      --accent-green: #6bc9a0;
+      --accent-cool: #7c9cf5;
+      --border: #1e1e2a;
+      --code-bg: #0d0d14;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 4rem 2rem 6rem;
+    }
+
+    .back-link {
+      display: inline-block;
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      margin-bottom: 2rem;
+    }
+    .back-link:hover { text-decoration: underline; }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.5rem;
+    }
+    h1 span { color: var(--accent); }
+
+    .subtitle {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      margin-bottom: 3rem;
+      max-width: 640px;
+      line-height: 1.7;
+    }
+
+    h2 {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1.5rem;
+      margin-top: 4rem;
+    }
+
+    h3 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+      margin-top: 2rem;
+    }
+
+    p, li {
+      color: var(--text-secondary);
+      margin-bottom: 1rem;
+      max-width: 720px;
+      line-height: 1.7;
+    }
+
+    ul, ol { padding-left: 1.5rem; margin-bottom: 1.5rem; }
+    li { margin-bottom: 0.5rem; }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.875em;
+      background: var(--code-bg);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      color: var(--accent-cool);
+    }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      overflow-x: auto;
+      margin-bottom: 1.5rem;
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      line-height: 1.8;
+      color: var(--text-secondary);
+    }
+
+    pre .cm { color: #546e7a; }
+    pre .kw { color: #c792ea; }
+    pre .str { color: #c3e88d; }
+    pre .var { color: #f78c6c; }
+    pre .type { color: #ffcb6b; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    th {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    td { color: var(--text-secondary); }
+    td:first-child { color: var(--text-primary); font-weight: 600; font-family: var(--font-mono); font-size: 0.875rem; }
+
+    .check { color: var(--accent-green); }
+    .cross { color: var(--text-muted); }
+    .partial { color: var(--accent-warm); }
+
+    .note {
+      background: rgba(226, 114, 91, 0.08);
+      border: 1px solid rgba(226, 114, 91, 0.2);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+    }
+
+    .note strong { color: var(--accent); }
+
+    .extension {
+      background: rgba(107, 201, 160, 0.08);
+      border: 1px solid rgba(107, 201, 160, 0.2);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+    }
+
+    .extension strong { color: var(--accent-green); }
+
+    .toc {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem 2rem;
+      margin-bottom: 2rem;
+    }
+
+    .toc h4 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
+      margin-bottom: 0.75rem;
+    }
+
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin-bottom: 0.375rem; }
+    .toc a { font-size: 0.9375rem; font-weight: 500; }
+
+    @media (max-width: 640px) {
+      table { font-size: 0.8125rem; }
+      th, td { padding: 0.5rem 0.625rem; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <a href="index.html" class="back-link">&larr; Back to homepage</a>
+
+  <h1>CQL <span>Reference</span></h1>
+  <p class="subtitle">Ferrosa implements CQL native protocol v5. This page documents what's supported, what's different, and what Ferrosa adds on top.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ul>
+      <li><a href="#protocol">Protocol</a></li>
+      <li><a href="#types">Data Types</a></li>
+      <li><a href="#ddl">DDL Statements</a></li>
+      <li><a href="#dml">DML Statements</a></li>
+      <li><a href="#auth-roles">Auth &amp; Roles</a></li>
+      <li><a href="#system">System Keyspaces</a></li>
+      <li><a href="#subscribe">SUBSCRIBE Extension</a></li>
+      <li><a href="#graph">Graph (Cypher) Extension</a></li>
+      <li><a href="#not-yet">Not Yet Supported</a></li>
+    </ul>
+  </div>
+
+  <!-- ── Protocol ── -->
+  <h2 id="protocol">Protocol</h2>
+
+  <h3>Wire protocol</h3>
+  <p>Ferrosa implements CQL native protocol version 5 with the standard 9-byte frame header. All 16 opcodes are handled:</p>
+
+  <table>
+    <thead><tr><th>Opcode</th><th>Name</th><th>Direction</th></tr></thead>
+    <tbody>
+      <tr><td>0x00</td><td>ERROR</td><td>Response</td></tr>
+      <tr><td>0x01</td><td>STARTUP</td><td>Request</td></tr>
+      <tr><td>0x02</td><td>READY</td><td>Response</td></tr>
+      <tr><td>0x03</td><td>AUTHENTICATE</td><td>Response</td></tr>
+      <tr><td>0x05</td><td>OPTIONS</td><td>Request</td></tr>
+      <tr><td>0x06</td><td>SUPPORTED</td><td>Response</td></tr>
+      <tr><td>0x07</td><td>QUERY</td><td>Request</td></tr>
+      <tr><td>0x08</td><td>RESULT</td><td>Response</td></tr>
+      <tr><td>0x09</td><td>PREPARE</td><td>Request</td></tr>
+      <tr><td>0x0A</td><td>EXECUTE</td><td>Request</td></tr>
+      <tr><td>0x0B</td><td>REGISTER</td><td>Request</td></tr>
+      <tr><td>0x0C</td><td>EVENT</td><td>Response</td></tr>
+      <tr><td>0x0D</td><td>BATCH</td><td>Request</td></tr>
+      <tr><td>0x0E</td><td>AUTH_CHALLENGE</td><td>Response</td></tr>
+      <tr><td>0x0F</td><td>AUTH_RESPONSE</td><td>Request</td></tr>
+      <tr><td>0x10</td><td>AUTH_SUCCESS</td><td>Response</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Compression</h3>
+  <p>Frame-level compression is negotiated during STARTUP via the <code>COMPRESSION</code> option:</p>
+  <ul>
+    <li><strong>LZ4</strong> — recommended for production (fast, low overhead)</li>
+    <li><strong>Snappy</strong> — alternative with good compression ratio</li>
+  </ul>
+  <p>Compression is optional. Uncompressed frames are always accepted.</p>
+
+  <h3>Authentication</h3>
+  <p>SASL PLAIN authentication via the standard <code>org.apache.cassandra.auth.PasswordAuthenticator</code> flow. Passwords are hashed with bcrypt or argon2. Disable with <code>FERROSA_AUTH_DISABLED=true</code> for development.</p>
+
+  <!-- ── Types ── -->
+  <h2 id="types">Data Types</h2>
+
+  <table>
+    <thead><tr><th>CQL Type</th><th>Protocol ID</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>ascii</td><td>0x0001</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>bigint</td><td>0x0002</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>blob</td><td>0x0003</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>boolean</td><td>0x0004</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>counter</td><td>0x0005</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>decimal</td><td>0x0006</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>double</td><td>0x0007</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>float</td><td>0x0008</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>int</td><td>0x0009</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>timestamp</td><td>0x000B</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>uuid</td><td>0x000C</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>varchar / text</td><td>0x000D</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>varint</td><td>0x000E</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>timeuuid</td><td>0x000F</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>inet</td><td>0x0010</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>date</td><td>0x0011</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>time</td><td>0x0012</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>smallint</td><td>0x0013</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>tinyint</td><td>0x0014</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>list&lt;T&gt;</td><td>0x0020</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>map&lt;K, V&gt;</td><td>0x0021</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>set&lt;T&gt;</td><td>0x0022</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>tuple&lt;...&gt;</td><td>0x0031</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>frozen&lt;T&gt;</td><td>—</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>duration</td><td>0x0015</td><td><span class="cross">Deferred</span></td></tr>
+      <tr><td>UDT</td><td>0x0030</td><td><span class="cross">Deferred</span></td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── DDL ── -->
+  <h2 id="ddl">DDL Statements</h2>
+
+  <table>
+    <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>CREATE KEYSPACE</td><td><span class="check">Supported</span></td><td>WITH replication, IF NOT EXISTS, DURABLE_WRITES</td></tr>
+      <tr><td>ALTER KEYSPACE</td><td><span class="check">Supported</span></td><td>Change replication, durable_writes</td></tr>
+      <tr><td>DROP KEYSPACE</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
+      <tr><td>CREATE TABLE</td><td><span class="check">Supported</span></td><td>Partition key, clustering key with order, IF NOT EXISTS, table options</td></tr>
+      <tr><td>ALTER TABLE</td><td><span class="check">Supported</span></td><td>ADD column, DROP column</td></tr>
+      <tr><td>DROP TABLE</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
+      <tr><td>CREATE INDEX</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
+      <tr><td>CREATE MATERIALIZED VIEW</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
+      <tr><td>CREATE TYPE (UDT)</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
+      <tr><td>CREATE FUNCTION / AGGREGATE</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Example</h3>
+  <pre><span class="kw">CREATE KEYSPACE</span> <span class="type">social</span> <span class="kw">WITH</span> replication = {
+  <span class="str">'class'</span>: <span class="str">'SimpleStrategy'</span>,
+  <span class="str">'replication_factor'</span>: <span class="var">3</span>
+} <span class="kw">AND</span> durable_writes = <span class="kw">true</span>;
+
+<span class="kw">CREATE TABLE</span> <span class="type">social.users</span> (
+  user_id <span class="type">uuid</span>,
+  name <span class="type">text</span>,
+  email <span class="type">text</span>,
+  created_at <span class="type">timestamp</span>,
+  tags <span class="type">set&lt;text&gt;</span>,
+  <span class="kw">PRIMARY KEY</span> (user_id)
+);</pre>
+
+  <!-- ── DML ── -->
+  <h2 id="dml">DML Statements</h2>
+
+  <table>
+    <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>SELECT</td><td><span class="check">Supported</span></td><td>WHERE, ORDER BY, LIMIT, bind markers (?), named bind markers (:name), IN clause</td></tr>
+      <tr><td>INSERT</td><td><span class="check">Supported</span></td><td>IF NOT EXISTS, USING TTL, USING TIMESTAMP</td></tr>
+      <tr><td>UPDATE</td><td><span class="check">Supported</span></td><td>SET, WHERE, IF conditions</td></tr>
+      <tr><td>DELETE</td><td><span class="check">Supported</span></td><td>WHERE, IF EXISTS, column-level delete</td></tr>
+      <tr><td>BATCH</td><td><span class="check">Supported</span></td><td>BEGIN BATCH ... APPLY BATCH (unlogged)</td></tr>
+      <tr><td>TRUNCATE</td><td><span class="check">Supported</span></td><td>—</td></tr>
+      <tr><td>USE</td><td><span class="check">Supported</span></td><td>Set default keyspace for session</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Prepared statements</h3>
+  <p>Full PREPARE/EXECUTE support. The prepared statement cache uses moka with W-TinyLFU eviction (64 MB default). Bind markers (<code>?</code>) and named bind markers (<code>:name</code>) are both supported.</p>
+
+  <pre><span class="cm">-- Prepare</span>
+<span class="kw">PREPARE</span> stmt <span class="kw">FROM</span> <span class="str">'SELECT * FROM social.users WHERE user_id = ?'</span>;
+
+<span class="cm">-- Execute with positional bind</span>
+<span class="kw">EXECUTE</span> stmt <span class="kw">USING</span> <span class="var">550e8400-e29b-41d4-a716-446655440000</span>;</pre>
+
+  <h3>Comparison operators</h3>
+  <p>WHERE clauses support: <code>=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>!=</code>, <code>IN</code></p>
+
+  <!-- ── Auth ── -->
+  <h2 id="auth-roles">Auth &amp; Roles</h2>
+
+  <table>
+    <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>CREATE ROLE</td><td><span class="check">Supported</span></td><td>WITH PASSWORD, SUPERUSER, LOGIN, IF NOT EXISTS</td></tr>
+      <tr><td>ALTER ROLE</td><td><span class="check">Supported</span></td><td>Change password, superuser, login</td></tr>
+      <tr><td>DROP ROLE</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
+      <tr><td>GRANT</td><td><span class="check">Supported</span></td><td>GRANT permission ON resource TO role</td></tr>
+      <tr><td>REVOKE</td><td><span class="check">Supported</span></td><td>REVOKE permission ON resource FROM role</td></tr>
+    </tbody>
+  </table>
+
+  <p>Ferrosa supports column-level permissions, rate limiting per role, and audit logging to configurable sinks (log file, audit table).</p>
+
+  <!-- ── System ── -->
+  <h2 id="system">System Keyspaces</h2>
+
+  <h3>system_schema</h3>
+  <p>Standard Cassandra system schema tables for driver compatibility:</p>
+  <ul>
+    <li><code>system_schema.keyspaces</code></li>
+    <li><code>system_schema.tables</code></li>
+    <li><code>system_schema.columns</code></li>
+    <li><code>system_schema.types</code></li>
+    <li><code>system_schema.functions</code></li>
+    <li><code>system_schema.aggregates</code></li>
+    <li><code>system_schema.triggers</code></li>
+    <li><code>system_schema.views</code></li>
+    <li><code>system_schema.indexes</code></li>
+  </ul>
+
+  <h3>system.local</h3>
+  <p>Node metadata including <code>tokens</code> column for driver topology awareness.</p>
+
+  <h3>system_observability (Ferrosa extension)</h3>
+  <p>Virtual tables backed by live in-memory state, not persisted:</p>
+  <ul>
+    <li><code>system_observability.connections</code> — active CQL client connections</li>
+    <li><code>system_observability.active_queries</code> — currently executing queries</li>
+    <li><code>system_observability.storage_stats</code> — storage engine metrics</li>
+  </ul>
+
+  <pre><span class="cm">-- Check active connections</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> system_observability.connections;
+
+<span class="cm">-- Monitor running queries</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> system_observability.active_queries;
+
+<span class="cm">-- Storage engine stats</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> system_observability.storage_stats;</pre>
+
+  <!-- ── SUBSCRIBE ── -->
+  <h2 id="subscribe">SUBSCRIBE Extension</h2>
+
+  <div class="extension">
+    <strong>Ferrosa Extension:</strong> SUBSCRIBE is a Ferrosa-specific CQL extension for
+    real-time change streaming. It uses the native CQL v5 framing with a STREAMING response
+    flag (0x10) — existing drivers work unchanged, no client modifications required.
+  </div>
+
+  <h3>Syntax</h3>
+  <pre><span class="cm">-- Subscribe to a table with polling interval</span>
+<span class="kw">SUBSCRIBE</span> keyspace.table <span class="kw">EVERY</span> <span class="var">5</span>s;
+
+<span class="cm">-- Subscribe with push-on-write (change data capture)</span>
+<span class="kw">SUBSCRIBE</span> keyspace.table <span class="kw">DELTA</span>;
+
+<span class="cm">-- Subscribe to a SELECT query</span>
+<span class="kw">SUBSCRIBE</span> <span class="kw">SELECT</span> name, email <span class="kw">FROM</span> social.users <span class="kw">WHERE</span> active = <span class="kw">true</span> <span class="kw">EVERY</span> <span class="var">10</span>s;
+
+<span class="cm">-- Subscribe to observability tables</span>
+<span class="kw">SUBSCRIBE</span> system_observability.connections <span class="kw">EVERY</span> <span class="var">5</span>s;
+
+<span class="cm">-- Unsubscribe from a specific stream</span>
+<span class="kw">UNSUBSCRIBE</span> <span class="var">42</span>;
+
+<span class="cm">-- Unsubscribe from all streams</span>
+<span class="kw">UNSUBSCRIBE</span>;</pre>
+
+  <h3>Modes</h3>
+  <table>
+    <thead><tr><th>Mode</th><th>Syntax</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td>EVERY</td><td><code>EVERY 5s</code></td><td>Server re-executes the query at the given interval and pushes results</td></tr>
+      <tr><td>DELTA</td><td><code>DELTA</code></td><td>Push-on-write via SubscriptionObserver in the commit log; only changed rows are sent</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Backward compatibility</h3>
+  <p>SUBSCRIBE responses use the standard CQL RESULT opcode (0x08) with the STREAMING flag set in the frame header. Drivers that don't understand the flag will simply see it as a normal result set. The subscription lifecycle is managed server-side — clients don't need to implement any new protocol logic.</p>
+
+  <!-- ── Graph ── -->
+  <h2 id="graph">Graph (Cypher) Extension</h2>
+
+  <div class="extension">
+    <strong>Ferrosa Extension:</strong> Cypher graph queries run against CQL tables annotated with
+    graph schema extensions. Queries are sent to a separate HTTP/JSON endpoint on port 7474.
+  </div>
+
+  <h3>Schema extensions</h3>
+  <pre><span class="cm">-- Mark a table as a vertex type</span>
+<span class="kw">ALTER TABLE</span> social.users
+  <span class="kw">WITH</span> extensions = {<span class="str">'graph.type'</span>: <span class="str">'vertex'</span>, <span class="str">'graph.label'</span>: <span class="str">'Person'</span>};
+
+<span class="cm">-- Mark a table as an edge type</span>
+<span class="kw">ALTER TABLE</span> social.follows
+  <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'edge'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'FOLLOWS'</span>,
+    <span class="str">'graph.source'</span>: <span class="str">'Person'</span>,
+    <span class="str">'graph.target'</span>: <span class="str">'Person'</span>
+  };</pre>
+
+  <h3>Supported Cypher statements</h3>
+  <table>
+    <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>MATCH ... RETURN</td><td><span class="check">Supported</span></td><td>Pattern matching, WHERE clause, multi-hop</td></tr>
+      <tr><td>CREATE</td><td><span class="check">Supported</span></td><td>Create vertices and edges</td></tr>
+      <tr><td>SET</td><td><span class="check">Supported</span></td><td>Update properties via MATCH ... SET</td></tr>
+      <tr><td>DELETE / DETACH DELETE</td><td><span class="check">Supported</span></td><td>Remove vertices/edges</td></tr>
+      <tr><td>SUBSCRIBE MATCH</td><td><span class="check">Supported</span></td><td>Real-time subscription to graph traversals with EVERY/DELTA</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Graph SUBSCRIBE</h3>
+  <pre><span class="cm">-- Subscribe to a graph traversal</span>
+<span class="kw">SUBSCRIBE MATCH</span> (a:<span class="type">Person</span> {name: <span class="str">'Alice'</span>})-[:<span class="type">FOLLOWS</span>]->(b:<span class="type">Person</span>)
+<span class="kw">RETURN</span> b.name, b.email
+<span class="kw">EVERY</span> <span class="var">10</span>s;
+
+<span class="cm">-- Push-on-write for graph changes</span>
+<span class="kw">SUBSCRIBE MATCH</span> (a:<span class="type">Person</span>)-[r:<span class="type">FOLLOWS</span>]->(b:<span class="type">Person</span>)
+<span class="kw">RETURN</span> a.name, b.name
+<span class="kw">DELTA</span>;</pre>
+
+  <!-- ── Not Yet ── -->
+  <h2 id="not-yet">Not Yet Supported</h2>
+
+  <p>The following Cassandra features are not yet implemented. They are planned for future releases:</p>
+
+  <table>
+    <thead><tr><th>Feature</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>CQL TLS (rustls)</td><td>Planned — critical priority</td></tr>
+      <tr><td>EVENT push notifications</td><td>Planned</td></tr>
+      <tr><td>ALLOW FILTERING</td><td>Planned</td></tr>
+      <tr><td>Logged batch atomicity</td><td>Planned</td></tr>
+      <tr><td>User-defined types (UDT)</td><td>Planned</td></tr>
+      <tr><td>Query tracing</td><td>Planned</td></tr>
+      <tr><td>Secondary indexes</td><td>Planned</td></tr>
+      <tr><td>Materialized views</td><td>Planned</td></tr>
+      <tr><td>User-defined functions</td><td>Planned</td></tr>
+      <tr><td>Lightweight transactions (LWT)</td><td>Planned</td></tr>
+      <tr><td>duration type</td><td>Deferred</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>Note:</strong> Even without these features, Ferrosa is fully compatible with standard
+    CQL drivers for core operations: DDL, DML, prepared statements, batches, system keyspaces,
+    and SASL authentication. Most applications migrate without code changes.
+  </div>
+
+</div>
+
+</body>
+</html>

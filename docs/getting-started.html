@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — Documentation</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #111118;
+      --bg-card: #16161f;
+      --bg-card-hover: #1c1c28;
+      --text-primary: #e8e8ed;
+      --text-secondary: #9494a3;
+      --text-muted: #6b6b7a;
+      --accent: #e2725b;
+      --accent-warm: #d4a574;
+      --accent-green: #6bc9a0;
+      --accent-cool: #7c9cf5;
+      --border: #1e1e2a;
+      --code-bg: #0d0d14;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 4rem 2rem 6rem;
+    }
+
+    .back-link {
+      display: inline-block;
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      margin-bottom: 2rem;
+    }
+    .back-link:hover { text-decoration: underline; }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.5rem;
+    }
+    h1 span { color: var(--accent); }
+
+    .subtitle {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      margin-bottom: 3rem;
+      max-width: 640px;
+      line-height: 1.7;
+    }
+
+    h2 {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1.5rem;
+      margin-top: 4rem;
+    }
+
+    h3 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+      margin-top: 2rem;
+    }
+
+    p, li {
+      color: var(--text-secondary);
+      margin-bottom: 1rem;
+      max-width: 720px;
+      line-height: 1.7;
+    }
+
+    ul, ol { padding-left: 1.5rem; margin-bottom: 1.5rem; }
+    li { margin-bottom: 0.5rem; }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.875em;
+      background: var(--code-bg);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      color: var(--accent-cool);
+    }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      overflow-x: auto;
+      margin-bottom: 1.5rem;
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      line-height: 1.8;
+      color: var(--text-secondary);
+    }
+
+    pre .cm { color: #546e7a; }
+    pre .kw { color: #c792ea; }
+    pre .str { color: #c3e88d; }
+    pre .var { color: #f78c6c; }
+
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.25rem;
+      margin-top: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      transition: border-color 0.2s;
+    }
+    .card:hover { border-color: var(--accent); }
+
+    .card h4 {
+      font-size: 0.9375rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+    }
+
+    .card p {
+      font-size: 0.875rem;
+      color: var(--text-muted);
+      margin-bottom: 0;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    th {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    td { color: var(--text-secondary); }
+    td:first-child { color: var(--text-primary); font-weight: 600; }
+    td code { font-size: 0.8125rem; }
+
+    .note {
+      background: rgba(226, 114, 91, 0.08);
+      border: 1px solid rgba(226, 114, 91, 0.2);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+    }
+
+    .note strong { color: var(--accent); }
+
+    .toc {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem 2rem;
+      margin-bottom: 2rem;
+    }
+
+    .toc h4 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
+      margin-bottom: 0.75rem;
+    }
+
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin-bottom: 0.375rem; }
+    .toc a { font-size: 0.9375rem; font-weight: 500; }
+
+    @media (max-width: 640px) {
+      .card-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <a href="index.html" class="back-link">&larr; Back to homepage</a>
+
+  <h1>Getting <span>Started</span></h1>
+  <p class="subtitle">Build from source and run a single-node Ferrosa instance in minutes. Everything you need to connect existing CQL drivers and start querying.</p>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ul>
+      <li><a href="#prerequisites">Prerequisites</a></li>
+      <li><a href="#build">Build from Source</a></li>
+      <li><a href="#run">Run Ferrosa</a></li>
+      <li><a href="#connect">Connect a CQL Driver</a></li>
+      <li><a href="#config">Configuration Reference</a></li>
+      <li><a href="#cli">CLI Tools</a></li>
+      <li><a href="#architecture">Architecture Overview</a></li>
+    </ul>
+  </div>
+
+  <!-- ── Prerequisites ── -->
+  <h2 id="prerequisites">Prerequisites</h2>
+
+  <ul>
+    <li><strong>Rust 1.75+</strong> — install via <a href="https://rustup.rs">rustup.rs</a></li>
+    <li><strong>Git</strong> — to clone the repository</li>
+    <li><strong>S3 bucket</strong> (optional) — for durable storage; local-only mode works without it</li>
+  </ul>
+
+  <!-- ── Build ── -->
+  <h2 id="build">Build from Source</h2>
+
+  <pre><span class="cm"># Clone the repository</span>
+<span class="kw">git</span> clone https://github.com/bkearns/ferrosa.git
+<span class="kw">cd</span> ferrosa
+
+<span class="cm"># Build all crates (release mode recommended for performance)</span>
+<span class="kw">cargo</span> build --release
+
+<span class="cm"># Run the test suite</span>
+<span class="kw">cargo</span> test
+
+<span class="cm"># Check for lint issues</span>
+<span class="kw">cargo</span> clippy --all-targets</pre>
+
+  <p>The build produces two binaries:</p>
+  <ul>
+    <li><code>target/release/ferrosa</code> — the database server</li>
+    <li><code>target/release/ferrosa-ctl</code> — the CLI admin tool</li>
+  </ul>
+
+  <!-- ── Run ── -->
+  <h2 id="run">Run Ferrosa</h2>
+
+  <h3>Minimal startup</h3>
+  <pre><span class="cm"># Start with defaults — CQL on :9042, web console on :9090</span>
+<span class="kw">./target/release/ferrosa</span></pre>
+
+  <h3>With graph engine enabled</h3>
+  <pre><span class="kw">FERROSA_GRAPH_ENABLED</span>=true ./target/release/ferrosa</pre>
+
+  <h3>Custom ports and auth disabled (development)</h3>
+  <pre><span class="kw">FERROSA_CQL_BIND</span>=127.0.0.1:9042 \
+<span class="kw">FERROSA_WEB_BIND</span>=127.0.0.1:9090 \
+<span class="kw">FERROSA_AUTH_DISABLED</span>=true \
+<span class="kw">FERROSA_GRAPH_ENABLED</span>=true \
+./target/release/ferrosa</pre>
+
+  <div class="note">
+    <strong>Note:</strong> Ferrosa starts in single-node mode by default. Multi-node clustering
+    via ferrosa-cluster is under active development.
+  </div>
+
+  <h3>Default ports</h3>
+  <table>
+    <thead>
+      <tr><th>Service</th><th>Port</th><th>Protocol</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>CQL Server</td><td><code>9042</code></td><td>CQL native protocol v5</td></tr>
+      <tr><td>Web Console</td><td><code>9090</code></td><td>HTTP (REST API + static UI)</td></tr>
+      <tr><td>Graph HTTP</td><td><code>7474</code></td><td>HTTP/JSON (Cypher queries)</td></tr>
+      <tr><td>Prometheus Metrics</td><td><code>9090/metrics</code></td><td>HTTP (text exposition)</td></tr>
+      <tr><td>Internode (cluster)</td><td><code>7000</code></td><td>Custom binary protocol</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── Connect ── -->
+  <h2 id="connect">Connect a CQL Driver</h2>
+
+  <p>Ferrosa speaks CQL protocol v5 — the same wire protocol as Apache Cassandra. Any standard CQL driver works unchanged.</p>
+
+  <h3>Python</h3>
+  <pre><span class="kw">from</span> cassandra.cluster <span class="kw">import</span> Cluster
+
+cluster = Cluster([<span class="str">'127.0.0.1'</span>])
+session = cluster.connect()
+
+<span class="cm"># Create a keyspace</span>
+session.execute(<span class="str">"""
+    CREATE KEYSPACE demo WITH replication = {
+        'class': 'SimpleStrategy',
+        'replication_factor': 1
+    }
+"""</span>)
+
+<span class="cm"># Create a table</span>
+session.execute(<span class="str">"""
+    CREATE TABLE demo.users (
+        user_id uuid PRIMARY KEY,
+        name text,
+        email text
+    )
+"""</span>)
+
+<span class="cm"># Insert and query</span>
+session.execute(<span class="str">"""
+    INSERT INTO demo.users (user_id, name, email)
+    VALUES (uuid(), 'Alice', 'alice@example.com')
+"""</span>)
+
+rows = session.execute(<span class="str">"SELECT * FROM demo.users"</span>)
+<span class="kw">for</span> row <span class="kw">in</span> rows:
+    print(row.name, row.email)</pre>
+
+  <h3>Java</h3>
+  <pre><span class="cm">// Same DataStax Java driver — just change the contact point</span>
+CqlSession session = CqlSession.builder()
+    .addContactPoint(<span class="kw">new</span> InetSocketAddress(<span class="str">"127.0.0.1"</span>, <span class="var">9042</span>))
+    .withLocalDatacenter(<span class="str">"datacenter1"</span>)
+    .build();
+
+ResultSet rs = session.execute(<span class="str">"SELECT * FROM demo.users"</span>);</pre>
+
+  <h3>Go</h3>
+  <pre>cluster := gocql.NewCluster(<span class="str">"127.0.0.1"</span>)
+session, _ := cluster.CreateSession()
+<span class="kw">defer</span> session.Close()
+
+<span class="kw">var</span> name, email <span class="kw">string</span>
+session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</span>).Scan(&amp;name, &amp;email)</pre>
+
+  <h3>cqlsh</h3>
+  <pre><span class="cm"># Standard cqlsh connects directly</span>
+<span class="kw">cqlsh</span> 127.0.0.1 9042</pre>
+
+  <!-- ── Config ── -->
+  <h2 id="config">Configuration Reference</h2>
+
+  <p>Ferrosa is configured via environment variables. All are optional with sensible defaults.</p>
+
+  <h3>Core</h3>
+  <table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>FERROSA_CQL_BIND</code></td><td><code>0.0.0.0:9042</code></td><td>CQL server bind address</td></tr>
+      <tr><td><code>FERROSA_WEB_BIND</code></td><td><code>0.0.0.0:9090</code></td><td>Web console bind address</td></tr>
+      <tr><td><code>FERROSA_AUTH_DISABLED</code></td><td><code>false</code></td><td>Disable SASL authentication</td></tr>
+      <tr><td><code>FERROSA_GRAPH_ENABLED</code></td><td><code>false</code></td><td>Enable graph engine + HTTP endpoint</td></tr>
+      <tr><td><code>RUST_LOG</code></td><td><code>info</code></td><td>Tracing filter (e.g. <code>debug</code>, <code>ferrosa_cql=trace</code>)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Cluster (ferrosa-net / ferrosa-cluster)</h3>
+  <table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>FERROSA_CLUSTER_NAME</code></td><td><code>ferrosa</code></td><td>Cluster name (must match across nodes)</td></tr>
+      <tr><td><code>FERROSA_CLUSTER_MODE</code></td><td><code>single</code></td><td>Cluster mode: <code>single</code>, <code>pair</code>, or <code>ring</code></td></tr>
+      <tr><td><code>FERROSA_SEED</code></td><td>—</td><td>Comma-separated seed addresses</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_BIND</code></td><td><code>0.0.0.0:7000</code></td><td>Internode protocol bind address</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_BROADCAST</code></td><td>—</td><td>Address other nodes use to reach this node</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_PSK</code></td><td>—</td><td>Pre-shared key for internode auth (HMAC-SHA256)</td></tr>
+      <tr><td><code>FERROSA_DATA_CENTER</code></td><td><code>dc1</code></td><td>Data center name</td></tr>
+      <tr><td><code>FERROSA_RACK</code></td><td><code>rack1</code></td><td>Rack name within the data center</td></tr>
+      <tr><td><code>FERROSA_NUM_TOKENS</code></td><td><code>256</code></td><td>Number of tokens on the ring</td></tr>
+      <tr><td><code>FERROSA_DEFAULT_CL</code></td><td><code>ONE</code></td><td>Default consistency level</td></tr>
+      <tr><td><code>FERROSA_HEARTBEAT_INTERVAL_MS</code></td><td><code>1000</code></td><td>Heartbeat interval between peers</td></tr>
+      <tr><td><code>FERROSA_HEARTBEAT_TIMEOUT_MS</code></td><td><code>5000</code></td><td>Timeout before marking a peer as down</td></tr>
+      <tr><td><code>FERROSA_MAX_INTERNODE_CONNECTIONS</code></td><td><code>64</code></td><td>Max concurrent internode connections</td></tr>
+      <tr><td><code>FERROSA_AUTO_JOIN</code></td><td><code>true</code></td><td>Automatically join the ring on startup</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Storage</h3>
+  <table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>FERROSA_DATA_DIR</code></td><td><code>/var/lib/ferrosa</code></td><td>Local data directory for SSTables and commit log</td></tr>
+      <tr><td><code>FERROSA_CACHE_MAX_BYTES</code></td><td><code>10737418240</code></td><td>Local LRU cache size (10 GB)</td></tr>
+      <tr><td><code>FERROSA_FLUSH_THRESHOLD_BYTES</code></td><td><code>67108864</code></td><td>Memtable flush threshold (64 MB)</td></tr>
+      <tr><td><code>FERROSA_S3_ENDPOINT</code></td><td>—</td><td>S3-compatible endpoint URL</td></tr>
+      <tr><td><code>FERROSA_S3_BUCKET</code></td><td>—</td><td>S3 bucket for durable storage</td></tr>
+      <tr><td><code>FERROSA_S3_REGION</code></td><td><code>us-east-1</code></td><td>AWS region for S3</td></tr>
+      <tr><td><code>FERROSA_S3_ACCESS_KEY_ID</code></td><td>—</td><td>Access key (falls back to instance profile)</td></tr>
+      <tr><td><code>FERROSA_S3_SECRET_ACCESS_KEY</code></td><td>—</td><td>Secret access key</td></tr>
+      <tr><td><code>FERROSA_S3_ALLOW_HTTP</code></td><td><code>false</code></td><td>Allow non-TLS for local dev (MinIO)</td></tr>
+      <tr><td><code>FERROSA_S3_PREFIX</code></td><td>—</td><td>Key prefix for multi-tenant separation</td></tr>
+      <tr><td><code>FERROSA_S3_UPLOAD_QUEUE_DEPTH</code></td><td><code>16</code></td><td>Upload backpressure queue depth</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Compaction (STCS)</h3>
+  <table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>FERROSA_COMPACTION_MIN_THRESHOLD</code></td><td><code>4</code></td><td>Min SSTables to trigger compaction</td></tr>
+      <tr><td><code>FERROSA_COMPACTION_MAX_THRESHOLD</code></td><td><code>32</code></td><td>Max SSTables per compaction task</td></tr>
+      <tr><td><code>FERROSA_COMPACTION_BUCKET_LOW</code></td><td><code>0.5</code></td><td>Lower size ratio for bucket membership</td></tr>
+      <tr><td><code>FERROSA_COMPACTION_BUCKET_HIGH</code></td><td><code>1.5</code></td><td>Upper size ratio for bucket membership</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ── CLI ── -->
+  <h2 id="cli">CLI Tools</h2>
+
+  <h3>ferrosa-ctl</h3>
+  <p>Admin CLI for querying and monitoring a running Ferrosa node.</p>
+
+  <pre><span class="cm"># Run a CQL query</span>
+<span class="kw">ferrosa-ctl</span> query <span class="str">"SELECT * FROM demo.users"</span>
+
+<span class="cm"># Describe schema</span>
+<span class="kw">ferrosa-ctl</span> describe
+
+<span class="cm"># Show Prometheus metrics</span>
+<span class="kw">ferrosa-ctl</span> metrics
+
+<span class="cm"># Node health status</span>
+<span class="kw">ferrosa-ctl</span> status
+
+<span class="cm"># Active CQL connections</span>
+<span class="kw">ferrosa-ctl</span> connections --sort client_addr
+
+<span class="cm"># Currently running queries (long-running only)</span>
+<span class="kw">ferrosa-ctl</span> queries --long-running
+
+<span class="cm"># Storage engine stats</span>
+<span class="kw">ferrosa-ctl</span> storage
+
+<span class="cm"># Live TUI dashboard (ratatui)</span>
+<span class="kw">ferrosa-ctl</span> monitor</pre>
+
+  <p>The <code>monitor</code> command launches a terminal dashboard with 5 panels showing connections, active queries, storage stats, and more. Navigate with arrow keys, refresh is automatic. Connect to a specific host with <code>--host 10.0.0.1:9042</code>.</p>
+
+  <!-- ── Architecture ── -->
+  <h2 id="architecture">Architecture Overview</h2>
+
+  <p>Ferrosa is composed of 10 independent Rust crates that can be used together or embedded individually.</p>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>ferrosa-common</h4>
+      <p>Shared types: Token, PartitionKey, DecoratedKey, CellValue, Murmur3 partitioner.</p>
+    </div>
+    <div class="card">
+      <h4>ferrosa-sstable</h4>
+      <p>Read/write BTI SSTables. On-disk trie, Bloom filter, LZ4/Zstd compression.</p>
+    </div>
+    <div class="card">
+      <h4>ferrosa-storage</h4>
+      <p>Memtable, commit log with CDC, STCS compaction, S3 upload manager, local LRU cache.</p>
+    </div>
+    <div class="card">
+      <h4>ferrosa-schema</h4>
+      <p>Schema registry with ArcSwap, RBAC auth, column-level permissions, audit logging.</p>
+    </div>
+    <div class="card">
+      <h4>ferrosa-cql</h4>
+      <p>CQL v5 framing, LL(2) parser, prepared cache, LZ4/Snappy compression, SUBSCRIBE.</p>
+    </div>
+    <div class="card">
+      <h4>ferrosa-graph</h4>
+      <p>Cypher parser, logical/physical planner, expand executor, HTTP/JSON endpoint.</p>
+    </div>
+    <div class="card">
+      <h4>ferrosa-net</h4>
+      <p>Internode protocol: 3 priority lanes, PSK handshake, RPC, heartbeat failure detection.</p>
+    </div>
+    <div class="card">
+      <h4>ferrosa-cluster</h4>
+      <p>Raft metadata, token ring, tunable consistency levels. In progress.</p>
+    </div>
+    <div class="card">
+      <h4>ferrosa-ctl</h4>
+      <p>CLI admin tool: query, describe, metrics, monitor (ratatui TUI dashboard).</p>
+    </div>
+    <div class="card">
+      <h4>ferrosa (binary)</h4>
+      <p>Composes all crates. CQL on :9042, graph on :7474, web console on :9090.</p>
+    </div>
+  </div>
+
+  <p>
+    For the full architecture spec, see the
+    <a href="https://github.com/bkearns/ferrosa">GitHub repository</a>.
+  </p>
+
+</div>
+
+</body>
+</html>
