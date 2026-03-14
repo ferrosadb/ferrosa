@@ -39,9 +39,44 @@ impl RpcClient {
         local_host_id: uuid::Uuid,
         peer_addr: std::net::SocketAddr,
     ) -> Result<Self> {
-        let stream = TcpStream::connect(peer_addr).await?;
-        let mut framed = Framed::new(stream, InternodeCodec::new(config.max_frame_body_size));
+        let tls_connector = crate::tls::build_tls_connector(&config)?;
+        Self::connect_with_tls(config, local_host_id, peer_addr, tls_connector.as_ref()).await
+    }
 
+    /// Connect with an optional pre-built TLS connector (avoids rebuilding per lane).
+    pub async fn connect_with_tls(
+        config: Arc<NetConfig>,
+        local_host_id: uuid::Uuid,
+        peer_addr: std::net::SocketAddr,
+        tls_connector: Option<&tokio_rustls::TlsConnector>,
+    ) -> Result<Self> {
+        let tcp_stream = TcpStream::connect(peer_addr).await?;
+
+        // Perform the protocol handshake (and TLS if configured) using a helper
+        // that handles the stream type generically.
+        if let Some(connector) = tls_connector {
+            let domain = rustls::pki_types::ServerName::try_from(peer_addr.ip().to_string())
+                .map_err(|e| NetError::Protocol(format!("invalid TLS server name: {e}")))?;
+            let tls_stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
+                NetError::Protocol(format!("TLS connect to {peer_addr} failed: {e}"))
+            })?;
+            let framed = Framed::new(tls_stream, InternodeCodec::new(config.max_frame_body_size));
+            Self::finish_connect(config, local_host_id, peer_addr, framed).await
+        } else {
+            let framed = Framed::new(tcp_stream, InternodeCodec::new(config.max_frame_body_size));
+            Self::finish_connect(config, local_host_id, peer_addr, framed).await
+        }
+    }
+
+    async fn finish_connect<S>(
+        config: Arc<NetConfig>,
+        local_host_id: uuid::Uuid,
+        peer_addr: std::net::SocketAddr,
+        mut framed: Framed<S, InternodeCodec>,
+    ) -> Result<Self>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let peer_host_id = tokio::time::timeout(
             config.handshake_timeout,
             initiate_handshake(&mut framed, &config, local_host_id),
