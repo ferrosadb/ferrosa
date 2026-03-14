@@ -415,6 +415,9 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Role) => {
                 self.parse_create_role().map(Statement::CreateRole)
             }
+            TokenKind::Keyword(Keyword::Index) => {
+                self.parse_create_index().map(Statement::CreateIndex)
+            }
             _ => Err(CqlError::SyntaxError(format!(
                 "CREATE {:?} not yet supported at position {}",
                 tok.kind, tok.pos
@@ -781,6 +784,7 @@ impl<'input> Parser<'input> {
         let tok = self.lexer.peek()?;
         match &tok.kind {
             TokenKind::Keyword(Keyword::Table) => self.parse_drop_table().map(Statement::DropTable),
+            TokenKind::Keyword(Keyword::Index) => self.parse_drop_index().map(Statement::DropIndex),
             _ => Err(CqlError::SyntaxError(format!(
                 "DROP {:?} not yet supported at position {}",
                 tok.kind, tok.pos
@@ -798,6 +802,95 @@ impl<'input> Parser<'input> {
             table,
             if_exists,
         })
+    }
+
+    // ---------------------------------------------------------------
+    // CREATE INDEX / DROP INDEX
+    // ---------------------------------------------------------------
+
+    fn parse_create_index(&mut self) -> Result<CreateIndexStatement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Index))?;
+
+        let if_not_exists = self.parse_if_not_exists()?;
+
+        // Optional index name — peek to see if next token is ON (no name) or an identifier (name)
+        let name = {
+            let tok = self.lexer.peek()?;
+            if tok.kind == TokenKind::Keyword(Keyword::On) {
+                None
+            } else {
+                Some(self.parse_ident()?)
+            }
+        };
+
+        // ON
+        self.lexer.expect(&TokenKind::Keyword(Keyword::On))?;
+
+        // Optional keyspace.table
+        let (keyspace, table) = self.parse_table_ref()?;
+
+        // (column, column, ...)
+        self.lexer.expect(&TokenKind::LParen)?;
+        let columns = self.parse_ident_list()?;
+        self.lexer.expect(&TokenKind::RParen)?;
+
+        // Optional USING 'type'
+        let using = if self.lexer.eat(&TokenKind::Keyword(Keyword::Using))? {
+            let tok = self.lexer.next_token()?;
+            match tok.kind {
+                TokenKind::StringLiteral(s) => Some(s),
+                _ => {
+                    return Err(CqlError::SyntaxError(format!(
+                        "expected string literal after USING, got {:?} at position {}",
+                        tok.kind, tok.pos
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
+        // Optional WITH OPTIONS = { map }
+        let options = if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
+            self.lexer.expect(&TokenKind::Keyword(Keyword::Options))?;
+            self.lexer.expect(&TokenKind::Eq)?;
+            self.parse_string_map()?
+        } else {
+            vec![]
+        };
+
+        Ok(CreateIndexStatement {
+            name,
+            keyspace,
+            table,
+            columns,
+            using,
+            filter: None,
+            options,
+            if_not_exists,
+        })
+    }
+
+    fn parse_drop_index(&mut self) -> Result<DropIndexStatement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Index))?;
+        let if_exists = self.parse_if_exists()?;
+
+        // Optional keyspace.index_name
+        let first = self.parse_ident()?;
+        if self.lexer.eat(&TokenKind::Dot)? {
+            let second = self.parse_ident()?;
+            Ok(DropIndexStatement {
+                keyspace: Some(first),
+                name: second,
+                if_exists,
+            })
+        } else {
+            Ok(DropIndexStatement {
+                keyspace: None,
+                name: first,
+                if_exists,
+            })
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1483,6 +1576,8 @@ impl<'input> Parser<'input> {
             Keyword::Writetime => "writetime",
             Keyword::All => "all",
             Keyword::Permissions => "permissions",
+            Keyword::Index => "index",
+            Keyword::Options => "options",
             Keyword::Subscribe => "subscribe",
             Keyword::Unsubscribe => "unsubscribe",
             Keyword::Every => "every",
@@ -1890,7 +1985,8 @@ mod tests {
 
     #[test]
     fn parse_unsupported_returns_error() {
-        let err = parse("CREATE INDEX idx ON t (col)").unwrap_err();
+        // CREATE TYPE is not yet supported
+        let err = parse("CREATE TYPE address (street text, city text)").unwrap_err();
         match err {
             CqlError::SyntaxError(msg) => assert!(
                 msg.contains("not yet supported"),
@@ -1898,6 +1994,99 @@ mod tests {
                 msg
             ),
             other => panic!("expected SyntaxError, got {:?}", other),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // CREATE INDEX / DROP INDEX tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_create_btree_index() {
+        let stmt = parse("CREATE INDEX idx_email ON users (email) USING 'btree'").unwrap();
+        match stmt {
+            Statement::CreateIndex(s) => {
+                assert_eq!(s.name, Some("idx_email".into()));
+                assert_eq!(s.table, "users");
+                assert_eq!(s.columns, vec!["email"]);
+                assert_eq!(s.using, Some("btree".into()));
+                assert!(!s.if_not_exists);
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn parse_create_index_default_type() {
+        let stmt = parse("CREATE INDEX idx_email ON users (email)").unwrap();
+        match stmt {
+            Statement::CreateIndex(s) => {
+                assert_eq!(s.using, None);
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn parse_create_vector_index_with_options() {
+        let stmt = parse(
+            "CREATE INDEX idx_embed ON docs (embedding) USING 'vector' WITH OPTIONS = {'method': 'hnsw', 'metric': 'cosine', 'dimensions': '768'}",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateIndex(s) => {
+                assert_eq!(s.using, Some("vector".into()));
+                assert_eq!(s.options.len(), 3);
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn parse_create_composite_index() {
+        let stmt =
+            parse("CREATE INDEX idx_name ON users (last_name, first_name) USING 'composite'")
+                .unwrap();
+        match stmt {
+            Statement::CreateIndex(s) => {
+                assert_eq!(s.columns, vec!["last_name", "first_name"]);
+                assert_eq!(s.using, Some("composite".into()));
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn parse_create_index_if_not_exists() {
+        let stmt = parse("CREATE INDEX IF NOT EXISTS idx ON t (c) USING 'hash'").unwrap();
+        match stmt {
+            Statement::CreateIndex(s) => assert!(s.if_not_exists),
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_index() {
+        let stmt = parse("DROP INDEX idx_email").unwrap();
+        match stmt {
+            Statement::DropIndex(s) => {
+                assert_eq!(s.name, "idx_email");
+                assert!(!s.if_exists);
+            }
+            _ => panic!("expected DropIndex"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_index_if_exists() {
+        let stmt = parse("DROP INDEX IF EXISTS ks.idx_email").unwrap();
+        match stmt {
+            Statement::DropIndex(s) => {
+                assert_eq!(s.keyspace, Some("ks".into()));
+                assert_eq!(s.name, "idx_email");
+                assert!(s.if_exists);
+            }
+            _ => panic!("expected DropIndex"),
         }
     }
 
