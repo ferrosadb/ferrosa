@@ -190,13 +190,20 @@ impl CompactionExecutor {
         let output_id = format!("{gen}");
         let partition_count = merged.len() as u64;
 
-        let total_size: u64 = ["Data", "Partitions", "Rows", "Filter", "Statistics", "TOC"]
-            .iter()
-            .filter_map(|component| {
-                let path = task.output_dir.join(format!("{gen}-{component}.db"));
-                std::fs::metadata(&path).ok().map(|m| m.len())
-            })
-            .sum();
+        let total_size: u64 = [
+            format!("{gen}-Data.db"),
+            format!("{gen}-Partitions.db"),
+            format!("{gen}-Rows.db"),
+            format!("{gen}-Filter.db"),
+            format!("{gen}-Statistics.db"),
+            format!("{gen}-TOC.txt"),
+        ]
+        .iter()
+        .filter_map(|name| {
+            let path = task.output_dir.join(name);
+            std::fs::metadata(&path).ok().map(|m| m.len())
+        })
+        .sum();
 
         let min_token = merged.first().map(|p| p.key.token.0).unwrap_or(0);
         let max_token = merged.last().map(|p| p.key.token.0).unwrap_or(0);
