@@ -5,7 +5,7 @@
 
 ## Overview
 
-Ferrosa is a Cargo workspace of 10 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently.
+Ferrosa is a Cargo workspace of 11 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently.
 
 ## Dependency Graph
 
@@ -13,6 +13,7 @@ Ferrosa is a Cargo workspace of 10 crates with a clean, acyclic dependency graph
 graph BT
     Common[ferrosa-common<br/>Shared types]
     SST[ferrosa-sstable<br/>SSTable read/write]
+    Index[ferrosa-index<br/>Secondary indexes]
     Net[ferrosa-net<br/>Internode protocol]
     Storage[ferrosa-storage<br/>Write-behind S3 engine]
     Schema[ferrosa-schema<br/>DDL, system keyspaces]
@@ -23,13 +24,17 @@ graph BT
     Bin[ferrosa<br/>Binary]
 
     SST --> Common
+    Index --> Common
     Net --> Common
     Storage --> Common
     Storage --> SST
+    Storage --> Index
     Schema --> Common
+    Schema --> Index
     CQL --> Common
     CQL --> Schema
     CQL --> Storage
+    CQL --> Index
     Graph --> Common
     Graph --> Schema
     Graph --> SST
@@ -72,6 +77,25 @@ graph BT
 - **Bloom filter**: Cassandra-compatible double-hashing using Murmur3 h1 + h2 from ferrosa-common
 - **Standalone tools** (Phase 2): `ferrosa-sstable-dump`, `ferrosa-sstable-import`
 
+### ferrosa-index
+
+- **Purpose**: Pluggable secondary index framework with multiple index type implementations
+- **Location**: `ferrosa-index/`
+- **Dependencies**: `ferrosa-common`, `serde`, `serde_json`, `bitflags`, `uuid`, `thiserror`, `rand`
+- **Status**: Implemented — 8 index types with build/read/factory trait system
+- **Modules**:
+  - `lib.rs` — Core types (`IndexType`, `IndexKey`, `RowPosition`, `IndexFiles`, `IndexConfig`, `IndexCapabilities`, `FilterPredicate`), traits (`IndexBuilder`, `IndexReader`, `IndexFactory`), error types
+  - `btree.rs` — B-tree index (sorted key → row position, binary search lookup, range scan)
+  - `hash.rs` — Hash index (O(1) point lookup via HashMap)
+  - `composite.rs` — Composite multi-column index (concatenated column keys with length prefixes)
+  - `phonetic/` — Phonetic index with `PhoneticEncoder` trait and 4 algorithms: `soundex.rs`, `metaphone.rs`, `double_metaphone.rs`, `caverphone.rs`
+  - `filtered.rs` — Filtered index wrapper (evaluates `FilterPredicate` at build time, delegates to inner factory)
+  - `vector/mod.rs` — Distance functions (L2, cosine, inner product), dimension constants (4096 f32 / 8192 f16)
+  - `vector/hnsw.rs` — HNSW graph index (multi-layer navigable small world, beam search)
+  - `vector/ivfflat.rs` — IVFFlat index (k-means clustering, inverted list probing)
+- **Key interfaces**: `IndexFactory` creates `IndexBuilder` (build-side, `Send`) and `IndexReader` (query-side, `Send + Sync`). Storage-attached design — indexes are per-SSTable companion files built asynchronously after flush.
+- **Spec**: [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md)
+
 ### ferrosa-storage
 
 - **Purpose**: Storage engine with S3 write-behind
@@ -92,6 +116,9 @@ graph BT
   - `observer.rs` — `WriteObserver` trait with `ObserverMode::Sync`/`Async`, bounded `mpsc` channel for async dispatch with backpressure (T9 mitigation)
   - `subscription_observer.rs` — `SubscriptionObserver` (`WriteObserver` impl, async mode), pushes write events to connected subscribers
   - `virtual_tables.rs` — `StorageStatsTable`, `StorageStatsProvider` trait for exposing memtable/SSTable/cache metrics to virtual table queries
+  - `index/tracker.rs` — `IndexStateTracker` (per-index staleness: Current/Building/Stale/Failed), `IndexState`, coverage tracking
+  - `index/scheduler.rs` — `IndexBuildScheduler` (channel-based worker pool following `CompactionExecutor` pattern), `IndexBuildJob`, `BuildPriority`
+  - `index/virtual_table.rs` — `SecondaryIndexesVirtualTable` for `system_views.secondary_indexes` operational metrics
 - **Concurrency**:
   - *Memtable writes*: 64-shard `BTreeMap` — different partitions write in parallel; same-shard writes serialize on a per-shard `RwLock`. Alternative: `SkipListMemtable` (lock-free, `crossbeam-skiplist`, behind feature flag).
   - *Memtable flush*: Atomic swap via `arc-swap` — current memtable replaced with a fresh one; old memtable flushed to SSTable. Reads check both active and flushing memtable.
@@ -107,11 +134,11 @@ graph BT
 - **Dependencies**: `ferrosa-common`, `arc-swap`, `bcrypt`, `argon2`, `uuid`, `serde`, `serde_json`, `indexmap`, `tracing`, `password-hash`
 - **Status**: Implemented — metadata types, schema registry with lock-free snapshots, auth (roles, permissions, RBAC, rate limiting), audit logging (composite sinks, graph audit events), system keyspace queries, secrets provider, production mode validation, `TableMetadata` extensions map + `is_system` flag, `graph.*` extension validation (T6), system table protection (T7), `schema_ref()` for lock-free observer reads
 - **Modules**:
-  - `metadata/` — `KeyspaceMetadata`, `TableMetadata`, `ColumnMetadata`, replication params, caching params
+  - `metadata/` — `KeyspaceMetadata`, `TableMetadata`, `ColumnMetadata`, `IndexMetadata`, replication params, caching params
   - `registry.rs` — `Schema` with `ArcSwap<SchemaSnapshot>` for lock-free reads, `AuthMethod` config
   - `auth/` — `AuthContext`, `Permission`, `Resource`, RBAC with `check_permission()`, `PasswordHasher` (bcrypt/argon2id), `AuthRateLimiter`
   - `audit/` — `AuditEvent`, `AuditSink` trait, `LogAuditSink`, `SystemTableAuditSink`, `CompositeSink`
-  - `system/` — System keyspace queries: `system.local`, `system.peers`, `system_schema.keyspaces/tables/columns`, `system_auth.roles/role_members/role_permissions`
+  - `system/` — System keyspace queries: `system.local`, `system.peers`, `system_schema.keyspaces/tables/columns/indexes`, `system_auth.roles/role_members/role_permissions`
   - `secrets/` — `SecretsProvider` trait, `EnvSecretsProvider`
   - `startup.rs` — `validate_production_requirements()`, `DeploymentMode`
   - `convert.rs` — CQL-to-marshal type conversion
@@ -148,7 +175,7 @@ graph BT
   - `client.rs` — `CqlClient`, thin async CQL client for admin tooling (`QueryResult`, `ResultRow`)
 - **Key interfaces**: Full CQL query lifecycle — frame decode → parse → route → execute → encode result
 - **Auth**: SASL PLAIN with `Schema::authenticate()`, rate limiting, connection state machine
-- **Supported operations**: SELECT, INSERT, UPDATE, DELETE, BATCH, CREATE/ALTER/DROP KEYSPACE/TABLE, CREATE/ALTER/DROP ROLE, GRANT/REVOKE, TRUNCATE, USE, PREPARE/EXECUTE, system table queries
+- **Supported operations**: SELECT, INSERT, UPDATE, DELETE, BATCH, CREATE/ALTER/DROP KEYSPACE/TABLE, CREATE/DROP INDEX (USING 'btree'/'hash'/'composite'/'phonetic'/'vector'), CREATE/ALTER/DROP ROLE, GRANT/REVOKE, TRUNCATE, USE, PREPARE/EXECUTE, system table queries
 - **Target**: All standard CQL drivers connect without modification
 
 ### ferrosa-graph
@@ -249,6 +276,7 @@ gantt
     section Foundation
     ferrosa-common          :done, 0, 1
     ferrosa-sstable         :done, 1, 3
+    ferrosa-index           :done, 1, 3
 
     section Engine
     ferrosa-storage         :done, 3, 5
@@ -271,6 +299,7 @@ gantt
 |-------|-------|--------------------|
 | 1 | ferrosa-common | Type definitions compile — **done** |
 | 2 | ferrosa-sstable | Read real Cassandra SSTables, round-trip BTI — **done** |
+| 2b | ferrosa-index | Pluggable secondary indexes (8 types) — **done** |
 | 3 | ferrosa-storage | Single-node writes + reads with S3 backend — **done** (core engine; follow-on items tracked) |
 | 4 | ferrosa-schema | Schema registry, auth, audit, system keyspaces queryable — **done** |
 | 5 | ferrosa-cql | cqlsh connects and runs basic queries — **done** (full CQL lifecycle: parse, route, execute, prepared cache) |

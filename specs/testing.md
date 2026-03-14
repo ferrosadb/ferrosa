@@ -1,6 +1,6 @@
 # Testing Strategy
 
-> Last updated: 2026-03-11
+> Last updated: 2026-03-14
 > Status: Approved
 
 ## Overview
@@ -111,10 +111,21 @@ Sprites are ideal — Firecracker VMs with fast spin-up/kill.
 
 - **Drivers**: DataStax Java/Python/Go, gocql, scylla-rust-driver
 - **Protocol**: All CQL v5 message types and error responses
-- **DDL**: CREATE/ALTER/DROP keyspaces, tables, indexes
+- **DDL**: CREATE/ALTER/DROP keyspaces, tables, indexes (USING 'btree'/'hash'/'composite'/'phonetic'/'vector'), roles, GRANT/REVOKE
 - **DML**: INSERT, UPDATE, DELETE, SELECT at all CL levels
 - **Types**: All CQL types including collections, UDTs, tuples
 - **cqlsh**: Connects and operates normally
+
+## Suite 5: Secondary Index Tests
+
+| Test | Validates | Location |
+|------|-----------|----------|
+| Index type unit tests | B-tree, hash, composite, phonetic, filtered, HNSW, IVFFlat build + query | `ferrosa-index/src/*.rs` (110 tests) |
+| Schema CRUD | CREATE/DROP INDEX, idempotent internal methods, cascade cleanup | `ferrosa-schema/tests/integration.rs` |
+| Build pipeline | IndexStateTracker staleness transitions, IndexBuildScheduler job processing | `ferrosa-storage/tests/index_integration.rs` |
+| Smoke — CQL client | CREATE INDEX DDL, IF NOT EXISTS idempotency, DROP INDEX | `ferrosa/tests/smoke.rs` |
+| Smoke — cqlsh | Index creation and system_schema.indexes introspection | `tests/cqlsh_smoke_test.sh` |
+| Smoke — Docker pair mode | Index DDL replication across two nodes, survival after failover | `tests/docker-smoke.sh` |
 
 ## Pre-1.0 Test Backlog
 

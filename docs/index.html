@@ -707,8 +707,9 @@
       <li><a href="#architecture">Architecture</a></li>
       <li><a href="#use-cases">Use Cases</a></li>
       <li><a href="#progress">Scaling</a></li>
+      <li><a href="#download">Download</a></li>
       <li><a href="brand.html">Brand</a></li>
-      <li><a href="https://github.com/bkearns/ferrosa">GitHub</a></li>
+      <li><a href="https://github.com/ferrosadb/ferrosadb">GitHub</a></li>
     </ul>
     <a href="#get-started" class="nav-cta">Get Started</a>
   </div>
@@ -982,6 +983,33 @@
       </p>
       <span class="metric">SELECT * FROM system_observability.*</span>
     </div>
+
+    <!-- Production Ready -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(140, 200, 120, 0.12);">⛨</div>
+      <h3>Production Ready</h3>
+      <p>
+        Background maintenance loop handles auto-flush, compaction polling, and commit log GC
+        without operator intervention. Graceful shutdown with configurable timeout drains
+        in-flight requests before stopping. Per-connection request limiting provides backpressure
+        under load. Exponential backoff reconnection for internode links. Ships as a systemd
+        service with .deb packaging.
+      </p>
+      <span class="metric">auto-flush · compaction · backpressure · graceful shutdown</span>
+    </div>
+
+    <!-- WASM User-Defined Functions -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(180, 130, 255, 0.12);">&#x2699;</div>
+      <h3>WebAssembly Functions <span style="font-size: 0.7em; color: var(--accent-secondary); font-weight: 600;">COMING SOON</span></h3>
+      <p>
+        User-defined functions execute as sandboxed WebAssembly — no Java, no JavaScript.
+        Upload a compiled WASM binary to a table, reference it in CREATE FUNCTION with an AS clause.
+        Write functions in Rust (preferred), C, Go, or any language that compiles to WASM.
+        Memory-limited, CPU-time-limited, no network or filesystem access. Deterministic execution guaranteed.
+      </p>
+      <span class="metric">WASM sandbox · Rust-native · deterministic · no GC runtime</span>
+    </div>
   </div>
 </section>
 
@@ -1212,12 +1240,28 @@ user = session.execute(stmt, [user_id])
           <td><span class="cross">✗</span></td>
         </tr>
         <tr>
+          <td>UDF Language</td>
+          <td class="ferrosa-col">WASM (any language)</td>
+          <td>Java</td>
+          <td>Lua / WASM</td>
+          <td>N/A</td>
+          <td>N/A</td>
+        </tr>
+        <tr>
           <td>Built-in Observability</td>
           <td class="ferrosa-col"><span class="check">✓</span> CQL + TUI + Web</td>
           <td>JMX/nodetool</td>
           <td>Prometheus</td>
           <td>CloudWatch</td>
           <td>CloudWatch</td>
+        </tr>
+        <tr>
+          <td>Production Ops</td>
+          <td class="ferrosa-col">Auto-maintenance, graceful shutdown, backpressure, systemd</td>
+          <td>Manual (nodetool)</td>
+          <td>Manual + Operator</td>
+          <td>Managed</td>
+          <td>Managed</td>
         </tr>
         <tr>
           <td>Node Recovery</td>
@@ -1328,9 +1372,10 @@ user = session.execute(stmt, [user_id])
         <span class="arch-layer-label">Cluster</span>
         <div class="arch-layer-items">
           <span class="arch-item">ferrosa-cluster</span>
+          <span class="arch-item">Pair Mode (HA)</span>
+          <span class="arch-item">DDL Replication</span>
           <span class="arch-item">Raft (openraft)</span>
           <span class="arch-item">Token Ring</span>
-          <span class="arch-item">Tunable CL</span>
         </div>
       </div>
     </div>
@@ -1397,8 +1442,9 @@ user = session.execute(stmt, [user_id])
         <h3>High availability with pair mode</h3>
         <p>
           Add a second node and Ferrosa automatically enters pair mode — synchronous replication
-          with instant failover. Perfect for production workloads that need HA without the
-          complexity of a full distributed cluster.
+          with instant failover. All 11 DDL operations replicate automatically: CREATE, ALTER,
+          and DROP for keyspaces, tables, and roles, plus GRANT and REVOKE. Schema catch-up
+          on rejoin, operator switchover, and force-promote for split-brain recovery.
         </p>
       </div>
       <div class="use-case">
@@ -1414,6 +1460,36 @@ user = session.execute(stmt, [user_id])
   </section>
 </div>
 
+<!-- ═══════════════════ Download ═══════════════════ -->
+<section id="download" style="padding-bottom: 2rem;">
+  <p class="section-label centered">Download</p>
+  <h2 class="section-title centered">Install in under a minute</h2>
+  <p class="section-subtitle centered" style="margin-bottom: 3rem;">
+    The .deb package includes the ferrosa server, ferrosa-ctl admin tool, systemd service unit, and smoke tests.
+  </p>
+
+  <div style="max-width: 700px; margin: 0 auto;">
+    <div class="code-demo">
+      <pre class="code-block active" style="display: block;"><span class="cm"># Download the latest release</span>
+<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_0.1.0_amd64.deb
+
+<span class="cm"># Install</span>
+<span class="kw">sudo</span> dpkg -i ferrosa_0.1.0_amd64.deb
+
+<span class="cm"># Start the service</span>
+<span class="kw">sudo</span> systemctl start ferrosa
+
+<span class="cm"># Connect with any CQL client</span>
+<span class="kw">cqlsh</span> localhost 9042</pre>
+    </div>
+
+    <p style="text-align: center; margin-top: 1.5rem; font-size: 0.9375rem; color: var(--text-secondary);">
+      Or <a href="getting-started.html" style="color: var(--accent);">build from source</a> for other platforms.
+      All releases available on <a href="https://github.com/ferrosadb/ferrosadb/releases/latest" style="color: var(--accent);">GitHub Releases</a>.
+    </p>
+  </div>
+</section>
+
 <!-- ═══════════════════ Get Started ═══════════════════ -->
 <section class="cta-section" id="get-started">
   <h2>Ready to leave GC pauses behind?</h2>
@@ -1421,7 +1497,8 @@ user = session.execute(stmt, [user_id])
     Ferrosa is open source. Get started in minutes.
   </p>
   <div class="cta-actions">
-    <a href="https://github.com/bkearns/ferrosa" class="btn-primary">View on GitHub</a>
+    <a href="https://github.com/ferrosadb/ferrosadb/releases/latest" class="btn-primary">Download Latest Release</a>
+    <a href="https://github.com/ferrosadb/ferrosadb" class="btn-secondary">View on GitHub</a>
     <a href="getting-started.html" class="btn-secondary">Read the Docs</a>
   </div>
 </section>
@@ -1434,7 +1511,7 @@ user = session.execute(stmt, [user_id])
     </div>
     <ul class="footer-links">
       <li><a href="https://ferrosadb.com">ferrosadb.com</a></li>
-      <li><a href="https://github.com/bkearns/ferrosa">GitHub</a></li>
+      <li><a href="https://github.com/ferrosadb/ferrosadb">GitHub</a></li>
       <li><a href="getting-started.html">Docs</a></li>
       <li><a href="cql-compatibility.html">CQL Reference</a></li>
       <li><a href="migration.html">Migration Guide</a></li>
