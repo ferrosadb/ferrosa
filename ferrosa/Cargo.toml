@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 arc-swap = "1.7"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-net = { path = "../ferrosa-net" }

@@ -23,6 +23,33 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
+/// Read a config value: env var takes precedence, then config file, then default.
+fn config_val(
+    env_key: &str,
+    config: &toml::Value,
+    section: &str,
+    key: &str,
+    default: &str,
+) -> String {
+    std::env::var(env_key).unwrap_or_else(|_| {
+        config
+            .get(section)
+            .and_then(|s| s.get(key))
+            .and_then(|v| v.as_str().map(String::from).or_else(|| Some(v.to_string())))
+            .unwrap_or_else(|| default.to_string())
+    })
+}
+
+/// Load TOML configuration from disk. Returns an empty table if the file does not exist.
+fn load_config(path: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
+    if std::path::Path::new(path).exists() {
+        let content = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&content)?)
+    } else {
+        Ok(toml::Value::Table(toml::map::Map::new()))
+    }
+}
+
 /// Load host_id from disk, env var, or generate a new one.
 fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
     let path = data_dir.join("host_id");
@@ -62,8 +89,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("ferrosa starting");
 
+    // 1b. Load TOML config file (env vars override file values)
+    let config_path =
+        std::env::var("FERROSA_CONFIG").unwrap_or_else(|_| "/etc/ferrosa/ferrosa.toml".to_string());
+    let file_config = load_config(&config_path)?;
+    if std::path::Path::new(&config_path).exists() {
+        tracing::info!(path = %config_path, "loaded config file");
+    }
+
     // 2. Load/generate host_id
-    let data_dir = std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());
+    let data_dir = config_val(
+        "FERROSA_DATA_DIR",
+        &file_config,
+        "storage",
+        "data_dir",
+        "/var/lib/ferrosa",
+    );
     std::fs::create_dir_all(&data_dir)?;
     let host_id = load_or_generate_host_id(Path::new(&data_dir));
 
@@ -132,14 +173,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(%internode_addr, %host_id, "internode server listening");
 
     // 8. Start CQL server
-    let cql_bind: std::net::SocketAddr = std::env::var("FERROSA_CQL_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:9042".to_string())
-        .parse()?;
+    let cql_bind: std::net::SocketAddr = config_val(
+        "FERROSA_CQL_BIND",
+        &file_config,
+        "cql",
+        "bind",
+        "0.0.0.0:9042",
+    )
+    .parse()?;
+    let auth_disabled_str = config_val(
+        "FERROSA_AUTH_DISABLED",
+        &file_config,
+        "cql",
+        "auth_disabled",
+        "false",
+    );
     let cql_config = ferrosa_cql::server::ServerConfig {
         bind_addr: cql_bind,
-        auth_disabled: std::env::var("FERROSA_AUTH_DISABLED")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
+        auth_disabled: auth_disabled_str == "true" || auth_disabled_str == "1",
         ..ferrosa_cql::server::ServerConfig::default()
     };
     let node_config = Arc::new(ferrosa_schema::NodeConfig {
@@ -340,4 +391,169 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("ferrosa stopped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_config() -> toml::Value {
+        toml::Value::Table(toml::map::Map::new())
+    }
+
+    fn sample_config() -> toml::Value {
+        toml::from_str(
+            r#"
+            [storage]
+            data_dir = "/data/ferrosa"
+
+            [cql]
+            bind = "127.0.0.1:19042"
+            auth_disabled = true
+
+            [internode]
+            cluster_name = "test-cluster"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn config_val_returns_default_when_empty_config_and_no_env() {
+        // Use a unique env key to avoid collisions with real env vars.
+        let key = "FERROSA_TEST_CFG_EMPTY_5a3b";
+        std::env::remove_var(key);
+
+        let result = config_val(
+            key,
+            &empty_config(),
+            "storage",
+            "data_dir",
+            "/var/lib/ferrosa",
+        );
+        assert_eq!(result, "/var/lib/ferrosa");
+    }
+
+    #[test]
+    fn config_val_reads_from_toml_when_no_env() {
+        let key = "FERROSA_TEST_CFG_TOML_7d2e";
+        std::env::remove_var(key);
+        let config = sample_config();
+
+        let result = config_val(key, &config, "storage", "data_dir", "/var/lib/ferrosa");
+        assert_eq!(result, "/data/ferrosa");
+    }
+
+    #[test]
+    fn config_val_env_overrides_toml() {
+        let key = "FERROSA_TEST_CFG_OVERRIDE_9f1c";
+        std::env::set_var(key, "/env/override");
+        let config = sample_config();
+
+        let result = config_val(key, &config, "storage", "data_dir", "/var/lib/ferrosa");
+        assert_eq!(result, "/env/override");
+
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn config_val_handles_boolean_values() {
+        let key = "FERROSA_TEST_CFG_BOOL_4c8a";
+        std::env::remove_var(key);
+        let config = sample_config();
+
+        let result = config_val(key, &config, "cql", "auth_disabled", "false");
+        assert_eq!(result, "true");
+    }
+
+    #[test]
+    fn config_val_missing_section_returns_default() {
+        let key = "FERROSA_TEST_CFG_NOSEC_1b7f";
+        std::env::remove_var(key);
+        let config = sample_config();
+
+        let result = config_val(key, &config, "nonexistent", "key", "fallback");
+        assert_eq!(result, "fallback");
+    }
+
+    #[test]
+    fn config_val_missing_key_returns_default() {
+        let key = "FERROSA_TEST_CFG_NOKEY_8e3d";
+        std::env::remove_var(key);
+        let config = sample_config();
+
+        let result = config_val(key, &config, "storage", "nonexistent", "default_val");
+        assert_eq!(result, "default_val");
+    }
+
+    #[test]
+    fn load_config_returns_empty_table_for_missing_file() {
+        let result = load_config("/tmp/ferrosa_nonexistent_config_test.toml").unwrap();
+        assert!(result.is_table());
+        assert!(result.as_table().unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_config_parses_valid_toml_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ferrosa.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [storage]
+            data_dir = "/test/data"
+
+            [cql]
+            bind = "0.0.0.0:9042"
+            "#,
+        )
+        .unwrap();
+
+        let config = load_config(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            config
+                .get("storage")
+                .unwrap()
+                .get("data_dir")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "/test/data"
+        );
+        assert_eq!(
+            config
+                .get("cql")
+                .unwrap()
+                .get("bind")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "0.0.0.0:9042"
+        );
+    }
+
+    #[test]
+    fn load_config_rejects_invalid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "this is not [valid toml =").unwrap();
+
+        assert!(load_config(path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn example_config_file_is_valid_toml() {
+        let example = include_str!("../ferrosa.example.toml");
+        let parsed: Result<toml::Value, _> = toml::from_str(example);
+        assert!(parsed.is_ok(), "ferrosa.example.toml must be valid TOML");
+
+        let config = parsed.unwrap();
+        // Verify key sections exist
+        assert!(config.get("cql").is_some());
+        assert!(config.get("internode").is_some());
+        assert!(config.get("storage").is_some());
+        assert!(config.get("s3").is_some());
+        assert!(config.get("graph").is_some());
+        assert!(config.get("web").is_some());
+    }
 }
