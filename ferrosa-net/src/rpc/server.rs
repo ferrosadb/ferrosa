@@ -75,12 +75,15 @@ impl RpcServer {
                         };
                         let mut body = bytes::BytesMut::new();
                         if ack.encode(&mut body).is_ok() {
+                            let Ok(body_len) = u32::try_from(body.len()) else {
+                                return;
+                            };
                             let frame = Frame {
                                 header: FrameHeader::new(
                                     crate::codec::MsgType::HandshakeAck,
                                     crate::codec::Lane::Raft,
                                     0,
-                                    body.len() as u32,
+                                    body_len,
                                 ),
                                 body: body.freeze(),
                             };
@@ -130,12 +133,14 @@ impl RpcServer {
             if let Some(response) = self.registry.dispatch(peer_id, msg_type, msg).await {
                 let mut body = bytes::BytesMut::new();
                 response.encode(&mut body)?;
+                let body_len = u32::try_from(body.len())
+                    .map_err(|_| NetError::Protocol("response body exceeds u32::MAX".into()))?;
                 let resp_frame = Frame {
                     header: FrameHeader::new(
                         response.msg_type(),
                         frame.header.lane,
                         stream_id,
-                        body.len() as u32,
+                        body_len,
                     ),
                     body: body.freeze(),
                 };
@@ -244,7 +249,12 @@ mod tests {
         let mut body = BytesMut::new();
         ping.encode(&mut body).unwrap();
         let frame = Frame {
-            header: FrameHeader::new(MsgType::Ping, Lane::Raft, 1, body.len() as u32),
+            header: FrameHeader::new(
+                MsgType::Ping,
+                Lane::Raft,
+                1,
+                u32::try_from(body.len()).unwrap(),
+            ),
             body: body.freeze(),
         };
         framed.send(frame).await.unwrap();

@@ -67,7 +67,13 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
     let mut body = BytesMut::new();
     handshake.encode(&mut body)?;
     let frame = Frame {
-        header: FrameHeader::new(MsgType::Handshake, Lane::Raft, 0, body.len() as u32),
+        header: FrameHeader::new(
+            MsgType::Handshake,
+            Lane::Raft,
+            0,
+            u32::try_from(body.len())
+                .map_err(|_| NetError::Protocol("handshake body exceeds u32::MAX".into()))?,
+        ),
         body: body.freeze(),
     };
     framed.send(frame).await?;
@@ -176,7 +182,13 @@ async fn send_handshake_ack<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     let mut body = BytesMut::new();
     ack.encode(&mut body)?;
     let frame = Frame {
-        header: FrameHeader::new(MsgType::HandshakeAck, Lane::Raft, 0, body.len() as u32),
+        header: FrameHeader::new(
+            MsgType::HandshakeAck,
+            Lane::Raft,
+            0,
+            u32::try_from(body.len())
+                .map_err(|_| NetError::Protocol("handshake ack body exceeds u32::MAX".into()))?,
+        ),
         body: body.freeze(),
     };
     framed.send(frame).await?;
@@ -302,7 +314,12 @@ mod tests {
         let mut body = BytesMut::new();
         bad_handshake.encode(&mut body).unwrap();
         let frame = Frame {
-            header: FrameHeader::new(MsgType::Handshake, Lane::Raft, 0, body.len() as u32),
+            header: FrameHeader::new(
+                MsgType::Handshake,
+                Lane::Raft,
+                0,
+                u32::try_from(body.len()).unwrap(),
+            ),
             body: body.freeze(),
         };
         client_framed.send(frame).await.unwrap();

@@ -89,8 +89,10 @@ impl RpcClient {
 
         let mut body = BytesMut::new();
         msg.encode(&mut body)?;
+        let body_len = u32::try_from(body.len())
+            .map_err(|_| NetError::Protocol("request body exceeds u32::MAX".into()))?;
         let frame = Frame {
-            header: FrameHeader::new(msg.msg_type(), lane, stream_id, body.len() as u32),
+            header: FrameHeader::new(msg.msg_type(), lane, stream_id, body_len),
             body: body.freeze(),
         };
         self.tx
@@ -108,7 +110,9 @@ impl RpcClient {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let mut body = BytesMut::new();
         msg.encode(&mut body)?;
-        let mut header = FrameHeader::new(msg.msg_type(), lane, stream_id, body.len() as u32);
+        let body_len = u32::try_from(body.len())
+            .map_err(|_| NetError::Protocol("fire body exceeds u32::MAX".into()))?;
+        let mut header = FrameHeader::new(msg.msg_type(), lane, stream_id, body_len);
         header.flags |= FLAG_FIRE_AND_FORGET;
         let frame = Frame {
             header,

@@ -39,9 +39,12 @@ fn get_uuid(buf: &mut Bytes) -> Result<Uuid> {
     Ok(Uuid::from_bytes(bytes))
 }
 
-fn put_bytes(buf: &mut BytesMut, data: &[u8]) {
-    buf.put_u32(data.len() as u32);
+fn put_bytes(buf: &mut BytesMut, data: &[u8]) -> Result<()> {
+    let len = u32::try_from(data.len())
+        .map_err(|_| NetError::Protocol("bytes field exceeds u32::MAX".into()))?;
+    buf.put_u32(len);
     buf.put_slice(data);
+    Ok(())
 }
 
 fn get_bytes(buf: &mut Bytes) -> Result<Vec<u8>> {
@@ -152,9 +155,11 @@ impl Message {
                 put_string(buf, cluster_name)?;
                 put_uuid(buf, host_id);
                 buf.put_u8(*protocol_version);
-                buf.put_u8(supported_compression.len() as u8);
+                let comp_len = u8::try_from(supported_compression.len())
+                    .map_err(|_| NetError::Protocol("compression list exceeds 255".into()))?;
+                buf.put_u8(comp_len);
                 buf.put_slice(supported_compression);
-                put_bytes(buf, auth_token);
+                put_bytes(buf, auth_token)?;
             }
             Self::HandshakeAck {
                 host_id,
