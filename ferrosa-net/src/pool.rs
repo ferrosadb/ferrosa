@@ -29,6 +29,11 @@ impl PriorityPool {
         Ok(Self { raft, data, bulk })
     }
 
+    /// The peer's host_id, obtained during the handshake on the first connection.
+    pub fn peer_host_id(&self) -> Uuid {
+        self.raft.peer_host_id()
+    }
+
     pub fn client(&self, lane: Lane) -> &RpcClient {
         match lane {
             Lane::Raft => &self.raft,
@@ -75,7 +80,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             ..NetConfig::default()
         };
-        let mut registry = HandlerRegistry::new();
+        let registry = Arc::new(HandlerRegistry::new());
         registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
         let server = Arc::new(RpcServer::new(
             config.clone(),

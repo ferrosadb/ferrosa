@@ -90,14 +90,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cluster_config = Arc::new(ferrosa_cluster::ClusterConfig::from_env());
     let net_config = Arc::new(ferrosa_net::config::NetConfig::from_env());
 
+    // Build handler registry — shared between RPC server and ModeController.
+    // Catch-up handler is always available; pair write/role-swap handlers are
+    // registered dynamically by ModeController on mode transition.
+    let registry = Arc::new(ferrosa_net::rpc::HandlerRegistry::new());
+    let catchup_handler = Arc::new(ferrosa_cluster::pair::catchup::PairCatchUpHandler::new(
+        storage.clone(),
+    ));
+    registry.register(ferrosa_net::codec::MsgType::PairCatchUp, catchup_handler);
+
     let (mode_controller, handles) = ferrosa_cluster::ModeController::new(
         cluster_config,
         net_config.clone(),
         host_id,
         storage.clone(),
+        registry.clone(),
     );
 
-    // 6. Create PeerManager + RPC handlers
+    // 6. Create PeerManager — ModeController is the PeerEventListener
     let peer_manager = Arc::new(ferrosa_net::peer::PeerManager::new(
         net_config.clone(),
         host_id,
@@ -105,21 +115,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     mode_controller.set_peer_manager(peer_manager.clone());
 
-    // Build handler registry for pair mode RPC
-    let mut registry = ferrosa_net::rpc::HandlerRegistry::new();
-    // Pair mode handlers will be registered by ModeController when transitioning
-    // For now, register catch-up and role-swap handlers that are always available
-    let catchup_handler = Arc::new(ferrosa_cluster::pair::catchup::PairCatchUpHandler::new(
-        storage.clone(),
-    ));
-    registry.register(ferrosa_net::codec::MsgType::PairCatchUp, catchup_handler);
-
-    // 7. Start internode RPC server
-    let rpc_server = Arc::new(ferrosa_net::rpc::server::RpcServer::new(
-        (*net_config).clone(),
-        host_id,
-        registry,
-    ));
+    // 7. Start internode RPC server with inbound peer callback
+    let rpc_server = Arc::new(
+        ferrosa_net::rpc::server::RpcServer::new((*net_config).clone(), host_id, registry)
+            .with_inbound_callback(mode_controller.clone()),
+    );
     let internode_addr = rpc_server.start_and_get_addr().await?;
     tracing::info!(%internode_addr, %host_id, "internode server listening");
 
@@ -213,12 +213,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await
                 {
                     Ok(pool) => {
-                        // The handshake exchanged host_ids. For now, use a placeholder
-                        // peer_id — the PeerEventListener will handle the mode transition.
-                        // TODO: extract peer host_id from handshake response.
-                        let peer_id = Uuid::new_v4();
-                        pm.add_peer((peer_id, *seed_addr), pool).await;
-                        tracing::info!(%seed_addr, "seed connected");
+                        let peer_host_id = pool.peer_host_id();
+                        pm.add_peer((peer_host_id, *seed_addr), pool).await;
+                        tracing::info!(%seed_addr, %peer_host_id, "seed connected");
                     }
                     Err(e) => {
                         tracing::warn!(%seed_addr, %e, "seed connection failed (will retry)");

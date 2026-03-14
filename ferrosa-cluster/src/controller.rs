@@ -10,9 +10,11 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use uuid::Uuid;
 
+use ferrosa_net::codec::MsgType;
 use ferrosa_net::config::NetConfig;
 use ferrosa_net::peer::{PeerEventListener, PeerManager};
 use ferrosa_net::rpc::handler::PeerId;
+use ferrosa_net::rpc::{HandlerRegistry, InboundPeerCallback};
 use ferrosa_schema::system::peers::{ClusterState, PeerInfo};
 use ferrosa_storage::engine::StorageEngine;
 
@@ -52,6 +54,7 @@ pub struct ModeController {
     net_config: Arc<NetConfig>,
     local_host_id: Uuid,
     peer_manager: ArcSwap<Option<Arc<PeerManager>>>,
+    registry: Arc<HandlerRegistry>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -67,6 +70,7 @@ impl ModeController {
         net_config: Arc<NetConfig>,
         local_host_id: Uuid,
         storage: Arc<StorageEngine>,
+        registry: Arc<HandlerRegistry>,
     ) -> (Arc<Self>, ModeControllerHandles) {
         let write_path = Arc::new(ArcSwap::from_pointee(WritePath::direct(storage.clone())));
         let cluster_state = Arc::new(ArcSwap::from_pointee(ClusterStateHolder::Standalone));
@@ -80,6 +84,7 @@ impl ModeController {
             net_config,
             local_host_id,
             peer_manager: ArcSwap::from_pointee(None),
+            registry,
         });
 
         let handles = ModeControllerHandles {
@@ -113,11 +118,25 @@ impl ModeController {
         let role_arc = Arc::new(ArcSwap::from_pointee(role));
 
         let coordinator = Arc::new(PairCoordinator::new(
-            role_arc,
+            role_arc.clone(),
             peer_host_id,
             self.storage.clone(),
             peer_manager,
         ));
+
+        // Register pair mode RPC handlers dynamically
+        let write_fwd_handler = Arc::new(crate::pair::handler::PairWriteForwardHandler::new(
+            role_arc.clone(),
+            coordinator.clone(),
+        ));
+        self.registry
+            .register(MsgType::PairWriteForward, write_fwd_handler);
+
+        let role_swap_handler = Arc::new(crate::pair::switchover::RoleSwapHandler::new(
+            self.local_host_id,
+            role_arc,
+        ));
+        self.registry.register(MsgType::RoleSwap, role_swap_handler);
 
         self.write_path
             .store(Arc::new(WritePath::pair(coordinator)));
@@ -178,6 +197,18 @@ impl PeerEventListener for ModeController {
     }
 }
 
+impl InboundPeerCallback for ModeController {
+    fn on_inbound_peer(&self, peer_id: PeerId) {
+        let (host_id, addr) = peer_id;
+        tracing::info!(peer = %host_id, %addr, "inbound peer connected");
+
+        let current_mode = **self.mode.load();
+        if current_mode == DeploymentMode::Standalone {
+            self.transition_to_pair(host_id, addr);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,7 +238,9 @@ mod tests {
         let net_config = Arc::new(NetConfig::default());
         let host_id = Uuid::new_v4();
 
-        let (controller, _handles) = ModeController::new(config, net_config, host_id, storage);
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) =
+            ModeController::new(config, net_config, host_id, storage, registry);
 
         assert_eq!(controller.mode(), DeploymentMode::Standalone);
     }
@@ -221,8 +254,9 @@ mod tests {
         let local_id = Uuid::new_v4();
         let peer_id = Uuid::new_v4();
 
+        let registry = Arc::new(HandlerRegistry::new());
         let (controller, _handles) =
-            ModeController::new(config, net_config.clone(), local_id, storage);
+            ModeController::new(config, net_config.clone(), local_id, storage, registry);
 
         // Create a PeerManager and set it
         let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
@@ -244,8 +278,9 @@ mod tests {
         let local_id = Uuid::new_v4();
         let peer_id = Uuid::new_v4();
 
+        let registry = Arc::new(HandlerRegistry::new());
         let (controller, _handles) =
-            ModeController::new(config, net_config.clone(), local_id, storage);
+            ModeController::new(config, net_config.clone(), local_id, storage, registry);
 
         let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
         controller.set_peer_manager(pm);

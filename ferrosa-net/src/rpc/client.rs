@@ -18,6 +18,7 @@ pub struct RpcClient {
     #[allow(dead_code)] // used in future phases (reconnection, pool management)
     config: Arc<NetConfig>,
     peer_addr: std::net::SocketAddr,
+    peer_host_id: uuid::Uuid,
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Message>>>>,
     tx: mpsc::Sender<Frame>,
     next_stream_id: Arc<AtomicU32>,
@@ -28,6 +29,11 @@ impl RpcClient {
         self.peer_addr
     }
 
+    /// The peer's host_id, obtained during the handshake.
+    pub fn peer_host_id(&self) -> uuid::Uuid {
+        self.peer_host_id
+    }
+
     pub async fn connect(
         config: Arc<NetConfig>,
         local_host_id: uuid::Uuid,
@@ -36,7 +42,7 @@ impl RpcClient {
         let stream = TcpStream::connect(peer_addr).await?;
         let mut framed = Framed::new(stream, InternodeCodec::new(config.max_frame_body_size));
 
-        let _peer_host_id = tokio::time::timeout(
+        let peer_host_id = tokio::time::timeout(
             config.handshake_timeout,
             initiate_handshake(&mut framed, &config, local_host_id),
         )
@@ -75,6 +81,7 @@ impl RpcClient {
         Ok(Self {
             config,
             peer_addr,
+            peer_host_id,
             pending,
             tx,
             next_stream_id: Arc::new(AtomicU32::new(1)),
@@ -148,7 +155,7 @@ mod tests {
     }
 
     async fn start_echo_server(config: &NetConfig) -> std::net::SocketAddr {
-        let mut registry = HandlerRegistry::new();
+        let registry = Arc::new(HandlerRegistry::new());
         registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
         let server = Arc::new(RpcServer::new(
             config.clone(),
@@ -213,7 +220,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             ..NetConfig::default()
         };
-        let registry = HandlerRegistry::new(); // empty — no handlers
+        let registry = Arc::new(HandlerRegistry::new()); // empty — no handlers
         let server = Arc::new(RpcServer::new(
             config.clone(),
             uuid::Uuid::new_v4(),

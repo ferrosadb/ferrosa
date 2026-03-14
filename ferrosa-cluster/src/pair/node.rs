@@ -132,7 +132,7 @@ impl PairNode {
 
     /// Build the handler registry with pair mode RPC handlers.
     pub fn build_registry(&self) -> HandlerRegistry {
-        let mut registry = HandlerRegistry::new();
+        let registry = HandlerRegistry::new();
         let handler = Arc::new(PairWriteForwardHandler::new(
             self.role.clone(),
             self.coordinator.clone(),
@@ -156,7 +156,7 @@ impl PairNode {
     /// Start the RPC server and connect to peer.
     /// Returns the bound address of this node's RPC server.
     pub async fn start(&self) -> Result<SocketAddr> {
-        let registry = self.build_registry();
+        let registry = Arc::new(self.build_registry());
         let server = Arc::new(RpcServer::new(
             (*self.net_config).clone(),
             self.local_host_id,
