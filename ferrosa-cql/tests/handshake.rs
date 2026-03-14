@@ -210,9 +210,8 @@ fn test_config(auth_disabled: bool) -> ServerConfig {
     ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         max_connections: 10,
-        max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-        max_in_flight_per_connection: 128,
         auth_disabled,
+        ..ServerConfig::default()
     }
 }
 

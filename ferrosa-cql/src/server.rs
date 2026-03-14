@@ -1,8 +1,9 @@
 //! CQL TCP server: accepts connections and spawns per-connection tasks.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use futures::SinkExt;
 use tokio::net::TcpListener;
@@ -25,6 +26,8 @@ pub struct ServerConfig {
     /// Enforced via a semaphore in the connection handler — exceeding this
     /// limit returns ERROR(Overloaded) to the client.
     pub max_in_flight_per_connection: usize,
+    /// Max connections from a single IP address (default 64).
+    pub max_connections_per_ip: usize,
     /// If true, skip auth (STARTUP returns READY directly).
     pub auth_disabled: bool,
 }
@@ -35,8 +38,46 @@ impl Default for ServerConfig {
             bind_addr: "127.0.0.1:9042".parse().unwrap(),
             max_connections: 1024,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            max_connections_per_ip: 64,
             max_in_flight_per_connection: 128,
             auth_disabled: false,
+        }
+    }
+}
+
+/// Tracks per-IP connection counts for rate limiting.
+#[derive(Debug, Default)]
+struct IpConnectionTracker {
+    counts: RwLock<HashMap<IpAddr, usize>>,
+}
+
+impl IpConnectionTracker {
+    fn new() -> Self {
+        Self {
+            counts: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Try to acquire a connection slot for the given IP.
+    /// Returns true if under limit, false if at/over limit.
+    fn try_acquire(&self, ip: IpAddr, limit: usize) -> bool {
+        let mut counts = self.counts.write().unwrap();
+        let count = counts.entry(ip).or_insert(0);
+        if *count >= limit {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Release a connection slot for the given IP.
+    fn release(&self, ip: IpAddr) {
+        let mut counts = self.counts.write().unwrap();
+        if let Some(count) = counts.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&ip);
+            }
         }
     }
 }
@@ -46,6 +87,7 @@ pub struct CqlServer {
     config: ServerConfig,
     state: Arc<SharedState>,
     active_connections: Arc<AtomicUsize>,
+    ip_tracker: Arc<IpConnectionTracker>,
 }
 
 impl CqlServer {
@@ -54,6 +96,7 @@ impl CqlServer {
             config,
             state,
             active_connections: Arc::new(AtomicUsize::new(0)),
+            ip_tracker: Arc::new(IpConnectionTracker::new()),
         }
     }
 
@@ -62,10 +105,12 @@ impl CqlServer {
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         let addr = listener.local_addr()?;
         let max_connections = self.config.max_connections;
+        let max_connections_per_ip = self.config.max_connections_per_ip;
         let max_frame_size = self.config.max_frame_size;
         let max_in_flight = self.config.max_in_flight_per_connection;
         let auth_disabled = self.config.auth_disabled;
         let active = self.active_connections.clone();
+        let ip_tracker = self.ip_tracker.clone();
         let state = self.state.clone();
 
         info!("CQL server listening on {addr}");
@@ -95,7 +140,30 @@ impl CqlServer {
                             let _ = framed.send(frame).await;
                             continue;
                         }
+                        // Per-IP rate limiting
+                        let peer_ip = peer.ip();
+                        if !ip_tracker.try_acquire(peer_ip, max_connections_per_ip) {
+                            active.fetch_sub(1, Ordering::Relaxed);
+                            warn!("per-IP limit reached for {peer_ip}, rejecting");
+                            let codec = CqlCodec::new(max_frame_size);
+                            let mut framed = Framed::new(stream, codec);
+                            let err = CqlError::Overloaded;
+                            let body = err.encode_body().freeze();
+                            let frame = CqlFrame {
+                                header: FrameHeader {
+                                    version: VERSION_RESPONSE,
+                                    flags: 0,
+                                    stream_id: -1,
+                                    opcode: Opcode::Error,
+                                    length: 0,
+                                },
+                                body,
+                            };
+                            let _ = framed.send(frame).await;
+                            continue;
+                        }
                         let active = active.clone();
+                        let ip_tracker = ip_tracker.clone();
                         let state = state.clone();
                         tokio::spawn(async move {
                             crate::connection::handle_connection(
@@ -107,6 +175,7 @@ impl CqlServer {
                                 state,
                             )
                             .await;
+                            ip_tracker.release(peer_ip);
                             active.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
@@ -210,17 +279,21 @@ mod tests {
         (state, dir)
     }
 
+    fn test_config(max_connections: usize, max_per_ip: usize) -> ServerConfig {
+        ServerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            max_connections,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            max_connections_per_ip: max_per_ip,
+            max_in_flight_per_connection: 128,
+            auth_disabled: false,
+        }
+    }
+
     #[tokio::test]
     async fn server_accepts_connection() {
         let (state, _dir) = setup_state();
-        let config = ServerConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            max_connections: 10,
-            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-            max_in_flight_per_connection: 128,
-            auth_disabled: false,
-        };
-        let server = CqlServer::new(config, state);
+        let server = CqlServer::new(test_config(10, 64), state);
         let addr = server.start_background().await.unwrap();
         let _stream = TcpStream::connect(addr).await.unwrap();
     }
@@ -228,14 +301,7 @@ mod tests {
     #[tokio::test]
     async fn server_rejects_over_limit_with_overloaded() {
         let (state, _dir) = setup_state();
-        let config = ServerConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            max_connections: 1,
-            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-            max_in_flight_per_connection: 128,
-            auth_disabled: false,
-        };
-        let server = CqlServer::new(config, state);
+        let server = CqlServer::new(test_config(1, 64), state);
         let addr = server.start_background().await.unwrap();
 
         let _conn1 = TcpStream::connect(addr).await.unwrap();
@@ -251,5 +317,55 @@ mod tests {
         assert_eq!(header.opcode, Opcode::Error);
         let error_code = i32::from_be_bytes(buf[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap());
         assert_eq!(error_code, 0x1100);
+    }
+
+    #[tokio::test]
+    async fn server_rejects_per_ip_over_limit() {
+        let (state, _dir) = setup_state();
+        // Global limit 10, per-IP limit 2
+        let server = CqlServer::new(test_config(10, 2), state);
+        let addr = server.start_background().await.unwrap();
+
+        // First two connections from 127.0.0.1 succeed
+        let _conn1 = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _conn2 = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Third connection from same IP should be rejected with Overloaded
+        let mut conn3 = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut buf = vec![0u8; 256];
+        let n = conn3.read(&mut buf).await.unwrap();
+        assert!(n >= HEADER_SIZE);
+        let header = FrameHeader::decode(&buf[..HEADER_SIZE]).unwrap();
+        assert_eq!(header.opcode, Opcode::Error);
+        let error_code = i32::from_be_bytes(buf[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap());
+        assert_eq!(error_code, 0x1100); // Overloaded
+    }
+
+    #[test]
+    fn ip_tracker_acquire_release() {
+        let tracker = IpConnectionTracker::new();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        assert!(tracker.try_acquire(ip, 2));
+        assert!(tracker.try_acquire(ip, 2));
+        assert!(!tracker.try_acquire(ip, 2)); // at limit
+
+        tracker.release(ip);
+        assert!(tracker.try_acquire(ip, 2)); // slot freed
+    }
+
+    #[test]
+    fn ip_tracker_different_ips_independent() {
+        let tracker = IpConnectionTracker::new();
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+
+        assert!(tracker.try_acquire(ip1, 1));
+        assert!(!tracker.try_acquire(ip1, 1)); // ip1 at limit
+        assert!(tracker.try_acquire(ip2, 1)); // ip2 still ok
     }
 }
