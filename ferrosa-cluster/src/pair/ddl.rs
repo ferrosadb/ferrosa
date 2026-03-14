@@ -16,9 +16,12 @@ use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 use ferrosa_schema::metadata::index::IndexMetadata;
-use ferrosa_schema::metadata::keyspace::KeyspaceMetadata;
-use ferrosa_schema::metadata::table::TableMetadata;
-use ferrosa_schema::{is_system_keyspace, GrantEntry, RoleMetadata, Schema, SchemaSnapshot};
+use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
+use ferrosa_schema::metadata::table::{TableMetadata, TableUpdates};
+use ferrosa_schema::{
+    is_system_keyspace, GrantEntry, Permission, Resource, RoleMetadata, RoleUpdates, Schema,
+    SchemaSnapshot,
+};
 use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::{ClusterError, Result};
@@ -37,6 +40,27 @@ pub enum DdlOperation {
     DropTable {
         keyspace: String,
         table: String,
+    },
+    AlterKeyspace {
+        name: String,
+        updates: KeyspaceUpdates,
+    },
+    AlterTable {
+        keyspace: String,
+        table: String,
+        updates: Box<TableUpdates>,
+    },
+    CreateRole(RoleMetadata),
+    AlterRole {
+        name: String,
+        updates: RoleUpdates,
+    },
+    DropRole(String),
+    Grant(GrantEntry),
+    Revoke {
+        role: String,
+        resource: Resource,
+        permission: Permission,
     },
     CreateIndex(IndexMetadata),
     DropIndex {
@@ -115,9 +139,22 @@ impl DdlCoordinator {
                     .map_err(|e| ClusterError::Internal(format!("create_keyspace: {e}")))?;
             }
             DdlOperation::DropKeyspace(name) => {
+                // Collect table IDs before dropping from schema so we can unregister them.
+                let snap = self.schema.snapshot();
+                let table_ids: Vec<_> = snap
+                    .tables
+                    .keys()
+                    .filter(|(ks, _)| ks == name)
+                    .map(|(ks, tbl)| ferrosa_storage::TableId::new(ks, tbl))
+                    .collect();
                 self.schema
                     .drop_keyspace_internal(name)
                     .map_err(|e| ClusterError::Internal(format!("drop_keyspace: {e}")))?;
+                for tid in &table_ids {
+                    self.engine
+                        .unregister_table(tid)
+                        .map_err(ClusterError::Storage)?;
+                }
             }
             DdlOperation::CreateTable(table) => {
                 self.schema
@@ -132,6 +169,53 @@ impl DdlCoordinator {
                 self.schema
                     .drop_table_internal(keyspace, table)
                     .map_err(|e| ClusterError::Internal(format!("drop_table: {e}")))?;
+                let tid = ferrosa_storage::TableId::new(keyspace, table);
+                self.engine
+                    .unregister_table(&tid)
+                    .map_err(ClusterError::Storage)?;
+            }
+            DdlOperation::AlterKeyspace { name, updates } => {
+                self.schema
+                    .alter_keyspace_internal(name, updates.clone())
+                    .map_err(|e| ClusterError::Internal(format!("alter_keyspace: {e}")))?;
+            }
+            DdlOperation::AlterTable {
+                keyspace,
+                table,
+                updates,
+            } => {
+                self.schema
+                    .alter_table_internal(keyspace, table, *updates.clone())
+                    .map_err(|e| ClusterError::Internal(format!("alter_table: {e}")))?;
+            }
+            DdlOperation::CreateRole(role) => {
+                self.schema
+                    .create_role_internal(role.clone())
+                    .map_err(|e| ClusterError::Internal(format!("create_role: {e}")))?;
+            }
+            DdlOperation::AlterRole { name, updates } => {
+                self.schema
+                    .alter_role_internal(name, updates.clone())
+                    .map_err(|e| ClusterError::Internal(format!("alter_role: {e}")))?;
+            }
+            DdlOperation::DropRole(name) => {
+                self.schema
+                    .drop_role_internal(name)
+                    .map_err(|e| ClusterError::Internal(format!("drop_role: {e}")))?;
+            }
+            DdlOperation::Grant(entry) => {
+                self.schema
+                    .grant_internal(entry.clone())
+                    .map_err(|e| ClusterError::Internal(format!("grant: {e}")))?;
+            }
+            DdlOperation::Revoke {
+                role,
+                resource,
+                permission,
+            } => {
+                self.schema
+                    .revoke_internal(role, resource, permission)
+                    .map_err(|e| ClusterError::Internal(format!("revoke: {e}")))?;
             }
             DdlOperation::CreateIndex(ref idx) => {
                 self.schema
@@ -481,5 +565,167 @@ mod tests {
             matches!(err, ClusterError::Internal(_)),
             "expected ClusterError::Internal, got {err:?}"
         );
+    }
+
+    #[test]
+    fn ddl_operation_alter_keyspace_roundtrip() {
+        use ferrosa_schema::metadata::keyspace::{KeyspaceUpdates, ReplicationParams};
+        let mut opts = HashMap::new();
+        opts.insert("replication_factor".to_string(), "3".to_string());
+        let op = DdlOperation::AlterKeyspace {
+            name: "ks".to_string(),
+            updates: KeyspaceUpdates {
+                replication: Some(ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: opts,
+                }),
+                durable_writes: None,
+            },
+        };
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::AlterKeyspace { name, updates } => {
+                assert_eq!(name, "ks");
+                assert!(updates.replication.is_some());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ddl_operation_alter_table_roundtrip() {
+        use ferrosa_schema::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
+        use ferrosa_schema::metadata::table::TableUpdates;
+        let op = DdlOperation::AlterTable {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            updates: Box::new(TableUpdates {
+                params: None,
+                add_columns: vec![ColumnMetadata {
+                    name: "new_col".to_string(),
+                    kind: ColumnKind::Regular,
+                    position: 1,
+                    column_type: "text".to_string(),
+                    clustering_order: ClusteringOrder::None,
+                    mask: None,
+                }],
+                drop_columns: vec![],
+                extensions: None,
+            }),
+        };
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::AlterTable {
+                keyspace,
+                table,
+                updates,
+            } => {
+                assert_eq!(keyspace, "ks");
+                assert_eq!(table, "tbl");
+                assert_eq!(updates.add_columns.len(), 1);
+                assert_eq!(updates.add_columns[0].name, "new_col");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ddl_operation_create_role_roundtrip() {
+        use ferrosa_schema::RoleMetadata;
+        let op = DdlOperation::CreateRole(RoleMetadata {
+            name: "analyst".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: HashSet::new(),
+        });
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::CreateRole(role) => {
+                assert_eq!(role.name, "analyst");
+                assert!(!role.is_superuser);
+                assert!(role.can_login);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ddl_operation_alter_role_roundtrip() {
+        use ferrosa_schema::RoleUpdates;
+        let op = DdlOperation::AlterRole {
+            name: "analyst".to_string(),
+            updates: RoleUpdates {
+                is_superuser: Some(true),
+                ..Default::default()
+            },
+        };
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::AlterRole { name, updates } => {
+                assert_eq!(name, "analyst");
+                assert_eq!(updates.is_superuser, Some(true));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ddl_operation_drop_role_roundtrip() {
+        let op = DdlOperation::DropRole("analyst".to_string());
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::DropRole(name) => assert_eq!(name, "analyst"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ddl_operation_grant_roundtrip() {
+        use ferrosa_schema::{GrantEntry, Permission, Resource};
+        let op = DdlOperation::Grant(GrantEntry {
+            role: "analyst".to_string(),
+            resource: Resource::Keyspace("ks".to_string()),
+            permissions: [Permission::Select].into_iter().collect(),
+        });
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::Grant(entry) => {
+                assert_eq!(entry.role, "analyst");
+                assert!(matches!(entry.resource, Resource::Keyspace(ref n) if n == "ks"));
+                assert!(entry.permissions.contains(&Permission::Select));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ddl_operation_revoke_roundtrip() {
+        use ferrosa_schema::{Permission, Resource};
+        let op = DdlOperation::Revoke {
+            role: "analyst".to_string(),
+            resource: Resource::Keyspace("ks".to_string()),
+            permission: Permission::Select,
+        };
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::Revoke {
+                role,
+                resource,
+                permission,
+            } => {
+                assert_eq!(role, "analyst");
+                assert!(matches!(resource, Resource::Keyspace(ref n) if n == "ks"));
+                assert_eq!(permission, Permission::Select);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }

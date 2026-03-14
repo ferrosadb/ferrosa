@@ -39,7 +39,7 @@ pub struct AuthContext {
 /// Optional updates for a role (builder-style partial update).
 ///
 /// `None` fields are left unchanged; `Some` fields are applied.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoleUpdates {
     /// New superuser status, if changing.
     pub is_superuser: Option<bool>,

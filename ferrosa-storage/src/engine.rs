@@ -296,6 +296,17 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Unregisters a table from the storage engine.
+    ///
+    /// Removes the `TableState` from the engine's table map. Any in-progress
+    /// reads holding an `Arc` reference to the underlying `TableStore` or its
+    /// SSTables will complete normally; the data is freed once those references drop.
+    /// Called as part of `DROP TABLE` / `DROP KEYSPACE` in pair mode.
+    pub fn unregister_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        self.tables.write().remove(table_id);
+        Ok(())
+    }
+
     /// Scans a table directory for existing SSTable files and opens them.
     ///
     /// Returns readers ordered newest-first (by generation number descending).
@@ -825,6 +836,27 @@ mod tests {
         let key = make_key("k");
         let result = engine.write(&TableId::new("no", "such"), &key, make_row(b"v", 1), 1);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn unregister_table_prevents_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+
+        engine.register_table(test_schema()).unwrap();
+
+        // Write should succeed while registered.
+        let key = make_key("before");
+        engine.write(&tid, &key, make_row(b"val", 1), 1).unwrap();
+
+        // Unregister the table.
+        engine.unregister_table(&tid).unwrap();
+
+        // Write should now fail — table is no longer registered.
+        let result = engine.write(&tid, &make_key("after"), make_row(b"v", 2), 2);
+        assert!(result.is_err(), "write to unregistered table should fail");
     }
 
     #[test]
