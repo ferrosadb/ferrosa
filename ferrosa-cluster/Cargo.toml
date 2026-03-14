@@ -10,13 +10,13 @@ bytes = "1"
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-net = { path = "../ferrosa-net" }
 ferrosa-schema = { path = "../ferrosa-schema" }
+ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-ferrosa-sstable = { path = "../ferrosa-sstable" }
 proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

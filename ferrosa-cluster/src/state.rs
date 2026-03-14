@@ -7,6 +7,15 @@ use ferrosa_schema::system::peers::{ClusterState, PeerInfo};
 use crate::config::ClusterConfig;
 use crate::pair::PairState;
 
+/// Standalone cluster state — reports no peers.
+pub struct SingleNodeClusterState;
+
+impl ClusterState for SingleNodeClusterState {
+    fn peers(&self) -> Vec<PeerInfo> {
+        vec![]
+    }
+}
+
 /// ClusterState implementation for pair mode.
 ///
 /// Returns the single peer as the only entry in `peers()`.
