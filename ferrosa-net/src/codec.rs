@@ -35,7 +35,7 @@ impl TryFrom<u8> for Lane {
 }
 
 /// Message type discriminant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum MsgType {
     // Lifecycle
