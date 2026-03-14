@@ -4,3 +4,4 @@ pub mod handler;
 pub mod server;
 
 pub use handler::{HandlerRegistry, PeerId, RpcHandler};
+pub use server::InboundPeerCallback;

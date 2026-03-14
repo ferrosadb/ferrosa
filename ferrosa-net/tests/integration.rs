@@ -40,7 +40,7 @@ async fn two_peers_handshake_and_exchange_messages() {
     };
 
     let server_id = uuid::Uuid::new_v4();
-    let mut registry = HandlerRegistry::new();
+    let registry = Arc::new(HandlerRegistry::new());
     registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
     let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
 
@@ -81,7 +81,7 @@ async fn two_peers_with_psk_authentication() {
         ..NetConfig::default()
     };
 
-    let mut registry = HandlerRegistry::new();
+    let registry = Arc::new(HandlerRegistry::new());
     registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
     let server = Arc::new(RpcServer::new(
         config.clone(),
@@ -111,7 +111,7 @@ async fn psk_mismatch_rejects_connection() {
         ..NetConfig::default()
     };
 
-    let registry = HandlerRegistry::new();
+    let registry = Arc::new(HandlerRegistry::new());
     let server = Arc::new(RpcServer::new(
         server_config.clone(),
         uuid::Uuid::new_v4(),

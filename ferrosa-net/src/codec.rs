@@ -74,6 +74,9 @@ pub enum MsgType {
     PairCatchUp = 0x42,
     PairCatchUpResponse = 0x43,
     RoleSwap = 0x44,
+    PairSchemaSync = 0x45,
+    PairDdlForward = 0x46,
+    PairDdlAck = 0x47,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -101,6 +104,9 @@ impl TryFrom<u8> for MsgType {
             0x42 => Ok(Self::PairCatchUp),
             0x43 => Ok(Self::PairCatchUpResponse),
             0x44 => Ok(Self::RoleSwap),
+            0x45 => Ok(Self::PairSchemaSync),
+            0x46 => Ok(Self::PairDdlForward),
+            0x47 => Ok(Self::PairDdlAck),
             _ => Err(NetError::UnknownMessageType(value)),
         }
     }

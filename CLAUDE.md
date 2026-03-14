@@ -9,7 +9,7 @@ Ferrosa is a Rust reimplementation of Apache Cassandra with S3-backed storage. T
 - **Rust workspace** (primary): Independent crates that compose into a distributed database
 - **Cassandra submodule** (`cassandra/`): Apache Cassandra 5.1 source as a behavioral reference/oracle for Track 1 analysis
 
-See `docs/superpowers/specs/2026-03-11-ferrosa-architecture-design.md` for the full architecture spec.
+See `superpowers/specs/2026-03-11-ferrosa-architecture-design.md` for the full architecture spec.
 
 ## Rust Workspace (Track 2 — Primary)
 

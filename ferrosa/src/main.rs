@@ -2,17 +2,53 @@
 //!
 //! Startup sequence:
 //! 1. Initialize tracing
-//! 2. Create StorageEngine
-//! 3. Create Schema
-//! 4. Start CQL server (port 9042)
-//! 5. Start web observability console (port 9090)
-//! 6. Create GraphEngine + HTTP server (if enabled)
-//! 7. Wait for shutdown signal
-//! 8. Graceful shutdown
+//! 2. Load/generate host_id
+//! 3. Create StorageEngine (with S3 if configured)
+//! 4. Create Schema
+//! 5. Create ModeController (standalone WritePath + ClusterState)
+//! 6. Create PeerManager + RPC handlers
+//! 7. Start internode RPC server (port 7000)
+//! 8. Start CQL server (port 9042)
+//! 9. Start web observability console (port 9090)
+//! 10. Create GraphEngine + HTTP server (if enabled)
+//! 11. Background: connect to seeds → triggers mode transition
+//! 12. Wait for shutdown signal
+//! 13. Graceful shutdown
 
 mod web;
 
+use std::path::Path;
 use std::sync::Arc;
+
+use uuid::Uuid;
+
+/// Load host_id from disk, env var, or generate a new one.
+fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
+    let path = data_dir.join("host_id");
+
+    // Try reading existing host_id from disk.
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        if let Ok(id) = Uuid::parse_str(contents.trim()) {
+            tracing::info!(%id, "loaded host_id from disk");
+            return id;
+        }
+    }
+
+    // Check env var override.
+    if let Ok(id_str) = std::env::var("FERROSA_HOST_ID") {
+        if let Ok(id) = Uuid::parse_str(&id_str) {
+            let _ = std::fs::write(&path, id.to_string());
+            tracing::info!(%id, "using host_id from FERROSA_HOST_ID");
+            return id;
+        }
+    }
+
+    // Generate new host_id and persist.
+    let id = Uuid::new_v4();
+    let _ = std::fs::write(&path, id.to_string());
+    tracing::info!(%id, "generated new host_id");
+    id
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,7 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("ferrosa starting");
 
-    // 2. Create StorageEngine
+    // 2. Load/generate host_id
+    let data_dir = std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());
+    std::fs::create_dir_all(&data_dir)?;
+    let host_id = load_or_generate_host_id(Path::new(&data_dir));
+
+    // 3. Create StorageEngine
     let storage_config = ferrosa_storage::StorageEngineConfig::from_env()?;
     let rt = tokio::runtime::Handle::current();
     let storage = Arc::new(ferrosa_storage::StorageEngine::new(
@@ -33,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(&rt),
     )?);
 
-    // 3. Create Schema
+    // 4. Create Schema
     let schema_config = ferrosa_schema::SchemaConfig {
         hasher: ferrosa_schema::PasswordHasher::default(),
         password_policy: ferrosa_schema::PasswordPolicy::permissive(),
@@ -45,7 +86,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let schema = Arc::new(ferrosa_schema::Schema::new(schema_config)?);
 
-    // 4. Start CQL server
+    // 5. Create ModeController — starts in standalone mode
+    let cluster_config = Arc::new(ferrosa_cluster::ClusterConfig::from_env());
+    let net_config = Arc::new(ferrosa_net::config::NetConfig::from_env());
+
+    // Build handler registry — shared between RPC server and ModeController.
+    // Catch-up handler is always available; pair write/role-swap handlers are
+    // registered dynamically by ModeController on mode transition.
+    let registry = Arc::new(ferrosa_net::rpc::HandlerRegistry::new());
+    let catchup_handler = Arc::new(ferrosa_cluster::pair::catchup::PairCatchUpHandler::new(
+        storage.clone(),
+    ));
+    registry.register(ferrosa_net::codec::MsgType::PairCatchUp, catchup_handler);
+
+    let (mode_controller, handles) = ferrosa_cluster::ModeController::new(
+        cluster_config,
+        net_config.clone(),
+        host_id,
+        storage.clone(),
+        schema.clone(),
+        registry.clone(),
+    );
+
+    // 6. Create PeerManager — ModeController is the PeerEventListener
+    let peer_manager = Arc::new(ferrosa_net::peer::PeerManager::new(
+        net_config.clone(),
+        host_id,
+        mode_controller.clone(),
+    ));
+    mode_controller.set_peer_manager(peer_manager.clone());
+
+    // 7. Start internode RPC server with inbound peer callback
+    let rpc_server = Arc::new(
+        ferrosa_net::rpc::server::RpcServer::new((*net_config).clone(), host_id, registry)
+            .with_inbound_callback(mode_controller.clone()),
+    );
+    let internode_addr = rpc_server.start_and_get_addr().await?;
+    tracing::info!(%internode_addr, %host_id, "internode server listening");
+
+    // 8. Start CQL server
     let cql_bind: std::net::SocketAddr = std::env::var("FERROSA_CQL_BIND")
         .unwrap_or_else(|_| "0.0.0.0:9042".to_string())
         .parse()?;
@@ -59,6 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_config = Arc::new(ferrosa_schema::NodeConfig {
         rpc_address: cql_bind.ip(),
         rpc_port: cql_bind.port(),
+        host_id,
+        listen_port: internode_addr.port(),
         ..ferrosa_schema::NodeConfig::default()
     });
     let connection_tracker =
@@ -68,7 +149,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: storage.clone(),
         schema: schema.clone(),
         node_config,
-        cluster_state: Arc::new(ferrosa_cql::router::SingleNodeClusterState),
+        cluster_state: handles.cluster_state,
+        write_path: handles.write_path,
+        ddl_path: handles.ddl_path,
         prepared_cache: Arc::new(ferrosa_cql::prepared::PreparedCache::new(64 * 1024 * 1024)),
         connection_tracker,
         query_tracker,
@@ -77,13 +160,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cql_addr = cql_server.start_background().await?;
     tracing::info!(%cql_addr, "CQL server listening");
 
-    // 5. Web observability console
+    // 9. Web observability console
     let vt_registry = Arc::new(ferrosa_schema::VirtualTableRegistry::new());
     let web_config = web::WebConfig::from_env();
-    let web_addr = web::start_web_server(&web_config, vt_registry).await?;
+    let web_addr = web::start_web_server(&web_config, vt_registry, mode_controller.clone()).await?;
     tracing::info!(%web_addr, "web console listening");
 
-    // 6. Graph engine (check FERROSA_GRAPH_ENABLED)
+    // 10. Graph engine (check FERROSA_GRAPH_ENABLED)
     let graph_enabled = std::env::var("FERROSA_GRAPH_ENABLED")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
@@ -92,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let graph_config = ferrosa_graph::engine::GraphConfig {
             enabled: true,
             http: ferrosa_graph::http::GraphHttpConfig {
-                require_tls: false, // TODO: read from env
+                require_tls: false,
                 ..ferrosa_graph::http::GraphHttpConfig::default()
             },
             ..ferrosa_graph::engine::GraphConfig::default()
@@ -120,11 +203,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("graph engine disabled (set FERROSA_GRAPH_ENABLED=true to enable)");
     }
 
-    // 7. Wait for shutdown signal
+    // 11. Background: connect to seeds
+    // Seeds can be hostnames (e.g., "node2:7000") which SocketAddr can't parse.
+    // Resolve via DNS in the background task.
+    let seed_strs: Vec<String> = std::env::var("FERROSA_SEED")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if !seed_strs.is_empty() {
+        let net_cfg = net_config.clone();
+        let pm = peer_manager.clone();
+        tokio::spawn(async move {
+            // Wait briefly for peer nodes to start
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            for seed in &seed_strs {
+                tracing::info!(%seed, "resolving seed");
+                match tokio::net::lookup_host(seed.as_str()).await {
+                    Ok(mut addrs) => {
+                        if let Some(seed_addr) = addrs.next() {
+                            tracing::info!(%seed, %seed_addr, "connecting to seed");
+                            match ferrosa_net::pool::PriorityPool::connect(
+                                net_cfg.clone(),
+                                host_id,
+                                seed_addr,
+                            )
+                            .await
+                            {
+                                Ok(pool) => {
+                                    let peer_host_id = pool.peer_host_id();
+                                    pm.add_peer((peer_host_id, seed_addr), pool).await;
+                                    tracing::info!(%seed, %peer_host_id, "seed connected");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%seed, %e, "seed connection failed");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%seed, %e, "seed DNS resolution failed");
+                    }
+                }
+            }
+        });
+    }
+
+    // 12. Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutdown signal received");
 
-    // 8. Graceful shutdown
+    // 13. Graceful shutdown
     storage.shutdown()?;
     tracing::info!("ferrosa stopped");
 

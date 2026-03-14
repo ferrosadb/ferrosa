@@ -27,7 +27,7 @@ pub struct ReplicationParams {
 /// Optional updates for a keyspace (partial update).
 ///
 /// `None` fields are left unchanged; `Some` fields are applied.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyspaceUpdates {
     /// New replication parameters, if changing.
     pub replication: Option<ReplicationParams>,

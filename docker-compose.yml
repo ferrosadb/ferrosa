@@ -1,0 +1,95 @@
+services:
+  # Volume permissions — RustFS runs as UID 10001
+  volume-permissions:
+    image: alpine
+    volumes:
+      - rustfs-data:/data
+    command: >
+      sh -c "chown -R 10001:10001 /data && echo 'permissions fixed'"
+    restart: "no"
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  rustfs-init:
+    image: minio/mc
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+             mc mb local/ferrosa-data --ignore-existing &&
+             echo 'bucket created'"
+    restart: "no"
+
+  node1:
+    build: .
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "9042:9042"
+      - "9090:9090"
+    environment:
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node1:7000"
+      FERROSA_SEED: "node2:7000"
+      FERROSA_CLUSTER_NAME: ferrosa-dev
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: ferrosa-data
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+    volumes:
+      - node1-data:/var/lib/ferrosa
+
+  node2:
+    build: .
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "9043:9042"
+      - "9091:9090"
+    environment:
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node2:7000"
+      FERROSA_SEED: "node1:7000"
+      FERROSA_CLUSTER_NAME: ferrosa-dev
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: ferrosa-data
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+    volumes:
+      - node2-data:/var/lib/ferrosa
+
+volumes:
+  rustfs-data:
+  node1-data:
+  node2-data:
