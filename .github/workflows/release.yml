@@ -140,6 +140,37 @@ jobs:
           retention-days: 90
 
       # ── Publish to public repo (ferrosadb/ferrosadb) ──────────────
+      - name: Clone public repo and update
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+        run: |
+          VERSION="${{ steps.package.outputs.version }}"
+          DEB_FILE="${{ steps.package.outputs.deb_file }}"
+
+          # Clone the public repo
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/ferrosadb/ferrosadb.git" /tmp/public-repo
+          cd /tmp/public-repo
+
+          git config user.name "Ferrosa Release Bot"
+          git config user.email "releases@ferrosadb.com"
+
+          # Copy marketing docs from private repo (HTML, SVG only — no specs/plans)
+          cp "${GITHUB_WORKSPACE}/docs/"*.html . 2>/dev/null || true
+          cp "${GITHUB_WORKSPACE}/docs/"*.svg . 2>/dev/null || true
+          cp "${GITHUB_WORKSPACE}/docs/CNAME" . 2>/dev/null || true
+
+          # Update version badge in README
+          sed -i "s|ferrosa_[0-9.]*_amd64\.deb|ferrosa_${VERSION}_amd64.deb|g" README.md
+
+          # Commit and push if there are changes
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "release: update to v${VERSION}"
+            git push origin main
+          fi
+
+          cd "${GITHUB_WORKSPACE}"
+
       - name: Create release on public repo
         env:
           GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
@@ -147,7 +178,6 @@ jobs:
           VERSION="${{ steps.package.outputs.version }}"
           DEB_FILE="${{ steps.package.outputs.deb_file }}"
 
-          # Generate release notes
           NOTES=$(cat <<NOTES
           ## Ferrosa v${VERSION}
 
