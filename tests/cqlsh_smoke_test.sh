@@ -101,6 +101,17 @@ run_cql "CREATE TABLE events" \
     "CREATE TABLE test_ks.events (user_id int, ts timestamp, data text, PRIMARY KEY (user_id, ts));"
 
 echo ""
+echo "--- Secondary Indexes ---"
+run_cql "CREATE btree index on email" \
+    "CREATE INDEX idx_email ON test_ks.users (email) USING 'btree';"
+run_cql "CREATE hash index on name" \
+    "CREATE INDEX idx_name ON test_ks.users (name) USING 'hash';"
+run_cql "CREATE INDEX IF NOT EXISTS (idempotent)" \
+    "CREATE INDEX IF NOT EXISTS idx_email ON test_ks.users (email) USING 'btree';"
+run_cql "Verify indexes in system_schema.indexes" \
+    "SELECT index_name, kind FROM system_schema.indexes WHERE keyspace_name = 'test_ks';"
+
+echo ""
 echo "=== Phase 3: DML writes ==="
 run_cql "INSERT user 1" \
     "INSERT INTO test_ks.users (id, name, email) VALUES (1, 'Alice', 'alice@test.com');"
@@ -132,6 +143,8 @@ run_cql "Verify UPDATE" \
 
 echo ""
 echo "=== Phase 7: DDL cleanup ==="
+run_cql "DROP INDEX idx_email" "DROP INDEX IF EXISTS idx_email;"
+run_cql "DROP INDEX idx_name" "DROP INDEX IF EXISTS idx_name;"
 run_cql "DROP TABLE users" "DROP TABLE test_ks.users;"
 run_cql "DROP TABLE events" "DROP TABLE test_ks.events;"
 run_cql "DROP KEYSPACE" "DROP KEYSPACE test_ks;"

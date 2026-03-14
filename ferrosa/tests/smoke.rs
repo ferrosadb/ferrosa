@@ -290,3 +290,87 @@ async fn describe_keyspaces() {
         "system_schema keyspace not found; keyspaces: {keyspace_names:?}"
     );
 }
+
+#[tokio::test]
+async fn test_create_and_query_indexes() {
+    let (mut client, _state, _dir) = boot_and_connect().await;
+
+    // Setup keyspace and table
+    client
+        .query("CREATE KEYSPACE idx_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}")
+        .await
+        .unwrap();
+    client
+        .query("CREATE TABLE idx_test.users (id text PRIMARY KEY, name text, email text)")
+        .await
+        .unwrap();
+
+    // Create indexes
+    client
+        .query("CREATE INDEX idx_email ON idx_test.users (email) USING 'btree'")
+        .await
+        .unwrap();
+    client
+        .query("CREATE INDEX idx_name ON idx_test.users (name) USING 'hash'")
+        .await
+        .unwrap();
+
+    // Idempotent CREATE INDEX IF NOT EXISTS should succeed
+    client
+        .query("CREATE INDEX IF NOT EXISTS idx_email ON idx_test.users (email) USING 'btree'")
+        .await
+        .unwrap();
+
+    // Verify indexes in system_schema.indexes
+    let result = client
+        .query(
+            "SELECT index_name, kind FROM system_schema.indexes WHERE keyspace_name = 'idx_test'",
+        )
+        .await
+        .expect("SELECT system_schema.indexes failed");
+    assert!(
+        result.rows.len() >= 2,
+        "Expected at least 2 indexes, got {}",
+        result.rows.len()
+    );
+
+    // Insert data (index building happens asynchronously)
+    client
+        .query("INSERT INTO idx_test.users (id, name, email) VALUES ('1', 'Alice', 'alice@example.com')")
+        .await
+        .unwrap();
+    client
+        .query(
+            "INSERT INTO idx_test.users (id, name, email) VALUES ('2', 'Bob', 'bob@example.com')",
+        )
+        .await
+        .unwrap();
+
+    // Drop index
+    client.query("DROP INDEX idx_email").await.unwrap();
+    let result = client
+        .query("SELECT index_name FROM system_schema.indexes WHERE keyspace_name = 'idx_test'")
+        .await
+        .expect("SELECT after DROP INDEX failed");
+    // Should have 1 index remaining (idx_name)
+    let idx_col = column_index(&result, "index_name").expect("'index_name' column not found");
+    let index_names: Vec<Option<String>> = result
+        .rows
+        .iter()
+        .map(|row| cell_as_str(row, idx_col))
+        .collect();
+    assert!(
+        index_names.iter().any(|n| n.as_deref() == Some("idx_name")),
+        "idx_name should still exist after dropping idx_email; indexes: {index_names:?}"
+    );
+    assert!(
+        !index_names
+            .iter()
+            .any(|n| n.as_deref() == Some("idx_email")),
+        "idx_email should be gone after DROP INDEX; indexes: {index_names:?}"
+    );
+
+    // Cleanup
+    client.query("DROP TABLE idx_test.users").await.unwrap();
+    client.query("DROP KEYSPACE idx_test").await.unwrap();
+}
