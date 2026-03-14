@@ -409,6 +409,38 @@ impl Segment {
         Ok(())
     }
 
+    /// Rewrites the entire segment file from scratch.
+    ///
+    /// Unlike `flush_to_disk` which only appends new bytes, this writes
+    /// `buf[0..position]` to the file. Required when sync markers at earlier
+    /// offsets have been updated after an incremental flush (e.g., during
+    /// `force_sync` for catch-up replay).
+    pub fn force_full_flush(&self) -> ferrosa_common::Result<()> {
+        let snapshot_pos = self.position.load(Ordering::Acquire) as usize;
+        self.wait_for_writers();
+
+        let buf = unsafe { &*self.buffer.get() };
+        let mut handle = self.file_handle.lock();
+
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&self.path)?;
+        *handle = Some(f);
+        let file = handle.as_mut().unwrap();
+        use std::io::Write;
+        file.write_all(&buf[..snapshot_pos])?;
+        file.sync_all()?;
+        self.last_flushed
+            .store(snapshot_pos as u64, Ordering::Release);
+
+        Ok(())
+    }
+
     /// Marks a table as having dirty (unflushed) data in this segment.
     pub fn mark_table_dirty(&self, table_id: &TableId, position: CommitLogPosition) {
         let mut dirty = self.dirty_tables.lock();

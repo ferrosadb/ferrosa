@@ -31,7 +31,7 @@ pub use metadata::{
     KeyspaceMetadata, KeyspaceUpdates, ReplicationParams, TableFlag, TableMetadata, TableParams,
     TableUpdates,
 };
-pub use registry::{AuthMethod, Schema, SchemaConfig, SchemaSnapshot};
+pub use registry::{is_system_keyspace, AuthMethod, Schema, SchemaConfig, SchemaSnapshot};
 pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};
 pub use startup::{
     validate_production_requirements, DeploymentMode, ProductionCheckConfig, ProductionViolation,

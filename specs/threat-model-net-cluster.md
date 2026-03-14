@@ -3,7 +3,7 @@
 > **Date:** 2026-03-13
 > **Scope:** New attack surface introduced by distributed operation (ferrosa-net + ferrosa-cluster)
 > **Methodology:** STRIDE per element
-> **Design Spec:** `docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md`
+> **Design Spec:** `superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md`
 
 ## System Overview
 

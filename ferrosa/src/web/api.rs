@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::routing::get;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use ferrosa_cluster::ModeController;
 use ferrosa_common::DataType;
 use ferrosa_schema::VirtualTableRegistry;
 use serde_json::{json, Value};
 
 type AppState = Arc<VirtualTableRegistry>;
+type ClusterAppState = Arc<ModeController>;
 
 pub fn routes(registry: Arc<VirtualTableRegistry>) -> Router {
     Router::new()
@@ -16,6 +19,54 @@ pub fn routes(registry: Arc<VirtualTableRegistry>) -> Router {
         .route("/active_queries", get(get_active_queries))
         .route("/tables", get(list_tables))
         .with_state(registry)
+}
+
+pub fn cluster_routes(mode_controller: Arc<ModeController>) -> Router {
+    Router::new()
+        .route("/status", get(cluster_status))
+        .route("/promote", post(cluster_promote))
+        .route("/switchover", post(cluster_switchover))
+        .with_state(mode_controller)
+}
+
+async fn cluster_status(State(mc): State<ClusterAppState>) -> Json<Value> {
+    Json(json!({
+        "mode": mc.mode().to_string(),
+        "role": mc.role().map(|r| r.to_string()),
+        "host_id": mc.host_id().to_string(),
+    }))
+}
+
+async fn cluster_promote(State(mc): State<ClusterAppState>) -> (StatusCode, Json<Value>) {
+    match mc.force_promote() {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "promoted",
+                "mode": mc.mode().to_string(),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn cluster_switchover(State(mc): State<ClusterAppState>) -> (StatusCode, Json<Value>) {
+    match mc.switchover().await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "switchover complete",
+                "role": mc.role().map(|r| r.to_string()),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
 }
 
 async fn get_connections(State(registry): State<AppState>) -> Json<Value> {

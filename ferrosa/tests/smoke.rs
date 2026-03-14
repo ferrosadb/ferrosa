@@ -5,9 +5,11 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
+use ferrosa_cluster::WritePath;
 use ferrosa_cql::client::{CqlClient, QueryResult, ResultRow};
 use ferrosa_cql::prepared::PreparedCache;
-use ferrosa_cql::router::{SharedState, SingleNodeClusterState};
+use ferrosa_cql::router::SharedState;
 use ferrosa_cql::server::{CqlServer, ServerConfig};
 use ferrosa_cql::virtual_tables::active_queries::QueryTracker;
 use ferrosa_cql::virtual_tables::connections::ConnectionTracker;
@@ -85,10 +87,17 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         tokens: vec![],
     });
     let state = Arc::new(SharedState {
-        engine,
-        schema,
+        engine: engine.clone(),
+        schema: schema.clone(),
         node_config,
-        cluster_state: Arc::new(SingleNodeClusterState),
+        cluster_state: Arc::new(ArcSwap::from_pointee(
+            ferrosa_cluster::ClusterStateHolder::Standalone,
+        )),
+        write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
+        ddl_path: Arc::new(ArcSwap::from_pointee(ferrosa_cluster::DdlPath::Direct {
+            schema,
+            engine,
+        })),
         prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
         connection_tracker: Arc::new(ConnectionTracker::new()),
         query_tracker: Arc::new(QueryTracker::new()),

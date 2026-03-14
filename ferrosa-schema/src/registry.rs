@@ -192,6 +192,109 @@ impl Schema {
         self.inner.load_full()
     }
 
+    /// Bulk-load schema from a snapshot. Bypasses auth and audit.
+    /// Used for pair mode catch-up. Idempotent — silently skips
+    /// keyspaces/tables that already exist.
+    ///
+    /// **Important:** Does NOT register tables with StorageEngine —
+    /// caller must call `engine.register_table()` for each table separately.
+    pub fn apply_snapshot(&self, snapshot: SchemaSnapshot) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut current = (**self.inner.load()).clone();
+
+        for (name, ks) in &snapshot.keyspaces {
+            if is_system_keyspace(name) {
+                continue;
+            }
+            current
+                .keyspaces
+                .entry(name.clone())
+                .or_insert_with(|| ks.clone());
+        }
+
+        for ((ks, tbl), table) in &snapshot.tables {
+            if is_system_keyspace(ks) {
+                continue;
+            }
+            current
+                .tables
+                .entry((ks.clone(), tbl.clone()))
+                .or_insert_with(|| table.clone());
+        }
+
+        for (name, role) in &snapshot.roles {
+            current
+                .roles
+                .entry(name.clone())
+                .or_insert_with(|| role.clone());
+        }
+
+        for (role, grants) in &snapshot.grants {
+            current
+                .grants
+                .entry(role.clone())
+                .or_insert_with(|| grants.clone());
+        }
+
+        current.version = Uuid::new_v4();
+        self.inner.store(Arc::new(current));
+        tracing::info!("applied schema snapshot");
+        Ok(())
+    }
+
+    /// Create a keyspace without auth checks. Idempotent — succeeds silently
+    /// if keyspace already exists.
+    pub fn create_keyspace_internal(&self, ks: KeyspaceMetadata) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        if snap.keyspaces.contains_key(&ks.name) {
+            return Ok(());
+        }
+        snap.keyspaces.insert(ks.name.clone(), ks);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Create a table without auth checks. Idempotent — succeeds silently
+    /// if table already exists.
+    pub fn create_table_internal(&self, table: TableMetadata) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let key = (table.keyspace.clone(), table.name.clone());
+        if snap.tables.contains_key(&key) {
+            return Ok(());
+        }
+        snap.tables.insert(key, table);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Drop a keyspace without auth checks. Idempotent — succeeds silently
+    /// if keyspace doesn't exist.
+    pub fn drop_keyspace_internal(&self, name: &str) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        snap.keyspaces.remove(name);
+        snap.tables.retain(|(ks, _), _| ks != name);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Drop a table without auth checks. Idempotent — succeeds silently
+    /// if table doesn't exist.
+    pub fn drop_table_internal(&self, keyspace: &str, table: &str) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        snap.tables
+            .remove(&(keyspace.to_string(), table.to_string()));
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
     /// Return a reference to the inner ArcSwap for lock-free reads.
     ///
     /// For hot-path code that needs repeated lock-free reads (e.g., observers),
@@ -1000,7 +1103,7 @@ impl Schema {
 }
 
 /// Returns true if the given name is a Cassandra system keyspace.
-fn is_system_keyspace(name: &str) -> bool {
+pub fn is_system_keyspace(name: &str) -> bool {
     matches!(
         name,
         "system"
@@ -2115,5 +2218,121 @@ mod tests {
         let schema = Schema::new_for_test();
         let registry = schema.virtual_tables();
         assert!(registry.get("system_observability", "anything").is_none());
+    }
+
+    // ---- Task 3: apply_snapshot and internal DDL tests ----
+
+    #[test]
+    fn apply_snapshot_creates_keyspaces_and_tables() {
+        let schema = test_schema();
+        let mut snapshot = SchemaSnapshot {
+            version: Uuid::new_v4(),
+            keyspaces: HashMap::new(),
+            tables: HashMap::new(),
+            roles: HashMap::new(),
+            grants: HashMap::new(),
+        };
+
+        let ks = KeyspaceMetadata {
+            name: "test_ks".to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+            },
+        };
+        snapshot.keyspaces.insert("test_ks".to_string(), ks);
+
+        schema.apply_snapshot(snapshot).unwrap();
+
+        let snap = schema.snapshot();
+        assert!(snap.keyspaces.contains_key("test_ks"));
+    }
+
+    #[test]
+    fn apply_snapshot_is_idempotent() {
+        let schema = test_schema();
+        let mut snapshot = SchemaSnapshot {
+            version: Uuid::new_v4(),
+            keyspaces: HashMap::new(),
+            tables: HashMap::new(),
+            roles: HashMap::new(),
+            grants: HashMap::new(),
+        };
+
+        let ks = KeyspaceMetadata {
+            name: "test_ks".to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+            },
+        };
+        snapshot.keyspaces.insert("test_ks".to_string(), ks);
+
+        schema.apply_snapshot(snapshot.clone()).unwrap();
+        schema.apply_snapshot(snapshot).unwrap(); // Should not error
+    }
+
+    #[test]
+    fn create_keyspace_internal_is_idempotent() {
+        let schema = test_schema();
+
+        let ks = KeyspaceMetadata {
+            name: "test_ks".to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+            },
+        };
+
+        schema.create_keyspace_internal(ks.clone()).unwrap();
+        schema.create_keyspace_internal(ks).unwrap(); // Should not error
+
+        let snap = schema.snapshot();
+        assert!(snap.keyspaces.contains_key("test_ks"));
+    }
+
+    #[test]
+    fn drop_table_internal_is_idempotent() {
+        let schema = test_schema();
+        // Drop a table that doesn't exist — should not error
+        schema.drop_table_internal("nonexistent", "table").unwrap();
+    }
+
+    #[test]
+    fn apply_snapshot_skips_system_keyspaces() {
+        let schema = test_schema();
+        let mut snapshot = SchemaSnapshot {
+            version: Uuid::new_v4(),
+            keyspaces: HashMap::new(),
+            tables: HashMap::new(),
+            roles: HashMap::new(),
+            grants: HashMap::new(),
+        };
+
+        let ks = KeyspaceMetadata {
+            name: "system".to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+            },
+        };
+        snapshot.keyspaces.insert("system".to_string(), ks);
+
+        schema.apply_snapshot(snapshot).unwrap();
+
+        // system keyspace should NOT be created via snapshot
+        let snap = schema.snapshot();
+        assert!(
+            !snap.keyspaces.contains_key("system")
+                || snap
+                    .keyspaces
+                    .get("system")
+                    .map(|k| k.name == "system")
+                    .unwrap_or(false)
+        );
     }
 }

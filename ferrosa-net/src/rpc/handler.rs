@@ -2,6 +2,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+
 use crate::codec::MsgType;
 use crate::message::Message;
 
@@ -16,8 +18,11 @@ pub trait RpcHandler: Send + Sync {
 }
 
 /// Registry mapping MsgType → handler.
+///
+/// Thread-safe for dynamic registration — handlers can be added after
+/// the RPC server starts (e.g., when transitioning to pair mode).
 pub struct HandlerRegistry {
-    handlers: HashMap<MsgType, Arc<dyn RpcHandler>>,
+    handlers: RwLock<HashMap<MsgType, Arc<dyn RpcHandler>>>,
 }
 
 impl Default for HandlerRegistry {
@@ -29,16 +34,19 @@ impl Default for HandlerRegistry {
 impl HandlerRegistry {
     pub fn new() -> Self {
         Self {
-            handlers: HashMap::new(),
+            handlers: RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn register(&mut self, msg_type: MsgType, handler: Arc<dyn RpcHandler>) {
-        self.handlers.insert(msg_type, handler);
+    /// Register a handler. Can be called at any time, including after
+    /// the RPC server is running.
+    pub fn register(&self, msg_type: MsgType, handler: Arc<dyn RpcHandler>) {
+        self.handlers.write().insert(msg_type, handler);
     }
 
     pub async fn dispatch(&self, from: PeerId, msg_type: MsgType, msg: Message) -> Option<Message> {
-        match self.handlers.get(&msg_type) {
+        let handler = self.handlers.read().get(&msg_type).cloned();
+        match handler {
             Some(handler) => handler.handle(from, msg).await,
             None => {
                 tracing::warn!(?msg_type, "no handler registered");
@@ -66,7 +74,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_dispatches_to_registered_handler() {
-        let mut registry = HandlerRegistry::new();
+        let registry = HandlerRegistry::new();
         registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
 
         let peer_id = (uuid::Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());

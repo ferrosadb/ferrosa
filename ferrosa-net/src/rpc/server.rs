@@ -10,7 +10,12 @@ use crate::config::NetConfig;
 use crate::error::NetError;
 use crate::handshake::accept_handshake;
 use crate::message::Message;
-use crate::rpc::handler::HandlerRegistry;
+use crate::rpc::handler::{HandlerRegistry, PeerId};
+
+/// Callback invoked when the server accepts an inbound peer connection.
+pub trait InboundPeerCallback: Send + Sync {
+    fn on_inbound_peer(&self, peer_id: PeerId);
+}
 
 pub struct RpcServer {
     config: Arc<NetConfig>,
@@ -20,19 +25,31 @@ pub struct RpcServer {
     bound_addr: tokio::sync::watch::Sender<Option<std::net::SocketAddr>>,
     #[allow(dead_code)]
     bound_addr_rx: tokio::sync::watch::Receiver<Option<std::net::SocketAddr>>,
+    inbound_callback: Option<Arc<dyn InboundPeerCallback>>,
 }
 
 impl RpcServer {
-    pub fn new(config: NetConfig, local_host_id: uuid::Uuid, registry: HandlerRegistry) -> Self {
+    pub fn new(
+        config: NetConfig,
+        local_host_id: uuid::Uuid,
+        registry: Arc<HandlerRegistry>,
+    ) -> Self {
         let (bound_addr, bound_addr_rx) = tokio::sync::watch::channel(None);
         Self {
             config: Arc::new(config),
             local_host_id,
-            registry: Arc::new(registry),
+            registry,
             active_connections: Arc::new(AtomicUsize::new(0)),
             bound_addr,
             bound_addr_rx,
+            inbound_callback: None,
         }
+    }
+
+    /// Set a callback for inbound peer connections. Called after handshake succeeds.
+    pub fn with_inbound_callback(mut self, cb: Arc<dyn InboundPeerCallback>) -> Self {
+        self.inbound_callback = Some(cb);
+        self
     }
 
     pub async fn start_and_get_addr(
@@ -121,7 +138,12 @@ impl RpcServer {
         .map_err(|_| NetError::Timeout("handshake".into()))??;
 
         let peer_id = (peer_host_id, peer_addr);
-        tracing::info!(?peer_id, "peer connected");
+        tracing::info!(?peer_id, "peer connected (inbound)");
+
+        // Notify callback about inbound peer
+        if let Some(cb) = &self.inbound_callback {
+            cb.on_inbound_peer(peer_id);
+        }
 
         // Message dispatch loop
         while let Some(frame_result) = framed.next().await {
@@ -185,7 +207,7 @@ mod tests {
             ..NetConfig::default()
         };
         let server_id = uuid::Uuid::new_v4();
-        let registry = HandlerRegistry::new();
+        let registry = Arc::new(HandlerRegistry::new());
         let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
 
         let addr = server.start_and_get_addr().await.unwrap();
@@ -206,7 +228,7 @@ mod tests {
             ..NetConfig::default()
         };
         let server_id = uuid::Uuid::new_v4();
-        let registry = HandlerRegistry::new();
+        let registry = Arc::new(HandlerRegistry::new());
         let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
 
         let addr = server.start_and_get_addr().await.unwrap();
@@ -232,7 +254,7 @@ mod tests {
             ..NetConfig::default()
         };
         let server_id = uuid::Uuid::new_v4();
-        let mut registry = HandlerRegistry::new();
+        let registry = Arc::new(HandlerRegistry::new());
         registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
         let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
 

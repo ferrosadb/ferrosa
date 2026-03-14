@@ -53,9 +53,14 @@ impl UploadManager {
                         sstable_id,
                         files,
                     } => {
+                        // Distribute across 256 S3 prefixes for parallelism.
+                        // S3 partitions by prefix — using the first 2 hex chars
+                        // of a hash of the sstable_id gives even distribution
+                        // and avoids the 3,500 PUT/s per-prefix limit.
+                        let hex_prefix = hex_prefix_for(&sstable_id);
                         for (name, data) in files {
                             let path = ObjectPath::from(format!(
-                                "{prefix}/sstables/{table_id}/{sstable_id}/{name}"
+                                "{prefix}/{hex_prefix}/{table_id}/{sstable_id}/{name}"
                             ));
                             if let Err(e) =
                                 Self::put_with_retry(&store, &path, data.clone(), 5).await
@@ -116,6 +121,19 @@ impl UploadManager {
     }
 }
 
+/// Compute a 2-character hex prefix from an SSTable ID for S3 key distribution.
+///
+/// Uses a simple hash (FNV-1a inspired) of the ID string to get even
+/// distribution across 256 buckets. This avoids S3's per-prefix
+/// throughput limits (3,500 PUT/s, 5,500 GET/s per partition).
+fn hex_prefix_for(sstable_id: &str) -> String {
+    let mut hash: u8 = 0;
+    for byte in sstable_id.as_bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(*byte);
+    }
+    format!("{hash:02x}")
+}
+
 /// Returns true for transient errors that should be retried.
 fn is_transient(err: &object_store::Error) -> bool {
     matches!(
@@ -139,6 +157,32 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn hex_prefix_is_two_chars() {
+        for id in ["1", "42", "abc123", "gen99-seq7", ""] {
+            let prefix = hex_prefix_for(id);
+            assert_eq!(prefix.len(), 2, "prefix for '{id}' should be 2 chars");
+            assert!(
+                prefix.chars().all(|c| c.is_ascii_hexdigit()),
+                "prefix for '{id}' should be hex"
+            );
+        }
+    }
+
+    #[test]
+    fn hex_prefix_distributes_across_buckets() {
+        use std::collections::HashSet;
+        let prefixes: HashSet<String> = (0..1000)
+            .map(|i| hex_prefix_for(&format!("gen{i}")))
+            .collect();
+        // 1000 unique IDs should produce at least 50 distinct prefixes
+        assert!(
+            prefixes.len() >= 50,
+            "expected >=50 distinct prefixes, got {}",
+            prefixes.len()
+        );
     }
 
     #[test]
@@ -166,7 +210,8 @@ mod tests {
             manager.shutdown().await;
 
             // Verify the file is in the store.
-            let path = ObjectPath::from("test/sstables/ks.table/abc123/Data.db");
+            let hex = hex_prefix_for("abc123");
+            let path = ObjectPath::from(format!("test/{hex}/ks.table/abc123/Data.db"));
             let result = store.get(&path).await.unwrap();
             let bytes = result.bytes().await.unwrap();
             assert_eq!(bytes.as_ref(), b"hello sstable data");
@@ -200,8 +245,9 @@ mod tests {
 
             manager.shutdown().await;
 
+            let hex = hex_prefix_for("001");
             for component in ["Data.db", "Index.db", "Filter.db"] {
-                let path = ObjectPath::from(format!("pfx/sstables/ks.t/001/{component}"));
+                let path = ObjectPath::from(format!("pfx/{hex}/ks.t/001/{component}"));
                 let result = store.get(&path).await.unwrap();
                 assert!(!result.bytes().await.unwrap().is_empty());
             }

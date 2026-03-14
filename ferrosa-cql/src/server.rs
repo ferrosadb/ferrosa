@@ -128,9 +128,10 @@ mod tests {
     use super::*;
     use crate::frame::{FrameHeader, Opcode, HEADER_SIZE};
     use crate::prepared::PreparedCache;
-    use crate::router::SingleNodeClusterState;
     use crate::virtual_tables::active_queries::QueryTracker;
     use crate::virtual_tables::connections::ConnectionTracker;
+    use arc_swap::ArcSwap;
+    use ferrosa_cluster::WritePath;
     use ferrosa_schema::NodeConfig;
     use ferrosa_schema::{
         AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
@@ -188,10 +189,17 @@ mod tests {
             tokens: vec![],
         });
         let state = Arc::new(SharedState {
-            engine,
-            schema,
+            engine: engine.clone(),
+            schema: schema.clone(),
             node_config,
-            cluster_state: Arc::new(SingleNodeClusterState),
+            cluster_state: Arc::new(ArcSwap::from_pointee(
+                ferrosa_cluster::ClusterStateHolder::Standalone,
+            )),
+            write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
+            ddl_path: Arc::new(ArcSwap::from_pointee(ferrosa_cluster::DdlPath::Direct {
+                schema,
+                engine,
+            })),
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),

@@ -27,7 +27,7 @@ use ferrosa_sstable::types::{Partition, Row};
 use ferrosa_sstable::WriteOptions;
 
 use crate::cache::LocalCache;
-use crate::commitlog::config::{CommitLogConfig, TableId};
+use crate::commitlog::config::{CommitLogConfig, CommitLogPosition, TableId};
 use crate::commitlog::mutation::Mutation;
 use crate::commitlog::CommitLog;
 use crate::compaction::executor::CompactionExecutor;
@@ -538,6 +538,25 @@ impl StorageEngine {
             Some(state) => state.store.read_range(start, end, limit),
             None => Ok(vec![]),
         }
+    }
+
+    /// Replay mutations from a given commit log position forward.
+    ///
+    /// Returns mutations with positions after `position`. If the segment
+    /// has been recycled, returns an empty vec (caller should bootstrap).
+    pub fn replay_from(
+        &self,
+        position: CommitLogPosition,
+    ) -> ferrosa_common::Result<Vec<Mutation>> {
+        self.commit_log.replay_from(position)
+    }
+
+    /// Force-syncs the commit log to disk.
+    ///
+    /// Ensures all buffered mutations are written to disk before reading
+    /// the commit log (e.g., for catch-up replay after failover).
+    pub fn force_commit_log_sync(&self) -> ferrosa_common::Result<()> {
+        self.commit_log.force_sync()
     }
 
     /// Flushes the active memtable for a table to an SSTable on disk.

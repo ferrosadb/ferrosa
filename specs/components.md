@@ -1,11 +1,11 @@
 # Component Architecture
 
-> Last updated: 2026-03-13
+> Last updated: 2026-03-14
 > Status: Approved
 
 ## Overview
 
-Ferrosa is a Cargo workspace of 9 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently.
+Ferrosa is a Cargo workspace of 10 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently.
 
 ## Dependency Graph
 
@@ -18,7 +18,7 @@ graph BT
     Schema[ferrosa-schema<br/>DDL, system keyspaces]
     CQL[ferrosa-cql<br/>CQL protocol v5]
     Graph[ferrosa-graph<br/>Graph query engine]
-    Cluster[ferrosa-cluster<br/>Raft, routing, CL]
+    Cluster[ferrosa-cluster<br/>Pair mode, DDL repl]
     Ctl[ferrosa-ctl<br/>CLI admin + TUI]
     Bin[ferrosa<br/>Binary]
 
@@ -37,6 +37,7 @@ graph BT
     Cluster --> Common
     Cluster --> Net
     Cluster --> Storage
+    Cluster --> Schema
     Ctl --> CQL
     Bin --> CQL
     Bin --> Graph
@@ -186,35 +187,56 @@ graph BT
 
 ### ferrosa-net
 
-- **Purpose**: Custom internode protocol
+- **Purpose**: Custom internode protocol — transport, RPC, failure detection
 - **Location**: `ferrosa-net/`
-- **Dependencies**: `ferrosa-common`
-- **Key interfaces**: Connection pooling, multiplexing, message framing, TLS (`rustls`)
-- **Transport**: TCP + length-prefixed framing initially. QUIC is a research item.
-- **Versioning**: Connection-level version negotiation handshake. Major version = breaking, minor = compatible.
+- **Dependencies**: `bytes`, `tokio`, `tokio-util`, `futures`, `hmac`, `sha2`, `rand`, `uuid`
+- **Status**: Phase 1 complete — 24 message types, PSK auth, priority-lane RPC
+- **No dependency on ferrosa-common** (standalone crate)
+- **Modules**:
+  - `codec.rs` — 12-byte frame header, `MsgType` enum (0x01-0x47), `InternodeCodec`
+  - `message.rs` — `Message` enum, encode/decode for all types
+  - `handshake.rs` — PSK-authenticated handshake (HMAC-SHA256), cluster name + protocol version
+  - `config.rs` — `NetConfig` with 12-factor env var support
+  - `pool.rs` — `PriorityPool` (3 TCP connections per peer: Raft/Data/Bulk lanes)
+  - `peer.rs` — `PeerManager` with heartbeat-based failure detection
+  - `rpc/` — `RpcServer`, `RpcClient`, `HandlerRegistry`, request-response + fire-and-forget
+  - `discovery/` — static seed resolution
+- **Transport**: TCP + length-prefixed binary framing. TLS (rustls) and QUIC are Phase 2.
 
 ### ferrosa-cluster
 
-- **Purpose**: Distributed coordination
+- **Purpose**: Distributed coordination — pair mode, DDL replication, failover
 - **Location**: `ferrosa-cluster/`
-- **Dependencies**: `ferrosa-common`, `ferrosa-net`, `ferrosa-storage`
-- **Key interfaces**: Raft metadata consensus, node membership, token ring (Murmur3, vnodes), request routing, tunable CL, read repair, hinted handoff, anti-entropy repair
-- **Raft design**: Single cluster-wide group via `openraft`. 3-5 voter nodes, rest are learners. Log on local disk + async S3 snapshots. New nodes bootstrap from S3 snapshot.
-- **Research**: Accord/Tempo/EPaxos for transactions, HLC for clock sync
+- **Dependencies**: `ferrosa-common`, `ferrosa-net`, `ferrosa-storage`, `ferrosa-schema`, `arc-swap`, `async-trait`, `bytes`, `serde`, `serde_json`, `tokio`, `uuid`
+- **Status**: Phase 1 complete — two-node pair mode with full failover lifecycle
+- **Modules**:
+  - `controller.rs` — `ModeController` (standalone → pair → degraded transitions), `ClusterStateHolder`, reverse connections, catch-up orchestration
+  - `write_path.rs` — `WritePath` enum (Direct/Pair/Unavailable) for atomic write routing
+  - `ddl_path.rs` — `DdlPath` enum (Direct/Pair/Unavailable) for atomic DDL routing
+  - `pair/coordinator.rs` — `PairCoordinator` (write forwarding + replication)
+  - `pair/ddl.rs` — `DdlOperation`, `DdlCoordinator`, `PairDdlForwardHandler`, `PairSchemaSyncHandler`, `WireSchemaSnapshot`
+  - `pair/handler.rs` — `PairWriteForwardHandler` (role-based dispatch)
+  - `pair/switchover.rs` — `initiate_switchover`, `RoleSwapHandler` (bidirectional)
+  - `pair/catchup.rs` — `request_catchup`, `PairCatchUpHandler`
+  - `pair/node.rs` — `PairNode` integration struct
+  - `consistency.rs` — `ConsistencyLevel` with `blockFor()` + property tests
+  - `config.rs`, `error.rs`, `mode.rs`, `state.rs`
+- **Key interfaces**: `ModeController::force_promote()`, `ModeController::switchover()`, REST API (`/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`)
+- **Phase 2 (planned)**: Raft metadata (openraft), token ring, tunable CL, coordinator pattern, hinted handoff
 
 ### ferrosa (binary)
 
 - **Purpose**: Compose all crates into the running database
 - **Location**: `ferrosa/` (workspace root binary)
-- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `ferrosa-cql`, `ferrosa-graph`, `axum`, `rust-embed`, `tokio`, `tracing`, `tracing-subscriber`
-- **Status**: Single-node operation implemented — starts CQL server on port 9042, optionally starts graph HTTP on port 7474, starts web admin server on port 9090
+- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `ferrosa-cql`, `ferrosa-graph`, `ferrosa-cluster`, `ferrosa-net`, `axum`, `rust-embed`, `tokio`, `tracing`, `tracing-subscriber`, `uuid`
+- **Status**: Pair-mode operation implemented — CQL on 9042, graph on 7474, web console + cluster API on 9090, internode on 7000
 - **Modules**:
   - `web/mod.rs` — `WebConfig`, `start_web_server()` on port 9090 (configurable), Axum router composition
-  - `web/api.rs` — Axum JSON API routes: `/api/connections`, `/api/storage_stats`, `/api/active_queries`, `/api/tables`
+  - `web/api.rs` — Axum JSON API routes: `/api/connections`, `/api/storage_stats`, `/api/active_queries`, `/api/tables`, `/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`
   - `web/static_files.rs` — `rust-embed` static file serving for the dashboard UI
   - `web/index.html` — Single-file HTML/CSS/JS dashboard with auto-refresh, connection/query/storage panels
-- **Startup sequence**: tracing init → `StorageEngine::new()` → `Schema::new()` → `CqlServer::start_background()` → optional `GraphEngine` + HTTP (gated by `FERROSA_GRAPH_ENABLED`) → web admin server on port 9090 → ctrl-c → graceful shutdown
-- **Environment variables**: `FERROSA_CQL_BIND` (default `0.0.0.0:9042`), `FERROSA_AUTH_DISABLED` (default false), `FERROSA_GRAPH_ENABLED` (default false), `FERROSA_WEB_BIND` (default `0.0.0.0:9090`), plus storage/schema env vars
+- **Startup sequence**: tracing init → host_id load/generate → `StorageEngine::new()` → `Schema::new()` → `ModeController::new()` → `PeerManager::new()` → RPC server on :7000 → `CqlServer::start_background()` → optional `GraphEngine` + HTTP → web admin + cluster API on :9090 → background seed connection → ctrl-c → graceful shutdown
+- **Environment variables**: `FERROSA_CQL_BIND`, `FERROSA_AUTH_DISABLED`, `FERROSA_GRAPH_ENABLED`, `FERROSA_WEB_BIND`, `FERROSA_DATA_DIR`, `FERROSA_HOST_ID`, `FERROSA_INTERNODE_BIND`, `FERROSA_INTERNODE_BROADCAST`, `FERROSA_SEED`, `FERROSA_CLUSTER_NAME`, plus storage/schema/S3 env vars
 
 ## Build Order
 
@@ -235,13 +257,13 @@ gantt
     section Protocol
     ferrosa-cql             :done, 6, 8
     ferrosa-graph           :done, 6, 7
-    ferrosa-net             :7, 8
+    ferrosa-net             :done, 7, 8
 
     section Tools
     ferrosa-ctl             :done, 8, 9
 
     section Distributed
-    ferrosa-cluster         :9, 11
+    ferrosa-cluster         :done, 9, 11
     ferrosa binary          :done, 11, 12
 ```
 
@@ -254,9 +276,9 @@ gantt
 | 5 | ferrosa-cql | cqlsh connects and runs basic queries — **done** (full CQL lifecycle: parse, route, execute, prepared cache) |
 | 5b | ferrosa-graph | Graph queries via HTTP with auth — **done** (Phase 1: parser, planner, executor, adjacency index, HTTP) |
 | 5c | ferrosa-ctl | CLI admin connects and displays node status — **done** (subcommands, TUI monitor) |
-| 6 | ferrosa-net | Two nodes exchange messages |
-| 7 | ferrosa-cluster | 3-node cluster at QUORUM |
-| 8 | ferrosa (binary) | Single-node binary accepts CQL on 9042 — **done**; distributed mode pending ferrosa-net/cluster |
+| 6 | ferrosa-net | Two nodes exchange messages — **done** (Phase 1: 24 msg types, PSK, RPC, pool) |
+| 7 | ferrosa-cluster | Two-node pair mode with failover — **done** (Phase 1: write/DDL forwarding, catch-up, switchover) |
+| 8 | ferrosa (binary) | Pair-mode binary with CQL + cluster API — **done** |
 
 ## Related Specs
 

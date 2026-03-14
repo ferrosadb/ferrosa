@@ -1,0 +1,8 @@
+target/
+cassandra/
+.git/
+.worktrees/
+docs/
+specs/
+*.md
+.claude/
