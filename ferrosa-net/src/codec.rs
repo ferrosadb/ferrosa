@@ -133,8 +133,14 @@ impl FrameHeader {
         if buf.len() < HEADER_SIZE {
             return Err(NetError::Protocol("header too short".into()));
         }
+        let version = buf[0];
+        if version != 1 {
+            return Err(NetError::Protocol(format!(
+                "unsupported internode protocol version: {version}"
+            )));
+        }
         Ok(Self {
-            version: buf[0],
+            version,
             flags: buf[1],
             lane: Lane::try_from(buf[2])?,
             msg_type: MsgType::try_from(buf[3])?,
@@ -195,7 +201,9 @@ impl Encoder<Frame> for InternodeCodec {
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<()> {
         let mut header = item.header;
-        header.length = item.body.len() as u32;
+        let body_len = u32::try_from(item.body.len())
+            .map_err(|_| NetError::Protocol("frame body exceeds u32::MAX".into()))?;
+        header.length = body_len;
         dst.reserve(HEADER_SIZE + item.body.len());
         header.encode(dst);
         dst.put_slice(&item.body);
