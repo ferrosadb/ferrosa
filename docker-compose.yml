@@ -1,0 +1,68 @@
+services:
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin  # pragma: allowlist secret
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      sh -c "sleep 2 &&
+             mc alias set local http://minio:9000 minioadmin minioadmin &&
+             mc mb local/ferrosa-data --ignore-existing"
+
+  node1:
+    build: .
+    depends_on:
+      - minio-init
+    ports:
+      - "9042:9042"
+      - "9090:9090"
+    environment:
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node1:7000"
+      FERROSA_SEED: "node2:7000"
+      FERROSA_CLUSTER_NAME: ferrosa-dev
+      FERROSA_S3_ENDPOINT: "http://minio:9000"
+      FERROSA_S3_BUCKET: ferrosa-data
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: minioadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: minioadmin  # pragma: allowlist secret
+    volumes:
+      - node1-data:/var/lib/ferrosa
+
+  node2:
+    build: .
+    depends_on:
+      - minio-init
+    ports:
+      - "9043:9042"
+    environment:
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node2:7000"
+      FERROSA_SEED: "node1:7000"
+      FERROSA_CLUSTER_NAME: ferrosa-dev
+      FERROSA_S3_ENDPOINT: "http://minio:9000"
+      FERROSA_S3_BUCKET: ferrosa-data
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: minioadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: minioadmin  # pragma: allowlist secret
+    volumes:
+      - node2-data:/var/lib/ferrosa
+
+volumes:
+  minio-data:
+  node1-data:
+  node2-data:
