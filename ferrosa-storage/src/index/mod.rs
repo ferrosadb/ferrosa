@@ -8,6 +8,7 @@
 
 pub mod scheduler;
 pub mod tracker;
+pub mod virtual_table;
 
 pub use scheduler::{BuildPriority, IndexBuildJob, IndexBuildScheduler};
 pub use tracker::{IndexState, IndexStateTracker, IndexStatus};
