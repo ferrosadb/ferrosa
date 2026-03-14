@@ -1,6 +1,6 @@
 # Ferrosa Architecture Specs
 
-> Last updated: 2026-03-13
+> Last updated: 2026-03-14
 
 Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassandra with S3-backed storage.
 
@@ -14,10 +14,10 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | ferrosa-schema | Done (DDL, auth, audit, system KS, graph extensions, virtual tables) |
 | ferrosa-cql | Done (Parts A-D + observability + LZ4/Snappy frame compression) |
 | ferrosa-graph | Done (Phase 1: parser, planner, executor, adjacency index, HTTP endpoint) |
-| ferrosa-net | Done (Phase 1: wire protocol, handshake, RPC, pool, peer manager — PR #39) |
-| ferrosa-cluster | Not started |
+| ferrosa-net | Done (Phase 1: wire protocol, handshake, RPC, pool, peer manager, 24 message types) |
+| ferrosa-cluster | Done (Phase 1: pair mode — write forwarding, DDL replication, failover, catch-up, switchover) |
 | ferrosa-ctl | Done (CLI + TUI monitoring dashboard) |
-| ferrosa (binary) | Done (single-node: CQL on 9042, optional graph on 7474, web console on 9090, smoke tests) |
+| ferrosa (binary) | Done (pair-mode: CQL on 9042, graph on 7474, web console + cluster API on 9090) |
 
 ## Specs Index
 
@@ -36,6 +36,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [Threat Model — CQL B/C](threat-model-cql-bc.md) | STRIDE for CQL parser, routing, prepared cache | Approved |
 | [Threat Model — Graph](threat-model-graph.md) | STRIDE for graph engine, HTTP endpoint, adjacency index | Draft |
 | [Threat Model — Net/Cluster](threat-model-net-cluster.md) | STRIDE for internode protocol, Raft, pair mode, coordinator | Draft |
+| [Threat Model — Schema Replication](threat-model-schema-replication.md) | STRIDE for schema snapshot sync, DDL forwarding (T21-T28) | Draft |
 
 ## Architecture Decision Records
 
@@ -61,3 +62,5 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 - [CQL Design](../docs/superpowers/specs/2026-03-12-ferrosa-cql-design.md) — implementation design for ferrosa-cql
 - [Graph Design](../docs/superpowers/specs/2026-03-12-ferrosa-graph-design.md) — implementation design for ferrosa-graph
 - [Observability Design](../docs/superpowers/specs/2026-03-13-ferrosa-observability-design.md) — implementation design for observability (virtual tables, web dashboard, ferrosa-ctl)
+- [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md) — implementation design for ferrosa-net + ferrosa-cluster
+- [Schema Replication Design](../docs/superpowers/specs/2026-03-14-schema-replication-design.md) — schema snapshot sync + DDL forwarding

@@ -1,6 +1,6 @@
 # System Overview
 
-> Last updated: 2026-03-13
+> Last updated: 2026-03-14
 > Status: Approved
 
 ## Overview
@@ -91,7 +91,7 @@ graph LR
 
 Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable.
 
-**Current progress**: All core crates are implemented. `ferrosa-common`, `ferrosa-sstable`, `ferrosa-storage`, `ferrosa-schema`, and `ferrosa-cql` (Parts A-D + observability) are complete. `ferrosa-graph` Phase 1 is complete (Cypher parser, planner, executor, adjacency index, HTTP endpoint with auth/TLS). The observability system is complete: virtual tables in `system_observability`, Prometheus metrics, web dashboard, SUBSCRIBE/UNSUBSCRIBE CQL extensions, and the `ferrosa-ctl` CLI admin tool with TUI monitor. The `ferrosa` binary crate composes everything into a working single-node database accepting CQL on port 9042, optionally graph queries on port 7474, and a web console on port 9090. Next up: `ferrosa-net` (internode protocol) and `ferrosa-cluster` (Raft, distributed coordination).
+**Current progress**: All 10 crates are implemented. `ferrosa-common`, `ferrosa-sstable`, `ferrosa-storage`, `ferrosa-schema`, and `ferrosa-cql` (Parts A-D + observability) are complete. `ferrosa-graph` Phase 1 is complete (Cypher parser, planner, executor, adjacency index, HTTP endpoint with auth/TLS). The observability system is complete: virtual tables in `system_observability`, Prometheus metrics, web dashboard, SUBSCRIBE/UNSUBSCRIBE CQL extensions, and the `ferrosa-ctl` CLI admin tool with TUI monitor. `ferrosa-net` Phase 1 is complete (24 message types, PSK handshake, priority-lane RPC, peer manager). `ferrosa-cluster` Phase 1 (pair mode) is complete: two-node synchronous replication with write forwarding, DDL replication, failover (force-promote + switchover), schema snapshot catch-up, and commit log data replay. The `ferrosa` binary composes everything into a pair-mode database accepting CQL on port 9042, graph queries on port 7474, web console + cluster management API on port 9090, and internode protocol on port 7000. Next up: Phase 2 — full cluster with Raft consensus, token ring, tunable consistency levels.
 
 ## Key Architectural Decisions
 
