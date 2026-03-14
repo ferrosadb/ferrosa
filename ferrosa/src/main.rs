@@ -151,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_config,
         cluster_state: handles.cluster_state,
         write_path: handles.write_path,
+        ddl_path: handles.ddl_path,
         prepared_cache: Arc::new(ferrosa_cql::prepared::PreparedCache::new(64 * 1024 * 1024)),
         connection_tracker,
         query_tracker,

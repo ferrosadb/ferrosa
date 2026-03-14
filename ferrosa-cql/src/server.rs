@@ -190,12 +190,16 @@ mod tests {
         });
         let state = Arc::new(SharedState {
             engine: engine.clone(),
-            schema,
+            schema: schema.clone(),
             node_config,
             cluster_state: Arc::new(ArcSwap::from_pointee(
                 ferrosa_cluster::ClusterStateHolder::Standalone,
             )),
-            write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine))),
+            write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
+            ddl_path: Arc::new(ArcSwap::from_pointee(ferrosa_cluster::DdlPath::Direct {
+                schema,
+                engine,
+            })),
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),

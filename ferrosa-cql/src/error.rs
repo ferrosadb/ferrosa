@@ -168,6 +168,12 @@ impl From<std::io::Error> for CqlError {
     }
 }
 
+impl From<ferrosa_cluster::ClusterError> for CqlError {
+    fn from(err: ferrosa_cluster::ClusterError) -> Self {
+        Self::ServerError(format!("cluster error: {err}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
