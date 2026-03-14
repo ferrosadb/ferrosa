@@ -3,6 +3,8 @@ name: Deploy Docs
 on:
   push:
     branches: [main]
+    paths:
+      - 'docs/**'
   workflow_dispatch:
 
 permissions:
@@ -20,18 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Generate rustdoc
-        run: cargo doc --no-deps --workspace
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-      - name: Add redirect to ferrosa_common
-        run: echo '<meta http-equiv="refresh" content="0; url=ferrosa_common/index.html">' > target/doc/index.html
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: target/doc/
+          path: docs/
 
   deploy:
     name: Deploy to GitHub Pages
