@@ -1,9 +1,9 @@
 //! Secondary index implementations for Ferrosa.
 //!
-//! This crate provides B-tree, hash, composite, and phonetic secondary indexes
-//! that map column values to row positions within SSTables. Each index type
-//! implements the [`IndexBuilder`], [`IndexReader`], and [`IndexFactory`]
-//! traits.
+//! This crate provides B-tree, hash, composite, phonetic, and filtered
+//! secondary indexes that map column values to row positions within SSTables.
+//! Each index type implements the [`IndexBuilder`], [`IndexReader`], and
+//! [`IndexFactory`] traits.
 //!
 //! Index types:
 //! - **B-tree** ([`btree`]): Sorted index supporting point lookups and range scans.
@@ -11,9 +11,12 @@
 //! - **Composite** ([`composite`]): Multi-column index supporting full-key and prefix lookups.
 //! - **Phonetic** ([`phonetic`]): Fuzzy name matching via Soundex, Metaphone, Double Metaphone,
 //!   or Caverphone encoding.
+//! - **Filtered** ([`filtered`]): Wraps another index, applying a predicate to filter rows
+//!   during build.
 
 pub mod btree;
 pub mod composite;
+pub mod filtered;
 pub mod hash;
 pub mod phonetic;
 
@@ -75,6 +78,7 @@ pub enum IndexType {
     Hash,
     Composite,
     Phonetic,
+    Filtered,
 }
 
 impl fmt::Display for IndexType {
@@ -84,6 +88,7 @@ impl fmt::Display for IndexType {
             IndexType::Hash => write!(f, "hash"),
             IndexType::Composite => write!(f, "composite"),
             IndexType::Phonetic => write!(f, "phonetic"),
+            IndexType::Filtered => write!(f, "filtered"),
         }
     }
 }
@@ -209,4 +214,28 @@ pub trait IndexFactory: Send + Sync {
 
     /// Capabilities of indexes produced by this factory.
     fn capabilities(&self) -> IndexCapabilities;
+}
+
+// ── Filter predicate types ───────────────────────────────────────────────────
+
+/// Comparison operators for filter predicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    NotEq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
+}
+
+/// A filter predicate applied to a specific column during index building.
+#[derive(Debug, Clone)]
+pub struct FilterPredicate {
+    /// The column position to filter on.
+    pub column_position: usize,
+    /// The comparison operator.
+    pub op: FilterOp,
+    /// The value to compare against.
+    pub value: Vec<u8>,
 }
