@@ -1,0 +1,329 @@
+use bytes::{Buf, BufMut, BytesMut};
+use tokio_util::codec::{Decoder, Encoder};
+
+use crate::error::{NetError, Result};
+
+/// Header size in bytes: version(1) + flags(1) + lane(1) + msg_type(1)
+/// + stream_id(4) + length(4) = 12.
+pub const HEADER_SIZE: usize = 12;
+
+/// Flag bits.
+pub const FLAG_COMPRESSED: u8 = 0x01;
+pub const FLAG_STREAM_START: u8 = 0x02;
+pub const FLAG_STREAM_END: u8 = 0x04;
+pub const FLAG_FIRE_AND_FORGET: u8 = 0x08;
+
+/// Priority lane for a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Lane {
+    Raft = 0,
+    Data = 1,
+    Bulk = 2,
+}
+
+impl TryFrom<u8> for Lane {
+    type Error = NetError;
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Raft),
+            1 => Ok(Self::Data),
+            2 => Ok(Self::Bulk),
+            _ => Err(NetError::InvalidLane(value)),
+        }
+    }
+}
+
+/// Message type discriminant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MsgType {
+    // Lifecycle
+    Handshake = 0x01,
+    HandshakeAck = 0x02,
+    Ping = 0x03,
+    Pong = 0x04,
+    // Raft
+    RaftAppendEntries = 0x10,
+    RaftAppendResponse = 0x11,
+    RaftVote = 0x12,
+    RaftVoteResponse = 0x13,
+    RaftInstallSnapshot = 0x14,
+    // Data
+    MutationForward = 0x20,
+    MutationAck = 0x21,
+    ReadRequest = 0x22,
+    ReadResponse = 0x23,
+    // Streaming
+    StreamStart = 0x30,
+    StreamChunk = 0x31,
+    StreamEnd = 0x32,
+    // Pair
+    PairWriteForward = 0x40,
+    PairWriteAck = 0x41,
+    PairCatchUp = 0x42,
+    PairCatchUpResponse = 0x43,
+    RoleSwap = 0x44,
+}
+
+impl TryFrom<u8> for MsgType {
+    type Error = NetError;
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0x01 => Ok(Self::Handshake),
+            0x02 => Ok(Self::HandshakeAck),
+            0x03 => Ok(Self::Ping),
+            0x04 => Ok(Self::Pong),
+            0x10 => Ok(Self::RaftAppendEntries),
+            0x11 => Ok(Self::RaftAppendResponse),
+            0x12 => Ok(Self::RaftVote),
+            0x13 => Ok(Self::RaftVoteResponse),
+            0x14 => Ok(Self::RaftInstallSnapshot),
+            0x20 => Ok(Self::MutationForward),
+            0x21 => Ok(Self::MutationAck),
+            0x22 => Ok(Self::ReadRequest),
+            0x23 => Ok(Self::ReadResponse),
+            0x30 => Ok(Self::StreamStart),
+            0x31 => Ok(Self::StreamChunk),
+            0x32 => Ok(Self::StreamEnd),
+            0x40 => Ok(Self::PairWriteForward),
+            0x41 => Ok(Self::PairWriteAck),
+            0x42 => Ok(Self::PairCatchUp),
+            0x43 => Ok(Self::PairCatchUpResponse),
+            0x44 => Ok(Self::RoleSwap),
+            _ => Err(NetError::UnknownMessageType(value)),
+        }
+    }
+}
+
+/// 12-byte wire frame header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameHeader {
+    pub version: u8,
+    pub flags: u8,
+    pub lane: Lane,
+    pub msg_type: MsgType,
+    pub stream_id: u32,
+    pub length: u32,
+}
+
+impl FrameHeader {
+    /// Create a new frame header with version=1 and flags=0.
+    pub fn new(msg_type: MsgType, lane: Lane, stream_id: u32, length: u32) -> Self {
+        Self {
+            version: 1,
+            flags: 0,
+            lane,
+            msg_type,
+            stream_id,
+            length,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.version);
+        buf.put_u8(self.flags);
+        buf.put_u8(self.lane as u8);
+        buf.put_u8(self.msg_type as u8);
+        buf.put_u32(self.stream_id);
+        buf.put_u32(self.length);
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < HEADER_SIZE {
+            return Err(NetError::Protocol("header too short".into()));
+        }
+        Ok(Self {
+            version: buf[0],
+            flags: buf[1],
+            lane: Lane::try_from(buf[2])?,
+            msg_type: MsgType::try_from(buf[3])?,
+            stream_id: u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            length: u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
+        })
+    }
+}
+
+/// A raw internode frame: header + body bytes.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub header: FrameHeader,
+    pub body: bytes::Bytes,
+}
+
+/// Codec for encoding/decoding internode frames on a TCP stream.
+pub struct InternodeCodec {
+    max_frame_body_size: u32,
+}
+
+impl InternodeCodec {
+    pub fn new(max_frame_body_size: u32) -> Self {
+        Self {
+            max_frame_body_size,
+        }
+    }
+}
+
+impl Decoder for InternodeCodec {
+    type Item = Frame;
+    type Error = NetError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
+        if src.len() < HEADER_SIZE {
+            return Ok(None);
+        }
+        let header = FrameHeader::decode(&src[..HEADER_SIZE])?;
+        if header.length > self.max_frame_body_size {
+            return Err(NetError::FrameTooLarge {
+                size: header.length,
+                max: self.max_frame_body_size,
+            });
+        }
+        let total = HEADER_SIZE + header.length as usize;
+        if src.len() < total {
+            src.reserve(total - src.len());
+            return Ok(None);
+        }
+        src.advance(HEADER_SIZE);
+        let body = src.split_to(header.length as usize).freeze();
+        Ok(Some(Frame { header, body }))
+    }
+}
+
+impl Encoder<Frame> for InternodeCodec {
+    type Error = NetError;
+
+    fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<()> {
+        let mut header = item.header;
+        header.length = item.body.len() as u32;
+        dst.reserve(HEADER_SIZE + item.body.len());
+        header.encode(dst);
+        dst.put_slice(&item.body);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lane_from_u8_valid() {
+        assert_eq!(Lane::try_from(0).unwrap(), Lane::Raft);
+        assert_eq!(Lane::try_from(1).unwrap(), Lane::Data);
+        assert_eq!(Lane::try_from(2).unwrap(), Lane::Bulk);
+    }
+
+    #[test]
+    fn lane_from_u8_invalid() {
+        assert!(Lane::try_from(3).is_err());
+        assert!(Lane::try_from(255).is_err());
+    }
+
+    #[test]
+    fn frame_header_encode_decode_roundtrip() {
+        let header = FrameHeader {
+            version: 1,
+            flags: 0,
+            lane: Lane::Data,
+            msg_type: MsgType::Ping,
+            stream_id: 42,
+            length: 1024,
+        };
+        let mut buf = BytesMut::with_capacity(HEADER_SIZE);
+        header.encode(&mut buf);
+        assert_eq!(buf.len(), HEADER_SIZE);
+
+        let decoded = FrameHeader::decode(&buf).unwrap();
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.lane, Lane::Data);
+        assert_eq!(decoded.msg_type, MsgType::Ping);
+        assert_eq!(decoded.stream_id, 42);
+        assert_eq!(decoded.length, 1024);
+    }
+
+    #[test]
+    fn codec_decode_complete_frame() {
+        let mut codec = InternodeCodec::new(256 * 1024 * 1024);
+        let mut buf = BytesMut::new();
+        let header = FrameHeader {
+            version: 1,
+            flags: 0,
+            lane: Lane::Raft,
+            msg_type: MsgType::Ping,
+            stream_id: 1,
+            length: 4,
+        };
+        header.encode(&mut buf);
+        buf.put_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(frame.header.msg_type, MsgType::Ping);
+        assert_eq!(frame.body.len(), 4);
+    }
+
+    #[test]
+    fn codec_decode_incomplete_header() {
+        let mut codec = InternodeCodec::new(256 * 1024 * 1024);
+        let mut buf = BytesMut::from(&[0x01, 0x00, 0x00][..]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn codec_decode_incomplete_body() {
+        let mut codec = InternodeCodec::new(256 * 1024 * 1024);
+        let mut buf = BytesMut::new();
+        let header = FrameHeader {
+            version: 1,
+            flags: 0,
+            lane: Lane::Raft,
+            msg_type: MsgType::Ping,
+            stream_id: 0,
+            length: 100,
+        };
+        header.encode(&mut buf);
+        buf.put_slice(&[0u8; 50]); // only 50 of 100 bytes
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn codec_reject_oversized_frame() {
+        let mut codec = InternodeCodec::new(1024);
+        let mut buf = BytesMut::new();
+        let header = FrameHeader {
+            version: 1,
+            flags: 0,
+            lane: Lane::Data,
+            msg_type: MsgType::Ping,
+            stream_id: 0,
+            length: 2048,
+        };
+        header.encode(&mut buf);
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert!(matches!(err, NetError::FrameTooLarge { .. }));
+    }
+
+    #[test]
+    fn codec_encode_decode_roundtrip() {
+        let mut codec = InternodeCodec::new(256 * 1024 * 1024);
+        let frame = Frame {
+            header: FrameHeader {
+                version: 1,
+                flags: 0,
+                lane: Lane::Bulk,
+                msg_type: MsgType::StreamChunk,
+                stream_id: 99,
+                length: 0, // set by encoder
+            },
+            body: bytes::Bytes::from_static(b"hello world"),
+        };
+        let mut buf = BytesMut::new();
+        codec.encode(frame.clone(), &mut buf).unwrap();
+
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.header.lane, Lane::Bulk);
+        assert_eq!(decoded.header.msg_type, MsgType::StreamChunk);
+        assert_eq!(decoded.header.stream_id, 99);
+        assert_eq!(decoded.body, bytes::Bytes::from_static(b"hello world"));
+    }
+}
