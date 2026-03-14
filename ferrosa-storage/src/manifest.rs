@@ -10,6 +10,9 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
 use serde::{Deserialize, Serialize};
 
+/// Maximum number of CAS retry attempts for manifest saves.
+pub const MAX_CAS_RETRIES: u32 = 3;
+
 /// Manifest listing all live SSTables in object storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -110,6 +113,35 @@ impl Manifest {
         Ok(())
     }
 
+    /// Saves the manifest with automatic CAS retry and exponential backoff.
+    ///
+    /// On each attempt, re-loads the latest version from the store, then
+    /// attempts a conditional put. If a CAS conflict occurs (another writer
+    /// updated the manifest concurrently), waits with exponential backoff
+    /// and retries up to [`MAX_CAS_RETRIES`] times.
+    pub async fn save_with_retry(
+        &self,
+        store: &dyn ObjectStore,
+        prefix: &str,
+    ) -> ferrosa_common::Result<()> {
+        for attempt in 0..MAX_CAS_RETRIES {
+            let (_, version) = Self::load(store, prefix).await?;
+            match self.save(store, prefix, version).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < MAX_CAS_RETRIES - 1 => {
+                    eprintln!(
+                        "manifest CAS conflict on attempt {}, retrying: {e}",
+                        attempt + 1
+                    );
+                    let backoff = std::time::Duration::from_millis(10 * 2u64.pow(attempt));
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
+
     /// Adds an SSTable entry to the manifest.
     pub fn add_sstable(&mut self, table_id: &str, entry: ManifestEntry) {
         self.sstables
@@ -198,6 +230,27 @@ mod tests {
         let entries = &manifest.sstables["ks.t"];
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "b");
+    }
+
+    #[test]
+    fn max_cas_retries_is_reasonable() {
+        assert!(MAX_CAS_RETRIES >= 2);
+        assert!(MAX_CAS_RETRIES <= 10);
+    }
+
+    #[tokio::test]
+    async fn manifest_save_with_retry_succeeds_on_fresh_store() {
+        let store = InMemory::new();
+        let mut manifest = Manifest::new();
+        manifest.add_sstable("ks.table", sample_entry("sst1"));
+
+        // save_with_retry should work on a fresh store (no conflicts).
+        manifest.save_with_retry(&store, "test").await.unwrap();
+
+        // Verify it was actually persisted.
+        let (loaded, _) = Manifest::load(&store, "test").await.unwrap();
+        assert_eq!(loaded.sstables["ks.table"].len(), 1);
+        assert_eq!(loaded.sstables["ks.table"][0].id, "sst1");
     }
 
     #[test]
