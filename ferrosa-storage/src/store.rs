@@ -92,6 +92,31 @@ impl<F: FlushTarget> TableStore<F> {
         }
     }
 
+    /// Create a `TableStore` with an initial set of SSTable readers already loaded.
+    ///
+    /// Used during crash recovery to populate the store with SSTables that
+    /// were flushed before the crash. The readers must be ordered newest first.
+    pub fn new_with_sstables(
+        schema: TableSchema,
+        flush_target: F,
+        options: WriteOptions,
+        initial_sstables: Vec<Arc<SSTableReader<F::Reader>>>,
+    ) -> Self {
+        let active: Arc<dyn Memtable> = new_memtable();
+        let initial_view = StoreView {
+            active,
+            flushing: None,
+            sstables: Arc::new(initial_sstables),
+        };
+        Self {
+            schema,
+            view: ArcSwap::from_pointee(initial_view),
+            flush_guard: Mutex::new(()),
+            flush_target,
+            options,
+        }
+    }
+
     /// Write a row into the active memtable.
     ///
     /// Loads the current view atomically, then delegates to the memtable's
@@ -266,6 +291,64 @@ impl<F: FlushTarget> TableStore<F> {
     /// Number of partitions in the active memtable.
     pub fn memtable_partition_count(&self) -> usize {
         self.view.load().active.partition_count()
+    }
+
+    /// Atomically replace input SSTables with a compacted output SSTable.
+    ///
+    /// Removes the `input_count` oldest SSTables (from the end of the
+    /// "newest first" list) and inserts the compacted output at position 0.
+    pub fn swap_compacted_sstables(
+        &self,
+        input_count: usize,
+        add: Arc<SSTableReader<F::Reader>>,
+    ) -> Result<()> {
+        let _guard = self.flush_guard.lock();
+        let current = self.view.load();
+        let len = current.sstables.len();
+        let mut new_sstables: Vec<Arc<SSTableReader<F::Reader>>> = current
+            .sstables
+            .iter()
+            .take(len.saturating_sub(input_count))
+            .cloned()
+            .collect();
+        new_sstables.insert(0, add);
+
+        self.view.store(Arc::new(StoreView {
+            active: Arc::clone(&current.active),
+            flushing: current.flushing.clone(),
+            sstables: Arc::new(new_sstables),
+        }));
+        Ok(())
+    }
+
+    /// Collect metadata for all current SSTables.
+    ///
+    /// Used by the compaction strategy to decide which SSTables to merge.
+    /// The `table_dir` is the directory where this table's SSTable files
+    /// reside (e.g., `{data_dir}/sstables/{table_id}`).
+    pub fn sstable_metadata(
+        &self,
+        table_dir: &std::path::Path,
+    ) -> Vec<crate::compaction::metadata::SSTableMetadata> {
+        let guard = self.view.load();
+        guard
+            .sstables
+            .iter()
+            .enumerate()
+            .map(|(i, sst)| {
+                let header = sst.header();
+                crate::compaction::metadata::SSTableMetadata {
+                    id: format!("{}", i + 1),
+                    path: table_dir.to_path_buf(),
+                    size_bytes: 0, // Approximate; exact tracking is a future optimization
+                    min_token: 0,
+                    max_token: 0,
+                    min_timestamp: header.min_timestamp,
+                    max_timestamp: i64::MAX, // SerializationHeader only has min; sentinel until full stats tracking
+                    partition_count: sst.key_count(),
+                }
+            })
+            .collect()
     }
 }
 
@@ -511,5 +594,38 @@ mod tests {
             0,
             "empty flush should not create SSTable"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 11: swap_compacted_sstables atomically replaces inputs with output
+    // -------------------------------------------------------------------------
+    #[test]
+    fn swap_compacted_sstables_replaces_inputs() {
+        let store = test_store();
+
+        // Create 3 SSTables via flush.
+        for i in 0..3 {
+            store
+                .write(
+                    &make_key(&format!("k{i}")),
+                    make_row(format!("v{i}").as_bytes(), i as i64 * 1000),
+                )
+                .unwrap();
+            store.flush().unwrap();
+        }
+        assert_eq!(store.sstable_count(), 3);
+
+        // Create a new SSTable to be the compaction output (flush a new entry).
+        store
+            .write(&make_key("compacted"), make_row(b"merged", 9000))
+            .unwrap();
+        store.flush().unwrap();
+        let view = store.view.load();
+        let new_sst = Arc::clone(&view.sstables[0]);
+        drop(view);
+
+        // Perform swap: remove 2 oldest, add 1 → should go from 4 to 3.
+        store.swap_compacted_sstables(2, new_sst).unwrap();
+        assert_eq!(store.sstable_count(), 3); // 4 - 2 + 1 = 3
     }
 }

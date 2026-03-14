@@ -4,10 +4,12 @@ use std::path::PathBuf;
 
 use proptest::prelude::*;
 
+use ferrosa_common::schema::TableSchema;
 use ferrosa_storage::compaction::metadata::SSTableMetadata;
 use ferrosa_storage::compaction::strategy::{
     CompactionConfig, CompactionStrategy, SizeTieredStrategy,
 };
+use ferrosa_storage::TableId;
 
 fn default_config() -> CompactionConfig {
     CompactionConfig {
@@ -32,6 +34,21 @@ fn make_metadata(id: &str, size: u64) -> SSTableMetadata {
     }
 }
 
+fn test_table_schema() -> TableSchema {
+    TableSchema {
+        keyspace: "test_ks".to_string(),
+        table: "test_table".to_string(),
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        clustering_columns: vec![],
+        static_columns: vec![],
+        regular_columns: vec![],
+    }
+}
+
+fn test_table_id() -> TableId {
+    TableId::new("test_ks", "test_table")
+}
+
 // Property: STCS bucket selection is deterministic.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
@@ -49,8 +66,8 @@ proptest! {
             .map(|(i, &size)| make_metadata(&format!("sst_{i}"), size))
             .collect();
 
-        let tasks1 = strategy.select(&sstables);
-        let tasks2 = strategy.select(&sstables);
+        let tasks1 = strategy.select(&sstables, &test_table_schema(), &test_table_id());
+        let tasks2 = strategy.select(&sstables, &test_table_schema(), &test_table_id());
 
         // Same input → same output.
         prop_assert_eq!(tasks1.len(), tasks2.len());
@@ -82,7 +99,7 @@ proptest! {
         let all_ids: std::collections::HashSet<_> =
             sstables.iter().map(|m| &m.id).collect();
 
-        let tasks = strategy.select(&sstables);
+        let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
         for task in &tasks {
             for input in &task.inputs {
                 prop_assert!(
@@ -113,7 +130,7 @@ proptest! {
             .map(|(i, &size)| make_metadata(&format!("sst_{i}"), size))
             .collect();
 
-        let tasks = strategy.select(&sstables);
+        let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
         for task in &tasks {
             prop_assert!(
                 task.inputs.len() >= min,
@@ -136,7 +153,7 @@ fn similar_sizes_in_same_bucket() {
         .map(|i| make_metadata(&format!("sst_{i}"), 10_000 + i * 100))
         .collect();
 
-    let tasks = strategy.select(&sstables);
+    let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
     assert_eq!(
         tasks.len(),
         1,
@@ -161,7 +178,7 @@ fn different_sizes_separate_buckets() {
         make_metadata("large3", 1_200_000),
     ];
 
-    let tasks = strategy.select(&sstables);
+    let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
     // Neither group has 4 SSTables (min_threshold), so no compaction.
     assert!(
         tasks.is_empty(),

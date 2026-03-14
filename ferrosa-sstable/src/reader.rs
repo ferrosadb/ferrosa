@@ -168,6 +168,27 @@ impl<R: ReadAt> SSTableReader<R> {
     pub fn compression_info(&self) -> Option<&CompressionInfo> {
         self.compression_info.as_ref()
     }
+
+    /// Read all partitions from this SSTable in storage order.
+    ///
+    /// Scans the Data.db file sequentially from position 0, reading each
+    /// partition until EOF. Used by the compaction executor to merge
+    /// multiple SSTables.
+    pub fn read_all_partitions(&self) -> Result<Vec<crate::types::Partition>> {
+        let mut partitions = Vec::new();
+        if let Some(ref dec) = self.decompressed_data {
+            let mut reader = crate::data::DataReader::new(dec, &self.header, 0);
+            while let Some(partition) = reader.read_partition()? {
+                partitions.push(partition);
+            }
+        } else {
+            let mut reader = crate::data::DataReader::new(&self.data, &self.header, 0);
+            while let Some(partition) = reader.read_partition()? {
+                partitions.push(partition);
+            }
+        }
+        Ok(partitions)
+    }
 }
 
 #[cfg(test)]
