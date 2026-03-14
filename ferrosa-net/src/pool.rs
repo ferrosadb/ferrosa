@@ -71,8 +71,10 @@ mod tests {
 
     #[tokio::test]
     async fn pool_connects_and_sends_on_each_lane() {
-        let mut config = NetConfig::default();
-        config.bind_addr = "127.0.0.1:0".parse().unwrap();
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
         let mut registry = HandlerRegistry::new();
         registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
         let server = Arc::new(RpcServer::new(
