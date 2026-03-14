@@ -1,21 +1,22 @@
 # Ferrosa Development Status
 
-> Last updated: 2026-03-13
+> Last updated: 2026-03-14
 > Status: Living document
 
 ## Overview
 
-Ferrosa is a fully functional **single-node CQL-compatible database** with graph query
-support and built-in observability. The internode transport layer (ferrosa-net Phase 1) is
-complete. The path to distributed operation requires ferrosa-cluster.
+Ferrosa is a **two-node pair-mode distributed CQL-compatible database** with graph
+query support, built-in observability, and S3-backed storage. The internode transport
+(ferrosa-net Phase 1) and pair mode cluster (ferrosa-cluster Phase 1) are complete,
+including DDL replication, write forwarding, failover, and catch-up.
 
 | Metric | Value |
 |--------|-------|
-| Crates | 9 of 10 planned |
-| Source files | ~150 |
-| Source LOC | ~48,300 |
-| Test functions | ~1,083 |
-| Integration test files | 19 |
+| Crates | 10 of 10 planned |
+| Source files | ~180 |
+| Source LOC | ~56,700 |
+| Test functions | ~1,082 |
+| Integration test files | 20 |
 
 ## Maturity Assessment
 
@@ -29,8 +30,8 @@ cql            ██████   ██████  ██████   █
 graph          █████░   ██████  ████░░   ███░░░
 ctl            ██████   ██████  ███░░░   ███░░░
 binary         █████░   ██████  ███░░░   ██░░░░
-net            █████░   ████░░  ████░░   ██░░░░
-cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░░░░░░
+net            █████░   █████░  ████░░   ██░░░░
+cluster        █████░   ████░░  ███░░░   ██░░░░
 ```
 
 ## Crate Status
@@ -63,9 +64,9 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   `engine`, `flush`, `manifest`, `memtable` (2 impls), `merge`, `observer`, `store`,
   `subscription_observer`, `upload`, `virtual_tables`
 - **What's done:** Memtable (sharded BTree + skiplist), commit log (CAS-allocated
-  segments, 3 sync modes, CDC), flush, merge, compaction (STCS strategy), S3 upload
-  manager, manifest with etag CAS, local LRU cache, WriteObserver trait,
-  SubscriptionObserver.
+  segments, 3 sync modes, CDC, `force_sync` for catch-up), flush, merge, compaction
+  (STCS strategy), S3 upload manager, manifest with etag CAS, local LRU cache,
+  WriteObserver trait, SubscriptionObserver.
 - **Remaining:**
   - [x] ~~Commit log replay integration~~ (merged PR #38)
   - [x] ~~Compaction execution merge I/O~~ (merged PR #38)
@@ -77,13 +78,14 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
 
 ### ferrosa-schema — Mostly Complete (Chunk A)
 
-- **LOC:** 7,129 (27 files) | **Tests:** 199
+- **LOC:** 7,348 (27 files) | **Tests:** 204
 - **Modules:** `audit` (3 submodules), `auth` (4 submodules), `convert`, `error`,
   `metadata` (3 submodules), `registry`, `secrets`, `startup`, `system` (4 submodules),
   `virtual_registry`, `virtual_table`
 - **What's done:** Schema registry with `ArcSwap` lock-free snapshots, full RBAC auth
   (bcrypt/argon2), column-level permissions, rate limiting, audit logging (log + table
-  sinks), system keyspace queries, VirtualTable trait + registry.
+  sinks), system keyspace queries, VirtualTable trait + registry. Schema replication:
+  `apply_snapshot()`, idempotent `*_internal()` methods for pair mode.
 - **Remaining (Chunks B-F):**
   - [ ] DDL validation rules
   - [ ] System table persistence to SSTable
@@ -93,7 +95,7 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
 
 ### ferrosa-cql — Complete (Parts A-D + Compression)
 
-- **LOC:** ~12,300 (20 files) | **Tests:** ~275 | **Largest crate**
+- **LOC:** ~12,200 (20 files) | **Tests:** ~248 | **Largest crate**
 - **Modules:** `ast`, `auth`, `bridge`, `client`, `connection`, `error`, `frame`,
   `lexer`, `parser`, `prepared`, `prometheus`, `result`, `router`, `server`,
   `subscribe`, `types`, `virtual_tables` (connections + active_queries)
@@ -101,7 +103,8 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   LL(2) recursive-descent parser, query routing (DDL to schema, DML to storage),
   prepared statement cache (moka W-TinyLFU), ConnectionTracker/QueryTracker virtual
   tables, SUBSCRIBE/UNSUBSCRIBE extensions, Prometheus text exposition, CqlClient,
-  LZ4 and Snappy frame compression with negotiation.
+  LZ4 and Snappy frame compression with negotiation. DDL routes through `DdlPath`
+  for pair mode replication.
 - **Remaining:**
   - [ ] CQL TLS via rustls (T02/T03 — Critical, plaintext traffic)
   - [ ] Per-IP rate limiting for connection/query flood (T04)
@@ -139,25 +142,27 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
 - **Remaining:**
   - [ ] Integration tests (currently unit tests only)
 
-### ferrosa (binary) — Complete (single-node)
+### ferrosa (binary) — Complete (pair-mode)
 
-- **LOC:** ~870 (5 files) | **Tests:** ~15
+- **LOC:** ~770 (5 files) | **Tests:** ~15
 - **Modules:** `web` (api, static_files)
 - **What's done:** Composes all crates. CQL server on :9042, graph HTTP on :7474,
   web console on :9090. Connection + query tracker wiring, REST API for
-  metrics/schema/queries, embedded static assets via rust-embed. Integration smoke
-  tests covering server lifecycle, DDL/DML, system tables, multi-connection.
+  metrics/schema/queries/cluster management, embedded static assets via rust-embed.
+  Cluster management endpoints: `GET /api/cluster/status`,
+  `POST /api/cluster/promote`, `POST /api/cluster/switchover`.
 - **Remaining:**
   - [ ] Graceful shutdown sequencing
   - [ ] Configuration file support (currently env vars only)
 
 ### ferrosa-net — Phase 1 Complete (PR #39)
 
-- **LOC:** 2,317 (14 files) | **Tests:** 43 (40 unit + 3 integration)
+- **LOC:** 2,383 (14 files) | **Tests:** 43 (40 unit + 3 integration)
 - **Modules:** `codec`, `config`, `discovery` (seeds), `error`, `handshake`, `message`,
   `peer`, `pool`, `rpc` (handler, server, client)
 - **What's done:** 12-byte binary wire protocol with 3 priority lanes (Raft/Data/Bulk),
-  21 message types, PSK-authenticated handshake (HMAC-SHA256), RPC server with connection
+  24 message types (including schema replication: PairSchemaSync, PairDdlForward,
+  PairDdlAck), PSK-authenticated handshake (HMAC-SHA256), RPC server with connection
   limits + handshake timeout, RPC client with request-response and fire-and-forget,
   `PriorityPool` (3 TCP connections per peer), static seed discovery, `PeerManager` with
   heartbeat-based failure detection. Proptest fuzzing for message decode. No dependency
@@ -172,12 +177,37 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
 - **Spec:** [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 - **Threat Model:** [Net/Cluster Threats](threat-model-net-cluster.md)
 
-### ferrosa-cluster — Not Started (Spec Written)
+### ferrosa-cluster — Phase 1 Complete (Pair Mode)
 
-- **Purpose:** Raft metadata (openraft), token ring, tunable consistency levels,
-  coordinator pattern, pair mode, hinted handoff, node lifecycle
-- **Prerequisites:** ferrosa-net
+- **LOC:** 2,756 (16 files) | **Tests:** 33 (29 unit + 4 integration)
+- **Modules:** `config`, `consistency`, `controller`, `ddl_path`, `error`, `mode`,
+  `pair` (catchup, coordinator, ddl, handler, node, switchover), `state`, `write_path`
+- **What's done:** Pair mode with full failover lifecycle:
+  - `PairCoordinator` — write forwarding (secondary → primary) + replication
+  - `DdlCoordinator` + `DdlPath` — DDL forwarding/replication through primary
+  - `PairSchemaSyncHandler` — schema snapshot catch-up on rejoin
+  - `ModeController` — runtime mode transitions (standalone → pair → degraded)
+  - `WritePath::Unavailable` — degraded mode rejects writes when peer lost
+  - `force_promote()` — operator promotes to standalone primary
+  - `switchover()` — swap primary/secondary roles (both nodes required)
+  - Reverse connection on inbound peer for bidirectional RPC
+  - Auto re-pair with force-promoted role override on peer rejoin
+  - Commit log `force_sync` for catch-up data replay
+  - `ConsistencyLevel` with `blockFor()` + property tests
+  - Docker smoke test: 5-phase lifecycle (bidirectional writes, failover,
+    promotion, catch-up with schema + data, switchover)
+- **Remaining (Phase 2 — Full Cluster):**
+  - [ ] Raft metadata (openraft) for schema + topology
+  - [ ] Token ring with Murmur3 partitioner
+  - [ ] Tunable consistency levels (ONE, QUORUM, ALL)
+  - [ ] Coordinator pattern for write/read fan-out
+  - [ ] Hinted handoff and repair
+  - [ ] Node lifecycle (join, leave, bootstrap)
+  - [ ] AlterKeyspace/AlterTable DDL forwarding
+  - [ ] `StorageEngine::unregister_table()` for drop replication cleanup
 - **Spec:** [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
+- **Schema Replication Spec:** [Schema Replication](../docs/superpowers/specs/2026-03-14-schema-replication-design.md)
+- **Threat Models:** [Net/Cluster](threat-model-net-cluster.md), [Schema Replication](threat-model-schema-replication.md)
 
 ## Active Work in Progress
 
@@ -185,15 +215,17 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
 |------|----------|-------|
 | ~~Storage replay + compaction execution~~ | ~~`.worktrees/storage-replay-compaction`~~ | Merged (PR #38) |
 | ~~ferrosa-net Phase 1~~ | ~~`ferrosa-net/`~~ | Complete (PR #39) |
-| ferrosa-cluster | Not started | Next up |
+| ~~ferrosa-cluster Phase 1 (Pair mode)~~ | ~~`feature/pair-integration`~~ | Complete |
+| ferrosa-cluster Phase 2 (Full cluster) | — | Next up |
 
 ## Path to Distributed Operation
 
 The critical path from single-node to multi-node:
 
 1. ~~**ferrosa-storage:** Commit log replay + compaction execution~~ (Done — PR #38)
-1. **ferrosa-schema:** System table persistence (Chunk B)
 1. ~~**ferrosa-net:** Internode transport (Phase 1)~~ (Done — PR #39)
+1. ~~**ferrosa-cluster:** Pair mode — write forwarding, DDL replication, failover~~ (Done)
+1. **ferrosa-schema:** System table persistence (Chunk B)
 1. **ferrosa-cluster:** Raft metadata, ring topology, request routing
 1. **ferrosa-cluster:** Tunable consistency levels (ONE, QUORUM, ALL)
 1. **ferrosa-cluster:** Hinted handoff and repair
@@ -203,3 +235,5 @@ The critical path from single-node to multi-node:
 - [Components](components.md) — crate dependency graph
 - [Overview](overview.md) — system architecture
 - [Architecture Design](../docs/superpowers/specs/2026-03-11-ferrosa-architecture-design.md) — full design spec
+- [Schema Replication Design](../docs/superpowers/specs/2026-03-14-schema-replication-design.md) — DDL replication spec
+- [Schema Replication Threat Model](threat-model-schema-replication.md) — STRIDE analysis (T21-T28)
