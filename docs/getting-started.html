@@ -276,9 +276,11 @@
   <!-- ── Build ── -->
   <h2 id="build">Build from Source</h2>
 
-  <pre><span class="cm"># Clone the repository</span>
-<span class="kw">git</span> clone https://github.com/ferrosadb/ferrosadb.git
-<span class="kw">cd</span> ferrosadb
+  <pre><span class="cm"># Install build dependencies and download source</span>
+<span class="kw">sudo</span> apt install -y build-essential pkg-config libssl-dev
+<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_0.1.0.orig.tar.gz
+<span class="kw">tar</span> xzf ferrosa_0.1.0.orig.tar.gz
+<span class="kw">cd</span> ferrosadb-0.1.0
 
 <span class="cm"># Build all crates (release mode recommended for performance)</span>
 <span class="kw">cargo</span> build --release
