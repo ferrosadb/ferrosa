@@ -35,6 +35,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [Threat Model](threat-model.md) | STRIDE threat analysis: trust boundaries, threat inventory, mitigations | Draft |
 | [Threat Model — CQL B/C](threat-model-cql-bc.md) | STRIDE for CQL parser, routing, prepared cache | Approved |
 | [Threat Model — Graph](threat-model-graph.md) | STRIDE for graph engine, HTTP endpoint, adjacency index | Draft |
+| [Threat Model — Net/Cluster](threat-model-net-cluster.md) | STRIDE for internode protocol, Raft, pair mode, coordinator | Draft |
 
 ## Architecture Decision Records
 

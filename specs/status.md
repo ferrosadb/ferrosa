@@ -23,7 +23,7 @@ and ferrosa-cluster, which are the two major unstarted crates.
                Spec'd   Coded   Tested   Prod-ready
 common         ██████   ██████  ██████   ████░░
 sstable        ██████   ██████  ██████   ████░░
-storage        ██████   █████░  █████░   ███░░░
+storage        ██████   ██████  █████░   ███░░░
 schema         ████░░   █████░  █████░   ███░░░
 cql            ██████   ██████  ██████   ████░░
 graph          █████░   ██████  ████░░   ███░░░
@@ -67,11 +67,13 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   manager, manifest with etag CAS, local LRU cache, WriteObserver trait,
   SubscriptionObserver.
 - **Remaining:**
-  - [ ] Commit log replay integration (spec exists, WIP in worktree)
-  - [ ] Compaction execution merge I/O (spec exists, WIP in worktree)
+  - [x] ~~Commit log replay integration~~ (merged PR #38)
+  - [x] ~~Compaction execution merge I/O~~ (merged PR #38)
   - [ ] LCS and TWCS compaction strategies
   - [ ] Disk backpressure
   - [ ] `io_uring` I/O backend
+  - [ ] Manifest CAS retry loop (T23 — designed, needs wiring)
+  - [ ] S3 bucket policy validation at startup (T22 — verify encryption enabled)
 
 ### ferrosa-schema — Mostly Complete (Chunk A)
 
@@ -101,6 +103,8 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   tables, SUBSCRIBE/UNSUBSCRIBE extensions, Prometheus text exposition, CqlClient,
   LZ4 and Snappy frame compression with negotiation.
 - **Remaining:**
+  - [ ] CQL TLS via rustls (T02/T03 — Critical, plaintext traffic)
+  - [ ] Per-IP rate limiting for connection/query flood (T04)
   - [ ] EVENT push notifications
   - [ ] ALLOW FILTERING support
   - [ ] Logged batch atomicity
@@ -118,6 +122,7 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   index with WriteObserver, background reconciliation, HTTP/JSON endpoint with
   auth, TLS, error sanitization, audit logging.
 - **Future (Phases 2-3):**
+  - [ ] Full adjacency reconciliation scan (T5 — stub, needs row-level verification)
   - [ ] WCO (worst-case optimal) joins
   - [ ] Leapfrog triejoin
   - [ ] Variable-length paths
@@ -146,24 +151,27 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   - [ ] Graceful shutdown sequencing
   - [ ] Configuration file support (currently env vars only)
 
-### ferrosa-net — Not Started
+### ferrosa-net — Not Started (Spec Written)
 
-- **Purpose:** Custom internode protocol, TLS, connection management
+- **Purpose:** Custom internode protocol, TLS, connection management, RPC service
+  layer, failure detection
 - **Prerequisites:** Single-node functionality stable
-- **Spec:** Not yet written
+- **Spec:** [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
+- **Threat Model:** [Net/Cluster Threats](threat-model-net-cluster.md)
 
-### ferrosa-cluster — Not Started
+### ferrosa-cluster — Not Started (Spec Written)
 
-- **Purpose:** Raft metadata (openraft), tunable consistency levels, request routing,
-  repair, hinted handoff
+- **Purpose:** Raft metadata (openraft), token ring, tunable consistency levels,
+  coordinator pattern, pair mode, hinted handoff, node lifecycle
 - **Prerequisites:** ferrosa-net
-- **Spec:** Not yet written
+- **Spec:** [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 
 ## Active Work in Progress
 
 | Item | Location | State |
 |------|----------|-------|
-| Storage replay + compaction execution | `.worktrees/storage-replay-compaction` | Uncommitted changes in 7 files |
+| ~~Storage replay + compaction execution~~ | ~~`.worktrees/storage-replay-compaction`~~ | Merged (PR #38) |
+| Net/cluster design spec | `docs/superpowers/specs/` | Draft, pending implementation plan |
 
 ## Path to Distributed Operation
 
