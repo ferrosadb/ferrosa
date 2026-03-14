@@ -6,6 +6,7 @@ pub mod error;
 pub mod mode;
 pub mod pair;
 pub mod raft;
+pub mod ring;
 pub mod state;
 pub mod write_path;
 
