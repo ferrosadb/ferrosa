@@ -19,7 +19,7 @@ impl ConsistencyLevel {
     ///
     /// # Panics
     ///
-    /// Panics if called with `EachQuorum` — use [`block_for_dc`] instead.
+    /// Panics if called with `EachQuorum` — use `block_for_dc` instead.
     pub fn block_for(&self, rf: usize) -> usize {
         match self {
             Self::One | Self::LocalOne => 1,

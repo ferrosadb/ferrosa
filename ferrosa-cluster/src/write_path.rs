@@ -4,8 +4,8 @@
 //! active implementation is swapped atomically via `ArcSwap` when the
 //! deployment mode changes (standalone → pair → cluster).
 //!
-//! - [`DirectWritePath`] — standalone mode, writes directly to `StorageEngine`.
-//! - [`PairWritePath`] — pair mode, delegates to `PairCoordinator::coordinate_write()`.
+//! - `WritePath::Direct` — standalone mode, writes directly to `StorageEngine`.
+//! - `WritePath::Pair` — pair mode, delegates to `PairCoordinator::coordinate_write()`.
 
 use std::sync::Arc;
 
