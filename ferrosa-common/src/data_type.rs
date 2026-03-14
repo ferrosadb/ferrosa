@@ -37,6 +37,8 @@ pub enum DataType {
     Timestamp,
     /// Arbitrary bytes.
     Blob,
+    /// Duration: months (i32), days (i32), nanoseconds (i64).
+    Duration,
 }
 
 impl DataType {
@@ -58,6 +60,7 @@ impl fmt::Display for DataType {
             DataType::Uuid => "uuid",
             DataType::Timestamp => "timestamp",
             DataType::Blob => "blob",
+            DataType::Duration => "duration",
         };
         f.write_str(name)
     }
