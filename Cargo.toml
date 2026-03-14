@@ -6,6 +6,7 @@ members = [
     "ferrosa-ctl",
     "ferrosa-cql",
     "ferrosa-graph",
+    "ferrosa-index",
     "ferrosa-net",
     "ferrosa-schema",
     "ferrosa-sstable",
