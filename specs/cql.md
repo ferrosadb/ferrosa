@@ -16,7 +16,7 @@ All hot paths are lock-free. The system parallelizes across all cores via Tokio'
 | Concurrency | Lock-free via `ArcSwap` + `moka` | No contention on hot paths; see [ADR-006](decisions/006-cql-architecture.md) |
 | Parser | Hand-written recursive descent | CQL is LL(2); no backtracking needed; see [ADR-006](decisions/006-cql-architecture.md) |
 | Prepared cache | `moka` W-TinyLFU | Lock-free reads, frequency+recency eviction |
-| `ALLOW FILTERING` | Rejected (returns Invalid error) | Full-scan support deferred to secondary index work |
+| `ALLOW FILTERING` | Rejected (returns Invalid error) | Full-scan support deferred; secondary index framework is implemented but query path integration pending |
 | Auth | SASL PLAIN only | Standard CQL driver expectation; pluggable trait for future |
 
 ## Dependencies
@@ -172,7 +172,28 @@ Input: &str → Lexer (Token stream) → Parser (AST) → Statement enum
 
 - **Lexer**: Single-pass, zero-allocation tokenizer, `Token<'input>` borrows from source. Keywords via `phf` perfect-hash map.
 - **Parser**: One function per grammar rule. LL(2) — no backtracking. Returns `Result<Statement>` with span info.
-- **AST**: `Statement` enum with variants: `Select`, `Insert`, `Update`, `Delete`, `CreateKeyspace`, `CreateTable`, `AlterTable`, `DropTable`, `Use`, `Batch`, etc.
+- **AST**: `Statement` enum with variants: `Select`, `Insert`, `Update`, `Delete`, `CreateKeyspace`, `CreateTable`, `AlterTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateRole`, `AlterRole`, `DropRole`, `Grant`, `Revoke`, `Use`, `Batch`, etc.
+
+### Secondary Index DDL
+
+```sql
+-- CREATE INDEX with pluggable type
+CREATE INDEX [IF NOT EXISTS] [index_name] ON [keyspace.]table (column [, column ...])
+    [USING 'btree' | 'hash' | 'composite' | 'phonetic' | 'vector']
+    [WITH OPTIONS = {'key': 'value', ...}];
+
+-- DROP INDEX
+DROP INDEX [IF EXISTS] [keyspace.]index_name;
+
+-- Examples
+CREATE INDEX idx_email ON users (email) USING 'btree';
+CREATE INDEX idx_embed ON docs (embedding) USING 'vector'
+    WITH OPTIONS = {'method': 'hnsw', 'metric': 'cosine', 'dimensions': '768'};
+CREATE INDEX idx_name ON users (last_name) USING 'phonetic'
+    WITH OPTIONS = {'algorithm': 'soundex'};
+```
+
+When `USING` is omitted, the default index type is `btree`. The router's `resolve_index_type()` maps the USING string + options to the `IndexType` enum from `ferrosa-index`. All index DDL routes through `DdlPath` for pair-mode replication.
 
 ## Query Routing
 

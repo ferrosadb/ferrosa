@@ -21,6 +21,7 @@ graph TB
         CQL[ferrosa-cql<br/>CQL Protocol v5]
         Schema[ferrosa-schema<br/>DDL, System KS]
         Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
+        Index[ferrosa-index<br/>Secondary Indexes]
         Storage[ferrosa-storage<br/>Memtable, Cache, Compaction]
         SST[ferrosa-sstable<br/>BTI Read + Write]
         Net[ferrosa-net<br/>Internode Protocol]
@@ -42,7 +43,9 @@ graph TB
     CQL --> Schema
     CQL --> Storage
     CQL --> Cluster
+    CQL --> Index
     Cluster --> Storage
+    Index --> Storage
     Cluster --> Net
     Storage --> SST
     SST --> NVMe
@@ -74,7 +77,9 @@ graph LR
 
     subgraph "Track 2: Rust Implementation"
         R1[ferrosa-common] --> R2[ferrosa-sstable]
+        R1 --> R2b[ferrosa-index]
         R2 --> R3[ferrosa-storage]
+        R2b --> R3
         R3 --> R4[ferrosa-schema]
         R4 --> R5[ferrosa-cql]
         R5 --> R6[ferrosa-net]
@@ -91,7 +96,7 @@ graph LR
 
 Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable.
 
-**Current progress**: All 10 crates are implemented. `ferrosa-common`, `ferrosa-sstable`, `ferrosa-storage`, `ferrosa-schema`, and `ferrosa-cql` (Parts A-D + observability) are complete. `ferrosa-graph` Phase 1 is complete (Cypher parser, planner, executor, adjacency index, HTTP endpoint with auth/TLS). The observability system is complete: virtual tables in `system_observability`, Prometheus metrics, web dashboard, SUBSCRIBE/UNSUBSCRIBE CQL extensions, and the `ferrosa-ctl` CLI admin tool with TUI monitor. `ferrosa-net` Phase 1 is complete (24 message types, PSK handshake, priority-lane RPC, peer manager). `ferrosa-cluster` Phase 1 (pair mode) is complete: two-node synchronous replication with write forwarding, DDL replication, failover (force-promote + switchover), schema snapshot catch-up, and commit log data replay. The `ferrosa` binary composes everything into a pair-mode database accepting CQL on port 9042, graph queries on port 7474, web console + cluster management API on port 9090, and internode protocol on port 7000. Next up: Phase 2 — full cluster with Raft consensus, token ring, tunable consistency levels.
+**Current progress**: All 11 crates are implemented. `ferrosa-common`, `ferrosa-sstable`, `ferrosa-storage`, `ferrosa-schema`, and `ferrosa-cql` (Parts A-D + observability) are complete. `ferrosa-graph` Phase 1 is complete (Cypher parser, planner, executor, adjacency index, HTTP endpoint with auth/TLS). The observability system is complete: virtual tables in `system_observability`, Prometheus metrics, web dashboard, SUBSCRIBE/UNSUBSCRIBE CQL extensions, and the `ferrosa-ctl` CLI admin tool with TUI monitor. `ferrosa-net` Phase 1 is complete (24 message types, PSK handshake, priority-lane RPC, peer manager). `ferrosa-cluster` Phase 1 (pair mode) is complete: two-node synchronous replication with write forwarding, DDL replication, failover (force-promote + switchover), schema snapshot catch-up, and commit log data replay. `ferrosa-index` provides 8 pluggable secondary index types (B-tree, hash, composite, phonetic, filtered, vector HNSW, vector IVFFlat) with storage-attached async builds and staleness tracking. All 11 DDL operations replicate in pair mode. The `ferrosa` binary composes everything into a pair-mode database with background maintenance (auto-flush, compaction polling, commit log GC), graceful shutdown, per-connection backpressure, and exponential backoff reconnection. Available as a `.deb` package via GitHub Releases. Next up: Phase 2 — full cluster with Raft consensus, token ring, tunable consistency levels.
 
 ## Key Architectural Decisions
 
@@ -125,6 +130,7 @@ The `system_observability` keyspace provides read-only virtual tables that are c
 | `connections` | `ConnectionTracker` (ferrosa-cql) | Active CQL client connections, addresses, auth state |
 | `active_queries` | `QueryTracker` (ferrosa-cql) | In-flight queries, elapsed time, bound parameters |
 | `storage_stats` | `StorageStatsTable` (ferrosa-storage) | Memtable sizes, flush counts, compaction stats, cache hit rates |
+| `secondary_indexes` | `SecondaryIndexesVirtualTable` (ferrosa-storage) | Per-index staleness, build status, pending SSTables, build errors |
 
 Virtual tables are backed by the `VirtualTable` trait defined in ferrosa-schema (`virtual_table.rs`). Each implementation provides a `read_rows()` method that returns the current state as CQL rows. The `VirtualTableRegistry` (`virtual_registry.rs`) manages registration and lookup using `ArcSwap` for lock-free concurrent reads.
 

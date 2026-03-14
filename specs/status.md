@@ -250,10 +250,12 @@ cluster        █████░   ████░░  ███░░░   █
 | Item | Location | State |
 |------|----------|-------|
 | ~~Storage replay + compaction execution~~ | ~~`.worktrees/storage-replay-compaction`~~ | Merged (PR #38) |
-| ~~ferrosa-net Phase 1~~ | ~~`ferrosa-net/`~~ | Complete (PR #39) |
-| ~~ferrosa-cluster Phase 1 (Pair mode)~~ | ~~`feature/pair-integration`~~ | Complete |
-| ferrosa-index Phase 1 (6 index types) | `feature/secondary-indexes-design` | Complete |
-| Production readiness (maintenance, shutdown, backpressure) | `ferrosa/` | Complete |
+| ~~ferrosa-net Phase 1~~ | ~~`ferrosa-net/`~~ | Merged (PR #39) |
+| ~~ferrosa-cluster Phase 1 (Pair mode)~~ | ~~`feature/pair-integration`~~ | Merged |
+| ~~ferrosa-index Phase 1 (8 index types)~~ | ~~`feature/secondary-indexes-design`~~ | Merged (PR #44) |
+| ~~DDL completeness (AlterKS/AlterTable, Role DDL, Index DDL)~~ | ~~`ferrosa-cluster/`~~ | Merged (PR #45) |
+| ~~.deb packaging + systemd service~~ | ~~`scripts/build-deb.sh`~~ | Merged (PR #46) |
+| Release workflow (GitHub Actions) | `.github/workflows/` | In progress (PR #47) |
 | ferrosa-cluster Phase 2 (Full cluster) | — | Next up |
 
 ## Path to Distributed Operation
@@ -274,4 +276,5 @@ The critical path from single-node to multi-node:
 - [Overview](overview.md) — system architecture
 - [Architecture Design](../superpowers/specs/2026-03-11-ferrosa-architecture-design.md) — full design spec
 - [Schema Replication Design](../superpowers/specs/2026-03-14-schema-replication-design.md) — DDL replication spec
+- [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md) — pluggable index framework spec
 - [Schema Replication Threat Model](threat-model-schema-replication.md) — STRIDE analysis (T21-T28)
