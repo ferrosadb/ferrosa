@@ -1,0 +1,1 @@
+//! Raft state machine.
