@@ -2229,6 +2229,7 @@ mod tests {
             version: Uuid::new_v4(),
             keyspaces: HashMap::new(),
             tables: HashMap::new(),
+            indexes: HashMap::new(),
             roles: HashMap::new(),
             grants: HashMap::new(),
         };
@@ -2256,6 +2257,7 @@ mod tests {
             version: Uuid::new_v4(),
             keyspaces: HashMap::new(),
             tables: HashMap::new(),
+            indexes: HashMap::new(),
             roles: HashMap::new(),
             grants: HashMap::new(),
         };
@@ -2308,6 +2310,7 @@ mod tests {
             version: Uuid::new_v4(),
             keyspaces: HashMap::new(),
             tables: HashMap::new(),
+            indexes: HashMap::new(),
             roles: HashMap::new(),
             grants: HashMap::new(),
         };
