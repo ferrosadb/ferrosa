@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use uuid::Uuid;
 
+use bytes::Bytes;
 use ferrosa_net::codec::{Lane, MsgType};
 use ferrosa_net::config::NetConfig;
 use ferrosa_net::message::Message;
@@ -26,13 +27,16 @@ use ferrosa_net::pool::PriorityPool;
 use ferrosa_net::rpc::handler::PeerId;
 use ferrosa_net::rpc::{HandlerRegistry, InboundPeerCallback};
 use ferrosa_schema::system::peers::{ClusterState, PeerInfo};
+use ferrosa_schema::Schema;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::CommitLogPosition;
 
 use crate::config::ClusterConfig;
+use crate::ddl_path::DdlPath;
 use crate::error::{ClusterError, Result};
 use crate::mode::DeploymentMode;
 use crate::pair::coordinator::{encode_mutation, PairCoordinator};
+use crate::pair::ddl::{DdlCoordinator, PairDdlForwardHandler, PairSchemaSyncHandler};
 use crate::pair::{PairRole, PairState};
 use crate::state::PairClusterState;
 use crate::write_path::WritePath;
@@ -69,6 +73,8 @@ pub struct ModeController {
     write_path: Arc<ArcSwap<WritePath>>,
     cluster_state: Arc<ArcSwap<ClusterStateHolder>>,
     storage: Arc<StorageEngine>,
+    schema: Arc<Schema>,
+    ddl_path: Arc<ArcSwap<DdlPath>>,
     config: Arc<ClusterConfig>,
     net_config: Arc<NetConfig>,
     local_host_id: Uuid,
@@ -84,6 +90,7 @@ pub struct ModeController {
 pub struct ModeControllerHandles {
     pub write_path: Arc<ArcSwap<WritePath>>,
     pub cluster_state: Arc<ArcSwap<ClusterStateHolder>>,
+    pub ddl_path: Arc<ArcSwap<DdlPath>>,
 }
 
 impl ModeController {
@@ -93,16 +100,23 @@ impl ModeController {
         net_config: Arc<NetConfig>,
         local_host_id: Uuid,
         storage: Arc<StorageEngine>,
+        schema: Arc<Schema>,
         registry: Arc<HandlerRegistry>,
     ) -> (Arc<Self>, ModeControllerHandles) {
         let write_path = Arc::new(ArcSwap::from_pointee(WritePath::direct(storage.clone())));
         let cluster_state = Arc::new(ArcSwap::from_pointee(ClusterStateHolder::Standalone));
+        let ddl_path = Arc::new(ArcSwap::from_pointee(DdlPath::Direct {
+            schema: schema.clone(),
+            engine: storage.clone(),
+        }));
 
         let controller = Arc::new(Self {
             mode: ArcSwap::from_pointee(DeploymentMode::Standalone),
             write_path: write_path.clone(),
             cluster_state: cluster_state.clone(),
             storage,
+            schema,
+            ddl_path: ddl_path.clone(),
             config,
             net_config,
             local_host_id,
@@ -115,6 +129,7 @@ impl ModeController {
         let handles = ModeControllerHandles {
             write_path,
             cluster_state,
+            ddl_path,
         };
 
         (controller, handles)
@@ -148,6 +163,10 @@ impl ModeController {
     pub fn force_promote(&self) -> Result<()> {
         self.write_path
             .store(Arc::new(WritePath::direct(self.storage.clone())));
+        self.ddl_path.store(Arc::new(DdlPath::Direct {
+            schema: self.schema.clone(),
+            engine: self.storage.clone(),
+        }));
         self.cluster_state
             .store(Arc::new(ClusterStateHolder::Standalone));
         self.mode.store(Arc::new(DeploymentMode::Standalone));
@@ -224,6 +243,32 @@ impl ModeController {
         ));
         self.registry.register(MsgType::RoleSwap, role_swap_handler);
 
+        // DDL coordination
+        let ddl_coordinator = Arc::new(DdlCoordinator::new(
+            role_arc.clone(),
+            peer_host_id,
+            self.schema.clone(),
+            self.storage.clone(),
+            peer_manager.clone(),
+        ));
+
+        let ddl_fwd_handler = Arc::new(PairDdlForwardHandler::new(
+            role_arc.clone(),
+            ddl_coordinator.clone(),
+        ));
+        self.registry
+            .register(MsgType::PairDdlForward, ddl_fwd_handler);
+
+        let schema_sync_handler = Arc::new(PairSchemaSyncHandler::new(
+            self.schema.clone(),
+            self.storage.clone(),
+        ));
+        self.registry
+            .register(MsgType::PairSchemaSync, schema_sync_handler);
+
+        self.ddl_path
+            .store(Arc::new(DdlPath::Pair(ddl_coordinator)));
+
         self.write_path
             .store(Arc::new(WritePath::pair(coordinator)));
 
@@ -281,6 +326,7 @@ impl ModeController {
             let local_id = self.local_host_id;
             let pm = peer_manager;
             let storage = self.storage.clone();
+            let schema = self.schema.clone();
             tokio::spawn(async move {
                 // Wait for reverse connection + peer pair transition + handler registration.
                 tokio::time::sleep(std::time::Duration::from_secs(4)).await;
@@ -302,6 +348,25 @@ impl ModeController {
                         tracing::warn!(%e, "failed to send role correction to peer");
                         return;
                     }
+                }
+
+                // Send schema snapshot before mutation replay.
+                let snap = schema.snapshot();
+                match serde_json::to_vec(&*snap) {
+                    Ok(json) => {
+                        match pm
+                            .send(
+                                peer_host_id,
+                                Message::PairSchemaSync(Bytes::from(json)),
+                                Lane::Bulk,
+                            )
+                            .await
+                        {
+                            Ok(_) => tracing::info!("schema snapshot sent to rejoined peer"),
+                            Err(e) => tracing::warn!(%e, "failed to send schema snapshot"),
+                        }
+                    }
+                    Err(e) => tracing::warn!(%e, "failed to serialize schema snapshot"),
                 }
 
                 // Replay recent data to bring peer up to date.
@@ -334,6 +399,7 @@ impl ModeController {
     /// Transition to degraded state: writes unavailable, reads still work.
     fn transition_to_degraded(&self) {
         self.write_path.store(Arc::new(WritePath::unavailable()));
+        self.ddl_path.store(Arc::new(DdlPath::Unavailable));
         self.cluster_state
             .store(Arc::new(ClusterStateHolder::Standalone));
         self.mode.store(Arc::new(DeploymentMode::Standalone));
@@ -404,17 +470,35 @@ mod tests {
         Arc::new(StorageEngine::new(config, None).unwrap())
     }
 
+    fn test_schema() -> Arc<Schema> {
+        use ferrosa_schema::{
+            AuthMethod, DeploymentMode as SchemaDeploymentMode, LogAuditSink, PasswordHasher,
+            PasswordPolicy, RateLimitConfig, SchemaConfig,
+        };
+        let config = SchemaConfig {
+            hasher: PasswordHasher::default(),
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(LogAuditSink),
+            secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+            mode: SchemaDeploymentMode::Development,
+        };
+        Arc::new(Schema::new(config).unwrap())
+    }
+
     #[test]
     fn starts_in_standalone_mode() {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
+        let schema = test_schema();
         let config = Arc::new(ClusterConfig::default());
         let net_config = Arc::new(NetConfig::default());
         let host_id = Uuid::new_v4();
 
         let registry = Arc::new(HandlerRegistry::new());
         let (controller, _handles) =
-            ModeController::new(config, net_config, host_id, storage, registry);
+            ModeController::new(config, net_config, host_id, storage, schema, registry);
 
         assert_eq!(controller.mode(), DeploymentMode::Standalone);
     }
@@ -423,14 +507,21 @@ mod tests {
     fn peer_connect_transitions_to_pair() {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
+        let schema = test_schema();
         let config = Arc::new(ClusterConfig::default());
         let net_config = Arc::new(NetConfig::default());
         let local_id = Uuid::new_v4();
         let peer_id = Uuid::new_v4();
 
         let registry = Arc::new(HandlerRegistry::new());
-        let (controller, _handles) =
-            ModeController::new(config, net_config.clone(), local_id, storage, registry);
+        let (controller, _handles) = ModeController::new(
+            config,
+            net_config.clone(),
+            local_id,
+            storage,
+            schema,
+            registry,
+        );
 
         // Create a PeerManager and set it
         let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
@@ -447,14 +538,21 @@ mod tests {
     fn peer_disconnect_transitions_to_degraded() {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
+        let schema = test_schema();
         let config = Arc::new(ClusterConfig::default());
         let net_config = Arc::new(NetConfig::default());
         let local_id = Uuid::new_v4();
         let peer_id = Uuid::new_v4();
 
         let registry = Arc::new(HandlerRegistry::new());
-        let (controller, _handles) =
-            ModeController::new(config, net_config.clone(), local_id, storage, registry);
+        let (controller, _handles) = ModeController::new(
+            config,
+            net_config.clone(),
+            local_id,
+            storage,
+            schema,
+            registry,
+        );
 
         let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
         controller.set_peer_manager(pm);
@@ -473,13 +571,14 @@ mod tests {
     fn force_promote_sets_direct_write_path() {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
+        let schema = test_schema();
         let config = Arc::new(ClusterConfig::default());
         let net_config = Arc::new(NetConfig::default());
         let local_id = Uuid::new_v4();
 
         let registry = Arc::new(HandlerRegistry::new());
         let (controller, _handles) =
-            ModeController::new(config, net_config, local_id, storage, registry);
+            ModeController::new(config, net_config, local_id, storage, schema, registry);
 
         controller.force_promote().unwrap();
         assert_eq!(controller.mode(), DeploymentMode::Standalone);

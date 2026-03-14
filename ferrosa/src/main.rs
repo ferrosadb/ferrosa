@@ -104,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         net_config.clone(),
         host_id,
         storage.clone(),
+        schema.clone(),
         registry.clone(),
     );
 
