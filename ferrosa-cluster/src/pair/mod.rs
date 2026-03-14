@@ -1,5 +1,6 @@
 pub mod catchup;
 pub mod coordinator;
+pub mod ddl;
 pub mod handler;
 pub mod node;
 pub mod switchover;

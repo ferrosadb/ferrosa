@@ -12,11 +12,14 @@ ferrosa-net = { path = "../ferrosa-net" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-storage = { path = "../ferrosa-storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+indexmap = "2"
 proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

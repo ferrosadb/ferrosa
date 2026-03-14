@@ -234,8 +234,7 @@ impl Schema {
 
     /// Create a keyspace without auth checks. Idempotent — succeeds silently
     /// if keyspace already exists.
-    #[allow(dead_code)]
-    pub(crate) fn create_keyspace_internal(&self, ks: KeyspaceMetadata) -> crate::Result<()> {
+    pub fn create_keyspace_internal(&self, ks: KeyspaceMetadata) -> crate::Result<()> {
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         if snap.keyspaces.contains_key(&ks.name) {
@@ -249,8 +248,7 @@ impl Schema {
 
     /// Create a table without auth checks. Idempotent — succeeds silently
     /// if table already exists.
-    #[allow(dead_code)]
-    pub(crate) fn create_table_internal(&self, table: TableMetadata) -> crate::Result<()> {
+    pub fn create_table_internal(&self, table: TableMetadata) -> crate::Result<()> {
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (table.keyspace.clone(), table.name.clone());
@@ -265,8 +263,7 @@ impl Schema {
 
     /// Drop a keyspace without auth checks. Idempotent — succeeds silently
     /// if keyspace doesn't exist.
-    #[allow(dead_code)]
-    pub(crate) fn drop_keyspace_internal(&self, name: &str) -> crate::Result<()> {
+    pub fn drop_keyspace_internal(&self, name: &str) -> crate::Result<()> {
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         snap.keyspaces.remove(name);
@@ -278,8 +275,7 @@ impl Schema {
 
     /// Drop a table without auth checks. Idempotent — succeeds silently
     /// if table doesn't exist.
-    #[allow(dead_code)]
-    pub(crate) fn drop_table_internal(&self, keyspace: &str, table: &str) -> crate::Result<()> {
+    pub fn drop_table_internal(&self, keyspace: &str, table: &str) -> crate::Result<()> {
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         snap.tables

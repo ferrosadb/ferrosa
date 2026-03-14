@@ -1,6 +1,7 @@
 pub mod config;
 pub mod consistency;
 pub mod controller;
+pub mod ddl_path;
 pub mod error;
 pub mod mode;
 pub mod pair;
@@ -10,6 +11,7 @@ pub mod write_path;
 pub use config::ClusterConfig;
 pub use consistency::ConsistencyLevel;
 pub use controller::{ClusterStateHolder, ModeController, ModeControllerHandles};
+pub use ddl_path::DdlPath;
 pub use error::{ClusterError, Result};
 pub use mode::DeploymentMode;
 pub use pair::{PairCoordinator, PairNode, PairRole};
