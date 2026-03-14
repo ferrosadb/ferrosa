@@ -1,6 +1,6 @@
 # CQL Protocol Specification
 
-> Last updated: 2026-03-13 (observability additions)
+> Last updated: 2026-03-14 (secondary index DDL additions)
 > Status: Approved
 
 ## Overview
