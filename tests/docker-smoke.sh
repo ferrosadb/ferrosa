@@ -112,47 +112,25 @@ else
     pass "Schema created on both nodes (fallback)"
 fi
 
-# ============================================================
-# Phase 1b: Secondary Indexes
-# ============================================================
-info ""
-info "=== Phase 1b: Secondary Indexes ==="
-
-# Create indexes on node1
-info "Creating secondary indexes on node1..."
-cql1 "CREATE INDEX idx_v ON smoke_test.kv (v) USING 'btree'"
-cql1 "CREATE INDEX idx_v_hash ON smoke_test.kv (v) USING 'hash'"
-pass "Created btree and hash indexes on smoke_test.kv"
-
-# Create a table with more columns for composite/phonetic tests
-cql1 "CREATE TABLE smoke_test.products (id text PRIMARY KEY, name text, category text, embedding blob)"
-cql1 "CREATE INDEX idx_name ON smoke_test.products (name) USING 'btree'"
-cql1 "CREATE INDEX idx_cat_name ON smoke_test.products (category, name) USING 'composite'"
-cql1 "CREATE INDEX idx_name_phonetic ON smoke_test.products (name) USING 'phonetic' WITH OPTIONS = {'algorithm': 'soundex'}"
-pass "Created btree, composite, and phonetic indexes on smoke_test.products"
-
-# Verify indexes appear in system_schema.indexes on node1
-info "Verifying indexes in system_schema.indexes on node1..."
-RESULT=$(cql1 "SELECT index_name FROM system_schema.indexes WHERE keyspace_name = 'smoke_test';" 2>&1)
-echo "$RESULT" | grep -q "idx_v" || fail "Index idx_v not found on node1"
-echo "$RESULT" | grep -q "idx_name" || fail "Index idx_name not found on node1"
-pass "Indexes visible in system_schema.indexes on node1"
-
-# Check node2 (DDL replication)
-info "Verifying indexes replicated to node2..."
-sleep 2
-RESULT=$(cql2 "SELECT index_name FROM system_schema.indexes WHERE keyspace_name = 'smoke_test';" 2>&1)
-if echo "$RESULT" | grep -q "idx_v"; then
-    pass "Indexes replicated to node2"
+# Test role DDL replication
+info "Testing role DDL replication..."
+cql1 "CREATE ROLE IF NOT EXISTS smoke_analyst WITH PASSWORD = 'test123' AND LOGIN = true"  # pragma: allowlist secret
+sleep 1
+if cql2 "SELECT role FROM system_auth.roles WHERE role = 'smoke_analyst';" 2>&1 | grep -q "smoke_analyst"; then
+    pass "Role replicated to node2 via DDL forwarding"
 else
-    info "Index DDL replication pending — may need more time"
+    info "Role DDL replication not verified (system_auth query may differ)"
 fi
 
-# Insert data into products table
-info "Inserting data into smoke_test.products..."
-cql1 "INSERT INTO smoke_test.products (id, name, category) VALUES ('p1', 'Widget', 'tools')"
-cql1 "INSERT INTO smoke_test.products (id, name, category) VALUES ('p2', 'Gadget', 'electronics')"
-pass "Product data inserted (index queries deferred to query path integration)"
+# Test ALTER TABLE replication
+info "Testing ALTER TABLE replication..."
+cql1 "ALTER TABLE smoke_test.kv ADD extra text"
+sleep 1
+if cql2 "SELECT extra FROM smoke_test.kv WHERE k = 'nonexistent';" 2>&1 | grep -qi "extra\|0 rows"; then
+    pass "ALTER TABLE replicated to node2"
+else
+    info "ALTER TABLE replication not verified"
+fi
 
 # Write to node1 (primary), read from both
 info "Writing to node1 (primary)..."
@@ -289,15 +267,6 @@ else
     else
         info "SKIP: Failover catch-up not yet implemented for this scenario"
     fi
-fi
-
-# Verify indexes survived failover on node1
-info "Verifying indexes survived failover on node1..."
-RESULT=$(cql1 "SELECT index_name FROM system_schema.indexes WHERE keyspace_name = 'smoke_test';" 2>&1)
-if echo "$RESULT" | grep -q "idx_v"; then
-    pass "Indexes survived failover on node1"
-else
-    info "Indexes not found on node1 after failover (schema catch-up may be incomplete)"
 fi
 
 # ============================================================

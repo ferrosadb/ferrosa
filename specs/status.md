@@ -13,9 +13,9 @@ including DDL replication, write forwarding, failover, and catch-up.
 | Metric | Value |
 |--------|-------|
 | Crates | 11 of 11 planned |
-| Source files | ~210 |
-| Source LOC | ~67,700 |
-| Test functions | ~1,230 |
+| Source files | ~194 |
+| Source LOC | ~68,000 |
+| Test functions | ~1,250 |
 | Integration test files | 22 |
 
 ## Maturity Assessment
@@ -26,11 +26,11 @@ common         ██████   ██████  ██████   █
 sstable        ██████   ██████  ██████   ████░░
 storage        ██████   ██████  █████░   ███░░░
 schema         ████░░   █████░  █████░   ███░░░
+index          █████░   █████░  ████░░   ██░░░░
 cql            ██████   ██████  ██████   ████░░
-index          █████░   █████░  █████░   ██░░░░
 graph          █████░   ██████  ████░░   ███░░░
 ctl            ██████   ██████  ███░░░   ███░░░
-binary         █████░   ██████  ███░░░   ██░░░░
+binary         █████░   ██████  ███░░░   ███░░░
 net            █████░   █████░  ████░░   ██░░░░
 cluster        █████░   ████░░  ███░░░   ██░░░░
 ```
@@ -62,15 +62,14 @@ cluster        █████░   ████░░  ███░░░   █
 
 - **LOC:** 9,278 (29 files) | **Tests:** 204
 - **Modules:** `cache`, `commitlog` (7 submodules), `compaction` (3 submodules),
-  `engine`, `flush`, `manifest`, `memtable` (2 impls), `merge`, `observer`, `store`,
-  `subscription_observer`, `upload`, `virtual_tables`, `index` (tracker, scheduler,
-  virtual\_table)
+  `engine`, `flush`, `index` (tracker, scheduler, virtual_table), `manifest`,
+  `memtable` (2 impls), `merge`, `observer`, `store`, `subscription_observer`,
+  `upload`, `virtual_tables`
 - **What's done:** Memtable (sharded BTree + skiplist), commit log (CAS-allocated
   segments, 3 sync modes, CDC, `force_sync` for catch-up), flush, merge, compaction
   (STCS strategy), S3 upload manager, manifest with etag CAS, local LRU cache,
-  WriteObserver trait, SubscriptionObserver. Secondary index infrastructure:
-  `IndexStateTracker` (per-index staleness), `IndexBuildScheduler` (channel-based
-  worker pool), `system_views.secondary_indexes` virtual table, `UploadTask::IndexFiles`.
+  WriteObserver trait, SubscriptionObserver. Index support: `IndexStateTracker`,
+  `IndexBuildScheduler`, index virtual table, `UploadTask::IndexFiles` variant.
 - **Remaining:**
   - [x] ~~Commit log replay integration~~ (merged PR #38)
   - [x] ~~Compaction execution merge I/O~~ (merged PR #38)
@@ -84,20 +83,43 @@ cluster        █████░   ████░░  ███░░░   █
 
 - **LOC:** 7,348 (27 files) | **Tests:** 204
 - **Modules:** `audit` (3 submodules), `auth` (4 submodules), `convert`, `error`,
-  `metadata` (4 submodules incl. index), `registry`, `secrets`, `startup`,
-  `system` (5 submodules incl. index\_tables), `virtual_registry`, `virtual_table`
+  `metadata` (3 submodules), `registry`, `secrets`, `startup`, `system` (4 submodules),
+  `virtual_registry`, `virtual_table`
 - **What's done:** Schema registry with `ArcSwap` lock-free snapshots, full RBAC auth
   (bcrypt/argon2), column-level permissions, rate limiting, audit logging (log + table
   sinks), system keyspace queries, VirtualTable trait + registry. Schema replication:
-  `apply_snapshot()`, idempotent `*_internal()` methods for pair mode. Secondary index
-  metadata: `IndexMetadata` struct, `SchemaSnapshot.indexes` with CRUD, cascade cleanup
-  on DROP TABLE/KEYSPACE, `system_schema.indexes` virtual table.
+  `apply_snapshot()`, idempotent `*_internal()` methods for pair mode. `IndexMetadata`
+  for secondary index definitions, `system_schema.indexes` virtual table, cascade
+  cleanup on `DROP TABLE` (removes associated indexes).
 - **Remaining (Chunks B-F):**
   - [ ] DDL validation rules
   - [ ] System table persistence to SSTable
   - [ ] UDT (user-defined type) support
   - [ ] Role hierarchy with inheritance
   - [ ] Audit sink composition
+
+### ferrosa-index — Phase 1 Complete (PR #44)
+
+- **LOC:** ~5,800 (14 files) | **Tests:** 110
+- **Modules:** `btree`, `hash`, `composite`, `filtered`, `phonetic` (soundex, metaphone,
+  double_metaphone, caverphone), `vector` (hnsw, ivfflat)
+- **What's done:** Pluggable secondary index framework with `IndexBuilder`/`IndexReader`/`IndexFactory`
+  traits. 8 index types: B-tree (range scans), hash (O(1) equality), composite
+  (multi-column), filtered (partial coverage), phonetic (Soundex, Metaphone, Double Metaphone,
+  Caverphone), and two vector methods (HNSW, IVFFlat) for approximate nearest neighbor search.
+  Distance functions (L2, cosine, inner product). Storage-attached: indexes build asynchronously
+  after SSTable flush with zero write-path impact. Per-index staleness tracking, operational
+  metrics via `system_views.secondary_indexes`, CQL-compatible DDL with
+  `CREATE INDEX ... USING 'type'` syntax.
+- **Remaining:**
+  - [ ] Query path integration (index-aware query planner in ferrosa-cql)
+  - [ ] `SOUNDS LIKE` / `ANN OF` CQL syntax
+  - [ ] Clustered indexes
+  - [ ] GPU offloading for vector operations
+  - [ ] Binary serialization for index persistence
+  - [ ] Compaction-triggered index rebuild
+  - [ ] Distributed index coordination in cluster mode
+- **Spec:** [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md)
 
 ### ferrosa-cql — Complete (Parts A-D + Compression)
 
@@ -110,11 +132,8 @@ cluster        █████░   ████░░  ███░░░   █
   prepared statement cache (moka W-TinyLFU), ConnectionTracker/QueryTracker virtual
   tables, SUBSCRIBE/UNSUBSCRIBE extensions, Prometheus text exposition, CqlClient,
   LZ4 and Snappy frame compression with negotiation. DDL routes through `DdlPath`
-  for pair mode replication.
-- **What's new (indexes):** `CREATE INDEX ... USING 'type'` / `DROP INDEX` DDL with
-  full parser (7 new tests) and router. `resolve_index_type()` maps USING strings to
-  `IndexType` (btree, hash, composite, phonetic, vector). Routes through `DdlPath` for
-  pair mode replication.
+  for pair mode replication. `CREATE INDEX` / `DROP INDEX` parser support and router
+  integration, `resolve_index_type()` for mapping index USING clause to index factory.
 - **Remaining:**
   - [ ] CQL TLS via rustls (T02/T03 — Critical, plaintext traffic)
   - [ ] Per-IP rate limiting for connection/query flood (T04)
@@ -123,25 +142,6 @@ cluster        █████░   ████░░  ███░░░   █
   - [ ] Logged batch atomicity
   - [ ] UDT support
   - [ ] Query tracing
-  - [ ] Index-accelerated SELECT query path (ScanPlan, SOUNDS LIKE, ANN OF)
-
-### ferrosa-index — Complete (Index Framework)
-
-- **LOC:** ~5,800 (14 files) | **Tests:** 110
-- **Modules:** `btree`, `hash`, `composite`, `filtered`, `phonetic` (soundex, metaphone,
-  double\_metaphone, caverphone), `vector` (hnsw, ivfflat)
-- **What's done:** Pluggable secondary index framework with `IndexBuilder`/`IndexReader`/
-  `IndexFactory` traits. 8 index types: B-tree (sorted range), hash (O(1) point),
-  composite (multi-column), phonetic (4 algorithms), filtered (predicate wrapper),
-  vector HNSW (graph-based ANN), vector IVFFlat (k-means ANN). Distance functions:
-  L2, cosine, inner product. Storage-attached design with per-SSTable companion files.
-- **Remaining:**
-  - [ ] Query path integration (ScanPlan, index-accelerated SELECT)
-  - [ ] `SOUNDS LIKE` and `ANN OF` query syntax
-  - [ ] Clustered index (flush-time sort constraint)
-  - [ ] GPU offloading for distance computations
-  - [ ] Binary serialization format (currently JSON for v1)
-- **Spec:** [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md)
 
 ### ferrosa-graph — Phase 1 Complete
 
@@ -171,17 +171,22 @@ cluster        █████░   ████░░  ███░░░   █
 - **Remaining:**
   - [ ] Integration tests (currently unit tests only)
 
-### ferrosa (binary) — Complete (pair-mode)
+### ferrosa (binary) — Complete (pair-mode, production-ready)
 
-- **LOC:** ~770 (5 files) | **Tests:** ~15
-- **Modules:** `web` (api, static_files)
+- **LOC:** ~870 (6 files) | **Tests:** ~18
+- **Modules:** `maintenance`, `web` (api, static_files)
 - **What's done:** Composes all crates. CQL server on :9042, graph HTTP on :7474,
   web console on :9090. Connection + query tracker wiring, REST API for
   metrics/schema/queries/cluster management, embedded static assets via rust-embed.
   Cluster management endpoints: `GET /api/cluster/status`,
   `POST /api/cluster/promote`, `POST /api/cluster/switchover`.
+  Background maintenance loop (auto-flush, compaction polling, commit log GC).
+  Graceful shutdown with configurable timeout (drains in-flight requests).
+  Per-connection request limiting for backpressure under load. Exponential backoff
+  reconnection for internode links. Ships as .deb via `scripts/build-deb.sh` with
+  systemd service unit.
 - **Remaining:**
-  - [ ] Graceful shutdown sequencing
+  - [x] ~~Graceful shutdown sequencing~~ (done)
   - [ ] Configuration file support (currently env vars only)
 
 ### ferrosa-net — Phase 1 Complete (PR #39)
@@ -232,10 +237,10 @@ cluster        █████░   ████░░  ███░░░   █
   - [ ] Coordinator pattern for write/read fan-out
   - [ ] Hinted handoff and repair
   - [ ] Node lifecycle (join, leave, bootstrap)
-  - [ ] AlterKeyspace/AlterTable DDL forwarding
-  - [ ] `StorageEngine::unregister_table()` for drop replication cleanup
-- **What's new (indexes):** `DdlOperation::CreateIndex`/`DropIndex` variants with
-  `apply_ddl_locally()` handling, `WireSchemaSnapshot.indexes` field for catch-up.
+  - [x] ~~AlterKeyspace/AlterTable DDL forwarding~~ (done)
+  - [x] ~~`StorageEngine::unregister_table()` for drop replication cleanup~~ (done)
+  - [x] ~~Role/auth DDL forwarding (CreateRole, AlterRole, DropRole, Grant, Revoke)~~ (done)
+  - [x] ~~CreateIndex/DropIndex DdlOperation variants~~ (done)
 - **Spec:** [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 - **Schema Replication Spec:** [Schema Replication](../superpowers/specs/2026-03-14-schema-replication-design.md)
 - **Threat Models:** [Net/Cluster](threat-model-net-cluster.md), [Schema Replication](threat-model-schema-replication.md)
@@ -245,9 +250,12 @@ cluster        █████░   ████░░  ███░░░   █
 | Item | Location | State |
 |------|----------|-------|
 | ~~Storage replay + compaction execution~~ | ~~`.worktrees/storage-replay-compaction`~~ | Merged (PR #38) |
-| ~~ferrosa-net Phase 1~~ | ~~`ferrosa-net/`~~ | Complete (PR #39) |
-| ~~ferrosa-cluster Phase 1 (Pair mode)~~ | ~~`feature/pair-integration`~~ | Complete |
-| ferrosa-index (Secondary indexes) | `docs/secondary-indexes-design` | PR #44 |
+| ~~ferrosa-net Phase 1~~ | ~~`ferrosa-net/`~~ | Merged (PR #39) |
+| ~~ferrosa-cluster Phase 1 (Pair mode)~~ | ~~`feature/pair-integration`~~ | Merged |
+| ~~ferrosa-index Phase 1 (8 index types)~~ | ~~`feature/secondary-indexes-design`~~ | Merged (PR #44) |
+| ~~DDL completeness (AlterKS/AlterTable, Role DDL, Index DDL)~~ | ~~`ferrosa-cluster/`~~ | Merged (PR #45) |
+| ~~.deb packaging + systemd service~~ | ~~`scripts/build-deb.sh`~~ | Merged (PR #46) |
+| Release workflow (GitHub Actions) | `.github/workflows/` | In progress (PR #47) |
 | ferrosa-cluster Phase 2 (Full cluster) | — | Next up |
 
 ## Path to Distributed Operation
@@ -268,5 +276,5 @@ The critical path from single-node to multi-node:
 - [Overview](overview.md) — system architecture
 - [Architecture Design](../superpowers/specs/2026-03-11-ferrosa-architecture-design.md) — full design spec
 - [Schema Replication Design](../superpowers/specs/2026-03-14-schema-replication-design.md) — DDL replication spec
-- [Schema Replication Threat Model](threat-model-schema-replication.md) — STRIDE analysis (T21-T28)
 - [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md) — pluggable index framework spec
+- [Schema Replication Threat Model](threat-model-schema-replication.md) — STRIDE analysis (T21-T28)

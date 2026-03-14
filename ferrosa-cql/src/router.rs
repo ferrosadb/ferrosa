@@ -22,10 +22,10 @@ use ferrosa_index::{DistanceMetric, IndexType, PhoneticAlgorithm, VectorMethod};
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local, query_peers, query_role_members,
     query_role_permissions, query_roles, query_tables, AuthContext,
-    ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, IndexMetadata,
-    KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams, Resource,
-    RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates, VirtualColumnDef,
-    VirtualRow,
+    ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
+    IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
+    Resource, RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
+    VirtualColumnDef, VirtualRow,
 };
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
@@ -99,21 +99,29 @@ pub async fn route(
         Statement::CreateTable(ct) => route_create_table(state, ctx, ct)
             .await
             .map(RouteResult::Result),
-        Statement::AlterTable(at) => route_alter_table(state, ctx, at).map(RouteResult::Result),
+        Statement::AlterTable(at) => route_alter_table(state, ctx, at)
+            .await
+            .map(RouteResult::Result),
         Statement::DropTable(dt) => route_drop_table(state, ctx, dt)
             .await
             .map(RouteResult::Result),
-        Statement::AlterKeyspace(ak) => {
-            route_alter_keyspace(state, ctx, ak).map(RouteResult::Result)
-        }
+        Statement::AlterKeyspace(ak) => route_alter_keyspace(state, ctx, ak)
+            .await
+            .map(RouteResult::Result),
         Statement::DropKeyspace(dk) => route_drop_keyspace(state, ctx, dk)
             .await
             .map(RouteResult::Result),
-        Statement::CreateRole(cr) => route_create_role(state, ctx, cr).map(RouteResult::Result),
-        Statement::AlterRole(ar) => route_alter_role(state, ctx, ar).map(RouteResult::Result),
-        Statement::DropRole(dr) => route_drop_role(state, ctx, dr).map(RouteResult::Result),
-        Statement::Grant(g) => route_grant(state, ctx, g).map(RouteResult::Result),
-        Statement::Revoke(r) => route_revoke(state, ctx, r).map(RouteResult::Result),
+        Statement::CreateRole(cr) => route_create_role(state, ctx, cr)
+            .await
+            .map(RouteResult::Result),
+        Statement::AlterRole(ar) => route_alter_role(state, ctx, ar)
+            .await
+            .map(RouteResult::Result),
+        Statement::DropRole(dr) => route_drop_role(state, ctx, dr)
+            .await
+            .map(RouteResult::Result),
+        Statement::Grant(g) => route_grant(state, ctx, g).await.map(RouteResult::Result),
+        Statement::Revoke(r) => route_revoke(state, ctx, r).await.map(RouteResult::Result),
         Statement::Use(u) => {
             let body = result::encode_set_keyspace(&u.keyspace);
             Ok(RouteResult::SetKeyspace(u.keyspace, body))
@@ -946,7 +954,7 @@ async fn route_create_keyspace(
     ))
 }
 
-fn route_alter_keyspace(
+async fn route_alter_keyspace(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: AlterKeyspaceStatement,
@@ -976,7 +984,24 @@ fn route_alter_keyspace(
         durable_writes: s.durable_writes,
     };
 
-    state.schema.alter_keyspace(&s.name, updates, ctx.auth)?;
+    match &**state.ddl_path.load() {
+        DdlPath::Direct { .. } => {
+            state.schema.alter_keyspace(&s.name, updates, ctx.auth)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::AlterKeyspace {
+                name: s.name.clone(),
+                updates,
+            };
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
     Ok(result::encode_schema_change(
         "UPDATED",
         "KEYSPACE",
@@ -998,7 +1023,19 @@ async fn route_drop_keyspace(
 
     match &**state.ddl_path.load() {
         DdlPath::Direct { .. } => {
+            // Collect tables before drop so we can unregister from storage.
+            let table_ids: Vec<_> = state
+                .schema
+                .snapshot()
+                .tables
+                .keys()
+                .filter(|(ks, _)| ks == &s.name)
+                .map(|(ks, tbl)| ferrosa_storage::TableId::new(ks, tbl))
+                .collect();
             state.schema.drop_keyspace(&s.name, ctx.auth)?;
+            for tid in &table_ids {
+                let _ = state.engine.unregister_table(tid);
+            }
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropKeyspace(s.name.clone());
@@ -1124,7 +1161,7 @@ async fn route_create_table(
     ))
 }
 
-fn route_alter_table(
+async fn route_alter_table(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: AlterTableStatement,
@@ -1158,7 +1195,25 @@ fn route_alter_table(
         extensions: None,
     };
 
-    state.schema.alter_table(ks, &s.table, updates, ctx.auth)?;
+    match &**state.ddl_path.load() {
+        DdlPath::Direct { .. } => {
+            state.schema.alter_table(ks, &s.table, updates, ctx.auth)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::AlterTable {
+                keyspace: ks.to_string(),
+                table: s.table.clone(),
+                updates: Box::new(updates),
+            };
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
     Ok(result::encode_schema_change(
         "UPDATED",
         "TABLE",
@@ -1183,6 +1238,8 @@ async fn route_drop_table(
     match &**state.ddl_path.load() {
         DdlPath::Direct { .. } => {
             state.schema.drop_table(ks, &s.table, ctx.auth)?;
+            let tid = ferrosa_storage::TableId::new(ks, &s.table);
+            let _ = state.engine.unregister_table(&tid);
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropTable {
@@ -1413,7 +1470,7 @@ async fn route_drop_index(
 
 // ── DDL: Role ────────────────────────────────────────────────────────────
 
-fn route_create_role(
+async fn route_create_role(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: CreateRoleStatement,
@@ -1431,13 +1488,27 @@ fn route_create_role(
         member_of: HashSet::new(),
     };
 
-    state
-        .schema
-        .create_role(role, s.password.as_deref(), ctx.auth)?;
+    match &**state.ddl_path.load() {
+        DdlPath::Direct { .. } => {
+            state
+                .schema
+                .create_role(role, s.password.as_deref(), ctx.auth)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::CreateRole(role);
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
     Ok(result::encode_void())
 }
 
-fn route_alter_role(
+async fn route_alter_role(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: AlterRoleStatement,
@@ -1454,11 +1525,28 @@ fn route_alter_role(
         member_of: None,
     };
 
-    state.schema.alter_role(&s.name, updates, ctx.auth)?;
+    match &**state.ddl_path.load() {
+        DdlPath::Direct { .. } => {
+            state.schema.alter_role(&s.name, updates, ctx.auth)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::AlterRole {
+                name: s.name.clone(),
+                updates,
+            };
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
     Ok(result::encode_void())
 }
 
-fn route_drop_role(
+async fn route_drop_role(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: DropRoleStatement,
@@ -1468,13 +1556,27 @@ fn route_drop_role(
         .schema
         .check_permission(ctx.auth, Permission::Drop, &Resource::Role(s.name.clone()))?;
 
-    state.schema.drop_role(&s.name, ctx.auth)?;
+    match &**state.ddl_path.load() {
+        DdlPath::Direct { .. } => {
+            state.schema.drop_role(&s.name, ctx.auth)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::DropRole(s.name.clone());
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
     Ok(result::encode_void())
 }
 
 // ── GRANT / REVOKE ───────────────────────────────────────────────────────
 
-fn route_grant(
+async fn route_grant(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: GrantStatement,
@@ -1489,11 +1591,29 @@ fn route_grant(
     let resource = ast_resource_to_schema(&s.resource, ctx.current_keyspace)?;
     let perms = parse_permissions(&s.permissions)?;
 
-    state.schema.grant(&s.role, &resource, perms, ctx.auth)?;
+    match &**state.ddl_path.load() {
+        DdlPath::Direct { .. } => {
+            state.schema.grant(&s.role, &resource, perms, ctx.auth)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::Grant(GrantEntry {
+                role: s.role.clone(),
+                resource,
+                permissions: perms,
+            });
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
     Ok(result::encode_void())
 }
 
-fn route_revoke(
+async fn route_revoke(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: RevokeStatement,
@@ -1508,7 +1628,29 @@ fn route_revoke(
     let resource = ast_resource_to_schema(&s.resource, ctx.current_keyspace)?;
     let perms = parse_permissions(&s.permissions)?;
 
-    state.schema.revoke(&s.role, &resource, perms, ctx.auth)?;
+    match &**state.ddl_path.load() {
+        DdlPath::Direct { .. } => {
+            state.schema.revoke(&s.role, &resource, perms, ctx.auth)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            // DdlOperation::Revoke carries one permission at a time; emit one
+            // operation per permission so each can be replicated atomically.
+            for perm in perms {
+                let op = DdlOperation::Revoke {
+                    role: s.role.clone(),
+                    resource: resource.clone(),
+                    permission: perm,
+                };
+                coordinator.coordinate_ddl(op).await?;
+            }
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
     Ok(result::encode_void())
 }
 

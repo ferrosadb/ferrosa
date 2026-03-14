@@ -295,6 +295,162 @@ impl Schema {
         Ok(())
     }
 
+    /// Alter an existing keyspace without auth checks. No-op if keyspace doesn't exist.
+    /// Used for pair mode DDL replication.
+    pub fn alter_keyspace_internal(
+        &self,
+        name: &str,
+        updates: KeyspaceUpdates,
+    ) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let Some(ks) = snap.keyspaces.get_mut(name) else {
+            return Ok(());
+        };
+        if let Some(replication) = updates.replication {
+            ks.replication = replication;
+        }
+        if let Some(durable_writes) = updates.durable_writes {
+            ks.durable_writes = durable_writes;
+        }
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Alter an existing table without auth checks. No-op if table doesn't exist.
+    /// Used for pair mode DDL replication.
+    pub fn alter_table_internal(
+        &self,
+        keyspace: &str,
+        table: &str,
+        updates: TableUpdates,
+    ) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let key = (keyspace.to_string(), table.to_string());
+        let Some(tbl) = snap.tables.get_mut(&key) else {
+            return Ok(());
+        };
+        if let Some(params) = updates.params {
+            tbl.params = params;
+        }
+        for col in updates.add_columns {
+            tbl.columns.insert(col.name.clone(), col);
+        }
+        for col_name in &updates.drop_columns {
+            tbl.columns.shift_remove(col_name);
+        }
+        if let Some(extensions) = updates.extensions {
+            for (k, v) in extensions {
+                tbl.extensions.insert(k, v);
+            }
+        }
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Create a role without auth checks. Idempotent — succeeds silently if role exists.
+    /// Used for pair mode DDL replication.
+    pub fn create_role_internal(&self, role: RoleMetadata) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        if snap.roles.contains_key(&role.name) {
+            return Ok(());
+        }
+        snap.roles.insert(role.name.clone(), role);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Alter an existing role without auth checks. No-op if role doesn't exist.
+    /// The `password` field in `RoleUpdates` is treated as a pre-hashed value
+    /// and stored directly as `salted_hash` (not re-hashed).
+    /// Used for pair mode DDL replication.
+    pub fn alter_role_internal(&self, name: &str, updates: RoleUpdates) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let Some(role) = snap.roles.get_mut(name) else {
+            return Ok(());
+        };
+        if let Some(is_superuser) = updates.is_superuser {
+            role.is_superuser = is_superuser;
+        }
+        if let Some(can_login) = updates.can_login {
+            role.can_login = can_login;
+        }
+        // password field carries the already-hashed value during replication;
+        // store it directly without re-hashing.
+        if let Some(hash) = updates.password {
+            role.salted_hash = Some(hash);
+        }
+        if let Some(member_of) = updates.member_of {
+            role.member_of = member_of;
+        }
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Drop a role without auth checks. Idempotent — succeeds silently if role doesn't exist.
+    /// Also removes all grants associated with the role.
+    /// Used for pair mode DDL replication.
+    pub fn drop_role_internal(&self, name: &str) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        snap.roles.remove(name);
+        snap.grants.remove(name);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Add a grant entry without auth checks.
+    /// If the role already has a grant for the same resource, permissions are merged.
+    /// Used for pair mode DDL replication.
+    pub fn grant_internal(&self, entry: GrantEntry) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let grants = snap.grants.entry(entry.role.clone()).or_default();
+        if let Some(existing) = grants.iter_mut().find(|g| g.resource == entry.resource) {
+            existing
+                .permissions
+                .extend(entry.permissions.iter().copied());
+        } else {
+            grants.push(entry);
+        }
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Remove a specific permission for a role on a resource without auth checks.
+    /// Removes the grant entry entirely if no permissions remain.
+    /// Used for pair mode DDL replication.
+    pub fn revoke_internal(
+        &self,
+        role: &str,
+        resource: &Resource,
+        permission: &Permission,
+    ) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        if let Some(grants) = snap.grants.get_mut(role) {
+            if let Some(entry) = grants.iter_mut().find(|g| &g.resource == resource) {
+                entry.permissions.remove(permission);
+            }
+            grants.retain(|g| !g.permissions.is_empty());
+            if grants.is_empty() {
+                snap.grants.remove(role);
+            }
+        }
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
     /// Return a reference to the inner ArcSwap for lock-free reads.
     ///
     /// For hot-path code that needs repeated lock-free reads (e.g., observers),
@@ -2337,5 +2493,300 @@ mod tests {
                     .map(|k| k.name == "system")
                     .unwrap_or(false)
         );
+    }
+
+    // ---- Internal method tests (pair mode replication) ----
+
+    #[test]
+    fn alter_keyspace_internal_updates_replication() {
+        use crate::metadata::keyspace::{KeyspaceUpdates, ReplicationParams};
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("ak_ks"), &auth)
+            .unwrap();
+
+        let updates = KeyspaceUpdates {
+            replication: Some(ReplicationParams {
+                strategy: "NetworkTopologyStrategy".to_string(),
+                options: [("dc1".to_string(), "3".to_string())].into_iter().collect(),
+            }),
+            durable_writes: Some(false),
+        };
+        schema.alter_keyspace_internal("ak_ks", updates).unwrap();
+
+        let snap = schema.snapshot();
+        let ks = &snap.keyspaces["ak_ks"];
+        assert_eq!(ks.replication.strategy, "NetworkTopologyStrategy");
+        assert!(!ks.durable_writes);
+    }
+
+    #[test]
+    fn alter_keyspace_internal_noop_if_missing() {
+        use crate::metadata::keyspace::KeyspaceUpdates;
+        let schema = test_schema();
+        // Should not error even if keyspace doesn't exist
+        schema
+            .alter_keyspace_internal(
+                "no_such_ks",
+                KeyspaceUpdates {
+                    replication: None,
+                    durable_writes: Some(false),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn alter_table_internal_adds_column() {
+        use crate::metadata::table::TableUpdates;
+        let schema = test_schema();
+        let auth = superuser_auth();
+        schema
+            .create_keyspace(test_keyspace("at_ks"), &auth)
+            .unwrap();
+        schema
+            .create_table(test_table("at_ks", "t1"), &auth)
+            .unwrap();
+
+        let updates = TableUpdates {
+            params: None,
+            add_columns: vec![ColumnMetadata {
+                name: "extra_col".to_string(),
+                kind: ColumnKind::Regular,
+                position: 1,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            }],
+            drop_columns: vec![],
+            extensions: None,
+        };
+        schema.alter_table_internal("at_ks", "t1", updates).unwrap();
+
+        let snap = schema.snapshot();
+        let tbl = &snap.tables[&("at_ks".to_string(), "t1".to_string())];
+        assert!(tbl.columns.contains_key("extra_col"));
+    }
+
+    #[test]
+    fn alter_table_internal_noop_if_missing() {
+        use crate::metadata::table::TableUpdates;
+        let schema = test_schema();
+        schema
+            .alter_table_internal(
+                "no_ks",
+                "no_tbl",
+                TableUpdates {
+                    params: None,
+                    add_columns: vec![],
+                    drop_columns: vec![],
+                    extensions: None,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn create_role_internal_is_idempotent() {
+        let schema = test_schema();
+        let role = RoleMetadata {
+            name: "rep_role".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: Some("$hashed$".to_string()),
+            member_of: HashSet::new(),
+        };
+        schema.create_role_internal(role.clone()).unwrap();
+        schema.create_role_internal(role).unwrap(); // idempotent
+
+        let snap = schema.snapshot();
+        assert!(snap.roles.contains_key("rep_role"));
+        // Only one entry
+        assert_eq!(
+            snap.roles.values().filter(|r| r.name == "rep_role").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn alter_role_internal_stores_hash_directly() {
+        use crate::auth::role::RoleUpdates;
+        let schema = test_schema();
+        let role = RoleMetadata {
+            name: "hash_role".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: HashSet::new(),
+        };
+        schema.create_role_internal(role).unwrap();
+
+        // The password field in RoleUpdates is the pre-hashed value during replication
+        schema
+            .alter_role_internal(
+                "hash_role",
+                RoleUpdates {
+                    is_superuser: Some(true),
+                    password: Some("$2a$04$pre_hashed_value".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let snap = schema.snapshot();
+        let r = &snap.roles["hash_role"];
+        assert!(r.is_superuser);
+        // Stored directly — not re-hashed
+        assert_eq!(r.salted_hash.as_deref(), Some("$2a$04$pre_hashed_value"));
+    }
+
+    #[test]
+    fn alter_role_internal_noop_if_missing() {
+        use crate::auth::role::RoleUpdates;
+        let schema = test_schema();
+        schema
+            .alter_role_internal(
+                "ghost",
+                RoleUpdates {
+                    is_superuser: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn drop_role_internal_is_idempotent() {
+        let schema = test_schema();
+        // Drop a role that doesn't exist — should not error
+        schema.drop_role_internal("nonexistent").unwrap();
+    }
+
+    #[test]
+    fn drop_role_internal_removes_grants() {
+        use crate::auth::permission::{GrantEntry, Permission, Resource};
+        let schema = test_schema();
+        let role = RoleMetadata {
+            name: "bye_role".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: HashSet::new(),
+        };
+        schema.create_role_internal(role).unwrap();
+        schema
+            .grant_internal(GrantEntry {
+                role: "bye_role".to_string(),
+                resource: Resource::AllKeyspaces,
+                permissions: [Permission::Select].into_iter().collect(),
+            })
+            .unwrap();
+        assert!(schema.snapshot().grants.contains_key("bye_role"));
+
+        schema.drop_role_internal("bye_role").unwrap();
+        let snap = schema.snapshot();
+        assert!(!snap.roles.contains_key("bye_role"));
+        assert!(!snap.grants.contains_key("bye_role"));
+    }
+
+    #[test]
+    fn grant_internal_merges_permissions() {
+        use crate::auth::permission::{GrantEntry, Permission, Resource};
+        let schema = test_schema();
+        let role = RoleMetadata {
+            name: "merge_role".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: HashSet::new(),
+        };
+        schema.create_role_internal(role).unwrap();
+
+        schema
+            .grant_internal(GrantEntry {
+                role: "merge_role".to_string(),
+                resource: Resource::AllKeyspaces,
+                permissions: [Permission::Select].into_iter().collect(),
+            })
+            .unwrap();
+        schema
+            .grant_internal(GrantEntry {
+                role: "merge_role".to_string(),
+                resource: Resource::AllKeyspaces,
+                permissions: [Permission::Modify].into_iter().collect(),
+            })
+            .unwrap();
+
+        let snap = schema.snapshot();
+        let grants = &snap.grants["merge_role"];
+        assert_eq!(grants.len(), 1, "same resource should merge");
+        assert!(grants[0].permissions.contains(&Permission::Select));
+        assert!(grants[0].permissions.contains(&Permission::Modify));
+    }
+
+    #[test]
+    fn revoke_internal_removes_single_permission() {
+        use crate::auth::permission::{GrantEntry, Permission, Resource};
+        let schema = test_schema();
+        let role = RoleMetadata {
+            name: "rev_role".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: HashSet::new(),
+        };
+        schema.create_role_internal(role).unwrap();
+        schema
+            .grant_internal(GrantEntry {
+                role: "rev_role".to_string(),
+                resource: Resource::AllKeyspaces,
+                permissions: [Permission::Select, Permission::Modify]
+                    .into_iter()
+                    .collect(),
+            })
+            .unwrap();
+
+        schema
+            .revoke_internal("rev_role", &Resource::AllKeyspaces, &Permission::Select)
+            .unwrap();
+
+        let snap = schema.snapshot();
+        let grants = &snap.grants["rev_role"];
+        assert_eq!(grants.len(), 1);
+        assert!(!grants[0].permissions.contains(&Permission::Select));
+        assert!(grants[0].permissions.contains(&Permission::Modify));
+    }
+
+    #[test]
+    fn revoke_internal_removes_entry_when_empty() {
+        use crate::auth::permission::{GrantEntry, Permission, Resource};
+        let schema = test_schema();
+        let role = RoleMetadata {
+            name: "empty_rev_role".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: HashSet::new(),
+        };
+        schema.create_role_internal(role).unwrap();
+        schema
+            .grant_internal(GrantEntry {
+                role: "empty_rev_role".to_string(),
+                resource: Resource::AllKeyspaces,
+                permissions: [Permission::Select].into_iter().collect(),
+            })
+            .unwrap();
+
+        schema
+            .revoke_internal(
+                "empty_rev_role",
+                &Resource::AllKeyspaces,
+                &Permission::Select,
+            )
+            .unwrap();
+
+        let snap = schema.snapshot();
+        assert!(!snap.grants.contains_key("empty_rev_role"));
     }
 }

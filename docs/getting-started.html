@@ -228,7 +228,8 @@
   <div class="toc">
     <h4>On this page</h4>
     <ul>
-      <li><a href="#prerequisites">Prerequisites</a></li>
+      <li><a href="#install">Install from Package</a></li>
+      <li><a href="#prerequisites">Prerequisites (Build from Source)</a></li>
       <li><a href="#build">Build from Source</a></li>
       <li><a href="#run">Run Ferrosa</a></li>
       <li><a href="#connect">Connect a CQL Driver</a></li>
@@ -238,8 +239,33 @@
     </ul>
   </div>
 
+  <!-- ── Install from Package ── -->
+  <h2 id="install">Install from Package</h2>
+
+  <p>The quickest way to get started. The .deb package includes the ferrosa server, ferrosa-ctl admin tool, systemd service unit, and smoke tests.</p>
+
+  <pre><span class="cm"># Download the latest release</span>
+<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_0.1.0_amd64.deb
+
+<span class="cm"># Install</span>
+<span class="kw">sudo</span> dpkg -i ferrosa_0.1.0_amd64.deb
+
+<span class="cm"># Start the service</span>
+<span class="kw">sudo</span> systemctl start ferrosa
+
+<span class="cm"># Connect with any CQL client</span>
+<span class="kw">cqlsh</span> localhost 9042</pre>
+
+  <p>All releases are available on <a href="https://github.com/ferrosadb/ferrosadb/releases/latest">GitHub Releases</a>.</p>
+
+  <div class="note">
+    <strong>What's in the package:</strong> <code>ferrosa</code> server binary, <code>ferrosa-ctl</code> admin CLI, systemd service unit (<code>ferrosa.service</code>), default configuration, and smoke tests.
+  </div>
+
   <!-- ── Prerequisites ── -->
-  <h2 id="prerequisites">Prerequisites</h2>
+  <h2 id="prerequisites">Prerequisites (Build from Source)</h2>
+
+  <p>If you prefer to build from source instead of using the .deb package:</p>
 
   <ul>
     <li><strong>Rust 1.75+</strong> — install via <a href="https://rustup.rs">rustup.rs</a></li>
@@ -250,9 +276,11 @@
   <!-- ── Build ── -->
   <h2 id="build">Build from Source</h2>
 
-  <pre><span class="cm"># Clone the repository</span>
-<span class="kw">git</span> clone https://github.com/bkearns/ferrosa.git
-<span class="kw">cd</span> ferrosa
+  <pre><span class="cm"># Install build dependencies and download source</span>
+<span class="kw">sudo</span> apt install -y build-essential pkg-config libssl-dev
+<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_0.1.0.orig.tar.gz
+<span class="kw">tar</span> xzf ferrosa_0.1.0.orig.tar.gz
+<span class="kw">cd</span> ferrosadb-0.1.0
 
 <span class="cm"># Build all crates (release mode recommended for performance)</span>
 <span class="kw">cargo</span> build --release
@@ -504,7 +532,7 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
     </div>
     <div class="card">
       <h4>ferrosa-cluster</h4>
-      <p>Raft metadata, token ring, tunable consistency levels. In progress.</p>
+      <p>Pair mode HA with DDL replication, write forwarding, failover, and schema catch-up. Full ring mode in progress.</p>
     </div>
     <div class="card">
       <h4>ferrosa-ctl</h4>
@@ -518,7 +546,7 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
 
   <p>
     For the full architecture spec, see the
-    <a href="https://github.com/bkearns/ferrosa">GitHub repository</a>.
+    <a href="https://github.com/ferrosadb/ferrosadb">GitHub repository</a>.
   </p>
 
 </div>

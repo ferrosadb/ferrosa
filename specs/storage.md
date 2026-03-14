@@ -1,6 +1,6 @@
 # Storage Engine
 
-> Last updated: 2026-03-13 (observability additions)
+> Last updated: 2026-03-14 (index support additions)
 > Status: Approved
 
 ## Overview
@@ -14,6 +14,7 @@ The crate is implemented in three parts, all complete:
 | **A** | Memtable + Flush + Read-path merge | Done | `ferrosa-common`, `ferrosa-sstable`, `arc_swap`, `parking_lot` |
 | **B** | Commit log (WAL, segments, sync, replay) | Done | Part A + `crc32fast` |
 | **C** | Compaction + S3 manager + StorageEngine | Done | Part A + B + `object_store`, `tokio`, `serde`, `bytes` |
+| **D** | Secondary index build pipeline | Done | Part C + `ferrosa-index` |
 
 ## Architecture
 
@@ -101,6 +102,10 @@ ferrosa-storage/
       manager.rs          # UploadManager — tokio task + retry
     manifest.rs           # Manifest — JSON + etag-based CAS
     cache.rs              # LocalCache — LRU eviction with pinning
+    index/
+      tracker.rs          # IndexStateTracker — per-index staleness tracking
+      scheduler.rs        # IndexBuildScheduler — channel-based worker pool
+      virtual_table.rs    # SecondaryIndexesVirtualTable — system_views.secondary_indexes
   tests/
     integration.rs        # Part A module integration tests
     engine_integration.rs # Part C end-to-end tests
@@ -430,6 +435,26 @@ impl StorageEngine {
 - `flush_if_needed()`: flush any table whose memtable exceeds `flush_threshold_bytes`
 - `shutdown()`: flush all tables, stop compaction executor, stop commit log
 - `upload_manager` is `Option` — tests run without S3
+
+### Index Support
+
+The storage engine includes infrastructure for secondary index lifecycle management, coordinating with `ferrosa-index` for build execution.
+
+**IndexStateTracker:**
+
+Tracks per-index build state with transitions: `Current` (up to date), `Building` (async build in progress), `Stale` (needs rebuild), `Failed` (build error, will retry). State is updated atomically. Provides staleness information to the query planner so it can decide whether to use an index or fall back to a full scan.
+
+**IndexBuildScheduler:**
+
+Channel-based worker pool following the same pattern as `CompactionExecutor`. After SSTable flush, the scheduler receives `IndexBuildJob` requests and executes builds asynchronously on a dedicated thread pool. Jobs carry a `BuildPriority` (Normal/High for newly created indexes). Zero write-path impact — indexes are built as companion files to SSTables after flush completes.
+
+**UploadTask::IndexFiles:**
+
+The `UploadTask` enum includes an `IndexFiles` variant so that index companion files are uploaded to S3 alongside SSTable components. The upload manager handles index files with the same retry and integrity semantics as SSTable data.
+
+**SecondaryIndexesVirtualTable:**
+
+Implements `VirtualTable` for `system_views.secondary_indexes`, exposing per-index operational metrics: index name, table, type, state (current/building/stale/failed), entry count, size bytes, build duration, and last build timestamp.
 
 ## Data Flow
 
