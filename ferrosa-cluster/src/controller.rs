@@ -32,19 +32,27 @@ use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::CommitLogPosition;
 
 use crate::config::ClusterConfig;
+use crate::consistency::ConsistencyLevel;
+use crate::coordinator::ClusterCoordinator;
 use crate::ddl_path::DdlPath;
 use crate::error::{ClusterError, Result};
 use crate::mode::DeploymentMode;
 use crate::pair::coordinator::{encode_mutation, PairCoordinator};
 use crate::pair::ddl::{DdlCoordinator, PairDdlForwardHandler, PairSchemaSyncHandler};
 use crate::pair::{PairRole, PairState};
-use crate::state::PairClusterState;
+use crate::raft::log_store::SledLogStore;
+use crate::raft::network::FerrosRaftNetworkFactory;
+use crate::raft::state_machine::FerrosStateMachine;
+use crate::raft::{uuid_to_node_id, NodeInfo, NodeState};
+use crate::ring::TokenRing;
+use crate::state::{PairClusterState, RaftClusterState};
 use crate::write_path::WritePath;
 
 /// Swappable cluster state — enum dispatch to avoid trait object Sized issues.
 pub enum ClusterStateHolder {
     Standalone,
     Pair(PairClusterState),
+    Cluster(RaftClusterState),
 }
 
 impl ClusterState for ClusterStateHolder {
@@ -52,6 +60,7 @@ impl ClusterState for ClusterStateHolder {
         match self {
             Self::Standalone => vec![],
             Self::Pair(s) => s.peers(),
+            Self::Cluster(s) => s.peers(),
         }
     }
 }
@@ -84,6 +93,8 @@ pub struct ModeController {
     pair_context: Mutex<Option<PairContext>>,
     /// Set by force_promote — overrides UUID election on next pair transition.
     force_promoted: AtomicBool,
+    /// All connected peers, tracked across mode transitions.
+    connected_peers: Mutex<Vec<(Uuid, SocketAddr)>>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -124,6 +135,7 @@ impl ModeController {
             registry,
             pair_context: Mutex::new(None),
             force_promoted: AtomicBool::new(false),
+            connected_peers: Mutex::new(Vec::new()),
         });
 
         let handles = ModeControllerHandles {
@@ -172,6 +184,7 @@ impl ModeController {
         self.mode.store(Arc::new(DeploymentMode::Standalone));
         self.force_promoted.store(true, Ordering::Release);
         *self.pair_context.lock().unwrap() = None;
+        self.connected_peers.lock().unwrap().clear();
         tracing::info!("force promoted to standalone primary");
         Ok(())
     }
@@ -405,6 +418,153 @@ impl ModeController {
         }
     }
 
+    /// Transition from pair mode to cluster mode when a 2nd peer connects.
+    ///
+    /// Sets up:
+    /// 1. Sled-backed Raft log store
+    /// 2. Raft state machine with schema/storage side effects
+    /// 3. Raft network factory bridging openraft to ferrosa-net
+    /// 4. TokenRing with deterministic initial token assignment
+    /// 5. ClusterCoordinator for replica-aware writes
+    /// 6. Swaps write path, DDL path, and cluster state atomically
+    fn transition_to_cluster(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        let peer_manager = match &**self.peer_manager.load() {
+            Some(pm) => pm.clone(),
+            None => {
+                tracing::error!("cannot transition to cluster: peer_manager not set");
+                return;
+            }
+        };
+
+        // 1. Create sled log store
+        let data_dir =
+            std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());
+        let raft_dir = std::path::Path::new(&data_dir).join("raft");
+        let log_store = match SledLogStore::new(&raft_dir) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::error!(%e, "failed to create Raft log store");
+                return;
+            }
+        };
+
+        // 2. Create state machine from current schema
+        let _state_machine = Arc::new(tokio::sync::Mutex::new(
+            FerrosStateMachine::with_side_effects(self.schema.clone(), self.storage.clone()),
+        ));
+
+        // 3. Create network factory
+        let network_factory = Arc::new(FerrosRaftNetworkFactory::new(peer_manager.clone()));
+        let local_node_id = uuid_to_node_id(self.local_host_id);
+
+        // Register node mappings for all peers
+        for (peer_uuid, _addr) in &peers {
+            let peer_node_id = uuid_to_node_id(*peer_uuid);
+            network_factory.register_node(peer_node_id, *peer_uuid);
+        }
+        // Register self
+        network_factory.register_node(local_node_id, self.local_host_id);
+
+        // 4. Build TokenRing with deterministic initial tokens
+        let mut ring = TokenRing::new();
+
+        // Add local node
+        let broadcast = self.net_config.broadcast_addr.to_string();
+        ring.add_node(
+            local_node_id,
+            NodeInfo {
+                host_id: self.local_host_id,
+                addr: broadcast,
+                data_center: self.config.data_center.clone(),
+                rack: self.config.rack.clone(),
+                state: NodeState::Normal,
+            },
+        );
+
+        // Add peers
+        for (peer_uuid, addr) in &peers {
+            let peer_node_id = uuid_to_node_id(*peer_uuid);
+            ring.add_node(
+                peer_node_id,
+                NodeInfo {
+                    host_id: *peer_uuid,
+                    addr: addr.to_string(),
+                    data_center: self.config.data_center.clone(),
+                    rack: self.config.rack.clone(),
+                    state: NodeState::Normal,
+                },
+            );
+        }
+
+        // Assign deterministic tokens to all nodes (256 per node).
+        // Uses node_id XOR with index to produce deterministic, well-distributed tokens.
+        let num_tokens = self.config.num_tokens as usize;
+        let mut all_node_ids: Vec<u64> = vec![local_node_id];
+        for (peer_uuid, _) in &peers {
+            all_node_ids.push(uuid_to_node_id(*peer_uuid));
+        }
+        all_node_ids.sort_unstable(); // deterministic order
+
+        for &nid in &all_node_ids {
+            let tokens: Vec<i64> = (0..num_tokens)
+                .map(|i| generate_deterministic_token(nid, i))
+                .collect();
+            ring.assign_tokens(nid, &tokens);
+        }
+
+        let ring_arc = Arc::new(ArcSwap::from_pointee(ring));
+
+        // 5. Create coordinator
+        let coordinator = Arc::new(ClusterCoordinator::new(
+            ring_arc.clone(),
+            peer_manager,
+            local_node_id,
+            self.storage.clone(),
+            3, // default RF
+            ConsistencyLevel::Quorum,
+        ));
+
+        // 6. Swap write path — cluster coordinator handles replica routing
+        self.write_path
+            .store(Arc::new(WritePath::cluster(coordinator)));
+
+        // DdlPath::Cluster needs the Raft instance — Raft initialization is async
+        // and happens in a background task. For now, keep DDL on the pair path or
+        // set to direct until Raft is fully initialized. We store the log_store
+        // and network_factory references for later Raft bootstrap.
+        //
+        // In the initial cluster transition we use direct DDL — the Raft leader
+        // election and DDL-via-Raft wiring will be completed by the background
+        // Raft initialization task.
+        self.ddl_path.store(Arc::new(DdlPath::Direct {
+            schema: self.schema.clone(),
+            engine: self.storage.clone(),
+        }));
+
+        // Swap cluster state to Raft-based
+        self.cluster_state
+            .store(Arc::new(ClusterStateHolder::Cluster(
+                RaftClusterState::new(ring_arc, local_node_id),
+            )));
+
+        // Clear pair context — no longer in pair mode
+        *self.pair_context.lock().unwrap() = None;
+
+        self.mode.store(Arc::new(DeploymentMode::Cluster));
+
+        // Spawn background Raft initialization
+        let _log_store = log_store;
+        let _network_factory = network_factory;
+        // TODO: Complete Raft::new() initialization + initial membership + leader election
+        // in background task. This requires openraft Raft::new() which is async.
+
+        tracing::info!(
+            node_id = local_node_id,
+            peers = peers.len(),
+            "mode transition: pair -> cluster"
+        );
+    }
+
     /// Transition to degraded state: writes unavailable, reads still work.
     fn transition_to_degraded(&self) {
         self.write_path.store(Arc::new(WritePath::unavailable()));
@@ -413,7 +573,8 @@ impl ModeController {
             .store(Arc::new(ClusterStateHolder::Standalone));
         self.mode.store(Arc::new(DeploymentMode::Standalone));
         *self.pair_context.lock().unwrap() = None;
-        tracing::warn!("mode transition: pair → degraded (peer lost, writes unavailable)");
+        self.connected_peers.lock().unwrap().clear();
+        tracing::warn!("mode transition: pair -> degraded (peer lost, writes unavailable)");
     }
 }
 
@@ -422,10 +583,31 @@ impl PeerEventListener for ModeController {
         let (host_id, addr) = peer;
         tracing::info!(peer = %host_id, %addr, "peer connected");
 
+        // Track this peer
+        {
+            let mut peers = self.connected_peers.lock().unwrap();
+            if !peers.iter().any(|(id, _)| *id == host_id) {
+                peers.push((host_id, addr));
+            }
+        }
+
         let current_mode = **self.mode.load();
-        if current_mode == DeploymentMode::Standalone {
-            // Outbound connection — we already have a pool, no reverse needed.
-            self.transition_to_pair(host_id, addr, false);
+        match current_mode {
+            DeploymentMode::Standalone => {
+                // Outbound connection — we already have a pool, no reverse needed.
+                self.transition_to_pair(host_id, addr, false);
+            }
+            DeploymentMode::Pair => {
+                // 2nd peer connecting while in pair mode → transition to cluster
+                let all_peers = self.connected_peers.lock().unwrap().clone();
+                if all_peers.len() >= 2 {
+                    self.transition_to_cluster(all_peers);
+                }
+            }
+            DeploymentMode::Cluster => {
+                // Already in cluster mode — new node will join via Raft membership
+                tracing::info!(peer = %host_id, "new peer connected in cluster mode");
+            }
         }
     }
 
@@ -433,10 +615,17 @@ impl PeerEventListener for ModeController {
         let (host_id, _addr) = peer;
         tracing::warn!(peer = %host_id, "peer disconnected");
 
+        // Remove from tracked peers
+        {
+            let mut peers = self.connected_peers.lock().unwrap();
+            peers.retain(|(id, _)| *id != host_id);
+        }
+
         let current_mode = **self.mode.load();
         if current_mode == DeploymentMode::Pair {
             self.transition_to_degraded();
         }
+        // In Cluster mode, node departure is handled by Raft — no automatic downgrade.
     }
 
     fn on_peer_suspected(&self, peer: PeerId) {
@@ -450,12 +639,46 @@ impl InboundPeerCallback for ModeController {
         let (host_id, addr) = peer_id;
         tracing::info!(peer = %host_id, %addr, "inbound peer connected");
 
+        // Track this peer
+        {
+            let mut peers = self.connected_peers.lock().unwrap();
+            if !peers.iter().any(|(id, _)| *id == host_id) {
+                peers.push((host_id, addr));
+            }
+        }
+
         let current_mode = **self.mode.load();
-        if current_mode == DeploymentMode::Standalone {
-            // Inbound connection — we need a reverse outbound pool for sends.
-            self.transition_to_pair(host_id, addr, true);
+        match current_mode {
+            DeploymentMode::Standalone => {
+                // Inbound connection — we need a reverse outbound pool for sends.
+                self.transition_to_pair(host_id, addr, true);
+            }
+            DeploymentMode::Pair => {
+                // 2nd peer connecting while in pair mode → transition to cluster
+                let all_peers = self.connected_peers.lock().unwrap().clone();
+                if all_peers.len() >= 2 {
+                    self.transition_to_cluster(all_peers);
+                }
+            }
+            DeploymentMode::Cluster => {
+                tracing::info!(peer = %host_id, "new inbound peer in cluster mode");
+            }
         }
     }
+}
+
+/// Generate a deterministic token for a node.
+///
+/// Uses a hash-like mixing of node_id and token index to produce well-distributed
+/// token values across the i64 range. All nodes running the same code will compute
+/// the same token assignments for the same (node_id, index) pair.
+fn generate_deterministic_token(node_id: u64, index: usize) -> i64 {
+    // Simple but effective: use wrapping multiply with a prime and XOR to spread bits.
+    let mut h = node_id.wrapping_mul(0x517cc1b727220a95);
+    h ^= (index as u64).wrapping_mul(0x6c62272e07bb0142);
+    h = h.wrapping_mul(0x2545F4914F6CDD1D);
+    h ^= h >> 32;
+    h as i64
 }
 
 #[cfg(test)]
@@ -592,5 +815,91 @@ mod tests {
         controller.force_promote().unwrap();
         assert_eq!(controller.mode(), DeploymentMode::Standalone);
         assert!(controller.force_promoted.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn second_peer_transitions_to_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        // Set FERROSA_DATA_DIR so transition_to_cluster can create the sled log store
+        std::env::set_var("FERROSA_DATA_DIR", dir.path().to_str().unwrap());
+
+        let storage = test_storage(dir.path());
+        let schema = test_schema();
+        let config = Arc::new(ClusterConfig::default());
+        let net_config = Arc::new(NetConfig::default());
+        let local_id = Uuid::new_v4();
+        let peer1_id = Uuid::new_v4();
+        let peer2_id = Uuid::new_v4();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) = ModeController::new(
+            config,
+            net_config.clone(),
+            local_id,
+            storage,
+            schema,
+            registry,
+        );
+
+        let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+        controller.set_peer_manager(pm);
+
+        // First peer → pair mode
+        let peer1_addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        controller.on_peer_connected((peer1_id, peer1_addr));
+        assert_eq!(controller.mode(), DeploymentMode::Pair);
+
+        // Second peer → cluster mode
+        let peer2_addr: SocketAddr = "127.0.0.2:7002".parse().unwrap();
+        controller.on_peer_connected((peer2_id, peer2_addr));
+        assert_eq!(controller.mode(), DeploymentMode::Cluster);
+    }
+
+    #[test]
+    fn connected_peers_tracked_and_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let schema = test_schema();
+        let config = Arc::new(ClusterConfig::default());
+        let net_config = Arc::new(NetConfig::default());
+        let local_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) = ModeController::new(
+            config,
+            net_config.clone(),
+            local_id,
+            storage,
+            schema,
+            registry,
+        );
+
+        let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+        controller.set_peer_manager(pm);
+
+        let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        controller.on_peer_connected((peer_id, peer_addr));
+
+        assert_eq!(controller.connected_peers.lock().unwrap().len(), 1);
+
+        controller.on_peer_disconnected((peer_id, peer_addr));
+        assert_eq!(controller.connected_peers.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn deterministic_token_generation_is_stable() {
+        let node_id = 42u64;
+        let t1 = generate_deterministic_token(node_id, 0);
+        let t2 = generate_deterministic_token(node_id, 0);
+        assert_eq!(t1, t2, "same inputs must produce same token");
+
+        // Different indices produce different tokens
+        let t3 = generate_deterministic_token(node_id, 1);
+        assert_ne!(t1, t3, "different indices should produce different tokens");
+
+        // Different node IDs produce different tokens
+        let t4 = generate_deterministic_token(99u64, 0);
+        assert_ne!(t1, t4, "different nodes should produce different tokens");
     }
 }

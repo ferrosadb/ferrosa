@@ -19,5 +19,5 @@ pub use ddl_path::DdlPath;
 pub use error::{ClusterError, Result};
 pub use mode::DeploymentMode;
 pub use pair::{PairCoordinator, PairNode, PairRole};
-pub use state::{PairClusterState, SingleNodeClusterState};
+pub use state::{PairClusterState, RaftClusterState, SingleNodeClusterState};
 pub use write_path::WritePath;

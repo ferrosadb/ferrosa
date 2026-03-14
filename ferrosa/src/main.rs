@@ -100,6 +100,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     registry.register(ferrosa_net::codec::MsgType::PairCatchUp, catchup_handler);
 
+    // Register MutationForwardHandler for cluster mode write forwarding
+    let mutation_fwd_handler = Arc::new(ferrosa_cluster::MutationForwardHandler::new(
+        storage.clone(),
+    ));
+    registry.register(
+        ferrosa_net::codec::MsgType::MutationForward,
+        mutation_fwd_handler,
+    );
+
     let (mode_controller, handles) = ferrosa_cluster::ModeController::new(
         cluster_config,
         net_config.clone(),
