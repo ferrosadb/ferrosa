@@ -4,6 +4,7 @@ members = [
     "ferrosa",
     "ferrosa-common",
     "ferrosa-ctl",
+    "ferrosa-cluster",
     "ferrosa-cql",
     "ferrosa-graph",
     "ferrosa-net",

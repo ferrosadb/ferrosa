@@ -1,0 +1,108 @@
+use std::path::PathBuf;
+
+use crate::consistency::ConsistencyLevel;
+use crate::mode::DeploymentMode;
+
+/// Cluster configuration. Parsed from `FERROSA_*` environment variables.
+#[derive(Debug, Clone)]
+pub struct ClusterConfig {
+    /// Forced deployment mode. `None` means auto-detect from peer count.
+    pub mode: Option<DeploymentMode>,
+    /// Cluster name — must match across all nodes.
+    pub cluster_name: String,
+    /// This node's data center.
+    pub data_center: String,
+    /// This node's rack within the data center.
+    pub rack: String,
+    /// Number of virtual token ranges per node.
+    pub num_tokens: u32,
+    /// Default consistency level for queries that don't specify one.
+    pub default_cl: ConsistencyLevel,
+    /// Hinted handoff storage directory.
+    pub hinted_handoff_dir: PathBuf,
+    /// Maximum hint storage per peer in megabytes.
+    pub hinted_handoff_max_mb: u64,
+    /// Allow unapproved nodes to join (true for development).
+    pub auto_join: bool,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            cluster_name: "ferrosa".to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            num_tokens: 256,
+            default_cl: ConsistencyLevel::Quorum,
+            hinted_handoff_dir: PathBuf::from("data/hints"),
+            hinted_handoff_max_mb: 1024,
+            auto_join: false,
+        }
+    }
+}
+
+impl ClusterConfig {
+    /// Parse configuration from environment variables.
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+
+        if let Ok(mode) = std::env::var("FERROSA_CLUSTER_MODE") {
+            config.mode = match mode.to_lowercase().as_str() {
+                "standalone" => Some(DeploymentMode::Standalone),
+                "pair" => Some(DeploymentMode::Pair),
+                "cluster" => Some(DeploymentMode::Cluster),
+                _ => None,
+            };
+        }
+        if let Ok(name) = std::env::var("FERROSA_CLUSTER_NAME") {
+            config.cluster_name = name;
+        }
+        if let Ok(dc) = std::env::var("FERROSA_DATA_CENTER") {
+            config.data_center = dc;
+        }
+        if let Ok(rack) = std::env::var("FERROSA_RACK") {
+            config.rack = rack;
+        }
+        if let Ok(tokens) = std::env::var("FERROSA_NUM_TOKENS") {
+            if let Ok(n) = tokens.parse() {
+                config.num_tokens = n;
+            }
+        }
+        if let Ok(cl) = std::env::var("FERROSA_DEFAULT_CL") {
+            if let Some(parsed) = ConsistencyLevel::from_str(&cl) {
+                config.default_cl = parsed;
+            }
+        }
+        if let Ok(dir) = std::env::var("FERROSA_HINTED_HANDOFF_DIR") {
+            config.hinted_handoff_dir = PathBuf::from(dir);
+        }
+        if let Ok(max) = std::env::var("FERROSA_HINTED_HANDOFF_MAX_MB") {
+            if let Ok(n) = max.parse() {
+                config.hinted_handoff_max_mb = n;
+            }
+        }
+        if let Ok(auto) = std::env::var("FERROSA_AUTO_JOIN") {
+            config.auto_join = auto == "true" || auto == "1";
+        }
+
+        config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_values() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.cluster_name, "ferrosa");
+        assert_eq!(config.data_center, "dc1");
+        assert_eq!(config.rack, "rack1");
+        assert_eq!(config.num_tokens, 256);
+        assert_eq!(config.default_cl, ConsistencyLevel::Quorum);
+        assert_eq!(config.hinted_handoff_max_mb, 1024);
+        assert!(!config.auto_join);
+    }
+}
