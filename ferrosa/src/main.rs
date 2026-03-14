@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 9. Web observability console
     let vt_registry = Arc::new(ferrosa_schema::VirtualTableRegistry::new());
     let web_config = web::WebConfig::from_env();
-    let web_addr = web::start_web_server(&web_config, vt_registry).await?;
+    let web_addr = web::start_web_server(&web_config, vt_registry, mode_controller.clone()).await?;
     tracing::info!(%web_addr, "web console listening");
 
     // 10. Graph engine (check FERROSA_GRAPH_ENABLED)

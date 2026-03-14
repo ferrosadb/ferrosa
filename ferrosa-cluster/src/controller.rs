@@ -3,24 +3,36 @@
 //! The controller implements [`PeerEventListener`] and swaps the active
 //! [`WritePath`] and [`ClusterStateHolder`] atomically when the deployment mode
 //! changes (standalone → pair → cluster).
+//!
+//! Failover lifecycle:
+//!   1. Pair mode active, both nodes connected
+//!   2. Peer disconnects → writes become unavailable (degraded)
+//!   3. Operator calls `force_promote()` → standalone with direct writes
+//!   4. Peer reconnects → auto re-pair, promoted node stays primary
+//!   5. Operator can `switchover()` to swap roles
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use uuid::Uuid;
 
-use ferrosa_net::codec::MsgType;
+use ferrosa_net::codec::{Lane, MsgType};
 use ferrosa_net::config::NetConfig;
+use ferrosa_net::message::Message;
 use ferrosa_net::peer::{PeerEventListener, PeerManager};
+use ferrosa_net::pool::PriorityPool;
 use ferrosa_net::rpc::handler::PeerId;
 use ferrosa_net::rpc::{HandlerRegistry, InboundPeerCallback};
 use ferrosa_schema::system::peers::{ClusterState, PeerInfo};
 use ferrosa_storage::engine::StorageEngine;
+use ferrosa_storage::CommitLogPosition;
 
 use crate::config::ClusterConfig;
+use crate::error::{ClusterError, Result};
 use crate::mode::DeploymentMode;
-use crate::pair::coordinator::PairCoordinator;
+use crate::pair::coordinator::{encode_mutation, PairCoordinator};
 use crate::pair::{PairRole, PairState};
 use crate::state::PairClusterState;
 use crate::write_path::WritePath;
@@ -40,6 +52,14 @@ impl ClusterState for ClusterStateHolder {
     }
 }
 
+/// Pair mode context stored across transitions.
+struct PairContext {
+    role: Arc<ArcSwap<PairRole>>,
+    peer_host_id: Uuid,
+    #[allow(dead_code)]
+    peer_addr: SocketAddr,
+}
+
 /// Manages deployment mode transitions at runtime.
 ///
 /// Created at startup with standalone mode. When peers connect/disconnect,
@@ -50,11 +70,14 @@ pub struct ModeController {
     cluster_state: Arc<ArcSwap<ClusterStateHolder>>,
     storage: Arc<StorageEngine>,
     config: Arc<ClusterConfig>,
-    #[allow(dead_code)]
     net_config: Arc<NetConfig>,
     local_host_id: Uuid,
     peer_manager: ArcSwap<Option<Arc<PeerManager>>>,
     registry: Arc<HandlerRegistry>,
+    /// Stored during pair mode for switchover/promote operations.
+    pair_context: Mutex<Option<PairContext>>,
+    /// Set by force_promote — overrides UUID election on next pair transition.
+    force_promoted: AtomicBool,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -85,6 +108,8 @@ impl ModeController {
             local_host_id,
             peer_manager: ArcSwap::from_pointee(None),
             registry,
+            pair_context: Mutex::new(None),
+            force_promoted: AtomicBool::new(false),
         });
 
         let handles = ModeControllerHandles {
@@ -105,7 +130,62 @@ impl ModeController {
         **self.mode.load()
     }
 
-    fn transition_to_pair(&self, peer_host_id: Uuid, peer_addr: SocketAddr) {
+    /// Get current pair role, if in pair mode.
+    pub fn role(&self) -> Option<PairRole> {
+        let ctx = self.pair_context.lock().unwrap();
+        ctx.as_ref().map(|c| **c.role.load())
+    }
+
+    /// Get local host_id.
+    pub fn host_id(&self) -> Uuid {
+        self.local_host_id
+    }
+
+    /// Force-promote this node to standalone primary.
+    ///
+    /// Use when the peer is unreachable and the operator wants to resume writes.
+    /// Subsequent peer reconnection will auto re-pair with this node as primary.
+    pub fn force_promote(&self) -> Result<()> {
+        self.write_path
+            .store(Arc::new(WritePath::direct(self.storage.clone())));
+        self.cluster_state
+            .store(Arc::new(ClusterStateHolder::Standalone));
+        self.mode.store(Arc::new(DeploymentMode::Standalone));
+        self.force_promoted.store(true, Ordering::Release);
+        *self.pair_context.lock().unwrap() = None;
+        tracing::info!("force promoted to standalone primary");
+        Ok(())
+    }
+
+    /// Initiate switchover: swap primary/secondary roles.
+    ///
+    /// Must be called on the current primary. Both nodes must be connected.
+    pub async fn switchover(&self) -> Result<()> {
+        let (role_arc, peer_host_id) = {
+            let ctx = self.pair_context.lock().unwrap();
+            let ctx = ctx
+                .as_ref()
+                .ok_or(ClusterError::Internal("not in pair mode".into()))?;
+            (ctx.role.clone(), ctx.peer_host_id)
+        };
+
+        let peer_manager = match &**self.peer_manager.load() {
+            Some(pm) => pm.clone(),
+            None => {
+                return Err(ClusterError::Internal("peer_manager not set".into()));
+            }
+        };
+
+        crate::pair::switchover::initiate_switchover(
+            &peer_manager,
+            self.local_host_id,
+            peer_host_id,
+            &role_arc,
+        )
+        .await
+    }
+
+    fn transition_to_pair(&self, peer_host_id: Uuid, peer_addr: SocketAddr, need_reverse: bool) {
         let peer_manager = match &**self.peer_manager.load() {
             Some(pm) => pm.clone(),
             None => {
@@ -114,14 +194,20 @@ impl ModeController {
             }
         };
 
-        let role = PairRole::elect(self.local_host_id, peer_host_id);
+        // If this node was force-promoted, override UUID election — stay primary.
+        let was_promoted = self.force_promoted.swap(false, Ordering::AcqRel);
+        let role = if was_promoted {
+            PairRole::Primary
+        } else {
+            PairRole::elect(self.local_host_id, peer_host_id)
+        };
         let role_arc = Arc::new(ArcSwap::from_pointee(role));
 
         let coordinator = Arc::new(PairCoordinator::new(
             role_arc.clone(),
             peer_host_id,
             self.storage.clone(),
-            peer_manager,
+            peer_manager.clone(),
         ));
 
         // Register pair mode RPC handlers dynamically
@@ -134,7 +220,7 @@ impl ModeController {
 
         let role_swap_handler = Arc::new(crate::pair::switchover::RoleSwapHandler::new(
             self.local_host_id,
-            role_arc,
+            role_arc.clone(),
         ));
         self.registry.register(MsgType::RoleSwap, role_swap_handler);
 
@@ -152,21 +238,107 @@ impl ModeController {
                 pair_state,
             ))));
 
+        // Store pair context for switchover/promote
+        *self.pair_context.lock().unwrap() = Some(PairContext {
+            role: role_arc,
+            peer_host_id,
+            peer_addr,
+        });
+
         self.mode.store(Arc::new(DeploymentMode::Pair));
         tracing::info!(
             %role,
             peer = %peer_host_id,
+            promoted = was_promoted,
             "mode transition: standalone → pair"
         );
+
+        // When triggered by an inbound peer connection, our peer_manager doesn't
+        // have the peer registered — create a reverse outbound pool for RPC sends.
+        if need_reverse {
+            let pm = peer_manager.clone();
+            let net_cfg = self.net_config.clone();
+            let local_id = self.local_host_id;
+            let internode_port = self.net_config.bind_addr.port();
+            let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
+            tokio::spawn(async move {
+                // Small delay to let peer's RPC server be ready.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                match PriorityPool::connect(net_cfg, local_id, reverse_addr).await {
+                    Ok(pool) => {
+                        pm.add_peer((peer_host_id, reverse_addr), pool).await;
+                        tracing::info!(%peer_host_id, %reverse_addr, "reverse connection established");
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "reverse connection to peer failed");
+                    }
+                }
+            });
+        }
+
+        // After force-promoted re-pairing, correct the peer's role and replay data.
+        if was_promoted {
+            let local_id = self.local_host_id;
+            let pm = peer_manager;
+            let storage = self.storage.clone();
+            tokio::spawn(async move {
+                // Wait for reverse connection + peer pair transition + handler registration.
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+                // Tell peer to become secondary.
+                match pm
+                    .send(
+                        peer_host_id,
+                        Message::RoleSwap {
+                            new_primary: local_id,
+                            new_secondary: peer_host_id,
+                        },
+                        Lane::Raft,
+                    )
+                    .await
+                {
+                    Ok(_) => tracing::info!("sent role correction to rejoined peer"),
+                    Err(e) => {
+                        tracing::warn!(%e, "failed to send role correction to peer");
+                        return;
+                    }
+                }
+
+                // Replay recent data to bring peer up to date.
+                let position = CommitLogPosition {
+                    segment_id: 0,
+                    offset: 0,
+                };
+                match storage.replay_from(position) {
+                    Ok(mutations) if !mutations.is_empty() => {
+                        tracing::info!(count = mutations.len(), "replaying data to rejoined peer");
+                        for mutation in &mutations {
+                            let body = encode_mutation(mutation);
+                            if let Err(e) = pm
+                                .send(peer_host_id, Message::PairWriteForward(body), Lane::Data)
+                                .await
+                            {
+                                tracing::warn!(%e, "catch-up replay send failed");
+                                break;
+                            }
+                        }
+                        tracing::info!("catch-up replay complete");
+                    }
+                    Ok(_) => tracing::info!("no data to replay for catch-up"),
+                    Err(e) => tracing::warn!(%e, "catch-up replay_from failed"),
+                }
+            });
+        }
     }
 
-    fn transition_to_standalone(&self) {
-        self.write_path
-            .store(Arc::new(WritePath::direct(self.storage.clone())));
+    /// Transition to degraded state: writes unavailable, reads still work.
+    fn transition_to_degraded(&self) {
+        self.write_path.store(Arc::new(WritePath::unavailable()));
         self.cluster_state
             .store(Arc::new(ClusterStateHolder::Standalone));
         self.mode.store(Arc::new(DeploymentMode::Standalone));
-        tracing::warn!("mode transition: pair → standalone (peer lost)");
+        *self.pair_context.lock().unwrap() = None;
+        tracing::warn!("mode transition: pair → degraded (peer lost, writes unavailable)");
     }
 }
 
@@ -177,7 +349,8 @@ impl PeerEventListener for ModeController {
 
         let current_mode = **self.mode.load();
         if current_mode == DeploymentMode::Standalone {
-            self.transition_to_pair(host_id, addr);
+            // Outbound connection — we already have a pool, no reverse needed.
+            self.transition_to_pair(host_id, addr, false);
         }
     }
 
@@ -187,7 +360,7 @@ impl PeerEventListener for ModeController {
 
         let current_mode = **self.mode.load();
         if current_mode == DeploymentMode::Pair {
-            self.transition_to_standalone();
+            self.transition_to_degraded();
         }
     }
 
@@ -204,7 +377,8 @@ impl InboundPeerCallback for ModeController {
 
         let current_mode = **self.mode.load();
         if current_mode == DeploymentMode::Standalone {
-            self.transition_to_pair(host_id, addr);
+            // Inbound connection — we need a reverse outbound pool for sends.
+            self.transition_to_pair(host_id, addr, true);
         }
     }
 }
@@ -270,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_disconnect_transitions_to_standalone() {
+    fn peer_disconnect_transitions_to_degraded() {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
         let config = Arc::new(ClusterConfig::default());
@@ -291,6 +465,24 @@ mod tests {
         assert_eq!(controller.mode(), DeploymentMode::Pair);
 
         controller.on_peer_disconnected((peer_id, peer_addr));
+        // Degraded transitions to standalone mode with unavailable writes
         assert_eq!(controller.mode(), DeploymentMode::Standalone);
+    }
+
+    #[test]
+    fn force_promote_sets_direct_write_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let config = Arc::new(ClusterConfig::default());
+        let net_config = Arc::new(NetConfig::default());
+        let local_id = Uuid::new_v4();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) =
+            ModeController::new(config, net_config, local_id, storage, registry);
+
+        controller.force_promote().unwrap();
+        assert_eq!(controller.mode(), DeploymentMode::Standalone);
+        assert!(controller.force_promoted.load(Ordering::Acquire));
     }
 }

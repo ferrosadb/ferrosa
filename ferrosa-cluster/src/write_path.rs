@@ -26,6 +26,8 @@ pub enum WritePath {
     Direct(Arc<StorageEngine>),
     /// Pair mode: delegates to PairCoordinator.
     Pair(Arc<PairCoordinator>),
+    /// Degraded: peer lost, writes rejected until operator promotes.
+    Unavailable,
 }
 
 impl WritePath {
@@ -37,6 +39,11 @@ impl WritePath {
     /// Create a pair mode write path.
     pub fn pair(coordinator: Arc<PairCoordinator>) -> Self {
         Self::Pair(coordinator)
+    }
+
+    /// Create an unavailable write path (degraded pair mode).
+    pub fn unavailable() -> Self {
+        Self::Unavailable
     }
 
     /// Write a row. In standalone mode this goes directly to storage.
@@ -51,6 +58,9 @@ impl WritePath {
     ) -> ferrosa_common::Result<()> {
         match self {
             Self::Direct(engine) => engine.write(table_id, key, row, timestamp),
+            Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
+            )),
             Self::Pair(coordinator) => {
                 let mutation = Mutation {
                     keyspace: table_id.keyspace.clone(),

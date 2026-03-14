@@ -85,17 +85,23 @@ impl RpcHandler for RoleSwapHandler {
             _ => return None,
         };
 
-        if new_primary != self.local_host_id {
+        // Determine our new role based on the assignment.
+        let new_role = if new_primary == self.local_host_id {
+            PairRole::Primary
+        } else if new_secondary == self.local_host_id {
+            PairRole::Secondary
+        } else {
             tracing::error!(
-                "role swap: expected new_primary={}, got {}",
+                "role swap: neither primary={} nor secondary={} matches local={}",
+                new_primary,
+                new_secondary,
                 self.local_host_id,
-                new_primary
             );
             return None;
-        }
+        };
 
-        self.role.store(Arc::new(PairRole::Primary));
-        tracing::info!("switchover complete: promoted to primary");
+        self.role.store(Arc::new(new_role));
+        tracing::info!(%new_role, "role swap complete");
 
         Some(Message::RoleSwap {
             new_primary,

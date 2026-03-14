@@ -73,6 +73,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "9043:9042"
+      - "9091:9090"
     environment:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
