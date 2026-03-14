@@ -361,6 +361,23 @@ impl CommitLog {
         Ok(mutations)
     }
 
+    /// Force-syncs the active segment to disk.
+    ///
+    /// Waits for all in-flight writers to complete, then flushes the
+    /// segment buffer to disk. Used before catch-up replay to ensure
+    /// all mutations are readable.
+    pub fn force_sync(&self) -> ferrosa_common::Result<()> {
+        let segment = self.active.load();
+        // Write an EOF sync marker so SegmentReader can follow the chain.
+        if let Some(offset) = segment.allocate(segment::SYNC_MARKER_SIZE) {
+            segment.write_sync_marker_at(offset, 0);
+        }
+        // Full rewrite: write_sync_marker_at updates the PREVIOUS marker
+        // in the buffer (at an earlier offset). Incremental flush wouldn't
+        // capture that update, so we rewrite the entire file.
+        segment.force_full_flush()
+    }
+
     /// Shuts down the commit log cleanly.
     ///
     /// Stops the sync strategy and flushes the active segment to disk.

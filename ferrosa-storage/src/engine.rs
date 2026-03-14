@@ -551,6 +551,14 @@ impl StorageEngine {
         self.commit_log.replay_from(position)
     }
 
+    /// Force-syncs the commit log to disk.
+    ///
+    /// Ensures all buffered mutations are written to disk before reading
+    /// the commit log (e.g., for catch-up replay after failover).
+    pub fn force_commit_log_sync(&self) -> ferrosa_common::Result<()> {
+        self.commit_log.force_sync()
+    }
+
     /// Flushes the active memtable for a table to an SSTable on disk.
     ///
     /// After flushing, checks if compaction is needed and submits tasks

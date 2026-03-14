@@ -373,6 +373,11 @@ impl ModeController {
                     Err(e) => tracing::warn!(%e, "failed to serialize schema snapshot"),
                 }
 
+                // Force sync commit log to disk before replay.
+                if let Err(e) = storage.force_commit_log_sync() {
+                    tracing::warn!(%e, "failed to force commit log sync before catch-up replay");
+                }
+
                 // Replay recent data to bring peer up to date.
                 let position = CommitLogPosition {
                     segment_id: 0,
