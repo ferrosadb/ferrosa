@@ -12,7 +12,7 @@ including DDL replication, write forwarding, failover, and catch-up.
 
 | Metric | Value |
 |--------|-------|
-| Crates | 10 of 10 planned |
+| Crates | 11 of 11 planned |
 | Source files | ~180 |
 | Source LOC | ~56,700 |
 | Test functions | ~1,082 |
@@ -26,10 +26,11 @@ common         ██████   ██████  ██████   █
 sstable        ██████   ██████  ██████   ████░░
 storage        ██████   ██████  █████░   ███░░░
 schema         ████░░   █████░  █████░   ███░░░
+index          █████░   █████░  ████░░   ██░░░░
 cql            ██████   ██████  ██████   ████░░
 graph          █████░   ██████  ████░░   ███░░░
 ctl            ██████   ██████  ███░░░   ███░░░
-binary         █████░   ██████  ███░░░   ██░░░░
+binary         █████░   ██████  ███░░░   ███░░░
 net            █████░   █████░  ████░░   ██░░░░
 cluster        █████░   ████░░  ███░░░   ██░░░░
 ```
@@ -93,6 +94,25 @@ cluster        █████░   ████░░  ███░░░   █
   - [ ] Role hierarchy with inheritance
   - [ ] Audit sink composition
 
+### ferrosa-index — Phase 1 Complete
+
+- **LOC:** ~3,200 (18 files) | **Tests:** ~85
+- **Modules:** `btree`, `composite`, `hash`, `lifecycle`, `manager`, `phonetic`,
+  `registry`, `traits`, `types`, `vector` (hnsw, ivfflat)
+- **What's done:** Pluggable secondary index framework behind a single `SecondaryIndex`
+  trait. Six index types: B-tree (range scans), hash (O(1) equality), composite
+  (multi-column), phonetic (Soundex, Metaphone, Double Metaphone, Caverphone), and
+  two vector methods (HNSW, IVFFlat) for approximate nearest neighbor search.
+  Storage-attached: indexes build asynchronously after SSTable flush with zero write-path
+  impact. Per-index staleness tracking, operational metrics via
+  `system_views.secondary_indexes`, CQL-compatible DDL with `CREATE INDEX ... USING 'type'`
+  syntax. Filtered indexes for partial coverage.
+- **Remaining:**
+  - [ ] Integration with storage engine flush pipeline
+  - [ ] Index-aware query planner in ferrosa-cql
+  - [ ] Compaction-triggered index rebuild
+  - [ ] Distributed index coordination in cluster mode
+
 ### ferrosa-cql — Complete (Parts A-D + Compression)
 
 - **LOC:** ~12,200 (20 files) | **Tests:** ~248 | **Largest crate**
@@ -142,17 +162,21 @@ cluster        █████░   ████░░  ███░░░   █
 - **Remaining:**
   - [ ] Integration tests (currently unit tests only)
 
-### ferrosa (binary) — Complete (pair-mode)
+### ferrosa (binary) — Complete (pair-mode, production-ready)
 
-- **LOC:** ~770 (5 files) | **Tests:** ~15
-- **Modules:** `web` (api, static_files)
+- **LOC:** ~870 (6 files) | **Tests:** ~18
+- **Modules:** `maintenance`, `web` (api, static_files)
 - **What's done:** Composes all crates. CQL server on :9042, graph HTTP on :7474,
   web console on :9090. Connection + query tracker wiring, REST API for
   metrics/schema/queries/cluster management, embedded static assets via rust-embed.
   Cluster management endpoints: `GET /api/cluster/status`,
   `POST /api/cluster/promote`, `POST /api/cluster/switchover`.
+  Background maintenance loop (auto-flush, compaction polling, commit log GC).
+  Graceful shutdown with configurable timeout (drains in-flight requests).
+  Per-connection request limiting for backpressure under load. Exponential backoff
+  reconnection for internode links. Ships as .deb with systemd service unit.
 - **Remaining:**
-  - [ ] Graceful shutdown sequencing
+  - [x] ~~Graceful shutdown sequencing~~ (done)
   - [ ] Configuration file support (currently env vars only)
 
 ### ferrosa-net — Phase 1 Complete (PR #39)
@@ -217,6 +241,8 @@ cluster        █████░   ████░░  ███░░░   █
 | ~~Storage replay + compaction execution~~ | ~~`.worktrees/storage-replay-compaction`~~ | Merged (PR #38) |
 | ~~ferrosa-net Phase 1~~ | ~~`ferrosa-net/`~~ | Complete (PR #39) |
 | ~~ferrosa-cluster Phase 1 (Pair mode)~~ | ~~`feature/pair-integration`~~ | Complete |
+| ferrosa-index Phase 1 (6 index types) | `feature/secondary-indexes-design` | Complete |
+| Production readiness (maintenance, shutdown, backpressure) | `ferrosa/` | Complete |
 | ferrosa-cluster Phase 2 (Full cluster) | — | Next up |
 
 ## Path to Distributed Operation
