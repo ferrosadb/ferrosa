@@ -23,7 +23,7 @@ pub fn compute_auth_token(cluster_name: &str, host_id: &Uuid, nonce: u64, psk: &
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Verify a received auth token using constant-time comparison.
+/// Verify a received auth token using the HMAC crate's constant-time verification.
 pub fn verify_auth_token(
     cluster_name: &str,
     host_id: &Uuid,
@@ -31,13 +31,11 @@ pub fn verify_auth_token(
     psk: &str,
     token: &[u8],
 ) -> bool {
-    let expected = compute_auth_token(cluster_name, host_id, nonce, psk);
-    expected.len() == token.len()
-        && expected
-            .iter()
-            .zip(token)
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    let mut mac = HmacSha256::new_from_slice(psk.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(cluster_name.as_bytes());
+    mac.update(host_id.as_bytes());
+    mac.update(&nonce.to_be_bytes());
+    mac.verify_slice(token).is_ok()
 }
 
 /// Run initiator side of handshake over a framed connection.
@@ -131,14 +129,14 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
         return Err(NetError::HandshakeFailed(reason));
     }
 
-    if peer_version < 1 {
+    if peer_version != PROTOCOL_VERSION {
         let reason = format!("unsupported protocol version: {}", peer_version);
         send_handshake_ack(framed, local_host_id, false, &reason).await?;
         return Err(NetError::HandshakeFailed(reason));
     }
 
     if let Some(psk) = &config.psk {
-        if peer_token.len() < 8 {
+        if peer_token.len() < 40 {
             let reason = "auth token too short".to_string();
             send_handshake_ack(framed, local_host_id, false, &reason).await?;
             return Err(NetError::HandshakeFailed(reason));
