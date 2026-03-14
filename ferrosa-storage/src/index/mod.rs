@@ -4,7 +4,7 @@
 //! The [`IndexStateTracker`] tracks which SSTables have been indexed and which
 //! are pending, while the [`IndexBuildScheduler`] processes build jobs on
 //! background worker threads following the same channel-based pattern as
-//! [`CompactionExecutor`](crate::compaction::executor::CompactionExecutor).
+//! `CompactionExecutor`.
 
 pub mod scheduler;
 pub mod tracker;

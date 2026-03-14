@@ -2,7 +2,7 @@
 //!
 //! Provides operational metrics for every tracked secondary index, exposing
 //! build status, staleness lag, pending work, and build statistics. This is
-//! the runtime counterpart to [`system_schema.indexes`] — schema metadata
+//! the runtime counterpart to `system_schema.indexes` — schema metadata
 //! lives there, while live operational state lives here.
 
 use std::sync::Arc;

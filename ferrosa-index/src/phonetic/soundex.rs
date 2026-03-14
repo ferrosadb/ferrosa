@@ -6,7 +6,7 @@
 //!
 //! Rules:
 //! 1. Retain the first letter.
-//! 2. Map remaining consonants to digits (see [`SOUNDEX_MAP`]).
+//! 2. Map remaining consonants to digits.
 //! 3. Collapse adjacent identical digits.
 //! 4. Remove vowels, H, W, Y.
 //! 5. Pad or truncate to exactly 4 characters.

@@ -2,7 +2,7 @@
 //!
 //! [`IndexBuildScheduler`] receives [`IndexBuildJob`]s via an mpsc channel and
 //! processes them on N worker threads, following the same pattern as
-//! [`CompactionExecutor`](crate::compaction::executor::CompactionExecutor).
+//! `CompactionExecutor`.
 //!
 //! Workers currently only update the [`IndexStateTracker`] — actual SSTable
 //! reading and index building will be wired in a later task.
@@ -45,7 +45,7 @@ pub struct IndexBuildJob {
 
 /// Background scheduler that dispatches index build jobs to worker threads.
 ///
-/// Follows the [`CompactionExecutor`] pattern: an mpsc channel feeds N worker
+/// Follows the `CompactionExecutor` pattern: an mpsc channel feeds N worker
 /// threads. Each worker pulls jobs, performs the build (stub for now), and
 /// updates the shared [`IndexStateTracker`].
 pub struct IndexBuildScheduler {
