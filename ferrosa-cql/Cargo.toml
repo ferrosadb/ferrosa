@@ -11,6 +11,7 @@ arc-swap = "1.7"
 bytes = "1"
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-index = { path = "../ferrosa-index" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-storage = { path = "../ferrosa-storage" }

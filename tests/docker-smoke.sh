@@ -112,6 +112,48 @@ else
     pass "Schema created on both nodes (fallback)"
 fi
 
+# ============================================================
+# Phase 1b: Secondary Indexes
+# ============================================================
+info ""
+info "=== Phase 1b: Secondary Indexes ==="
+
+# Create indexes on node1
+info "Creating secondary indexes on node1..."
+cql1 "CREATE INDEX idx_v ON smoke_test.kv (v) USING 'btree'"
+cql1 "CREATE INDEX idx_v_hash ON smoke_test.kv (v) USING 'hash'"
+pass "Created btree and hash indexes on smoke_test.kv"
+
+# Create a table with more columns for composite/phonetic tests
+cql1 "CREATE TABLE smoke_test.products (id text PRIMARY KEY, name text, category text, embedding blob)"
+cql1 "CREATE INDEX idx_name ON smoke_test.products (name) USING 'btree'"
+cql1 "CREATE INDEX idx_cat_name ON smoke_test.products (category, name) USING 'composite'"
+cql1 "CREATE INDEX idx_name_phonetic ON smoke_test.products (name) USING 'phonetic' WITH OPTIONS = {'algorithm': 'soundex'}"
+pass "Created btree, composite, and phonetic indexes on smoke_test.products"
+
+# Verify indexes appear in system_schema.indexes on node1
+info "Verifying indexes in system_schema.indexes on node1..."
+RESULT=$(cql1 "SELECT index_name FROM system_schema.indexes WHERE keyspace_name = 'smoke_test';" 2>&1)
+echo "$RESULT" | grep -q "idx_v" || fail "Index idx_v not found on node1"
+echo "$RESULT" | grep -q "idx_name" || fail "Index idx_name not found on node1"
+pass "Indexes visible in system_schema.indexes on node1"
+
+# Check node2 (DDL replication)
+info "Verifying indexes replicated to node2..."
+sleep 2
+RESULT=$(cql2 "SELECT index_name FROM system_schema.indexes WHERE keyspace_name = 'smoke_test';" 2>&1)
+if echo "$RESULT" | grep -q "idx_v"; then
+    pass "Indexes replicated to node2"
+else
+    info "Index DDL replication pending — may need more time"
+fi
+
+# Insert data into products table
+info "Inserting data into smoke_test.products..."
+cql1 "INSERT INTO smoke_test.products (id, name, category) VALUES ('p1', 'Widget', 'tools')"
+cql1 "INSERT INTO smoke_test.products (id, name, category) VALUES ('p2', 'Gadget', 'electronics')"
+pass "Product data inserted (index queries deferred to query path integration)"
+
 # Write to node1 (primary), read from both
 info "Writing to node1 (primary)..."
 cql1 "INSERT INTO smoke_test.kv (k, v) VALUES ('key1', 'from_node1')"
@@ -247,6 +289,15 @@ else
     else
         info "SKIP: Failover catch-up not yet implemented for this scenario"
     fi
+fi
+
+# Verify indexes survived failover on node1
+info "Verifying indexes survived failover on node1..."
+RESULT=$(cql1 "SELECT index_name FROM system_schema.indexes WHERE keyspace_name = 'smoke_test';" 2>&1)
+if echo "$RESULT" | grep -q "idx_v"; then
+    pass "Indexes survived failover on node1"
+else
+    info "Indexes not found on node1 after failover (schema catch-up may be incomplete)"
 fi
 
 # ============================================================

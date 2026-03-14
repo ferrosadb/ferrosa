@@ -18,6 +18,7 @@ use crate::auth::permission::{GrantEntry, Permission, Resource};
 use crate::auth::rate_limit::{AuthRateLimiter, RateLimitConfig};
 use crate::auth::role::{AuthContext, RoleMetadata, RoleUpdates};
 use crate::error::SchemaError;
+use crate::metadata::index::IndexMetadata;
 use crate::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
 use crate::metadata::table::{TableMetadata, TableUpdates};
 use crate::secrets::SecretsProvider;
@@ -40,6 +41,9 @@ pub struct SchemaSnapshot {
     pub roles: HashMap<String, RoleMetadata>,
     /// All grants, keyed by role name.
     pub grants: HashMap<String, Vec<GrantEntry>>,
+    /// All secondary indexes, keyed by (keyspace, table, index_name).
+    #[serde(default)]
+    pub indexes: HashMap<(String, String, String), IndexMetadata>,
 }
 
 impl SchemaSnapshot {
@@ -51,6 +55,7 @@ impl SchemaSnapshot {
             tables: HashMap::new(),
             roles: HashMap::new(),
             grants: HashMap::new(),
+            indexes: HashMap::new(),
         }
     }
 }
@@ -99,8 +104,8 @@ pub struct SchemaConfig {
 /// Holds the current `SchemaSnapshot` behind an `ArcSwap` for lock-free reads.
 /// Mutations acquire `write_lock`, clone-and-swap the snapshot, and emit audit events.
 pub struct Schema {
-    /// Lock-free swappable snapshot.
-    inner: ArcSwap<SchemaSnapshot>,
+    /// Lock-free swappable snapshot, wrapped in Arc so virtual tables can share it.
+    inner: Arc<ArcSwap<SchemaSnapshot>>,
     /// Serializes writes (clone → mutate → store).
     write_lock: Mutex<()>,
     /// Password hashing configuration.
@@ -157,7 +162,7 @@ impl Schema {
         }
 
         let schema = Self {
-            inner: ArcSwap::new(Arc::new(snapshot)),
+            inner: Arc::new(ArcSwap::new(Arc::new(snapshot))),
             write_lock: Mutex::new(()),
             hasher_config: config.hasher,
             password_policy: config.password_policy,
@@ -166,6 +171,11 @@ impl Schema {
             default_password_roles: Mutex::new(default_password_roles),
             virtual_table_registry: Arc::new(VirtualTableRegistry::new()),
         };
+
+        // Register built-in virtual tables
+        schema.virtual_table_registry.register(Arc::new(
+            crate::system::index_tables::SystemSchemaIndexesTable::new(schema.snapshot_handle()),
+        ));
 
         // Emit bootstrap audit event
         schema.emit_audit(AuditEventKind::SchemaBootstrapped);
@@ -291,6 +301,12 @@ impl Schema {
     /// use this instead of `snapshot()` to avoid `Arc` cloning on each call.
     pub fn schema_ref(&self) -> &ArcSwap<SchemaSnapshot> {
         &self.inner
+    }
+
+    /// Return a shared handle to the inner ArcSwap for virtual tables
+    /// that need lock-free snapshot reads.
+    pub fn snapshot_handle(&self) -> Arc<ArcSwap<SchemaSnapshot>> {
+        Arc::clone(&self.inner)
     }
 
     /// Return a reference to the virtual table registry.
@@ -584,6 +600,8 @@ impl Schema {
         }
         // Remove all tables in the dropped keyspace
         snap.tables.retain(|(ks, _), _| ks != name);
+        // Remove all indexes in the dropped keyspace
+        snap.indexes.retain(|(ks, _, _), _| ks != name);
         snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         self.emit_audit_with_actor(
@@ -752,6 +770,9 @@ impl Schema {
                 table.to_string(),
             ));
         }
+        // Remove all indexes on the dropped table
+        snap.indexes
+            .retain(|(ks, tbl, _), _| !(ks == keyspace && tbl == table));
         snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         self.emit_audit_with_actor(
@@ -762,6 +783,69 @@ impl Schema {
             auth,
         );
         Ok(())
+    }
+
+    // ---- Index CRUD ----
+
+    /// Create a secondary index (internal, idempotent).
+    ///
+    /// Inserts the index if it does not already exist. Succeeds silently
+    /// on duplicates (idempotent).
+    pub fn create_index_internal(&self, index: IndexMetadata) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (*self.inner.load_full()).clone();
+        let key = (
+            index.keyspace.clone(),
+            index.table.clone(),
+            index.name.clone(),
+        );
+        snap.indexes.entry(key).or_insert(index);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Drop a secondary index (internal, idempotent).
+    ///
+    /// Removes the index if it exists. Succeeds silently if the index
+    /// does not exist (idempotent).
+    pub fn drop_index_internal(
+        &self,
+        keyspace: &str,
+        table: &str,
+        name: &str,
+    ) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (*self.inner.load_full()).clone();
+        snap.indexes
+            .remove(&(keyspace.to_string(), table.to_string(), name.to_string()));
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Create a secondary index with authorization.
+    ///
+    /// Requires `Alter` permission on the parent table.
+    pub fn create_index(&self, index: IndexMetadata, auth: &AuthContext) -> crate::Result<()> {
+        let resource = Resource::Table(index.keyspace.clone(), index.table.clone());
+        self.check_permission(auth, Permission::Alter, &resource)?;
+        self.create_index_internal(index)
+    }
+
+    /// Drop a secondary index with authorization.
+    ///
+    /// Requires `Alter` permission on the parent table.
+    pub fn drop_index(
+        &self,
+        keyspace: &str,
+        table: &str,
+        name: &str,
+        auth: &AuthContext,
+    ) -> crate::Result<()> {
+        let resource = Resource::Table(keyspace.to_string(), table.to_string());
+        self.check_permission(auth, Permission::Alter, &resource)?;
+        self.drop_index_internal(keyspace, table, name)
     }
 
     // ---- Role CRUD ----
@@ -2145,6 +2229,7 @@ mod tests {
             version: Uuid::new_v4(),
             keyspaces: HashMap::new(),
             tables: HashMap::new(),
+            indexes: HashMap::new(),
             roles: HashMap::new(),
             grants: HashMap::new(),
         };
@@ -2172,6 +2257,7 @@ mod tests {
             version: Uuid::new_v4(),
             keyspaces: HashMap::new(),
             tables: HashMap::new(),
+            indexes: HashMap::new(),
             roles: HashMap::new(),
             grants: HashMap::new(),
         };
@@ -2224,6 +2310,7 @@ mod tests {
             version: Uuid::new_v4(),
             keyspaces: HashMap::new(),
             tables: HashMap::new(),
+            indexes: HashMap::new(),
             roles: HashMap::new(),
             grants: HashMap::new(),
         };

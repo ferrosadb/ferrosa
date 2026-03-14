@@ -21,6 +21,15 @@ pub enum UploadTask {
         /// Component files: (component_name, data).
         files: Vec<(String, Bytes)>,
     },
+    /// Upload index files for an SSTable.
+    IndexFiles {
+        /// Table identifier (e.g., "ks.table").
+        table_id: String,
+        /// SSTable identifier that the index was built from.
+        sstable_id: String,
+        /// Index component files: (component_name, data).
+        files: Vec<(String, Bytes)>,
+    },
     /// Shutdown signal.
     Shutdown,
 }
@@ -66,6 +75,24 @@ impl UploadManager {
                                 Self::put_with_retry(&store, &path, data.clone(), 5).await
                             {
                                 tracing_or_eprintln(format!("upload failed for {path}: {e}"));
+                            }
+                        }
+                    }
+                    UploadTask::IndexFiles {
+                        table_id,
+                        sstable_id,
+                        files,
+                    } => {
+                        // Use the same S3 prefix distribution as SSTables.
+                        let hex_prefix = hex_prefix_for(&sstable_id);
+                        for (name, data) in files {
+                            let path = ObjectPath::from(format!(
+                                "{prefix}/{hex_prefix}/{table_id}/{sstable_id}/{name}"
+                            ));
+                            if let Err(e) =
+                                Self::put_with_retry(&store, &path, data.clone(), 5).await
+                            {
+                                tracing_or_eprintln(format!("index upload failed for {path}: {e}"));
                             }
                         }
                     }

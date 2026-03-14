@@ -115,6 +115,9 @@ pub struct StorageEngine {
     async_observers: RwLock<Vec<AsyncObserverState>>,
     /// Default channel capacity for async observers.
     async_observer_capacity: usize,
+    /// Optional index build scheduler — wiring to flush/compaction is deferred.
+    #[allow(dead_code)]
+    index_scheduler: Option<crate::index::IndexBuildScheduler>,
 }
 
 /// Per-table state: schema + store.
@@ -176,6 +179,7 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            index_scheduler: None,
         })
     }
 
@@ -227,6 +231,7 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            index_scheduler: None,
         };
 
         Ok((engine, pending_mutations))

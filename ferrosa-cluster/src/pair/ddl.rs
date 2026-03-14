@@ -15,6 +15,7 @@ use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+use ferrosa_schema::metadata::index::IndexMetadata;
 use ferrosa_schema::metadata::keyspace::KeyspaceMetadata;
 use ferrosa_schema::metadata::table::TableMetadata;
 use ferrosa_schema::{is_system_keyspace, GrantEntry, RoleMetadata, Schema, SchemaSnapshot};
@@ -33,7 +34,16 @@ pub enum DdlOperation {
     CreateKeyspace(KeyspaceMetadata),
     DropKeyspace(String),
     CreateTable(Box<TableMetadata>),
-    DropTable { keyspace: String, table: String },
+    DropTable {
+        keyspace: String,
+        table: String,
+    },
+    CreateIndex(IndexMetadata),
+    DropIndex {
+        keyspace: String,
+        table: String,
+        index: String,
+    },
 }
 
 impl DdlOperation {
@@ -122,6 +132,20 @@ impl DdlCoordinator {
                 self.schema
                     .drop_table_internal(keyspace, table)
                     .map_err(|e| ClusterError::Internal(format!("drop_table: {e}")))?;
+            }
+            DdlOperation::CreateIndex(ref idx) => {
+                self.schema
+                    .create_index_internal(idx.clone())
+                    .map_err(|e| ClusterError::Internal(format!("create_index: {e}")))?;
+            }
+            DdlOperation::DropIndex {
+                ref keyspace,
+                ref table,
+                ref index,
+            } => {
+                self.schema
+                    .drop_index_internal(keyspace, table, index)
+                    .map_err(|e| ClusterError::Internal(format!("drop_index: {e}")))?;
             }
         }
         Ok(())
@@ -244,6 +268,8 @@ pub struct WireSchemaSnapshot {
     pub version: Uuid,
     pub keyspaces: std::collections::HashMap<String, KeyspaceMetadata>,
     pub tables: Vec<((String, String), TableMetadata)>,
+    #[serde(default)]
+    pub indexes: Vec<((String, String, String), IndexMetadata)>,
     pub roles: std::collections::HashMap<String, RoleMetadata>,
     pub grants: std::collections::HashMap<String, Vec<GrantEntry>>,
 }
@@ -259,6 +285,11 @@ impl WireSchemaSnapshot {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            indexes: snap
+                .indexes
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             roles: snap.roles.clone(),
             grants: snap.grants.clone(),
         }
@@ -270,6 +301,7 @@ impl WireSchemaSnapshot {
             version: self.version,
             keyspaces: self.keyspaces,
             tables: self.tables.into_iter().collect(),
+            indexes: self.indexes.into_iter().collect(),
             roles: self.roles,
             grants: self.grants,
         }

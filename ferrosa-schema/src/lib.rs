@@ -27,8 +27,9 @@ pub use auth::{
 pub use convert::cql_to_marshal_type;
 pub use error::{Result, SchemaError};
 pub use metadata::{
-    CachingParams, ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata, KeyspaceMetadata,
-    KeyspaceUpdates, ReplicationParams, TableFlag, TableMetadata, TableParams, TableUpdates,
+    CachingParams, ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata, IndexMetadata,
+    KeyspaceMetadata, KeyspaceUpdates, ReplicationParams, TableFlag, TableMetadata, TableParams,
+    TableUpdates,
 };
 pub use registry::{is_system_keyspace, AuthMethod, Schema, SchemaConfig, SchemaSnapshot};
 pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};

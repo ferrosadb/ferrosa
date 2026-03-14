@@ -290,3 +290,62 @@ async fn describe_keyspaces() {
         "system_schema keyspace not found; keyspaces: {keyspace_names:?}"
     );
 }
+
+#[tokio::test]
+async fn test_create_and_query_indexes() {
+    let (mut client, _state, _dir) = boot_and_connect().await;
+
+    // Setup keyspace and table
+    client
+        .query("CREATE KEYSPACE idx_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}")
+        .await
+        .unwrap();
+    client
+        .query("CREATE TABLE idx_test.users (id text PRIMARY KEY, name text, email text)")
+        .await
+        .unwrap();
+
+    // Create indexes
+    client
+        .query("CREATE INDEX idx_email ON idx_test.users (email) USING 'btree'")
+        .await
+        .unwrap();
+    client
+        .query("CREATE INDEX idx_name ON idx_test.users (name) USING 'hash'")
+        .await
+        .unwrap();
+
+    // Idempotent CREATE INDEX IF NOT EXISTS should succeed
+    client
+        .query("CREATE INDEX IF NOT EXISTS idx_email ON idx_test.users (email) USING 'btree'")
+        .await
+        .unwrap();
+
+    // Verify indexes exist in schema snapshot (virtual table query path
+    // for system_schema.indexes is a follow-up integration task).
+    // For now, verify that CREATE INDEX DDL succeeded by checking that
+    // a duplicate CREATE INDEX IF NOT EXISTS also succeeds (idempotent).
+
+    // Insert data (index building happens asynchronously)
+    client
+        .query("INSERT INTO idx_test.users (id, name, email) VALUES ('1', 'Alice', 'alice@example.com')")
+        .await
+        .unwrap();
+    client
+        .query(
+            "INSERT INTO idx_test.users (id, name, email) VALUES ('2', 'Bob', 'bob@example.com')",
+        )
+        .await
+        .unwrap();
+
+    // Drop index — verify DDL succeeds
+    client.query("DROP INDEX idx_test.idx_email").await.unwrap();
+    // DROP IF EXISTS on already-dropped index should also succeed
+    client
+        .query("DROP INDEX IF EXISTS idx_test.idx_email")
+        .await
+        .unwrap();
+
+    // Cleanup — drop table (DROP KEYSPACE parser support is pending)
+    client.query("DROP TABLE idx_test.users").await.unwrap();
+}

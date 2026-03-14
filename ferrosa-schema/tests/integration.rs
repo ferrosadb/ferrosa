@@ -89,6 +89,18 @@ fn test_table(keyspace: &str, name: &str) -> TableMetadata {
     }
 }
 
+fn test_index(keyspace: &str, table: &str, name: &str) -> IndexMetadata {
+    IndexMetadata {
+        keyspace: keyspace.to_string(),
+        table: table.to_string(),
+        name: name.to_string(),
+        index_type: ferrosa_index::IndexType::BTree,
+        target_columns: vec!["email".to_string()],
+        filter_predicate: None,
+        options: HashMap::new(),
+    }
+}
+
 fn test_role(name: &str) -> RoleMetadata {
     RoleMetadata {
         name: name.to_string(),
@@ -210,4 +222,102 @@ fn every_mutation_emits_audit_event() {
         "8 operations should emit 8 audit events, got: {}",
         events.len()
     );
+}
+
+#[test]
+fn create_and_drop_index() {
+    let schema = test_schema();
+    let auth = superuser_auth();
+    schema.create_keyspace(test_keyspace("ks1"), &auth).unwrap();
+    schema.create_table(test_table("ks1", "t1"), &auth).unwrap();
+
+    // Create an index
+    schema
+        .create_index(test_index("ks1", "t1", "idx_email"), &auth)
+        .unwrap();
+
+    // Verify index exists in snapshot
+    let snap = schema.snapshot();
+    let key = ("ks1".to_string(), "t1".to_string(), "idx_email".to_string());
+    assert!(snap.indexes.contains_key(&key));
+    assert_eq!(snap.indexes[&key].target_columns, vec!["email".to_string()]);
+
+    // Drop the index
+    schema.drop_index("ks1", "t1", "idx_email", &auth).unwrap();
+    let snap = schema.snapshot();
+    assert!(!snap.indexes.contains_key(&key));
+}
+
+#[test]
+fn create_index_internal_is_idempotent() {
+    let schema = test_schema();
+    let auth = superuser_auth();
+    schema.create_keyspace(test_keyspace("ks1"), &auth).unwrap();
+    schema.create_table(test_table("ks1", "t1"), &auth).unwrap();
+
+    let index = test_index("ks1", "t1", "idx_email");
+    schema.create_index_internal(index.clone()).unwrap();
+    // Second call with same key should succeed silently (idempotent)
+    schema.create_index_internal(index).unwrap();
+
+    let snap = schema.snapshot();
+    let key = ("ks1".to_string(), "t1".to_string(), "idx_email".to_string());
+    assert!(snap.indexes.contains_key(&key));
+    // Only one index should exist
+    assert_eq!(snap.indexes.len(), 1);
+}
+
+#[test]
+fn drop_index_internal_is_idempotent() {
+    let schema = test_schema();
+    let auth = superuser_auth();
+    schema.create_keyspace(test_keyspace("ks1"), &auth).unwrap();
+    schema.create_table(test_table("ks1", "t1"), &auth).unwrap();
+
+    let index = test_index("ks1", "t1", "idx_email");
+    schema.create_index_internal(index).unwrap();
+
+    // Drop should work
+    schema
+        .drop_index_internal("ks1", "t1", "idx_email")
+        .unwrap();
+    // Second drop should also succeed (idempotent)
+    schema
+        .drop_index_internal("ks1", "t1", "idx_email")
+        .unwrap();
+
+    let snap = schema.snapshot();
+    assert!(snap.indexes.is_empty());
+}
+
+#[test]
+fn drop_keyspace_removes_indexes() {
+    let schema = test_schema();
+    let auth = superuser_auth();
+    schema.create_keyspace(test_keyspace("ks1"), &auth).unwrap();
+    schema.create_table(test_table("ks1", "t1"), &auth).unwrap();
+    schema
+        .create_index(test_index("ks1", "t1", "idx_email"), &auth)
+        .unwrap();
+
+    // Drop keyspace should cascade to indexes
+    schema.drop_keyspace("ks1", &auth).unwrap();
+    let snap = schema.snapshot();
+    assert!(snap.indexes.is_empty());
+}
+
+#[test]
+fn drop_table_removes_indexes() {
+    let schema = test_schema();
+    let auth = superuser_auth();
+    schema.create_keyspace(test_keyspace("ks1"), &auth).unwrap();
+    schema.create_table(test_table("ks1", "t1"), &auth).unwrap();
+    schema
+        .create_index(test_index("ks1", "t1", "idx_email"), &auth)
+        .unwrap();
+
+    // Drop table should cascade to indexes
+    schema.drop_table("ks1", "t1", &auth).unwrap();
+    let snap = schema.snapshot();
+    assert!(snap.indexes.is_empty());
 }
