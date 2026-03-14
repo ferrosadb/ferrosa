@@ -68,32 +68,29 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
-# 3. Create keyspace and table on node1
-info "Creating keyspace and table on node1..."
-cqlsh localhost 9042 -e "
-    CREATE KEYSPACE IF NOT EXISTS smoke_test
-    WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
-"
-cqlsh localhost 9042 -e "
-    CREATE TABLE IF NOT EXISTS smoke_test.kv (
-        k text PRIMARY KEY,
-        v text
-    );
-"
-pass "Keyspace and table created on node1"
+# 3. Wait for pair mode to activate (seed connection has 2s delay)
+info "Waiting for pair mode activation..."
+sleep 4
 
-# 4. Insert data on node1
+# 4. Create keyspace and table on both nodes
+# (Schema replication is Phase 2 — for now, create on both)
+info "Creating keyspace and table..."
+cqlsh localhost 9042 -e "CREATE KEYSPACE smoke_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"
+cqlsh localhost 9042 -e "CREATE TABLE smoke_test.kv (k text PRIMARY KEY, v text)"
+cqlsh localhost 9043 -e "CREATE KEYSPACE smoke_test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"
+cqlsh localhost 9043 -e "CREATE TABLE smoke_test.kv (k text PRIMARY KEY, v text)"
+pass "Keyspace and table created on both nodes"
+
+# 5. Insert data on node1
 info "Inserting data on node1..."
-cqlsh localhost 9042 -e "
-    INSERT INTO smoke_test.kv (k, v) VALUES ('hello', 'world');
-    INSERT INTO smoke_test.kv (k, v) VALUES ('foo', 'bar');
-"
+cqlsh localhost 9042 -e "INSERT INTO smoke_test.kv (k, v) VALUES ('hello', 'world')"
+cqlsh localhost 9042 -e "INSERT INTO smoke_test.kv (k, v) VALUES ('foo', 'bar')"
 pass "Data inserted on node1"
 
 # Give pair replication a moment to complete
-sleep 2
+sleep 1
 
-# 5. Read data from node2
+# 6. Read data from node2
 info "Reading data from node2..."
 RESULT=$(cqlsh localhost 9043 -e "SELECT k, v FROM smoke_test.kv WHERE k = 'hello';" 2>&1)
 if echo "$RESULT" | grep -q "world"; then
@@ -111,7 +108,7 @@ else
     fail "Second row not found on node2"
 fi
 
-# 6. Check node health
+# 7. Check node health
 info "Checking node1 system.local..."
 NODE1_ID=$(cqlsh localhost 9042 -e "SELECT host_id FROM system.local;" 2>&1)
 pass "node1 system.local responding"

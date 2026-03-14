@@ -202,23 +202,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 11. Background: connect to seeds
-    if !net_config.seeds.is_empty() {
-        let seeds = net_config.seeds.clone();
+    // Seeds can be hostnames (e.g., "node2:7000") which SocketAddr can't parse.
+    // Resolve via DNS in the background task.
+    let seed_strs: Vec<String> = std::env::var("FERROSA_SEED")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if !seed_strs.is_empty() {
         let net_cfg = net_config.clone();
         let pm = peer_manager.clone();
         tokio::spawn(async move {
-            for seed_addr in &seeds {
-                tracing::info!(%seed_addr, "connecting to seed");
-                match ferrosa_net::pool::PriorityPool::connect(net_cfg.clone(), host_id, *seed_addr)
-                    .await
-                {
-                    Ok(pool) => {
-                        let peer_host_id = pool.peer_host_id();
-                        pm.add_peer((peer_host_id, *seed_addr), pool).await;
-                        tracing::info!(%seed_addr, %peer_host_id, "seed connected");
+            // Wait briefly for peer nodes to start
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            for seed in &seed_strs {
+                tracing::info!(%seed, "resolving seed");
+                match tokio::net::lookup_host(seed.as_str()).await {
+                    Ok(mut addrs) => {
+                        if let Some(seed_addr) = addrs.next() {
+                            tracing::info!(%seed, %seed_addr, "connecting to seed");
+                            match ferrosa_net::pool::PriorityPool::connect(
+                                net_cfg.clone(),
+                                host_id,
+                                seed_addr,
+                            )
+                            .await
+                            {
+                                Ok(pool) => {
+                                    let peer_host_id = pool.peer_host_id();
+                                    pm.add_peer((peer_host_id, seed_addr), pool).await;
+                                    tracing::info!(%seed, %peer_host_id, "seed connected");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%seed, %e, "seed connection failed");
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
-                        tracing::warn!(%seed_addr, %e, "seed connection failed (will retry)");
+                        tracing::warn!(%seed, %e, "seed DNS resolution failed");
                     }
                 }
             }
