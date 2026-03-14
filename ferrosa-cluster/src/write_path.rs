@@ -14,6 +14,7 @@ use ferrosa_sstable::types::Row;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::{Mutation, TableId};
 
+use crate::coordinator::ClusterCoordinator;
 use crate::pair::coordinator::PairCoordinator;
 
 /// The active write path. Swapped atomically via `ArcSwap` when the
@@ -26,6 +27,8 @@ pub enum WritePath {
     Direct(Arc<StorageEngine>),
     /// Pair mode: delegates to PairCoordinator.
     Pair(Arc<PairCoordinator>),
+    /// Cluster mode: delegates to ClusterCoordinator with CL enforcement.
+    Cluster(Arc<ClusterCoordinator>),
     /// Degraded: peer lost, writes rejected until operator promotes.
     Unavailable,
 }
@@ -39,6 +42,11 @@ impl WritePath {
     /// Create a pair mode write path.
     pub fn pair(coordinator: Arc<PairCoordinator>) -> Self {
         Self::Pair(coordinator)
+    }
+
+    /// Create a cluster mode write path.
+    pub fn cluster(coordinator: Arc<ClusterCoordinator>) -> Self {
+        Self::Cluster(coordinator)
     }
 
     /// Create an unavailable write path (degraded pair mode).
@@ -74,6 +82,10 @@ impl WritePath {
                     .await
                     .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}")))
             }
+            Self::Cluster(coordinator) => coordinator
+                .coordinate_write(table_id, key, row, timestamp)
+                .await
+                .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
         }
     }
 }
