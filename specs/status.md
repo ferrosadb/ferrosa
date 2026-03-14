@@ -168,6 +168,7 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   - [ ] Graceful shutdown / drain
   - [ ] Compression (LZ4/Snappy frame-level)
   - [ ] Metrics and tracing integration
+  - [ ] Zero-copy serialization (Cap'n Proto / FlatBuffers / rkyv) for wire protocol
 - **Spec:** [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 - **Threat Model:** [Net/Cluster Threats](threat-model-net-cluster.md)
 
