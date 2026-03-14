@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
@@ -75,14 +74,16 @@ impl Drop for ConnectionGuard {
 /// In-flight request limiting: a semaphore bounds the number of concurrent
 /// requests being processed. When the limit is reached, new requests receive
 /// ERROR(Overloaded) without consuming a permit.
-pub async fn handle_connection(
-    stream: TcpStream,
+pub async fn handle_connection<S>(
+    stream: S,
     peer: SocketAddr,
     max_frame_size: u32,
     max_in_flight: usize,
     auth_disabled: bool,
     state: Arc<SharedState>,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     debug!("new connection from {peer}");
 
     // Register this connection with the tracker and create a drop guard.

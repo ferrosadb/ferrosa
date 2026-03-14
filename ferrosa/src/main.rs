@@ -188,9 +188,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "auth_disabled",
         "false",
     );
+    let cql_tls_cert = config_val("FERROSA_CQL_TLS_CERT", &file_config, "cql", "tls_cert", "");
+    let cql_tls_key = config_val("FERROSA_CQL_TLS_KEY", &file_config, "cql", "tls_key", "");
+    let cql_require_tls = config_val(
+        "FERROSA_CQL_REQUIRE_TLS",
+        &file_config,
+        "cql",
+        "require_tls",
+        "false",
+    );
     let cql_config = ferrosa_cql::server::ServerConfig {
         bind_addr: cql_bind,
         auth_disabled: auth_disabled_str == "true" || auth_disabled_str == "1",
+        tls_cert_path: if cql_tls_cert.is_empty() {
+            None
+        } else {
+            Some(cql_tls_cert)
+        },
+        tls_key_path: if cql_tls_key.is_empty() {
+            None
+        } else {
+            Some(cql_tls_key)
+        },
+        require_tls: cql_require_tls == "true" || cql_require_tls == "1",
         ..ferrosa_cql::server::ServerConfig::default()
     };
     let node_config = Arc::new(ferrosa_schema::NodeConfig {

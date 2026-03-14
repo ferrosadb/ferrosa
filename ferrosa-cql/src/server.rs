@@ -4,9 +4,11 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use futures::SinkExt;
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::Framed;
 use tracing::{info, warn};
 
@@ -28,6 +30,12 @@ pub struct ServerConfig {
     pub max_in_flight_per_connection: usize,
     /// Max connections from a single IP address (default 64).
     pub max_connections_per_ip: usize,
+    /// Path to TLS certificate file (PEM). If set with tls_key_path, enables TLS.
+    pub tls_cert_path: Option<String>,
+    /// Path to TLS private key file (PEM).
+    pub tls_key_path: Option<String>,
+    /// If true, reject startup when no TLS cert/key are configured (production mode).
+    pub require_tls: bool,
     /// If true, skip auth (STARTUP returns READY directly).
     pub auth_disabled: bool,
 }
@@ -40,6 +48,9 @@ impl Default for ServerConfig {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             max_connections_per_ip: 64,
             max_in_flight_per_connection: 128,
+            tls_cert_path: None,
+            tls_key_path: None,
+            require_tls: false,
             auth_disabled: false,
         }
     }
@@ -100,8 +111,57 @@ impl CqlServer {
         }
     }
 
+    /// Build a TLS acceptor from cert/key paths if configured.
+    fn build_tls_acceptor(&self) -> Result<Option<TlsAcceptor>, CqlError> {
+        match (&self.config.tls_cert_path, &self.config.tls_key_path) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert_file = std::fs::File::open(cert_path).map_err(|e| {
+                    CqlError::ServerError(format!("failed to open TLS cert {cert_path}: {e}"))
+                })?;
+                let key_file = std::fs::File::open(key_path).map_err(|e| {
+                    CqlError::ServerError(format!("failed to open TLS key {key_path}: {e}"))
+                })?;
+
+                let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        CqlError::ServerError(format!("failed to parse TLS certs: {e}"))
+                    })?;
+
+                let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
+                    .map_err(|e| CqlError::ServerError(format!("failed to parse TLS key: {e}")))?
+                    .ok_or_else(|| {
+                        CqlError::ServerError("no private key found in TLS key file".into())
+                    })?;
+
+                let provider = rustls::crypto::ring::default_provider();
+                let config = rustls::ServerConfig::builder_with_provider(provider.into())
+                    .with_safe_default_protocol_versions()
+                    .map_err(|e| CqlError::ServerError(format!("TLS protocol error: {e}")))?
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .map_err(|e| CqlError::ServerError(format!("TLS config error: {e}")))?;
+
+                info!("TLS enabled for CQL connections");
+                Ok(Some(TlsAcceptor::from(Arc::new(config))))
+            }
+            (None, None) => {
+                if self.config.require_tls {
+                    return Err(CqlError::ServerError(
+                        "require_tls is true but no tls_cert_path/tls_key_path configured".into(),
+                    ));
+                }
+                Ok(None)
+            }
+            _ => Err(CqlError::ServerError(
+                "both tls_cert_path and tls_key_path must be set (or neither)".into(),
+            )),
+        }
+    }
+
     /// Start the server in the background. Returns the bound address.
     pub async fn start_background(&self) -> Result<SocketAddr, CqlError> {
+        let tls_acceptor = self.build_tls_acceptor()?;
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         let addr = listener.local_addr()?;
         let max_connections = self.config.max_connections;
@@ -165,16 +225,45 @@ impl CqlServer {
                         let active = active.clone();
                         let ip_tracker = ip_tracker.clone();
                         let state = state.clone();
+                        let tls_acceptor = tls_acceptor.clone();
                         tokio::spawn(async move {
-                            crate::connection::handle_connection(
-                                stream,
-                                peer,
-                                max_frame_size,
-                                max_in_flight,
-                                auth_disabled,
-                                state,
-                            )
-                            .await;
+                            if let Some(acceptor) = tls_acceptor {
+                                // TLS handshake with 10s timeout
+                                match tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    acceptor.accept(stream),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(tls_stream)) => {
+                                        crate::connection::handle_connection(
+                                            tls_stream,
+                                            peer,
+                                            max_frame_size,
+                                            max_in_flight,
+                                            auth_disabled,
+                                            state,
+                                        )
+                                        .await;
+                                    }
+                                    Ok(Err(e)) => {
+                                        warn!("TLS handshake failed from {peer}: {e}");
+                                    }
+                                    Err(_) => {
+                                        warn!("TLS handshake timeout from {peer}");
+                                    }
+                                }
+                            } else {
+                                crate::connection::handle_connection(
+                                    stream,
+                                    peer,
+                                    max_frame_size,
+                                    max_in_flight,
+                                    auth_disabled,
+                                    state,
+                                )
+                                .await;
+                            }
                             ip_tracker.release(peer_ip);
                             active.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -283,10 +372,8 @@ mod tests {
         ServerConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             max_connections,
-            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             max_connections_per_ip: max_per_ip,
-            max_in_flight_per_connection: 128,
-            auth_disabled: false,
+            ..ServerConfig::default()
         }
     }
 
@@ -356,6 +443,58 @@ mod tests {
 
         tracker.release(ip);
         assert!(tracker.try_acquire(ip, 2)); // slot freed
+    }
+
+    #[tokio::test]
+    async fn server_accepts_tls_connection() {
+        use rcgen::generate_simple_self_signed;
+
+        let certified = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+
+        let (state, _dir2) = setup_state();
+        let mut config = test_config(10, 64);
+        config.tls_cert_path = Some(cert_path.to_str().unwrap().to_string());
+        config.tls_key_path = Some(key_path.to_str().unwrap().to_string());
+        let server = CqlServer::new(config, state);
+        let addr = server.start_background().await.unwrap();
+
+        // Connect with TLS client
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(certified.cert.der().clone()).unwrap();
+        let provider = rustls::crypto::ring::default_provider();
+        let client_config = rustls::ClientConfig::builder_with_provider(provider.into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let _tls_stream = connector.connect(domain, tcp).await.unwrap();
+    }
+
+    #[test]
+    fn require_tls_without_certs_fails() {
+        let (state, _dir) = setup_state();
+        let mut config = test_config(10, 64);
+        config.require_tls = true;
+        let server = CqlServer::new(config, state);
+        assert!(server.build_tls_acceptor().is_err());
+    }
+
+    #[test]
+    fn partial_tls_config_fails() {
+        let (state, _dir) = setup_state();
+        let mut config = test_config(10, 64);
+        config.tls_cert_path = Some("/tmp/cert.pem".into());
+        // key_path is None — should fail
+        let server = CqlServer::new(config, state);
+        assert!(server.build_tls_acceptor().is_err());
     }
 
     #[test]
