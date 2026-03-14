@@ -3,7 +3,7 @@
 > **Date:** 2026-03-12
 > **Scope:** New attack surface introduced by the graph query endpoint (ferrosa-graph)
 > **Methodology:** STRIDE per element
-> **Design Spec:** `docs/superpowers/specs/2026-03-12-ferrosa-graph-design.md`
+> **Design Spec:** `superpowers/specs/2026-03-12-ferrosa-graph-design.md`
 
 ## System Overview
 

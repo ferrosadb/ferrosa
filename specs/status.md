@@ -174,7 +174,7 @@ cluster        █████░   ████░░  ███░░░   █
   - [ ] Compression (LZ4/Snappy frame-level)
   - [ ] Metrics and tracing integration
   - [ ] Zero-copy serialization (Cap'n Proto / FlatBuffers / rkyv) for wire protocol
-- **Spec:** [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
+- **Spec:** [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 - **Threat Model:** [Net/Cluster Threats](threat-model-net-cluster.md)
 
 ### ferrosa-cluster — Phase 1 Complete (Pair Mode)
@@ -205,8 +205,8 @@ cluster        █████░   ████░░  ███░░░   █
   - [ ] Node lifecycle (join, leave, bootstrap)
   - [ ] AlterKeyspace/AlterTable DDL forwarding
   - [ ] `StorageEngine::unregister_table()` for drop replication cleanup
-- **Spec:** [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
-- **Schema Replication Spec:** [Schema Replication](../docs/superpowers/specs/2026-03-14-schema-replication-design.md)
+- **Spec:** [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
+- **Schema Replication Spec:** [Schema Replication](../superpowers/specs/2026-03-14-schema-replication-design.md)
 - **Threat Models:** [Net/Cluster](threat-model-net-cluster.md), [Schema Replication](threat-model-schema-replication.md)
 
 ## Active Work in Progress
@@ -234,6 +234,6 @@ The critical path from single-node to multi-node:
 
 - [Components](components.md) — crate dependency graph
 - [Overview](overview.md) — system architecture
-- [Architecture Design](../docs/superpowers/specs/2026-03-11-ferrosa-architecture-design.md) — full design spec
-- [Schema Replication Design](../docs/superpowers/specs/2026-03-14-schema-replication-design.md) — DDL replication spec
+- [Architecture Design](../superpowers/specs/2026-03-11-ferrosa-architecture-design.md) — full design spec
+- [Schema Replication Design](../superpowers/specs/2026-03-14-schema-replication-design.md) — DDL replication spec
 - [Schema Replication Threat Model](threat-model-schema-replication.md) — STRIDE analysis (T21-T28)

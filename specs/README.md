@@ -56,11 +56,11 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 ## Related Documents
 
 - [README](../README.md) — project introduction
-- [SSTable Design](../docs/superpowers/specs/2026-03-11-ferrosa-sstable-design.md) — implementation design for ferrosa-sstable
-- [Storage Design](../docs/superpowers/specs/2026-03-11-ferrosa-storage-design.md) — implementation design for ferrosa-storage
-- [Schema Design](../docs/superpowers/specs/2026-03-12-ferrosa-schema-design.md) — implementation design for ferrosa-schema
-- [CQL Design](../docs/superpowers/specs/2026-03-12-ferrosa-cql-design.md) — implementation design for ferrosa-cql
-- [Graph Design](../docs/superpowers/specs/2026-03-12-ferrosa-graph-design.md) — implementation design for ferrosa-graph
-- [Observability Design](../docs/superpowers/specs/2026-03-13-ferrosa-observability-design.md) — implementation design for observability (virtual tables, web dashboard, ferrosa-ctl)
-- [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md) — implementation design for ferrosa-net + ferrosa-cluster
-- [Schema Replication Design](../docs/superpowers/specs/2026-03-14-schema-replication-design.md) — schema snapshot sync + DDL forwarding
+- [SSTable Design](../superpowers/specs/2026-03-11-ferrosa-sstable-design.md) — implementation design for ferrosa-sstable
+- [Storage Design](../superpowers/specs/2026-03-11-ferrosa-storage-design.md) — implementation design for ferrosa-storage
+- [Schema Design](../superpowers/specs/2026-03-12-ferrosa-schema-design.md) — implementation design for ferrosa-schema
+- [CQL Design](../superpowers/specs/2026-03-12-ferrosa-cql-design.md) — implementation design for ferrosa-cql
+- [Graph Design](../superpowers/specs/2026-03-12-ferrosa-graph-design.md) — implementation design for ferrosa-graph
+- [Observability Design](../superpowers/specs/2026-03-13-ferrosa-observability-design.md) — implementation design for observability (virtual tables, web dashboard, ferrosa-ctl)
+- [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md) — implementation design for ferrosa-net + ferrosa-cluster
+- [Schema Replication Design](../superpowers/specs/2026-03-14-schema-replication-design.md) — schema snapshot sync + DDL forwarding

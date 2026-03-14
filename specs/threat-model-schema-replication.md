@@ -3,7 +3,7 @@
 > **Date:** 2026-03-14
 > **Scope:** New attack surface introduced by schema replication (PairSchemaSync, PairDdlForward)
 > **Methodology:** STRIDE per element
-> **Design Spec:** `docs/superpowers/specs/2026-03-14-schema-replication-design.md`
+> **Design Spec:** `superpowers/specs/2026-03-14-schema-replication-design.md`
 > **Parent Threat Model:** `specs/threat-model-net-cluster.md` (T1-T20)
 
 ## System Overview
