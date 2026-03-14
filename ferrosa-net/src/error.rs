@@ -2,6 +2,7 @@ use std::fmt;
 
 /// Errors produced by the ferrosa-net transport layer.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum NetError {
     /// Frame body exceeds MAX_FRAME_BODY_SIZE.
     FrameTooLarge { size: u32, max: u32 },
@@ -41,7 +42,14 @@ impl fmt::Display for NetError {
     }
 }
 
-impl std::error::Error for NetError {}
+impl std::error::Error for NetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for NetError {
     fn from(e: std::io::Error) -> Self {
