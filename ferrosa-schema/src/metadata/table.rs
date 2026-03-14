@@ -132,7 +132,7 @@ impl Default for TableParams {
 ///
 /// `None` fields are left unchanged; `Some` fields are applied.
 /// Columns can be added or dropped in the same update.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableUpdates {
     /// New table parameters, if changing.
     pub params: Option<TableParams>,

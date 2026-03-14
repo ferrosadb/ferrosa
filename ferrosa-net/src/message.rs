@@ -113,6 +113,12 @@ pub enum Message {
         new_primary: Uuid,
         new_secondary: Uuid,
     },
+    /// Schema snapshot for catch-up sync (JSON-serialized SchemaSnapshot).
+    PairSchemaSync(Bytes),
+    /// DDL operation forwarded between pair nodes (JSON-serialized DdlOperation).
+    PairDdlForward(Bytes),
+    /// DDL acknowledgment.
+    PairDdlAck(Bytes),
 }
 
 impl Message {
@@ -139,6 +145,9 @@ impl Message {
             Self::PairCatchUp { .. } => MsgType::PairCatchUp,
             Self::PairCatchUpResponse(_) => MsgType::PairCatchUpResponse,
             Self::RoleSwap { .. } => MsgType::RoleSwap,
+            Self::PairSchemaSync(_) => MsgType::PairSchemaSync,
+            Self::PairDdlForward(_) => MsgType::PairDdlForward,
+            Self::PairDdlAck(_) => MsgType::PairDdlAck,
         }
     }
 
@@ -204,7 +213,10 @@ impl Message {
             | Self::StreamEnd(b)
             | Self::PairWriteForward(b)
             | Self::PairWriteAck(b)
-            | Self::PairCatchUpResponse(b) => buf.put_slice(b),
+            | Self::PairCatchUpResponse(b)
+            | Self::PairSchemaSync(b)
+            | Self::PairDdlForward(b)
+            | Self::PairDdlAck(b) => buf.put_slice(b),
         }
         Ok(())
     }
@@ -308,6 +320,9 @@ impl Message {
             MsgType::PairCatchUpResponse => {
                 Self::PairCatchUpResponse(body.split_to(body.remaining()))
             }
+            MsgType::PairSchemaSync => Self::PairSchemaSync(body.split_to(body.remaining())),
+            MsgType::PairDdlForward => Self::PairDdlForward(body.split_to(body.remaining())),
+            MsgType::PairDdlAck => Self::PairDdlAck(body.split_to(body.remaining())),
         })
     }
 }
@@ -358,7 +373,7 @@ mod tests {
         fn decode_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
             let bytes = Bytes::from(data);
             // Try decoding as each message type — should return Ok or Err, never panic
-            for msg_type_byte in 0x01..=0x44u8 {
+            for msg_type_byte in 0x01..=0x47u8 {
                 if let Ok(msg_type) = MsgType::try_from(msg_type_byte) {
                     let _ = Message::decode(msg_type, &mut bytes.clone());
                 }
