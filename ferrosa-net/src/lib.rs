@@ -6,6 +6,7 @@
 
 pub mod codec;
 pub mod config;
+pub mod discovery;
 pub mod error;
 pub mod handshake;
 pub mod message;
