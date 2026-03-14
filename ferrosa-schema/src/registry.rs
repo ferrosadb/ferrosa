@@ -104,8 +104,8 @@ pub struct SchemaConfig {
 /// Holds the current `SchemaSnapshot` behind an `ArcSwap` for lock-free reads.
 /// Mutations acquire `write_lock`, clone-and-swap the snapshot, and emit audit events.
 pub struct Schema {
-    /// Lock-free swappable snapshot.
-    inner: ArcSwap<SchemaSnapshot>,
+    /// Lock-free swappable snapshot, wrapped in Arc so virtual tables can share it.
+    inner: Arc<ArcSwap<SchemaSnapshot>>,
     /// Serializes writes (clone → mutate → store).
     write_lock: Mutex<()>,
     /// Password hashing configuration.
@@ -162,7 +162,7 @@ impl Schema {
         }
 
         let schema = Self {
-            inner: ArcSwap::new(Arc::new(snapshot)),
+            inner: Arc::new(ArcSwap::new(Arc::new(snapshot))),
             write_lock: Mutex::new(()),
             hasher_config: config.hasher,
             password_policy: config.password_policy,
@@ -171,6 +171,11 @@ impl Schema {
             default_password_roles: Mutex::new(default_password_roles),
             virtual_table_registry: Arc::new(VirtualTableRegistry::new()),
         };
+
+        // Register built-in virtual tables
+        schema.virtual_table_registry.register(Arc::new(
+            crate::system::index_tables::SystemSchemaIndexesTable::new(schema.snapshot_handle()),
+        ));
 
         // Emit bootstrap audit event
         schema.emit_audit(AuditEventKind::SchemaBootstrapped);
@@ -193,6 +198,12 @@ impl Schema {
     /// use this instead of `snapshot()` to avoid `Arc` cloning on each call.
     pub fn schema_ref(&self) -> &ArcSwap<SchemaSnapshot> {
         &self.inner
+    }
+
+    /// Return a shared handle to the inner ArcSwap for virtual tables
+    /// that need lock-free snapshot reads.
+    pub fn snapshot_handle(&self) -> Arc<ArcSwap<SchemaSnapshot>> {
+        Arc::clone(&self.inner)
     }
 
     /// Return a reference to the virtual table registry.
