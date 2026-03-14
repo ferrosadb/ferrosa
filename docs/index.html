@@ -373,6 +373,7 @@
     .feature-icon.cql { background: rgba(124, 156, 245, 0.12); }
     .feature-icon.graph { background: rgba(107, 201, 160, 0.12); }
     .feature-icon.lock { background: rgba(200, 130, 240, 0.12); }
+    .feature-icon.index { background: rgba(100, 200, 220, 0.12); }
     .feature-icon.observe { background: rgba(240, 200, 100, 0.12); }
 
     .feature-card h3 {
@@ -916,6 +917,48 @@
       </div>
     </div>
 
+    <!-- Secondary Indexes — full width highlight -->
+    <div class="feature-card highlight">
+      <div>
+        <div class="feature-icon index">◎</div>
+        <h3>Pluggable Secondary Indexes</h3>
+        <p>
+          Six index types behind a single trait: B-tree for range scans, hash for O(1) lookups,
+          composite for multi-column queries, phonetic for fuzzy string matching (Soundex,
+          Metaphone, Double Metaphone, Caverphone), and two vector index methods for
+          approximate nearest neighbor search.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          Indexes are storage-attached — built asynchronously after SSTable flush with zero
+          impact on the write path. Per-index staleness tracking and operational metrics
+          via <code>system_views.secondary_indexes</code> let you monitor build progress
+          and lag in real time. CQL-compatible DDL with standard <code>CREATE INDEX ... USING 'type'</code> syntax.
+        </p>
+        <span class="metric">B-tree · Hash · Composite · Phonetic · Vector (HNSW) · Vector (IVFFlat)</span>
+      </div>
+      <div class="code-demo" style="margin: 0; border: none;">
+        <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- B-tree index for range queries</span>
+<span class="kw">CREATE INDEX</span> idx_email <span class="kw">ON</span> users (email)
+  <span class="kw">USING</span> <span class="str">'btree'</span>;
+
+<span class="cm">-- Phonetic index for fuzzy name matching</span>
+<span class="kw">CREATE INDEX</span> idx_name <span class="kw">ON</span> users (last_name)
+  <span class="kw">USING</span> <span class="str">'phonetic'</span>
+  <span class="kw">WITH OPTIONS</span> = {<span class="str">'algorithm'</span>: <span class="str">'double_metaphone'</span>};
+
+<span class="cm">-- Vector index for ANN search</span>
+<span class="kw">CREATE INDEX</span> idx_embed <span class="kw">ON</span> documents (embedding)
+  <span class="kw">USING</span> <span class="str">'vector'</span>
+  <span class="kw">WITH OPTIONS</span> = {<span class="str">'method'</span>: <span class="str">'hnsw'</span>,
+    <span class="str">'metric'</span>: <span class="str">'cosine'</span>, <span class="str">'dimensions'</span>: <span class="str">'768'</span>};
+
+<span class="cm">-- Nearest neighbor query</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> documents
+  <span class="kw">ORDER BY</span> embedding <span class="kw">ANN OF</span> [<span class="num">0.1</span>, <span class="num">0.2</span>, ...]
+  <span class="kw">LIMIT</span> <span class="num">10</span>;</pre>
+      </div>
+    </div>
+
     <!-- Lock-free -->
     <div class="feature-card">
       <div class="feature-icon lock">⚡</div>
@@ -954,6 +997,7 @@
     <div class="code-tabs">
       <button class="code-tab active" onclick="showTab('cql')">CQL</button>
       <button class="code-tab" onclick="showTab('cypher')">Cypher</button>
+      <button class="code-tab" onclick="showTab('indexes')">Indexes</button>
       <button class="code-tab" onclick="showTab('python')">Python Driver</button>
       <button class="code-tab" onclick="showTab('observe')">Observability</button>
     </div>
@@ -1000,6 +1044,41 @@
 <span class="kw">MATCH</span> (a:<span class="type">Person</span>)-[:<span class="type">FOLLOWS</span>*<span class="num">2</span>]->(c:<span class="type">Person</span>)
 <span class="kw">WHERE</span> a.name <span class="op">=</span> <span class="str">'Alice'</span>
 <span class="kw">RETURN DISTINCT</span> c.name;</pre>
+
+    <pre class="code-block" id="tab-indexes"><span class="cm">-- B-tree index for sorted range queries</span>
+<span class="kw">CREATE INDEX</span> idx_email <span class="kw">ON</span> <span class="type">social.users</span> (email) <span class="kw">USING</span> <span class="str">'btree'</span>;
+
+<span class="cm">-- Hash index for O(1) equality lookups</span>
+<span class="kw">CREATE INDEX</span> idx_uid <span class="kw">ON</span> <span class="type">social.users</span> (user_id) <span class="kw">USING</span> <span class="str">'hash'</span>;
+
+<span class="cm">-- Composite index on multiple columns</span>
+<span class="kw">CREATE INDEX</span> idx_name <span class="kw">ON</span> <span class="type">social.users</span> (last_name, first_name)
+  <span class="kw">USING</span> <span class="str">'composite'</span>;
+
+<span class="cm">-- Phonetic index — fuzzy name matching</span>
+<span class="kw">CREATE INDEX</span> idx_snd <span class="kw">ON</span> <span class="type">social.users</span> (last_name)
+  <span class="kw">USING</span> <span class="str">'phonetic'</span>
+  <span class="kw">WITH OPTIONS</span> <span class="op">=</span> {<span class="str">'algorithm'</span>: <span class="str">'double_metaphone'</span>};
+
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> social.users <span class="kw">WHERE</span> last_name <span class="kw">SOUNDS LIKE</span> <span class="str">'Smith'</span>;
+
+<span class="cm">-- Filtered index — partial index over a row subset</span>
+<span class="kw">CREATE INDEX</span> idx_active <span class="kw">ON</span> <span class="type">social.users</span> (email) <span class="kw">USING</span> <span class="str">'btree'</span>
+  <span class="kw">WHERE</span> status <span class="op">=</span> <span class="str">'active'</span>;
+
+<span class="cm">-- Vector index with HNSW for ANN search</span>
+<span class="kw">CREATE INDEX</span> idx_embed <span class="kw">ON</span> <span class="type">docs.articles</span> (embedding)
+  <span class="kw">USING</span> <span class="str">'vector'</span>
+  <span class="kw">WITH OPTIONS</span> <span class="op">=</span> {<span class="str">'method'</span>: <span class="str">'hnsw'</span>, <span class="str">'metric'</span>: <span class="str">'cosine'</span>,
+    <span class="str">'dimensions'</span>: <span class="str">'768'</span>, <span class="str">'m'</span>: <span class="str">'16'</span>, <span class="str">'ef_construction'</span>: <span class="str">'200'</span>};
+
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> docs.articles
+  <span class="kw">ORDER BY</span> embedding <span class="kw">ANN OF</span> [<span class="num">0.1</span>, <span class="num">0.2</span>, ...]
+  <span class="kw">LIMIT</span> <span class="num">10</span>;
+
+<span class="cm">-- Monitor index health</span>
+<span class="kw">SELECT</span> index_name, status, lag_seconds
+  <span class="kw">FROM</span> system_views.secondary_indexes;</pre>
 
     <pre class="code-block" id="tab-python"><span class="cm"># Your existing Python code — just change the contact point</span>
 <span class="kw">from</span> cassandra.cluster <span class="kw">import</span> Cluster
@@ -1109,6 +1188,22 @@ user = session.execute(stmt, [user_id])
           <td><span class="cross">✗</span></td>
         </tr>
         <tr>
+          <td>Vector Search</td>
+          <td class="ferrosa-col"><span class="check">✓</span> HNSW + IVFFlat</td>
+          <td>SAI (limited)</td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>Secondary Indexes</td>
+          <td class="ferrosa-col">6 types</td>
+          <td>SAI / 2i</td>
+          <td>SI</td>
+          <td>GSI / LSI</td>
+          <td>GSI</td>
+        </tr>
+        <tr>
           <td>Real-Time Pub/Sub</td>
           <td class="ferrosa-col"><span class="check">✓</span> SUBSCRIBE</td>
           <td>CDC (external)</td>
@@ -1202,6 +1297,15 @@ user = session.execute(stmt, [user_id])
           <span class="arch-item">ferrosa-schema</span>
           <span class="arch-item">RBAC</span>
           <span class="arch-item">Graph Extensions</span>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <span class="arch-layer-label">Index</span>
+        <div class="arch-layer-items">
+          <span class="arch-item">ferrosa-index</span>
+          <span class="arch-item">B-tree / Hash</span>
+          <span class="arch-item">Composite / Phonetic</span>
+          <span class="arch-item">Vector (HNSW / IVFFlat)</span>
         </div>
       </div>
       <div class="arch-layer">

@@ -467,7 +467,7 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
   <!-- ── Architecture ── -->
   <h2 id="architecture">Architecture Overview</h2>
 
-  <p>Ferrosa is composed of 10 independent Rust crates that can be used together or embedded individually.</p>
+  <p>Ferrosa is composed of 11 independent Rust crates that can be used together or embedded individually.</p>
 
   <div class="card-grid">
     <div class="card">
@@ -485,6 +485,10 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
     <div class="card">
       <h4>ferrosa-schema</h4>
       <p>Schema registry with ArcSwap, RBAC auth, column-level permissions, audit logging.</p>
+    </div>
+    <div class="card">
+      <h4>ferrosa-index</h4>
+      <p>Secondary index framework: B-tree, hash, composite, phonetic, vector (HNSW + IVFFlat). Async builds, staleness tracking.</p>
     </div>
     <div class="card">
       <h4>ferrosa-cql</h4>
