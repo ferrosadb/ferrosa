@@ -14,7 +14,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | ferrosa-schema | Done (DDL, auth, audit, system KS, graph extensions, virtual tables) |
 | ferrosa-cql | Done (Parts A-D + observability + LZ4/Snappy frame compression) |
 | ferrosa-graph | Done (Phase 1: parser, planner, executor, adjacency index, HTTP endpoint) |
-| ferrosa-net | Not started |
+| ferrosa-net | Done (Phase 1: wire protocol, handshake, RPC, pool, peer manager — PR #39) |
 | ferrosa-cluster | Not started |
 | ferrosa-ctl | Done (CLI + TUI monitoring dashboard) |
 | ferrosa (binary) | Done (single-node: CQL on 9042, optional graph on 7474, web console on 9090, smoke tests) |

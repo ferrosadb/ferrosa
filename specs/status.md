@@ -6,16 +6,16 @@
 ## Overview
 
 Ferrosa is a fully functional **single-node CQL-compatible database** with graph query
-support and built-in observability. The path to distributed operation requires ferrosa-net
-and ferrosa-cluster, which are the two major unstarted crates.
+support and built-in observability. The internode transport layer (ferrosa-net Phase 1) is
+complete. The path to distributed operation requires ferrosa-cluster.
 
 | Metric | Value |
 |--------|-------|
-| Crates | 8 of 10 planned |
-| Source files | ~135 |
-| Source LOC | ~46,000 |
-| Test functions | ~1,040 |
-| Integration test files | 18 |
+| Crates | 9 of 10 planned |
+| Source files | ~150 |
+| Source LOC | ~48,300 |
+| Test functions | ~1,083 |
+| Integration test files | 19 |
 
 ## Maturity Assessment
 
@@ -29,7 +29,7 @@ cql            ██████   ██████  ██████   █
 graph          █████░   ██████  ████░░   ███░░░
 ctl            ██████   ██████  ███░░░   ███░░░
 binary         █████░   ██████  ███░░░   ██░░░░
-net            ░░░░░░   ░░░░░░  ░░░░░░   ░░░░░░
+net            █████░   ████░░  ████░░   ██░░░░
 cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░░░░░░
 ```
 
@@ -151,11 +151,23 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
   - [ ] Graceful shutdown sequencing
   - [ ] Configuration file support (currently env vars only)
 
-### ferrosa-net — Not Started (Spec Written)
+### ferrosa-net — Phase 1 Complete (PR #39)
 
-- **Purpose:** Custom internode protocol, TLS, connection management, RPC service
-  layer, failure detection
-- **Prerequisites:** Single-node functionality stable
+- **LOC:** 2,317 (14 files) | **Tests:** 43 (40 unit + 3 integration)
+- **Modules:** `codec`, `config`, `discovery` (seeds), `error`, `handshake`, `message`,
+  `peer`, `pool`, `rpc` (handler, server, client)
+- **What's done:** 12-byte binary wire protocol with 3 priority lanes (Raft/Data/Bulk),
+  21 message types, PSK-authenticated handshake (HMAC-SHA256), RPC server with connection
+  limits + handshake timeout, RPC client with request-response and fire-and-forget,
+  `PriorityPool` (3 TCP connections per peer), static seed discovery, `PeerManager` with
+  heartbeat-based failure detection. Proptest fuzzing for message decode. No dependency
+  on ferrosa-common.
+- **Remaining (Phase 2):**
+  - [ ] TLS via rustls for internode encryption
+  - [ ] Connection reconnection and backoff
+  - [ ] Graceful shutdown / drain
+  - [ ] Compression (LZ4/Snappy frame-level)
+  - [ ] Metrics and tracing integration
 - **Spec:** [Net/Cluster Design](../docs/superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 - **Threat Model:** [Net/Cluster Threats](threat-model-net-cluster.md)
 
@@ -171,15 +183,16 @@ cluster        ░░░░░░   ░░░░░░  ░░░░░░   ░
 | Item | Location | State |
 |------|----------|-------|
 | ~~Storage replay + compaction execution~~ | ~~`.worktrees/storage-replay-compaction`~~ | Merged (PR #38) |
-| Net/cluster design spec | `docs/superpowers/specs/` | Draft, pending implementation plan |
+| ~~ferrosa-net Phase 1~~ | ~~`ferrosa-net/`~~ | Complete (PR #39) |
+| ferrosa-cluster | Not started | Next up |
 
 ## Path to Distributed Operation
 
 The critical path from single-node to multi-node:
 
-1. **ferrosa-storage:** Commit log replay + compaction execution (WIP)
+1. ~~**ferrosa-storage:** Commit log replay + compaction execution~~ (Done — PR #38)
 1. **ferrosa-schema:** System table persistence (Chunk B)
-1. **ferrosa-net:** Internode protocol design and implementation
+1. ~~**ferrosa-net:** Internode transport (Phase 1)~~ (Done — PR #39)
 1. **ferrosa-cluster:** Raft metadata, ring topology, request routing
 1. **ferrosa-cluster:** Tunable consistency levels (ONE, QUORUM, ALL)
 1. **ferrosa-cluster:** Hinted handoff and repair
