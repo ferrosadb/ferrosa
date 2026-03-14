@@ -66,14 +66,14 @@ pub enum IndexKey {
     Vector(Vec<f32>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexFiles {
     pub data_path: PathBuf,
     pub meta_path: PathBuf,
     pub meta: IndexFileMeta,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexFileMeta {
     pub index_type: IndexType,
     pub index_name: String,
