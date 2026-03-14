@@ -1,4 +1,4 @@
-name: Nightly Fuzz
+name: Nightly Fuzz + Smoke Test
 
 on:
   schedule:
@@ -92,3 +92,34 @@ jobs:
             echo "::error::Property tests found failures — check regression files"
             exit 1
           fi
+
+  smoke-test:
+    name: Docker Smoke Test (Pair Mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Docker smoke test
+        run: bash tests/docker-smoke.sh
+
+      - name: Collect Docker logs on failure
+        if: failure()
+        run: |
+          docker compose logs node1 > node1.log 2>&1 || true
+          docker compose logs node2 > node2.log 2>&1 || true
+
+      - name: Upload Docker logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-smoke-logs
+          path: |
+            node1.log
+            node2.log
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v --remove-orphans 2>/dev/null || true
