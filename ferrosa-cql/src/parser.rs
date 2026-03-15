@@ -418,6 +418,7 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Index) => {
                 self.parse_create_index().map(Statement::CreateIndex)
             }
+            TokenKind::Keyword(Keyword::Type) => self.parse_create_type(),
             _ => Err(CqlError::SyntaxError(format!(
                 "CREATE {:?} not yet supported at position {}",
                 tok.kind, tok.pos
@@ -732,6 +733,7 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Table) => {
                 self.parse_alter_table().map(Statement::AlterTable)
             }
+            TokenKind::Keyword(Keyword::Type) => self.parse_alter_type(),
             _ => Err(CqlError::SyntaxError(format!(
                 "ALTER {:?} not yet supported at position {}",
                 tok.kind, tok.pos
@@ -785,6 +787,7 @@ impl<'input> Parser<'input> {
         match &tok.kind {
             TokenKind::Keyword(Keyword::Table) => self.parse_drop_table().map(Statement::DropTable),
             TokenKind::Keyword(Keyword::Index) => self.parse_drop_index().map(Statement::DropIndex),
+            TokenKind::Keyword(Keyword::Type) => self.parse_drop_type(),
             _ => Err(CqlError::SyntaxError(format!(
                 "DROP {:?} not yet supported at position {}",
                 tok.kind, tok.pos
@@ -800,6 +803,93 @@ impl<'input> Parser<'input> {
         Ok(DropTableStatement {
             keyspace,
             table,
+            if_exists,
+        })
+    }
+
+    // ---------------------------------------------------------------
+    // CREATE/ALTER/DROP TYPE (UDT)
+    // ---------------------------------------------------------------
+
+    fn parse_create_type(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Type))?;
+
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (keyspace, name) = self.parse_table_ref()?;
+
+        self.lexer.expect(&TokenKind::LParen)?;
+
+        let mut fields: Vec<(String, CqlTypeName)> = vec![];
+        loop {
+            let tok = self.lexer.peek()?;
+            if tok.kind == TokenKind::RParen {
+                break;
+            }
+            let field_name = self.parse_ident()?;
+            let field_type = self.parse_cql_type_name()?;
+            fields.push((field_name, field_type));
+            if !self.lexer.eat(&TokenKind::Comma)? {
+                break;
+            }
+        }
+
+        self.lexer.expect(&TokenKind::RParen)?;
+
+        Ok(Statement::CreateType {
+            keyspace,
+            name,
+            if_not_exists,
+            fields,
+        })
+    }
+
+    fn parse_alter_type(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Type))?;
+
+        let (keyspace, name) = self.parse_table_ref()?;
+
+        let mut alterations = vec![];
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            TokenKind::Keyword(Keyword::Add) => {
+                self.lexer.next_token()?;
+                let field_name = self.parse_ident()?;
+                let field_type = self.parse_cql_type_name()?;
+                alterations.push(TypeAlteration::AddField {
+                    name: field_name,
+                    field_type,
+                });
+            }
+            TokenKind::Keyword(Keyword::Rename) => {
+                self.lexer.next_token()?;
+                let from = self.parse_ident()?;
+                self.lexer.expect(&TokenKind::Keyword(Keyword::To))?;
+                let to = self.parse_ident()?;
+                alterations.push(TypeAlteration::RenameField { from, to });
+            }
+            _ => {
+                return Err(CqlError::SyntaxError(format!(
+                    "expected ADD or RENAME after ALTER TYPE, got {:?} at position {}",
+                    tok.kind, tok.pos
+                )))
+            }
+        }
+
+        Ok(Statement::AlterType {
+            keyspace,
+            name,
+            alterations,
+        })
+    }
+
+    fn parse_drop_type(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Type))?;
+        let if_exists = self.parse_if_exists()?;
+        let (keyspace, name) = self.parse_table_ref()?;
+
+        Ok(Statement::DropType {
+            keyspace,
+            name,
             if_exists,
         })
     }
@@ -1988,8 +2078,8 @@ mod tests {
 
     #[test]
     fn parse_unsupported_returns_error() {
-        // CREATE TYPE is not yet supported
-        let err = parse("CREATE TYPE address (street text, city text)").unwrap_err();
+        // CREATE MATERIALIZED VIEW is not yet supported
+        let err = parse("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t").unwrap_err();
         match err {
             CqlError::SyntaxError(msg) => assert!(
                 msg.contains("not yet supported"),
@@ -2380,6 +2470,127 @@ mod tests {
     #[test]
     fn parse_subscribe_enforces_min_interval() {
         assert!(parse("SUBSCRIBE SELECT * FROM t EVERY 100ms").is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // CREATE/ALTER/DROP TYPE tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_create_type_basic() {
+        let stmt = parse("CREATE TYPE ks.address (street text, city text, zip int)").unwrap();
+        match stmt {
+            Statement::CreateType {
+                keyspace,
+                name,
+                fields,
+                if_not_exists,
+            } => {
+                assert_eq!(keyspace, Some("ks".to_string()));
+                assert_eq!(name, "address");
+                assert_eq!(fields.len(), 3);
+                assert!(!if_not_exists);
+            }
+            _ => panic!("expected CreateType"),
+        }
+    }
+
+    #[test]
+    fn parse_create_type_if_not_exists() {
+        let stmt = parse("CREATE TYPE IF NOT EXISTS ks.address (street text)").unwrap();
+        match stmt {
+            Statement::CreateType { if_not_exists, .. } => assert!(if_not_exists),
+            _ => panic!("expected CreateType"),
+        }
+    }
+
+    #[test]
+    fn parse_create_type_no_keyspace() {
+        let stmt = parse("CREATE TYPE address (street text, city text)").unwrap();
+        match stmt {
+            Statement::CreateType { keyspace, name, .. } => {
+                assert_eq!(keyspace, None);
+                assert_eq!(name, "address");
+            }
+            _ => panic!("expected CreateType"),
+        }
+    }
+
+    #[test]
+    fn parse_create_type_frozen_field() {
+        let stmt = parse("CREATE TYPE ks.contact (addr frozen<text>, phone text)").unwrap();
+        match stmt {
+            Statement::CreateType { fields, .. } => {
+                assert_eq!(fields.len(), 2);
+                match &fields[0].1 {
+                    CqlTypeName::Frozen(_) => {}
+                    _ => panic!("expected Frozen type for first field"),
+                }
+            }
+            _ => panic!("expected CreateType"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_type_add() {
+        let stmt = parse("ALTER TYPE ks.address ADD country text").unwrap();
+        match stmt {
+            Statement::AlterType {
+                keyspace,
+                name,
+                alterations,
+            } => {
+                assert_eq!(keyspace, Some("ks".to_string()));
+                assert_eq!(name, "address");
+                assert_eq!(alterations.len(), 1);
+                match &alterations[0] {
+                    TypeAlteration::AddField { name, .. } => assert_eq!(name, "country"),
+                    _ => panic!("expected AddField"),
+                }
+            }
+            _ => panic!("expected AlterType"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_type_rename() {
+        let stmt = parse("ALTER TYPE ks.address RENAME street TO street_name").unwrap();
+        match stmt {
+            Statement::AlterType { alterations, .. } => match &alterations[0] {
+                TypeAlteration::RenameField { from, to } => {
+                    assert_eq!(from, "street");
+                    assert_eq!(to, "street_name");
+                }
+                _ => panic!("expected RenameField"),
+            },
+            _ => panic!("expected AlterType"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_type() {
+        let stmt = parse("DROP TYPE ks.address").unwrap();
+        match stmt {
+            Statement::DropType {
+                keyspace,
+                name,
+                if_exists,
+            } => {
+                assert_eq!(keyspace, Some("ks".to_string()));
+                assert_eq!(name, "address");
+                assert!(!if_exists);
+            }
+            _ => panic!("expected DropType"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_type_if_exists() {
+        let stmt = parse("DROP TYPE IF EXISTS ks.address").unwrap();
+        match stmt {
+            Statement::DropType { if_exists, .. } => assert!(if_exists),
+            _ => panic!("expected DropType"),
+        }
     }
 }
 
