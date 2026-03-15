@@ -110,8 +110,35 @@ async fn bootstrap_from_s3(
     // Apply schema (creates keyspaces, tables, roles, grants)
     schema.apply_snapshot(snapshot)?;
 
-    // Register each table with the StorageEngine
+    // Load manifest to know what SSTables exist in S3.
+    let (manifest, _version) = ferrosa_storage::Manifest::load(store.as_ref(), prefix).await?;
+    let sstable_count: usize = manifest.sstables.values().map(|v| v.len()).sum();
+
+    // Download SSTables from S3 to local disk BEFORE registering tables,
+    // so register_table() finds them and opens readers.
     let snap = schema.snapshot();
+    let mut downloaded_total = 0usize;
+    for ((_ks, _tbl), table_meta) in &snap.tables {
+        if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
+            continue;
+        }
+        let table_id = ferrosa_storage::TableId::new(&table_meta.keyspace, &table_meta.name);
+        match storage
+            .download_sstables_from_s3(&table_id, &manifest)
+            .await
+        {
+            Ok(n) => downloaded_total += n,
+            Err(e) => {
+                tracing::warn!(
+                    table = %table_meta.name,
+                    ks = %table_meta.keyspace,
+                    "failed to download SSTables from S3: {e}"
+                );
+            }
+        }
+    }
+
+    // Register each table with the StorageEngine — will find downloaded SSTables on disk.
     for ((_ks, _tbl), table_meta) in &snap.tables {
         if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
             continue;
@@ -126,15 +153,12 @@ async fn bootstrap_from_s3(
         }
     }
 
-    // Also load the manifest to know about SSTables
-    let (manifest, _version) = ferrosa_storage::Manifest::load(store.as_ref(), prefix).await?;
-    let sstable_count: usize = manifest.sstables.values().map(|v| v.len()).sum();
-
     tracing::info!(
         ks_count,
         table_count,
         sstable_count,
-        "S3 bootstrap complete: schema and tables restored"
+        downloaded_total,
+        "S3 bootstrap complete: schema restored, SSTables downloaded"
     );
 
     Ok(())
@@ -455,7 +479,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut compact_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         // Persist schema snapshot to S3 every 60s (catches DDL changes).
         let mut schema_sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        let mut s3_warned = false;
         let mut last_schema_version = uuid::Uuid::nil();
 
         loop {
@@ -463,6 +486,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = flush_interval.tick() => {
                     if let Err(e) = maintenance_engine.flush_if_needed() {
                         tracing::warn!(%e, "periodic flush failed");
+                    }
+
+                    // After flush, sync new SSTables to S3.
+                    if has_s3 {
+                        match maintenance_engine.sync_sstables_to_s3().await {
+                            Ok(n) if n > 0 => {
+                                tracing::info!(count = n, "synced SSTables to S3");
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "S3 SSTable sync failed");
+                            }
+                            _ => {}
+                        }
                     }
 
                     // Commit log GC: discard segments with no remaining dirty tables.
@@ -478,14 +514,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ = compact_interval.tick() => {
                     maintenance_engine.poll_compactions();
-
-                    if has_s3 && !s3_warned {
-                        tracing::warn!(
-                            "S3 object storage configured but automatic upload not yet wired; \
-                             SSTables will remain on local disk only"
-                        );
-                        s3_warned = true;
-                    }
                 }
                 _ = schema_sync_interval.tick() => {
                     if !has_s3 { continue; }
