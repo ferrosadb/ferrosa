@@ -12,6 +12,7 @@ members = [
     "ferrosa-schema",
     "ferrosa-sstable",
     "ferrosa-storage",
+    "ferrosa-udf",
 ]
 
 [workspace.package]
