@@ -9,27 +9,24 @@ use ferrosa_common::DataType;
 use ferrosa_schema::VirtualTableRegistry;
 use serde_json::{json, Value};
 
-type AppState = Arc<VirtualTableRegistry>;
-type ClusterAppState = Arc<ModeController>;
+use super::WebAppState;
 
-pub fn routes(registry: Arc<VirtualTableRegistry>) -> Router {
+pub fn routes() -> Router<WebAppState> {
     Router::new()
         .route("/connections", get(get_connections))
         .route("/storage_stats", get(get_storage_stats))
         .route("/active_queries", get(get_active_queries))
         .route("/tables", get(list_tables))
-        .with_state(registry)
 }
 
-pub fn cluster_routes(mode_controller: Arc<ModeController>) -> Router {
+pub fn cluster_routes() -> Router<WebAppState> {
     Router::new()
         .route("/status", get(cluster_status))
         .route("/promote", post(cluster_promote))
         .route("/switchover", post(cluster_switchover))
-        .with_state(mode_controller)
 }
 
-async fn cluster_status(State(mc): State<ClusterAppState>) -> Json<Value> {
+async fn cluster_status(State(mc): State<Arc<ModeController>>) -> Json<Value> {
     Json(json!({
         "mode": mc.mode().to_string(),
         "role": mc.role().map(|r| r.to_string()),
@@ -37,7 +34,7 @@ async fn cluster_status(State(mc): State<ClusterAppState>) -> Json<Value> {
     }))
 }
 
-async fn cluster_promote(State(mc): State<ClusterAppState>) -> (StatusCode, Json<Value>) {
+async fn cluster_promote(State(mc): State<Arc<ModeController>>) -> (StatusCode, Json<Value>) {
     match mc.force_promote() {
         Ok(()) => (
             StatusCode::OK,
@@ -53,7 +50,7 @@ async fn cluster_promote(State(mc): State<ClusterAppState>) -> (StatusCode, Json
     }
 }
 
-async fn cluster_switchover(State(mc): State<ClusterAppState>) -> (StatusCode, Json<Value>) {
+async fn cluster_switchover(State(mc): State<Arc<ModeController>>) -> (StatusCode, Json<Value>) {
     match mc.switchover().await {
         Ok(()) => (
             StatusCode::OK,
@@ -69,25 +66,25 @@ async fn cluster_switchover(State(mc): State<ClusterAppState>) -> (StatusCode, J
     }
 }
 
-async fn get_connections(State(registry): State<AppState>) -> Json<Value> {
+async fn get_connections(State(registry): State<Arc<VirtualTableRegistry>>) -> Json<Value> {
     Json(virtual_table_to_json(&registry, "connections"))
 }
 
-async fn get_storage_stats(State(registry): State<AppState>) -> Json<Value> {
+async fn get_storage_stats(State(registry): State<Arc<VirtualTableRegistry>>) -> Json<Value> {
     Json(virtual_table_to_json(&registry, "storage_stats"))
 }
 
-async fn get_active_queries(State(registry): State<AppState>) -> Json<Value> {
+async fn get_active_queries(State(registry): State<Arc<VirtualTableRegistry>>) -> Json<Value> {
     Json(virtual_table_to_json(&registry, "active_queries"))
 }
 
-async fn list_tables(State(registry): State<AppState>) -> Json<Value> {
+async fn list_tables(State(registry): State<Arc<VirtualTableRegistry>>) -> Json<Value> {
     let tables = registry.list("system_observability");
     let names: Vec<&str> = tables.iter().map(|t| t.name()).collect();
     Json(json!(names))
 }
 
-fn virtual_table_to_json(registry: &VirtualTableRegistry, table_name: &str) -> Value {
+pub(crate) fn virtual_table_to_json(registry: &VirtualTableRegistry, table_name: &str) -> Value {
     let table = match registry.get("system_observability", table_name) {
         Some(t) => t,
         None => return json!([]),

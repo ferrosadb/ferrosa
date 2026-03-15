@@ -17,7 +17,10 @@ ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-cql = { path = "../ferrosa-cql" }
 ferrosa-graph = { path = "../ferrosa-graph" }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
 rust-embed = "8"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -28,3 +31,4 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
+tokio-tungstenite = "0.26"
