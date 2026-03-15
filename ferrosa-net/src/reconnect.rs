@@ -11,8 +11,8 @@ use crate::rpc::client::RpcClient;
 
 /// Exponential backoff with a configurable initial delay and maximum cap.
 ///
-/// Each call to [`next_delay`] returns the current delay and doubles it for
-/// the next call, capped at `max`.  Call [`reset`] to restart from `initial`.
+/// Each call to [`Self::next_delay`] returns the current delay and doubles it for
+/// the next call, capped at `max`.  Call [`Self::reset`] to restart from `initial`.
 pub struct ExponentialBackoff {
     initial: Duration,
     max: Duration,
@@ -41,7 +41,7 @@ impl ExponentialBackoff {
     }
 }
 
-/// State of a single lane within a [`PriorityPool`].
+/// State of a single lane within a `PriorityPool`.
 pub enum LaneState {
     /// The TCP connection is established and the client is usable.
     Connected(RpcClient),

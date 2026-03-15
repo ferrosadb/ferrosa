@@ -13,7 +13,7 @@
 //! # Failure handling
 //!
 //! If a send fails the task returns immediately, leaving the remaining hints
-//! on disk.  The caller (typically [`ModeController::on_peer_recovered`]) is
+//! on disk.  The caller (typically `ModeController::on_peer_recovered`) is
 //! responsible for re-spawning the task on the next recovery event.
 //!
 //! # Cleanup

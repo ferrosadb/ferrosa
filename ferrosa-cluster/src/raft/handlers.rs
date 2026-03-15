@@ -2,7 +2,7 @@
 //! local storage reads.
 //!
 //! Each handler implements [`RpcHandler`] and is registered in the
-//! [`HandlerRegistry`] during cluster initialization (Task 2).  The handlers
+//! `HandlerRegistry` during cluster initialization (Task 2).  The handlers
 //! are the inbound counterparts of the outbound serialization done in
 //! [`super::network`].
 //!
