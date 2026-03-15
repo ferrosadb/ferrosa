@@ -1,8 +1,13 @@
-//! Hash index implementation: O(1) point lookups via HashMap.
+//! Hash secondary index.
 //!
-//! Supports [`IndexCapabilities::POINT_LOOKUP`] only.
-//! [`range()`](IndexReader::range) and [`nearest()`](IndexReader::nearest)
-//! return [`IndexError::Unsupported`].
+//! Stores entries in a `HashMap<key_bytes, Vec<RowPosition>>` for O(1) point
+//! lookups. Does not support range scans or nearest lookups.
+//!
+//! ## File format
+//!
+//! Same binary layout as the B-tree index (length-prefixed entries), but
+//! entries are not required to be sorted. On read, they are loaded into a
+//! `HashMap`.
 
 use crate::{
     IndexBuilder, IndexCapabilities, IndexConfig, IndexError, IndexFactory, IndexFileMeta,
@@ -10,45 +15,51 @@ use crate::{
 };
 use ferrosa_common::CellValue;
 use std::collections::HashMap;
-use std::io::{Read as _, Write as _};
 use std::ops::Bound;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+
+// ── Factory ──────────────────────────────────────────────────────────────────
 
 /// Factory for creating hash index builders and readers.
 pub struct HashIndexFactory;
 
 impl IndexFactory for HashIndexFactory {
     fn create_builder(&self, config: &IndexConfig) -> IndexResult<Box<dyn IndexBuilder>> {
+        let file_path = config.output_dir.join(format!("{}.hash", config.name));
         Ok(Box::new(HashBuilder {
             entries: Vec::new(),
-            config: config.clone(),
+            file_path,
         }))
     }
 
     fn open_reader(&self, files: &IndexFiles) -> IndexResult<Box<dyn IndexReader>> {
-        let data = std::fs::read(&files.data_path)?;
-        let entries = deserialize_entries(&data)?;
-        let mut map: HashMap<Vec<u8>, Vec<RowPosition>> = HashMap::new();
-        for (key, pos) in entries {
-            map.entry(key).or_default().push(pos);
-        }
-        Ok(Box::new(HashReader { map }))
+        let data = std::fs::read(&files.data.path)?;
+        let entries = deserialize_to_map(&data)?;
+        Ok(Box::new(HashReader { entries }))
     }
 
-    fn merge(
-        &self,
-        readers: Vec<Box<dyn IndexReader>>,
-        builder: Box<dyn IndexBuilder>,
-    ) -> IndexResult<IndexFiles> {
-        let _ = readers;
-        builder.finish()
+    fn index_type(&self) -> IndexType {
+        IndexType::Hash
+    }
+
+    fn capabilities(&self) -> IndexCapabilities {
+        IndexCapabilities::POINT_LOOKUP
     }
 }
 
-/// Accumulates entries during index build.
+// ── Builder ──────────────────────────────────────────────────────────────────
+
+/// Raw entry before building the hash map.
+#[derive(Debug, Clone)]
+struct RawEntry {
+    key: Vec<u8>,
+    position: RowPosition,
+}
+
+/// Accumulates rows and writes a hash index file.
 pub struct HashBuilder {
-    entries: Vec<(Vec<u8>, RowPosition)>,
-    config: IndexConfig,
+    entries: Vec<RawEntry>,
+    file_path: PathBuf,
 }
 
 impl IndexBuilder for HashBuilder {
@@ -56,99 +67,60 @@ impl IndexBuilder for HashBuilder {
         &mut self,
         partition_key: &[u8],
         clustering_key: &[u8],
-        cells: &[(u16, CellValue)],
+        cells: &[CellValue],
+        column_positions: &[usize],
     ) -> IndexResult<()> {
-        let col_pos = self
-            .config
-            .column_positions
-            .first()
-            .copied()
-            .ok_or_else(|| IndexError::Build("no column positions configured".into()))?;
-
-        let cell = cells
-            .iter()
-            .find(|(pos, _)| *pos as usize == col_pos)
-            .map(|(_, cv)| cv);
-
-        let cell = match cell {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-
-        if cell.is_tombstone() {
+        if column_positions.is_empty() {
             return Ok(());
         }
 
-        let key_bytes = match &cell.value {
+        let col_pos = column_positions[0];
+        if col_pos >= cells.len() {
+            return Err(IndexError::MissingColumn(col_pos));
+        }
+
+        let cell = &cells[col_pos];
+        // Skip tombstones
+        let value = match &cell.value {
             Some(v) => v.clone(),
             None => return Ok(()),
         };
 
-        self.entries.push((
-            key_bytes,
-            RowPosition {
+        self.entries.push(RawEntry {
+            key: value,
+            position: RowPosition {
                 partition_key: partition_key.to_vec(),
                 clustering_key: clustering_key.to_vec(),
             },
-        ));
+        });
 
         Ok(())
     }
 
     fn finish(self: Box<Self>) -> IndexResult<IndexFiles> {
-        let row_count = self.entries.len() as u64;
         let data = serialize_entries(&self.entries);
+        std::fs::write(&self.file_path, &data)?;
 
-        let data_path = self.config.output_dir.join(format!(
-            "{}-{}.db",
-            self.config.sstable_prefix, self.config.index_name
-        ));
-        let meta_path = self.config.output_dir.join(format!(
-            "{}-{}.meta",
-            self.config.sstable_prefix, self.config.index_name
-        ));
-
-        std::fs::create_dir_all(&self.config.output_dir)?;
-        std::fs::write(&data_path, &data)?;
-
-        let checksum = crc32(&data);
-        let file_size = data.len() as u64;
-        let build_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let meta = IndexFileMeta {
-            index_type: IndexType::Hash,
-            index_name: self.config.index_name.clone(),
-            row_count,
-            build_timestamp,
-            sstable_id: self.config.sstable_prefix.clone(),
-            file_size,
-            checksum,
-        };
-
-        let meta_json = serde_json::to_vec(&meta)
-            .map_err(|e| IndexError::Build(format!("meta serialization: {e}")))?;
-        std::fs::write(&meta_path, &meta_json)?;
-
+        let size = data.len() as u64;
         Ok(IndexFiles {
-            data_path,
-            meta_path,
-            meta,
+            data: IndexFileMeta {
+                path: self.file_path,
+                size,
+            },
         })
     }
 }
 
-/// Reads a hash index from a deserialized HashMap.
+// ── Reader ───────────────────────────────────────────────────────────────────
+
+/// Reads a hash index for O(1) point lookups.
 pub struct HashReader {
-    map: HashMap<Vec<u8>, Vec<RowPosition>>,
+    entries: HashMap<Vec<u8>, Vec<RowPosition>>,
 }
 
 impl IndexReader for HashReader {
     fn lookup(&self, key: &IndexKey) -> IndexResult<Vec<RowPosition>> {
-        let needle = extract_bytes(key)?;
-        Ok(self.map.get(needle).cloned().unwrap_or_default())
+        Ok(self.entries.get(&key.0).cloned().unwrap_or_default())
     }
 
     fn range(
@@ -157,18 +129,13 @@ impl IndexReader for HashReader {
         _end: Bound<&IndexKey>,
     ) -> IndexResult<Vec<RowPosition>> {
         Err(IndexError::Unsupported(
-            "range scan not supported by hash index".into(),
+            "range scan not supported by hash index".to_string(),
         ))
     }
 
-    fn nearest(
-        &self,
-        _query: &[f32],
-        _k: usize,
-        _ef_search: Option<u16>,
-    ) -> IndexResult<Vec<(RowPosition, f32)>> {
+    fn nearest(&self, _key: &IndexKey) -> IndexResult<Vec<RowPosition>> {
         Err(IndexError::Unsupported(
-            "nearest not supported by hash index".into(),
+            "nearest lookup not supported by hash index".to_string(),
         ))
     }
 
@@ -177,274 +144,201 @@ impl IndexReader for HashReader {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ── Serialization ────────────────────────────────────────────────────────────
 
-fn extract_bytes(key: &IndexKey) -> IndexResult<&[u8]> {
-    match key {
-        IndexKey::Bytes(b) => Ok(b.as_slice()),
-        _ => Err(IndexError::Query(
-            "hash index only supports Bytes keys".into(),
-        )),
-    }
-}
+fn serialize_entries(entries: &[RawEntry]) -> Vec<u8> {
+    let mut buf = Vec::new();
 
-/// Same binary format as btree for on-disk storage (order does not matter for hash).
-fn serialize_entries(entries: &[(Vec<u8>, RowPosition)]) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::new();
-    buf.write_all(&(entries.len() as u64).to_le_bytes())
-        .unwrap();
-    for (key, pos) in entries {
-        buf.write_all(&(key.len() as u32).to_le_bytes()).unwrap();
-        buf.write_all(key).unwrap();
-        buf.write_all(&(pos.partition_key.len() as u32).to_le_bytes())
-            .unwrap();
-        buf.write_all(&pos.partition_key).unwrap();
-        buf.write_all(&(pos.clustering_key.len() as u32).to_le_bytes())
-            .unwrap();
-        buf.write_all(&pos.clustering_key).unwrap();
+    // Header: entry count
+    buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+
+    for entry in entries {
+        // key_len + key_bytes
+        buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&entry.key);
+
+        // pk_len + pk_bytes
+        buf.extend_from_slice(&(entry.position.partition_key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&entry.position.partition_key);
+
+        // ck_len + ck_bytes
+        buf.extend_from_slice(&(entry.position.clustering_key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&entry.position.clustering_key);
     }
+
     buf
 }
 
-fn deserialize_entries(data: &[u8]) -> IndexResult<Vec<(Vec<u8>, RowPosition)>> {
-    let mut cursor = std::io::Cursor::new(data);
-    let mut buf8 = [0u8; 8];
-    let mut buf4 = [0u8; 4];
-
-    cursor
-        .read_exact(&mut buf8)
-        .map_err(|e| IndexError::Query(format!("read entry_count: {e}")))?;
-    let count = u64::from_le_bytes(buf8) as usize;
-
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        cursor
-            .read_exact(&mut buf4)
-            .map_err(|e| IndexError::Query(format!("read key_len: {e}")))?;
-        let key_len = u32::from_le_bytes(buf4) as usize;
-        let mut key = vec![0u8; key_len];
-        cursor
-            .read_exact(&mut key)
-            .map_err(|e| IndexError::Query(format!("read key: {e}")))?;
-
-        cursor
-            .read_exact(&mut buf4)
-            .map_err(|e| IndexError::Query(format!("read pk_len: {e}")))?;
-        let pk_len = u32::from_le_bytes(buf4) as usize;
-        let mut pk = vec![0u8; pk_len];
-        cursor
-            .read_exact(&mut pk)
-            .map_err(|e| IndexError::Query(format!("read pk: {e}")))?;
-
-        cursor
-            .read_exact(&mut buf4)
-            .map_err(|e| IndexError::Query(format!("read ck_len: {e}")))?;
-        let ck_len = u32::from_le_bytes(buf4) as usize;
-        let mut ck = vec![0u8; ck_len];
-        cursor
-            .read_exact(&mut ck)
-            .map_err(|e| IndexError::Query(format!("read ck: {e}")))?;
-
-        entries.push((
-            key,
-            RowPosition {
-                partition_key: pk,
-                clustering_key: ck,
-            },
-        ));
+fn deserialize_to_map(data: &[u8]) -> IndexResult<HashMap<Vec<u8>, Vec<RowPosition>>> {
+    if data.len() < 8 {
+        return Err(IndexError::Corrupt("file too short for header".to_string()));
     }
 
-    Ok(entries)
+    let entry_count = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
+    let mut map: HashMap<Vec<u8>, Vec<RowPosition>> = HashMap::new();
+    let mut offset = 8;
+
+    for _ in 0..entry_count {
+        let key = read_length_prefixed(data, &mut offset)?;
+        let pk = read_length_prefixed(data, &mut offset)?;
+        let ck = read_length_prefixed(data, &mut offset)?;
+
+        map.entry(key).or_default().push(RowPosition {
+            partition_key: pk,
+            clustering_key: ck,
+        });
+    }
+
+    Ok(map)
 }
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        let idx = ((crc ^ byte as u32) & 0xFF) as usize;
-        crc = CRC32_TABLE[idx] ^ (crc >> 8);
+fn read_length_prefixed(data: &[u8], offset: &mut usize) -> IndexResult<Vec<u8>> {
+    if *offset + 4 > data.len() {
+        return Err(IndexError::Corrupt(format!(
+            "unexpected EOF at offset {offset} reading length"
+        )));
     }
-    !crc
-}
+    let len = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+    *offset += 4;
 
-#[rustfmt::skip]
-static CRC32_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let poly: u32 = 0xEDB88320;
-    let mut i = 0;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ poly;
-            } else {
-                crc >>= 1;
-            }
-            j += 1;
-        }
-        table[i] = crc;
-        i += 1;
+    if *offset + len > data.len() {
+        return Err(IndexError::Corrupt(format!(
+            "unexpected EOF at offset {offset} reading {len} bytes"
+        )));
     }
-    table
-};
+    let bytes = data[*offset..*offset + len].to_vec();
+    *offset += len;
+    Ok(bytes)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrosa_common::CellValue;
+    use tempfile::tempdir;
 
-    fn make_config(dir: &std::path::Path) -> IndexConfig {
-        IndexConfig {
+    /// Helper: build a hash index from rows and return a reader.
+    fn build_and_read(
+        rows: Vec<(&[u8], &[u8], Vec<CellValue>)>,
+        column_positions: &[usize],
+    ) -> Box<dyn IndexReader> {
+        let dir = tempdir().unwrap();
+        let config = IndexConfig {
             index_type: IndexType::Hash,
-            column_positions: vec![0],
-            output_dir: dir.to_path_buf(),
-            sstable_prefix: "sstable-001".into(),
-            index_name: "idx_email_hash".into(),
-        }
-    }
-
-    fn cell(value: &[u8]) -> CellValue {
-        CellValue::live(value.to_vec(), 1000)
-    }
-
-    fn tombstone_cell() -> CellValue {
-        CellValue::tombstone(1000, 1_700_000_000)
-    }
-
-    #[test]
-    fn point_lookup() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
+            column_positions: column_positions.to_vec(),
+            output_dir: dir.path().to_path_buf(),
+            name: "test_hash".to_string(),
+        };
         let factory = HashIndexFactory;
         let mut builder = factory.create_builder(&config).unwrap();
 
-        builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"alice"))])
-            .unwrap();
-        builder
-            .add_row(b"pk2", b"ck2", &[(0, cell(b"bob"))])
-            .unwrap();
-        builder
-            .add_row(b"pk3", b"ck3", &[(0, cell(b"alice"))])
-            .unwrap();
+        for (pk, ck, cells) in &rows {
+            builder.add_row(pk, ck, cells, column_positions).unwrap();
+        }
 
         let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
+        factory.open_reader(&files).unwrap()
+    }
 
-        let results = reader.lookup(&IndexKey::Bytes(b"alice".to_vec())).unwrap();
-        assert_eq!(results.len(), 2);
+    #[test]
+    fn point_lookup_succeeds() {
+        let reader = build_and_read(
+            vec![
+                (b"pk1", b"ck1", vec![CellValue::live(b"alpha".to_vec(), 1)]),
+                (b"pk2", b"ck2", vec![CellValue::live(b"beta".to_vec(), 2)]),
+                (b"pk3", b"ck3", vec![CellValue::live(b"gamma".to_vec(), 3)]),
+            ],
+            &[0],
+        );
 
-        let results = reader.lookup(&IndexKey::Bytes(b"bob".to_vec())).unwrap();
+        let results = reader.lookup(&IndexKey(b"beta".to_vec())).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].partition_key, b"pk2");
+        assert_eq!(results[0].clustering_key, b"ck2");
+    }
 
-        let results = reader
-            .lookup(&IndexKey::Bytes(b"charlie".to_vec()))
-            .unwrap();
+    #[test]
+    fn point_lookup_not_found() {
+        let reader = build_and_read(
+            vec![(b"pk1", b"ck1", vec![CellValue::live(b"alpha".to_vec(), 1)])],
+            &[0],
+        );
+
+        let results = reader.lookup(&IndexKey(b"missing".to_vec())).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
-    fn empty_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HashIndexFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        assert_eq!(files.meta.row_count, 0);
-        let results = reader
-            .lookup(&IndexKey::Bytes(b"anything".to_vec()))
-            .unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn tombstone_skip() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HashIndexFactory;
-        let mut builder = factory.create_builder(&config).unwrap();
-
-        builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"alive"))])
-            .unwrap();
-        builder
-            .add_row(b"pk2", b"ck2", &[(0, tombstone_cell())])
-            .unwrap();
-
-        let files = builder.finish().unwrap();
-        assert_eq!(files.meta.row_count, 1);
-
-        let reader = factory.open_reader(&files).unwrap();
-        let results = reader.lookup(&IndexKey::Bytes(b"alive".to_vec())).unwrap();
-        assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn duplicate_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HashIndexFactory;
-        let mut builder = factory.create_builder(&config).unwrap();
-
-        builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"same"))])
-            .unwrap();
-        builder
-            .add_row(b"pk2", b"ck2", &[(0, cell(b"same"))])
-            .unwrap();
-        builder
-            .add_row(b"pk3", b"ck3", &[(0, cell(b"same"))])
-            .unwrap();
-
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let results = reader.lookup(&IndexKey::Bytes(b"same".to_vec())).unwrap();
-        assert_eq!(results.len(), 3);
-    }
-
-    #[test]
-    fn range_unsupported() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HashIndexFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
+    fn range_returns_unsupported() {
+        let reader = build_and_read(
+            vec![(b"pk1", b"ck1", vec![CellValue::live(b"alpha".to_vec(), 1)])],
+            &[0],
+        );
 
         let result = reader.range(Bound::Unbounded, Bound::Unbounded);
+        assert!(result.is_err());
         assert!(matches!(result, Err(IndexError::Unsupported(_))));
     }
 
     #[test]
-    fn nearest_unsupported() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HashIndexFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
+    fn nearest_returns_unsupported() {
+        let reader = build_and_read(
+            vec![(b"pk1", b"ck1", vec![CellValue::live(b"alpha".to_vec(), 1)])],
+            &[0],
+        );
 
-        let result = reader.nearest(&[1.0, 2.0], 5, None);
+        let result = reader.nearest(&IndexKey(b"alpha".to_vec()));
+        assert!(result.is_err());
         assert!(matches!(result, Err(IndexError::Unsupported(_))));
     }
 
     #[test]
-    fn capabilities_correct() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HashIndexFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
+    fn empty_index_returns_empty() {
+        let reader = build_and_read(vec![], &[0]);
 
+        let results = reader.lookup(&IndexKey(b"anything".to_vec())).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn tombstone_rows_are_skipped() {
+        let reader = build_and_read(
+            vec![
+                (b"pk1", b"ck1", vec![CellValue::live(b"alpha".to_vec(), 1)]),
+                (b"pk2", b"ck2", vec![CellValue::tombstone(2, 1700000000)]),
+                (b"pk3", b"ck3", vec![CellValue::live(b"gamma".to_vec(), 3)]),
+            ],
+            &[0],
+        );
+
+        // Tombstone should not be indexed at all
+        let alpha = reader.lookup(&IndexKey(b"alpha".to_vec())).unwrap();
+        assert_eq!(alpha.len(), 1);
+        let gamma = reader.lookup(&IndexKey(b"gamma".to_vec())).unwrap();
+        assert_eq!(gamma.len(), 1);
+
+        // pk2 had a tombstone - nothing to look up for it
+    }
+
+    #[test]
+    fn multiple_rows_with_same_key() {
+        let reader = build_and_read(
+            vec![
+                (b"pk1", b"ck1", vec![CellValue::live(b"same".to_vec(), 1)]),
+                (b"pk2", b"ck2", vec![CellValue::live(b"same".to_vec(), 2)]),
+            ],
+            &[0],
+        );
+
+        let results = reader.lookup(&IndexKey(b"same".to_vec())).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn capabilities_point_only() {
+        let reader = build_and_read(vec![], &[0]);
         let caps = reader.capabilities();
         assert!(caps.contains(IndexCapabilities::POINT_LOOKUP));
         assert!(!caps.contains(IndexCapabilities::RANGE_SCAN));
-        assert!(!caps.contains(IndexCapabilities::NEAREST));
     }
 }

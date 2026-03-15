@@ -1,115 +1,101 @@
-//! Metaphone phonetic encoding algorithm.
+//! Standard Metaphone encoding algorithm.
 //!
-//! The original Metaphone algorithm (Lawrence Philips, 1990) produces a
-//! variable-length phonetic code by applying English pronunciation rules.
+//! Metaphone generates a phonetic code based on English pronunciation rules.
 //! It is more accurate than Soundex for English names.
+//!
+//! Reference: Lawrence Philips, "Hanging on the Metaphone" (1990).
 
 use super::PhoneticEncoder;
 
-/// Original Metaphone encoder.
-pub struct Metaphone {
-    /// Maximum code length (default: 4).
-    pub max_length: usize,
-}
+/// Standard Metaphone encoder.
+pub struct MetaphoneEncoder;
 
-impl Default for Metaphone {
-    fn default() -> Self {
-        Self { max_length: 4 }
-    }
-}
+impl MetaphoneEncoder {
+    /// Maximum length of the generated code.
+    const MAX_LEN: usize = 4;
 
-impl Metaphone {
     fn is_vowel(c: char) -> bool {
         matches!(c, 'A' | 'E' | 'I' | 'O' | 'U')
     }
 }
 
-impl PhoneticEncoder for Metaphone {
+impl PhoneticEncoder for MetaphoneEncoder {
     fn encode(&self, input: &str) -> String {
-        let input = input.trim();
-        if input.is_empty() {
-            return String::new();
-        }
-
-        let upper: Vec<char> = input
+        let chars: Vec<char> = input
             .chars()
             .filter(|c| c.is_ascii_alphabetic())
             .map(|c| c.to_ascii_uppercase())
             .collect();
 
-        if upper.is_empty() {
+        if chars.is_empty() {
             return String::new();
         }
 
-        let mut result = String::with_capacity(self.max_length);
-        let len = upper.len();
-        let mut i = 0;
+        let len = chars.len();
+        let mut result = String::with_capacity(Self::MAX_LEN);
 
-        // Drop initial silent letters
-        if len >= 2 {
-            match (upper[0], upper[1]) {
-                ('A', 'E') | ('G', 'N') | ('K', 'N') | ('P', 'N') | ('W', 'R') => {
-                    i = 1;
-                }
-                _ => {}
+        let at = |i: usize| -> char {
+            if i < len {
+                chars[i]
+            } else {
+                '\0'
             }
+        };
+
+        // Drop initial silent letter combinations
+        let mut i: usize = 0;
+        match (at(0), at(1)) {
+            ('A', 'E') | ('G', 'N') | ('K', 'N') | ('P', 'N') | ('W', 'R') => i = 1,
+            _ => {}
         }
 
-        // Special handling for initial vowel: emit it
-        if i == 0 && Self::is_vowel(upper[0]) {
-            result.push(upper[0]);
-            i = 1;
-        }
+        while i < len && result.len() < Self::MAX_LEN {
+            let c = at(i);
+            let prev = if i > 0 { at(i - 1) } else { '\0' };
+            let next = at(i + 1);
+            let next2 = at(i + 2);
 
-        while i < len && result.len() < self.max_length {
-            let c = upper[i];
-            let next = if i + 1 < len {
-                Some(upper[i + 1])
-            } else {
-                None
-            };
-            let prev = if i > 0 { Some(upper[i - 1]) } else { None };
-            let next2 = if i + 2 < len {
-                Some(upper[i + 2])
-            } else {
-                None
-            };
-
-            // Skip duplicate adjacent consonants (except C)
-            if c != 'C' && prev == Some(c) {
+            // Skip duplicate adjacent letters (except C)
+            if c == prev && c != 'C' {
                 i += 1;
                 continue;
             }
 
             match c {
+                'A' | 'E' | 'I' | 'O' | 'U' => {
+                    // Vowels are only kept at the beginning
+                    if result.is_empty() {
+                        result.push(c);
+                    }
+                }
                 'B' => {
-                    // Drop B if after M at end of word
-                    if prev != Some('M') || i + 1 != len {
+                    // B unless silent at end after M (e.g., "dumb")
+                    if !(i == len - 1 && prev == 'M') {
                         result.push('B');
                     }
                 }
                 'C' => {
-                    if next == Some('I') && next2 == Some('A') {
-                        // CIA -> X
+                    if next == 'I' && next2 == 'A' {
                         result.push('X');
                         i += 2;
-                    } else if next == Some('I') || next == Some('E') || next == Some('Y') {
+                    } else if next == 'I' || next == 'E' || next == 'Y' {
                         result.push('S');
                         i += 1;
-                    } else if next == Some('H') {
-                        result.push('X');
+                    } else if next == 'H' {
+                        if prev == 'S' {
+                            result.push('K');
+                        } else {
+                            result.push('X');
+                        }
                         i += 1;
                     } else {
                         result.push('K');
                     }
                 }
                 'D' => {
-                    if next == Some('G')
-                        && next2.is_some()
-                        && (next2 == Some('I') || next2 == Some('E') || next2 == Some('Y'))
-                    {
+                    if next == 'G' && (next2 == 'I' || next2 == 'E' || next2 == 'Y') {
                         result.push('J');
-                        i += 2;
+                        i += 1;
                     } else {
                         result.push('T');
                     }
@@ -118,32 +104,26 @@ impl PhoneticEncoder for Metaphone {
                     result.push('F');
                 }
                 'G' => {
-                    if next == Some('H') && i + 2 < len && !Self::is_vowel(upper[i + 2]) {
-                        // GH before non-vowel: silent
-                        i += 1;
-                    } else if i > 0 && next == Some('H') && i + 2 >= len {
-                        // GH at end: silent
+                    if next == 'H' && (i + 2 >= len || !Self::is_vowel(next2)) {
+                        // GH not followed by vowel, or GH at end -> skip
                         i += 1;
                     } else if i > 0
-                        && next == Some('N')
-                        && (i + 2 >= len
-                            || (i + 3 >= len && next2.is_some() && upper.get(i + 2) == Some(&'E')))
+                        && next == 'N'
+                        && (i + 2 >= len || (next2 == 'E' && at(i + 3) == '\0'))
                     {
-                        // GN or GNE at end: silent
-                    } else if prev == Some('G') {
-                        // Already handled by double-letter skip, but just in case
-                    } else if next == Some('I') || next == Some('E') || next == Some('Y') {
+                        // GN or GNE at end -> skip
+                    } else if prev == 'G' {
+                        // GG -> skip second G
+                    } else if i > 0 && (next == 'I' || next == 'E' || next == 'Y') {
                         result.push('J');
-                    } else if next != Some('H') || Self::is_vowel(next.unwrap_or('X')) {
+                    } else if next == '\0' && i > 0 {
+                        // Silent G at end
+                    } else {
                         result.push('K');
                     }
                 }
                 'H' => {
-                    // H before a vowel and not after a vowel
-                    if next.is_some()
-                        && Self::is_vowel(next.unwrap())
-                        && (prev.is_none() || !Self::is_vowel(prev.unwrap()))
-                    {
+                    if Self::is_vowel(next) && !Self::is_vowel(prev) {
                         result.push('H');
                     }
                 }
@@ -151,7 +131,7 @@ impl PhoneticEncoder for Metaphone {
                     result.push('J');
                 }
                 'K' => {
-                    if prev != Some('C') {
+                    if prev != 'C' {
                         result.push('K');
                     }
                 }
@@ -165,7 +145,7 @@ impl PhoneticEncoder for Metaphone {
                     result.push('N');
                 }
                 'P' => {
-                    if next == Some('H') {
+                    if next == 'H' {
                         result.push('F');
                         i += 1;
                     } else {
@@ -179,27 +159,28 @@ impl PhoneticEncoder for Metaphone {
                     result.push('R');
                 }
                 'S' => {
-                    if next == Some('C') && next2 == Some('H') {
-                        // SCH -> SK
+                    if next == 'H' || (next == 'I' && (next2 == 'A' || next2 == 'O')) {
+                        result.push('X');
+                        if next != 'H' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    } else if next == 'C' && next2 == 'H' {
                         result.push('S');
                         result.push('K');
                         i += 2;
-                    } else if next == Some('H')
-                        || (next == Some('I') && (next2 == Some('O') || next2 == Some('A')))
-                    {
-                        result.push('X');
-                        i += 1;
                     } else {
                         result.push('S');
                     }
                 }
                 'T' => {
-                    if next == Some('H') {
+                    if next == 'H' {
                         result.push('0'); // theta
                         i += 1;
-                    } else if next == Some('I') && (next2 == Some('A') || next2 == Some('O')) {
+                    } else if next == 'I' && (next2 == 'A' || next2 == 'O') {
                         result.push('X');
-                        i += 1;
+                        i += 2;
                     } else {
                         result.push('T');
                     }
@@ -208,8 +189,7 @@ impl PhoneticEncoder for Metaphone {
                     result.push('F');
                 }
                 'W' | 'Y' => {
-                    // Only if followed by a vowel
-                    if next.is_some() && Self::is_vowel(next.unwrap()) {
+                    if Self::is_vowel(next) {
                         result.push(c);
                     }
                 }
@@ -220,15 +200,12 @@ impl PhoneticEncoder for Metaphone {
                 'Z' => {
                     result.push('S');
                 }
-                _ => {
-                    // Vowels and other characters are skipped (after initial)
-                }
+                _ => {}
             }
 
             i += 1;
         }
 
-        result.truncate(self.max_length);
         result
     }
 }
@@ -238,68 +215,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn basic_examples() {
-        let m = Metaphone::default();
-        // Common test cases for Metaphone
-        assert_eq!(m.encode("Smith"), "SM0");
-        // SCH -> SK, M, (I skipped), D->T => SKMT
-        assert_eq!(m.encode("Schmidt"), "SKMT");
+    fn metaphone_basic() {
+        let enc = MetaphoneEncoder;
+        assert_eq!(enc.encode("Smith"), "SM0");
+        // SCH -> SK in standard Metaphone
+        assert_eq!(enc.encode("Schmidt"), "SKMT");
     }
 
     #[test]
-    fn empty_input() {
-        let m = Metaphone::default();
-        assert_eq!(m.encode(""), "");
-        assert_eq!(m.encode("   "), "");
+    fn metaphone_empty() {
+        let enc = MetaphoneEncoder;
+        assert_eq!(enc.encode(""), "");
     }
 
     #[test]
-    fn single_letter() {
-        let m = Metaphone::default();
-        assert_eq!(m.encode("A"), "A");
-        assert_eq!(m.encode("B"), "B");
+    fn metaphone_initial_silent() {
+        let enc = MetaphoneEncoder;
+        assert_eq!(enc.encode("Knight"), "NT");
+        assert_eq!(enc.encode("Pneumonia"), "NMN");
+        assert_eq!(enc.encode("Wright"), "RT");
     }
 
     #[test]
-    fn case_insensitive() {
-        let m = Metaphone::default();
-        assert_eq!(m.encode("smith"), m.encode("SMITH"));
-        assert_eq!(m.encode("john"), m.encode("JOHN"));
+    fn metaphone_ph() {
+        let enc = MetaphoneEncoder;
+        assert_eq!(enc.encode("Phone"), "FN");
     }
 
     #[test]
-    fn phone_combinations() {
-        let m = Metaphone::default();
-        // PH -> F
-        assert_eq!(m.encode("Phone"), "FN");
-        // TH -> 0 (theta), O skipped, M, A skipped, S => 0MS
-        assert_eq!(m.encode("Thomas"), "0MS");
+    fn metaphone_th() {
+        let enc = MetaphoneEncoder;
+        // TH -> 0 (theta) in standard Metaphone
+        assert_eq!(enc.encode("Thomas"), "0MS");
     }
 
     #[test]
-    fn silent_initial_letters() {
-        let m = Metaphone::default();
-        // KN -> N
-        assert_eq!(m.encode("Knight"), "NT");
-        assert_eq!(m.encode("Knife"), "NF");
-        // PN -> N
-        assert_eq!(m.encode("Pneumonia"), "NMN");
-        // WR -> R
-        assert_eq!(m.encode("Write"), "RT");
+    fn metaphone_case_insensitive() {
+        let enc = MetaphoneEncoder;
+        assert_eq!(enc.encode("SMITH"), enc.encode("smith"));
     }
 
     #[test]
-    fn trailing_mb() {
-        let m = Metaphone::default();
-        // MB at end: B is silent
-        assert_eq!(m.encode("Lamb"), "LM");
-        assert_eq!(m.encode("Dumb"), "TM");
+    fn metaphone_similar_names() {
+        let enc = MetaphoneEncoder;
+        assert_eq!(enc.encode("Smith"), enc.encode("Smythe"));
     }
 
     #[test]
-    fn similar_sounding() {
-        let m = Metaphone::default();
-        // These should produce the same or similar codes
-        assert_eq!(m.encode("Smith"), m.encode("Smyth"));
+    fn metaphone_x_maps_to_ks() {
+        let enc = MetaphoneEncoder;
+        let code = enc.encode("Alex");
+        assert!(code.contains("KS"), "Alex should contain KS, got: {code}");
     }
 }

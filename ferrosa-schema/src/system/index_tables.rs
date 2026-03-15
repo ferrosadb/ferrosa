@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ferrosa_common::{CellValue, DataType};
-use ferrosa_index::{IndexType, VectorMethod};
+use ferrosa_index::IndexType;
 
 use crate::registry::SchemaSnapshot;
 use crate::virtual_table::{
@@ -64,24 +64,16 @@ fn index_type_kind(index_type: &IndexType) -> &'static str {
     match index_type {
         IndexType::BTree => "btree",
         IndexType::Hash => "hash",
-        IndexType::Composite { .. } => "composite",
-        IndexType::Phonetic { .. } => "phonetic",
-        IndexType::Filtered { inner, .. } => index_type_kind(inner),
-        IndexType::Vector {
-            method: VectorMethod::Hnsw { .. },
-            ..
-        } => "vector_hnsw",
-        IndexType::Vector {
-            method: VectorMethod::IvfFlat { .. },
-            ..
-        } => "vector_ivfflat",
+        IndexType::Composite => "composite",
+        IndexType::Phonetic => "phonetic",
+        IndexType::Filtered => "filtered",
     }
 }
 
 /// Format target columns for display.
 fn format_target(target_columns: &[String], index_type: &IndexType) -> String {
     match index_type {
-        IndexType::Composite { .. } => {
+        IndexType::Composite => {
             format!("({})", target_columns.join(", "))
         }
         _ => target_columns.join(", "),
@@ -214,9 +206,7 @@ mod tests {
                 keyspace: "ks1".into(),
                 table: "tbl1".into(),
                 name: "idx_composite".into(),
-                index_type: IndexType::Composite {
-                    columns: vec!["a".into(), "b".into()],
-                },
+                index_type: IndexType::Composite,
                 target_columns: vec!["a".into(), "b".into()],
                 filter_predicate: None,
                 options: HashMap::new(),

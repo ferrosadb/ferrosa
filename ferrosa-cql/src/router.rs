@@ -18,7 +18,7 @@ use indexmap::IndexMap;
 use ferrosa_cluster::pair::ddl::DdlOperation;
 use ferrosa_cluster::{DdlPath, WritePath};
 use ferrosa_common::DataType;
-use ferrosa_index::{DistanceMetric, IndexType, PhoneticAlgorithm, VectorMethod};
+use ferrosa_index::IndexType;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local, query_peers, query_role_members,
     query_role_permissions, query_roles, query_tables, AuthContext,
@@ -1497,79 +1497,15 @@ async fn route_drop_table(
 /// Resolve the USING string to an IndexType.
 fn resolve_index_type(
     using: Option<&str>,
-    columns: &[String],
-    options: &HashMap<String, String>,
+    _columns: &[String],
+    _options: &HashMap<String, String>,
 ) -> Result<IndexType, CqlError> {
     match using {
         None | Some("btree") => Ok(IndexType::BTree),
         Some("hash") => Ok(IndexType::Hash),
-        Some("composite") => Ok(IndexType::Composite {
-            columns: columns.to_vec(),
-        }),
-        Some("phonetic") => {
-            let algorithm = match options.get("algorithm").map(|s| s.as_str()) {
-                Some("soundex") | None => PhoneticAlgorithm::Soundex,
-                Some("metaphone") => PhoneticAlgorithm::Metaphone,
-                Some("double_metaphone") => PhoneticAlgorithm::DoubleMetaphone,
-                Some("caverphone") => PhoneticAlgorithm::Caverphone,
-                Some(other) => {
-                    return Err(CqlError::Invalid(format!(
-                        "unknown phonetic algorithm: {other}"
-                    )))
-                }
-            };
-            Ok(IndexType::Phonetic { algorithm })
-        }
-        Some("vector") => {
-            let dimensions: u32 = options
-                .get("dimensions")
-                .ok_or_else(|| {
-                    CqlError::Invalid("vector index requires 'dimensions' option".to_string())
-                })?
-                .parse()
-                .map_err(|_| CqlError::Invalid("invalid dimensions value".to_string()))?;
-
-            let metric = match options.get("metric").map(|s| s.as_str()) {
-                Some("cosine") | None => DistanceMetric::Cosine,
-                Some("l2") => DistanceMetric::L2,
-                Some("inner_product") => DistanceMetric::InnerProduct,
-                Some(other) => {
-                    return Err(CqlError::Invalid(format!(
-                        "unknown distance metric: {other}"
-                    )))
-                }
-            };
-
-            let method = match options.get("method").map(|s| s.as_str()) {
-                Some("hnsw") | None => {
-                    let m = options
-                        .get("m")
-                        .map(|s| s.parse().unwrap_or(16))
-                        .unwrap_or(16);
-                    let ef_construction = options
-                        .get("ef_construction")
-                        .map(|s| s.parse().unwrap_or(200))
-                        .unwrap_or(200);
-                    VectorMethod::Hnsw { m, ef_construction }
-                }
-                Some("ivfflat") => {
-                    let lists = options
-                        .get("lists")
-                        .map(|s| s.parse().unwrap_or(100))
-                        .unwrap_or(100);
-                    VectorMethod::IvfFlat { lists }
-                }
-                Some(other) => {
-                    return Err(CqlError::Invalid(format!("unknown vector method: {other}")))
-                }
-            };
-
-            Ok(IndexType::Vector {
-                method,
-                metric,
-                dimensions,
-            })
-        }
+        Some("composite") => Ok(IndexType::Composite),
+        Some("phonetic") => Ok(IndexType::Phonetic),
+        Some("filtered") => Ok(IndexType::Filtered),
         Some(other) => Err(CqlError::Invalid(format!("unknown index type: {other}"))),
     }
 }
@@ -2870,32 +2806,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_index_type_vector_hnsw() {
-        let mut opts = HashMap::new();
-        opts.insert("method".to_string(), "hnsw".to_string());
-        opts.insert("metric".to_string(), "cosine".to_string());
-        opts.insert("dimensions".to_string(), "768".to_string());
-        let result = resolve_index_type(Some("vector"), &["embed".to_string()], &opts);
+    fn resolve_index_type_phonetic() {
+        let result = resolve_index_type(Some("phonetic"), &["name".to_string()], &HashMap::new());
         assert!(result.is_ok());
-        match result.unwrap() {
-            IndexType::Vector {
-                method,
-                metric,
-                dimensions,
-            } => {
-                assert!(matches!(method, VectorMethod::Hnsw { .. }));
-                assert_eq!(metric, DistanceMetric::Cosine);
-                assert_eq!(dimensions, 768);
-            }
-            other => panic!("expected Vector, got {:?}", other),
-        }
+        assert_eq!(result.unwrap(), IndexType::Phonetic);
     }
 
     #[test]
-    fn resolve_index_type_vector_missing_dimensions_errors() {
-        let mut opts = HashMap::new();
-        opts.insert("method".to_string(), "hnsw".to_string());
-        let result = resolve_index_type(Some("vector"), &["embed".to_string()], &opts);
+    fn resolve_index_type_unknown_errors() {
+        let result = resolve_index_type(Some("nonexistent"), &["col".to_string()], &HashMap::new());
         assert!(result.is_err());
     }
 

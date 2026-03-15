@@ -1,16 +1,15 @@
 [package]
 name = "ferrosa-index"
-version = "0.1.0"
-edition = "2021"
+description = "Secondary index implementations for Ferrosa: B-tree, hash, and composite indexes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 ferrosa-common = { path = "../ferrosa-common" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-bitflags = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
-thiserror = "2"
-rand = "0.8"
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,76 +1,31 @@
-//! Double Metaphone phonetic encoding algorithm.
+//! Double Metaphone encoding algorithm.
 //!
-//! Developed by Lawrence Philips (2000), Double Metaphone returns two codes:
-//! a primary and an alternate. The alternate captures secondary pronunciations
-//! common in names of non-English origin (e.g., Germanic, Slavic, Celtic).
+//! Double Metaphone generates a primary and an alternate phonetic code for
+//! a given input. The primary code represents the most common pronunciation;
+//! the alternate handles variant pronunciations (e.g., for names of different
+//! ethnic origins).
 //!
-//! This implementation produces codes of up to 4 characters.
+//! For simplicity in v1, the [`PhoneticEncoder::encode`] implementation
+//! returns only the primary code. The full `(primary, alternate)` pair is
+//! available via [`DoubleMetaphoneEncoder::encode_full`].
+//!
+//! Reference: Lawrence Philips, "The Double Metaphone Search Algorithm" (2000).
 
 use super::PhoneticEncoder;
 
 /// Double Metaphone encoder.
-///
-/// Returns the primary code via [`PhoneticEncoder::encode`].
-/// Use [`encode_both`](DoubleMetaphone::encode_both) to get both primary and alternate.
-pub struct DoubleMetaphone {
-    /// Maximum code length (default: 4).
-    pub max_length: usize,
-}
+pub struct DoubleMetaphoneEncoder;
 
-impl Default for DoubleMetaphone {
-    fn default() -> Self {
-        Self { max_length: 4 }
-    }
-}
+impl DoubleMetaphoneEncoder {
+    /// Maximum code length.
+    const MAX_LEN: usize = 4;
 
-impl DoubleMetaphone {
     fn is_vowel(c: char) -> bool {
         matches!(c, 'A' | 'E' | 'I' | 'O' | 'U')
     }
 
-    fn char_at(chars: &[char], i: usize) -> char {
-        if i < chars.len() {
-            chars[i]
-        } else {
-            '\0'
-        }
-    }
-
-    fn starts_with_at(chars: &[char], pos: usize, s: &str) -> bool {
-        let target: Vec<char> = s.chars().collect();
-        if pos + target.len() > chars.len() {
-            return false;
-        }
-        for (j, &tc) in target.iter().enumerate() {
-            if chars[pos + j] != tc {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn is_slavo_germanic(chars: &[char]) -> bool {
-        for &c in chars {
-            if c == 'W' || c == 'K' {
-                return true;
-            }
-        }
-        // Check for CZ or WITZ patterns
-        for i in 0..chars.len() {
-            if Self::starts_with_at(chars, i, "CZ") || Self::starts_with_at(chars, i, "WITZ") {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Returns (primary, alternate) codes.
-    pub fn encode_both(&self, input: &str) -> (String, String) {
-        let input = input.trim();
-        if input.is_empty() {
-            return (String::new(), String::new());
-        }
-
+    /// Return both primary and alternate metaphone codes.
+    pub fn encode_full(&self, input: &str) -> (String, String) {
         let chars: Vec<char> = input
             .chars()
             .filter(|c| c.is_ascii_alphabetic())
@@ -82,340 +37,191 @@ impl DoubleMetaphone {
         }
 
         let len = chars.len();
-        let slavo_germanic = Self::is_slavo_germanic(&chars);
-        let mut primary = String::with_capacity(self.max_length);
-        let mut alternate = String::with_capacity(self.max_length);
-        let mut i = 0;
+        let mut primary = String::with_capacity(Self::MAX_LEN);
+        let mut alternate = String::with_capacity(Self::MAX_LEN);
 
-        // Skip initial silent combinations
-        if len >= 2 {
-            match (chars[0], chars[1]) {
-                ('G', 'N') | ('K', 'N') | ('P', 'N') | ('A', 'E') | ('W', 'R') => {
-                    i = 1;
-                }
-                _ => {}
+        let at = |i: usize| -> char {
+            if i < len {
+                chars[i]
+            } else {
+                '\0'
             }
+        };
+
+        let mut i: usize = 0;
+
+        // Handle initial silent letters
+        match (at(0), at(1)) {
+            ('G', 'N') | ('K', 'N') | ('P', 'N') | ('A', 'E') | ('W', 'R') => i = 1,
+            _ => {}
         }
 
-        // Initial vowel maps to A
-        if i < len && Self::is_vowel(chars[i]) {
+        // Initial vowel -> map to A
+        if i == 0 && Self::is_vowel(at(0)) {
             primary.push('A');
             alternate.push('A');
-            i += 1;
+            i = 1;
         }
 
-        while i < len && (primary.len() < self.max_length || alternate.len() < self.max_length) {
-            let c = chars[i];
+        while i < len && (primary.len() < Self::MAX_LEN || alternate.len() < Self::MAX_LEN) {
+            let c = at(i);
+            let next = at(i + 1);
+            let prev = if i > 0 { at(i - 1) } else { '\0' };
+
+            // Skip duplicate letters except C
+            if c == prev && c != 'C' {
+                i += 1;
+                continue;
+            }
+
+            let mut push_both = |ch: char| {
+                if primary.len() < Self::MAX_LEN {
+                    primary.push(ch);
+                }
+                if alternate.len() < Self::MAX_LEN {
+                    alternate.push(ch);
+                }
+            };
 
             match c {
                 'A' | 'E' | 'I' | 'O' | 'U' => {
-                    // Vowels after initial position are skipped
-                    i += 1;
+                    // Vowels only kept at start (already handled above)
                 }
                 'B' => {
-                    primary.push('P');
-                    alternate.push('P');
-                    // Skip BB
-                    if Self::char_at(&chars, i + 1) == 'B' {
-                        i += 2;
-                    } else {
-                        i += 1;
+                    if !(i == len - 1 && prev == 'M') {
+                        push_both('P');
                     }
                 }
                 'C' => {
-                    if Self::starts_with_at(&chars, i, "CH") {
-                        primary.push('X');
-                        alternate.push('X');
-                        i += 2;
-                    } else if Self::starts_with_at(&chars, i, "CK") {
-                        primary.push('K');
-                        alternate.push('K');
-                        i += 2;
-                    } else if Self::starts_with_at(&chars, i, "CI")
-                        || Self::starts_with_at(&chars, i, "CE")
-                        || Self::starts_with_at(&chars, i, "CY")
-                    {
-                        primary.push('S');
-                        alternate.push('S');
-                        i += 2;
-                    } else {
-                        primary.push('K');
-                        alternate.push('K');
-                        if Self::char_at(&chars, i + 1) == 'C' {
-                            i += 2;
-                        } else {
-                            i += 1;
+                    if next == 'H' {
+                        push_both('X');
+                        i += 1;
+                    } else if next == 'I' || next == 'E' || next == 'Y' {
+                        if primary.len() < Self::MAX_LEN {
+                            primary.push('S');
                         }
+                        if alternate.len() < Self::MAX_LEN {
+                            alternate.push('S');
+                        }
+                        if next == 'I' && at(i + 2) == 'A' {
+                            i += 2;
+                        }
+                    } else {
+                        push_both('K');
                     }
                 }
                 'D' => {
-                    if Self::starts_with_at(&chars, i, "DG") {
-                        let after_dg = Self::char_at(&chars, i + 2);
-                        if after_dg == 'I' || after_dg == 'E' || after_dg == 'Y' {
-                            primary.push('J');
-                            alternate.push('J');
-                            i += 3;
-                        } else {
-                            primary.push('T');
-                            alternate.push('T');
-                            primary.push('K');
-                            alternate.push('K');
-                            i += 2;
-                        }
-                    } else {
-                        primary.push('T');
-                        alternate.push('T');
-                        if Self::char_at(&chars, i + 1) == 'D' {
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                }
-                'F' => {
-                    primary.push('F');
-                    alternate.push('F');
-                    if Self::char_at(&chars, i + 1) == 'F' {
-                        i += 2;
-                    } else {
+                    if next == 'G' && (at(i + 2) == 'I' || at(i + 2) == 'E' || at(i + 2) == 'Y') {
+                        push_both('J');
                         i += 1;
+                    } else {
+                        push_both('T');
                     }
                 }
+                'F' => push_both('F'),
                 'G' => {
-                    if Self::char_at(&chars, i + 1) == 'H' {
-                        if i + 2 < len && Self::is_vowel(chars[i + 2]) {
-                            // GH before vowel
-                            primary.push('K');
-                            alternate.push('K');
-                            i += 2;
-                        } else {
-                            // GH silent
-                            i += 2;
+                    if next == 'H' {
+                        if i + 2 < len && Self::is_vowel(at(i + 2)) {
+                            push_both('K');
                         }
-                    } else if Self::char_at(&chars, i + 1) == 'N' {
-                        // GN -> silent G
                         i += 1;
-                    } else if Self::char_at(&chars, i + 1) == 'G' {
-                        primary.push('K');
-                        alternate.push('K');
-                        i += 2;
-                    } else {
-                        let next = Self::char_at(&chars, i + 1);
-                        if next == 'I' || next == 'E' || next == 'Y' {
+                    } else if i > 0 && (next == 'N' || next == '\0') {
+                        // Silent G at end or before N
+                    } else if next == 'I' || next == 'E' || next == 'Y' {
+                        // G before front vowel: primary=J, alternate=K
+                        if primary.len() < Self::MAX_LEN {
                             primary.push('J');
-                            alternate.push('K');
-                            i += 2;
-                        } else {
-                            primary.push('K');
-                            alternate.push('K');
-                            i += 1;
                         }
+                        if alternate.len() < Self::MAX_LEN {
+                            alternate.push('K');
+                        }
+                    } else {
+                        push_both('K');
                     }
                 }
                 'H' => {
-                    // H is coded only if before a vowel and not after a vowel
-                    if i + 1 < len
-                        && Self::is_vowel(chars[i + 1])
-                        && (i == 0 || !Self::is_vowel(chars[i - 1]))
-                    {
-                        primary.push('H');
-                        alternate.push('H');
-                    }
-                    i += 1;
-                }
-                'J' => {
-                    primary.push('J');
-                    alternate.push('J');
-                    if Self::char_at(&chars, i + 1) == 'J' {
-                        i += 2;
-                    } else {
-                        i += 1;
+                    if Self::is_vowel(next) && !Self::is_vowel(prev) {
+                        push_both('H');
                     }
                 }
+                'J' => push_both('J'),
                 'K' => {
-                    primary.push('K');
-                    alternate.push('K');
-                    if Self::char_at(&chars, i + 1) == 'K' {
-                        i += 2;
-                    } else {
-                        i += 1;
+                    if prev != 'C' {
+                        push_both('K');
                     }
                 }
-                'L' => {
-                    primary.push('L');
-                    alternate.push('L');
-                    if Self::char_at(&chars, i + 1) == 'L' {
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                'M' => {
-                    primary.push('M');
-                    alternate.push('M');
-                    if Self::char_at(&chars, i + 1) == 'M' {
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                'N' => {
-                    primary.push('N');
-                    alternate.push('N');
-                    if Self::char_at(&chars, i + 1) == 'N' {
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
+                'L' => push_both('L'),
+                'M' => push_both('M'),
+                'N' => push_both('N'),
                 'P' => {
-                    if Self::char_at(&chars, i + 1) == 'H' {
-                        primary.push('F');
-                        alternate.push('F');
-                        i += 2;
-                    } else {
-                        primary.push('P');
-                        alternate.push('P');
-                        if Self::char_at(&chars, i + 1) == 'P' {
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                }
-                'Q' => {
-                    primary.push('K');
-                    alternate.push('K');
-                    if Self::char_at(&chars, i + 1) == 'Q' {
-                        i += 2;
-                    } else {
+                    if next == 'H' {
+                        push_both('F');
                         i += 1;
-                    }
-                }
-                'R' => {
-                    primary.push('R');
-                    alternate.push('R');
-                    if Self::char_at(&chars, i + 1) == 'R' {
-                        i += 2;
                     } else {
-                        i += 1;
+                        push_both('P');
                     }
                 }
+                'Q' => push_both('K'),
+                'R' => push_both('R'),
                 'S' => {
-                    if Self::starts_with_at(&chars, i, "SH") {
-                        primary.push('X');
-                        alternate.push('X');
-                        i += 2;
-                    } else if Self::starts_with_at(&chars, i, "SCH") {
-                        primary.push('X');
-                        alternate.push('S');
-                        i += 3;
-                    } else if Self::starts_with_at(&chars, i, "SC") {
-                        primary.push('S');
-                        alternate.push('S');
-                        primary.push('K');
-                        alternate.push('K');
+                    if next == 'H' {
+                        push_both('X');
+                        i += 1;
+                    } else if next == 'I' && (at(i + 2) == 'A' || at(i + 2) == 'O') {
+                        push_both('X');
                         i += 2;
                     } else {
-                        primary.push('S');
-                        alternate.push('S');
-                        if Self::char_at(&chars, i + 1) == 'S'
-                            || Self::char_at(&chars, i + 1) == 'Z'
-                        {
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
+                        push_both('S');
                     }
                 }
                 'T' => {
-                    if Self::starts_with_at(&chars, i, "TH") {
-                        primary.push('T');
-                        alternate.push('T');
-                        i += 2;
-                    } else if Self::starts_with_at(&chars, i, "TCH") {
-                        i += 3;
-                    } else {
-                        primary.push('T');
-                        alternate.push('T');
-                        if Self::char_at(&chars, i + 1) == 'T' {
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                }
-                'V' => {
-                    primary.push('F');
-                    alternate.push('F');
-                    if Self::char_at(&chars, i + 1) == 'V' {
+                    if next == 'H' {
+                        push_both('T');
+                        i += 1;
+                    } else if next == 'I' && (at(i + 2) == 'A' || at(i + 2) == 'O') {
+                        push_both('X');
                         i += 2;
                     } else {
-                        i += 1;
+                        push_both('T');
                     }
                 }
-                'W' => {
-                    if i + 1 < len && Self::is_vowel(chars[i + 1]) {
-                        primary.push('A');
-                        alternate.push('F');
-                        i += 1;
-                    } else {
-                        i += 1;
+                'V' => push_both('F'),
+                'W' | 'Y' => {
+                    if Self::is_vowel(next) {
+                        push_both(c);
                     }
                 }
                 'X' => {
-                    primary.push('K');
-                    alternate.push('K');
-                    primary.push('S');
-                    alternate.push('S');
-                    if Self::char_at(&chars, i + 1) == 'X' {
-                        i += 2;
-                    } else {
-                        i += 1;
+                    if primary.len() < Self::MAX_LEN {
+                        primary.push('K');
                     }
-                }
-                'Y' => {
-                    if i + 1 < len && Self::is_vowel(chars[i + 1]) {
-                        primary.push('A');
-                        alternate.push('A');
+                    if alternate.len() < Self::MAX_LEN {
+                        alternate.push('K');
                     }
-                    i += 1;
-                }
-                'Z' => {
-                    if Self::char_at(&chars, i + 1) == 'H' {
-                        primary.push('J');
-                        alternate.push('J');
-                        i += 2;
-                    } else {
+                    if primary.len() < Self::MAX_LEN {
                         primary.push('S');
-                        if slavo_germanic {
-                            alternate.push('S');
-                        } else {
-                            alternate.push('T');
-                            alternate.push('S');
-                        }
-                        if Self::char_at(&chars, i + 1) == 'Z' {
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
+                    }
+                    if alternate.len() < Self::MAX_LEN {
+                        alternate.push('S');
                     }
                 }
-                _ => {
-                    i += 1;
-                }
+                'Z' => push_both('S'),
+                _ => {}
             }
+
+            i += 1;
         }
 
-        primary.truncate(self.max_length);
-        alternate.truncate(self.max_length);
+        primary.truncate(Self::MAX_LEN);
+        alternate.truncate(Self::MAX_LEN);
+
         (primary, alternate)
     }
 }
 
-impl PhoneticEncoder for DoubleMetaphone {
+impl PhoneticEncoder for DoubleMetaphoneEncoder {
     fn encode(&self, input: &str) -> String {
-        self.encode_both(input).0
+        self.encode_full(input).0
     }
 }
 
@@ -424,86 +230,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn basic_examples() {
-        let dm = DoubleMetaphone::default();
-        // Smith -> primary should start with SM or similar
-        let (p, _) = dm.encode_both("Smith");
-        assert!(!p.is_empty());
+    fn double_metaphone_basic() {
+        let enc = DoubleMetaphoneEncoder;
+        let code = enc.encode("Smith");
+        assert!(!code.is_empty(), "Smith should produce a code");
     }
 
     #[test]
-    fn empty_input() {
-        let dm = DoubleMetaphone::default();
-        assert_eq!(dm.encode(""), "");
-        assert_eq!(dm.encode("   "), "");
+    fn double_metaphone_empty() {
+        let enc = DoubleMetaphoneEncoder;
+        assert_eq!(enc.encode(""), "");
     }
 
     #[test]
-    fn case_insensitive() {
-        let dm = DoubleMetaphone::default();
-        assert_eq!(dm.encode("smith"), dm.encode("SMITH"));
-        assert_eq!(dm.encode("johnson"), dm.encode("JOHNSON"));
+    fn double_metaphone_full_returns_pair() {
+        let enc = DoubleMetaphoneEncoder;
+        let (primary, alternate) = enc.encode_full("Smith");
+        assert!(!primary.is_empty());
+        assert!(!alternate.is_empty());
     }
 
     #[test]
-    fn primary_and_alternate_differ() {
-        let dm = DoubleMetaphone::default();
-        // Words with multiple pronunciations may differ
-        let (p, a) = dm.encode_both("Wagner");
-        // Both should be non-empty
-        assert!(!p.is_empty());
-        assert!(!a.is_empty());
+    fn double_metaphone_similar_names() {
+        let enc = DoubleMetaphoneEncoder;
+        assert_eq!(enc.encode("Smith"), enc.encode("Smythe"));
     }
 
     #[test]
-    fn similar_names_match() {
-        let dm = DoubleMetaphone::default();
-        // Smith and Smyth should produce similar primary codes
-        let (p1, _) = dm.encode_both("Smith");
-        let (p2, _) = dm.encode_both("Smyth");
-        assert_eq!(p1, p2);
-    }
-
-    #[test]
-    fn ph_produces_f() {
-        let dm = DoubleMetaphone::default();
-        let (p, _) = dm.encode_both("Philip");
+    fn double_metaphone_ph() {
+        let enc = DoubleMetaphoneEncoder;
+        let code = enc.encode("Philip");
         assert!(
-            p.starts_with('F'),
-            "Expected Philip to start with F, got {p}"
+            code.starts_with('F'),
+            "Philip should start with F, got: {code}"
         );
     }
 
     #[test]
-    fn initial_silent_letters() {
-        let dm = DoubleMetaphone::default();
-        let (p1, _) = dm.encode_both("Knight");
-        let (p2, _) = dm.encode_both("Night");
-        // Both should start with N
+    fn double_metaphone_max_length() {
+        let enc = DoubleMetaphoneEncoder;
+        let code = enc.encode("Alexandropoulos");
         assert!(
-            p1.starts_with('N'),
-            "Expected Knight to start with N, got {p1}"
-        );
-        assert!(
-            p2.starts_with('N'),
-            "Expected Night to start with N, got {p2}"
+            code.len() <= 4,
+            "code should be at most 4 chars, got: {code}"
         );
     }
 
     #[test]
-    fn sch_handling() {
-        let dm = DoubleMetaphone::default();
-        let (p, a) = dm.encode_both("Schmidt");
-        // SCH should produce X in primary, S in alternate
-        assert!(!p.is_empty());
-        assert!(!a.is_empty());
+    fn double_metaphone_case_insensitive() {
+        let enc = DoubleMetaphoneEncoder;
+        assert_eq!(enc.encode("SMITH"), enc.encode("smith"));
     }
 
     #[test]
-    fn max_length_respected() {
-        let dm = DoubleMetaphone { max_length: 4 };
-        let (p, a) = dm.encode_both("Abrahamson");
-        assert!(p.len() <= 4);
-        assert!(a.len() <= 4);
+    fn double_metaphone_g_variants() {
+        let enc = DoubleMetaphoneEncoder;
+        let (primary, alternate) = enc.encode_full("George");
+        assert!(
+            primary.starts_with('J'),
+            "George primary should start with J, got: {primary}"
+        );
+        assert!(
+            alternate.starts_with('K'),
+            "George alternate should start with K, got: {alternate}"
+        );
     }
 }

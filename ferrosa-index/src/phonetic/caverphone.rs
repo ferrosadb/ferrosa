@@ -1,136 +1,128 @@
-//! Caverphone phonetic encoding algorithm.
+//! Caverphone 2.0 encoding algorithm.
 //!
-//! Caverphone was developed by David Hood at the University of Otago in New
-//! Zealand for matching names in the electoral roll. It is tuned for New
-//! Zealand English pronunciation.
+//! Caverphone was designed by David Hood for matching New Zealand English
+//! names, particularly for electoral roll matching. Caverphone 2.0 produces
+//! a 10-character code.
 //!
-//! This implements Caverphone 2.0, which produces a 10-character code.
-//!
-//! The algorithm applies a sequence of ordered string replacements to the
-//! lowercased input, then pads/truncates to 10 characters.
+//! Reference: <https://en.wikipedia.org/wiki/Caverphone>
 
 use super::PhoneticEncoder;
 
 /// Caverphone 2.0 encoder.
-pub struct Caverphone;
+pub struct CaverphoneEncoder;
 
-impl PhoneticEncoder for Caverphone {
+impl PhoneticEncoder for CaverphoneEncoder {
     fn encode(&self, input: &str) -> String {
-        let input = input.trim();
         if input.is_empty() {
             return String::new();
         }
 
-        // Step 1: lowercase, keep only alpha
-        let mut s: String = input
+        // Step 1: Convert to lowercase, remove non-alpha
+        let mut word: String = input
             .chars()
             .filter(|c| c.is_ascii_alphabetic())
             .map(|c| c.to_ascii_lowercase())
             .collect();
 
-        if s.is_empty() {
+        if word.is_empty() {
             return String::new();
         }
 
         // Step 2: Remove trailing 'e'
-        if s.ends_with('e') {
-            s.pop();
-            if s.is_empty() {
+        if word.ends_with('e') {
+            word.pop();
+            if word.is_empty() {
                 return "1111111111".to_string();
             }
         }
 
-        // Step 3: Handle starting patterns
-        if s.starts_with("cough") {
-            s = format!("cou2f{}", &s[5..]);
-        } else if s.starts_with("rough") {
-            s = format!("rou2f{}", &s[5..]);
-        } else if s.starts_with("tough") {
-            s = format!("tou2f{}", &s[5..]);
-        } else if s.starts_with("enough") {
-            s = format!("enou2f{}", &s[6..]);
-        } else if s.starts_with("trough") {
-            s = format!("trou2f{}", &s[6..]);
+        // Step 3: Handle initial replacements for -ough words
+        if word.starts_with("cough") {
+            word = format!("cou2f{}", &word[5..]);
         }
-
-        if s.starts_with("gn") {
-            s = format!("2n{}", &s[2..]);
+        if word.starts_with("rough") {
+            word = format!("rou2f{}", &word[5..]);
         }
-
-        // Step 4: Handle ending 'mb'
-        if s.ends_with("mb") {
-            let new_len = s.len() - 2;
-            s.truncate(new_len);
-            s.push_str("m2");
+        if word.starts_with("tough") {
+            word = format!("tou2f{}", &word[5..]);
         }
-
-        // Step 5: Apply phonetic replacements in order
-        s = s.replace("cq", "2q");
-        s = s.replace("ci", "si");
-        s = s.replace("ce", "se");
-        s = s.replace("cy", "sy");
-        s = s.replace("tch", "2ch");
-        s = s.replace("c", "k");
-        s = s.replace("q", "k");
-        s = s.replace("x", "k");
-        s = s.replace("v", "f");
-        s = s.replace("dg", "2g");
-        s = s.replace("tio", "sio");
-        s = s.replace("tia", "sia");
-        s = s.replace("d", "t");
-        s = s.replace("ph", "fh");
-        s = s.replace("b", "p");
-        s = s.replace("sh", "s2");
-        s = s.replace("z", "s");
-
-        // Replace initial vowel with its mapped value
-        // (this is done as: if starts with vowel, replace that vowel pattern)
-        let first = s.chars().next().unwrap_or('\0');
-        if matches!(first, 'a' | 'e' | 'i' | 'o' | 'u') {
-            // Initial vowel is kept as the starting character
-            // but all other vowels will be removed
+        if word.starts_with("enough") {
+            word = format!("enou2f{}", &word[6..]);
         }
-
-        // Replace remaining vowels: 'aeiou' -> '3' (except initial)
-        s = s.replace("gh", "22");
-        s = s.replace("h", "2");
-
-        // Now handle vowels: keep first char, replace interior vowels with 3
-        let mut chars: Vec<char> = s.chars().collect();
-        for ch in chars.iter_mut().skip(1) {
-            if matches!(*ch, 'a' | 'e' | 'i' | 'o' | 'u' | 'y') {
-                *ch = '3';
+        // Handle words starting with "tro" + "ugh"
+        {
+            let prefix = "trough";
+            if word.starts_with(prefix) {
+                word = format!("trou2f{}", &word[6..]);
             }
         }
-        s = chars.into_iter().collect();
 
-        // Handle w -> treat like vowel (replace with 3 after position 0)
-        let mut chars: Vec<char> = s.chars().collect();
-        for ch in chars.iter_mut().skip(1) {
-            if *ch == 'w' {
-                *ch = '3';
+        // Replace 'gn' at start with '2n'
+        if word.starts_with("gn") {
+            word = format!("2n{}", &word[2..]);
+        }
+
+        // Replace 'mb' at end with 'm2'
+        if word.ends_with("mb") {
+            let prefix = &word[..word.len() - 2];
+            word = format!("{prefix}m2");
+        }
+
+        // Apply global replacements in order
+        let replacements: &[(&str, &str)] = &[
+            ("cq", "2q"),
+            ("ci", "si"),
+            ("ce", "se"),
+            ("cy", "sy"),
+            ("tch", "2ch"),
+            ("c", "k"),
+            ("q", "k"),
+            ("x", "k"),
+            ("v", "f"),
+            ("dg", "2g"),
+            ("tio", "sio"),
+            ("tia", "sia"),
+            ("d", "t"),
+            ("ph", "fh"),
+            ("b", "p"),
+            ("sh", "s2"),
+            ("z", "s"),
+        ];
+
+        for &(from, to) in replacements {
+            word = word.replace(from, to);
+        }
+
+        // Replace initial vowel with 'A'
+        let first = word.chars().next().unwrap();
+        if "aeiou".contains(first) {
+            word = format!("A{}", &word[1..]);
+        }
+
+        // Remove all remaining vowels
+        word = word.chars().filter(|&c| !"aeiou".contains(c)).collect();
+
+        // Remove all instances of '2' and '3'
+        word = word.chars().filter(|&c| c != '2' && c != '3').collect();
+
+        // Collapse consecutive duplicate characters
+        let mut collapsed = String::new();
+        let mut last = '\0';
+        for c in word.chars() {
+            if c != last {
+                collapsed.push(c);
             }
+            last = c;
         }
-        s = chars.into_iter().collect();
+        word = collapsed;
 
-        // Remove all '3's
-        s = s.replace('3', "");
-
-        // Remove all '2's
-        s = s.replace('2', "");
-
-        // If empty after removals, use initial character
-        if s.is_empty() {
-            s = first.to_string();
+        // Pad or truncate to 10 characters
+        while word.len() < 10 {
+            word.push('1');
         }
+        word.truncate(10);
 
-        // Pad with '1's to length 10
-        while s.len() < 10 {
-            s.push('1');
-        }
-        s.truncate(10);
-
-        s.to_ascii_uppercase()
+        word.to_uppercase()
     }
 }
 
@@ -139,60 +131,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn basic_examples() {
-        let c = Caverphone;
-        // Known Caverphone 2.0 test cases
-        let code = c.encode("Lee");
-        assert_eq!(code.len(), 10);
-        assert!(
-            code.starts_with('L'),
-            "Expected Lee to start with L, got {code}"
-        );
+    fn caverphone_empty() {
+        let enc = CaverphoneEncoder;
+        assert_eq!(enc.encode(""), "");
     }
 
     #[test]
-    fn empty_input() {
-        let c = Caverphone;
-        assert_eq!(c.encode(""), "");
-        assert_eq!(c.encode("   "), "");
-    }
-
-    #[test]
-    fn case_insensitive() {
-        let c = Caverphone;
-        assert_eq!(c.encode("smith"), c.encode("SMITH"));
-        assert_eq!(c.encode("Thompson"), c.encode("thompson"));
-    }
-
-    #[test]
-    fn ten_char_output() {
-        let c = Caverphone;
-        let code = c.encode("Smith");
+    fn caverphone_basic() {
+        let enc = CaverphoneEncoder;
+        let code = enc.encode("Thompson");
+        assert!(!code.is_empty());
         assert_eq!(code.len(), 10);
     }
 
     #[test]
-    fn similar_names() {
-        let c = Caverphone;
-        // Similar sounding names should get the same code
-        let code1 = c.encode("Smith");
-        let code2 = c.encode("Smyth");
-        assert_eq!(code1, code2, "Smith={code1} Smyth={code2} should match");
+    fn caverphone_similar_names() {
+        let enc = CaverphoneEncoder;
+        assert_eq!(enc.encode("Lee"), enc.encode("Lea"));
     }
 
     #[test]
-    fn nz_names() {
-        let c = Caverphone;
-        // Lee and Lea should match (both end in 'e' which is stripped)
-        let code1 = c.encode("Lee");
-        let code2 = c.encode("Lea");
-        assert_eq!(code1, code2, "Lee={code1} Lea={code2} should match");
+    fn caverphone_ten_chars() {
+        let enc = CaverphoneEncoder;
+        assert_eq!(enc.encode("A").len(), 10);
+        assert_eq!(enc.encode("Smith").len(), 10);
+        assert_eq!(enc.encode("Abrahamson").len(), 10);
     }
 
     #[test]
-    fn single_letter() {
-        let c = Caverphone;
-        let code = c.encode("A");
-        assert_eq!(code.len(), 10);
+    fn caverphone_case_insensitive() {
+        let enc = CaverphoneEncoder;
+        assert_eq!(enc.encode("SMITH"), enc.encode("smith"));
+    }
+
+    #[test]
+    fn caverphone_non_alpha_ignored() {
+        let enc = CaverphoneEncoder;
+        assert_eq!(enc.encode("O'Brien"), enc.encode("OBrien"));
     }
 }

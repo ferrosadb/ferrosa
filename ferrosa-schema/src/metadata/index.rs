@@ -51,17 +51,10 @@ mod tests {
             keyspace: "ks".into(),
             table: "tbl".into(),
             name: "idx_active".into(),
-            index_type: IndexType::Filtered {
-                predicate: FilterPredicate {
-                    column: "status".into(),
-                    op: FilterOp::Eq,
-                    value: b"active".to_vec(),
-                },
-                inner: Box::new(IndexType::BTree),
-            },
+            index_type: IndexType::Filtered,
             target_columns: vec!["email".into()],
             filter_predicate: Some(FilterPredicate {
-                column: "status".into(),
+                column_position: 2,
                 op: FilterOp::Eq,
                 value: b"active".to_vec(),
             }),
