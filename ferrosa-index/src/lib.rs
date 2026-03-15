@@ -1,11 +1,10 @@
-//! Secondary index implementations for Ferrosa.
+//! Secondary and vector index implementations for Ferrosa.
 //!
-//! This crate provides B-tree, hash, composite, phonetic, and filtered
+//! This crate provides B-tree, hash, composite, phonetic, filtered, and vector
 //! secondary indexes that map column values to row positions within SSTables.
-//! Each index type implements the [`IndexBuilder`], [`IndexReader`], and
-//! [`IndexFactory`] traits.
 //!
-//! Index types:
+//! # Secondary Indexes
+//!
 //! - **B-tree** ([`btree`]): Sorted index supporting point lookups and range scans.
 //! - **Hash** ([`hash`]): Hash-based index for O(1) point lookups.
 //! - **Composite** ([`composite`]): Multi-column index supporting full-key and prefix lookups.
@@ -13,12 +12,18 @@
 //!   or Caverphone encoding.
 //! - **Filtered** ([`filtered`]): Wraps another index, applying a predicate to filter rows
 //!   during build.
+//!
+//! # Vector Indexes
+//!
+//! - **HNSW** ([`vector::hnsw`]): Hierarchical Navigable Small World graph for ANN search.
+//! - **IVFFlat** ([`vector::ivfflat`]): Inverted File with Flat vectors for ANN search.
 
 pub mod btree;
 pub mod composite;
 pub mod filtered;
 pub mod hash;
 pub mod phonetic;
+pub mod vector;
 
 pub use phonetic::PhoneticAlgorithm;
 
@@ -41,6 +46,10 @@ pub enum IndexError {
     Corrupt(String),
     /// A required column was missing from the row.
     MissingColumn(usize),
+    /// Data format / serialization error.
+    Format(String),
+    /// Dimension mismatch between query vector and indexed vectors.
+    DimensionMismatch { expected: usize, got: usize },
 }
 
 impl fmt::Display for IndexError {
@@ -50,6 +59,10 @@ impl fmt::Display for IndexError {
             IndexError::Unsupported(msg) => write!(f, "unsupported: {msg}"),
             IndexError::Corrupt(msg) => write!(f, "corrupt index: {msg}"),
             IndexError::MissingColumn(idx) => write!(f, "missing column at position {idx}"),
+            IndexError::Format(msg) => write!(f, "format: {msg}"),
+            IndexError::DimensionMismatch { expected, got } => {
+                write!(f, "dimension mismatch: expected {expected}, got {got}")
+            }
         }
     }
 }
@@ -66,6 +79,12 @@ impl std::error::Error for IndexError {
 impl From<std::io::Error> for IndexError {
     fn from(e: std::io::Error) -> Self {
         IndexError::Io(e)
+    }
+}
+
+impl From<serde_json::Error> for IndexError {
+    fn from(e: serde_json::Error) -> Self {
+        IndexError::Format(e.to_string())
     }
 }
 
@@ -92,6 +111,27 @@ impl fmt::Display for IndexType {
             IndexType::Composite => write!(f, "composite"),
             IndexType::Phonetic => write!(f, "phonetic"),
             IndexType::Filtered => write!(f, "filtered"),
+        }
+    }
+}
+
+/// Distance metric for vector similarity search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DistanceMetric {
+    /// Euclidean (L2) distance.
+    L2,
+    /// Cosine distance: `1 - cosine_similarity`.
+    Cosine,
+    /// Negative inner (dot) product: `-dot(a, b)`.
+    InnerProduct,
+}
+
+impl fmt::Display for DistanceMetric {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DistanceMetric::L2 => f.write_str("l2"),
+            DistanceMetric::Cosine => f.write_str("cosine"),
+            DistanceMetric::InnerProduct => f.write_str("inner_product"),
         }
     }
 }
@@ -168,11 +208,6 @@ impl std::ops::BitOr for IndexCapabilities {
 /// to disk.
 pub trait IndexBuilder: Send {
     /// Add a row to the index.
-    ///
-    /// * `partition_key` - the row's partition key bytes
-    /// * `clustering_key` - the row's clustering key bytes (may be empty)
-    /// * `cells` - all cells in the row, ordered by column position
-    /// * `column_positions` - which columns to extract for the index key
     fn add_row(
         &mut self,
         partition_key: &[u8],
@@ -241,4 +276,44 @@ pub struct FilterPredicate {
     pub op: FilterOp,
     /// The value to compare against.
     pub value: Vec<u8>,
+}
+
+// ── Vector helpers ───────────────────────────────────────────────────────────
+
+/// Decode a byte slice into a vector of f32 values (little-endian).
+pub fn bytes_to_vec_f32(bytes: &[u8]) -> Result<Vec<f32>, IndexError> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(IndexError::Format(format!(
+            "vector byte length {} is not a multiple of 4",
+            bytes.len()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+/// Encode a vector of f32 values into bytes (little-endian).
+pub fn vec_f32_to_bytes(vec: &[f32]) -> Vec<u8> {
+    vec.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_to_vec_f32_roundtrip() {
+        let original = vec![1.0_f32, 2.5, -3.0, 0.0];
+        let bytes = vec_f32_to_bytes(&original);
+        let decoded = bytes_to_vec_f32(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn bytes_to_vec_f32_bad_length() {
+        let bytes = vec![0u8, 1, 2]; // 3 bytes, not multiple of 4
+        assert!(bytes_to_vec_f32(&bytes).is_err());
+    }
 }

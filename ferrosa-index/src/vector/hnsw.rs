@@ -1,201 +1,435 @@
-//! HNSW (Hierarchical Navigable Small World) vector index.
+//! HNSW (Hierarchical Navigable Small World) graph index for approximate
+//! nearest-neighbor search.
 //!
-//! Implements approximate nearest-neighbor search using a multi-layer
-//! navigable small world graph. Supports [`IndexCapabilities::NEAREST`] only.
+//! The HNSW graph is a multi-layer structure where:
+//! - Each node is a vector with connections to neighboring vectors
+//! - Higher layers are sparser, enabling fast coarse navigation
+//! - The base layer (layer 0) contains all vectors
+//! - Layer assignment follows an exponential distribution:
+//!   `l = floor(-ln(rand()) * mL)` where `mL = 1 / ln(m)`
+//!
+//! # References
+//!
+//! Malkov & Yashunin, "Efficient and robust approximate nearest neighbor
+//! search using Hierarchical Navigable Small World graphs" (2018).
 
-use crate::{
-    DistanceMetric, IndexBuilder, IndexCapabilities, IndexConfig, IndexError, IndexFactory,
-    IndexFileMeta, IndexFiles, IndexKey, IndexReader, IndexResult, IndexType, RowPosition,
-    VectorMethod,
-};
-use ferrosa_common::CellValue;
-use serde::{Deserialize, Serialize};
 use std::collections::BinaryHeap;
-use std::ops::Bound;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 use super::distance;
+use super::{
+    bytes_to_vec_f32, DistanceMetric, IndexBuilder, IndexCapability, IndexError, IndexFactory,
+    IndexReader, IndexResult, RowPosition,
+};
+use ferrosa_common::CellValue;
 
-/// Factory for creating HNSW index builders and readers.
-pub struct HnswFactory;
+// ---------------------------------------------------------------------------
+// Serializable graph structure
+// ---------------------------------------------------------------------------
 
-impl IndexFactory for HnswFactory {
-    fn create_builder(&self, config: &IndexConfig) -> IndexResult<Box<dyn IndexBuilder>> {
-        let (m, ef_construction, metric, dimensions) = match &config.index_type {
-            IndexType::Vector {
-                method: VectorMethod::Hnsw { m, ef_construction },
-                metric,
-                dimensions,
-            } => (*m, *ef_construction, metric.clone(), *dimensions),
-            _ => {
-                return Err(IndexError::Build(
-                    "HnswFactory requires Vector/Hnsw index type".into(),
-                ))
-            }
-        };
-        Ok(Box::new(HnswBuilder {
-            vectors: Vec::new(),
-            positions: Vec::new(),
-            m: m as usize,
-            ef_construction: ef_construction as usize,
-            metric,
-            dimensions: dimensions as usize,
-            config: config.clone(),
-        }))
-    }
-
-    fn open_reader(&self, files: &IndexFiles) -> IndexResult<Box<dyn IndexReader>> {
-        let data = std::fs::read(&files.data_path)?;
-        let graph: SerializedGraph = serde_json::from_slice(&data)
-            .map_err(|e| IndexError::Query(format!("deserialize HNSW graph: {e}")))?;
-        Ok(Box::new(HnswReader { graph }))
-    }
-
-    fn merge(
-        &self,
-        readers: Vec<Box<dyn IndexReader>>,
-        builder: Box<dyn IndexBuilder>,
-    ) -> IndexResult<IndexFiles> {
-        let _ = readers;
-        builder.finish()
-    }
+/// The serialized HNSW graph, stored as JSON on disk.
+#[derive(Debug, Serialize, Deserialize)]
+struct HnswGraphData {
+    /// `layers[l][node_id]` = list of neighbor node IDs at layer `l`.
+    layers: Vec<Vec<Vec<usize>>>,
+    /// `vectors[node_id]` = the vector for that node.
+    vectors: Vec<Vec<f32>>,
+    /// `positions[node_id]` = the row position for that node.
+    positions: Vec<RowPosition>,
+    /// Entry point node ID (if the graph is non-empty).
+    entry_point: Option<usize>,
+    /// The highest occupied layer index.
+    max_layer: usize,
+    /// Max connections per node per layer.
+    m: usize,
+    /// Construction-time search width.
+    ef_construction: usize,
+    /// Distance metric.
+    metric: DistanceMetric,
 }
 
-/// Accumulates vectors during index construction and builds the HNSW graph on finish.
-struct HnswBuilder {
+// ---------------------------------------------------------------------------
+// In-memory graph used during construction
+// ---------------------------------------------------------------------------
+
+/// In-memory HNSW graph, used for building.
+struct HnswGraph {
+    layers: Vec<Vec<Vec<usize>>>,
     vectors: Vec<Vec<f32>>,
     positions: Vec<RowPosition>,
+    entry_point: Option<usize>,
+    max_layer: usize,
     m: usize,
     ef_construction: usize,
     metric: DistanceMetric,
-    dimensions: usize,
-    config: IndexConfig,
+}
+
+impl HnswGraph {
+    fn new(m: usize, ef_construction: usize, metric: DistanceMetric) -> Self {
+        Self {
+            layers: vec![Vec::new()], // start with layer 0
+            vectors: Vec::new(),
+            positions: Vec::new(),
+            entry_point: None,
+            max_layer: 0,
+            m,
+            ef_construction,
+            metric,
+        }
+    }
+
+    /// Assign a random layer for a new node.
+    fn random_layer(&self) -> usize {
+        let mut rng = rand::thread_rng();
+        let ml = 1.0 / (self.m as f64).ln();
+        let r: f64 = rng.gen();
+        // Avoid -ln(0) by clamping
+        let r = r.max(1e-15);
+        (-r.ln() * ml).floor() as usize
+    }
+
+    /// Insert a vector into the graph.
+    fn insert(&mut self, vector: Vec<f32>, position: RowPosition) {
+        let node_id = self.vectors.len();
+        let node_layer = self.random_layer();
+
+        self.vectors.push(vector);
+        self.positions.push(position);
+
+        // Ensure we have enough layers
+        while self.layers.len() <= node_layer {
+            self.layers.push(Vec::new());
+        }
+        // Ensure each layer has a slot for this node
+        for layer in self.layers.iter_mut() {
+            while layer.len() <= node_id {
+                layer.push(Vec::new());
+            }
+        }
+
+        if self.entry_point.is_none() {
+            // First node: just set as entry point
+            self.entry_point = Some(node_id);
+            self.max_layer = node_layer;
+            return;
+        }
+
+        let entry = self.entry_point.unwrap();
+
+        // Phase 1: Greedily descend from the top layer down to node_layer + 1
+        let mut current_entry = entry;
+        let top = self.max_layer;
+        if top > node_layer {
+            for layer_idx in (node_layer + 1..=top).rev() {
+                current_entry = self.greedy_closest(layer_idx, current_entry, node_id);
+            }
+        }
+
+        // Phase 2: For layers node_layer down to 0, search and connect
+        let search_top = node_layer.min(self.max_layer);
+        for layer_idx in (0..=search_top).rev() {
+            let neighbors =
+                self.search_layer(layer_idx, current_entry, node_id, self.ef_construction);
+            // Keep the M closest
+            let m_max = if layer_idx == 0 { self.m * 2 } else { self.m };
+            let selected: Vec<usize> = neighbors.into_iter().take(m_max).collect();
+
+            // Connect node to selected neighbors (bidirectional)
+            for &neighbor in &selected {
+                self.layers[layer_idx][node_id].push(neighbor);
+                self.layers[layer_idx][neighbor].push(node_id);
+
+                // Prune neighbor's connections if over limit
+                if self.layers[layer_idx][neighbor].len() > m_max {
+                    self.prune_connections(layer_idx, neighbor, m_max);
+                }
+            }
+
+            if !selected.is_empty() {
+                current_entry = selected[0];
+            }
+        }
+
+        // Update entry point if this node's layer is higher
+        if node_layer > self.max_layer {
+            self.entry_point = Some(node_id);
+            self.max_layer = node_layer;
+        }
+    }
+
+    /// Greedily find the closest node to `target` starting from `entry`
+    /// in a single layer.
+    fn greedy_closest(&self, layer: usize, entry: usize, target: usize) -> usize {
+        let target_vec = &self.vectors[target];
+        let mut current = entry;
+        let mut current_dist = distance(&self.metric, &self.vectors[current], target_vec);
+
+        loop {
+            let mut changed = false;
+            if layer < self.layers.len() {
+                for &neighbor in &self.layers[layer][current] {
+                    let d = distance(&self.metric, &self.vectors[neighbor], target_vec);
+                    if d < current_dist {
+                        current = neighbor;
+                        current_dist = d;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        current
+    }
+
+    /// Search a layer for the `ef` closest nodes to the target node.
+    /// Returns node IDs sorted by distance (closest first).
+    fn search_layer(&self, layer: usize, entry: usize, target: usize, ef: usize) -> Vec<usize> {
+        self.search_layer_by_vec(layer, entry, &self.vectors[target].clone(), ef)
+    }
+
+    /// Search a layer for the `ef` closest nodes to a query vector.
+    fn search_layer_by_vec(
+        &self,
+        layer: usize,
+        entry: usize,
+        query: &[f32],
+        ef: usize,
+    ) -> Vec<usize> {
+        if layer >= self.layers.len() {
+            return Vec::new();
+        }
+
+        let entry_dist = distance(&self.metric, &self.vectors[entry], query);
+
+        // Min-heap for candidates (to explore)
+        let mut candidates: BinaryHeap<std::cmp::Reverse<OrdF32Node>> = BinaryHeap::new();
+        // Max-heap for results (to track worst in result set)
+        let mut results: BinaryHeap<OrdF32Node> = BinaryHeap::new();
+        let mut visited = std::collections::HashSet::new();
+
+        candidates.push(std::cmp::Reverse(OrdF32Node {
+            dist: entry_dist,
+            id: entry,
+        }));
+        results.push(OrdF32Node {
+            dist: entry_dist,
+            id: entry,
+        });
+        visited.insert(entry);
+
+        while let Some(std::cmp::Reverse(current)) = candidates.pop() {
+            let worst_dist = results.peek().map(|n| n.dist).unwrap_or(f32::INFINITY);
+            if current.dist > worst_dist && results.len() >= ef {
+                break;
+            }
+
+            if layer < self.layers.len() && current.id < self.layers[layer].len() {
+                for &neighbor in &self.layers[layer][current.id] {
+                    if visited.contains(&neighbor) {
+                        continue;
+                    }
+                    visited.insert(neighbor);
+
+                    let d = distance(&self.metric, &self.vectors[neighbor], query);
+                    let worst_dist = results.peek().map(|n| n.dist).unwrap_or(f32::INFINITY);
+
+                    if d < worst_dist || results.len() < ef {
+                        candidates.push(std::cmp::Reverse(OrdF32Node {
+                            dist: d,
+                            id: neighbor,
+                        }));
+                        results.push(OrdF32Node {
+                            dist: d,
+                            id: neighbor,
+                        });
+                        if results.len() > ef {
+                            results.pop(); // remove the worst
+                        }
+                    }
+                }
+            }
+        }
+
+        // Extract and sort by distance
+        let mut result_vec: Vec<(f32, usize)> =
+            results.into_iter().map(|n| (n.dist, n.id)).collect();
+        result_vec.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        result_vec.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Prune a node's connections to keep only the `max_conn` closest.
+    fn prune_connections(&mut self, layer: usize, node: usize, max_conn: usize) {
+        let node_vec = self.vectors[node].clone();
+        let mut scored: Vec<(f32, usize)> = self.layers[layer][node]
+            .iter()
+            .map(|&n| (distance(&self.metric, &self.vectors[n], &node_vec), n))
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(max_conn);
+        self.layers[layer][node] = scored.into_iter().map(|(_, id)| id).collect();
+    }
+
+    /// Convert to serializable data.
+    fn to_data(&self) -> HnswGraphData {
+        HnswGraphData {
+            layers: self.layers.clone(),
+            vectors: self.vectors.clone(),
+            positions: self.positions.clone(),
+            entry_point: self.entry_point,
+            max_layer: self.max_layer,
+            m: self.m,
+            ef_construction: self.ef_construction,
+            metric: self.metric,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ordered f32 wrapper for BinaryHeap
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct OrdF32Node {
+    dist: f32,
+    id: usize,
+}
+
+impl PartialEq for OrdF32Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for OrdF32Node {}
+
+impl PartialOrd for OrdF32Node {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrdF32Node {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dist
+            .partial_cmp(&other.dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HnswFactory
+// ---------------------------------------------------------------------------
+
+/// Factory for creating HNSW index builders and readers.
+pub struct HnswFactory {
+    /// Max connections per node per layer.
+    pub m: usize,
+    /// Construction-time search width.
+    pub ef_construction: usize,
+    /// Distance metric.
+    pub metric: DistanceMetric,
+}
+
+impl HnswFactory {
+    pub fn new(m: usize, ef_construction: usize, metric: DistanceMetric) -> Self {
+        Self {
+            m,
+            ef_construction,
+            metric,
+        }
+    }
+}
+
+impl IndexFactory for HnswFactory {
+    fn create_builder(&self, dir: &Path) -> Result<Box<dyn IndexBuilder>, IndexError> {
+        Ok(Box::new(HnswBuilder {
+            graph: HnswGraph::new(self.m, self.ef_construction, self.metric),
+            dir: dir.to_path_buf(),
+        }))
+    }
+
+    fn open_reader(&self, dir: &Path) -> Result<Box<dyn IndexReader>, IndexError> {
+        let db_path = dir.join("hnsw.db");
+        let data_bytes = std::fs::read(&db_path)?;
+        let data: HnswGraphData = serde_json::from_slice(&data_bytes)?;
+        Ok(Box::new(HnswReader { data }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HnswBuilder
+// ---------------------------------------------------------------------------
+
+/// Builds an HNSW index by inserting vectors one at a time.
+pub struct HnswBuilder {
+    graph: HnswGraph,
+    dir: std::path::PathBuf,
 }
 
 impl IndexBuilder for HnswBuilder {
-    fn add_row(
-        &mut self,
-        partition_key: &[u8],
-        clustering_key: &[u8],
-        cells: &[(u16, CellValue)],
-    ) -> IndexResult<()> {
-        let col_pos = self
-            .config
-            .column_positions
-            .first()
-            .copied()
-            .ok_or_else(|| IndexError::Build("no column positions configured".into()))?;
-
-        let cell = cells
-            .iter()
-            .find(|(pos, _)| *pos as usize == col_pos)
-            .map(|(_, cv)| cv);
-
-        let cell = match cell {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-
-        if cell.is_tombstone() {
-            return Ok(());
-        }
-
-        let raw = match &cell.value {
-            Some(v) => v,
-            None => return Ok(()),
-        };
-
-        let vec = super::bytes_to_vector(raw);
-        if vec.len() != self.dimensions {
-            return Err(IndexError::Build(format!(
-                "expected {} dimensions, got {}",
-                self.dimensions,
-                vec.len()
-            )));
-        }
-
-        self.vectors.push(vec);
-        self.positions.push(RowPosition {
-            partition_key: partition_key.to_vec(),
-            clustering_key: clustering_key.to_vec(),
-        });
-
+    fn add_row(&mut self, position: RowPosition, value: &CellValue) -> Result<(), IndexError> {
+        let bytes = value
+            .value
+            .as_ref()
+            .ok_or_else(|| IndexError::Format("cannot index tombstone cell".to_string()))?;
+        let vector = bytes_to_vec_f32(bytes)?;
+        self.graph.insert(vector, position);
         Ok(())
     }
 
-    fn finish(self: Box<Self>) -> IndexResult<IndexFiles> {
-        let graph = build_graph(
-            &self.vectors,
-            &self.positions,
-            self.m,
-            self.ef_construction,
-            &self.metric,
-        );
-
-        let row_count = self.positions.len() as u64;
-        let data = serde_json::to_vec(&graph)
-            .map_err(|e| IndexError::Build(format!("serialize HNSW graph: {e}")))?;
-
-        let data_path = self.config.output_dir.join(format!(
-            "{}-{}.db",
-            self.config.sstable_prefix, self.config.index_name
-        ));
-        let meta_path = self.config.output_dir.join(format!(
-            "{}-{}.meta",
-            self.config.sstable_prefix, self.config.index_name
-        ));
-
-        std::fs::create_dir_all(&self.config.output_dir)?;
-        std::fs::write(&data_path, &data)?;
-
-        let checksum = crc32_simple(&data);
-        let file_size = data.len() as u64;
-        let build_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let meta = IndexFileMeta {
-            index_type: self.config.index_type.clone(),
-            index_name: self.config.index_name.clone(),
-            row_count,
-            build_timestamp,
-            sstable_id: self.config.sstable_prefix.clone(),
-            file_size,
-            checksum,
-        };
-
-        let meta_json = serde_json::to_vec(&meta)
-            .map_err(|e| IndexError::Build(format!("meta serialization: {e}")))?;
-        std::fs::write(&meta_path, &meta_json)?;
-
-        Ok(IndexFiles {
-            data_path,
-            meta_path,
-            meta,
-        })
+    fn finish(&mut self) -> Result<(), IndexError> {
+        std::fs::create_dir_all(&self.dir)?;
+        let data = self.graph.to_data();
+        let json = serde_json::to_vec(&data)?;
+        std::fs::write(self.dir.join("hnsw.db"), json)?;
+        Ok(())
     }
 }
 
-/// Reads a serialized HNSW graph and performs ANN queries.
-struct HnswReader {
-    graph: SerializedGraph,
+// ---------------------------------------------------------------------------
+// HnswReader
+// ---------------------------------------------------------------------------
+
+/// Reads a previously built HNSW index and answers nearest-neighbor queries.
+pub struct HnswReader {
+    data: HnswGraphData,
+}
+
+impl HnswReader {
+    /// Reconstruct a searchable in-memory graph from the stored data.
+    fn to_graph(&self) -> HnswGraph {
+        HnswGraph {
+            layers: self.data.layers.clone(),
+            vectors: self.data.vectors.clone(),
+            positions: self.data.positions.clone(),
+            entry_point: self.data.entry_point,
+            max_layer: self.data.max_layer,
+            m: self.data.m,
+            ef_construction: self.data.ef_construction,
+            metric: self.data.metric,
+        }
+    }
 }
 
 impl IndexReader for HnswReader {
-    fn lookup(&self, _key: &IndexKey) -> IndexResult<Vec<RowPosition>> {
+    fn capabilities(&self) -> Vec<IndexCapability> {
+        vec![IndexCapability::Nearest]
+    }
+
+    fn lookup(&self, _value: &CellValue) -> Result<Vec<IndexResult>, IndexError> {
         Err(IndexError::Unsupported(
-            "point lookup not supported by HNSW index".into(),
+            "HNSW index does not support point lookups".to_string(),
         ))
     }
 
-    fn range(
-        &self,
-        _start: Bound<&IndexKey>,
-        _end: Bound<&IndexKey>,
-    ) -> IndexResult<Vec<RowPosition>> {
+    fn range(&self, _start: &CellValue, _end: &CellValue) -> Result<Vec<IndexResult>, IndexError> {
         Err(IndexError::Unsupported(
-            "range scan not supported by HNSW index".into(),
+            "HNSW index does not support range scans".to_string(),
         ))
     }
 
@@ -203,545 +437,184 @@ impl IndexReader for HnswReader {
         &self,
         query: &[f32],
         k: usize,
-        ef_search: Option<u16>,
-    ) -> IndexResult<Vec<(RowPosition, f32)>> {
-        if self.graph.nodes.is_empty() {
+        ef_search: usize,
+    ) -> Result<Vec<IndexResult>, IndexError> {
+        if self.data.entry_point.is_none() || self.data.vectors.is_empty() {
             return Ok(Vec::new());
         }
-        let ef = ef_search.map(|v| v as usize).unwrap_or(k.max(10));
-        let results = search_graph(&self.graph, query, k, ef);
-        Ok(results)
-    }
 
-    fn capabilities(&self) -> IndexCapabilities {
-        IndexCapabilities::NEAREST
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Serialized graph structures
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedGraph {
-    metric: DistanceMetric,
-    m: usize,
-    max_layer: usize,
-    entry_point: Option<usize>,
-    nodes: Vec<GraphNode>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GraphNode {
-    vector: Vec<f32>,
-    position: RowPosition,
-    layer: usize,
-    /// Neighbors at each layer: neighbors[l] contains node indices for layer l.
-    neighbors: Vec<Vec<usize>>,
-}
-
-// ---------------------------------------------------------------------------
-// Graph construction
-// ---------------------------------------------------------------------------
-
-/// Assign a random layer to a new node using an exponential distribution.
-/// The probability of being assigned to layer l is (1/m)^l * (1 - 1/m).
-fn random_layer(m: usize) -> usize {
-    // Use a simple approach: keep flipping a biased coin.
-    let ml = 1.0 / (m as f64).ln();
-    let r: f64 = rand::random();
-    // floor(-ln(r) * ml) gives an exponential distribution
-    let layer = (-r.ln() * ml).floor() as usize;
-    // Cap at a reasonable maximum to prevent pathological cases
-    layer.min(16)
-}
-
-fn build_graph(
-    vectors: &[Vec<f32>],
-    positions: &[RowPosition],
-    m: usize,
-    ef_construction: usize,
-    metric: &DistanceMetric,
-) -> SerializedGraph {
-    if vectors.is_empty() {
-        return SerializedGraph {
-            metric: metric.clone(),
-            m,
-            max_layer: 0,
-            entry_point: None,
-            nodes: Vec::new(),
-        };
-    }
-
-    let m_max = m;
-    let m_max0 = m * 2; // Double connections at layer 0
-
-    let mut nodes: Vec<GraphNode> = Vec::with_capacity(vectors.len());
-    let mut entry_point: usize = 0;
-
-    // Insert first node
-    let first_layer = random_layer(m);
-    nodes.push(GraphNode {
-        vector: vectors[0].clone(),
-        position: positions[0].clone(),
-        layer: first_layer,
-        neighbors: vec![Vec::new(); first_layer + 1],
-    });
-    let mut max_layer: usize = first_layer;
-
-    // Insert remaining nodes
-    for i in 1..vectors.len() {
-        let node_layer = random_layer(m);
-        let new_node_idx = nodes.len();
-
-        nodes.push(GraphNode {
-            vector: vectors[i].clone(),
-            position: positions[i].clone(),
-            layer: node_layer,
-            neighbors: vec![Vec::new(); node_layer + 1],
-        });
-
-        // Greedy search from top layer down to node_layer + 1
-        let mut current = entry_point;
-        for layer in (node_layer + 1..=max_layer).rev() {
-            current = greedy_closest(&nodes, &vectors[i], current, layer, metric);
+        // Validate dimensions
+        let dim = self.data.vectors[0].len();
+        if query.len() != dim {
+            return Err(IndexError::DimensionMismatch {
+                expected: dim,
+                got: query.len(),
+            });
         }
 
-        // For layers min(node_layer, max_layer) down to 0, find ef_construction nearest
-        // and connect to the M nearest.
-        let start_layer = node_layer.min(max_layer);
-        let mut candidates = vec![current];
+        let graph = self.to_graph();
+        let entry = self.data.entry_point.unwrap();
 
-        for layer in (0..=start_layer).rev() {
-            // Search for nearest neighbors at this layer
-            let nearest = search_layer(
-                &nodes,
-                &vectors[i],
-                &candidates,
-                ef_construction,
-                layer,
-                metric,
-            );
+        // Phase 1: Greedy descent from top layer to layer 1
+        let mut current_entry = entry;
+        let query_dist = |node: usize| distance(&self.data.metric, &self.data.vectors[node], query);
 
-            // Select M nearest to connect
-            let m_layer = if layer == 0 { m_max0 } else { m_max };
-            let selected = select_neighbors(&nodes, &vectors[i], &nearest, m_layer, metric);
-
-            // Bidirectional connections
-            nodes[new_node_idx].neighbors[layer] = selected.clone();
-            for &neighbor_idx in &selected {
-                nodes[neighbor_idx].neighbors[layer].push(new_node_idx);
-                // Prune if over capacity
-                let max_neighbors = if layer == 0 { m_max0 } else { m_max };
-                if nodes[neighbor_idx].neighbors[layer].len() > max_neighbors {
-                    let nv = nodes[neighbor_idx].vector.clone();
-                    let current_neighbors = nodes[neighbor_idx].neighbors[layer].clone();
-                    let pruned =
-                        select_neighbors(&nodes, &nv, &current_neighbors, max_neighbors, metric);
-                    nodes[neighbor_idx].neighbors[layer] = pruned;
-                }
-            }
-
-            candidates = nearest;
-        }
-
-        if node_layer > max_layer {
-            max_layer = node_layer;
-            entry_point = new_node_idx;
-        }
-    }
-
-    SerializedGraph {
-        metric: metric.clone(),
-        m,
-        max_layer,
-        entry_point: Some(entry_point),
-        nodes,
-    }
-}
-
-/// Greedily walk to the closest node at a given layer.
-fn greedy_closest(
-    nodes: &[GraphNode],
-    query: &[f32],
-    start: usize,
-    layer: usize,
-    metric: &DistanceMetric,
-) -> usize {
-    let mut current = start;
-    let mut current_dist = distance(metric, query, &nodes[current].vector);
-    loop {
-        let mut changed = false;
-        let neighbors = if layer < nodes[current].neighbors.len() {
-            &nodes[current].neighbors[layer]
-        } else {
-            break;
-        };
-        for &neighbor in neighbors {
-            let d = distance(metric, query, &nodes[neighbor].vector);
-            if d < current_dist {
-                current = neighbor;
-                current_dist = d;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    current
-}
-
-/// Search a single layer starting from the given entry points, returning up to
-/// `ef` nearest node indices.
-fn search_layer(
-    nodes: &[GraphNode],
-    query: &[f32],
-    entry_points: &[usize],
-    ef: usize,
-    layer: usize,
-    metric: &DistanceMetric,
-) -> Vec<usize> {
-    // Min-heap for candidates (closest first)
-    let mut candidates: BinaryHeap<MinDist> = BinaryHeap::new();
-    // Max-heap for results (furthest first, so we can evict)
-    let mut results: BinaryHeap<MaxDist> = BinaryHeap::new();
-    let mut visited = std::collections::HashSet::new();
-
-    for &ep in entry_points {
-        if visited.insert(ep) {
-            let d = distance(metric, query, &nodes[ep].vector);
-            candidates.push(MinDist { dist: d, idx: ep });
-            results.push(MaxDist { dist: d, idx: ep });
-        }
-    }
-
-    while let Some(MinDist {
-        dist: c_dist,
-        idx: c_idx,
-    }) = candidates.pop()
-    {
-        let furthest_result = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
-        if c_dist > furthest_result && results.len() >= ef {
-            break;
-        }
-
-        let neighbors = if layer < nodes[c_idx].neighbors.len() {
-            &nodes[c_idx].neighbors[layer]
-        } else {
-            continue;
-        };
-
-        for &neighbor in neighbors {
-            if visited.insert(neighbor) {
-                let d = distance(metric, query, &nodes[neighbor].vector);
-                let furthest = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
-                if results.len() < ef || d < furthest {
-                    candidates.push(MinDist {
-                        dist: d,
-                        idx: neighbor,
-                    });
-                    results.push(MaxDist {
-                        dist: d,
-                        idx: neighbor,
-                    });
-                    if results.len() > ef {
-                        results.pop();
+        for layer_idx in (1..=self.data.max_layer).rev() {
+            // Greedy search: move to the closest neighbor in this layer
+            loop {
+                let mut changed = false;
+                if layer_idx < graph.layers.len() && current_entry < graph.layers[layer_idx].len() {
+                    for &neighbor in &graph.layers[layer_idx][current_entry] {
+                        if query_dist(neighbor) < query_dist(current_entry) {
+                            current_entry = neighbor;
+                            changed = true;
+                        }
                     }
                 }
+                if !changed {
+                    break;
+                }
             }
         }
+
+        // Phase 2: Search layer 0 with ef_search width
+        let ef = ef_search.max(k);
+        let result_ids = graph.search_layer_by_vec(0, current_entry, query, ef);
+
+        // Return top k
+        let results: Vec<IndexResult> = result_ids
+            .into_iter()
+            .take(k)
+            .map(|id| IndexResult {
+                position: self.data.positions[id],
+                score: distance(&self.data.metric, &self.data.vectors[id], query),
+            })
+            .collect();
+
+        Ok(results)
     }
-
-    results.into_iter().map(|r| r.idx).collect()
-}
-
-/// Select up to `m` nearest neighbors from candidates.
-fn select_neighbors(
-    nodes: &[GraphNode],
-    query: &[f32],
-    candidates: &[usize],
-    m: usize,
-    metric: &DistanceMetric,
-) -> Vec<usize> {
-    let mut scored: Vec<(f32, usize)> = candidates
-        .iter()
-        .map(|&idx| (distance(metric, query, &nodes[idx].vector), idx))
-        .collect();
-    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(m);
-    scored.into_iter().map(|(_, idx)| idx).collect()
-}
-
-// ---------------------------------------------------------------------------
-// Graph search (query time)
-// ---------------------------------------------------------------------------
-
-fn search_graph(
-    graph: &SerializedGraph,
-    query: &[f32],
-    k: usize,
-    ef: usize,
-) -> Vec<(RowPosition, f32)> {
-    let entry = match graph.entry_point {
-        Some(ep) => ep,
-        None => return Vec::new(),
-    };
-
-    // Greedy descent from top layer to layer 1
-    let mut current = entry;
-    for layer in (1..=graph.max_layer).rev() {
-        current = greedy_closest(&graph.nodes, query, current, layer, &graph.metric);
-    }
-
-    // Search layer 0 with ef candidates
-    let results = search_layer(&graph.nodes, query, &[current], ef, 0, &graph.metric);
-
-    // Score and sort
-    let mut scored: Vec<(f32, usize)> = results
-        .iter()
-        .map(|&idx| {
-            (
-                distance(&graph.metric, query, &graph.nodes[idx].vector),
-                idx,
-            )
-        })
-        .collect();
-    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(k);
-
-    scored
-        .into_iter()
-        .map(|(dist, idx)| (graph.nodes[idx].position.clone(), dist))
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Heap helpers (ordered wrappers for BinaryHeap)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct MinDist {
-    dist: f32,
-    idx: usize,
-}
-
-impl PartialEq for MinDist {
-    fn eq(&self, other: &Self) -> bool {
-        self.dist == other.dist && self.idx == other.idx
-    }
-}
-impl Eq for MinDist {}
-impl PartialOrd for MinDist {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for MinDist {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Reverse ordering so BinaryHeap acts as a min-heap
-        other
-            .dist
-            .partial_cmp(&self.dist)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| other.idx.cmp(&self.idx))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct MaxDist {
-    dist: f32,
-    idx: usize,
-}
-
-impl PartialEq for MaxDist {
-    fn eq(&self, other: &Self) -> bool {
-        self.dist == other.dist && self.idx == other.idx
-    }
-}
-impl Eq for MaxDist {}
-impl PartialOrd for MaxDist {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for MaxDist {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Natural ordering for max-heap
-        self.dist
-            .partial_cmp(&other.dist)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| self.idx.cmp(&other.idx))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn crc32_simple(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    let poly: u32 = 0xEDB8_8320;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ poly;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::IndexConfig;
+    use crate::vec_f32_to_bytes;
 
-    fn make_config(dir: &std::path::Path) -> IndexConfig {
-        IndexConfig {
-            index_type: IndexType::Vector {
-                method: VectorMethod::Hnsw {
-                    m: 4,
-                    ef_construction: 16,
-                },
-                metric: DistanceMetric::L2,
-                dimensions: 3,
-            },
-            column_positions: vec![0],
-            output_dir: dir.to_path_buf(),
-            sstable_prefix: "sstable-001".into(),
-            index_name: "idx_vec".into(),
-        }
-    }
-
-    fn vector_cell(v: &[f32]) -> CellValue {
-        let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
-        CellValue::live(bytes, 1000)
+    fn make_vector_cell(v: &[f32]) -> CellValue {
+        CellValue::live(vec_f32_to_bytes(v), 1)
     }
 
     #[test]
-    fn build_and_query_nearest() {
+    fn hnsw_build_and_nearest() {
         let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HnswFactory;
-        let mut builder = factory.create_builder(&config).unwrap();
+        let factory = HnswFactory::new(16, 200, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
 
-        // Four vectors in 3D
-        let vecs = [
-            [1.0f32, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [1.0, 1.0, 1.0],
+        // Insert 4 vectors
+        let vectors: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![0.9, 0.1, 0.0],
         ];
-
-        for (i, v) in vecs.iter().enumerate() {
-            let pk = format!("pk{}", i);
-            let ck = format!("ck{}", i);
+        for (i, v) in vectors.iter().enumerate() {
             builder
-                .add_row(pk.as_bytes(), ck.as_bytes(), &[(0, vector_cell(v))])
+                .add_row(RowPosition::new(i as u64 * 100), &make_vector_cell(v))
                 .unwrap();
         }
+        builder.finish().unwrap();
 
-        let files = builder.finish().unwrap();
-        assert_eq!(files.meta.row_count, 4);
+        // Query [1,0,0] with k=2
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let results = reader.nearest(&[1.0, 0.0, 0.0], 2, 50).unwrap();
+        assert_eq!(results.len(), 2);
 
-        let reader = factory.open_reader(&files).unwrap();
+        // First result should be exact match at offset 0
+        assert_eq!(results[0].position.offset, 0);
+        assert!(results[0].score < 1e-6); // distance ~0
 
-        // Query near [1,1,1] - should find [1,1,1] as closest
-        let results = reader.nearest(&[1.0, 1.0, 1.0], 2, None).unwrap();
-        assert!(!results.is_empty());
-        assert_eq!(results[0].0.partition_key, b"pk3");
-        assert!((results[0].1).abs() < 1e-6); // distance to itself is 0
+        // Second result should be [0.9, 0.1, 0.0] at offset 300
+        assert_eq!(results[1].position.offset, 300);
     }
 
     #[test]
-    fn empty_index_nearest() {
+    fn hnsw_empty_index() {
         let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HnswFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
+        let factory = HnswFactory::new(16, 200, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
+        builder.finish().unwrap();
 
-        let results = reader.nearest(&[1.0, 0.0, 0.0], 5, None).unwrap();
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let results = reader.nearest(&[1.0, 0.0, 0.0], 5, 50).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
-    fn lookup_unsupported() {
+    fn hnsw_lookup_returns_unsupported() {
         let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HnswFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
+        let factory = HnswFactory::new(16, 200, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
+        builder.finish().unwrap();
 
-        let result = reader.lookup(&IndexKey::Bytes(b"test".to_vec()));
-        assert!(matches!(result, Err(IndexError::Unsupported(_))));
-    }
-
-    #[test]
-    fn range_unsupported() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HnswFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let result = reader.range(Bound::Unbounded, Bound::Unbounded);
-        assert!(matches!(result, Err(IndexError::Unsupported(_))));
-    }
-
-    #[test]
-    fn capabilities_nearest_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HnswFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let caps = reader.capabilities();
-        assert!(caps.contains(IndexCapabilities::NEAREST));
-        assert!(!caps.contains(IndexCapabilities::POINT_LOOKUP));
-        assert!(!caps.contains(IndexCapabilities::RANGE_SCAN));
-    }
-
-    #[test]
-    fn nearest_returns_sorted_by_distance() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = HnswFactory;
-        let mut builder = factory.create_builder(&config).unwrap();
-
-        let vecs = [
-            [10.0f32, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
-            [5.0, 0.0, 0.0],
-            [2.0, 0.0, 0.0],
-        ];
-
-        for (i, v) in vecs.iter().enumerate() {
-            let pk = format!("pk{}", i);
-            builder
-                .add_row(pk.as_bytes(), b"ck", &[(0, vector_cell(v))])
-                .unwrap();
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let cell = CellValue::live(b"hello".to_vec(), 1);
+        let result = reader.lookup(&cell);
+        assert!(result.is_err());
+        match result {
+            Err(IndexError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported, got {:?}", other),
         }
+    }
 
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
+    #[test]
+    fn hnsw_range_returns_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = HnswFactory::new(16, 200, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
+        builder.finish().unwrap();
 
-        let results = reader.nearest(&[0.0, 0.0, 0.0], 4, Some(16)).unwrap();
-        // Verify distances are non-decreasing
-        for pair in results.windows(2) {
-            assert!(
-                pair[0].1 <= pair[1].1,
-                "results should be sorted by distance"
-            );
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let cell = CellValue::live(b"x".to_vec(), 1);
+        let result = reader.range(&cell, &cell);
+        assert!(result.is_err());
+        match result {
+            Err(IndexError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hnsw_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = HnswFactory::new(16, 200, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
+        builder.finish().unwrap();
+
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let caps = reader.capabilities();
+        assert_eq!(caps, vec![IndexCapability::Nearest]);
+    }
+
+    #[test]
+    fn hnsw_dimension_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = HnswFactory::new(16, 200, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
+        builder
+            .add_row(RowPosition::new(0), &make_vector_cell(&[1.0, 0.0, 0.0]))
+            .unwrap();
+        builder.finish().unwrap();
+
+        let reader = factory.open_reader(dir.path()).unwrap();
+        // Query with wrong dimension (2 instead of 3)
+        let result = reader.nearest(&[1.0, 0.0], 1, 50);
+        assert!(result.is_err());
+        match result {
+            Err(IndexError::DimensionMismatch {
+                expected: 3,
+                got: 2,
+            }) => {}
+            other => panic!("expected DimensionMismatch, got {:?}", other),
         }
     }
 }
