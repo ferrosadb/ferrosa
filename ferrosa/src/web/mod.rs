@@ -13,10 +13,12 @@
 pub mod api;
 pub mod auth;
 pub mod static_files;
+pub mod ws;
 
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::extract::FromRef;
+use axum::routing::get;
 use axum::Router;
 use ferrosa_cluster::ModeController;
 use ferrosa_schema::{Schema, VirtualTableRegistry};
@@ -74,6 +76,7 @@ pub fn build_router(state: WebAppState) -> Router {
     Router::new()
         .nest("/api", api::routes())
         .nest("/api/cluster", api::cluster_routes())
+        .route("/api/ws", get(ws::ws_handler))
         .fallback(static_files::static_handler)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
