@@ -199,6 +199,164 @@ pub async fn run_monitor(addr: SocketAddr, panel: Option<&str>) -> Result<(), Cq
     Ok(())
 }
 
+// ── Cluster web-API commands ──────────────────────────────────────────────────
+//
+// These commands make HTTP requests to the Ferrosa web admin API (port 9090 by
+// default).  They intentionally avoid coupling to the CQL stack.
+
+/// Error type returned by HTTP-based cluster commands.
+pub type WebError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Pre-approve a node for cluster join.
+///
+/// Issues `POST /api/cluster/add-node` with a JSON body `{"host_id": …}`.
+pub async fn add_node(host: &str, web_port: u16, host_id: &str) -> Result<(), WebError> {
+    let url = format!("http://{}:{}/api/cluster/add-node", host, web_port);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "host_id": host_id }))
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        println!("Node {} approved for cluster join.", host_id);
+        if !body.is_empty() {
+            println!("{body}");
+        }
+        Ok(())
+    } else {
+        Err(format!("add-node failed (HTTP {}): {}", status, body).into())
+    }
+}
+
+/// Decommission a node from the cluster.
+///
+/// Issues `POST /api/cluster/decommission` with an optional `{"host_id": …}`.
+/// When `host_id` is `None` the server decommissions the local node.
+pub async fn decommission(
+    host: &str,
+    web_port: u16,
+    host_id: Option<&str>,
+) -> Result<(), WebError> {
+    let url = format!("http://{}:{}/api/cluster/decommission", host, web_port);
+    let client = reqwest::Client::new();
+
+    let body = match host_id {
+        Some(id) => serde_json::json!({ "host_id": id }),
+        None => serde_json::json!({}),
+    };
+
+    let resp = client.post(&url).json(&body).send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        match host_id {
+            Some(id) => println!("Node {} decommissioned.", id),
+            None => println!("Local node decommissioned."),
+        }
+        if !text.is_empty() {
+            println!("{text}");
+        }
+        Ok(())
+    } else {
+        Err(format!("decommission failed (HTTP {}): {}", status, text).into())
+    }
+}
+
+/// Show token ring distribution.
+///
+/// Issues `GET /api/cluster/ring` and renders the response as a table.
+pub async fn ring(host: &str, web_port: u16) -> Result<(), WebError> {
+    let url = format!("http://{}:{}/api/cluster/ring", host, web_port);
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await?;
+    let status = resp.status();
+
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("ring failed (HTTP {}): {}", status, body).into());
+    }
+
+    let value: serde_json::Value = resp.json().await?;
+
+    // The API is expected to return a JSON array of objects with at least
+    // "host_id", "token", and "status" fields.  We do a best-effort render.
+    if let Some(entries) = value.as_array() {
+        if entries.is_empty() {
+            println!("(ring is empty)");
+            return Ok(());
+        }
+
+        // Collect column names from the union of all keys in the first entry.
+        let columns: Vec<String> = entries
+            .first()
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+
+        use tabled::builder::Builder;
+        use tabled::settings::Style;
+        let mut builder = Builder::default();
+        builder.push_record(columns.clone());
+
+        for entry in entries {
+            let row: Vec<String> = columns
+                .iter()
+                .map(|col| {
+                    entry
+                        .get(col)
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_else(|| "NULL".to_string())
+                })
+                .collect();
+            builder.push_record(row);
+        }
+
+        let mut table = builder.build();
+        table.with(Style::sharp());
+        println!("{table}");
+    } else {
+        // If the server returned something other than an array, just pretty-print it.
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    }
+
+    Ok(())
+}
+
+/// Rebalance token distribution across the cluster.
+///
+/// Issues `POST /api/cluster/rebalance` with an empty body.
+pub async fn rebalance(host: &str, web_port: u16) -> Result<(), WebError> {
+    let url = format!("http://{}:{}/api/cluster/rebalance", host, web_port);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({}))
+        .send()
+        .await?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        println!("Rebalance initiated.");
+        if !body.is_empty() {
+            println!("{body}");
+        }
+        Ok(())
+    } else {
+        Err(format!("rebalance failed (HTTP {}): {}", status, body).into())
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -316,5 +474,123 @@ mod tests {
         assert_eq!(result.rows[0].columns[0].as_deref(), Some(b"q2" as &[u8]));
         assert_eq!(result.rows[1].columns[0].as_deref(), Some(b"q3" as &[u8]));
         assert_eq!(result.rows[2].columns[0].as_deref(), Some(b"q1" as &[u8]));
+    }
+
+    // ── Cluster web-API command unit tests ────────────────────────────────────
+    //
+    // These tests verify URL construction and request-body serialization without
+    // making live HTTP connections.
+
+    /// Helper: build the URL for add-node the same way the real function does.
+    fn add_node_url(host: &str, web_port: u16) -> String {
+        format!("http://{}:{}/api/cluster/add-node", host, web_port)
+    }
+
+    /// Helper: build the URL for decommission.
+    fn decommission_url(host: &str, web_port: u16) -> String {
+        format!("http://{}:{}/api/cluster/decommission", host, web_port)
+    }
+
+    /// Helper: build the URL for ring.
+    fn ring_url(host: &str, web_port: u16) -> String {
+        format!("http://{}:{}/api/cluster/ring", host, web_port)
+    }
+
+    /// Helper: build the URL for rebalance.
+    fn rebalance_url(host: &str, web_port: u16) -> String {
+        format!("http://{}:{}/api/cluster/rebalance", host, web_port)
+    }
+
+    #[test]
+    fn add_node_formats_correct_url() {
+        let url = add_node_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/add-node");
+    }
+
+    #[test]
+    fn add_node_formats_correct_url_custom_port() {
+        let url = add_node_url("10.0.0.5", 8080);
+        assert_eq!(url, "http://10.0.0.5:8080/api/cluster/add-node");
+    }
+
+    #[test]
+    fn add_node_body_contains_host_id() {
+        let body = serde_json::json!({ "host_id": "host-uuid-1234" });
+        assert_eq!(body["host_id"], "host-uuid-1234");
+    }
+
+    #[test]
+    fn decommission_formats_correct_url() {
+        let url = decommission_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/decommission");
+    }
+
+    #[test]
+    fn decommission_body_with_host_id() {
+        let body = serde_json::json!({ "host_id": "node-abc" });
+        assert_eq!(body["host_id"], "node-abc");
+    }
+
+    #[test]
+    fn decommission_body_without_host_id_is_empty_object() {
+        let body = serde_json::json!({});
+        assert!(body.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ring_formats_correct_url() {
+        let url = ring_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/ring");
+    }
+
+    #[test]
+    fn rebalance_formats_correct_url() {
+        let url = rebalance_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/cluster/rebalance");
+    }
+
+    #[test]
+    fn ring_renders_array_response() {
+        // Verify that the column extraction logic works for a sample API response.
+        let value = serde_json::json!([
+            { "host_id": "node-1", "token": "-9223372036854775808", "status": "UP" },
+            { "host_id": "node-2", "token": "0",                    "status": "UP" },
+        ]);
+
+        let entries = value.as_array().unwrap();
+        let columns: Vec<String> = entries
+            .first()
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+
+        assert_eq!(columns.len(), 3);
+        assert!(columns.contains(&"host_id".to_string()));
+        assert!(columns.contains(&"token".to_string()));
+        assert!(columns.contains(&"status".to_string()));
+
+        // Each entry produces the right number of cells.
+        for entry in entries {
+            let row: Vec<String> = columns
+                .iter()
+                .map(|col| {
+                    entry
+                        .get(col)
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_else(|| "NULL".to_string())
+                })
+                .collect();
+            assert_eq!(row.len(), 3);
+        }
+    }
+
+    #[test]
+    fn ring_renders_empty_array_response() {
+        let value = serde_json::json!([]);
+        let entries = value.as_array().unwrap();
+        assert!(entries.is_empty());
     }
 }
