@@ -25,7 +25,7 @@ use ferrosa_schema::{
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
     IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
     Resource, RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
-    VirtualColumnDef, VirtualRow,
+    UserTypeMetadata, VirtualColumnDef, VirtualRow,
 };
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
@@ -175,11 +175,28 @@ pub async fn route(
             })
         }
         Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
-        Statement::CreateType { .. } | Statement::AlterType { .. } | Statement::DropType { .. } => {
-            Err(CqlError::Invalid(
-                "UDT operations not yet implemented".into(),
-            ))
-        }
+        Statement::CreateType {
+            keyspace,
+            name,
+            if_not_exists,
+            fields,
+        } => route_create_type(state, ctx, keyspace, name, if_not_exists, fields)
+            .await
+            .map(RouteResult::Result),
+        Statement::AlterType {
+            keyspace,
+            name,
+            alterations,
+        } => route_alter_type(state, ctx, keyspace, name, alterations)
+            .await
+            .map(RouteResult::Result),
+        Statement::DropType {
+            keyspace,
+            name,
+            if_exists,
+        } => route_drop_type(state, ctx, keyspace, name, if_exists)
+            .await
+            .map(RouteResult::Result),
     }
 }
 
@@ -2089,6 +2106,192 @@ fn cql_type_name_to_string(type_name: &CqlTypeName) -> String {
     }
 }
 
+// ── DDL: User-Defined Types ──────────────────────────────────────────────
+
+async fn route_create_type(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    keyspace: Option<String>,
+    name: String,
+    if_not_exists: bool,
+    fields: Vec<(String, CqlTypeName)>,
+) -> Result<BytesMut, CqlError> {
+    let ks = keyspace
+        .or_else(|| ctx.current_keyspace.clone())
+        .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
+
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Create,
+        &Resource::Keyspace(ks.clone()),
+    )?;
+
+    // IF NOT EXISTS check
+    if if_not_exists && state.schema.get_type(&ks, &name).is_some() {
+        return Ok(result::encode_schema_change(
+            "CREATED",
+            "TYPE",
+            &[&ks, &name],
+        ));
+    }
+
+    // Resolve field types using bridge::resolve_type_name
+    let resolved_fields: Vec<(String, CqlType)> = fields
+        .iter()
+        .map(|(fname, ftype)| {
+            let resolved = bridge::resolve_type_name(ftype, &ks, &state.schema)?;
+            Ok((fname.clone(), resolved))
+        })
+        .collect::<Result<_, CqlError>>()?;
+
+    let udt = UserTypeMetadata {
+        keyspace: ks.clone(),
+        name: name.clone(),
+        fields: resolved_fields,
+    };
+
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
+        DdlPath::Direct { .. } => {
+            ddl.execute(DdlOperation::CreateType(udt))
+                .await
+                .map_err(CqlError::from)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::CreateType(udt);
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            let op = DdlOperation::CreateType(udt);
+            ddl.execute(op).await.map_err(CqlError::from)?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "CREATED",
+        "TYPE",
+        &[&ks, &name],
+    ))
+}
+
+async fn route_alter_type(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    keyspace: Option<String>,
+    name: String,
+    alterations: Vec<TypeAlteration>,
+) -> Result<BytesMut, CqlError> {
+    let ks = keyspace
+        .or_else(|| ctx.current_keyspace.clone())
+        .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
+
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Alter, &Resource::Keyspace(ks.clone()))?;
+
+    for alt in alterations {
+        match alt {
+            TypeAlteration::AddField {
+                name: fname,
+                field_type,
+            } => {
+                let resolved = bridge::resolve_type_name(&field_type, &ks, &state.schema)?;
+                state
+                    .schema
+                    .alter_type_add_field(&ks, &name, &fname, resolved)
+                    .map_err(|e| CqlError::Invalid(format!("alter type: {e}")))?;
+            }
+            TypeAlteration::RenameField { from, to } => {
+                state
+                    .schema
+                    .alter_type_rename_field(&ks, &name, &from, &to)
+                    .map_err(|e| CqlError::Invalid(format!("alter type: {e}")))?;
+            }
+            TypeAlteration::AlterField { .. } => {
+                // ALTER TYPE ... ALTER field TYPE is deprecated in Cassandra; defer
+            }
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "UPDATED",
+        "TYPE",
+        &[&ks, &name],
+    ))
+}
+
+async fn route_drop_type(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    keyspace: Option<String>,
+    name: String,
+    if_exists: bool,
+) -> Result<BytesMut, CqlError> {
+    let ks = keyspace
+        .or_else(|| ctx.current_keyspace.clone())
+        .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
+
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Drop, &Resource::Keyspace(ks.clone()))?;
+
+    // IF EXISTS check
+    if if_exists && state.schema.get_type(&ks, &name).is_none() {
+        return Ok(result::encode_schema_change(
+            "DROPPED",
+            "TYPE",
+            &[&ks, &name],
+        ));
+    }
+
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
+        DdlPath::Direct { .. } => {
+            ddl.execute(DdlOperation::DropType {
+                keyspace: ks.clone(),
+                name: name.clone(),
+            })
+            .await
+            .map_err(CqlError::from)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::DropType {
+                keyspace: ks.clone(),
+                name: name.clone(),
+            };
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            let op = DdlOperation::DropType {
+                keyspace: ks.clone(),
+                name: name.clone(),
+            };
+            ddl.execute(op).await.map_err(CqlError::from)?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "DROPPED",
+        "TYPE",
+        &[&ks, &name],
+    ))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2589,5 +2792,226 @@ mod tests {
         opts.insert("method".to_string(), "hnsw".to_string());
         let result = resolve_index_type(Some("vector"), &["embed".to_string()], &opts);
         assert!(result.is_err());
+    }
+
+    // ── UDT DDL routing tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn route_create_type_stores_in_schema() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace first
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // CREATE TYPE ks.address (street text, city text)
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text, city text)").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                // SchemaChange kind = 0x0005
+                assert_eq!(&b[0..4], &0x0005i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
+
+        // Verify type exists in schema
+        let udt = state.schema.get_type("ks", "address");
+        assert!(
+            udt.is_some(),
+            "type should exist in schema after CREATE TYPE"
+        );
+        let udt = udt.unwrap();
+        assert_eq!(udt.fields.len(), 2);
+        assert_eq!(udt.fields[0].0, "street");
+        assert_eq!(udt.fields[1].0, "city");
+    }
+
+    #[tokio::test]
+    async fn route_drop_type() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace + type
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text, city text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        assert!(state.schema.get_type("ks", "address").is_some());
+
+        // DROP TYPE
+        let stmt = crate::parser::parse("DROP TYPE ks.address").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(&b[0..4], &0x0005i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
+
+        assert!(
+            state.schema.get_type("ks", "address").is_none(),
+            "type should be gone after DROP TYPE"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_create_type_if_not_exists() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace + type
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text, city text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // CREATE TYPE IF NOT EXISTS with same name — should succeed without error
+        let stmt =
+            crate::parser::parse("CREATE TYPE IF NOT EXISTS ks.address (street text, city text)")
+                .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "IF NOT EXISTS should not error on duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_drop_type_if_exists() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // DROP TYPE IF EXISTS on non-existent type — should succeed
+        let stmt = crate::parser::parse("DROP TYPE IF EXISTS ks.address").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "IF EXISTS should not error on missing type");
+    }
+
+    #[tokio::test]
+    async fn route_alter_type_add_field() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace + type
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // ALTER TYPE ADD city text
+        let stmt = crate::parser::parse("ALTER TYPE ks.address ADD city text").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "ALTER TYPE ADD should succeed");
+
+        let udt = state.schema.get_type("ks", "address").unwrap();
+        assert_eq!(udt.fields.len(), 2);
+        assert_eq!(udt.fields[1].0, "city");
+    }
+
+    #[tokio::test]
+    async fn route_alter_type_rename_field() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace + type
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // ALTER TYPE RENAME street TO street_name
+        let stmt =
+            crate::parser::parse("ALTER TYPE ks.address RENAME street TO street_name").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "ALTER TYPE RENAME should succeed");
+
+        let udt = state.schema.get_type("ks", "address").unwrap();
+        assert_eq!(udt.fields[0].0, "street_name");
+    }
+
+    #[tokio::test]
+    async fn route_create_type_uses_session_keyspace() {
+        let (state, _dir) = setup();
+        let ks = Some("ks".to_string());
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &ks,
+        };
+
+        // Create keyspace first (with explicit ks in statement)
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // CREATE TYPE without explicit keyspace — should use session keyspace
+        let stmt = crate::parser::parse("CREATE TYPE address (street text)").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "should use session keyspace");
+
+        let udt = state.schema.get_type("ks", "address");
+        assert!(udt.is_some(), "type should be in session keyspace");
+    }
+
+    #[tokio::test]
+    async fn route_create_type_no_keyspace_errors() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // CREATE TYPE without keyspace and no session keyspace
+        let stmt = crate::parser::parse("CREATE TYPE address (street text)").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_err(), "should error without keyspace");
     }
 }

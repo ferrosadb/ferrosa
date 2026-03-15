@@ -18,6 +18,7 @@ use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 use ferrosa_schema::metadata::index::IndexMetadata;
 use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
 use ferrosa_schema::metadata::table::{TableMetadata, TableUpdates};
+use ferrosa_schema::metadata::user_type::UserTypeMetadata;
 use ferrosa_schema::{
     is_system_keyspace, GrantEntry, Permission, Resource, RoleMetadata, RoleUpdates, Schema,
     SchemaSnapshot,
@@ -67,6 +68,11 @@ pub enum DdlOperation {
         keyspace: String,
         table: String,
         index: String,
+    },
+    CreateType(UserTypeMetadata),
+    DropType {
+        keyspace: String,
+        name: String,
     },
 }
 
@@ -231,6 +237,19 @@ impl DdlCoordinator {
                     .drop_index_internal(keyspace, table, index)
                     .map_err(|e| ClusterError::Internal(format!("drop_index: {e}")))?;
             }
+            DdlOperation::CreateType(ref udt) => {
+                self.schema
+                    .create_type_internal(udt)
+                    .map_err(|e| ClusterError::Internal(format!("create_type: {e}")))?;
+            }
+            DdlOperation::DropType {
+                ref keyspace,
+                ref name,
+            } => {
+                self.schema
+                    .drop_type_internal(keyspace, name)
+                    .map_err(|e| ClusterError::Internal(format!("drop_type: {e}")))?;
+            }
         }
         Ok(())
     }
@@ -356,6 +375,8 @@ pub struct WireSchemaSnapshot {
     pub indexes: Vec<((String, String, String), IndexMetadata)>,
     pub roles: std::collections::HashMap<String, RoleMetadata>,
     pub grants: std::collections::HashMap<String, Vec<GrantEntry>>,
+    #[serde(default)]
+    pub types: Vec<((String, String), UserTypeMetadata)>,
 }
 
 impl WireSchemaSnapshot {
@@ -376,6 +397,11 @@ impl WireSchemaSnapshot {
                 .collect(),
             roles: snap.roles.clone(),
             grants: snap.grants.clone(),
+            types: snap
+                .types
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         }
     }
 
@@ -388,7 +414,7 @@ impl WireSchemaSnapshot {
             indexes: self.indexes.into_iter().collect(),
             roles: self.roles,
             grants: self.grants,
-            types: std::collections::HashMap::new(),
+            types: self.types.into_iter().collect(),
         }
     }
 }
@@ -728,5 +754,81 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn ddl_operation_create_type_roundtrip() {
+        use ferrosa_common::CqlType;
+        let op = DdlOperation::CreateType(UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("city".to_string(), CqlType::Varchar),
+            ],
+        });
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::CreateType(udt) => {
+                assert_eq!(udt.keyspace, "ks");
+                assert_eq!(udt.name, "address");
+                assert_eq!(udt.fields.len(), 2);
+                assert_eq!(udt.fields[0].0, "street");
+                assert_eq!(udt.fields[1].0, "city");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ddl_operation_drop_type_roundtrip() {
+        let op = DdlOperation::DropType {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+        };
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::DropType { keyspace, name } => {
+                assert_eq!(keyspace, "ks");
+                assert_eq!(name, "address");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wire_schema_snapshot_preserves_types() {
+        use ferrosa_common::CqlType;
+        let mut types = std::collections::HashMap::new();
+        types.insert(
+            ("ks".to_string(), "address".to_string()),
+            UserTypeMetadata {
+                keyspace: "ks".to_string(),
+                name: "address".to_string(),
+                fields: vec![("street".to_string(), CqlType::Varchar)],
+            },
+        );
+
+        let snap = SchemaSnapshot {
+            version: Uuid::new_v4(),
+            keyspaces: std::collections::HashMap::new(),
+            tables: std::collections::HashMap::new(),
+            indexes: std::collections::HashMap::new(),
+            roles: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
+            types,
+        };
+
+        let wire = WireSchemaSnapshot::from_snapshot(&snap);
+        assert_eq!(wire.types.len(), 1);
+
+        let restored = wire.into_snapshot();
+        let udt = restored
+            .types
+            .get(&("ks".to_string(), "address".to_string()));
+        assert!(udt.is_some());
+        assert_eq!(udt.unwrap().fields.len(), 1);
     }
 }

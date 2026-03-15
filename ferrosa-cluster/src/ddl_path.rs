@@ -165,6 +165,19 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &StorageEngine) -> R
                 .drop_index_internal(keyspace, table, index)
                 .map_err(|e| ClusterError::Internal(format!("drop_index: {e}")))?;
         }
+        DdlOperation::CreateType(ref udt) => {
+            schema
+                .create_type_internal(udt)
+                .map_err(|e| ClusterError::Internal(format!("create_type: {e}")))?;
+        }
+        DdlOperation::DropType {
+            ref keyspace,
+            ref name,
+        } => {
+            schema
+                .drop_type_internal(keyspace, name)
+                .map_err(|e| ClusterError::Internal(format!("drop_type: {e}")))?;
+        }
     }
     Ok(())
 }
@@ -215,6 +228,8 @@ fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
             table,
             index,
         },
+        DdlOperation::CreateType(udt) => RaftCommand::CreateType(udt),
+        DdlOperation::DropType { keyspace, name } => RaftCommand::DropType { keyspace, name },
     }
 }
 

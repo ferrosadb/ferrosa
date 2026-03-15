@@ -22,6 +22,7 @@ use uuid::Uuid;
 use ferrosa_schema::metadata::index::IndexMetadata;
 use ferrosa_schema::metadata::keyspace::KeyspaceMetadata;
 use ferrosa_schema::metadata::table::TableMetadata;
+use ferrosa_schema::metadata::user_type::UserTypeMetadata;
 use ferrosa_schema::{GrantEntry, RoleMetadata, Schema};
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
@@ -54,6 +55,8 @@ pub struct RaftState {
     pub grants: BTreeMap<String, Vec<GrantEntry>>,
     /// All secondary indexes, keyed by (keyspace, table, index_name).
     pub indexes: BTreeMap<(String, String, String), IndexMetadata>,
+    /// All user-defined types, keyed by (keyspace, type_name).
+    pub types: BTreeMap<(String, String), UserTypeMetadata>,
     /// Cluster members, keyed by openraft NodeId.
     pub members: BTreeMap<u64, NodeInfo>,
     /// Token ring: token → NodeId mapping.
@@ -156,6 +159,8 @@ impl FerrosStateMachine {
                 self.state.tables.retain(|(ks, _), _| ks != &name);
                 // Also drop indexes in this keyspace.
                 self.state.indexes.retain(|(ks, _, _), _| ks != &name);
+                // Also drop types in this keyspace.
+                self.state.types.retain(|(ks, _), _| ks != &name);
                 if let Some(schema) = &self.schema {
                     let _ = schema.drop_keyspace_internal(&name);
                 }
@@ -263,6 +268,21 @@ impl FerrosStateMachine {
                     .remove(&(keyspace.clone(), table.clone(), index.clone()));
                 if let Some(schema) = &self.schema {
                     let _ = schema.drop_index_internal(&keyspace, &table, &index);
+                }
+            }
+
+            // ---- DDL: User-Defined Types -------------------------------
+            RaftCommand::CreateType(udt) => {
+                let key = (udt.keyspace.clone(), udt.name.clone());
+                self.state.types.entry(key).or_insert_with(|| udt.clone());
+                if let Some(schema) = &self.schema {
+                    let _ = schema.create_type_internal(&udt);
+                }
+            }
+            RaftCommand::DropType { keyspace, name } => {
+                self.state.types.remove(&(keyspace.clone(), name.clone()));
+                if let Some(schema) = &self.schema {
+                    let _ = schema.drop_type_internal(&keyspace, &name);
                 }
             }
 
@@ -521,7 +541,12 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
-                types: std::collections::HashMap::new(),
+                types: self
+                    .state
+                    .types
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             };
             let _ = schema.apply_snapshot(snap);
         }
@@ -1020,5 +1045,115 @@ mod tests {
             .unwrap();
 
         assert!(sm2.state().approved_nodes.contains(&host_id));
+    }
+
+    #[tokio::test]
+    async fn apply_create_and_drop_type() {
+        use ferrosa_common::CqlType;
+
+        let mut sm = FerrosStateMachine::new();
+
+        // Create keyspace first
+        let ks = simple_keyspace("ks");
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("city".to_string(), CqlType::Varchar),
+            ],
+        };
+
+        let entries = vec![
+            make_entry(1, 1, RaftCommand::CreateKeyspace(ks)),
+            make_entry(1, 2, RaftCommand::CreateType(udt)),
+        ];
+        sm.apply(entries).await.unwrap();
+
+        assert!(sm
+            .state()
+            .types
+            .contains_key(&("ks".into(), "address".into())));
+
+        // Drop type
+        let entry = make_entry(
+            1,
+            3,
+            RaftCommand::DropType {
+                keyspace: "ks".to_string(),
+                name: "address".to_string(),
+            },
+        );
+        sm.apply(vec![entry]).await.unwrap();
+
+        assert!(!sm
+            .state()
+            .types
+            .contains_key(&("ks".into(), "address".into())));
+    }
+
+    #[tokio::test]
+    async fn types_survive_snapshot() {
+        use ferrosa_common::CqlType;
+
+        let mut sm = FerrosStateMachine::new();
+
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![("street".to_string(), CqlType::Varchar)],
+        };
+
+        let entries = vec![
+            make_entry(1, 1, RaftCommand::CreateKeyspace(simple_keyspace("ks"))),
+            make_entry(1, 2, RaftCommand::CreateType(udt)),
+        ];
+        sm.apply(entries).await.unwrap();
+
+        // Build snapshot
+        let snapshot = sm.build_snapshot().await.unwrap();
+        let snap_meta = snapshot.meta.clone();
+        let snap_bytes = snapshot.snapshot.into_inner();
+
+        // Install into fresh state machine
+        let mut sm2 = FerrosStateMachine::new();
+        sm2.install_snapshot(&snap_meta, Box::new(Cursor::new(snap_bytes)))
+            .await
+            .unwrap();
+
+        assert!(sm2
+            .state()
+            .types
+            .contains_key(&("ks".into(), "address".into())));
+        let udt = &sm2.state().types[&("ks".into(), "address".into())];
+        assert_eq!(udt.fields.len(), 1);
+        assert_eq!(udt.fields[0].0, "street");
+    }
+
+    #[tokio::test]
+    async fn drop_keyspace_cascades_types() {
+        use ferrosa_common::CqlType;
+
+        let mut sm = FerrosStateMachine::new();
+
+        let udt = UserTypeMetadata {
+            keyspace: "doomed".to_string(),
+            name: "address".to_string(),
+            fields: vec![("street".to_string(), CqlType::Varchar)],
+        };
+
+        let entries = vec![
+            make_entry(1, 1, RaftCommand::CreateKeyspace(simple_keyspace("doomed"))),
+            make_entry(1, 2, RaftCommand::CreateType(udt)),
+            make_entry(1, 3, RaftCommand::DropKeyspace("doomed".to_string())),
+        ];
+        sm.apply(entries).await.unwrap();
+
+        assert!(
+            !sm.state()
+                .types
+                .contains_key(&("doomed".into(), "address".into())),
+            "types in dropped keyspace should be removed"
+        );
     }
 }

@@ -18,6 +18,7 @@ use uuid::Uuid;
 use ferrosa_schema::metadata::index::IndexMetadata;
 use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
 use ferrosa_schema::metadata::table::{TableMetadata, TableUpdates};
+use ferrosa_schema::metadata::user_type::UserTypeMetadata;
 use ferrosa_schema::{GrantEntry, Permission, Resource, RoleMetadata, RoleUpdates};
 
 use crate::config::ClusterConfig;
@@ -129,6 +130,11 @@ pub enum RaftCommand {
         keyspace: String,
         table: String,
         index: String,
+    },
+    CreateType(UserTypeMetadata),
+    DropType {
+        keyspace: String,
+        name: String,
     },
 
     // ---- Topology (node-membership mutations) ---------------------------
