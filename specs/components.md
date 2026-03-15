@@ -5,7 +5,7 @@
 
 ## Overview
 
-Ferrosa is a Cargo workspace of 11 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently.
+Ferrosa is a Cargo workspace of 12 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently.
 
 ## Dependency Graph
 
@@ -13,7 +13,8 @@ Ferrosa is a Cargo workspace of 11 crates with a clean, acyclic dependency graph
 graph BT
     Common[ferrosa-common<br/>Shared types]
     SST[ferrosa-sstable<br/>SSTable read/write]
-    Index[ferrosa-index<br/>Secondary indexes]
+    Index[ferrosa-index<br/>Secondary + vector indexes]
+    UDF[ferrosa-udf<br/>WASM UDF sandbox]
     Net[ferrosa-net<br/>Internode protocol]
     Storage[ferrosa-storage<br/>Write-behind S3 engine]
     Schema[ferrosa-schema<br/>DDL, system keyspaces]
@@ -25,6 +26,7 @@ graph BT
 
     SST --> Common
     Index --> Common
+    UDF --> Common
     Net --> Common
     Storage --> Common
     Storage --> SST
@@ -81,7 +83,7 @@ graph BT
 
 - **Purpose**: Pluggable secondary index framework with multiple index type implementations
 - **Location**: `ferrosa-index/`
-- **Dependencies**: `ferrosa-common`, `serde`, `serde_json`, `bitflags`, `uuid`, `thiserror`, `rand`
+- **Dependencies**: `ferrosa-common`, `serde`, `serde_json`, `rand`, `tracing`
 - **Status**: Implemented — 8 index types with build/read/factory trait system
 - **Modules**:
   - `lib.rs` — Core types (`IndexType`, `IndexKey`, `RowPosition`, `IndexFiles`, `IndexConfig`, `IndexCapabilities`, `FilterPredicate`), traits (`IndexBuilder`, `IndexReader`, `IndexFactory`), error types
@@ -93,8 +95,22 @@ graph BT
   - `vector/mod.rs` — Distance functions (L2, cosine, inner product), dimension constants (4096 f32 / 8192 f16)
   - `vector/hnsw.rs` — HNSW graph index (multi-layer navigable small world, beam search)
   - `vector/ivfflat.rs` — IVFFlat index (k-means clustering, inverted list probing)
-- **Key interfaces**: `IndexFactory` creates `IndexBuilder` (build-side, `Send`) and `IndexReader` (query-side, `Send + Sync`). Storage-attached design — indexes are per-SSTable companion files built asynchronously after flush.
+- **Key interfaces**: Two trait APIs — secondary indexes use `IndexFactory`/`IndexBuilder`/`IndexReader` with partition/clustering key addressing; vector indexes use their own trait set in `vector::` module with byte-offset `RowPosition` and `nearest(query, k, ef_search)` for ANN queries. Storage-attached design — indexes are per-SSTable companion files built asynchronously after flush.
 - **Spec**: [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md)
+
+### ferrosa-udf
+
+- **Purpose**: WASM-sandboxed user-defined function execution
+- **Location**: `ferrosa-udf/`
+- **Dependencies**: `ferrosa-common`, `wasmtime` (component-model), `moka`, `num-bigint`, `uuid`, `thiserror`, `tracing`
+- **Status**: In progress — WIT contract and executor scaffold complete, Wasmtime integration deferred
+- **Modules**:
+  - `wit/ferrosa-udf.wit` — WebAssembly Component Model contract defining `cql-value` type (all CQL types including UDTs, collections, temporal) with single `invoke(args) -> result<cql-value, string>` export
+  - `executor.rs` — `UdfExecutor` with moka compilation cache (configurable capacity, default 256), `compile()`, `invalidate()`, `call()` methods
+  - `sandbox.rs` — `SandboxConfig` with resource limits: 16MB memory, 1M fuel, 5s timeout, 10MB binary upload limit, 10M aggregate fuel
+  - `convert.rs` — `CqlValue` to WIT `cql-value` bidirectional conversion covering primitives, collections, UDTs, decimal/varint
+  - `error.rs` — `UdfError` enum: CompilationFailed, NotFound, ResourceExhausted, ExecutionFailed, TypeMismatch, BinaryTooLarge
+- **Design**: UDFs are uploaded as WASM binaries via `CREATE FUNCTION ... LANGUAGE wasm AS <hex>`. The executor compiles and caches modules, enforcing per-invocation resource limits via Wasmtime fuel and epoch interruption. Rust is the preferred authoring language but any language targeting WASM Component Model works.
 
 ### ferrosa-storage
 
@@ -132,9 +148,9 @@ graph BT
 - **Purpose**: Schema management, auth, audit, and system keyspaces
 - **Location**: `ferrosa-schema/`
 - **Dependencies**: `ferrosa-common`, `arc-swap`, `bcrypt`, `argon2`, `uuid`, `serde`, `serde_json`, `indexmap`, `tracing`, `password-hash`
-- **Status**: Implemented — metadata types, schema registry with lock-free snapshots, auth (roles, permissions, RBAC, rate limiting), audit logging (composite sinks, graph audit events), system keyspace queries, secrets provider, production mode validation, `TableMetadata` extensions map + `is_system` flag, `graph.*` extension validation (T6), system table protection (T7), `schema_ref()` for lock-free observer reads
+- **Status**: Implemented — metadata types, schema registry with lock-free snapshots, auth (roles, permissions, RBAC, rate limiting), audit logging (composite sinks, graph audit events), system keyspace queries, secrets provider, production mode validation, `TableMetadata` extensions map + `is_system` flag, `graph.*` extension validation (T6), system table protection (T7), `schema_ref()` for lock-free observer reads, `UserTypeMetadata` for UDTs with `system_schema.types` virtual table, `IndexMetadata` with `system_schema.indexes` virtual table
 - **Modules**:
-  - `metadata/` — `KeyspaceMetadata`, `TableMetadata`, `ColumnMetadata`, `IndexMetadata`, replication params, caching params
+  - `metadata/` — `KeyspaceMetadata`, `TableMetadata`, `ColumnMetadata`, `IndexMetadata`, `UserTypeMetadata`, replication params, caching params
   - `registry.rs` — `Schema` with `ArcSwap<SchemaSnapshot>` for lock-free reads, `AuthMethod` config
   - `auth/` — `AuthContext`, `Permission`, `Resource`, RBAC with `check_permission()`, `PasswordHasher` (bcrypt/argon2id), `AuthRateLimiter`
   - `audit/` — `AuditEvent`, `AuditSink` trait, `LogAuditSink`, `SystemTableAuditSink`, `CompositeSink`
