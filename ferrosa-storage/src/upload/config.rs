@@ -112,6 +112,35 @@ impl ObjectStoreConfig {
     }
 }
 
+/// Validate S3 bucket connectivity and write permissions at startup.
+///
+/// Performs a list + put + delete cycle to confirm the bucket is accessible
+/// and writable. Returns warnings (non-fatal) or an error (fatal).
+pub async fn validate_s3_bucket(store: &dyn ObjectStore) -> ferrosa_common::Result<Vec<String>> {
+    let mut warnings = Vec::new();
+
+    // Check connectivity — list root with a short prefix
+    store.list_with_delimiter(None).await.map_err(|e| {
+        ferrosa_common::Error::InvalidFormat(format!("S3 bucket not accessible: {e}"))
+    })?;
+
+    // Check write permission — write a test object
+    let test_path = object_store::path::Path::from(".ferrosa/connectivity-check");
+    let test_data = bytes::Bytes::from_static(b"ok");
+    store.put(&test_path, test_data.into()).await.map_err(|e| {
+        ferrosa_common::Error::InvalidFormat(format!("S3 write permission check failed: {e}"))
+    })?;
+
+    // Clean up test object (best effort)
+    if let Err(e) = store.delete(&test_path).await {
+        warnings.push(format!(
+            "S3 delete permission check failed (non-fatal): {e}"
+        ));
+    }
+
+    Ok(warnings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +151,12 @@ mod tests {
         assert_eq!(config.region, "us-east-1");
         assert!(config.allow_http);
         assert_eq!(config.upload_queue_depth, 16);
+    }
+
+    #[tokio::test]
+    async fn validate_s3_bucket_succeeds_with_in_memory_store() {
+        let store = object_store::memory::InMemory::new();
+        let warnings = validate_s3_bucket(&store).await.unwrap();
+        assert!(warnings.is_empty());
     }
 }

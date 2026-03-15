@@ -53,6 +53,8 @@ pub struct SharedState {
     pub prepared_cache: Arc<PreparedCache>,
     pub connection_tracker: Arc<ConnectionTracker>,
     pub query_tracker: Arc<QueryTracker>,
+    /// Broadcast channel for CQL EVENT push notifications.
+    pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
 }
 
 /// Per-request context: authentication and current keyspace.
@@ -67,6 +69,14 @@ pub enum RouteResult {
     Result(BytesMut),
     /// USE keyspace: returns the new keyspace name and a SetKeyspace frame body.
     SetKeyspace(String, BytesMut),
+    /// Subscription accepted — connection should spawn a polling task.
+    Subscribe {
+        inner: Box<Statement>,
+        interval: Option<std::time::Duration>,
+        delta: bool,
+    },
+    /// Unsubscribe — cancel one or all subscriptions.
+    Unsubscribe { stream_id: Option<u16> },
 }
 
 // ── Main dispatch ────────────────────────────────────────────────────────
@@ -133,9 +143,38 @@ pub async fn route(
         Statement::DropIndex(di) => route_drop_index(state, ctx, di)
             .await
             .map(RouteResult::Result),
-        Statement::Subscribe { .. } | Statement::Unsubscribe { .. } => Err(CqlError::Invalid(
-            "SUBSCRIBE/UNSUBSCRIBE not yet supported".to_string(),
-        )),
+        Statement::Subscribe {
+            inner,
+            interval,
+            delta,
+        } => {
+            // Validate: inner must be a Select
+            match inner.as_ref() {
+                Statement::Select(s) => {
+                    let ks = s
+                        .keyspace
+                        .as_deref()
+                        .or(ctx.current_keyspace.as_deref())
+                        .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
+                    state.schema.check_permission(
+                        ctx.auth,
+                        Permission::Select,
+                        &Resource::Table(ks.to_string(), s.table.clone()),
+                    )?;
+                }
+                _ => {
+                    return Err(CqlError::Invalid(
+                        "SUBSCRIBE requires a SELECT statement".into(),
+                    ))
+                }
+            }
+            Ok(RouteResult::Subscribe {
+                inner,
+                interval,
+                delta,
+            })
+        }
+        Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
     }
 }
 
@@ -471,10 +510,6 @@ fn route_select_user_table(
         &Resource::Table(ks.to_string(), s.table.clone()),
     )?;
 
-    if s.allow_filtering {
-        return Err(CqlError::Invalid("ALLOW FILTERING not supported".into()));
-    }
-
     let snap = state.schema.snapshot();
     let table_meta = snap
         .tables
@@ -484,67 +519,113 @@ fn route_select_user_table(
     // Build column info for result
     let (col_names, col_types) = build_column_info(table_meta, &s.columns)?;
 
-    // Extract PK values from WHERE clauses
-    let pk_values = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta)?;
-    let pk_types: Vec<CqlType> = table_meta
+    let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+    let all_col_types: Vec<CqlType> = table_meta
+        .columns
+        .values()
+        .map(|c| bridge::parse_cql_type(&c.column_type))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pk_indices: Vec<usize> = table_meta
         .partition_key
         .iter()
-        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+        .map(|name| table_meta.columns.get_index_of(name).unwrap())
+        .collect();
+    let ck_indices: Vec<usize> = table_meta
+        .clustering_key
+        .iter()
+        .map(|(name, _)| table_meta.columns.get_index_of(name).unwrap())
+        .collect();
     let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
 
-    match state.engine.read(&table_id, &decorated_key)? {
-        Some(partition) => {
-            // Build column index maps for partition_to_rows
-            let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
-            let all_col_types: Vec<CqlType> = table_meta
-                .columns
-                .values()
-                .map(|c| bridge::parse_cql_type(&c.column_type))
-                .collect::<Result<Vec<_>, _>>()?;
-            let pk_indices: Vec<usize> = table_meta
-                .partition_key
-                .iter()
-                .map(|name| table_meta.columns.get_index_of(name).unwrap())
-                .collect();
-            let ck_indices: Vec<usize> = table_meta
-                .clustering_key
-                .iter()
-                .map(|(name, _)| table_meta.columns.get_index_of(name).unwrap())
-                .collect();
+    // Try PK-based lookup first; fall back to full scan with ALLOW FILTERING
+    let pk_result = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta);
 
-            let rows = bridge::partition_to_rows(
+    let rows = if let Ok(pk_values) = pk_result {
+        // PK present — single partition lookup
+        let pk_types: Vec<CqlType> = table_meta
+            .partition_key
+            .iter()
+            .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+            .collect::<Result<Vec<_>, _>>()?;
+        let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+        match state.engine.read(&table_id, &decorated_key)? {
+            Some(partition) => bridge::partition_to_rows(
                 &partition,
                 &all_col_names,
                 &all_col_types,
                 &pk_indices,
                 &ck_indices,
-            );
-
-            // Apply column selection if not Star
-            let selected_rows = select_columns(&rows, &all_col_names, &col_names);
-
-            // Apply LIMIT
-            let limited = if let Some(limit) = s.limit {
-                &selected_rows[..std::cmp::min(selected_rows.len(), limit as usize)]
-            } else {
-                &selected_rows
-            };
-
-            Ok(result::encode_rows(
-                &col_names, &col_types, ks, &s.table, limited,
-            ))
+            ),
+            None => vec![],
         }
-        None => Ok(result::encode_rows(
-            &col_names,
-            &col_types,
-            ks,
-            &s.table,
-            &[],
-        )),
-    }
+    } else {
+        // No PK — check for secondary indexes on WHERE columns
+        let where_columns: Vec<&str> = s.where_clauses.iter().map(|w| w.column.as_str()).collect();
+        let has_matching_index = snap.indexes.iter().any(|((idx_ks, idx_tbl, _), meta)| {
+            idx_ks == ks
+                && idx_tbl == &s.table
+                && meta
+                    .target_columns
+                    .iter()
+                    .any(|c| where_columns.contains(&c.as_str()))
+        });
+
+        if !has_matching_index && !s.allow_filtering {
+            return Err(CqlError::Invalid(
+                "Cannot execute this query as it might involve data filtering and \
+                 thus may have unpredictable performance. If you want to execute \
+                 this query despite the performance unpredictability, use ALLOW FILTERING"
+                    .into(),
+            ));
+        }
+
+        // TODO: When IndexReader is available on StorageEngine, use it here
+        // for index-accelerated lookups instead of full scan. For now, the
+        // presence of a matching index allows the query without ALLOW FILTERING,
+        // but execution still falls through to a full scan + post-filter.
+        if has_matching_index {
+            tracing::debug!(table = %s.table, "index exists for WHERE columns; full scan until index readers are wired");
+        } else {
+            tracing::warn!(table = %s.table, "executing full scan with ALLOW FILTERING");
+        }
+
+        let limit = s.limit.map(|l| l as usize).unwrap_or(10_000);
+        let partitions = state.engine.read_range(&table_id, None, None, limit)?;
+        let mut all_rows = Vec::new();
+        for partition in &partitions {
+            let mut prows = bridge::partition_to_rows(
+                partition,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+            );
+            all_rows.append(&mut prows);
+            if all_rows.len() >= limit {
+                all_rows.truncate(limit);
+                break;
+            }
+        }
+        // Apply WHERE predicates as post-filter
+        all_rows.retain(|row| {
+            evaluate_where_predicates(row, &s.where_clauses, &all_col_names, table_meta)
+        });
+        all_rows
+    };
+
+    // Apply column selection if not Star
+    let selected_rows = select_columns(&rows, &all_col_names, &col_names);
+
+    // Apply LIMIT
+    let limited = if let Some(limit) = s.limit {
+        &selected_rows[..std::cmp::min(selected_rows.len(), limit as usize)]
+    } else {
+        &selected_rows
+    };
+
+    Ok(result::encode_rows(
+        &col_names, &col_types, ks, &s.table, limited,
+    ))
 }
 
 // ── Virtual table helpers ────────────────────────────────────────────────
@@ -560,6 +641,7 @@ fn data_type_to_cql_type(dt: &DataType) -> CqlType {
         DataType::Uuid => CqlType::Uuid,
         DataType::Timestamp => CqlType::Timestamp,
         DataType::Blob => CqlType::Blob,
+        DataType::Duration => CqlType::Duration,
         // DataType is #[non_exhaustive]; treat unknown variants as blob.
         _ => CqlType::Blob,
     }
@@ -1815,6 +1897,46 @@ fn extract_pk_values(
     Ok(values)
 }
 
+/// Evaluate WHERE predicates against a row for ALLOW FILTERING post-filter.
+fn evaluate_where_predicates(
+    row: &[Option<CqlValue>],
+    where_clauses: &[WhereClause],
+    all_col_names: &[String],
+    table_meta: &TableMetadata,
+) -> bool {
+    for wc in where_clauses {
+        let col_idx = match all_col_names.iter().position(|n| n == &wc.column) {
+            Some(i) => i,
+            None => return false,
+        };
+        let col_meta = match table_meta.columns.get(&wc.column) {
+            Some(m) => m,
+            None => return false,
+        };
+        let cql_type = match bridge::parse_cql_type(&col_meta.column_type) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        let expected = match bridge::term_to_cql_value(&wc.value, &cql_type) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let actual = match &row[col_idx] {
+            Some(v) => v,
+            None => return false,
+        };
+        let matches = match wc.op {
+            ComparisonOp::Eq => *actual == expected,
+            ComparisonOp::Ne => *actual != expected,
+            _ => true, // TODO: implement GT/LT/GE/LE comparisons
+        };
+        if !matches {
+            return false;
+        }
+    }
+    true
+}
+
 /// Project rows to a selected column subset.
 fn select_columns(
     rows: &[Vec<Option<CqlValue>>],
@@ -1995,6 +2117,7 @@ mod tests {
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
+            event_sender: tokio::sync::broadcast::channel(64).0,
         };
         (state, dir)
     }

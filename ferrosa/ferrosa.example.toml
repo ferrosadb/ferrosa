@@ -1,0 +1,38 @@
+# Ferrosa Configuration
+# Environment variables override all settings below.
+# Copy to /etc/ferrosa/ferrosa.toml or specify with FERROSA_CONFIG env var.
+
+[cql]
+bind = "0.0.0.0:9042"
+auth_disabled = false
+max_connections = 1024
+max_connections_per_ip = 64
+# tls_cert = "/etc/ferrosa/tls/server.crt"
+# tls_key = "/etc/ferrosa/tls/server.key"
+# require_tls = false
+
+[internode]
+bind = "0.0.0.0:7000"
+# broadcast = "192.168.1.1:7000"
+# seed = "192.168.1.2:7000"
+cluster_name = "ferrosa"
+# psk = "shared-secret-key"
+
+[storage]
+data_dir = "/var/lib/ferrosa"
+flush_threshold_bytes = 67108864  # 64 MB
+flush_interval_secs = 30          # How often to flush memtables + sync to S3
+commit_log_segment_size = 33554432  # 32 MB
+
+[s3]
+# endpoint = "https://s3.amazonaws.com"
+# bucket = "ferrosa-data"
+# region = "us-east-1"
+# allow_http = false
+
+[graph]
+enabled = false
+bind = "0.0.0.0:7474"
+
+[web]
+bind = "0.0.0.0:9090"

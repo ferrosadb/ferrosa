@@ -91,6 +91,7 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
         connection_tracker: Arc::new(ConnectionTracker::new()),
         query_tracker: Arc::new(QueryTracker::new()),
+        event_sender: tokio::sync::broadcast::channel(64).0,
     });
     (state, dir)
 }
@@ -210,9 +211,8 @@ fn test_config(auth_disabled: bool) -> ServerConfig {
     ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         max_connections: 10,
-        max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-        max_in_flight_per_connection: 128,
         auth_disabled,
+        ..ServerConfig::default()
     }
 }
 
@@ -673,5 +673,154 @@ async fn stream_id_preserved() {
     assert_eq!(
         resp.header.stream_id, 42,
         "response stream_id must match request"
+    );
+}
+
+// ── SUBSCRIBE tests ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn subscribe_every_receives_streaming_frames() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Create keyspace and table
+    let body = encode_query_body(
+        "CREATE KEYSPACE sub_test WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 1).await;
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Result);
+
+    let body = encode_query_body("CREATE TABLE sub_test.data (id text PRIMARY KEY, value text)");
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 2).await;
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Result);
+
+    // Insert some data
+    let body = encode_query_body("INSERT INTO sub_test.data (id, value) VALUES ('k1', 'v1')");
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 3).await;
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Result);
+
+    // Subscribe with 500ms polling interval (minimum allowed)
+    let body = encode_query_body("SUBSCRIBE SELECT * FROM sub_test.data EVERY 500ms");
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 10).await;
+
+    // First response: void ACK
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Result, "should get void ACK");
+    assert_eq!(resp.header.stream_id, 10);
+
+    // Second frame: first polling result (streaming flag set)
+    let resp = timeout(Duration::from_secs(3), read_frame(&mut stream))
+        .await
+        .expect("should receive streaming frame within 3s");
+    assert_eq!(resp.opcode, Opcode::Result);
+    assert_eq!(resp.header.stream_id, 10);
+    assert_ne!(
+        resp.header.flags & STREAMING_FLAG,
+        0,
+        "streaming flag must be set"
+    );
+    // Body should contain rows (non-empty)
+    assert!(
+        !resp.body.is_empty(),
+        "streaming frame should have row data"
+    );
+
+    // Send UNSUBSCRIBE to cancel
+    let body = encode_query_body("UNSUBSCRIBE");
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 11).await;
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Result);
+}
+
+#[tokio::test]
+async fn subscribe_without_every_returns_error() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Create keyspace and table
+    let body = encode_query_body(
+        "CREATE KEYSPACE sub_err WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 1).await;
+    read_frame(&mut stream).await;
+
+    let body = encode_query_body("CREATE TABLE sub_err.t (id text PRIMARY KEY)");
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 2).await;
+    read_frame(&mut stream).await;
+
+    // SUBSCRIBE without EVERY — should return error
+    let body = encode_query_body("SUBSCRIBE SELECT * FROM sub_err.t");
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 3).await;
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(
+        resp.opcode,
+        Opcode::Error,
+        "subscribe without EVERY should fail"
+    );
+}
+
+#[tokio::test]
+async fn unsubscribe_returns_void_result() {
+    // UNSUBSCRIBE without active subscriptions should still succeed.
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    let body = encode_query_body("UNSUBSCRIBE");
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 1).await;
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Result);
+}
+
+#[tokio::test]
+async fn subscribe_max_subscriptions_enforced() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Create table
+    let body = encode_query_body(
+        "CREATE KEYSPACE sub_max WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 1).await;
+    read_frame(&mut stream).await;
+
+    let body = encode_query_body("CREATE TABLE sub_max.t (id text PRIMARY KEY)");
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 2).await;
+    read_frame(&mut stream).await;
+
+    // Create 8 subscriptions (the max) — use long polling interval to avoid
+    // interleaved streaming frames confusing the ACK reads.
+    for i in 0..8u16 {
+        let body = encode_query_body("SUBSCRIBE SELECT * FROM sub_max.t EVERY 60s");
+        send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 100 + i as i16).await;
+        let resp = read_frame(&mut stream).await;
+        assert_eq!(
+            resp.opcode,
+            Opcode::Result,
+            "subscription {i} should succeed"
+        );
+    }
+
+    // 9th subscription should fail
+    let body = encode_query_body("SUBSCRIBE SELECT * FROM sub_max.t EVERY 60s");
+    send_raw_frame_with_stream(&mut stream, Opcode::Query, &body, 200).await;
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(
+        resp.opcode,
+        Opcode::Error,
+        "9th subscription should be rejected"
     );
 }

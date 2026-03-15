@@ -13,3 +13,4 @@ pub mod message;
 pub mod peer;
 pub mod pool;
 pub mod rpc;
+pub mod tls;

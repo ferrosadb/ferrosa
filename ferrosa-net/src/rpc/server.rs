@@ -1,8 +1,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::Framed;
 
 use crate::codec::{Frame, FrameHeader, InternodeCodec};
@@ -52,19 +54,26 @@ impl RpcServer {
         self
     }
 
+    /// Build TLS acceptor and store it, then start listening.
     pub async fn start_and_get_addr(
         self: &Arc<Self>,
     ) -> crate::error::Result<std::net::SocketAddr> {
+        // Build TLS acceptor if configured (must happen before spawning)
+        let tls_acceptor = crate::tls::build_tls_acceptor(&self.config)?;
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         let addr = listener.local_addr()?;
         let _ = self.bound_addr.send(Some(addr));
         tracing::info!(%addr, "internode server listening");
         let server = self.clone();
-        tokio::spawn(async move { server.accept_loop(listener).await });
+        tokio::spawn(async move { server.accept_loop(listener, tls_acceptor).await });
         Ok(addr)
     }
 
-    async fn accept_loop(self: Arc<Self>, listener: TcpListener) {
+    async fn accept_loop(
+        self: Arc<Self>,
+        listener: TcpListener,
+        tls_acceptor: Option<TlsAcceptor>,
+    ) {
         loop {
             let (stream, peer_addr) = match listener.accept().await {
                 Ok(conn) => conn,
@@ -113,8 +122,26 @@ impl RpcServer {
 
             self.active_connections.fetch_add(1, Ordering::Relaxed);
             let server = self.clone();
+            let tls_acceptor = tls_acceptor.clone();
             tokio::spawn(async move {
-                if let Err(e) = server.handle_connection(stream, peer_addr).await {
+                let result = if let Some(acceptor) = tls_acceptor {
+                    match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
+                        .await
+                    {
+                        Ok(Ok(tls_stream)) => server.handle_connection(tls_stream, peer_addr).await,
+                        Ok(Err(e)) => {
+                            tracing::warn!(%peer_addr, "TLS handshake failed: {e}");
+                            Err(NetError::Protocol(format!("TLS handshake failed: {e}")))
+                        }
+                        Err(_) => {
+                            tracing::warn!(%peer_addr, "TLS handshake timeout");
+                            Err(NetError::Timeout("TLS handshake".into()))
+                        }
+                    }
+                } else {
+                    server.handle_connection(stream, peer_addr).await
+                };
+                if let Err(e) = result {
                     tracing::error!(%peer_addr, error = %e, "connection error");
                 }
                 server.active_connections.fetch_sub(1, Ordering::Relaxed);
@@ -122,11 +149,14 @@ impl RpcServer {
         }
     }
 
-    async fn handle_connection(
+    async fn handle_connection<S>(
         &self,
-        stream: tokio::net::TcpStream,
+        stream: S,
         peer_addr: std::net::SocketAddr,
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
         let mut framed = Framed::new(stream, InternodeCodec::new(self.config.max_frame_body_size));
 
         // Handshake with timeout (T5)

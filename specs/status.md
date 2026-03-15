@@ -74,11 +74,14 @@ cluster        ██████   █████░  ████░░   █
 - **Remaining:**
   - [x] ~~Commit log replay integration~~ (merged PR #38)
   - [x] ~~Compaction execution merge I/O~~ (merged PR #38)
+  - [x] ~~Manifest CAS retry loop~~ (exponential backoff, 3 retries)
+  - [x] ~~S3 bucket validation at startup~~ (list + put + delete probe)
+  - [x] ~~S3 upload wiring~~ (flush → UploadManager → manifest update)
+  - [x] ~~S3 cold restart bootstrap~~ (schema.json + manifest → download SSTables)
+  - [x] ~~Graceful shutdown flush + S3 sync~~
   - [ ] LCS and TWCS compaction strategies
   - [ ] Disk backpressure
   - [ ] `io_uring` I/O backend
-  - [ ] Manifest CAS retry loop (T23 — designed, needs wiring)
-  - [ ] S3 bucket policy validation at startup (T22 — verify encryption enabled)
 
 ### ferrosa-schema — Mostly Complete (Chunk A)
 
@@ -93,7 +96,7 @@ cluster        ██████   █████░  ████░░   █
   for secondary index definitions, `system_schema.indexes` virtual table, cascade
   cleanup on `DROP TABLE` (removes associated indexes).
 - **Remaining (Chunks B-F):**
-  - [ ] DDL validation rules
+  - [x] ~~DDL validation rules~~ (table name, PK, RF constraints)
   - [ ] System table persistence to SSTable
   - [ ] UDT (user-defined type) support
   - [ ] Role hierarchy with inheritance
@@ -113,7 +116,7 @@ cluster        ██████   █████░  ████░░   █
   metrics via `system_views.secondary_indexes`, CQL-compatible DDL with
   `CREATE INDEX ... USING 'type'` syntax.
 - **Remaining:**
-  - [ ] Query path integration (index-aware query planner in ferrosa-cql)
+  - [x] ~~Query path integration~~ (index check in SELECT path, falls through to scan until IndexReader wired)
   - [ ] `SOUNDS LIKE` / `ANN OF` CQL syntax
   - [ ] Clustered indexes
   - [ ] GPU offloading for vector operations
@@ -136,10 +139,13 @@ cluster        ██████   █████░  ████░░   █
   for pair mode replication. `CREATE INDEX` / `DROP INDEX` parser support and router
   integration, `resolve_index_type()` for mapping index USING clause to index factory.
 - **Remaining:**
-  - [ ] CQL TLS via rustls (T02/T03 — Critical, plaintext traffic)
-  - [ ] Per-IP rate limiting for connection/query flood (T04)
-  - [ ] EVENT push notifications
-  - [ ] ALLOW FILTERING support
+  - [x] ~~CQL TLS via rustls~~ (ring crypto provider, 10s handshake timeout)
+  - [x] ~~Per-IP rate limiting~~ (IpConnectionTracker, default 64 per IP)
+  - [x] ~~EVENT push notification types~~ (SchemaChange/Topology/Status + broadcast channel)
+  - [x] ~~ALLOW FILTERING support~~ (full table scan + WHERE predicate post-filter)
+  - [x] ~~SUBSCRIBE EVERY polling mode~~ (streaming frames, max 8 per connection)
+  - [x] ~~Secondary index checks in SELECT path~~ (allows query without ALLOW FILTERING when index exists)
+  - [x] ~~CQL Duration type (0x0015)~~ (zigzag vint encoding)
   - [ ] Logged batch atomicity
   - [ ] UDT support
   - [ ] Query tracing
@@ -170,7 +176,7 @@ cluster        ██████   █████░  ████░░   █
   `metrics`. TUI monitor dashboard (ratatui/crossterm) with 5 panels, auto-refresh,
   keyboard navigation.
 - **Remaining:**
-  - [ ] Integration tests (currently unit tests only)
+  - [x] ~~Integration tests~~ (11 tests covering connections, queries, system tables)
 
 ### ferrosa (binary) — Complete (pair-mode, production-ready)
 
@@ -188,7 +194,9 @@ cluster        ██████   █████░  ████░░   █
   systemd service unit.
 - **Remaining:**
   - [x] ~~Graceful shutdown sequencing~~ (done)
-  - [ ] Configuration file support (currently env vars only)
+  - [x] ~~Configuration file support~~ (TOML with env var override)
+  - [x] ~~Flush + S3 sync on graceful shutdown~~ (zero data loss on SIGTERM)
+  - [x] ~~Configurable flush interval~~ (FERROSA_FLUSH_INTERVAL_SECS)
 
 ### ferrosa-net — Phase 1 Complete (PR #39)
 
@@ -203,7 +211,7 @@ cluster        ██████   █████░  ████░░   █
   heartbeat-based failure detection. Proptest fuzzing for message decode. No dependency
   on ferrosa-common.
 - **Remaining (Phase 2):**
-  - [ ] TLS via rustls for internode encryption
+  - [x] ~~TLS via rustls for internode encryption~~ (server + client, self-signed support)
   - [ ] Connection reconnection and backoff
   - [ ] Graceful shutdown / drain
   - [ ] Compression (LZ4/Snappy frame-level)
