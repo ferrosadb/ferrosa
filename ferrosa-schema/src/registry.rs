@@ -18,9 +18,12 @@ use crate::auth::permission::{GrantEntry, Permission, Resource};
 use crate::auth::rate_limit::{AuthRateLimiter, RateLimitConfig};
 use crate::auth::role::{AuthContext, RoleMetadata, RoleUpdates};
 use crate::error::SchemaError;
+use ferrosa_common::CqlType;
+
 use crate::metadata::index::IndexMetadata;
 use crate::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
 use crate::metadata::table::{TableMetadata, TableUpdates};
+use crate::metadata::user_type::UserTypeMetadata;
 use crate::secrets::SecretsProvider;
 use crate::startup::DeploymentMode;
 use crate::virtual_registry::VirtualTableRegistry;
@@ -44,6 +47,9 @@ pub struct SchemaSnapshot {
     /// All secondary indexes, keyed by (keyspace, table, index_name).
     #[serde(default)]
     pub indexes: HashMap<(String, String, String), IndexMetadata>,
+    /// All user-defined types, keyed by (keyspace, type_name).
+    #[serde(default)]
+    pub types: HashMap<(String, String), UserTypeMetadata>,
 }
 
 impl SchemaSnapshot {
@@ -56,6 +62,7 @@ impl SchemaSnapshot {
             roles: HashMap::new(),
             grants: HashMap::new(),
             indexes: HashMap::new(),
+            types: HashMap::new(),
         }
     }
 }
@@ -1229,6 +1236,114 @@ impl Schema {
         );
         Ok(())
     }
+
+    // ---- User-Defined Type (UDT) operations ----
+
+    /// Create a user-defined type. Returns error if type already exists or
+    /// keyspace not found.
+    pub fn create_type_internal(&self, udt: &UserTypeMetadata) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let key = (udt.keyspace.clone(), udt.name.clone());
+        if snap.types.contains_key(&key) {
+            return Err(SchemaError::TypeExists(
+                udt.keyspace.clone(),
+                udt.name.clone(),
+            ));
+        }
+        if !snap.keyspaces.contains_key(&udt.keyspace) {
+            return Err(SchemaError::KeyspaceNotFound(udt.keyspace.clone()));
+        }
+        snap.types.insert(key, udt.clone());
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Drop a user-defined type. Returns error if type not found.
+    pub fn drop_type_internal(&self, keyspace: &str, name: &str) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let key = (keyspace.to_string(), name.to_string());
+        if !snap.types.contains_key(&key) {
+            return Err(SchemaError::TypeNotFound(
+                keyspace.to_string(),
+                name.to_string(),
+            ));
+        }
+        snap.types.remove(&key);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Look up a user-defined type by keyspace and name.
+    pub fn get_type(&self, keyspace: &str, name: &str) -> Option<UserTypeMetadata> {
+        let snap = self.snapshot();
+        snap.types
+            .get(&(keyspace.to_string(), name.to_string()))
+            .cloned()
+    }
+
+    /// Alter a type — add a field. Returns error if type not found or field
+    /// already exists.
+    pub fn alter_type_add_field(
+        &self,
+        keyspace: &str,
+        name: &str,
+        field_name: &str,
+        field_type: CqlType,
+    ) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let key = (keyspace.to_string(), name.to_string());
+        let udt = snap
+            .types
+            .get_mut(&key)
+            .ok_or_else(|| SchemaError::TypeNotFound(keyspace.to_string(), name.to_string()))?;
+        if udt.fields.iter().any(|(n, _)| n == field_name) {
+            return Err(SchemaError::FieldExists(
+                keyspace.to_string(),
+                name.to_string(),
+                field_name.to_string(),
+            ));
+        }
+        udt.fields.push((field_name.to_string(), field_type));
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Alter a type — rename a field. Returns error if type or field not found.
+    pub fn alter_type_rename_field(
+        &self,
+        keyspace: &str,
+        type_name: &str,
+        from: &str,
+        to: &str,
+    ) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let key = (keyspace.to_string(), type_name.to_string());
+        let udt = snap.types.get_mut(&key).ok_or_else(|| {
+            SchemaError::TypeNotFound(keyspace.to_string(), type_name.to_string())
+        })?;
+        let field = udt
+            .fields
+            .iter_mut()
+            .find(|(n, _)| n == from)
+            .ok_or_else(|| {
+                SchemaError::FieldNotFound(
+                    keyspace.to_string(),
+                    type_name.to_string(),
+                    from.to_string(),
+                )
+            })?;
+        field.0 = to.to_string();
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2390,6 +2505,7 @@ mod tests {
             indexes: HashMap::new(),
             roles: HashMap::new(),
             grants: HashMap::new(),
+            types: HashMap::new(),
         };
 
         let ks = KeyspaceMetadata {
@@ -2418,6 +2534,7 @@ mod tests {
             indexes: HashMap::new(),
             roles: HashMap::new(),
             grants: HashMap::new(),
+            types: HashMap::new(),
         };
 
         let ks = KeyspaceMetadata {
@@ -2471,6 +2588,7 @@ mod tests {
             indexes: HashMap::new(),
             roles: HashMap::new(),
             grants: HashMap::new(),
+            types: HashMap::new(),
         };
 
         let ks = KeyspaceMetadata {
@@ -2790,5 +2908,115 @@ mod tests {
 
         let snap = schema.snapshot();
         assert!(!snap.grants.contains_key("empty_rev_role"));
+    }
+
+    // ---- UDT tests ----
+
+    fn create_test_keyspace(schema: &Schema, name: &str) {
+        schema
+            .create_keyspace_internal(KeyspaceMetadata {
+                name: name.to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+                },
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn create_and_lookup_udt() {
+        let schema = test_schema();
+        create_test_keyspace(&schema, "ks");
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("zip".to_string(), CqlType::Int),
+            ],
+        };
+        schema.create_type_internal(&udt).unwrap();
+        let found = schema.get_type("ks", "address");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().fields.len(), 2);
+    }
+
+    #[test]
+    fn create_type_fails_duplicate() {
+        let schema = test_schema();
+        create_test_keyspace(&schema, "ks");
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![("street".to_string(), CqlType::Varchar)],
+        };
+        schema.create_type_internal(&udt).unwrap();
+        let err = schema.create_type_internal(&udt).unwrap_err();
+        assert!(
+            format!("{err}").contains("already exists"),
+            "expected 'already exists' in: {err}"
+        );
+    }
+
+    #[test]
+    fn create_type_fails_missing_keyspace() {
+        let schema = test_schema();
+        let udt = UserTypeMetadata {
+            keyspace: "nonexistent".to_string(),
+            name: "addr".to_string(),
+            fields: vec![],
+        };
+        assert!(schema.create_type_internal(&udt).is_err());
+    }
+
+    #[test]
+    fn drop_type() {
+        let schema = test_schema();
+        create_test_keyspace(&schema, "ks");
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![("street".to_string(), CqlType::Varchar)],
+        };
+        schema.create_type_internal(&udt).unwrap();
+        schema.drop_type_internal("ks", "address").unwrap();
+        assert!(schema.get_type("ks", "address").is_none());
+    }
+
+    #[test]
+    fn alter_type_add_field() {
+        let schema = test_schema();
+        create_test_keyspace(&schema, "ks");
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![("street".to_string(), CqlType::Varchar)],
+        };
+        schema.create_type_internal(&udt).unwrap();
+        schema
+            .alter_type_add_field("ks", "address", "city", CqlType::Varchar)
+            .unwrap();
+        let found = schema.get_type("ks", "address").unwrap();
+        assert_eq!(found.fields.len(), 2);
+        assert_eq!(found.fields[1].0, "city");
+    }
+
+    #[test]
+    fn alter_type_rename_field() {
+        let schema = test_schema();
+        create_test_keyspace(&schema, "ks");
+        let udt = UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![("street".to_string(), CqlType::Varchar)],
+        };
+        schema.create_type_internal(&udt).unwrap();
+        schema
+            .alter_type_rename_field("ks", "address", "street", "street_name")
+            .unwrap();
+        let found = schema.get_type("ks", "address").unwrap();
+        assert_eq!(found.fields[0].0, "street_name");
     }
 }

@@ -41,6 +41,14 @@ pub enum SchemaError {
     PasswordTooWeak { violations: Vec<String> },
     /// Cannot modify a system-managed table (keyspace, table).
     SystemTableProtected(String, String),
+    /// User-defined type already exists (keyspace, type).
+    TypeExists(String, String),
+    /// User-defined type not found (keyspace, type).
+    TypeNotFound(String, String),
+    /// Field already exists in a user-defined type (keyspace, type, field).
+    FieldExists(String, String, String),
+    /// Field not found in a user-defined type (keyspace, type, field).
+    FieldNotFound(String, String, String),
     /// Generic schema validation error.
     InvalidSchema(String),
 }
@@ -79,6 +87,14 @@ impl fmt::Display for SchemaError {
             }
             Self::SystemTableProtected(ks, t) => {
                 write!(f, "cannot modify system table: {ks}.{t}")
+            }
+            Self::TypeExists(ks, t) => write!(f, "type already exists: {ks}.{t}"),
+            Self::TypeNotFound(ks, t) => write!(f, "type not found: {ks}.{t}"),
+            Self::FieldExists(ks, t, field) => {
+                write!(f, "field already exists: {field} in type {ks}.{t}")
+            }
+            Self::FieldNotFound(ks, t, field) => {
+                write!(f, "field not found: {field} in type {ks}.{t}")
             }
             Self::InvalidSchema(msg) => write!(f, "invalid schema: {msg}"),
         }
@@ -145,6 +161,10 @@ mod tests {
                 violations: vec!["too short".into()],
             },
             SchemaError::SystemTableProtected("ks".into(), "t".into()),
+            SchemaError::TypeExists("ks".into(), "t".into()),
+            SchemaError::TypeNotFound("ks".into(), "t".into()),
+            SchemaError::FieldExists("ks".into(), "t".into(), "f".into()),
+            SchemaError::FieldNotFound("ks".into(), "t".into(), "f".into()),
             SchemaError::InvalidSchema("bad".into()),
         ];
         for err in &errors {

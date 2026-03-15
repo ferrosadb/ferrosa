@@ -388,6 +388,7 @@ impl WireSchemaSnapshot {
             indexes: self.indexes.into_iter().collect(),
             roles: self.roles,
             grants: self.grants,
+            types: std::collections::HashMap::new(),
         }
     }
 }
