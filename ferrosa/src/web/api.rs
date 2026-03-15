@@ -49,6 +49,28 @@ pub fn routes() -> Router<WebAppState> {
         .route("/tables", get(list_tables))
 }
 
+/// Prometheus text exposition endpoint — returns `text/plain; charset=utf-8`.
+///
+/// Sits outside the auth middleware so Prometheus scrapers work without
+/// credentials.
+pub async fn get_metrics(
+    State(registry): State<Arc<VirtualTableRegistry>>,
+) -> (
+    StatusCode,
+    [(axum::http::header::HeaderName, &'static str); 1],
+    String,
+) {
+    let body = ferrosa_cql::prometheus::render_metrics(&registry);
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        body,
+    )
+}
+
 pub fn cluster_routes() -> Router<WebAppState> {
     Router::new()
         .route("/status", get(cluster_status))
@@ -772,5 +794,37 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn get_metrics_returns_prometheus_text() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![
+                VirtualColumnDef {
+                    name: "host".to_string(),
+                    data_type: DataType::Text,
+                },
+                VirtualColumnDef {
+                    name: "count".to_string(),
+                    data_type: DataType::Int,
+                },
+            ],
+            rows: vec![VirtualRow {
+                cells: vec![
+                    CellValue::live(b"node1".to_vec(), 1),
+                    CellValue::live(5i32.to_be_bytes().to_vec(), 1),
+                ],
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let state = Arc::new(registry);
+        let (status, headers, body) = get_metrics(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[0].1, "text/plain; charset=utf-8");
+        assert!(body.contains("ferrosa_test_table_count"));
+        assert!(body.contains("host=\"node1\""));
+        assert!(body.contains("5"));
     }
 }
