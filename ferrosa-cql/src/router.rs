@@ -69,6 +69,14 @@ pub enum RouteResult {
     Result(BytesMut),
     /// USE keyspace: returns the new keyspace name and a SetKeyspace frame body.
     SetKeyspace(String, BytesMut),
+    /// Subscription accepted — connection should spawn a polling task.
+    Subscribe {
+        inner: Box<Statement>,
+        interval: Option<std::time::Duration>,
+        delta: bool,
+    },
+    /// Unsubscribe — cancel one or all subscriptions.
+    Unsubscribe { stream_id: Option<u16> },
 }
 
 // ── Main dispatch ────────────────────────────────────────────────────────
@@ -135,9 +143,38 @@ pub async fn route(
         Statement::DropIndex(di) => route_drop_index(state, ctx, di)
             .await
             .map(RouteResult::Result),
-        Statement::Subscribe { .. } | Statement::Unsubscribe { .. } => Err(CqlError::Invalid(
-            "SUBSCRIBE/UNSUBSCRIBE not yet supported".to_string(),
-        )),
+        Statement::Subscribe {
+            inner,
+            interval,
+            delta,
+        } => {
+            // Validate: inner must be a Select
+            match inner.as_ref() {
+                Statement::Select(s) => {
+                    let ks = s
+                        .keyspace
+                        .as_deref()
+                        .or(ctx.current_keyspace.as_deref())
+                        .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
+                    state.schema.check_permission(
+                        ctx.auth,
+                        Permission::Select,
+                        &Resource::Table(ks.to_string(), s.table.clone()),
+                    )?;
+                }
+                _ => {
+                    return Err(CqlError::Invalid(
+                        "SUBSCRIBE requires a SELECT statement".into(),
+                    ))
+                }
+            }
+            Ok(RouteResult::Subscribe {
+                inner,
+                interval,
+                delta,
+            })
+        }
+        Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
     }
 }
 

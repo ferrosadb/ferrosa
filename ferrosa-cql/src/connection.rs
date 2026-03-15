@@ -112,145 +112,273 @@ pub async fn handle_connection<S>(
     let mut subscription_state = SubscriptionState::new(8);
     let mut pending_compression: Option<Compression> = None;
 
+    // Channel for subscription tasks to push streaming frames.
+    let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<crate::subscribe::SubscriptionPush>(64);
+
     // In-flight request limiter: bounds concurrent requests on this connection.
-    // Currently the handler is sequential (one frame at a time), so this acts as
-    // a guard for future concurrent frame handling (CQL v5 stream multiplexing).
     let in_flight = tokio::sync::Semaphore::new(max_in_flight);
 
     loop {
-        // M11: idle timeout — drop connection if no frame arrives within IDLE_TIMEOUT.
-        let maybe_frame = match timeout(IDLE_TIMEOUT, framed.next()).await {
-            Ok(Some(Ok(frame))) => frame,
-            Ok(Some(Err(e))) => {
-                warn!("frame decode error from {peer}: {e}");
-                break;
-            }
-            Ok(None) => {
-                // Stream ended — client disconnected.
-                debug!("connection from {peer} closed (EOF)");
-                break;
-            }
-            Err(_) => {
-                // Timeout — drop the connection.
-                debug!("idle timeout for {peer}, closing connection");
-                break;
-            }
-        };
-
-        let stream_id = maybe_frame.header.stream_id;
-
-        // Check in-flight limit for request opcodes (QUERY, EXECUTE, BATCH).
-        let is_request = matches!(
-            maybe_frame.header.opcode,
-            Opcode::Query | Opcode::Execute | Opcode::Batch
-        );
-        let _permit = if is_request {
-            match in_flight.try_acquire() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    // At capacity — respond with ERROR(Overloaded).
-                    debug!("in-flight limit reached for {peer}, rejecting request");
-                    let err = CqlError::Overloaded;
-                    let body = err.encode_body().freeze();
-                    let frame = CqlFrame {
-                        header: FrameHeader {
-                            version: VERSION_RESPONSE,
-                            flags: 0,
-                            stream_id,
-                            opcode: Opcode::Error,
-                            length: 0,
-                        },
-                        body,
-                    };
-                    if framed.send(frame).await.is_err() {
+        // Use select to handle both client frames and subscription pushes.
+        let frame_or_push = tokio::select! {
+            // M11: idle timeout — drop connection if no frame arrives within IDLE_TIMEOUT.
+            result = timeout(IDLE_TIMEOUT, framed.next()) => {
+                match result {
+                    Ok(Some(Ok(frame))) => FrameOrPush::ClientFrame(frame),
+                    Ok(Some(Err(e))) => {
+                        warn!("frame decode error from {peer}: {e}");
                         break;
                     }
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-
-        // Snapshot phase discriminant before handling, so we can detect transitions.
-        let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);
-        let was_ready = matches!(phase, ConnectionPhase::Ready);
-
-        match handle_frame(
-            &mut phase,
-            &mut auth_context,
-            &mut current_keyspace,
-            &state,
-            auth_disabled,
-            &maybe_frame,
-            &mut pending_compression,
-        )
-        .await
-        {
-            HandleResult::Reply(opcode, body) => {
-                // Track phase transitions and requests.
-                if was_awaiting_startup && matches!(phase, ConnectionPhase::Authenticating { .. }) {
-                    // STARTUP sent, auth required — entered Authenticating phase.
-                    state
-                        .connection_tracker
-                        .update_state(&peer, "authenticating");
-                } else if !was_ready && matches!(phase, ConnectionPhase::Ready) {
-                    // Transitioned to Ready — update state and username if auth completed.
-                    state.connection_tracker.update_state(&peer, "ready");
-                    if let Some(ctx) = auth_context.as_ref() {
-                        state.connection_tracker.update_username(&peer, &ctx.role);
+                    Ok(None) => {
+                        debug!("connection from {peer} closed (EOF)");
+                        break;
+                    }
+                    Err(_) => {
+                        debug!("idle timeout for {peer}, closing connection");
+                        break;
                     }
                 }
-                if was_ready {
-                    // Count every request handled in the Ready phase.
-                    state.connection_tracker.increment_requests(&peer);
-                }
+            }
+            Some(push) = sub_rx.recv() => {
+                FrameOrPush::SubscriptionPush(push)
+            }
+        };
 
-                let body_bytes = body.freeze();
+        match frame_or_push {
+            FrameOrPush::SubscriptionPush(push) => {
+                // Send streaming result frame from a subscription task.
                 let frame = CqlFrame {
-                    header: FrameHeader {
-                        version: VERSION_RESPONSE,
-                        flags: 0,
-                        stream_id,
-                        opcode,
-                        length: 0, // CqlCodec::encode will set this
-                    },
-                    body: body_bytes,
+                    header: FrameHeader::streaming_response(push.stream_id, Opcode::Result),
+                    body: push.body,
                 };
                 if framed.send(frame).await.is_err() {
                     break;
                 }
+            }
+            FrameOrPush::ClientFrame(maybe_frame) => {
+                let stream_id = maybe_frame.header.stream_id;
 
-                // After sending READY or AUTH_SUCCESS, enable compression if negotiated.
-                // STARTUP/READY frames themselves are NOT compressed; only subsequent frames.
-                if (opcode == Opcode::Ready || opcode == Opcode::AuthSuccess)
-                    && pending_compression.is_some()
-                {
-                    let compression = pending_compression.take().unwrap();
-                    debug!(
-                        "enabling {} compression for {peer}",
-                        compression.protocol_name()
-                    );
-                    framed.codec_mut().set_compression(compression);
-                }
-            }
-            HandleResult::Close(opcode, body) => {
-                let body_bytes = body.freeze();
-                let frame = CqlFrame {
-                    header: FrameHeader {
-                        version: VERSION_RESPONSE,
-                        flags: 0,
-                        stream_id,
-                        opcode,
-                        length: 0,
-                    },
-                    body: body_bytes,
+                // Check in-flight limit for request opcodes (QUERY, EXECUTE, BATCH).
+                let is_request = matches!(
+                    maybe_frame.header.opcode,
+                    Opcode::Query | Opcode::Execute | Opcode::Batch
+                );
+                let _permit = if is_request {
+                    match in_flight.try_acquire() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            debug!("in-flight limit reached for {peer}, rejecting request");
+                            let err = CqlError::Overloaded;
+                            let body = err.encode_body().freeze();
+                            let frame = CqlFrame {
+                                header: FrameHeader {
+                                    version: VERSION_RESPONSE,
+                                    flags: 0,
+                                    stream_id,
+                                    opcode: Opcode::Error,
+                                    length: 0,
+                                },
+                                body,
+                            };
+                            if framed.send(frame).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    None
                 };
-                let _ = framed.send(frame).await;
-                break;
-            }
-            HandleResult::CloseNow => {
-                break;
+
+                let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);
+                let was_ready = matches!(phase, ConnectionPhase::Ready);
+
+                match handle_frame(
+                    &mut phase,
+                    &mut auth_context,
+                    &mut current_keyspace,
+                    &state,
+                    auth_disabled,
+                    &maybe_frame,
+                    &mut pending_compression,
+                )
+                .await
+                {
+                    HandleResult::Reply(opcode, body) => {
+                        if was_awaiting_startup
+                            && matches!(phase, ConnectionPhase::Authenticating { .. })
+                        {
+                            state
+                                .connection_tracker
+                                .update_state(&peer, "authenticating");
+                        } else if !was_ready && matches!(phase, ConnectionPhase::Ready) {
+                            state.connection_tracker.update_state(&peer, "ready");
+                            if let Some(ctx) = auth_context.as_ref() {
+                                state.connection_tracker.update_username(&peer, &ctx.role);
+                            }
+                        }
+                        if was_ready {
+                            state.connection_tracker.increment_requests(&peer);
+                        }
+
+                        let body_bytes = body.freeze();
+                        let frame = CqlFrame {
+                            header: FrameHeader {
+                                version: VERSION_RESPONSE,
+                                flags: 0,
+                                stream_id,
+                                opcode,
+                                length: 0,
+                            },
+                            body: body_bytes,
+                        };
+                        if framed.send(frame).await.is_err() {
+                            break;
+                        }
+
+                        if (opcode == Opcode::Ready || opcode == Opcode::AuthSuccess)
+                            && pending_compression.is_some()
+                        {
+                            let compression = pending_compression.take().unwrap();
+                            debug!(
+                                "enabling {} compression for {peer}",
+                                compression.protocol_name()
+                            );
+                            framed.codec_mut().set_compression(compression);
+                        }
+                    }
+                    HandleResult::StartSubscription {
+                        inner,
+                        interval,
+                        delta: _,
+                    } => {
+                        let interval = match interval {
+                            Some(d) => d,
+                            None => {
+                                // Change-driven mode not yet implemented
+                                let err = CqlError::Invalid(
+                                    "SUBSCRIBE without EVERY not yet supported; \
+                                     use SUBSCRIBE ... EVERY <interval>"
+                                        .into(),
+                                );
+                                let body = err.encode_body().freeze();
+                                let frame = CqlFrame {
+                                    header: FrameHeader {
+                                        version: VERSION_RESPONSE,
+                                        flags: 0,
+                                        stream_id,
+                                        opcode: Opcode::Error,
+                                        length: 0,
+                                    },
+                                    body,
+                                };
+                                if framed.send(frame).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+
+                        // Create a cancellation token and register the subscription.
+                        let cancel = tokio_util::sync::CancellationToken::new();
+                        let handle = crate::subscribe::SubscriptionHandle {
+                            stream_id: stream_id as u16,
+                            cancel: cancel.clone(),
+                        };
+                        if let Err(msg) = subscription_state.add(handle) {
+                            let err = CqlError::Invalid(msg.to_string());
+                            let body = err.encode_body().freeze();
+                            let frame = CqlFrame {
+                                header: FrameHeader {
+                                    version: VERSION_RESPONSE,
+                                    flags: 0,
+                                    stream_id,
+                                    opcode: Opcode::Error,
+                                    length: 0,
+                                },
+                                body,
+                            };
+                            if framed.send(frame).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+
+                        // Send void ACK to confirm subscription.
+                        let ack_body = crate::result::encode_void().freeze();
+                        let frame = CqlFrame {
+                            header: FrameHeader {
+                                version: VERSION_RESPONSE,
+                                flags: 0,
+                                stream_id,
+                                opcode: Opcode::Result,
+                                length: 0,
+                            },
+                            body: ack_body,
+                        };
+                        if framed.send(frame).await.is_err() {
+                            break;
+                        }
+
+                        // Build owned auth context for the subscription task.
+                        let auth = auth_context.clone().unwrap_or(AuthContext {
+                            role: "cassandra".to_string(),
+                            is_superuser: true,
+                            must_change_password: false,
+                        });
+
+                        crate::subscribe::spawn_subscription_poll(
+                            stream_id,
+                            interval,
+                            state.clone(),
+                            auth,
+                            current_keyspace.clone(),
+                            *inner,
+                            sub_tx.clone(),
+                            cancel,
+                        );
+
+                        debug!(
+                            "subscription started for {peer} stream={stream_id} interval={:?}",
+                            interval
+                        );
+                    }
+                    HandleResult::CancelSubscription { stream_id: sub_id } => {
+                        subscription_state.cancel(sub_id);
+                        let body = crate::result::encode_void().freeze();
+                        let frame = CqlFrame {
+                            header: FrameHeader {
+                                version: VERSION_RESPONSE,
+                                flags: 0,
+                                stream_id,
+                                opcode: Opcode::Result,
+                                length: 0,
+                            },
+                            body,
+                        };
+                        if framed.send(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    HandleResult::Close(opcode, body) => {
+                        let body_bytes = body.freeze();
+                        let frame = CqlFrame {
+                            header: FrameHeader {
+                                version: VERSION_RESPONSE,
+                                flags: 0,
+                                stream_id,
+                                opcode,
+                                length: 0,
+                            },
+                            body: body_bytes,
+                        };
+                        let _ = framed.send(frame).await;
+                        break;
+                    }
+                    HandleResult::CloseNow => {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -259,6 +387,12 @@ pub async fn handle_connection<S>(
     subscription_state.cancel_all();
 
     debug!("connection handler for {peer} finished");
+}
+
+/// Internal enum for the select! loop — either a client frame or a subscription push.
+enum FrameOrPush {
+    ClientFrame(CqlFrame),
+    SubscriptionPush(crate::subscribe::SubscriptionPush),
 }
 
 /// Outcome of processing a single frame.
@@ -270,6 +404,15 @@ enum HandleResult {
     /// Close immediately without sending anything (reserved for future use).
     #[allow(dead_code)]
     CloseNow,
+    /// Subscription accepted — send void ACK, then spawn polling task.
+    StartSubscription {
+        inner: Box<crate::ast::Statement>,
+        interval: Option<Duration>,
+        #[allow(dead_code)] // delta mode deferred
+        delta: bool,
+    },
+    /// Unsubscribe — cancel one or all subscriptions.
+    CancelSubscription { stream_id: Option<u16> },
 }
 
 /// Dispatch a single frame based on the current connection phase.
@@ -537,6 +680,18 @@ async fn handle_query(
             *current_keyspace = Some(ks);
             HandleResult::Reply(Opcode::Result, body)
         }
+        Ok(RouteResult::Subscribe {
+            inner,
+            interval,
+            delta,
+        }) => HandleResult::StartSubscription {
+            inner,
+            interval,
+            delta,
+        },
+        Ok(RouteResult::Unsubscribe { stream_id }) => {
+            HandleResult::CancelSubscription { stream_id }
+        }
         Err(e) => HandleResult::Reply(Opcode::Error, e.encode_body()),
     }
 }
@@ -659,6 +814,11 @@ async fn handle_execute(
         Ok(RouteResult::SetKeyspace(ks, body)) => {
             *current_keyspace = Some(ks);
             HandleResult::Reply(Opcode::Result, body)
+        }
+        Ok(RouteResult::Subscribe { .. } | RouteResult::Unsubscribe { .. }) => {
+            // SUBSCRIBE/UNSUBSCRIBE via EXECUTE is not supported — use QUERY.
+            let err = CqlError::Invalid("SUBSCRIBE via EXECUTE not supported".into());
+            HandleResult::Reply(Opcode::Error, err.encode_body())
         }
         Err(e) => HandleResult::Reply(Opcode::Error, e.encode_body()),
     }
