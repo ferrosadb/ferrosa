@@ -116,10 +116,13 @@ Distributed transactions (Accord-style) are a research item, not yet implemented
 | `ferrosa` | Binary — composes all crates into the running database |
 | `ferrosa-cluster` | Raft metadata, node membership, tunable CL, request routing |
 | `ferrosa-cql` | CQL native protocol v5, query parsing, execution |
+| `ferrosa-graph` | Graph query engine — Cypher parser, adjacency index, HTTP endpoint |
+| `ferrosa-index` | Pluggable secondary indexes — B-tree, hash, composite, phonetic, vector |
 | `ferrosa-storage` | Memtable, commit log, compaction, S3 write-behind, cache management |
-| `ferrosa-schema` | Table/keyspace definitions, schema evolution, validation |
+| `ferrosa-schema` | Table/keyspace definitions, auth, audit, system keyspaces |
 | `ferrosa-sstable` | Read/write BTI SSTables, trie indices, Bloom filter, compression |
-| `ferrosa-net` | Internode protocol, connection management, TLS |
+| `ferrosa-net` | Internode protocol, connection management, priority-lane RPC |
+| `ferrosa-ctl` | CLI admin tool with TUI monitoring dashboard |
 | `ferrosa-common` | Shared types: Token, PartitionKey, DecoratedKey, CQL types |
 
 ## Migrating from Cassandra
@@ -155,8 +158,10 @@ Test infrastructure runs on [Sprites](https://docs.sprites.dev/) (Firecracker VM
 
 ## Project Status
 
-Ferrosa is in the design and early implementation phase. See the
-[architecture specs](specs/README.md) for the full specification.
+All 11 crates are implemented with ~68,000 lines of Rust and ~1,370 tests. Pair-mode
+two-node operation is production-ready; full Raft-based cluster mode (Phase 2) is
+complete and Phase 3 (production cluster wiring) is next. See the
+[architecture specs](specs/README.md) for the full specification and status.
 
 ## License
 
