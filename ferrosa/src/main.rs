@@ -573,6 +573,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let shutdown_timeout = std::time::Duration::from_secs(30);
     match tokio::time::timeout(shutdown_timeout, async {
+        // Drain internode connections before flushing memtables so peers stop
+        // sending mutations while we're in the middle of a flush.
+        tracing::info!("draining internode connections...");
+        rpc_server
+            .shutdown(std::time::Duration::from_secs(10))
+            .await;
+        tracing::info!("internode drained");
+
         // Flush all memtables to SSTables on disk.
         storage.shutdown()?;
         tracing::info!("memtables flushed");
