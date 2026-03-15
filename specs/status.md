@@ -16,7 +16,7 @@ catch-up, Raft consensus, token ring, and coordinator pattern.
 | Crates | 11 of 11 planned |
 | Source files | ~194 |
 | Source LOC | ~68,000 |
-| Test functions | ~1,250 |
+| Test functions | ~1,370 |
 | Integration test files | 22 |
 
 ## Maturity Assessment
