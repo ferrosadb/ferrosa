@@ -53,6 +53,8 @@ pub struct SharedState {
     pub prepared_cache: Arc<PreparedCache>,
     pub connection_tracker: Arc<ConnectionTracker>,
     pub query_tracker: Arc<QueryTracker>,
+    /// Broadcast channel for CQL EVENT push notifications.
+    pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
 }
 
 /// Per-request context: authentication and current keyspace.
@@ -1992,6 +1994,7 @@ mod tests {
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
+            event_sender: tokio::sync::broadcast::channel(64).0,
         };
         (state, dir)
     }

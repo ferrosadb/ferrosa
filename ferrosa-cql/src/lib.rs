@@ -21,6 +21,7 @@ pub mod bridge;
 pub mod client;
 pub mod connection;
 pub mod error;
+pub mod event;
 pub mod frame;
 pub mod lexer;
 pub mod parser;

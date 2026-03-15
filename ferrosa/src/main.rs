@@ -233,6 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prepared_cache: Arc::new(ferrosa_cql::prepared::PreparedCache::new(64 * 1024 * 1024)),
         connection_tracker,
         query_tracker,
+        event_sender: tokio::sync::broadcast::channel(64).0,
     });
     let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state);
     let cql_addr = cql_server.start_background().await?;

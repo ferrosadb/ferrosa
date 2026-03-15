@@ -364,6 +364,7 @@ mod tests {
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
+            event_sender: tokio::sync::broadcast::channel(64).0,
         });
         (state, dir)
     }
