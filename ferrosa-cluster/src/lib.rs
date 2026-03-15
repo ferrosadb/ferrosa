@@ -10,6 +10,7 @@ pub mod pair;
 pub mod raft;
 pub mod ring;
 pub mod state;
+pub mod streaming;
 pub mod write_path;
 
 pub use config::ClusterConfig;
