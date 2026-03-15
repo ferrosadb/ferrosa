@@ -172,14 +172,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         connection_tracker,
         query_tracker,
     });
+    let auth_disabled = cql_config.auth_disabled;
+    let vt_connection_tracker = shared_state.connection_tracker.clone();
+    let vt_query_tracker = shared_state.query_tracker.clone();
     let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state);
     let cql_addr = cql_server.start_background().await?;
     tracing::info!(%cql_addr, "CQL server listening");
 
     // 9. Web observability console
     let vt_registry = Arc::new(ferrosa_schema::VirtualTableRegistry::new());
+    vt_registry.register(Arc::new(
+        ferrosa_cql::virtual_tables::connections::ConnectionsTable::new(vt_connection_tracker),
+    ));
+    vt_registry.register(Arc::new(
+        ferrosa_cql::virtual_tables::active_queries::ActiveQueriesTable::new(vt_query_tracker),
+    ));
+    // TODO: Register StorageStatsTable once StorageEngine implements StorageStatsProvider.
+    // Until then, GET /api/storage_stats will return [].
+
+    let web_state = web::WebAppState {
+        registry: vt_registry,
+        mode_controller: mode_controller.clone(),
+        schema: schema.clone(),
+        auth_disabled,
+    };
     let web_config = web::WebConfig::from_env();
-    let web_addr = web::start_web_server(&web_config, vt_registry, mode_controller.clone()).await?;
+    let web_addr = web::start_web_server(&web_config, web_state).await?;
     tracing::info!(%web_addr, "web console listening");
 
     // 10. Graph engine (check FERROSA_GRAPH_ENABLED)
