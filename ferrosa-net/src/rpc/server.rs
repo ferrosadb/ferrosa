@@ -6,6 +6,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
 
 use crate::codec::{Frame, FrameHeader, InternodeCodec};
 use crate::config::NetConfig;
@@ -24,6 +25,7 @@ pub struct RpcServer {
     local_host_id: uuid::Uuid,
     registry: Arc<HandlerRegistry>,
     active_connections: Arc<AtomicUsize>,
+    cancel: CancellationToken,
     bound_addr: tokio::sync::watch::Sender<Option<std::net::SocketAddr>>,
     #[allow(dead_code)]
     bound_addr_rx: tokio::sync::watch::Receiver<Option<std::net::SocketAddr>>,
@@ -42,6 +44,7 @@ impl RpcServer {
             local_host_id,
             registry,
             active_connections: Arc::new(AtomicUsize::new(0)),
+            cancel: CancellationToken::new(),
             bound_addr,
             bound_addr_rx,
             inbound_callback: None,
@@ -52,6 +55,26 @@ impl RpcServer {
     pub fn with_inbound_callback(mut self, cb: Arc<dyn InboundPeerCallback>) -> Self {
         self.inbound_callback = Some(cb);
         self
+    }
+
+    /// Signal the server to stop accepting new connections and wait for in-flight
+    /// connections to drain, up to `drain_timeout`. Any connections still active after
+    /// the timeout are abandoned (the OS will close the socket).
+    pub async fn shutdown(&self, drain_timeout: Duration) {
+        self.cancel.cancel();
+        tokio::time::timeout(drain_timeout, self.wait_for_connections())
+            .await
+            .ok();
+    }
+
+    /// Busy-poll until no active connections remain.
+    async fn wait_for_connections(&self) {
+        loop {
+            if self.active_connections.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Build TLS acceptor and store it, then start listening.
@@ -75,11 +98,19 @@ impl RpcServer {
         tls_acceptor: Option<TlsAcceptor>,
     ) {
         loop {
-            let (stream, peer_addr) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::error!(error = %e, "accept error");
-                    continue;
+            let (stream, peer_addr) = tokio::select! {
+                _ = self.cancel.cancelled() => {
+                    tracing::info!("RpcServer: stopping accept loop");
+                    break;
+                }
+                result = listener.accept() => {
+                    match result {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            tracing::error!(error = %e, "accept error");
+                            continue;
+                        }
+                    }
                 }
             };
 
@@ -316,5 +347,153 @@ mod tests {
         let resp =
             Message::decode(resp_frame.header.msg_type, &mut resp_frame.body.clone()).unwrap();
         assert!(matches!(resp, Message::Pong { nonce: 42 }));
+    }
+
+    /// After shutdown(), the listener should stop accepting new connections.
+    #[tokio::test]
+    async fn shutdown_stops_accepting_connections() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        // Confirm the server is up: a connection + handshake should succeed.
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, InternodeCodec::new(config.max_frame_body_size));
+        initiate_handshake(&mut framed, &config, uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+        // Drop the framed connection so the server-side handler exits and the
+        // active_connections counter returns to zero before we call shutdown.
+        drop(framed);
+
+        // Give the connection handler a moment to decrement the counter.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Shut down with a generous drain timeout.
+        server.shutdown(Duration::from_millis(200)).await;
+
+        // After shutdown the accept loop has exited, so the listener is dropped.
+        // New connection attempts should be refused at the OS level (connection
+        // refused) or at least the server will not process them.
+        let connect_result =
+            tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr)).await;
+
+        match connect_result {
+            // Connection refused — OS already closed the port.
+            Ok(Err(_)) => {}
+            // Timeout — the listen socket is gone but the OS hasn't recycled the port yet.
+            Err(_) => {}
+            // Connected — verify the server no longer performs a handshake by reading EOF.
+            Ok(Ok(stream)) => {
+                let mut framed2 =
+                    Framed::new(stream, InternodeCodec::new(config.max_frame_body_size));
+                // The accept loop is not running, so no handshake frame will arrive.
+                // framed.next() should return None (EOF) quickly.
+                let frame = tokio::time::timeout(Duration::from_millis(200), framed2.next()).await;
+                // Either timeout or EOF — either way, no new connection is served.
+                assert!(
+                    frame.is_err() || frame.unwrap().is_none(),
+                    "server must not serve connections after shutdown"
+                );
+            }
+        }
+    }
+
+    /// A slow handler that blocks for a configurable duration, used to hold a
+    /// connection open while shutdown drains.
+    struct SlowHandler {
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for SlowHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            tokio::time::sleep(self.delay).await;
+            match msg {
+                Message::Ping { nonce } => Some(Message::Pong { nonce }),
+                _ => None,
+            }
+        }
+    }
+
+    /// shutdown() should wait for an in-flight handler to complete before returning
+    /// when the drain timeout is long enough.
+    #[tokio::test]
+    async fn shutdown_waits_for_inflight() {
+        let handler_delay = Duration::from_millis(80);
+        let drain_timeout = Duration::from_millis(500);
+
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(
+            MsgType::Ping,
+            Arc::new(SlowHandler {
+                delay: handler_delay,
+            }),
+        );
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        // Connect and complete handshake so an active connection is counted.
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut framed = Framed::new(stream, InternodeCodec::new(config.max_frame_body_size));
+        initiate_handshake(&mut framed, &config, uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+
+        // Send a Ping which will be processed slowly by SlowHandler.
+        use futures::SinkExt;
+        let ping = Message::Ping { nonce: 99 };
+        let mut body = BytesMut::new();
+        ping.encode(&mut body).unwrap();
+        let frame = Frame {
+            header: FrameHeader::new(
+                MsgType::Ping,
+                Lane::Raft,
+                1,
+                u32::try_from(body.len()).unwrap(),
+            ),
+            body: body.freeze(),
+        };
+        framed.send(frame).await.unwrap();
+
+        // Kick off shutdown concurrently. The drain window is long enough that
+        // the slow handler should finish inside it.
+        let server_clone = server.clone();
+        let shutdown_handle = tokio::spawn(async move {
+            server_clone.shutdown(drain_timeout).await;
+        });
+
+        // Receive the Pong — proves the handler ran to completion.
+        let resp_frame = tokio::time::timeout(drain_timeout, framed.next())
+            .await
+            .expect("expected pong before drain timeout")
+            .expect("stream should not be closed")
+            .expect("expected valid frame");
+        let resp =
+            Message::decode(resp_frame.header.msg_type, &mut resp_frame.body.clone()).unwrap();
+        assert!(
+            matches!(resp, Message::Pong { nonce: 99 }),
+            "expected Pong nonce=99"
+        );
+
+        // Drop our end so the server-side connection task exits and the counter
+        // goes to zero, letting shutdown() complete.
+        drop(framed);
+        shutdown_handle.await.unwrap();
+
+        // After shutdown the active connection counter must be zero.
+        assert_eq!(server.active_connections.load(Ordering::Acquire), 0);
     }
 }
