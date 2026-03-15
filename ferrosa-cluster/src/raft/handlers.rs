@@ -712,6 +712,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn partition_digest_detects_row_count_difference() {
+        let mut p1 = make_partition(b"abc", 500);
+        let mut p2 = make_partition(b"abc", 500);
+
+        // Add a second row to p2 so it has more rows than p1.
+        p2.rows.push(Row {
+            clustering: vec![1],
+            cells: vec![(0, CellValue::live(b"extra".to_vec(), 500))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(500),
+        });
+
+        // Sanity: the same partition is equal to itself.
+        assert_eq!(
+            compute_partition_digest(&p1),
+            compute_partition_digest(&p1),
+            "same partition must be equal to itself"
+        );
+
+        // Make sure row counts differ.
+        assert_ne!(p1.rows.len(), p2.rows.len());
+
+        // Different row counts must produce different digests.
+        assert_ne!(
+            compute_partition_digest(&p1),
+            compute_partition_digest(&p2),
+            "different row counts must produce different digest"
+        );
+
+        // Conversely, adding the same row to p1 must make the digests agree.
+        p1.rows.push(Row {
+            clustering: vec![1],
+            cells: vec![(0, CellValue::live(b"extra".to_vec(), 500))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(500),
+        });
+        assert_eq!(
+            compute_partition_digest(&p1),
+            compute_partition_digest(&p2),
+            "identical row counts and content must produce the same digest"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // ReadRequestHandler tests
     // -----------------------------------------------------------------------
