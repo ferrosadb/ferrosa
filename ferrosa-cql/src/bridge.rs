@@ -13,9 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
-use crate::ast::Term;
+use crate::ast::{CqlTypeName, Term};
 use crate::error::CqlError;
 use crate::types::{decode_value, encode_value, CqlType, CqlValue};
+use ferrosa_schema::Schema;
 
 // ---------------------------------------------------------------------------
 // Function 1: term_to_cql_value
@@ -147,6 +148,25 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     converted.push((ck, cv));
                 }
                 Ok(CqlValue::Map(converted))
+            }
+            CqlType::Udt {
+                fields: field_defs, ..
+            } => {
+                // UDT literal: {field_name: value, ...}
+                // Keys in the map literal must be string literals matching field names.
+                let mut result = Vec::with_capacity(field_defs.len());
+                for (field_name, field_type) in field_defs {
+                    let value = pairs
+                        .iter()
+                        .find(|(k, _)| match k {
+                            Term::StringLiteral(s) => s.eq_ignore_ascii_case(field_name),
+                            _ => false,
+                        })
+                        .map(|(_, v)| term_to_cql_value(v, field_type))
+                        .transpose()?;
+                    result.push((field_name.clone(), value));
+                }
+                Ok(CqlValue::Udt(result))
             }
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got map literal",
@@ -373,6 +393,101 @@ impl<'a> TypeParser<'a> {
             }
             _ => Err(CqlError::Invalid(format!("unknown CQL type: '{lower}'"))),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Function 2b: resolve_type_name
+// ---------------------------------------------------------------------------
+
+/// Resolve a [`CqlTypeName`] (from the parser AST) to a [`CqlType`], looking up
+/// user-defined types in the schema registry.
+///
+/// Built-in types (text, int, etc.) are resolved directly. If a `Simple` name
+/// doesn't match any built-in, the schema is checked for a UDT in the current
+/// keyspace (or a fully-qualified `ks.typename`).
+///
+/// `frozen<...>` is treated as transparent — the inner type is returned directly.
+pub fn resolve_type_name(
+    type_name: &CqlTypeName,
+    keyspace: &str,
+    schema: &Schema,
+) -> Result<CqlType, CqlError> {
+    match type_name {
+        CqlTypeName::Simple(name) => {
+            // Try built-in types first via the existing TypeParser
+            let lower = name.to_ascii_lowercase();
+            if let Some(builtin) = resolve_builtin_type(&lower) {
+                return Ok(builtin);
+            }
+            // Try UDT lookup — could be "other_ks.typename"
+            if let Some(dot_pos) = name.find('.') {
+                let ks = &name[..dot_pos];
+                let tn = &name[dot_pos + 1..];
+                if let Some(udt) = schema.get_type(ks, tn) {
+                    return Ok(CqlType::Udt {
+                        keyspace: udt.keyspace,
+                        name: udt.name,
+                        fields: udt.fields,
+                    });
+                }
+            } else if let Some(udt) = schema.get_type(keyspace, name) {
+                return Ok(CqlType::Udt {
+                    keyspace: udt.keyspace,
+                    name: udt.name,
+                    fields: udt.fields,
+                });
+            }
+            Err(CqlError::Invalid(format!("unknown type: '{name}'")))
+        }
+        CqlTypeName::Frozen(inner) => {
+            // frozen is a storage hint, not a separate type
+            resolve_type_name(inner, keyspace, schema)
+        }
+        CqlTypeName::List(inner) => Ok(CqlType::List(Box::new(resolve_type_name(
+            inner, keyspace, schema,
+        )?))),
+        CqlTypeName::Set(inner) => Ok(CqlType::Set(Box::new(resolve_type_name(
+            inner, keyspace, schema,
+        )?))),
+        CqlTypeName::Map(k, v) => Ok(CqlType::Map(
+            Box::new(resolve_type_name(k, keyspace, schema)?),
+            Box::new(resolve_type_name(v, keyspace, schema)?),
+        )),
+        CqlTypeName::Tuple(elems) => {
+            let resolved: Result<Vec<_>, _> = elems
+                .iter()
+                .map(|e| resolve_type_name(e, keyspace, schema))
+                .collect();
+            Ok(CqlType::Tuple(resolved?))
+        }
+    }
+}
+
+/// Try to resolve a lowercase type name to a built-in CQL type.
+fn resolve_builtin_type(name: &str) -> Option<CqlType> {
+    match name {
+        "text" | "varchar" => Some(CqlType::Varchar),
+        "int" => Some(CqlType::Int),
+        "bigint" => Some(CqlType::Bigint),
+        "smallint" => Some(CqlType::Smallint),
+        "tinyint" => Some(CqlType::Tinyint),
+        "float" => Some(CqlType::Float),
+        "double" => Some(CqlType::Double),
+        "boolean" => Some(CqlType::Boolean),
+        "blob" => Some(CqlType::Blob),
+        "uuid" => Some(CqlType::Uuid),
+        "timeuuid" => Some(CqlType::Timeuuid),
+        "timestamp" => Some(CqlType::Timestamp),
+        "inet" => Some(CqlType::Inet),
+        "ascii" => Some(CqlType::Ascii),
+        "counter" => Some(CqlType::Counter),
+        "varint" => Some(CqlType::Varint),
+        "decimal" => Some(CqlType::Decimal),
+        "date" => Some(CqlType::Date),
+        "time" => Some(CqlType::Time),
+        "duration" => Some(CqlType::Duration),
+        _ => None,
     }
 }
 
@@ -1187,5 +1302,311 @@ mod tests {
         assert_eq!(rows[0][0], Some(CqlValue::Int(1)));
         // Tombstone cell -> None
         assert_eq!(rows[0][1], None);
+    }
+
+    // --- resolve_type_name tests ---
+
+    fn test_schema_with_keyspace(ks: &str) -> Schema {
+        use ferrosa_schema::{
+            AuthMethod, DeploymentMode, EnvSecretsProvider, KeyspaceMetadata, PasswordHasher,
+            PasswordPolicy, RateLimitConfig, ReplicationParams, SchemaConfig, TestAuditSink,
+        };
+        use std::collections::HashMap;
+
+        let schema = Schema::new(SchemaConfig {
+            hasher: PasswordHasher::Bcrypt { cost: 4 },
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(TestAuditSink::new()),
+            secrets: Box::new(EnvSecretsProvider),
+            mode: DeploymentMode::Development,
+        })
+        .unwrap();
+        schema
+            .create_keyspace_internal(KeyspaceMetadata {
+                name: ks.to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+                },
+            })
+            .unwrap();
+        schema
+    }
+
+    #[test]
+    fn resolve_builtin_type_still_works() {
+        let schema = test_schema_with_keyspace("ks");
+        let resolved =
+            resolve_type_name(&CqlTypeName::Simple("text".to_string()), "ks", &schema).unwrap();
+        assert_eq!(resolved, CqlType::Varchar);
+    }
+
+    #[test]
+    fn resolve_builtin_int() {
+        let schema = test_schema_with_keyspace("ks");
+        let resolved =
+            resolve_type_name(&CqlTypeName::Simple("int".to_string()), "ks", &schema).unwrap();
+        assert_eq!(resolved, CqlType::Int);
+    }
+
+    #[test]
+    fn resolve_udt_type_name() {
+        use ferrosa_schema::metadata::UserTypeMetadata;
+
+        let schema = test_schema_with_keyspace("ks");
+        schema
+            .create_type_internal(&UserTypeMetadata {
+                keyspace: "ks".to_string(),
+                name: "address".to_string(),
+                fields: vec![
+                    ("street".to_string(), CqlType::Varchar),
+                    ("zip".to_string(), CqlType::Int),
+                ],
+            })
+            .unwrap();
+
+        let resolved =
+            resolve_type_name(&CqlTypeName::Simple("address".to_string()), "ks", &schema).unwrap();
+        match resolved {
+            CqlType::Udt {
+                keyspace,
+                name,
+                fields,
+            } => {
+                assert_eq!(keyspace, "ks");
+                assert_eq!(name, "address");
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].0, "street");
+                assert_eq!(fields[1].0, "zip");
+            }
+            other => panic!("expected Udt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_frozen_udt() {
+        use ferrosa_schema::metadata::UserTypeMetadata;
+
+        let schema = test_schema_with_keyspace("ks");
+        schema
+            .create_type_internal(&UserTypeMetadata {
+                keyspace: "ks".to_string(),
+                name: "address".to_string(),
+                fields: vec![("street".to_string(), CqlType::Varchar)],
+            })
+            .unwrap();
+
+        // frozen<address> should resolve to CqlType::Udt
+        let resolved = resolve_type_name(
+            &CqlTypeName::Frozen(Box::new(CqlTypeName::Simple("address".to_string()))),
+            "ks",
+            &schema,
+        )
+        .unwrap();
+        match resolved {
+            CqlType::Udt { name, .. } => assert_eq!(name, "address"),
+            other => panic!("expected Udt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_qualified_udt() {
+        use ferrosa_schema::metadata::UserTypeMetadata;
+        use ferrosa_schema::{KeyspaceMetadata, ReplicationParams};
+        use std::collections::HashMap;
+
+        let schema = test_schema_with_keyspace("ks1");
+        schema
+            .create_keyspace_internal(KeyspaceMetadata {
+                name: "ks2".to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+                },
+            })
+            .unwrap();
+        schema
+            .create_type_internal(&UserTypeMetadata {
+                keyspace: "ks2".to_string(),
+                name: "phone".to_string(),
+                fields: vec![("number".to_string(), CqlType::Varchar)],
+            })
+            .unwrap();
+
+        // From ks1 context, resolve "ks2.phone"
+        let resolved = resolve_type_name(
+            &CqlTypeName::Simple("ks2.phone".to_string()),
+            "ks1",
+            &schema,
+        )
+        .unwrap();
+        match resolved {
+            CqlType::Udt { keyspace, name, .. } => {
+                assert_eq!(keyspace, "ks2");
+                assert_eq!(name, "phone");
+            }
+            other => panic!("expected Udt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_unknown_type_rejected() {
+        let schema = test_schema_with_keyspace("ks");
+        let result = resolve_type_name(
+            &CqlTypeName::Simple("nosuchtype".to_string()),
+            "ks",
+            &schema,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_list_of_udt() {
+        use ferrosa_schema::metadata::UserTypeMetadata;
+
+        let schema = test_schema_with_keyspace("ks");
+        schema
+            .create_type_internal(&UserTypeMetadata {
+                keyspace: "ks".to_string(),
+                name: "tag".to_string(),
+                fields: vec![("label".to_string(), CqlType::Varchar)],
+            })
+            .unwrap();
+
+        let resolved = resolve_type_name(
+            &CqlTypeName::List(Box::new(CqlTypeName::Frozen(Box::new(
+                CqlTypeName::Simple("tag".to_string()),
+            )))),
+            "ks",
+            &schema,
+        )
+        .unwrap();
+        match resolved {
+            CqlType::List(inner) => match *inner {
+                CqlType::Udt { name, .. } => assert_eq!(name, "tag"),
+                other => panic!("expected Udt inside List, got {:?}", other),
+            },
+            other => panic!("expected List, got {:?}", other),
+        }
+    }
+
+    // --- UDT literal coercion tests ---
+
+    #[test]
+    fn udt_literal_coercion() {
+        let udt_type = CqlType::Udt {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("city".to_string(), CqlType::Varchar),
+            ],
+        };
+        let term = Term::MapLiteral(vec![
+            (
+                Term::StringLiteral("street".to_string()),
+                Term::StringLiteral("123 Main".to_string()),
+            ),
+            (
+                Term::StringLiteral("city".to_string()),
+                Term::StringLiteral("Springfield".to_string()),
+            ),
+        ]);
+        let val = term_to_cql_value(&term, &udt_type).unwrap();
+        match val {
+            CqlValue::Udt(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].0, "street");
+                assert_eq!(fields[0].1, Some(CqlValue::Text("123 Main".to_string())));
+                assert_eq!(fields[1].0, "city");
+                assert_eq!(fields[1].1, Some(CqlValue::Text("Springfield".to_string())));
+            }
+            other => panic!("expected Udt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn udt_literal_missing_field_is_none() {
+        let udt_type = CqlType::Udt {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("city".to_string(), CqlType::Varchar),
+            ],
+        };
+        // Only provide 'street', leave 'city' missing
+        let term = Term::MapLiteral(vec![(
+            Term::StringLiteral("street".to_string()),
+            Term::StringLiteral("123 Main".to_string()),
+        )]);
+        let val = term_to_cql_value(&term, &udt_type).unwrap();
+        match val {
+            CqlValue::Udt(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].1, Some(CqlValue::Text("123 Main".to_string())));
+                // Missing field should be None
+                assert_eq!(fields[1].0, "city");
+                assert_eq!(fields[1].1, None);
+            }
+            other => panic!("expected Udt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn udt_literal_case_insensitive_keys() {
+        let udt_type = CqlType::Udt {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![("street".to_string(), CqlType::Varchar)],
+        };
+        // Key uses different case
+        let term = Term::MapLiteral(vec![(
+            Term::StringLiteral("STREET".to_string()),
+            Term::StringLiteral("123 Main".to_string()),
+        )]);
+        let val = term_to_cql_value(&term, &udt_type).unwrap();
+        match val {
+            CqlValue::Udt(fields) => {
+                assert_eq!(fields[0].0, "street");
+                assert_eq!(fields[0].1, Some(CqlValue::Text("123 Main".to_string())));
+            }
+            other => panic!("expected Udt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn udt_literal_nested_types() {
+        let udt_type = CqlType::Udt {
+            keyspace: "ks".to_string(),
+            name: "person".to_string(),
+            fields: vec![
+                ("name".to_string(), CqlType::Varchar),
+                ("age".to_string(), CqlType::Int),
+            ],
+        };
+        let term = Term::MapLiteral(vec![
+            (
+                Term::StringLiteral("name".to_string()),
+                Term::StringLiteral("Alice".to_string()),
+            ),
+            (
+                Term::StringLiteral("age".to_string()),
+                Term::IntegerLiteral(30),
+            ),
+        ]);
+        let val = term_to_cql_value(&term, &udt_type).unwrap();
+        match val {
+            CqlValue::Udt(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].1, Some(CqlValue::Text("Alice".to_string())));
+                assert_eq!(fields[1].1, Some(CqlValue::Int(30)));
+            }
+            other => panic!("expected Udt, got {:?}", other),
+        }
     }
 }
