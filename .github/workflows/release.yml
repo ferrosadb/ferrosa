@@ -160,7 +160,7 @@ jobs:
           cp "${GITHUB_WORKSPACE}/docs/CNAME" . 2>/dev/null || true
 
           # Update version badge in README
-          sed -i "s|ferrosa_[0-9.]*_amd64\.deb|ferrosa_${VERSION}_amd64.deb|g" README.md
+          sed -i "s|ferrosa_[0-9a-zA-Z._-]*_amd64\.deb|ferrosa_${VERSION}_amd64.deb|g" README.md
 
           # Commit and push if there are changes
           git add -A
