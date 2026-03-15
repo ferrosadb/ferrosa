@@ -471,11 +471,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 12. Background maintenance loop: periodic flush, compaction polling, commit log GC,
     //     and S3 schema persistence.
+    let flush_interval_secs: u64 = config_val(
+        "FERROSA_FLUSH_INTERVAL_SECS",
+        &file_config,
+        "storage",
+        "flush_interval_secs",
+        "30",
+    )
+    .parse()
+    .unwrap_or(30);
     let maintenance_engine = storage.clone();
     let maintenance_schema = schema.clone();
     let has_s3 = maintenance_engine.has_s3();
     tokio::spawn(async move {
-        let mut flush_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut flush_interval =
+            tokio::time::interval(std::time::Duration::from_secs(flush_interval_secs));
         let mut compact_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         // Persist schema snapshot to S3 every 60s (catches DDL changes).
         let mut schema_sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -531,17 +541,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 13. Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
 
-    // 14. Graceful shutdown with timeout
+    // 14. Graceful shutdown: flush memtables, sync to S3, stop compaction
     tracing::info!("shutdown signal received, draining...");
 
-    // CqlServer and RpcServer do not yet expose shutdown methods to stop
-    // accepting new connections. For now, proceed directly to storage shutdown
-    // which flushes memtables and stops compaction.
-    // TODO: Add CqlServer::shutdown() and RpcServer::shutdown() to drain
-    // in-flight requests before stopping the storage layer.
-
     let shutdown_timeout = std::time::Duration::from_secs(30);
-    match tokio::time::timeout(shutdown_timeout, async { storage.shutdown() }).await {
+    match tokio::time::timeout(shutdown_timeout, async {
+        // Flush all memtables to SSTables on disk.
+        storage.shutdown()?;
+        tracing::info!("memtables flushed");
+
+        // Sync any new SSTables to S3 and persist schema.
+        if storage.has_s3() {
+            match storage.sync_sstables_to_s3().await {
+                Ok(n) => tracing::info!(count = n, "shutdown: synced SSTables to S3"),
+                Err(e) => tracing::warn!(%e, "shutdown: S3 SSTable sync failed"),
+            }
+            persist_schema_to_s3(&storage, &schema).await;
+            tracing::info!("shutdown: schema snapshot persisted to S3");
+        }
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+    .await
+    {
         Ok(Ok(())) => tracing::info!("clean shutdown"),
         Ok(Err(e)) => tracing::error!(%e, "shutdown error"),
         Err(_) => tracing::error!("shutdown timed out after 30s"),
