@@ -29,6 +29,22 @@ pub enum Statement {
     Truncate(TruncateStatement),
     CreateIndex(CreateIndexStatement),
     DropIndex(DropIndexStatement),
+    CreateType {
+        keyspace: Option<String>,
+        name: String,
+        if_not_exists: bool,
+        fields: Vec<(String, CqlTypeName)>,
+    },
+    AlterType {
+        keyspace: Option<String>,
+        name: String,
+        alterations: Vec<TypeAlteration>,
+    },
+    DropType {
+        keyspace: Option<String>,
+        name: String,
+        if_exists: bool,
+    },
     Subscribe {
         inner: Box<Statement>,
         interval: Option<Duration>,
@@ -210,6 +226,23 @@ pub struct DropIndexStatement {
     pub if_exists: bool,
 }
 
+/// Alteration operations for `ALTER TYPE` statements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeAlteration {
+    AddField {
+        name: String,
+        field_type: CqlTypeName,
+    },
+    RenameField {
+        from: String,
+        to: String,
+    },
+    AlterField {
+        name: String,
+        new_type: CqlTypeName,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateKeyspaceStatement {
     pub name: String,
@@ -327,6 +360,90 @@ mod tests {
         assert!(matches!(
             stmt_all,
             Statement::Unsubscribe { stream_id: None }
+        ));
+    }
+
+    #[test]
+    fn construct_create_type_statement() {
+        let stmt = Statement::CreateType {
+            keyspace: Some("ks".to_string()),
+            name: "address".to_string(),
+            if_not_exists: true,
+            fields: vec![
+                (
+                    "street".to_string(),
+                    CqlTypeName::Simple("text".to_string()),
+                ),
+                ("zip".to_string(), CqlTypeName::Simple("int".to_string())),
+            ],
+        };
+        match &stmt {
+            Statement::CreateType {
+                keyspace,
+                name,
+                if_not_exists,
+                fields,
+            } => {
+                assert_eq!(keyspace.as_deref(), Some("ks"));
+                assert_eq!(name, "address");
+                assert!(if_not_exists);
+                assert_eq!(fields.len(), 2);
+            }
+            other => panic!("expected CreateType, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn construct_alter_type_statement() {
+        let stmt = Statement::AlterType {
+            keyspace: None,
+            name: "address".to_string(),
+            alterations: vec![
+                TypeAlteration::AddField {
+                    name: "city".to_string(),
+                    field_type: CqlTypeName::Simple("text".to_string()),
+                },
+                TypeAlteration::RenameField {
+                    from: "zip".to_string(),
+                    to: "postal_code".to_string(),
+                },
+                TypeAlteration::AlterField {
+                    name: "street".to_string(),
+                    new_type: CqlTypeName::Simple("varchar".to_string()),
+                },
+            ],
+        };
+        match &stmt {
+            Statement::AlterType { alterations, .. } => {
+                assert_eq!(alterations.len(), 3);
+                assert!(
+                    matches!(&alterations[0], TypeAlteration::AddField { name, .. } if name == "city")
+                );
+                assert!(
+                    matches!(&alterations[1], TypeAlteration::RenameField { from, to } if from == "zip" && to == "postal_code")
+                );
+                assert!(
+                    matches!(&alterations[2], TypeAlteration::AlterField { name, .. } if name == "street")
+                );
+            }
+            other => panic!("expected AlterType, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn construct_drop_type_statement() {
+        let stmt = Statement::DropType {
+            keyspace: Some("ks".to_string()),
+            name: "address".to_string(),
+            if_exists: true,
+        };
+        assert!(matches!(
+            stmt,
+            Statement::DropType {
+                keyspace: Some(_),
+                name: _,
+                if_exists: true,
+            }
         ));
     }
 }

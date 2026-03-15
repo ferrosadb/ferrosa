@@ -748,7 +748,7 @@ impl<'input> Parser<'input> {
 
         let tok = self.lexer.peek()?;
         match &tok.kind {
-            TokenKind::Ident(s) if s.eq_ignore_ascii_case("add") => {
+            TokenKind::Keyword(Keyword::Add) => {
                 self.lexer.next_token()?;
                 let col_name = self.parse_ident()?;
                 let col_type = self.parse_cql_type_name()?;
@@ -1582,6 +1582,9 @@ impl<'input> Parser<'input> {
             Keyword::Unsubscribe => "unsubscribe",
             Keyword::Every => "every",
             Keyword::Delta => "delta",
+            Keyword::Type => "type",
+            Keyword::Rename => "rename",
+            Keyword::Add => "add",
         }
         .to_string()
     }

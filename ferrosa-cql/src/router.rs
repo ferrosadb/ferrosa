@@ -175,6 +175,11 @@ pub async fn route(
             })
         }
         Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
+        Statement::CreateType { .. } | Statement::AlterType { .. } | Statement::DropType { .. } => {
+            Err(CqlError::Invalid(
+                "UDT operations not yet implemented".into(),
+            ))
+        }
     }
 }
 
