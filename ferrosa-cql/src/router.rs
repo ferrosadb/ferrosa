@@ -471,10 +471,6 @@ fn route_select_user_table(
         &Resource::Table(ks.to_string(), s.table.clone()),
     )?;
 
-    if s.allow_filtering {
-        return Err(CqlError::Invalid("ALLOW FILTERING not supported".into()));
-    }
-
     let snap = state.schema.snapshot();
     let table_meta = snap
         .tables
@@ -484,67 +480,92 @@ fn route_select_user_table(
     // Build column info for result
     let (col_names, col_types) = build_column_info(table_meta, &s.columns)?;
 
-    // Extract PK values from WHERE clauses
-    let pk_values = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta)?;
-    let pk_types: Vec<CqlType> = table_meta
+    let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+    let all_col_types: Vec<CqlType> = table_meta
+        .columns
+        .values()
+        .map(|c| bridge::parse_cql_type(&c.column_type))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pk_indices: Vec<usize> = table_meta
         .partition_key
         .iter()
-        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+        .map(|name| table_meta.columns.get_index_of(name).unwrap())
+        .collect();
+    let ck_indices: Vec<usize> = table_meta
+        .clustering_key
+        .iter()
+        .map(|(name, _)| table_meta.columns.get_index_of(name).unwrap())
+        .collect();
     let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
 
-    match state.engine.read(&table_id, &decorated_key)? {
-        Some(partition) => {
-            // Build column index maps for partition_to_rows
-            let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
-            let all_col_types: Vec<CqlType> = table_meta
-                .columns
-                .values()
-                .map(|c| bridge::parse_cql_type(&c.column_type))
-                .collect::<Result<Vec<_>, _>>()?;
-            let pk_indices: Vec<usize> = table_meta
-                .partition_key
-                .iter()
-                .map(|name| table_meta.columns.get_index_of(name).unwrap())
-                .collect();
-            let ck_indices: Vec<usize> = table_meta
-                .clustering_key
-                .iter()
-                .map(|(name, _)| table_meta.columns.get_index_of(name).unwrap())
-                .collect();
+    // Try PK-based lookup first; fall back to full scan with ALLOW FILTERING
+    let pk_result = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta);
 
-            let rows = bridge::partition_to_rows(
+    let rows = if let Ok(pk_values) = pk_result {
+        // PK present — single partition lookup
+        let pk_types: Vec<CqlType> = table_meta
+            .partition_key
+            .iter()
+            .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+            .collect::<Result<Vec<_>, _>>()?;
+        let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+        match state.engine.read(&table_id, &decorated_key)? {
+            Some(partition) => bridge::partition_to_rows(
                 &partition,
                 &all_col_names,
                 &all_col_types,
                 &pk_indices,
                 &ck_indices,
-            );
-
-            // Apply column selection if not Star
-            let selected_rows = select_columns(&rows, &all_col_names, &col_names);
-
-            // Apply LIMIT
-            let limited = if let Some(limit) = s.limit {
-                &selected_rows[..std::cmp::min(selected_rows.len(), limit as usize)]
-            } else {
-                &selected_rows
-            };
-
-            Ok(result::encode_rows(
-                &col_names, &col_types, ks, &s.table, limited,
-            ))
+            ),
+            None => vec![],
         }
-        None => Ok(result::encode_rows(
-            &col_names,
-            &col_types,
-            ks,
-            &s.table,
-            &[],
-        )),
-    }
+    } else if s.allow_filtering {
+        // No PK — full table scan with ALLOW FILTERING
+        tracing::warn!(table = %s.table, "executing full scan with ALLOW FILTERING");
+        let limit = s.limit.map(|l| l as usize).unwrap_or(10_000);
+        let partitions = state.engine.read_range(&table_id, None, None, limit)?;
+        let mut all_rows = Vec::new();
+        for partition in &partitions {
+            let mut prows = bridge::partition_to_rows(
+                partition,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+            );
+            all_rows.append(&mut prows);
+            if all_rows.len() >= limit {
+                all_rows.truncate(limit);
+                break;
+            }
+        }
+        // Apply WHERE predicates as post-filter
+        all_rows.retain(|row| {
+            evaluate_where_predicates(row, &s.where_clauses, &all_col_names, table_meta)
+        });
+        all_rows
+    } else {
+        return Err(CqlError::Invalid(
+            "Cannot execute this query as it might involve data filtering and \
+             thus may have unpredictable performance. If you want to execute \
+             this query despite the performance unpredictability, use ALLOW FILTERING"
+                .into(),
+        ));
+    };
+
+    // Apply column selection if not Star
+    let selected_rows = select_columns(&rows, &all_col_names, &col_names);
+
+    // Apply LIMIT
+    let limited = if let Some(limit) = s.limit {
+        &selected_rows[..std::cmp::min(selected_rows.len(), limit as usize)]
+    } else {
+        &selected_rows
+    };
+
+    Ok(result::encode_rows(
+        &col_names, &col_types, ks, &s.table, limited,
+    ))
 }
 
 // ── Virtual table helpers ────────────────────────────────────────────────
@@ -1749,6 +1770,46 @@ fn extract_pk_values(
         values.push(val);
     }
     Ok(values)
+}
+
+/// Evaluate WHERE predicates against a row for ALLOW FILTERING post-filter.
+fn evaluate_where_predicates(
+    row: &[Option<CqlValue>],
+    where_clauses: &[WhereClause],
+    all_col_names: &[String],
+    table_meta: &TableMetadata,
+) -> bool {
+    for wc in where_clauses {
+        let col_idx = match all_col_names.iter().position(|n| n == &wc.column) {
+            Some(i) => i,
+            None => return false,
+        };
+        let col_meta = match table_meta.columns.get(&wc.column) {
+            Some(m) => m,
+            None => return false,
+        };
+        let cql_type = match bridge::parse_cql_type(&col_meta.column_type) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        let expected = match bridge::term_to_cql_value(&wc.value, &cql_type) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let actual = match &row[col_idx] {
+            Some(v) => v,
+            None => return false,
+        };
+        let matches = match wc.op {
+            ComparisonOp::Eq => *actual == expected,
+            ComparisonOp::Ne => *actual != expected,
+            _ => true, // TODO: implement GT/LT/GE/LE comparisons
+        };
+        if !matches {
+            return false;
+        }
+    }
+    true
 }
 
 /// Project rows to a selected column subset.
