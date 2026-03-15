@@ -19,7 +19,7 @@ graph BT
     Schema[ferrosa-schema<br/>DDL, system keyspaces]
     CQL[ferrosa-cql<br/>CQL protocol v5]
     Graph[ferrosa-graph<br/>Graph query engine]
-    Cluster[ferrosa-cluster<br/>Pair mode, DDL repl]
+    Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
     Ctl[ferrosa-ctl<br/>CLI admin + TUI]
     Bin[ferrosa<br/>Binary]
 
@@ -232,24 +232,33 @@ graph BT
 
 ### ferrosa-cluster
 
-- **Purpose**: Distributed coordination — pair mode, DDL replication, failover
+- **Purpose**: Distributed coordination — Raft consensus, token ring, tunable CL, pair mode, DDL replication, failover
 - **Location**: `ferrosa-cluster/`
-- **Dependencies**: `ferrosa-common`, `ferrosa-net`, `ferrosa-storage`, `ferrosa-schema`, `arc-swap`, `async-trait`, `bytes`, `serde`, `serde_json`, `tokio`, `uuid`
-- **Status**: Phase 1 complete — two-node pair mode with full failover lifecycle
+- **Dependencies**: `ferrosa-common`, `ferrosa-net`, `ferrosa-storage`, `ferrosa-schema`, `openraft`, `sled`, `arc-swap`, `async-trait`, `bytes`, `serde`, `serde_json`, `tokio`, `uuid`
+- **Status**: Phase 2 complete — Raft consensus, token ring, coordinator pattern, plus Phase 1 pair mode
 - **Modules**:
-  - `controller.rs` — `ModeController` (standalone → pair → degraded transitions), `ClusterStateHolder`, reverse connections, catch-up orchestration
-  - `write_path.rs` — `WritePath` enum (Direct/Pair/Unavailable) for atomic write routing
-  - `ddl_path.rs` — `DdlPath` enum (Direct/Pair/Unavailable) for atomic DDL routing
+  - `controller.rs` — `ModeController` (standalone → pair → degraded → cluster transitions), `ClusterStateHolder`, reverse connections, catch-up orchestration, `transition_to_cluster()` (3rd peer triggers Raft group + token ring + coordinator)
+  - `write_path.rs` — `WritePath` enum (Direct/Pair/Cluster/Unavailable) for atomic write routing
+  - `ddl_path.rs` — `DdlPath` enum (Direct/Pair/Cluster/Unavailable) for atomic DDL routing
   - `pair/coordinator.rs` — `PairCoordinator` (write forwarding + replication)
   - `pair/ddl.rs` — `DdlOperation`, `DdlCoordinator`, `PairDdlForwardHandler`, `PairSchemaSyncHandler`, `WireSchemaSnapshot`
   - `pair/handler.rs` — `PairWriteForwardHandler` (role-based dispatch)
   - `pair/switchover.rs` — `initiate_switchover`, `RoleSwapHandler` (bidirectional)
   - `pair/catchup.rs` — `request_catchup`, `PairCatchUpHandler`
   - `pair/node.rs` — `PairNode` integration struct
+  - `raft/mod.rs` — `FerrosRaftConfig` (openraft type config), `RaftCommand` enum (15 schema + 3 topology + 1 config variant)
+  - `raft/log_store.rs` — `SledLogStore` (sled-backed persistent Raft log with vote/commit persistence)
+  - `raft/state_machine.rs` — `FerrosStateMachine` (deterministic apply with `BTreeMap`-based `RaftState`, schema + topology + token map, snapshot build/install)
+  - `raft/network.rs` — `FerrosRaftNetwork` + factory (wraps PeerManager for Raft RPC)
+  - `ring/mod.rs` — `TokenRing` with `BTreeMap<Token, u64>` for O(log n) replica lookup, clockwise walk
+  - `ring/strategy.rs` — `SimpleStrategy` with vnode-aware dedup
+  - `coordinator/mod.rs` — `ClusterCoordinator` composition
+  - `coordinator/write.rs` — Write fan-out with tunable CL enforcement (`blockFor(CL)` ACK collection)
+  - `coordinator/read.rs` — Read fan-out with local-replica optimization
   - `consistency.rs` — `ConsistencyLevel` with `blockFor()` + property tests
   - `config.rs`, `error.rs`, `mode.rs`, `state.rs`
-- **Key interfaces**: `ModeController::force_promote()`, `ModeController::switchover()`, REST API (`/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`)
-- **Phase 2 (planned)**: Raft metadata (openraft), token ring, tunable CL, coordinator pattern, hinted handoff
+- **Key interfaces**: `ModeController::force_promote()`, `ModeController::switchover()`, `ModeController::transition_to_cluster()`, `ClusterCoordinator` (write/read fan-out), `TokenRing` (replica selection), REST API (`/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`)
+- **Phase 3 (planned)**: End-to-end cluster wiring in binary, hinted handoff, repair, node lifecycle (leave/decommission/bootstrap), `NetworkTopologyStrategy` (multi-DC), read repair, automatic token rebalancing
 
 ### ferrosa (binary)
 

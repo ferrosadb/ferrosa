@@ -280,8 +280,8 @@
 
   <div class="note">
     <strong>Note:</strong> Ferrosa starts in single-node mode by default. Two-node pair mode
-    is available via <code>FERROSA_SEED</code> configuration. Full cluster mode (3+ nodes) is
-    under active development.
+    is available via <code>FERROSA_SEED</code> configuration. Full cluster mode (3+ nodes)
+    uses Raft consensus and a Murmur3 token ring — set <code>FERROSA_CLUSTER_MODE=ring</code>.
   </div>
 
   <h3>Default ports</h3>
@@ -291,7 +291,7 @@
     </thead>
     <tbody>
       <tr><td>CQL Server</td><td><code>9042</code></td><td>CQL native protocol v5</td></tr>
-      <tr><td>Web Console</td><td><code>9090</code></td><td>HTTP (REST API + static UI)</td></tr>
+      <tr><td>Web Console</td><td><code>9090</code></td><td>HTTP (REST API + static UI + WebSocket)</td></tr>
       <tr><td>Graph HTTP</td><td><code>7474</code></td><td>HTTP/JSON (Cypher queries)</td></tr>
       <tr><td>Prometheus Metrics</td><td><code>9090/metrics</code></td><td>HTTP (text exposition)</td></tr>
       <tr><td>Internode (cluster)</td><td><code>7000</code></td><td>Custom binary protocol</td></tr>
@@ -496,7 +496,7 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
     </div>
     <div class="card">
       <h4>ferrosa-cluster</h4>
-      <p>Pair mode HA with DDL replication, write forwarding, failover, and schema catch-up. Full ring mode in progress.</p>
+      <p>Pair mode HA, Raft consensus (openraft + sled), token ring, coordinator with tunable CL.</p>
     </div>
     <div class="card">
       <h4>ferrosa-ctl</h4>
@@ -504,7 +504,7 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
     </div>
     <div class="card">
       <h4>ferrosa (binary)</h4>
-      <p>Composes all crates. CQL on :9042, graph on :7474, web console on :9090.</p>
+      <p>Composes all crates. CQL on :9042, graph on :7474, web console on :9090 (auth + WebSocket).</p>
     </div>
   </div>
 

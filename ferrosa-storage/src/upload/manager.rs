@@ -153,7 +153,7 @@ impl UploadManager {
 /// Uses a simple hash (FNV-1a inspired) of the ID string to get even
 /// distribution across 256 buckets. This avoids S3's per-prefix
 /// throughput limits (3,500 PUT/s, 5,500 GET/s per partition).
-fn hex_prefix_for(sstable_id: &str) -> String {
+pub fn hex_prefix_for(sstable_id: &str) -> String {
     let mut hash: u8 = 0;
     for byte in sstable_id.as_bytes() {
         hash = hash.wrapping_mul(31).wrapping_add(*byte);

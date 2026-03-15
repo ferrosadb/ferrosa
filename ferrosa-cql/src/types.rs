@@ -33,7 +33,7 @@ pub enum CqlType {
     Time,      // 0x0012
     Smallint,  // 0x0013
     Tinyint,   // 0x0014
-    // 0x0015 = duration, deferred
+    Duration,  // 0x0015
     // 0x0030 = UDT, deferred
     List(Box<CqlType>),              // 0x0020
     Map(Box<CqlType>, Box<CqlType>), // 0x0021
@@ -64,6 +64,7 @@ impl CqlType {
             Self::Time => 0x0012,
             Self::Smallint => 0x0013,
             Self::Tinyint => 0x0014,
+            Self::Duration => 0x0015,
             Self::List(_) => 0x0020,
             Self::Map(_, _) => 0x0021,
             Self::Set(_) => 0x0022,
@@ -108,6 +109,13 @@ pub enum CqlValue {
     Time(i64),
     Smallint(i16),
     Tinyint(i8),
+    /// CQL duration: months (i32), days (i32), nanoseconds (i64).
+    /// Encoded as three zigzag-encoded variable-length integers.
+    Duration {
+        months: i32,
+        days: i32,
+        nanos: i64,
+    },
     /// Ordered list of values.
     List(Vec<CqlValue>),
     /// Set of values. Uses Vec (not BTreeSet) to preserve exact wire order
@@ -142,6 +150,18 @@ impl Ord for CqlValue {
             | (Self::Counter(a), Self::Counter(b))
             | (Self::Timestamp(a), Self::Timestamp(b))
             | (Self::Time(a), Self::Time(b)) => a.cmp(b),
+            (
+                Self::Duration {
+                    months: ma,
+                    days: da,
+                    nanos: na,
+                },
+                Self::Duration {
+                    months: mb,
+                    days: db,
+                    nanos: nb,
+                },
+            ) => ma.cmp(mb).then_with(|| da.cmp(db)).then_with(|| na.cmp(nb)),
             (Self::Int(a), Self::Int(b)) => a.cmp(b),
             (Self::Smallint(a), Self::Smallint(b)) => a.cmp(b),
             (Self::Tinyint(a), Self::Tinyint(b)) => a.cmp(b),
@@ -195,10 +215,11 @@ impl CqlValue {
             Self::Time(_) => 17,
             Self::Smallint(_) => 18,
             Self::Tinyint(_) => 19,
-            Self::List(_) => 20,
-            Self::Set(_) => 21,
-            Self::Map(_) => 22,
-            Self::Tuple(_) => 23,
+            Self::Duration { .. } => 20,
+            Self::List(_) => 21,
+            Self::Set(_) => 22,
+            Self::Map(_) => 23,
+            Self::Tuple(_) => 24,
         }
     }
 
@@ -227,6 +248,17 @@ impl CqlValue {
             Self::Time(t) => t.to_be_bytes().to_vec(),
             Self::Smallint(n) => n.to_be_bytes().to_vec(),
             Self::Tinyint(n) => n.to_be_bytes().to_vec(),
+            Self::Duration {
+                months,
+                days,
+                nanos,
+            } => {
+                let mut buf = Vec::new();
+                buf.extend(encode_vint(*months as i64));
+                buf.extend(encode_vint(*days as i64));
+                buf.extend(encode_vint(*nanos));
+                buf
+            }
             Self::List(items) | Self::Set(items) => {
                 let mut buf = Vec::new();
                 buf.extend_from_slice(&(items.len() as i32).to_be_bytes());
@@ -375,6 +407,17 @@ impl CqlValue {
                 }
                 Ok(Self::Tinyint(bytes[0] as i8))
             }
+            CqlType::Duration => {
+                let mut offset = 0;
+                let months = decode_vint(bytes, &mut offset)? as i32;
+                let days = decode_vint(bytes, &mut offset)? as i32;
+                let nanos = decode_vint(bytes, &mut offset)?;
+                Ok(Self::Duration {
+                    months,
+                    days,
+                    nanos,
+                })
+            }
             CqlType::Varint => Ok(Self::Varint(BigInt::from_signed_bytes_be(bytes))),
             CqlType::Decimal => {
                 if bytes.len() < 4 {
@@ -443,6 +486,47 @@ impl CqlValue {
     }
 }
 
+/// Zigzag-encode and write a signed integer as a variable-length byte sequence.
+/// This is the encoding Cassandra uses for the CQL duration type (0x0015).
+fn encode_vint(value: i64) -> Vec<u8> {
+    let zigzag = if value >= 0 {
+        (value as u64) << 1
+    } else {
+        ((-(value + 1)) as u64) << 1 | 1
+    };
+    let mut buf = Vec::new();
+    let mut v = zigzag;
+    loop {
+        if v < 0x80 {
+            buf.push(v as u8);
+            break;
+        }
+        buf.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    buf
+}
+
+/// Decode a zigzag-encoded variable-length integer from `data` at `offset`.
+fn decode_vint(data: &[u8], offset: &mut usize) -> Result<i64, CqlError> {
+    let mut result: u64 = 0;
+    let mut shift = 0;
+    loop {
+        if *offset >= data.len() {
+            return Err(CqlError::Invalid("truncated vint in duration".into()));
+        }
+        let byte = data[*offset];
+        *offset += 1;
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    // Zigzag decode
+    Ok(((result >> 1) as i64) ^ (-((result & 1) as i64)))
+}
+
 /// Read the 4-byte element count from a collection header.
 fn read_collection_header(bytes: &[u8]) -> Result<(i32, usize), CqlError> {
     if bytes.len() < 4 {
@@ -509,6 +593,7 @@ mod tests {
             (0x0012, CqlType::Time),
             (0x0013, CqlType::Smallint),
             (0x0014, CqlType::Tinyint),
+            (0x0015, CqlType::Duration),
             (0x0020, CqlType::List(Box::new(CqlType::Int))),
             (
                 0x0021,
@@ -729,6 +814,76 @@ mod tests {
         let decoded = CqlValue::decode_value(&CqlType::Timeuuid, &bytes).unwrap();
         assert_eq!(decoded, val);
         assert!(matches!(decoded, CqlValue::Timeuuid(_)));
+    }
+
+    // === Duration type tests ===
+
+    #[test]
+    fn duration_type_id() {
+        assert_eq!(CqlType::Duration.type_id(), 0x0015);
+    }
+
+    #[test]
+    fn duration_type_roundtrip() {
+        let val = CqlValue::Duration {
+            months: 14,
+            days: 7,
+            nanos: 3_600_000_000_000,
+        };
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Duration, &bytes).unwrap();
+        assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn duration_type_zero() {
+        let val = CqlValue::Duration {
+            months: 0,
+            days: 0,
+            nanos: 0,
+        };
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Duration, &bytes).unwrap();
+        assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn duration_type_negative() {
+        let val = CqlValue::Duration {
+            months: -1,
+            days: -2,
+            nanos: -3,
+        };
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Duration, &bytes).unwrap();
+        assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn duration_type_large_values() {
+        let val = CqlValue::Duration {
+            months: i32::MAX,
+            days: i32::MIN,
+            nanos: i64::MAX,
+        };
+        let bytes = val.encode_value();
+        let decoded = CqlValue::decode_value(&CqlType::Duration, &bytes).unwrap();
+        assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn duration_ord() {
+        let a = CqlValue::Duration {
+            months: 1,
+            days: 0,
+            nanos: 0,
+        };
+        let b = CqlValue::Duration {
+            months: 2,
+            days: 0,
+            nanos: 0,
+        };
+        assert!(a < b);
     }
 
     #[test]

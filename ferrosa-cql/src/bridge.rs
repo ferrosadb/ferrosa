@@ -204,6 +204,7 @@ fn cql_type_name(t: &CqlType) -> &'static str {
         CqlType::Time => "time",
         CqlType::Smallint => "smallint",
         CqlType::Tinyint => "tinyint",
+        CqlType::Duration => "duration",
         CqlType::List(_) => "list",
         CqlType::Map(_, _) => "map",
         CqlType::Set(_) => "set",
@@ -317,6 +318,7 @@ impl<'a> TypeParser<'a> {
             "decimal" => Ok(CqlType::Decimal),
             "date" => Ok(CqlType::Date),
             "time" => Ok(CqlType::Time),
+            "duration" => Ok(CqlType::Duration),
             "list" => {
                 self.skip_whitespace();
                 self.consume(b'<')?;

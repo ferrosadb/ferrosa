@@ -7,5 +7,5 @@
 pub mod config;
 pub mod manager;
 
-pub use config::ObjectStoreConfig;
+pub use config::{validate_s3_bucket, ObjectStoreConfig};
 pub use manager::{UploadManager, UploadTask};

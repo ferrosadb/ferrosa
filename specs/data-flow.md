@@ -1,6 +1,6 @@
 # Data Flow
 
-> Last updated: 2026-03-13
+> Last updated: 2026-03-14
 > Status: Approved
 
 ## Overview
@@ -173,14 +173,16 @@ Closed segments are uploaded to S3 immediately. The active (not yet full) segmen
 
 **What is implemented**: The commit log checkpoint system (`ferrosa-storage/src/commitlog/checkpoint.rs`) tracks per-table flush positions as `CommitLogPosition { segment_id, offset }`. The checkpoint is serialized as JSON and persisted to local disk. S3 upload of segments and checkpoint is follow-on work.
 
-### Replay Protocol (Follow-on)
+### Replay Protocol
 
-Commit log replay is not yet implemented. The design:
+Commit log replay is implemented (merged PR #38). At startup, the storage engine:
 
-1. Read `checkpoint.json` from S3 (or local disk) to find the replay starting point
-1. Determine which commit log segments contain data newer than the latest durable SSTable
-1. Download and replay those segments in order, applying mutations to the memtable
+1. Reads the checkpoint from local disk to find the replay starting point
+1. Determines which commit log segments contain data newer than the latest checkpoint
+1. Replays those segments in order, applying mutations to the memtable
 1. Once replay is complete, the node is current and can begin serving
+
+**S3 replay (follow-on)**: Downloading and replaying segments from S3 (for cold-start recovery on a new node) is not yet implemented. The current replay path is local-disk only.
 
 ### Commit Log Cleanup
 

@@ -755,12 +755,231 @@ impl StorageEngine {
         self.upload_manager.is_some()
     }
 
+    /// Returns the S3 object store and config, if S3 is configured.
+    pub fn object_store_and_config(
+        &self,
+    ) -> ferrosa_common::Result<(&ObjectStoreConfig, Arc<dyn object_store::ObjectStore>)> {
+        let os_config = self
+            .config
+            .object_store
+            .as_ref()
+            .ok_or_else(|| ferrosa_common::Error::InvalidFormat("S3 not configured".into()))?;
+        let store = os_config.build_object_store()?;
+        Ok((os_config, Arc::from(store)))
+    }
+
     /// Discards commit log segments that have no remaining dirty tables.
     ///
     /// Called from the background maintenance loop. Returns the number of
     /// segments cleaned up.
     pub fn discard_completed_commit_log_segments(&self) -> ferrosa_common::Result<usize> {
         self.commit_log.discard_completed_segments()
+    }
+
+    /// Sync all local SSTables to S3 and update the manifest.
+    ///
+    /// Scans each registered table's SSTable directory, collects component
+    /// files for each generation, uploads them via UploadManager, and
+    /// updates the S3 manifest with new entries.
+    pub async fn sync_sstables_to_s3(&self) -> ferrosa_common::Result<usize> {
+        let (os_config, store) = self.object_store_and_config()?;
+        let prefix = os_config.prefix.clone();
+        let upload_mgr = self.upload_manager.as_ref().ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat("UploadManager not initialized".into())
+        })?;
+
+        // Load current manifest to check which SSTables are already uploaded.
+        let (mut manifest, _version) =
+            crate::manifest::Manifest::load(store.as_ref(), &prefix).await?;
+
+        let mut uploaded = 0usize;
+
+        // Collect table IDs and directories under the lock, then release
+        // before any .await (RwLockReadGuard is !Send).
+        let table_dirs: Vec<(String, std::path::PathBuf)> = {
+            let tables = self.tables.read();
+            tables
+                .keys()
+                .map(|id| {
+                    let dir = self.config.data_dir.join("sstables").join(id.to_string());
+                    (id.to_string(), dir)
+                })
+                .collect()
+        };
+
+        for (table_id_str, table_dir) in &table_dirs {
+            if !table_dir.exists() {
+                continue;
+            }
+
+            let generations = Self::scan_generations(table_dir);
+            let existing_ids: std::collections::HashSet<String> = manifest
+                .sstables
+                .get(table_id_str)
+                .map(|entries| entries.iter().map(|e| e.id.clone()).collect())
+                .unwrap_or_default();
+
+            for gen in generations {
+                let gen_str = gen.to_string();
+                if existing_ids.contains(&gen_str) {
+                    continue;
+                }
+
+                let files = Self::collect_sstable_files(table_dir, gen);
+                if files.is_empty() {
+                    continue;
+                }
+
+                let total_size: u64 = files.iter().map(|(_, data)| data.len() as u64).sum();
+
+                let task = crate::upload::UploadTask::SSTable {
+                    table_id: table_id_str.clone(),
+                    sstable_id: gen_str.clone(),
+                    files,
+                };
+                upload_mgr.submit(task).await?;
+
+                manifest.add_sstable(
+                    table_id_str,
+                    crate::manifest::ManifestEntry {
+                        id: gen_str,
+                        size: total_size,
+                        min_token: i64::MIN,
+                        max_token: i64::MAX,
+                        min_timestamp: 0,
+                        max_timestamp: 0,
+                    },
+                );
+                uploaded += 1;
+            }
+        }
+
+        if uploaded > 0 {
+            // Save updated manifest.
+            manifest.save_with_retry(store.as_ref(), &prefix).await?;
+            eprintln!("[s3-sync] uploaded {uploaded} SSTables, manifest saved");
+        }
+
+        Ok(uploaded)
+    }
+
+    /// Download SSTables from S3 to local disk for a specific table.
+    ///
+    /// Uses the manifest to know which SSTables exist, then downloads
+    /// all component files for each. After this call, `register_table()`
+    /// will find the files on local disk.
+    pub async fn download_sstables_from_s3(
+        &self,
+        table_id: &TableId,
+        manifest: &crate::manifest::Manifest,
+    ) -> ferrosa_common::Result<usize> {
+        let (os_config, store) = self.object_store_and_config()?;
+        let prefix = &os_config.prefix;
+
+        let entries = match manifest.sstables.get(&table_id.to_string()) {
+            Some(e) => e,
+            None => return Ok(0),
+        };
+
+        let table_dir = self
+            .config
+            .data_dir
+            .join("sstables")
+            .join(table_id.to_string());
+        std::fs::create_dir_all(&table_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("failed to create table dir: {e}"))
+        })?;
+
+        let mut downloaded = 0;
+        let components = [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+        ];
+
+        for entry in entries {
+            let hex = crate::upload::manager::hex_prefix_for(&entry.id);
+
+            for component in &components {
+                let s3_path = object_store::path::Path::from(format!(
+                    "{prefix}/{hex}/{table_id}/{}/{component}",
+                    entry.id
+                ));
+                let local_path = table_dir.join(format!("{}-{component}", entry.id));
+
+                // Skip if already downloaded.
+                if local_path.exists() {
+                    continue;
+                }
+
+                match store.get(&s3_path).await {
+                    Ok(result) => {
+                        let data = result.bytes().await.map_err(|e| {
+                            ferrosa_common::Error::InvalidFormat(format!(
+                                "failed to read {s3_path}: {e}"
+                            ))
+                        })?;
+                        std::fs::write(&local_path, &data).map_err(|e| {
+                            ferrosa_common::Error::InvalidFormat(format!(
+                                "failed to write {}: {e}",
+                                local_path.display()
+                            ))
+                        })?;
+                    }
+                    Err(object_store::Error::NotFound { .. }) => {
+                        // Component might not exist (e.g., CompressionInfo.db is optional)
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(ferrosa_common::Error::InvalidFormat(format!(
+                            "S3 download failed for {s3_path}: {e}"
+                        )));
+                    }
+                }
+            }
+            downloaded += 1;
+        }
+
+        Ok(downloaded)
+    }
+
+    /// Scan a table directory for SSTable generation numbers.
+    fn scan_generations(table_dir: &std::path::Path) -> Vec<u64> {
+        std::fs::read_dir(table_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                if name.ends_with("-Data.db") {
+                    name.split('-').next()?.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Collect all component files for an SSTable generation.
+    fn collect_sstable_files(table_dir: &std::path::Path, gen: u64) -> Vec<(String, bytes::Bytes)> {
+        let gen_str = gen.to_string();
+        std::fs::read_dir(table_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                if name.starts_with(&format!("{gen_str}-")) {
+                    let data = std::fs::read(e.path()).ok()?;
+                    Some((name, bytes::Bytes::from(data)))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 

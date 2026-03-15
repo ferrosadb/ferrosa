@@ -27,6 +27,14 @@ pub struct NetConfig {
     pub max_frame_body_size: u32,
     /// Max concurrent streams per connection lane (T15).
     pub max_streams_per_lane: usize,
+    /// Path to TLS certificate file (PEM) for internode encryption.
+    pub tls_cert_path: Option<String>,
+    /// Path to TLS private key file (PEM).
+    pub tls_key_path: Option<String>,
+    /// Path to CA certificate file (PEM) for mutual TLS verification.
+    pub tls_ca_path: Option<String>,
+    /// If true, reject startup when no TLS cert/key are configured.
+    pub require_tls: bool,
 }
 
 impl Default for NetConfig {
@@ -43,6 +51,10 @@ impl Default for NetConfig {
             handshake_timeout: Duration::from_secs(5),
             max_frame_body_size: 256 * 1024 * 1024, // 256 MiB
             max_streams_per_lane: 128,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_path: None,
+            require_tls: false,
         }
     }
 }
@@ -100,6 +112,18 @@ impl NetConfig {
             if let Ok(n) = v.parse() {
                 cfg.max_streams_per_lane = n;
             }
+        }
+        if let Ok(v) = std::env::var("FERROSA_INTERNODE_TLS_CERT") {
+            cfg.tls_cert_path = Some(v);
+        }
+        if let Ok(v) = std::env::var("FERROSA_INTERNODE_TLS_KEY") {
+            cfg.tls_key_path = Some(v);
+        }
+        if let Ok(v) = std::env::var("FERROSA_INTERNODE_TLS_CA") {
+            cfg.tls_ca_path = Some(v);
+        }
+        if let Ok(v) = std::env::var("FERROSA_INTERNODE_REQUIRE_TLS") {
+            cfg.require_tls = v == "true" || v == "1";
         }
 
         cfg

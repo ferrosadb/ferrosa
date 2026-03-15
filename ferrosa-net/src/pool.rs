@@ -18,14 +18,30 @@ pub struct PriorityPool {
 
 impl PriorityPool {
     /// Open 3 TCP connections to the peer (one per lane).
+    /// Builds TLS connector once and shares it across all 3 connections.
     pub async fn connect(
         config: Arc<NetConfig>,
         local_host_id: Uuid,
         peer_addr: SocketAddr,
     ) -> Result<Self> {
-        let raft = RpcClient::connect(config.clone(), local_host_id, peer_addr).await?;
-        let data = RpcClient::connect(config.clone(), local_host_id, peer_addr).await?;
-        let bulk = RpcClient::connect(config, local_host_id, peer_addr).await?;
+        let tls_connector = crate::tls::build_tls_connector(&config)?;
+        let raft = RpcClient::connect_with_tls(
+            config.clone(),
+            local_host_id,
+            peer_addr,
+            tls_connector.as_ref(),
+        )
+        .await?;
+        let data = RpcClient::connect_with_tls(
+            config.clone(),
+            local_host_id,
+            peer_addr,
+            tls_connector.as_ref(),
+        )
+        .await?;
+        let bulk =
+            RpcClient::connect_with_tls(config, local_host_id, peer_addr, tls_connector.as_ref())
+                .await?;
         Ok(Self { raft, data, bulk })
     }
 
