@@ -11,6 +11,7 @@
 //!   `POST /api/cluster/switchover`→ swap primary/secondary roles
 
 pub mod api;
+pub mod auth;
 pub mod static_files;
 
 use std::{net::SocketAddr, sync::Arc};
@@ -74,6 +75,10 @@ pub fn build_router(state: WebAppState) -> Router {
         .nest("/api", api::routes())
         .nest("/api/cluster", api::cluster_routes())
         .fallback(static_files::static_handler)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_middleware,
+        ))
         .with_state(state)
 }
 
