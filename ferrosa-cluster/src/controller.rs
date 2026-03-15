@@ -36,6 +36,8 @@ use crate::consistency::ConsistencyLevel;
 use crate::coordinator::ClusterCoordinator;
 use crate::ddl_path::DdlPath;
 use crate::error::{ClusterError, Result};
+use crate::hints::delivery::HintDeliveryTask;
+use crate::hints::{HintConfig, HintStore};
 use crate::mode::DeploymentMode;
 use crate::pair::coordinator::{encode_mutation, PairCoordinator};
 use crate::pair::ddl::{DdlCoordinator, PairDdlForwardHandler, PairSchemaSyncHandler};
@@ -100,6 +102,11 @@ pub struct ModeController {
     connected_peers: Mutex<Vec<(Uuid, SocketAddr)>>,
     /// Raft instance, set asynchronously after cluster transition completes.
     raft_instance: Arc<ArcSwap<Option<Arc<FerrosRaft>>>>,
+    /// Persistent hint store — holds mutations destined for temporarily
+    /// unreachable replicas.  Shared with `ClusterCoordinator`.
+    hint_store: Arc<HintStore>,
+    /// Hint delivery configuration — batch size, interval, etc.
+    hint_config: HintConfig,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -126,6 +133,32 @@ impl ModeController {
             engine: storage.clone(),
         }));
 
+        // Build a HintConfig from ClusterConfig, then initialise the store.
+        // If the hint store fails to initialise (e.g. bad directory permissions)
+        // we log the error and continue — the worst outcome is missing hints, not
+        // a crash at startup.
+        let hint_config = HintConfig {
+            dir: config.hinted_handoff_dir.clone(),
+            max_per_peer_mb: config.hinted_handoff_max_mb,
+            ..HintConfig::default()
+        };
+        let hint_store = match HintStore::new(hint_config.clone()) {
+            Ok(hs) => Arc::new(hs),
+            Err(e) => {
+                tracing::error!("hint store initialisation failed: {e} — hinted handoff disabled");
+                Arc::new(
+                    HintStore::new(HintConfig {
+                        dir: std::env::temp_dir().join("ferrosa_hints_fallback"),
+                        ..HintConfig::default()
+                    })
+                    .unwrap_or_else(|_| {
+                        // If even the fallback fails, create a store in a temp dir.
+                        HintStore::new(HintConfig::default()).expect("fallback hint store failed")
+                    }),
+                )
+            }
+        };
+
         let controller = Arc::new(Self {
             mode: ArcSwap::from_pointee(DeploymentMode::Standalone),
             write_path: write_path.clone(),
@@ -142,6 +175,8 @@ impl ModeController {
             force_promoted: AtomicBool::new(false),
             connected_peers: Mutex::new(Vec::new()),
             raft_instance: Arc::new(ArcSwap::from_pointee(None)),
+            hint_store,
+            hint_config,
         });
 
         let handles = ModeControllerHandles {
@@ -177,6 +212,15 @@ impl ModeController {
     /// Get the Raft instance, if cluster mode initialization has completed.
     pub fn raft(&self) -> Option<Arc<FerrosRaft>> {
         (**self.raft_instance.load()).clone()
+    }
+
+    /// Return a reference to the shared hint store.
+    ///
+    /// Used by callers that build a [`ClusterCoordinator`] and want to
+    /// attach the same `HintStore` instance via
+    /// [`ClusterCoordinator::with_hint_store`].
+    pub fn hint_store(&self) -> Arc<HintStore> {
+        self.hint_store.clone()
     }
 
     /// Force-promote this node to standalone primary.
@@ -757,8 +801,27 @@ impl PeerEventListener for ModeController {
     }
 
     fn on_peer_recovered(&self, peer_id: uuid::Uuid) {
-        tracing::info!(%peer_id, "peer recovered");
-        // Hint delivery will be wired in Slice 3 (Task 14)
+        tracing::info!(%peer_id, "peer recovered — scheduling hint delivery");
+
+        // Only replay hints if there are any pending for this peer.
+        if self.hint_store.pending_count(peer_id) == 0 {
+            return;
+        }
+
+        let peer_manager = match &**self.peer_manager.load() {
+            Some(pm) => pm.clone(),
+            None => {
+                tracing::warn!(%peer_id, "hint delivery skipped: peer_manager not set");
+                return;
+            }
+        };
+
+        let hint_store = self.hint_store.clone();
+        let hint_config = self.hint_config.clone();
+
+        tokio::spawn(async move {
+            HintDeliveryTask::run(peer_id, hint_store, peer_manager, &hint_config).await;
+        });
     }
 
     fn on_peer_failed(&self, peer_id: uuid::Uuid) {
