@@ -824,3 +824,261 @@ async fn subscribe_max_subscriptions_enforced() {
         "9th subscription should be rejected"
     );
 }
+
+// ── UDT integration tests ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn create_type_and_use_in_table() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Create keyspace
+    let query = encode_query_body(
+        "CREATE KEYSPACE udt_ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // USE keyspace
+    let query = encode_query_body("USE udt_ks");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // CREATE TYPE
+    let query = encode_query_body("CREATE TYPE address (street text, city text, zip int)");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    // Verify it's a SchemaChange result (kind = 0x0005)
+    let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+    assert_eq!(kind, 0x0005, "CREATE TYPE should return SchemaChange");
+
+    // CREATE TABLE with frozen<address> column
+    let query = encode_query_body("CREATE TABLE users (id int PRIMARY KEY, home frozen<address>)");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // INSERT with UDT literal (field names as quoted strings)
+    let query = encode_query_body(
+        "INSERT INTO users (id, home) VALUES (1, {'street': '123 Main', 'city': 'Springfield', 'zip': 62701})",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // SELECT and verify the result
+    let query = encode_query_body("SELECT * FROM users WHERE id = 1");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+    assert_eq!(kind, 0x0002, "SELECT should return Rows");
+    // Verify row data contains our UDT values
+    let body_str = String::from_utf8_lossy(&resp.body);
+    assert!(
+        body_str.contains("123 Main"),
+        "SELECT result should contain UDT street value"
+    );
+    assert!(
+        body_str.contains("Springfield"),
+        "SELECT result should contain UDT city value"
+    );
+}
+
+#[tokio::test]
+async fn create_type_if_not_exists() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Create keyspace
+    let query = encode_query_body(
+        "CREATE KEYSPACE udt_ine_ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let query = encode_query_body("USE udt_ine_ks");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // Create type first time
+    let query = encode_query_body("CREATE TYPE address (street text, city text)");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // Create same type again with IF NOT EXISTS — should succeed without error
+    let query = encode_query_body("CREATE TYPE IF NOT EXISTS address (street text, city text)");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+}
+
+#[tokio::test]
+async fn drop_type_if_exists() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Create keyspace
+    let query = encode_query_body(
+        "CREATE KEYSPACE udt_die_ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let query = encode_query_body("USE udt_die_ks");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // DROP TYPE IF EXISTS on nonexistent type — should succeed without error
+    let query = encode_query_body("DROP TYPE IF EXISTS nonexistent_type");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // Create type, then drop it, then drop again with IF EXISTS
+    let query = encode_query_body("CREATE TYPE temp_type (x text)");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let query = encode_query_body("DROP TYPE temp_type");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // Drop again with IF EXISTS — should succeed
+    let query = encode_query_body("DROP TYPE IF EXISTS temp_type");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+}
+
+#[tokio::test]
+async fn alter_type_add_field() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Create keyspace
+    let query = encode_query_body(
+        "CREATE KEYSPACE udt_alter_ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let query = encode_query_body("USE udt_alter_ks");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // Create type with one field
+    let query = encode_query_body("CREATE TYPE address (street text)");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // ALTER TYPE ADD city text
+    let query = encode_query_body("ALTER TYPE address ADD city text");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // Verify via system_schema.types that the new field appears
+    let query = encode_query_body("SELECT * FROM system_schema.types");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let body_str = String::from_utf8_lossy(&resp.body);
+    assert!(
+        body_str.contains("address"),
+        "system_schema.types should contain the altered type"
+    );
+    assert!(
+        body_str.contains("city"),
+        "system_schema.types should show the added field 'city'"
+    );
+    assert!(
+        body_str.contains("street"),
+        "system_schema.types should still show the original field 'street'"
+    );
+}
+
+#[tokio::test]
+async fn system_schema_types_queryable() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Query system_schema.types before any types exist — should return empty Rows
+    let query = encode_query_body("SELECT * FROM system_schema.types");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+    assert_eq!(kind, 0x0002, "should return Rows");
+
+    // Create keyspace and type
+    let query = encode_query_body(
+        "CREATE KEYSPACE udt_sys_ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let query = encode_query_body("USE udt_sys_ks");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let query = encode_query_body("CREATE TYPE contact (name text, phone text, email text)");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // Query system_schema.types — should now contain our type
+    let query = encode_query_body("SELECT * FROM system_schema.types");
+    send_raw_frame(&mut stream, Opcode::Query, &query).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+    assert_eq!(kind, 0x0002, "should return Rows");
+
+    let body_str = String::from_utf8_lossy(&resp.body);
+    assert!(
+        body_str.contains("udt_sys_ks"),
+        "system_schema.types should contain our keyspace"
+    );
+    assert!(
+        body_str.contains("contact"),
+        "system_schema.types should contain our type name"
+    );
+    assert!(
+        body_str.contains("name"),
+        "system_schema.types should list field 'name'"
+    );
+    assert!(
+        body_str.contains("phone"),
+        "system_schema.types should list field 'phone'"
+    );
+    assert!(
+        body_str.contains("email"),
+        "system_schema.types should list field 'email'"
+    );
+}

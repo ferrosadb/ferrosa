@@ -111,6 +111,17 @@ pub enum Keyword {
     Type,
     Rename,
     Add,
+    Function,
+    Returns,
+    Language,
+    Called,
+    Input,
+    Replace,
+    Aggregate,
+    Sfunc,
+    Stype,
+    Finalfunc,
+    Initcond,
 }
 
 /// Compile-time keyword map. Case-insensitive lookup is done by
@@ -212,6 +223,17 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "TYPE" => Keyword::Type,
     "RENAME" => Keyword::Rename,
     "ADD" => Keyword::Add,
+    "FUNCTION" => Keyword::Function,
+    "RETURNS" => Keyword::Returns,
+    "LANGUAGE" => Keyword::Language,
+    "CALLED" => Keyword::Called,
+    "INPUT" => Keyword::Input,
+    "REPLACE" => Keyword::Replace,
+    "AGGREGATE" => Keyword::Aggregate,
+    "SFUNC" => Keyword::Sfunc,
+    "STYPE" => Keyword::Stype,
+    "FINALFUNC" => Keyword::Finalfunc,
+    "INITCOND" => Keyword::Initcond,
 };
 
 /// Token kind produced by the lexer.

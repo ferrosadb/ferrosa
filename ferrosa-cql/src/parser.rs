@@ -1675,6 +1675,17 @@ impl<'input> Parser<'input> {
             Keyword::Type => "type",
             Keyword::Rename => "rename",
             Keyword::Add => "add",
+            Keyword::Function => "function",
+            Keyword::Returns => "returns",
+            Keyword::Language => "language",
+            Keyword::Called => "called",
+            Keyword::Input => "input",
+            Keyword::Replace => "replace",
+            Keyword::Aggregate => "aggregate",
+            Keyword::Sfunc => "sfunc",
+            Keyword::Stype => "stype",
+            Keyword::Finalfunc => "finalfunc",
+            Keyword::Initcond => "initcond",
         }
         .to_string()
     }

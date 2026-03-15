@@ -45,6 +45,40 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
+    CreateFunction {
+        keyspace: Option<String>,
+        name: String,
+        or_replace: bool,
+        if_not_exists: bool,
+        params: Vec<(String, CqlTypeName)>,
+        called_on_null: bool,
+        return_type: CqlTypeName,
+        language: String,
+        body: String,
+    },
+    DropFunction {
+        keyspace: Option<String>,
+        name: String,
+        arg_types: Option<Vec<CqlTypeName>>,
+        if_exists: bool,
+    },
+    CreateAggregate {
+        keyspace: Option<String>,
+        name: String,
+        or_replace: bool,
+        if_not_exists: bool,
+        arg_types: Vec<CqlTypeName>,
+        state_func: String,
+        state_type: CqlTypeName,
+        final_func: Option<String>,
+        init_cond: Option<Term>,
+    },
+    DropAggregate {
+        keyspace: Option<String>,
+        name: String,
+        arg_types: Option<Vec<CqlTypeName>>,
+        if_exists: bool,
+    },
     Subscribe {
         inner: Box<Statement>,
         interval: Option<Duration>,
@@ -75,6 +109,11 @@ pub enum Term {
     MapLiteral(Vec<(Term, Term)>),
     SetLiteral(Vec<Term>),
     TupleLiteral(Vec<Term>),
+    FunctionCall {
+        keyspace: Option<String>,
+        name: String,
+        args: Vec<Term>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,10 +134,16 @@ pub struct WhereClause {
     pub value: Term,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SelectColumn {
     Star,
     Column(String),
+    FunctionCall {
+        keyspace: Option<String>,
+        name: String,
+        args: Vec<Term>,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +350,14 @@ pub enum GrantResource {
     Table(Option<String>, String),
     AllRoles,
     Role(String),
+    Function {
+        keyspace: Option<String>,
+        name: String,
+        arg_types: Vec<CqlTypeName>,
+    },
+    AllFunctions {
+        keyspace: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -197,6 +197,18 @@ pub async fn route(
         } => route_drop_type(state, ctx, keyspace, name, if_exists)
             .await
             .map(RouteResult::Result),
+        Statement::CreateFunction { .. } => Err(CqlError::Invalid(
+            "UDF operations not yet implemented".into(),
+        )),
+        Statement::DropFunction { .. } => Err(CqlError::Invalid(
+            "UDF operations not yet implemented".into(),
+        )),
+        Statement::CreateAggregate { .. } => Err(CqlError::Invalid(
+            "UDA operations not yet implemented".into(),
+        )),
+        Statement::DropAggregate { .. } => Err(CqlError::Invalid(
+            "UDA operations not yet implemented".into(),
+        )),
     }
 }
 
@@ -493,18 +505,61 @@ fn route_select(
                 &rows,
             ))
         }
+        ("system_schema", "types") => {
+            let snap = state.schema.snapshot();
+            let col_names: Vec<String> = vec![
+                "keyspace_name".into(),
+                "type_name".into(),
+                "field_names".into(),
+                "field_types".into(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+            ];
+            let rows: Vec<Vec<Option<CqlValue>>> = snap
+                .types
+                .values()
+                .map(|udt| {
+                    let field_names: Vec<String> = udt
+                        .fields
+                        .iter()
+                        .map(|(n, _)| format!("\"{}\"", n))
+                        .collect();
+                    let field_types: Vec<String> = udt
+                        .fields
+                        .iter()
+                        .map(|(_, t)| format!("\"{}\"", bridge::cql_type_display_name(t)))
+                        .collect();
+                    vec![
+                        Some(CqlValue::Text(udt.keyspace.clone())),
+                        Some(CqlValue::Text(udt.name.clone())),
+                        Some(CqlValue::Text(format!("[{}]", field_names.join(", ")))),
+                        Some(CqlValue::Text(format!("[{}]", field_types.join(", ")))),
+                    ]
+                })
+                .collect();
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_schema",
+                "types",
+                &rows,
+            ))
+        }
         // cqlsh queries these system_schema tables during startup introspection.
         // Return empty results for tables we don't populate yet.
-        (
-            "system_schema",
-            "types" | "functions" | "aggregates" | "triggers" | "views" | "indexes",
-        ) => Ok(result::encode_rows(
-            &["keyspace_name".into(), "type_name".into()],
-            &[CqlType::Varchar, CqlType::Varchar],
-            "system_schema",
-            s.table.as_str(),
-            &[],
-        )),
+        ("system_schema", "functions" | "aggregates" | "triggers" | "views" | "indexes") => {
+            Ok(result::encode_rows(
+                &["keyspace_name".into(), "type_name".into()],
+                &[CqlType::Varchar, CqlType::Varchar],
+                "system_schema",
+                s.table.as_str(),
+                &[],
+            ))
+        }
         _ => {
             // Virtual table: check registry before storage lookup.
             if let Some(vtable) = state.schema.virtual_tables().get(ks, &s.table) {
@@ -539,13 +594,13 @@ fn route_select_user_table(
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
     // Build column info for result
-    let (col_names, col_types) = build_column_info(table_meta, &s.columns)?;
+    let (col_names, col_types) = build_column_info(table_meta, &s.columns, ks, &state.schema)?;
 
     let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
     let all_col_types: Vec<CqlType> = table_meta
         .columns
         .values()
-        .map(|c| bridge::parse_cql_type(&c.column_type))
+        .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
         .collect::<Result<Vec<_>, _>>()?;
     let pk_indices: Vec<usize> = table_meta
         .partition_key
@@ -560,14 +615,20 @@ fn route_select_user_table(
     let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
 
     // Try PK-based lookup first; fall back to full scan with ALLOW FILTERING
-    let pk_result = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta);
+    let pk_result = extract_pk_values(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        table_meta,
+        ks,
+        &state.schema,
+    );
 
     let rows = if let Ok(pk_values) = pk_result {
         // PK present — single partition lookup
         let pk_types: Vec<CqlType> = table_meta
             .partition_key
             .iter()
-            .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+            .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
             .collect::<Result<Vec<_>, _>>()?;
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
         match state.engine.read(&table_id, &decorated_key)? {
@@ -630,7 +691,14 @@ fn route_select_user_table(
         }
         // Apply WHERE predicates as post-filter
         all_rows.retain(|row| {
-            evaluate_where_predicates(row, &s.where_clauses, &all_col_names, table_meta)
+            evaluate_where_predicates(
+                row,
+                &s.where_clauses,
+                &all_col_names,
+                table_meta,
+                ks,
+                &state.schema,
+            )
         });
         all_rows
     };
@@ -773,7 +841,7 @@ async fn route_insert(
             .columns
             .get(col_name)
             .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?;
-        let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+        let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
         let value = bridge::term_to_cql_value(&s.values[i], &cql_type)?;
 
         match col_meta.kind {
@@ -794,7 +862,7 @@ async fn route_insert(
     let pk_types: Vec<CqlType> = table_meta
         .partition_key
         .iter()
-        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
         .collect::<Result<Vec<_>, _>>()?;
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
@@ -839,11 +907,17 @@ async fn route_update(
     });
 
     // Extract PK and CK values from WHERE clauses
-    let pk_values = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta)?;
+    let pk_values = extract_pk_values(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        table_meta,
+        ks,
+        &state.schema,
+    )?;
     let pk_types: Vec<CqlType> = table_meta
         .partition_key
         .iter()
-        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Extract CK values from WHERE
@@ -857,7 +931,7 @@ async fn route_update(
         for wc in &s.where_clauses {
             if wc.column == *ck_name && wc.op == ComparisonOp::Eq {
                 let col_meta = &table_meta.columns[ck_name];
-                let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
                 let val = bridge::term_to_cql_value(&wc.value, &cql_type)?;
                 ck_values.push(val);
                 break;
@@ -872,7 +946,7 @@ async fn route_update(
             .columns
             .get(col_name)
             .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?;
-        let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+        let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
         let value = bridge::term_to_cql_value(term, &cql_type)?;
         let col_idx = table_meta.columns.get_index_of(col_name).unwrap() as u16;
         regular_cells.push((col_idx, value));
@@ -920,11 +994,17 @@ async fn route_delete(
     });
 
     // Extract PK values from WHERE
-    let pk_values = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta)?;
+    let pk_values = extract_pk_values(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        table_meta,
+        ks,
+        &state.schema,
+    )?;
     let pk_types: Vec<CqlType> = table_meta
         .partition_key
         .iter()
-        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Extract CK values from WHERE
@@ -938,7 +1018,7 @@ async fn route_delete(
         for wc in &s.where_clauses {
             if wc.column == *ck_name && wc.op == ComparisonOp::Eq {
                 let col_meta = &table_meta.columns[ck_name];
-                let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
                 let val = bridge::term_to_cql_value(&wc.value, &cql_type)?;
                 ck_values.push(val);
                 break;
@@ -1901,6 +1981,8 @@ fn resolve_keyspace<'a>(
 fn build_column_info(
     table_meta: &TableMetadata,
     select_columns: &[SelectColumn],
+    ks: &str,
+    schema: &Schema,
 ) -> Result<(Vec<String>, Vec<CqlType>), CqlError> {
     // Check for Star
     let has_star = select_columns
@@ -1912,7 +1994,7 @@ fn build_column_info(
         let types: Vec<CqlType> = table_meta
             .columns
             .values()
-            .map(|c| bridge::parse_cql_type(&c.column_type))
+            .map(|c| resolve_col_type(&c.column_type, ks, schema))
             .collect::<Result<Vec<_>, _>>()?;
         return Ok((names, types));
     }
@@ -1928,7 +2010,12 @@ fn build_column_info(
                     .get(name)
                     .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", name)))?;
                 names.push(name.clone());
-                types.push(bridge::parse_cql_type(&col.column_type)?);
+                types.push(resolve_col_type(&col.column_type, ks, schema)?);
+            }
+            SelectColumn::FunctionCall { .. } => {
+                return Err(CqlError::Invalid(
+                    "function calls in SELECT not yet implemented".into(),
+                ));
             }
         }
     }
@@ -1940,6 +2027,8 @@ fn extract_pk_values(
     where_clauses: &[WhereClause],
     pk_names: &[String],
     table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
 ) -> Result<Vec<CqlValue>, CqlError> {
     let mut values = Vec::with_capacity(pk_names.len());
     for pk_name in pk_names {
@@ -1953,7 +2042,7 @@ fn extract_pk_values(
                 ))
             })?;
         let col_meta = &table_meta.columns[pk_name];
-        let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+        let cql_type = resolve_col_type(&col_meta.column_type, ks, schema)?;
         let val = bridge::term_to_cql_value(&wc.value, &cql_type)?;
         values.push(val);
     }
@@ -1966,6 +2055,8 @@ fn evaluate_where_predicates(
     where_clauses: &[WhereClause],
     all_col_names: &[String],
     table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
 ) -> bool {
     for wc in where_clauses {
         let col_idx = match all_col_names.iter().position(|n| n == &wc.column) {
@@ -1976,7 +2067,7 @@ fn evaluate_where_predicates(
             Some(m) => m,
             None => return false,
         };
-        let cql_type = match bridge::parse_cql_type(&col_meta.column_type) {
+        let cql_type = match resolve_col_type(&col_meta.column_type, ks, schema) {
             Ok(t) => t,
             Err(_) => return false,
         };
@@ -2037,6 +2128,12 @@ fn ast_resource_to_schema(
         }
         GrantResource::AllRoles => Ok(Resource::AllRoles),
         GrantResource::Role(name) => Ok(Resource::Role(name.clone())),
+        GrantResource::Function { .. } => Err(CqlError::Invalid(
+            "GRANT/REVOKE on functions not yet implemented".into(),
+        )),
+        GrantResource::AllFunctions { .. } => Err(CqlError::Invalid(
+            "GRANT/REVOKE on functions not yet implemented".into(),
+        )),
     }
 }
 
@@ -2085,6 +2182,14 @@ fn parse_permissions(perm_strings: &[String]) -> Result<HashSet<Permission>, Cql
         }
     }
     Ok(perms)
+}
+
+/// Resolve a column type string using schema context for UDT resolution.
+///
+/// Wrapper around `bridge::parse_cql_type_in_keyspace` that provides
+/// the keyspace and schema needed to resolve user-defined type names.
+fn resolve_col_type(col_type: &str, ks: &str, schema: &Schema) -> Result<CqlType, CqlError> {
+    bridge::parse_cql_type_in_keyspace(col_type, ks, schema)
 }
 
 /// Convert an AST `CqlTypeName` to a column_type string for `ColumnMetadata`.

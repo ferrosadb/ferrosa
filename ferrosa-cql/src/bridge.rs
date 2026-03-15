@@ -199,6 +199,10 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
         Term::InList(_) => Err(CqlError::Invalid(
             "IN list not supported in this context".into(),
         )),
+
+        Term::FunctionCall { .. } => Err(CqlError::Invalid(
+            "function calls in values not yet implemented".into(),
+        )),
     }
 }
 
@@ -233,6 +237,49 @@ fn cql_type_name(t: &CqlType) -> &'static str {
     }
 }
 
+/// CQL type display name suitable for `system_schema.types` `field_types`.
+///
+/// Produces lowercase CQL type names (e.g. `"text"`, `"int"`, `"list<text>"`,
+/// `"map<text, int>"`, `"ks.typename"`).
+pub fn cql_type_display_name(t: &CqlType) -> String {
+    match t {
+        CqlType::Ascii => "ascii".to_string(),
+        CqlType::Bigint => "bigint".to_string(),
+        CqlType::Blob => "blob".to_string(),
+        CqlType::Boolean => "boolean".to_string(),
+        CqlType::Counter => "counter".to_string(),
+        CqlType::Decimal => "decimal".to_string(),
+        CqlType::Double => "double".to_string(),
+        CqlType::Float => "float".to_string(),
+        CqlType::Int => "int".to_string(),
+        CqlType::Timestamp => "timestamp".to_string(),
+        CqlType::Uuid => "uuid".to_string(),
+        CqlType::Varchar => "text".to_string(),
+        CqlType::Varint => "varint".to_string(),
+        CqlType::Timeuuid => "timeuuid".to_string(),
+        CqlType::Inet => "inet".to_string(),
+        CqlType::Date => "date".to_string(),
+        CqlType::Time => "time".to_string(),
+        CqlType::Smallint => "smallint".to_string(),
+        CqlType::Tinyint => "tinyint".to_string(),
+        CqlType::Duration => "duration".to_string(),
+        CqlType::List(inner) => format!("list<{}>", cql_type_display_name(inner)),
+        CqlType::Set(inner) => format!("set<{}>", cql_type_display_name(inner)),
+        CqlType::Map(k, v) => {
+            format!(
+                "map<{}, {}>",
+                cql_type_display_name(k),
+                cql_type_display_name(v)
+            )
+        }
+        CqlType::Tuple(types) => {
+            let inner: Vec<String> = types.iter().map(cql_type_display_name).collect();
+            format!("tuple<{}>", inner.join(", "))
+        }
+        CqlType::Udt { keyspace, name, .. } => format!("{keyspace}.{name}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Function 2: parse_cql_type
 // ---------------------------------------------------------------------------
@@ -255,15 +302,50 @@ pub fn parse_cql_type(s: &str) -> Result<CqlType, CqlError> {
     Ok(result)
 }
 
+/// Parse a CQL type name string with schema context for UDT resolution.
+///
+/// Like [`parse_cql_type`] but also resolves user-defined type names by looking
+/// them up in the schema registry for the given keyspace.
+pub fn parse_cql_type_in_keyspace(
+    s: &str,
+    keyspace: &str,
+    schema: &Schema,
+) -> Result<CqlType, CqlError> {
+    let s = s.trim();
+    let mut parser = TypeParser::new_with_schema(s, keyspace, schema);
+    let result = parser.parse_type()?;
+    let remaining = parser.remaining().trim();
+    if !remaining.is_empty() {
+        return Err(CqlError::Invalid(format!(
+            "unexpected trailing characters in type: '{remaining}'"
+        )));
+    }
+    Ok(result)
+}
+
 /// Small recursive-descent parser for CQL type strings.
 struct TypeParser<'a> {
     input: &'a str,
     pos: usize,
+    /// Optional schema context for resolving UDT names.
+    schema_ctx: Option<(&'a str, &'a Schema)>,
 }
 
 impl<'a> TypeParser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+        Self {
+            input,
+            pos: 0,
+            schema_ctx: None,
+        }
+    }
+
+    fn new_with_schema(input: &'a str, keyspace: &'a str, schema: &'a Schema) -> Self {
+        Self {
+            input,
+            pos: 0,
+            schema_ctx: Some((keyspace, schema)),
+        }
     }
 
     fn remaining(&self) -> &'a str {
@@ -391,7 +473,38 @@ impl<'a> TypeParser<'a> {
                 self.consume(b'>')?;
                 Ok(inner)
             }
-            _ => Err(CqlError::Invalid(format!("unknown CQL type: '{lower}'"))),
+            _ => {
+                // Try UDT lookup if schema context is available.
+                // Copy context refs to avoid borrow conflict with `self.read_ident()`.
+                let ctx = self.schema_ctx;
+                if let Some((keyspace, schema)) = ctx {
+                    // Check for fully-qualified name (ks.typename) by reading a dot
+                    if self.peek() == Some(b'.') {
+                        self.pos += 1;
+                        let type_name = self.read_ident()?;
+                        let type_name_lower = type_name.to_ascii_lowercase();
+                        if let Some(udt) = schema.get_type(&lower, &type_name_lower) {
+                            return Ok(CqlType::Udt {
+                                keyspace: udt.keyspace,
+                                name: udt.name,
+                                fields: udt.fields,
+                            });
+                        }
+                        return Err(CqlError::Invalid(format!(
+                            "unknown CQL type: '{lower}.{type_name_lower}'"
+                        )));
+                    }
+                    // Try unqualified name in current keyspace
+                    if let Some(udt) = schema.get_type(keyspace, &lower) {
+                        return Ok(CqlType::Udt {
+                            keyspace: udt.keyspace,
+                            name: udt.name,
+                            fields: udt.fields,
+                        });
+                    }
+                }
+                Err(CqlError::Invalid(format!("unknown CQL type: '{lower}'")))
+            }
         }
     }
 }
