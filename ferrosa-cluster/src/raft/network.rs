@@ -87,7 +87,7 @@ impl FerrosRaftNetworkFactory {
         }
     }
 
-    /// Async version of [`register_node`] — preferred from async contexts.
+    /// Async version of `register_node` — preferred from async contexts.
     pub async fn register_node_async(&self, node_id: u64, host_id: Uuid) {
         self.node_map.write().await.insert(node_id, host_id);
     }

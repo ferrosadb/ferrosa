@@ -752,7 +752,7 @@ mod tests {
     #[tokio::test]
     async fn apply_is_deterministic() {
         // Apply the same sequence of commands to two independent state machines.
-        let commands = vec![
+        let commands = [
             RaftCommand::CreateKeyspace(simple_keyspace("ks1")),
             RaftCommand::CreateTable(Box::new(simple_table("ks1", "t1"))),
             RaftCommand::JoinNode(NodeInfo {
@@ -918,7 +918,7 @@ mod tests {
         sm.apply(entries).await.unwrap();
 
         // After revoking the only permission, the grant entry should be removed.
-        assert!(sm.state().grants.get("analyst").is_none());
+        assert!(!sm.state().grants.contains_key("analyst"));
     }
 
     #[tokio::test]
@@ -970,8 +970,10 @@ mod tests {
     #[tokio::test]
     async fn apply_update_config() {
         let mut sm = FerrosStateMachine::new();
-        let mut config = ClusterConfig::default();
-        config.cluster_name = "my-cluster".to_string();
+        let config = ClusterConfig {
+            cluster_name: "my-cluster".to_string(),
+            ..ClusterConfig::default()
+        };
 
         let entry = make_entry(1, 1, RaftCommand::UpdateConfig(config));
         sm.apply(vec![entry]).await.unwrap();

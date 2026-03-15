@@ -33,8 +33,8 @@ const META_LAST_PURGED: &[u8] = b"last_purged";
 // SledLogStore
 // ---------------------------------------------------------------------------
 
-/// Sled-backed implementation of openraft's [`RaftLogStorage`] and
-/// [`RaftLogReader`] traits.
+/// Sled-backed implementation of openraft's `RaftLogStorage` and
+/// `RaftLogReader` traits.
 pub struct SledLogStore {
     #[allow(dead_code)]
     db: sled::Db,
