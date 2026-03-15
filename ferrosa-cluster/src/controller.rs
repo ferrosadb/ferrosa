@@ -113,6 +113,9 @@ pub struct ModeController {
     /// Mirrors `RaftState.approved_nodes` for synchronous access in join checks.
     /// Updated when `ApproveNode` commands are committed.
     approved_nodes: Mutex<BTreeSet<Uuid>>,
+    /// Live token ring, set when transitioning to cluster mode.
+    /// `None` in standalone and pair modes.
+    ring: Arc<ArcSwap<Option<Arc<TokenRing>>>>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -184,6 +187,7 @@ impl ModeController {
             hint_store,
             hint_config,
             approved_nodes: Mutex::new(BTreeSet::new()),
+            ring: Arc::new(ArcSwap::from_pointee(None)),
         });
 
         let handles = ModeControllerHandles {
@@ -219,6 +223,22 @@ impl ModeController {
     /// Get the Raft instance, if cluster mode initialization has completed.
     pub fn raft(&self) -> Option<Arc<FerrosRaft>> {
         (**self.raft_instance.load()).clone()
+    }
+
+    /// Return a snapshot of the current token ring.
+    ///
+    /// Returns the live [`TokenRing`] if the node is in cluster mode with an
+    /// initialized ring, `None` otherwise (standalone or pair mode).
+    pub fn token_ring(&self) -> Option<Arc<TokenRing>> {
+        (**self.ring.load()).clone()
+    }
+
+    /// Directly install a token ring.
+    ///
+    /// Used by the cluster mode transition and in tests to seed ring state
+    /// without going through a full peer-connection lifecycle.
+    pub fn set_token_ring(&self, ring: Arc<TokenRing>) {
+        self.ring.store(Arc::new(Some(ring)));
     }
 
     /// Return a reference to the shared hint store.
@@ -696,6 +716,14 @@ impl ModeController {
         }
 
         let ring_arc = Arc::new(ArcSwap::from_pointee(ring));
+
+        // Expose the live ring snapshot for observability (web API, CLI).
+        // We capture a snapshot of the ring at this point; it will be updated
+        // by the Raft state machine as tokens are reassigned.
+        {
+            let ring_snapshot = Arc::new((**ring_arc.load()).clone());
+            self.set_token_ring(ring_snapshot);
+        }
 
         // 5. Create coordinator
         let coordinator = Arc::new(ClusterCoordinator::new(
