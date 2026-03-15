@@ -5,6 +5,7 @@
 //! enum, supporting node-state types, and a convenience helper for mapping
 //! `Uuid` node identifiers to openraft's `u64` `NodeId` space.
 
+pub mod handlers;
 pub mod log_store;
 pub mod network;
 pub mod state_machine;
