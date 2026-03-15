@@ -15,7 +15,7 @@ use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
 use crate::ast::Term;
 use crate::error::CqlError;
-use crate::types::{CqlType, CqlValue};
+use crate::types::{decode_value, encode_value, CqlType, CqlValue};
 
 // ---------------------------------------------------------------------------
 // Function 1: term_to_cql_value
@@ -209,6 +209,7 @@ fn cql_type_name(t: &CqlType) -> &'static str {
         CqlType::Map(_, _) => "map",
         CqlType::Set(_) => "set",
         CqlType::Tuple(_) => "tuple",
+        CqlType::Udt { .. } => "udt",
     }
 }
 
@@ -394,12 +395,12 @@ pub fn build_decorated_key(
     }
 
     let bytes = if pk_values.len() == 1 {
-        pk_values[0].encode_value()
+        encode_value(&pk_values[0])
     } else {
         // Composite key: [2-byte len][value bytes][0x00] per component
         let mut buf = Vec::new();
         for val in pk_values {
-            let encoded = val.encode_value();
+            let encoded = encode_value(val);
             let len = u16::try_from(encoded.len())
                 .map_err(|_| CqlError::Invalid("partition key component too large".into()))?;
             buf.extend_from_slice(&len.to_be_bytes());
@@ -433,7 +434,7 @@ pub fn build_row(
     let cells: Vec<(u16, CellValue)> = column_values
         .iter()
         .map(|(idx, val)| {
-            let encoded = val.encode_value();
+            let encoded = encode_value(val);
             let cell = match ttl {
                 Some(ttl_secs) => {
                     // System clock: the one allowed unwrap
@@ -555,7 +556,7 @@ pub fn partition_to_rows(
         for (i, &col_idx) in pk_columns.iter().enumerate() {
             if col_idx < column_types.len() {
                 if let Some(bytes) = pk_values.get(i) {
-                    if let Ok(val) = CqlValue::decode_value(&column_types[col_idx], bytes) {
+                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
                         output_row[col_idx] = Some(val);
                     }
                 }
@@ -567,7 +568,7 @@ pub fn partition_to_rows(
         for (i, &col_idx) in ck_columns.iter().enumerate() {
             if col_idx < column_types.len() {
                 if let Some(bytes) = ck_values.get(i) {
-                    if let Ok(val) = CqlValue::decode_value(&column_types[col_idx], bytes) {
+                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
                         output_row[col_idx] = Some(val);
                     }
                 }
@@ -581,7 +582,7 @@ pub fn partition_to_rows(
                 if cell.is_tombstone() {
                     output_row[idx] = None;
                 } else if let Some(ref value_bytes) = cell.value {
-                    if let Ok(val) = CqlValue::decode_value(&column_types[idx], value_bytes) {
+                    if let Ok(val) = decode_value(&column_types[idx], value_bytes) {
                         output_row[idx] = Some(val);
                     }
                 }
@@ -607,12 +608,12 @@ fn encode_clustering(values: &[CqlValue]) -> Vec<u8> {
         return vec![];
     }
     if values.len() == 1 {
-        return values[0].encode_value();
+        return encode_value(&values[0]);
     }
     // Multi-column clustering: length-prefixed concatenation
     let mut buf = Vec::new();
     for val in values {
-        let encoded = val.encode_value();
+        let encoded = encode_value(val);
         // Use saturating cast; clustering values should never be > 64K
         let len = (encoded.len() as u16).to_be_bytes();
         buf.extend_from_slice(&len);
@@ -1034,7 +1035,7 @@ mod tests {
             2000,
             None,
         );
-        assert_eq!(row.clustering, CqlValue::Text("ck1".into()).encode_value());
+        assert_eq!(row.clustering, encode_value(&CqlValue::Text("ck1".into())));
         assert!(row.primary_key_liveness.has_timestamp());
         assert!(!row.primary_key_liveness.has_ttl());
     }
@@ -1058,10 +1059,10 @@ mod tests {
         // Multi-column clustering: length-prefixed concatenation
         let expected = {
             let mut buf = Vec::new();
-            let a_bytes = CqlValue::Text("a".into()).encode_value();
+            let a_bytes = encode_value(&CqlValue::Text("a".into()));
             buf.extend_from_slice(&(a_bytes.len() as u16).to_be_bytes());
             buf.extend_from_slice(&a_bytes);
-            let i_bytes = CqlValue::Int(42).encode_value();
+            let i_bytes = encode_value(&CqlValue::Int(42));
             buf.extend_from_slice(&(i_bytes.len() as u16).to_be_bytes());
             buf.extend_from_slice(&i_bytes);
             buf
@@ -1094,10 +1095,10 @@ mod tests {
     fn partition_to_rows_basic() {
         use ferrosa_sstable::types::Partition;
 
-        let pk_bytes = CqlValue::Int(42).encode_value();
+        let pk_bytes = encode_value(&CqlValue::Int(42));
         let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
 
-        let cell_bytes = CqlValue::Text("alice".into()).encode_value();
+        let cell_bytes = encode_value(&CqlValue::Text("alice".into()));
         let row = Row {
             clustering: vec![],
             cells: vec![(1, CellValue::live(cell_bytes, 1000))],
@@ -1133,7 +1134,7 @@ mod tests {
     fn partition_to_rows_skips_tombstone() {
         use ferrosa_sstable::types::Partition;
 
-        let pk_bytes = CqlValue::Int(1).encode_value();
+        let pk_bytes = encode_value(&CqlValue::Int(1));
         let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
 
         let tombstone_row = Row {
@@ -1158,7 +1159,7 @@ mod tests {
     fn partition_to_rows_tombstone_cell() {
         use ferrosa_sstable::types::Partition;
 
-        let pk_bytes = CqlValue::Int(1).encode_value();
+        let pk_bytes = encode_value(&CqlValue::Int(1));
         let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
 
         let row = Row {
