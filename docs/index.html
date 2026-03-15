@@ -1264,6 +1264,14 @@ user = session.execute(stmt, [user_id])
           <td>Managed</td>
         </tr>
         <tr>
+          <td>Consensus</td>
+          <td class="ferrosa-col">Raft (openraft)</td>
+          <td>Paxos (Accord)</td>
+          <td>Paxos (Pegasus)</td>
+          <td>N/A (managed)</td>
+          <td>N/A (managed)</td>
+        </tr>
+        <tr>
           <td>Node Recovery</td>
           <td class="ferrosa-col">Seconds</td>
           <td>Hours</td>
@@ -1376,6 +1384,7 @@ user = session.execute(stmt, [user_id])
           <span class="arch-item">DDL Replication</span>
           <span class="arch-item">Raft (openraft)</span>
           <span class="arch-item">Token Ring</span>
+          <span class="arch-item">Coordinator</span>
         </div>
       </div>
     </div>
@@ -1449,11 +1458,12 @@ user = session.execute(stmt, [user_id])
       </div>
       <div class="use-case">
         <p class="use-case-label graph-uc">3+ Nodes</p>
-        <h3>Full ring with multi-DC replication</h3>
+        <h3>Full ring with Raft consensus</h3>
         <p>
-          Scale to any number of nodes across multiple data centers. Raft consensus for
-          metadata, tunable consistency levels (ONE through ALL), and automatic
-          token ring rebalancing. Petabyte-scale with S3-backed storage economics.
+          Add a third node and Ferrosa automatically transitions to cluster mode:
+          Raft consensus for metadata (openraft + sled), Murmur3 token ring for data
+          sharding, and a coordinator pattern for tunable consistency writes and reads.
+          QUORUM survives single-node failures. Petabyte-scale with S3-backed storage economics.
         </p>
       </div>
     </div>

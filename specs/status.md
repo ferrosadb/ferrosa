@@ -5,10 +5,11 @@
 
 ## Overview
 
-Ferrosa is a **two-node pair-mode distributed CQL-compatible database** with graph
-query support, built-in observability, and S3-backed storage. The internode transport
-(ferrosa-net Phase 1) and pair mode cluster (ferrosa-cluster Phase 1) are complete,
-including DDL replication, write forwarding, failover, and catch-up.
+Ferrosa is a **distributed CQL-compatible database** with graph query support,
+built-in observability, and S3-backed storage. The internode transport (ferrosa-net
+Phase 1), pair mode cluster (ferrosa-cluster Phase 1), and cluster building blocks
+(ferrosa-cluster Phase 2) are complete: DDL replication, write forwarding, failover,
+catch-up, Raft consensus, token ring, and coordinator pattern.
 
 | Metric | Value |
 |--------|-------|
@@ -32,7 +33,7 @@ graph          █████░   ██████  ████░░   █
 ctl            ██████   ██████  ███░░░   ███░░░
 binary         █████░   ██████  ███░░░   ███░░░
 net            █████░   █████░  ████░░   ██░░░░
-cluster        █████░   ████░░  ███░░░   ██░░░░
+cluster        ██████   █████░  ████░░   ██░░░░
 ```
 
 ## Crate Status
@@ -211,37 +212,47 @@ cluster        █████░   ████░░  ███░░░   █
 - **Spec:** [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 - **Threat Model:** [Net/Cluster Threats](threat-model-net-cluster.md)
 
-### ferrosa-cluster — Phase 1 Complete (Pair Mode)
+### ferrosa-cluster — Phase 2 Complete (Raft + Token Ring + Coordinator)
 
-- **LOC:** 2,756 (16 files) | **Tests:** 33 (29 unit + 4 integration)
+- **LOC:** 6,262 (25 files) | **Tests:** 91 (87 unit + 4 integration)
 - **Modules:** `config`, `consistency`, `controller`, `ddl_path`, `error`, `mode`,
-  `pair` (catchup, coordinator, ddl, handler, node, switchover), `state`, `write_path`
-- **What's done:** Pair mode with full failover lifecycle:
-  - `PairCoordinator` — write forwarding (secondary → primary) + replication
-  - `DdlCoordinator` + `DdlPath` — DDL forwarding/replication through primary
-  - `PairSchemaSyncHandler` — schema snapshot catch-up on rejoin
-  - `ModeController` — runtime mode transitions (standalone → pair → degraded)
-  - `WritePath::Unavailable` — degraded mode rejects writes when peer lost
-  - `force_promote()` — operator promotes to standalone primary
-  - `switchover()` — swap primary/secondary roles (both nodes required)
-  - Reverse connection on inbound peer for bidirectional RPC
-  - Auto re-pair with force-promoted role override on peer rejoin
-  - Commit log `force_sync` for catch-up data replay
-  - `ConsistencyLevel` with `blockFor()` + property tests
-  - Docker smoke test: 5-phase lifecycle (bidirectional writes, failover,
-    promotion, catch-up with schema + data, switchover)
-- **Remaining (Phase 2 — Full Cluster):**
-  - [ ] Raft metadata (openraft) for schema + topology
-  - [ ] Token ring with Murmur3 partitioner
-  - [ ] Tunable consistency levels (ONE, QUORUM, ALL)
-  - [ ] Coordinator pattern for write/read fan-out
+  `pair` (catchup, coordinator, ddl, handler, node, switchover), `state`, `write_path`,
+  `raft` (mod, log_store, state_machine, network), `ring` (mod, strategy),
+  `coordinator` (mod, write, read)
+- **What's done:**
+  - **Phase 1 (Pair mode):** `PairCoordinator` (write forwarding + replication),
+    `DdlCoordinator` + `DdlPath` (DDL forwarding through primary),
+    `PairSchemaSyncHandler` (schema catch-up on rejoin), `ModeController`
+    (standalone → pair → degraded → cluster transitions), `force_promote()`,
+    `switchover()`, auto re-pair, commit log `force_sync`, `ConsistencyLevel`
+    with `blockFor()` + property tests
+  - **Phase 2 (Raft consensus):** `FerrosRaftConfig` (openraft type config),
+    `RaftCommand` enum (15 schema + 3 topology + 1 config variant),
+    `SledLogStore` (sled-backed persistent Raft log with vote/commit persistence),
+    `FerrosStateMachine` (deterministic apply with BTreeMap-based `RaftState`,
+    schema + topology + token map, snapshot build/install),
+    `FerrosRaftNetwork` + factory (wraps PeerManager for Raft RPC)
+  - **Phase 2 (Token ring):** `TokenRing` with `BTreeMap<Token, u64>` for O(log n)
+    replica lookup, clockwise walk for SimpleStrategy, vnode-aware dedup
+  - **Phase 2 (Coordinator):** `ClusterCoordinator` with write/read fan-out,
+    tunable consistency level enforcement (`blockFor(CL)` ACK collection),
+    local-replica optimization, `WritePath::Cluster` and `DdlPath::Cluster` variants
+  - **Phase 2 (Wiring):** `transition_to_cluster()` in ModeController (3rd peer
+    triggers Raft group + token ring + coordinator initialization),
+    `RaftClusterState` for system.peers
+  - Docker smoke test: 12-phase lifecycle (pair mode phases 1-5, cluster
+    formation, 3-node writes/reads, QUORUM with node failure, below-QUORUM
+    rejection, recovery, DDL replication, FMEA failure modes)
+- **Remaining (Phase 3 — Production Cluster):**
+  - [ ] End-to-end cluster mode activation in binary (RPC handler registration)
   - [ ] Hinted handoff and repair
-  - [ ] Node lifecycle (join, leave, bootstrap)
-  - [x] ~~AlterKeyspace/AlterTable DDL forwarding~~ (done)
-  - [x] ~~`StorageEngine::unregister_table()` for drop replication cleanup~~ (done)
-  - [x] ~~Role/auth DDL forwarding (CreateRole, AlterRole, DropRole, Grant, Revoke)~~ (done)
-  - [x] ~~CreateIndex/DropIndex DdlOperation variants~~ (done)
-- **Spec:** [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
+  - [ ] Node lifecycle (leave, decommission, bootstrap streaming)
+  - [ ] NetworkTopologyStrategy (multi-DC)
+  - [ ] Read repair
+  - [ ] Automatic token rebalancing
+  - [ ] Quorum Lease / Mencius optimizations (Paxos-Raft paper)
+- **Spec:** [Cluster Phase 2 Design](../superpowers/specs/2026-03-14-cluster-phase2-design.md)
+- **Phase 1 Spec:** [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 - **Schema Replication Spec:** [Schema Replication](../superpowers/specs/2026-03-14-schema-replication-design.md)
 - **Threat Models:** [Net/Cluster](threat-model-net-cluster.md), [Schema Replication](threat-model-schema-replication.md)
 
@@ -256,7 +267,8 @@ cluster        █████░   ████░░  ███░░░   █
 | ~~DDL completeness (AlterKS/AlterTable, Role DDL, Index DDL)~~ | ~~`ferrosa-cluster/`~~ | Merged (PR #45) |
 | ~~.deb packaging + systemd service~~ | ~~`scripts/build-deb.sh`~~ | Merged (PR #46) |
 | Release workflow (GitHub Actions) | `.github/workflows/` | In progress (PR #47) |
-| ferrosa-cluster Phase 2 (Full cluster) | — | Next up |
+| ~~ferrosa-cluster Phase 2 (Raft + Ring + Coordinator)~~ | ~~`feature/raft-cluster-phase2`~~ | PR pending |
+| ferrosa-cluster Phase 3 (Production cluster wiring) | — | Next up |
 
 ## Path to Distributed Operation
 
@@ -265,9 +277,9 @@ The critical path from single-node to multi-node:
 1. ~~**ferrosa-storage:** Commit log replay + compaction execution~~ (Done — PR #38)
 1. ~~**ferrosa-net:** Internode transport (Phase 1)~~ (Done — PR #39)
 1. ~~**ferrosa-cluster:** Pair mode — write forwarding, DDL replication, failover~~ (Done)
+1. ~~**ferrosa-cluster:** Raft metadata, ring topology, coordinator pattern~~ (Done — Phase 2)
+1. **ferrosa-cluster:** End-to-end cluster wiring in binary (Phase 3)
 1. **ferrosa-schema:** System table persistence (Chunk B)
-1. **ferrosa-cluster:** Raft metadata, ring topology, request routing
-1. **ferrosa-cluster:** Tunable consistency levels (ONE, QUORUM, ALL)
 1. **ferrosa-cluster:** Hinted handoff and repair
 
 ## Related Documents
