@@ -7,7 +7,7 @@
 //! the `PeerManager`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
@@ -17,7 +17,6 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory};
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use ferrosa_net::codec::Lane;
@@ -38,6 +37,11 @@ use super::FerrosRaftConfig;
 pub struct FerrosRaftNetworkFactory {
     peer_manager: Arc<PeerManager>,
     /// Maps openraft u64 node IDs to ferrosa Uuid host IDs.
+    ///
+    /// Uses `std::sync::RwLock` rather than `tokio::sync::RwLock` because the
+    /// critical section is a trivial `HashMap::insert` — no async work is done
+    /// under the lock.  This allows `register_node` to be called from both sync
+    /// and async contexts without `block_on` / `block_in_place` gymnastics.
     node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
 }
 
@@ -50,51 +54,30 @@ impl FerrosRaftNetworkFactory {
         }
     }
 
-    /// Register a node ID → host ID mapping.
+    /// Register a node ID -> host ID mapping.
     ///
     /// Must be called before openraft asks the factory to create a network
-    /// client for a given node ID.
+    /// client for a given node ID.  Safe to call from both sync and async
+    /// contexts.
     pub fn register_node(&self, node_id: u64, host_id: Uuid) {
-        // Use a blocking write — this is called from non-async contexts such as
-        // cluster membership change handling.  The lock is held only for a
-        // HashMap insertion so the contention window is negligible.
-        let rt = tokio::runtime::Handle::try_current();
-        match rt {
-            Ok(handle) => {
-                let node_map = Arc::clone(&self.node_map);
-                handle.block_on(async move {
-                    node_map.write().await.insert(node_id, host_id);
-                });
-            }
-            Err(_) => {
-                // No async runtime available — use blocking_write equivalent via
-                // std::sync::RwLock would require a different type.  Callers in
-                // test code that don't have a runtime can use tokio::test or
-                // call the async variant directly.
-                //
-                // For production paths this branch should not be hit; log a
-                // warning and do a best-effort insert on the current thread by
-                // spinning up a minimal one-shot runtime.
-                let node_map = Arc::clone(&self.node_map);
-                let _ = tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .map(|rt| {
-                        rt.block_on(async move {
-                            node_map.write().await.insert(node_id, host_id);
-                        })
-                    });
-            }
-        }
+        self.node_map
+            .write()
+            .expect("node_map lock poisoned")
+            .insert(node_id, host_id);
     }
 
-    /// Async version of `register_node` — preferred from async contexts.
+    /// Async version of `register_node` — kept for API compatibility.
     pub async fn register_node_async(&self, node_id: u64, host_id: Uuid) {
-        self.node_map.write().await.insert(node_id, host_id);
+        self.register_node(node_id, host_id);
     }
 
     /// Look up the host UUID for a given openraft node ID.
-    async fn resolve_host_id(&self, node_id: u64) -> Option<Uuid> {
-        self.node_map.read().await.get(&node_id).copied()
+    fn resolve_host_id(&self, node_id: u64) -> Option<Uuid> {
+        self.node_map
+            .read()
+            .expect("node_map lock poisoned")
+            .get(&node_id)
+            .copied()
     }
 }
 
@@ -102,8 +85,8 @@ impl RaftNetworkFactory<FerrosRaftConfig> for FerrosRaftNetworkFactory {
     type Network = FerrosRaftNetwork;
 
     async fn new_client(&mut self, target: u64, _node: &BasicNode) -> FerrosRaftNetwork {
-        // Resolve the UUID synchronously from within this async context.
-        let target_host_id = self.resolve_host_id(target).await.unwrap_or_else(|| {
+        // Resolve the UUID from the sync map.
+        let target_host_id = self.resolve_host_id(target).unwrap_or_else(|| {
             // openraft does not allow returning an error here.  Return a
             // nil UUID; the first RPC will fail with Unreachable which will
             // trigger openraft's backoff logic.
@@ -362,7 +345,7 @@ mod tests {
         }
 
         // Verify all mappings are present and correct.
-        let map = factory.node_map.read().await;
+        let map = factory.node_map.read().expect("lock");
         for (node_id, host_id) in &ids {
             assert_eq!(
                 map.get(node_id),
@@ -386,7 +369,7 @@ mod tests {
         factory.register_node_async(1, first).await;
         factory.register_node_async(1, second).await;
 
-        let map = factory.node_map.read().await;
+        let map = factory.node_map.read().expect("lock");
         assert_eq!(
             map.get(&1),
             Some(&second),
