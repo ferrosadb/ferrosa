@@ -282,4 +282,26 @@ mod tests {
         ring.set_node_state(1, NodeState::Decommissioned);
         assert_eq!(ring.get_node(1).unwrap().state, NodeState::Decommissioned);
     }
+
+    #[test]
+    fn decommission_removes_node_from_ring() {
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node("10.0.0.1:7000"));
+        ring.add_node(2, make_node("10.0.0.2:7000"));
+        ring.assign_tokens(1, &[10, 20, 30]);
+        ring.assign_tokens(2, &[40, 50, 60]);
+
+        assert_eq!(ring.node_count(), 2);
+        assert_eq!(ring.token_count(), 6);
+
+        // Simulate decommission: mark leaving, then remove
+        ring.set_node_state(1, NodeState::Leaving);
+        assert_eq!(ring.get_node(1).unwrap().state, NodeState::Leaving);
+
+        ring.remove_node(1);
+        assert_eq!(ring.node_count(), 1);
+        assert_eq!(ring.token_count(), 3);
+        assert!(ring.get_node(1).is_none());
+        assert!(ring.tokens_for_node(1).is_empty());
+    }
 }
