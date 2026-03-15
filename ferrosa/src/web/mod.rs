@@ -72,17 +72,21 @@ impl FromRef<WebAppState> for Arc<ModeController> {
 }
 
 /// Build the axum router for the web console.
+///
+/// Auth middleware is scoped to `/api/*` routes only — static assets
+/// (the embedded web UI at `/`) remain publicly accessible so the
+/// browser can load the login page.
 pub fn build_router(state: WebAppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .nest("/api", api::routes())
         .nest("/api/cluster", api::cluster_routes())
         .route("/api/ws", get(ws::ws_handler))
-        .fallback(static_files::static_handler)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,
-        ))
-        .with_state(state)
+        ));
+
+    api.fallback(static_files::static_handler).with_state(state)
 }
 
 /// Start the web server in a background task, returning the bound address.
