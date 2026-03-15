@@ -222,6 +222,7 @@
       <li><a href="#dml">DML Statements</a></li>
       <li><a href="#auth-roles">Auth &amp; Roles</a></li>
       <li><a href="#system">System Keyspaces</a></li>
+      <li><a href="#indexes">Secondary Indexes</a></li>
       <li><a href="#subscribe">SUBSCRIBE Extension</a></li>
       <li><a href="#graph">Graph (Cypher) Extension</a></li>
       <li><a href="#not-yet">Not Yet Supported</a></li>
@@ -314,10 +315,11 @@
       <tr><td>CREATE TABLE</td><td><span class="check">Supported</span></td><td>Partition key, clustering key with order, IF NOT EXISTS, table options</td></tr>
       <tr><td>ALTER TABLE</td><td><span class="check">Supported</span></td><td>ADD column, DROP column</td></tr>
       <tr><td>DROP TABLE</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
-      <tr><td>CREATE INDEX</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
+      <tr><td>CREATE INDEX</td><td><span class="check">Supported</span></td><td>USING type, WITH OPTIONS, IF NOT EXISTS — <a href="#indexes">see below</a></td></tr>
+      <tr><td>DROP INDEX</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
       <tr><td>CREATE MATERIALIZED VIEW</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
       <tr><td>CREATE TYPE (UDT)</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
-      <tr><td>CREATE FUNCTION / AGGREGATE</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
+      <tr><td>CREATE FUNCTION / AGGREGATE</td><td><span class="cross">Not yet</span></td><td>WASM-based UDFs planned (no Java/JS)</td></tr>
     </tbody>
   </table>
 
@@ -406,6 +408,7 @@
     <li><code>system_observability.connections</code> — active CQL client connections</li>
     <li><code>system_observability.active_queries</code> — currently executing queries</li>
     <li><code>system_observability.storage_stats</code> — storage engine metrics</li>
+    <li><code>system_views.secondary_indexes</code> — per-index build status, staleness, pending work</li>
   </ul>
 
   <pre><span class="cm">-- Check active connections</span>
@@ -416,6 +419,120 @@
 
 <span class="cm">-- Storage engine stats</span>
 <span class="kw">SELECT</span> * <span class="kw">FROM</span> system_observability.storage_stats;</pre>
+
+  <!-- ── Secondary Indexes ── -->
+  <h2 id="indexes">Secondary Indexes</h2>
+
+  <div class="extension">
+    <strong>Beyond Cassandra:</strong> Ferrosa's secondary index framework goes far beyond Cassandra's SAI
+    or legacy 2i indexes. Eight pluggable index types cover traditional queries, full-text phonetic
+    search, and AI/ML vector similarity — all built into the database with zero external dependencies.
+  </div>
+
+  <h3>Index types</h3>
+  <table>
+    <thead><tr><th>Type</th><th>USING clause</th><th>Use case</th></tr></thead>
+    <tbody>
+      <tr><td>B-tree</td><td><code>'btree'</code> (default)</td><td>Ordered range queries and sorted scans</td></tr>
+      <tr><td>Hash</td><td><code>'hash'</code></td><td>O(1) equality point lookups</td></tr>
+      <tr><td>Composite</td><td><code>'composite'</code></td><td>Multi-column prefix-based lookups</td></tr>
+      <tr><td>Phonetic</td><td><code>'phonetic'</code></td><td>Fuzzy name matching (Soundex, Metaphone, Double Metaphone, Caverphone)</td></tr>
+      <tr><td>Filtered</td><td>Any + <code>WHERE</code></td><td>Partial index over a subset of rows</td></tr>
+      <tr><td>Vector (HNSW)</td><td><code>'vector'</code></td><td>Approximate nearest neighbor — graph-based, best query performance</td></tr>
+      <tr><td>Vector (IVFFlat)</td><td><code>'vector'</code></td><td>Approximate nearest neighbor — k-means clustering, faster builds</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Creating indexes</h3>
+  <pre><span class="cm">-- B-tree index (default when USING is omitted)</span>
+<span class="kw">CREATE INDEX</span> idx_email <span class="kw">ON</span> <span class="type">users</span> (email) <span class="kw">USING</span> <span class="str">'btree'</span>;
+
+<span class="cm">-- Hash index for fast equality lookups</span>
+<span class="kw">CREATE INDEX</span> idx_user_id <span class="kw">ON</span> <span class="type">sessions</span> (user_id) <span class="kw">USING</span> <span class="str">'hash'</span>;
+
+<span class="cm">-- Composite index across multiple columns</span>
+<span class="kw">CREATE INDEX</span> idx_name <span class="kw">ON</span> <span class="type">users</span> (last_name, first_name) <span class="kw">USING</span> <span class="str">'composite'</span>;
+
+<span class="cm">-- Phonetic index for "sounds like" matching</span>
+<span class="kw">CREATE INDEX</span> idx_name_phonetic <span class="kw">ON</span> <span class="type">users</span> (last_name)
+  <span class="kw">USING</span> <span class="str">'phonetic'</span> <span class="kw">WITH OPTIONS</span> = {<span class="str">'algorithm'</span>: <span class="str">'double_metaphone'</span>};
+
+<span class="cm">-- Filtered index — only index active users</span>
+<span class="kw">CREATE INDEX</span> idx_active_email <span class="kw">ON</span> <span class="type">users</span> (email)
+  <span class="kw">USING</span> <span class="str">'btree'</span> <span class="kw">WHERE</span> status = <span class="str">'active'</span>;
+
+<span class="cm">-- IF NOT EXISTS is supported</span>
+<span class="kw">CREATE INDEX IF NOT EXISTS</span> idx_email <span class="kw">ON</span> <span class="type">users</span> (email);
+
+<span class="cm">-- Drop an index</span>
+<span class="kw">DROP INDEX</span> idx_email;
+<span class="kw">DROP INDEX IF EXISTS</span> idx_email;</pre>
+
+  <h3>Vector indexes for AI and similarity search</h3>
+  <p>Ferrosa includes two vector index algorithms for approximate nearest neighbor (ANN) search, supporting AI embeddings, semantic search, and recommendation systems:</p>
+
+  <pre><span class="cm">-- HNSW index — best query performance, incremental builds</span>
+<span class="kw">CREATE INDEX</span> idx_embed <span class="kw">ON</span> <span class="type">documents</span> (embedding)
+  <span class="kw">USING</span> <span class="str">'vector'</span> <span class="kw">WITH OPTIONS</span> = {
+    <span class="str">'method'</span>: <span class="str">'hnsw'</span>,
+    <span class="str">'metric'</span>: <span class="str">'cosine'</span>,
+    <span class="str">'dimensions'</span>: <span class="str">'768'</span>,
+    <span class="str">'m'</span>: <span class="str">'16'</span>,
+    <span class="str">'ef_construction'</span>: <span class="str">'200'</span>
+  };
+
+<span class="cm">-- IVFFlat index — faster builds, good for batch imports</span>
+<span class="kw">CREATE INDEX</span> idx_embed_ivf <span class="kw">ON</span> <span class="type">documents</span> (embedding)
+  <span class="kw">USING</span> <span class="str">'vector'</span> <span class="kw">WITH OPTIONS</span> = {
+    <span class="str">'method'</span>: <span class="str">'ivfflat'</span>,
+    <span class="str">'metric'</span>: <span class="str">'l2'</span>,
+    <span class="str">'dimensions'</span>: <span class="str">'1536'</span>,
+    <span class="str">'lists'</span>: <span class="str">'100'</span>
+  };</pre>
+
+  <h3>Distance metrics</h3>
+  <table>
+    <thead><tr><th>Metric</th><th>Value</th><th>Use case</th></tr></thead>
+    <tbody>
+      <tr><td>L2 (Euclidean)</td><td><code>'l2'</code></td><td>Standard distance — smaller = more similar</td></tr>
+      <tr><td>Cosine</td><td><code>'cosine'</code></td><td>Angle-based similarity — ideal for text embeddings</td></tr>
+      <tr><td>Inner product</td><td><code>'inner_product'</code></td><td>Dot product — larger = more similar</td></tr>
+    </tbody>
+  </table>
+  <p>Supports up to 4,096 dimensions (f32) or 8,192 dimensions (f16 half-precision).</p>
+
+  <h3>Phonetic algorithms</h3>
+  <table>
+    <thead><tr><th>Algorithm</th><th>Value</th><th>Best for</th></tr></thead>
+    <tbody>
+      <tr><td>Soundex</td><td><code>'soundex'</code></td><td>Standard American English names</td></tr>
+      <tr><td>Metaphone</td><td><code>'metaphone'</code></td><td>General English pronunciation</td></tr>
+      <tr><td>Double Metaphone</td><td><code>'double_metaphone'</code></td><td>Multi-origin names (returns primary + alternate codes)</td></tr>
+      <tr><td>Caverphone</td><td><code>'caverphone'</code></td><td>New Zealand English names</td></tr>
+    </tbody>
+  </table>
+
+  <h3>How indexes work</h3>
+  <p>Ferrosa indexes are <strong>storage-attached</strong> — built as companion files alongside SSTables. Indexes are built <strong>asynchronously</strong> after memtable flush, with zero impact on the write path. This means:</p>
+  <ul>
+    <li><strong>Writes are never blocked</strong> by index maintenance</li>
+    <li><strong>Indexes are eventually consistent</strong> — there's a brief window between write and index availability</li>
+    <li><strong>Per-index staleness tracking</strong> via <code>system_views.secondary_indexes</code> lets you monitor how far behind each index is</li>
+    <li><strong>Best-effort queries</strong> — queries union indexed SSTable results with scans of not-yet-indexed SSTables, so results are always complete</li>
+  </ul>
+
+  <h3>Monitoring index status</h3>
+  <pre><span class="cm">-- Check index build status and staleness</span>
+<span class="kw">SELECT</span> index_name, status, pending_sstable_count, lag_seconds
+<span class="kw">FROM</span> system_views.secondary_indexes;
+
+<span class="cm">-- View index metadata</span>
+<span class="kw">SELECT</span> index_name, kind, target, options
+<span class="kw">FROM</span> system_schema.indexes
+<span class="kw">WHERE</span> keyspace_name = <span class="str">'myapp'</span>;</pre>
+
+  <h3>Multi-node replication</h3>
+  <p>All index DDL (CREATE INDEX, DROP INDEX) replicates automatically in pair mode. Each node independently builds indexes for its local SSTables — no cross-node index coordination needed.</p>
 
   <!-- ── SUBSCRIBE ── -->
   <h2 id="subscribe">SUBSCRIBE Extension</h2>
@@ -516,9 +633,8 @@
       <tr><td>Logged batch atomicity</td><td>Planned</td></tr>
       <tr><td>User-defined types (UDT)</td><td>Planned</td></tr>
       <tr><td>Query tracing</td><td>Planned</td></tr>
-      <tr><td>Secondary indexes</td><td>Planned</td></tr>
       <tr><td>Materialized views</td><td>Planned</td></tr>
-      <tr><td>User-defined functions</td><td>Planned</td></tr>
+      <tr><td>User-defined functions</td><td>Planned — WebAssembly (no Java/JS)</td></tr>
       <tr><td>Lightweight transactions (LWT)</td><td>Planned</td></tr>
       <tr><td>duration type</td><td>Deferred</td></tr>
     </tbody>

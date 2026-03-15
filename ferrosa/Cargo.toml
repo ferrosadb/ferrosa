@@ -10,17 +10,19 @@ path = "src/main.rs"
 
 [dependencies]
 arc-swap = "1.7"
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-cql = { path = "../ferrosa-cql" }
+ferrosa-graph = { path = "../ferrosa-graph" }
 ferrosa-net = { path = "../ferrosa-net" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-storage = { path = "../ferrosa-storage" }
-ferrosa-cql = { path = "../ferrosa-cql" }
-ferrosa-graph = { path = "../ferrosa-graph" }
-axum = "0.8"
+futures = "0.3"
 rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -30,3 +32,5 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
+tokio-tungstenite = "0.26"
+tower = { version = "0.5", features = ["util"] }

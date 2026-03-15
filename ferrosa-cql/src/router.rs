@@ -1022,6 +1022,11 @@ async fn route_create_keyspace(
             let op = DdlOperation::CreateKeyspace(ks_meta);
             coordinator.coordinate_ddl(op).await?;
         }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
+        }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
@@ -1077,6 +1082,11 @@ async fn route_alter_keyspace(
             };
             coordinator.coordinate_ddl(op).await?;
         }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
+        }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
@@ -1122,6 +1132,11 @@ async fn route_drop_keyspace(
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropKeyspace(s.name.clone());
             coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1229,6 +1244,11 @@ async fn route_create_table(
             let op = DdlOperation::CreateTable(Box::new(table_meta));
             coordinator.coordinate_ddl(op).await?;
         }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
+        }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
@@ -1289,6 +1309,11 @@ async fn route_alter_table(
             };
             coordinator.coordinate_ddl(op).await?;
         }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
+        }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
@@ -1329,6 +1354,11 @@ async fn route_drop_table(
                 table: s.table.clone(),
             };
             coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1469,6 +1499,11 @@ async fn route_create_index(
             let op = DdlOperation::CreateIndex(index_meta);
             coordinator.coordinate_ddl(op).await?;
         }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
+        }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
@@ -1536,6 +1571,11 @@ async fn route_drop_index(
             };
             coordinator.coordinate_ddl(op).await?;
         }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
+        }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
@@ -1580,6 +1620,11 @@ async fn route_create_role(
             let op = DdlOperation::CreateRole(role);
             coordinator.coordinate_ddl(op).await?;
         }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
+        }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
@@ -1618,6 +1663,11 @@ async fn route_alter_role(
             };
             coordinator.coordinate_ddl(op).await?;
         }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
+        }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
@@ -1645,6 +1695,11 @@ async fn route_drop_role(
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropRole(s.name.clone());
             coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1684,6 +1739,11 @@ async fn route_grant(
                 permissions: perms,
             });
             coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1725,6 +1785,11 @@ async fn route_revoke(
                 };
                 coordinator.coordinate_ddl(op).await?;
             }
+        }
+        DdlPath::Cluster(_) => {
+            return Err(CqlError::ServerError(
+                "DDL via Raft not yet implemented".to_string(),
+            ));
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(

@@ -1,19 +1,23 @@
 pub mod config;
 pub mod consistency;
 pub mod controller;
+pub mod coordinator;
 pub mod ddl_path;
 pub mod error;
 pub mod mode;
 pub mod pair;
+pub mod raft;
+pub mod ring;
 pub mod state;
 pub mod write_path;
 
 pub use config::ClusterConfig;
 pub use consistency::ConsistencyLevel;
 pub use controller::{ClusterStateHolder, ModeController, ModeControllerHandles};
+pub use coordinator::{ClusterCoordinator, MutationForwardHandler};
 pub use ddl_path::DdlPath;
 pub use error::{ClusterError, Result};
 pub use mode::DeploymentMode;
 pub use pair::{PairCoordinator, PairNode, PairRole};
-pub use state::{PairClusterState, SingleNodeClusterState};
+pub use state::{PairClusterState, RaftClusterState, SingleNodeClusterState};
 pub use write_path::WritePath;

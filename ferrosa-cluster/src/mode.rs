@@ -1,7 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 /// Deployment mode inferred from peer count or set explicitly.
 ///
 /// Mode transitions are a one-way ratchet: Standalone → Pair → Cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeploymentMode {
     Standalone,
     Pair,

@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::consistency::ConsistencyLevel;
 use crate::mode::DeploymentMode;
 
 /// Cluster configuration. Parsed from `FERROSA_*` environment variables.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
     /// Forced deployment mode. `None` means auto-detect from peer count.
     pub mode: Option<DeploymentMode>,

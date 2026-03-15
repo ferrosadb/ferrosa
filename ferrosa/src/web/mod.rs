@@ -11,13 +11,17 @@
 //!   `POST /api/cluster/switchover`→ swap primary/secondary roles
 
 pub mod api;
+pub mod auth;
 pub mod static_files;
+pub mod ws;
 
 use std::{net::SocketAddr, sync::Arc};
 
+use axum::extract::FromRef;
+use axum::routing::get;
 use axum::Router;
 use ferrosa_cluster::ModeController;
-use ferrosa_schema::VirtualTableRegistry;
+use ferrosa_schema::{Schema, VirtualTableRegistry};
 
 /// Configuration for the web observability server.
 #[derive(Debug, Clone)]
@@ -47,24 +51,50 @@ impl WebConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct WebAppState {
+    pub registry: Arc<VirtualTableRegistry>,
+    pub mode_controller: Arc<ModeController>,
+    pub schema: Arc<Schema>,
+    pub auth_disabled: bool,
+}
+
+impl FromRef<WebAppState> for Arc<VirtualTableRegistry> {
+    fn from_ref(state: &WebAppState) -> Self {
+        state.registry.clone()
+    }
+}
+
+impl FromRef<WebAppState> for Arc<ModeController> {
+    fn from_ref(state: &WebAppState) -> Self {
+        state.mode_controller.clone()
+    }
+}
+
 /// Build the axum router for the web console.
-pub fn build_router(
-    registry: Arc<VirtualTableRegistry>,
-    mode_controller: Arc<ModeController>,
-) -> Router {
-    Router::new()
-        .nest("/api", api::routes(registry))
-        .nest("/api/cluster", api::cluster_routes(mode_controller))
-        .fallback(static_files::static_handler)
+///
+/// Auth middleware is scoped to `/api/*` routes only — static assets
+/// (the embedded web UI at `/`) remain publicly accessible so the
+/// browser can load the login page.
+pub fn build_router(state: WebAppState) -> Router {
+    let api = Router::new()
+        .nest("/api", api::routes())
+        .nest("/api/cluster", api::cluster_routes())
+        .route("/api/ws", get(ws::ws_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_middleware,
+        ));
+
+    api.fallback(static_files::static_handler).with_state(state)
 }
 
 /// Start the web server in a background task, returning the bound address.
 pub async fn start_web_server(
     config: &WebConfig,
-    registry: Arc<VirtualTableRegistry>,
-    mode_controller: Arc<ModeController>,
+    state: WebAppState,
 ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    let router = build_router(registry, mode_controller);
+    let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {

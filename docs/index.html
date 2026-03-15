@@ -709,6 +709,7 @@
       <li><a href="#progress">Scaling</a></li>
       <li><a href="#download">Download</a></li>
       <li><a href="https://github.com/ferrosadb/ferrosadb">GitHub</a></li>
+      <li><a href="cypher.html">Cypher</a></li>
     </ul>
     <a href="#get-started" class="nav-cta">Get Started</a>
   </div>
@@ -978,7 +979,8 @@
       <p>
         Query cluster state with CQL — connections, storage stats, active queries, topology.
         SUBSCRIBE for streaming updates. Prometheus metrics at /metrics.
-        CLI tool with live TUI dashboards. Web console included. No external agents required.
+        CLI tool with live TUI dashboards. Authenticated web console with real-time
+        WebSocket push. No external agents required.
       </p>
       <span class="metric">SELECT * FROM system_observability.*</span>
     </div>
@@ -1140,8 +1142,8 @@ user = session.execute(stmt, [user_id])
 <span class="cm">-- Or subscribe to your own data for CDC-style streaming</span>
 <span class="kw">SUBSCRIBE</span> social.users;
 
-<span class="cm">-- Prometheus metrics available at /metrics</span>
-<span class="cm">-- CLI: ferrosa-ctl status, ferrosa-ctl monitor (live TUI)</span></pre>
+<span class="cm">-- Prometheus metrics at /metrics, CLI: ferrosa-ctl monitor (TUI)</span>
+<span class="cm">-- WebSocket push: ws://host:9090/api/ws (subscribe/unsubscribe)</span></pre>
   </div>
 </section>
 
@@ -1248,7 +1250,7 @@ user = session.execute(stmt, [user_id])
         </tr>
         <tr>
           <td>Built-in Observability</td>
-          <td class="ferrosa-col"><span class="check">✓</span> CQL + TUI + Web</td>
+          <td class="ferrosa-col"><span class="check">✓</span> CQL + TUI + Web + WS</td>
           <td>JMX/nodetool</td>
           <td>Prometheus</td>
           <td>CloudWatch</td>
@@ -1261,6 +1263,14 @@ user = session.execute(stmt, [user_id])
           <td>Manual + Operator</td>
           <td>Managed</td>
           <td>Managed</td>
+        </tr>
+        <tr>
+          <td>Consensus</td>
+          <td class="ferrosa-col">Raft (openraft)</td>
+          <td>Paxos (Accord)</td>
+          <td>Paxos (Pegasus)</td>
+          <td>N/A (managed)</td>
+          <td>N/A (managed)</td>
         </tr>
         <tr>
           <td>Node Recovery</td>
@@ -1322,7 +1332,7 @@ user = session.execute(stmt, [user_id])
         <div class="arch-layer-items">
           <span class="arch-item">Virtual Tables</span>
           <span class="arch-item">Prometheus</span>
-          <span class="arch-item">Web Console</span>
+          <span class="arch-item">Web Console + WS</span>
           <span class="arch-item">ferrosa-ctl</span>
         </div>
       </div>
@@ -1375,6 +1385,7 @@ user = session.execute(stmt, [user_id])
           <span class="arch-item">DDL Replication</span>
           <span class="arch-item">Raft (openraft)</span>
           <span class="arch-item">Token Ring</span>
+          <span class="arch-item">Coordinator</span>
         </div>
       </div>
     </div>
@@ -1448,11 +1459,12 @@ user = session.execute(stmt, [user_id])
       </div>
       <div class="use-case">
         <p class="use-case-label graph-uc">3+ Nodes</p>
-        <h3>Full ring with multi-DC replication</h3>
+        <h3>Full ring with Raft consensus</h3>
         <p>
-          Scale to any number of nodes across multiple data centers. Raft consensus for
-          metadata, tunable consistency levels (ONE through ALL), and automatic
-          token ring rebalancing. Petabyte-scale with S3-backed storage economics.
+          Add a third node and Ferrosa automatically transitions to cluster mode:
+          Raft consensus for metadata (openraft + sled), Murmur3 token ring for data
+          sharding, and a coordinator pattern for tunable consistency writes and reads.
+          QUORUM survives single-node failures. Petabyte-scale with S3-backed storage economics.
         </p>
       </div>
     </div>
@@ -1513,6 +1525,7 @@ user = session.execute(stmt, [user_id])
       <li><a href="https://github.com/ferrosadb/ferrosadb">GitHub</a></li>
       <li><a href="getting-started.html">Docs</a></li>
       <li><a href="cql-compatibility.html">CQL Reference</a></li>
+      <li><a href="cypher.html">Cypher Reference</a></li>
       <li><a href="migration.html">Migration Guide</a></li>
     </ul>
   </div>

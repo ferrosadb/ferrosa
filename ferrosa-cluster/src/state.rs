@@ -1,11 +1,14 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
 
 use ferrosa_schema::system::peers::{ClusterState, PeerInfo};
 
 use crate::config::ClusterConfig;
 use crate::pair::PairState;
+use crate::ring::TokenRing;
 
 /// Standalone cluster state — reports no peers.
 pub struct SingleNodeClusterState;
@@ -57,6 +60,59 @@ impl ClusterState for PairClusterState {
             release_version: env!("CARGO_PKG_VERSION").to_string(),
         }]
     }
+}
+
+/// ClusterState implementation for Raft cluster mode.
+///
+/// Reads node metadata from the token ring to produce the peer list.
+pub struct RaftClusterState {
+    ring: Arc<ArcSwap<TokenRing>>,
+    local_node_id: u64,
+}
+
+impl RaftClusterState {
+    pub fn new(ring: Arc<ArcSwap<TokenRing>>, local_node_id: u64) -> Self {
+        Self {
+            ring,
+            local_node_id,
+        }
+    }
+}
+
+impl ClusterState for RaftClusterState {
+    fn peers(&self) -> Vec<PeerInfo> {
+        let ring = self.ring.load();
+        ring.node_ids()
+            .iter()
+            .filter(|&&id| id != self.local_node_id)
+            .filter_map(|&id| {
+                let info = ring.get_node(id)?;
+                // Parse addr string "host:port" into IP + port.
+                let (ip, port) = parse_addr(&info.addr)?;
+                Some(PeerInfo {
+                    peer: ip,
+                    peer_port: port,
+                    data_center: info.data_center.clone(),
+                    rack: info.rack.clone(),
+                    host_id: info.host_id,
+                    preferred_ip: None,
+                    preferred_port: None,
+                    native_address: ip,
+                    native_port: 9042,
+                    schema_version: uuid::Uuid::nil(),
+                    tokens: vec![],
+                    release_version: env!("CARGO_PKG_VERSION").to_string(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Parse "ip:port" or "host:port" into (IpAddr, u16).
+/// Returns None if parsing fails.
+fn parse_addr(addr: &str) -> Option<(IpAddr, u16)> {
+    let socket_addr: std::net::SocketAddr = addr.parse().ok()?;
+    Some((socket_addr.ip(), socket_addr.port()))
 }
 
 #[cfg(test)]
