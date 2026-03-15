@@ -979,7 +979,8 @@
       <p>
         Query cluster state with CQL — connections, storage stats, active queries, topology.
         SUBSCRIBE for streaming updates. Prometheus metrics at /metrics.
-        CLI tool with live TUI dashboards. Web console included. No external agents required.
+        CLI tool with live TUI dashboards. Authenticated web console with real-time
+        WebSocket push. No external agents required.
       </p>
       <span class="metric">SELECT * FROM system_observability.*</span>
     </div>
@@ -1141,8 +1142,8 @@ user = session.execute(stmt, [user_id])
 <span class="cm">-- Or subscribe to your own data for CDC-style streaming</span>
 <span class="kw">SUBSCRIBE</span> social.users;
 
-<span class="cm">-- Prometheus metrics available at /metrics</span>
-<span class="cm">-- CLI: ferrosa-ctl status, ferrosa-ctl monitor (live TUI)</span></pre>
+<span class="cm">-- Prometheus metrics at /metrics, CLI: ferrosa-ctl monitor (TUI)</span>
+<span class="cm">-- WebSocket push: ws://host:9090/api/ws (subscribe/unsubscribe)</span></pre>
   </div>
 </section>
 
@@ -1249,7 +1250,7 @@ user = session.execute(stmt, [user_id])
         </tr>
         <tr>
           <td>Built-in Observability</td>
-          <td class="ferrosa-col"><span class="check">✓</span> CQL + TUI + Web</td>
+          <td class="ferrosa-col"><span class="check">✓</span> CQL + TUI + Web + WS</td>
           <td>JMX/nodetool</td>
           <td>Prometheus</td>
           <td>CloudWatch</td>
@@ -1331,7 +1332,7 @@ user = session.execute(stmt, [user_id])
         <div class="arch-layer-items">
           <span class="arch-item">Virtual Tables</span>
           <span class="arch-item">Prometheus</span>
-          <span class="arch-item">Web Console</span>
+          <span class="arch-item">Web Console + WS</span>
           <span class="arch-item">ferrosa-ctl</span>
         </div>
       </div>

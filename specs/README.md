@@ -15,7 +15,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | ferrosa-cql | Done (Parts A-D + observability + LZ4/Snappy frame compression) |
 | ferrosa-graph | Done (Phase 1: parser, planner, executor, adjacency index, HTTP endpoint) |
 | ferrosa-net | Done (Phase 1: wire protocol, handshake, RPC, pool, peer manager, 24 message types) |
-| ferrosa-cluster | Done (Phase 1: pair mode; Phase 2: Raft consensus, token ring, coordinator pattern) |
+| ferrosa-cluster | Done (Phase 1: pair mode; Phase 2: Raft consensus, token ring, coordinator pattern; Phase 3: next) |
 | ferrosa-ctl | Done (CLI + TUI monitoring dashboard) |
 | ferrosa (binary) | Done (pair-mode: CQL on 9042, graph on 7474, web console + cluster API on 9090) |
 

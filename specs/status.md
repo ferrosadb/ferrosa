@@ -267,7 +267,8 @@ cluster        ██████   █████░  ████░░   █
 | ~~DDL completeness (AlterKS/AlterTable, Role DDL, Index DDL)~~ | ~~`ferrosa-cluster/`~~ | Merged (PR #45) |
 | ~~.deb packaging + systemd service~~ | ~~`scripts/build-deb.sh`~~ | Merged (PR #46) |
 | Release workflow (GitHub Actions) | `.github/workflows/` | In progress (PR #47) |
-| ~~ferrosa-cluster Phase 2 (Raft + Ring + Coordinator)~~ | ~~`feature/raft-cluster-phase2`~~ | PR pending |
+| ~~ferrosa-cluster Phase 2 (Raft + Ring + Coordinator)~~ | ~~`feature/raft-cluster-phase2`~~ | Merged |
+| Observability wiring (virtual tables + auth + WebSocket) | `feature/observability-wiring` | In progress |
 | ferrosa-cluster Phase 3 (Production cluster wiring) | — | Next up |
 
 ## Path to Distributed Operation
