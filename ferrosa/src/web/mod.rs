@@ -2,6 +2,7 @@
 //!
 //! Routes:
 //!   `GET /`                       → embedded `index.html` (rust-embed)
+//!   `GET /metrics`                → Prometheus text exposition (no auth)
 //!   `GET /api/tables`             → list of registered virtual tables
 //!   `GET /api/connections`        → CQL connection rows
 //!   `GET /api/storage_stats`      → per-table storage metrics
@@ -74,8 +75,8 @@ impl FromRef<WebAppState> for Arc<ModeController> {
 /// Build the axum router for the web console.
 ///
 /// Auth middleware is scoped to `/api/*` routes only — static assets
-/// (the embedded web UI at `/`) remain publicly accessible so the
-/// browser can load the login page.
+/// (the embedded web UI at `/`) and `/metrics` (Prometheus scrape)
+/// remain publicly accessible.
 pub fn build_router(state: WebAppState) -> Router {
     let api = Router::new()
         .nest("/api", api::routes())
@@ -86,7 +87,9 @@ pub fn build_router(state: WebAppState) -> Router {
             auth::auth_middleware,
         ));
 
-    api.fallback(static_files::static_handler).with_state(state)
+    api.route("/metrics", get(api::get_metrics))
+        .fallback(static_files::static_handler)
+        .with_state(state)
 }
 
 /// Start the web server in a background task, returning the bound address.
