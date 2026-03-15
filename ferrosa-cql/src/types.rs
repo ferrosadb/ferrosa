@@ -92,9 +92,19 @@ pub fn encode_value(value: &CqlValue) -> Vec<u8> {
             }
             buf
         }
-        CqlValue::Udt(_) => {
-            // UDT encoding implemented in Task 4
-            vec![]
+        CqlValue::Udt(fields) => {
+            let mut buf = Vec::new();
+            for (_name, value) in fields {
+                match value {
+                    Some(val) => {
+                        let encoded = encode_value(val);
+                        buf.extend_from_slice(&(encoded.len() as i32).to_be_bytes());
+                        buf.extend_from_slice(&encoded);
+                    }
+                    None => buf.extend_from_slice(&(-1i32).to_be_bytes()),
+                }
+            }
+            buf
         }
         CqlValue::Null => vec![],
     }
@@ -282,7 +292,36 @@ pub fn decode_value(cql_type: &CqlType, bytes: &[u8]) -> Result<CqlValue, CqlErr
             }
             Ok(CqlValue::Tuple(elements))
         }
-        CqlType::Udt { .. } => Err(CqlError::Invalid("UDT decoding not yet implemented".into())),
+        CqlType::Udt {
+            fields: field_defs, ..
+        } => {
+            let mut result_fields = Vec::with_capacity(field_defs.len());
+            let mut pos = 0;
+            for (field_name, field_type) in field_defs {
+                if pos >= bytes.len() {
+                    // Cassandra allows shorter encodings — trailing fields are null
+                    result_fields.push((field_name.clone(), None));
+                    continue;
+                }
+                if pos + 4 > bytes.len() {
+                    return Err(CqlError::Invalid("UDT field truncated at length".into()));
+                }
+                let len = i32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                if len < 0 {
+                    result_fields.push((field_name.clone(), None));
+                } else {
+                    let end = pos + len as usize;
+                    if end > bytes.len() {
+                        return Err(CqlError::Invalid("UDT field truncated at data".into()));
+                    }
+                    let val = decode_value(field_type, &bytes[pos..end])?;
+                    result_fields.push((field_name.clone(), Some(val)));
+                    pos = end;
+                }
+            }
+            Ok(CqlValue::Udt(result_fields))
+        }
     }
 }
 
@@ -764,6 +803,86 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded, val);
+    }
+
+    // === Task 4: UDT encode/decode tests ===
+
+    #[test]
+    fn encode_decode_udt_roundtrip() {
+        let udt_type = CqlType::Udt {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("zip".to_string(), CqlType::Int),
+            ],
+        };
+        let udt_val = CqlValue::Udt(vec![
+            (
+                "street".to_string(),
+                Some(CqlValue::Text("123 Main".to_string())),
+            ),
+            ("zip".to_string(), Some(CqlValue::Int(62701))),
+        ]);
+        let encoded = encode_value(&udt_val);
+        let decoded = decode_value(&udt_type, &encoded).unwrap();
+        assert_eq!(decoded, udt_val);
+    }
+
+    #[test]
+    fn encode_udt_with_null_field() {
+        let udt_type = CqlType::Udt {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("zip".to_string(), CqlType::Int),
+            ],
+        };
+        let udt_val = CqlValue::Udt(vec![
+            (
+                "street".to_string(),
+                Some(CqlValue::Text("Main St".to_string())),
+            ),
+            ("zip".to_string(), None),
+        ]);
+        let encoded = encode_value(&udt_val);
+        let decoded = decode_value(&udt_type, &encoded).unwrap();
+        assert_eq!(decoded, udt_val);
+    }
+
+    #[test]
+    fn decode_udt_with_fewer_fields_than_definition() {
+        // Cassandra allows shorter encodings — trailing fields become null
+        let udt_type = CqlType::Udt {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("city".to_string(), CqlType::Varchar),
+                ("zip".to_string(), CqlType::Int),
+            ],
+        };
+        // Only encode 1 field (street) — city and zip should decode as null
+        let partial_val = CqlValue::Udt(vec![(
+            "street".to_string(),
+            Some(CqlValue::Text("Main".to_string())),
+        )]);
+        let encoded = encode_value(&partial_val);
+        let decoded = decode_value(&udt_type, &encoded).unwrap();
+        // Should have all 3 fields, with city and zip as None
+        match decoded {
+            CqlValue::Udt(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].0, "street");
+                assert!(fields[0].1.is_some());
+                assert_eq!(fields[1].0, "city");
+                assert!(fields[1].1.is_none());
+                assert_eq!(fields[2].0, "zip");
+                assert!(fields[2].1.is_none());
+            }
+            _ => panic!("expected Udt"),
+        }
     }
 }
 
