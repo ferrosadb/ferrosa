@@ -88,6 +88,23 @@ impl PeerEventListener for PairEventListener {
             state.write().await.connected = false;
         });
     }
+
+    fn on_peer_recovered(&self, peer_id: uuid::Uuid) {
+        tracing::info!(
+            role = %**self.role.load(),
+            peer = %peer_id,
+            "peer recovered"
+        );
+        // Hint delivery will be wired in Slice 3 (Task 14)
+    }
+
+    fn on_peer_failed(&self, peer_id: uuid::Uuid) {
+        tracing::warn!(
+            role = %**self.role.load(),
+            peer = %peer_id,
+            "peer failed — excluding from replica set"
+        );
+    }
 }
 
 impl PairNode {

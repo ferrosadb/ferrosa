@@ -5,6 +5,7 @@
 //! enum, supporting node-state types, and a convenience helper for mapping
 //! `Uuid` node identifiers to openraft's `u64` `NodeId` space.
 
+pub mod handlers;
 pub mod log_store;
 pub mod network;
 pub mod state_machine;
@@ -149,6 +150,12 @@ pub enum RaftCommand {
     // ---- Config ---------------------------------------------------------
     /// Replace the cluster-wide configuration.
     UpdateConfig(ClusterConfig),
+
+    // ---- Node admission ------------------------------------------------
+    /// Approve a node that has requested admission to the cluster.
+    ApproveNode {
+        host_id: Uuid,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +271,16 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn approve_node_command_serializes() {
+        let cmd = RaftCommand::ApproveNode {
+            host_id: Uuid::new_v4(),
+        };
+        let bytes = bincode::serialize(&cmd).unwrap();
+        let decoded: RaftCommand = bincode::deserialize(&bytes).unwrap();
+        assert!(matches!(decoded, RaftCommand::ApproveNode { .. }));
     }
 
     #[test]

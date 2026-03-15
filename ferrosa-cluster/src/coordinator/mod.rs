@@ -16,6 +16,7 @@ use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
 use crate::consistency::ConsistencyLevel;
+use crate::hints::HintStore;
 use crate::pair::coordinator::decode_mutation;
 use crate::ring::TokenRing;
 
@@ -27,6 +28,10 @@ pub struct ClusterCoordinator {
     pub(crate) storage: Arc<StorageEngine>,
     pub(crate) default_rf: usize,
     pub(crate) default_cl: ConsistencyLevel,
+    /// Optional hint store — when `Some`, failed remote replicas receive hints
+    /// after a successful quorum write.  When `None` (e.g. in unit tests),
+    /// hint storage is skipped.
+    pub(crate) hint_store: Option<Arc<HintStore>>,
 }
 
 impl ClusterCoordinator {
@@ -45,7 +50,14 @@ impl ClusterCoordinator {
             storage,
             default_rf,
             default_cl,
+            hint_store: None,
         }
+    }
+
+    /// Attach a hint store to this coordinator.
+    pub fn with_hint_store(mut self, hint_store: Arc<HintStore>) -> Self {
+        self.hint_store = Some(hint_store);
+        self
     }
 }
 
@@ -305,5 +317,7 @@ mod tests {
         fn on_peer_connected(&self, _peer: PeerId) {}
         fn on_peer_disconnected(&self, _peer: PeerId) {}
         fn on_peer_suspected(&self, _peer: PeerId) {}
+        fn on_peer_recovered(&self, _peer_id: uuid::Uuid) {}
+        fn on_peer_failed(&self, _peer_id: uuid::Uuid) {}
     }
 }

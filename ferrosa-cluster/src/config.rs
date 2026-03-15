@@ -26,6 +26,8 @@ pub struct ClusterConfig {
     pub hinted_handoff_max_mb: u64,
     /// Allow unapproved nodes to join (true for development).
     pub auto_join: bool,
+    /// Directory for Raft log store (sled). Defaults to `FERROSA_DATA_DIR/raft`.
+    pub raft_data_dir: Option<PathBuf>,
 }
 
 impl Default for ClusterConfig {
@@ -40,6 +42,7 @@ impl Default for ClusterConfig {
             hinted_handoff_dir: PathBuf::from("data/hints"),
             hinted_handoff_max_mb: 1024,
             auto_join: false,
+            raft_data_dir: None,
         }
     }
 }

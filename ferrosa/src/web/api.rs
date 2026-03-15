@@ -4,12 +4,42 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use ferrosa_cluster::raft::NodeState;
 use ferrosa_cluster::ModeController;
 use ferrosa_common::DataType;
 use ferrosa_schema::VirtualTableRegistry;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use super::WebAppState;
+
+// ---------------------------------------------------------------------------
+// Request / response types for cluster management endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct AddNodeRequest {
+    host_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DecommissionRequest {
+    host_id: String,
+}
+
+#[derive(serde::Serialize)]
+struct RingInfo {
+    nodes: Vec<RingNodeInfo>,
+}
+
+#[derive(serde::Serialize)]
+struct RingNodeInfo {
+    node_id: u64,
+    host_id: String,
+    address: String,
+    state: String,
+    token_count: usize,
+}
 
 pub fn routes() -> Router<WebAppState> {
     Router::new()
@@ -46,6 +76,10 @@ pub fn cluster_routes() -> Router<WebAppState> {
         .route("/status", get(cluster_status))
         .route("/promote", post(cluster_promote))
         .route("/switchover", post(cluster_switchover))
+        .route("/add-node", post(add_node_handler))
+        .route("/decommission", post(decommission_handler))
+        .route("/ring", get(ring_handler))
+        .route("/rebalance", post(rebalance_handler))
 }
 
 async fn cluster_status(State(mc): State<Arc<ModeController>>) -> Json<Value> {
@@ -85,6 +119,174 @@ async fn cluster_switchover(State(mc): State<Arc<ModeController>>) -> (StatusCod
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cluster management handlers
+// ---------------------------------------------------------------------------
+
+/// `POST /api/cluster/add-node` — pre-approve a node for cluster admission.
+///
+/// Parses the `host_id` UUID from the request body, records approval in the
+/// mode controller's local set, and proposes an `ApproveNode` Raft command
+/// if Raft is available.
+async fn add_node_handler(
+    State(mc): State<Arc<ModeController>>,
+    Json(body): Json<AddNodeRequest>,
+) -> (StatusCode, Json<Value>) {
+    let host_id = match body.host_id.parse::<Uuid>() {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid host_id UUID: {e}") })),
+            );
+        }
+    };
+
+    // Record approval in the controller's local set.
+    mc.approve_node(host_id);
+
+    // If Raft is initialized, also propose ApproveNode so all replicas learn.
+    if let Some(raft) = mc.raft() {
+        let cmd = ferrosa_cluster::raft::RaftCommand::ApproveNode { host_id };
+        if let Err(e) = raft.client_write(cmd).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Raft ApproveNode failed: {e}") })),
+            );
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "approved",
+            "host_id": host_id.to_string(),
+        })),
+    )
+}
+
+/// `POST /api/cluster/decommission` — initiate graceful removal of a node.
+///
+/// Parses the `host_id` UUID and delegates to
+/// [`ModeController::initiate_decommission`], which proposes a `LeaveNode`
+/// Raft command.
+async fn decommission_handler(
+    State(mc): State<Arc<ModeController>>,
+    Json(body): Json<DecommissionRequest>,
+) -> (StatusCode, Json<Value>) {
+    let host_id = match body.host_id.parse::<Uuid>() {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid host_id UUID: {e}") })),
+            );
+        }
+    };
+
+    match mc.initiate_decommission(host_id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "decommissioning",
+                "host_id": host_id.to_string(),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// `GET /api/cluster/ring` — return token ring topology.
+///
+/// Returns a JSON object with a `nodes` array. Each entry contains the node's
+/// openraft `node_id`, `host_id`, internode `address`, lifecycle `state`, and
+/// `token_count`.  Returns 503 if not in cluster mode.
+async fn ring_handler(State(mc): State<Arc<ModeController>>) -> (StatusCode, Json<Value>) {
+    let ring = match mc.token_ring() {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "not in cluster mode" })),
+            );
+        }
+    };
+
+    let nodes: Vec<RingNodeInfo> = ring
+        .node_ids()
+        .into_iter()
+        .filter_map(|node_id| {
+            let info = ring.get_node(node_id)?;
+            Some(RingNodeInfo {
+                node_id,
+                host_id: info.host_id.to_string(),
+                address: info.addr.clone(),
+                state: node_state_to_str(info.state),
+                token_count: ring.tokens_for_node(node_id).len(),
+            })
+        })
+        .collect();
+
+    let ring_info = RingInfo { nodes };
+    match serde_json::to_value(&ring_info) {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// `POST /api/cluster/rebalance` — rebalance token distribution across nodes.
+///
+/// Requires Raft to be initialized. Calls [`ferrosa_cluster::rebalance::execute_rebalance`]
+/// which computes a rebalance plan and proposes `AssignTokens` Raft commands.
+async fn rebalance_handler(State(mc): State<Arc<ModeController>>) -> (StatusCode, Json<Value>) {
+    let raft = match mc.raft() {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "raft not initialized" })),
+            );
+        }
+    };
+
+    let ring = match mc.token_ring() {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "not in cluster mode" })),
+            );
+        }
+    };
+
+    match ferrosa_cluster::rebalance::execute_rebalance(&raft, &ring).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "status": "rebalance complete" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Convert [`NodeState`] to a human-readable string for JSON output.
+fn node_state_to_str(state: NodeState) -> String {
+    match state {
+        NodeState::Joining => "Joining".to_string(),
+        NodeState::Normal => "Normal".to_string(),
+        NodeState::Leaving => "Leaving".to_string(),
+        NodeState::Decommissioned => "Decommissioned".to_string(),
     }
 }
 
@@ -181,10 +383,66 @@ pub(crate) fn virtual_table_to_json(registry: &VirtualTableRegistry, table_name:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use ferrosa_cluster::ring::TokenRing;
+    use ferrosa_cluster::ModeController;
     use ferrosa_common::CellValue;
+    use ferrosa_net::rpc::HandlerRegistry;
     use ferrosa_schema::{
         RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow, VirtualTable,
+        VirtualTableRegistry,
     };
+    use ferrosa_storage::commitlog::CommitLogConfig;
+    use ferrosa_storage::compaction::CompactionConfig;
+    use ferrosa_storage::{StorageEngine, StorageEngineConfig};
+    use tower::ServiceExt;
+
+    /// Build a minimal `WebAppState` with a freshly created `ModeController`.
+    fn make_state() -> WebAppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                log_dir: dir.path().join("commitlog"),
+                checkpoint_dir: dir.path().join("commitlog"),
+                ..CommitLogConfig::default()
+            },
+            compaction: CompactionConfig::from_env(dir.path().join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            flush_threshold_bytes: 4096,
+            data_dir: dir.path().to_path_buf(),
+        };
+        let storage = Arc::new(StorageEngine::new(storage_config, None).expect("storage engine"));
+        let registry = Arc::new(HandlerRegistry::new());
+        // Build a minimal schema with no auth complexity.
+        let schema = Arc::new(
+            ferrosa_schema::Schema::new(ferrosa_schema::SchemaConfig {
+                hasher: ferrosa_schema::PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+                auth_method: ferrosa_schema::AuthMethod::Password,
+                rate_limit: ferrosa_schema::RateLimitConfig::default(),
+                audit_sink: Box::new(ferrosa_schema::TestAuditSink::new()),
+                secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+                mode: ferrosa_schema::DeploymentMode::Development,
+            })
+            .expect("test schema"),
+        );
+        let (mc, _handles) = ModeController::new(
+            Arc::new(ferrosa_cluster::ClusterConfig::default()),
+            Arc::new(ferrosa_net::config::NetConfig::default()),
+            uuid::Uuid::new_v4(),
+            storage,
+            schema.clone(),
+            registry,
+        );
+        WebAppState {
+            registry: Arc::new(VirtualTableRegistry::new()),
+            mode_controller: mc,
+            schema,
+            auth_disabled: true,
+        }
+    }
 
     struct StubTable {
         cols: Vec<VirtualColumnDef>,
@@ -423,6 +681,119 @@ mod tests {
         let rows = result.as_array().unwrap();
         assert_eq!(rows[0]["host"], "localhost");
         assert_eq!(rows[0]["port"], 9042);
+    }
+
+    // ---- Cluster ring endpoint tests ------------------------------------
+
+    /// Ring endpoint returns 503 when the node is not in cluster mode.
+    #[tokio::test]
+    async fn api_ring_returns_503_when_not_in_cluster_mode() {
+        let state = make_state();
+        // No ring installed — standalone mode.
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/cluster/ring")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Ring endpoint returns JSON with the correct number of nodes when a ring
+    /// is seeded directly via `ModeController::set_token_ring`.
+    #[tokio::test]
+    async fn api_ring_returns_json() {
+        use ferrosa_cluster::raft::{NodeInfo, NodeState};
+
+        let state = make_state();
+
+        // Build a 3-node token ring and seed it into the controller.
+        let mut ring = TokenRing::new();
+        for i in 1u64..=3 {
+            let host_id = uuid::Uuid::new_v4();
+            ring.add_node(
+                i,
+                NodeInfo {
+                    host_id,
+                    addr: format!("10.0.0.{}:7000", i),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: NodeState::Normal,
+                },
+            );
+            // Assign a few tokens per node so token_count > 0.
+            let tokens: Vec<i64> = (0..16).map(|j| (i as i64) * 1_000_000 + j).collect();
+            ring.assign_tokens(i, &tokens);
+        }
+        state.mode_controller.set_token_ring(Arc::new(ring));
+
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/cluster/ring")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let nodes = parsed["nodes"].as_array().expect("nodes array");
+        assert_eq!(nodes.len(), 3, "ring should contain 3 nodes");
+
+        for node in nodes {
+            assert!(node["node_id"].is_number(), "node_id must be a number");
+            assert!(node["host_id"].is_string(), "host_id must be a string");
+            assert!(node["address"].is_string(), "address must be a string");
+            assert!(node["state"].is_string(), "state must be a string");
+            assert_eq!(node["state"], "Normal", "state should be Normal");
+            assert_eq!(node["token_count"], 16, "each node has 16 tokens");
+        }
+    }
+
+    /// Add-node endpoint rejects invalid UUIDs with 400 Bad Request.
+    #[tokio::test]
+    async fn api_add_node_rejects_invalid_uuid() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/cluster/add-node")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"host_id": "not-a-uuid"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// Decommission endpoint rejects invalid UUIDs with 400 Bad Request.
+    #[tokio::test]
+    async fn api_decommission_rejects_invalid_uuid() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/cluster/decommission")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"host_id": "not-a-uuid"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// Rebalance endpoint returns 503 when Raft is not initialized.
+    #[tokio::test]
+    async fn api_rebalance_returns_503_when_raft_not_initialized() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/cluster/rebalance")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

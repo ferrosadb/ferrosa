@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 use crate::codec::Lane;
 use crate::config::NetConfig;
 use crate::message::Message;
-use crate::pool::PriorityPool;
+use crate::pool::{LaneOutcome, PriorityPool};
 use crate::rpc::handler::PeerId;
 
 /// Subscribe to peer lifecycle events.
@@ -13,6 +13,10 @@ pub trait PeerEventListener: Send + Sync {
     fn on_peer_connected(&self, peer: PeerId);
     fn on_peer_disconnected(&self, peer: PeerId);
     fn on_peer_suspected(&self, peer: PeerId);
+    /// Called when a suspected peer successfully re-establishes all lanes.
+    fn on_peer_recovered(&self, peer_id: uuid::Uuid);
+    /// Called when all reconnection attempts for a suspected peer are exhausted.
+    fn on_peer_failed(&self, peer_id: uuid::Uuid);
 }
 
 /// Manages all peer connections and runs failure detection.
@@ -25,7 +29,7 @@ pub struct PeerManager {
 }
 
 struct PeerState {
-    pool: Option<PriorityPool>, // None for unit-test entries (add_peer_entry)
+    pool: Option<Arc<PriorityPool>>, // None for unit-test entries (add_peer_entry)
     peer_id: PeerId,
     last_heartbeat: tokio::time::Instant,
     missed_heartbeats: u32,
@@ -49,7 +53,7 @@ impl PeerManager {
     pub async fn add_peer(&self, peer_id: PeerId, pool: PriorityPool) {
         let (host_id, _addr) = peer_id;
         let state = PeerState {
-            pool: Some(pool),
+            pool: Some(Arc::new(pool)),
             peer_id,
             last_heartbeat: tokio::time::Instant::now(),
             missed_heartbeats: 0,
@@ -110,7 +114,9 @@ impl PeerManager {
                             "peer suspected dead: {} missed heartbeats",
                             state.missed_heartbeats
                         );
-                        suspected.push(state.peer_id);
+                        // Collect (peer_id, pool_arc) so we can drive reconnection.
+                        let pool_arc = state.pool.as_ref().map(Arc::clone);
+                        suspected.push((state.peer_id, pool_arc));
                     }
                 } else {
                     state.missed_heartbeats = 0;
@@ -123,10 +129,45 @@ impl PeerManager {
                 }
             }
 
-            // Notify listener outside the iteration
+            // Notify listener outside the iteration and trigger reconnection.
             drop(peers);
-            for peer_id in suspected {
+            for (peer_id, pool_opt) in suspected {
                 self.listener.on_peer_suspected(peer_id);
+
+                let (host_id, _addr) = peer_id;
+
+                if let Some(pool) = pool_opt {
+                    // Trigger immediate reconnection of all lanes.
+                    pool.reconnect_all_lanes();
+
+                    // Spawn a monitor task that fires on_peer_recovered or
+                    // on_peer_failed once the reconnect attempt resolves.
+                    let listener = Arc::clone(&self.listener);
+                    tokio::spawn(async move {
+                        // Poll every 500 ms until all lanes leave Reconnecting.
+                        // Max ~60 s before we give up and declare the peer failed.
+                        for _ in 0u32..120 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                            match pool.all_lanes_resolved().await {
+                                LaneOutcome::AllConnected => {
+                                    listener.on_peer_recovered(host_id);
+                                    return;
+                                }
+                                LaneOutcome::AnyFailed => {
+                                    listener.on_peer_failed(host_id);
+                                    return;
+                                }
+                                LaneOutcome::StillReconnecting => {
+                                    // Keep waiting.
+                                }
+                            }
+                        }
+
+                        // Timeout: treat as failed.
+                        listener.on_peer_failed(host_id);
+                    });
+                }
             }
         }
     }
@@ -154,6 +195,8 @@ mod tests {
         connected_count: AtomicUsize,
         suspected_count: AtomicUsize,
         disconnected_count: AtomicUsize,
+        recovered_count: AtomicUsize,
+        failed_count: AtomicUsize,
     }
 
     impl TestListener {
@@ -162,6 +205,8 @@ mod tests {
                 connected_count: AtomicUsize::new(0),
                 suspected_count: AtomicUsize::new(0),
                 disconnected_count: AtomicUsize::new(0),
+                recovered_count: AtomicUsize::new(0),
+                failed_count: AtomicUsize::new(0),
             }
         }
     }
@@ -175,6 +220,12 @@ mod tests {
         }
         fn on_peer_suspected(&self, _peer: PeerId) {
             self.suspected_count.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_peer_recovered(&self, _peer_id: uuid::Uuid) {
+            self.recovered_count.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_peer_failed(&self, _peer_id: uuid::Uuid) {
+            self.failed_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -255,5 +306,47 @@ mod tests {
         }
 
         assert_eq!(listener.suspected_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// Verify that suspecting a peer (with no real pool) fires on_peer_suspected
+    /// but does not panic. The monitor task is skipped when pool is None.
+    #[tokio::test(start_paused = true)]
+    async fn suspected_peer_triggers_reconnection() {
+        let config = Arc::new(NetConfig {
+            heartbeat_interval: Duration::from_millis(100),
+            heartbeat_timeout: Duration::from_millis(300),
+            ..NetConfig::default()
+        });
+        let listener = Arc::new(TestListener::new());
+        let pm = Arc::new(PeerManager::new(
+            config,
+            uuid::Uuid::new_v4(),
+            listener.clone(),
+        ));
+
+        // add_peer_entry inserts a pool-less entry (simulates a peer whose pool
+        // isn't wired up in tests). The heartbeat loop still fires on_peer_suspected.
+        let peer_id = (uuid::Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        pm.add_peer_entry(peer_id).await;
+
+        let pm_clone = pm.clone();
+        tokio::spawn(async move { pm_clone.run_heartbeat_loop().await });
+
+        // Drive the loop until the peer is suspected.
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            listener.suspected_count.load(Ordering::Relaxed) >= 1,
+            "on_peer_suspected should have fired"
+        );
+        // No pool → no reconnect task → no recovered/failed callbacks.
+        assert_eq!(
+            listener.recovered_count.load(Ordering::Relaxed),
+            0,
+            "no pool means no reconnect and therefore no recovered event"
+        );
     }
 }

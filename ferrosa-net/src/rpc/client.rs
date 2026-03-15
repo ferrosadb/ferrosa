@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_util::codec::Framed;
 
 use crate::codec::{Frame, FrameHeader, InternodeCodec, Lane, FLAG_FIRE_AND_FORGET};
@@ -22,6 +22,8 @@ pub struct RpcClient {
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Message>>>>,
     tx: mpsc::Sender<Frame>,
     next_stream_id: Arc<AtomicU32>,
+    /// Signals `false` when the TCP connection drops.
+    alive_tx: watch::Sender<bool>,
 }
 
 impl RpcClient {
@@ -32,6 +34,15 @@ impl RpcClient {
     /// The peer's host_id, obtained during the handshake.
     pub fn peer_host_id(&self) -> uuid::Uuid {
         self.peer_host_id
+    }
+
+    /// Subscribe to the connection liveness channel.
+    ///
+    /// The receiver holds `true` while the TCP connection is alive and transitions
+    /// to `false` when the read loop detects EOF or a stream error.  Callers can
+    /// use [`watch::Receiver::changed`] to be notified immediately on drop.
+    pub fn alive_rx(&self) -> watch::Receiver<bool> {
+        self.alive_tx.subscribe()
     }
 
     pub async fn connect(
@@ -88,6 +99,8 @@ impl RpcClient {
             Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel::<Frame>(256);
 
+        let (alive_tx, _alive_rx_init) = watch::channel(true);
+
         let (mut sink, mut stream) = framed.split();
 
         // Write loop
@@ -99,8 +112,9 @@ impl RpcClient {
             }
         });
 
-        // Read loop
+        // Read loop — signals `alive_tx` false when the stream ends or errors.
         let pending_clone = pending.clone();
+        let alive_tx_clone = alive_tx.clone();
         tokio::spawn(async move {
             while let Some(Ok(frame)) = stream.next().await {
                 let stream_id = frame.header.stream_id;
@@ -111,6 +125,8 @@ impl RpcClient {
                     }
                 }
             }
+            // Stream ended (EOF) or errored — notify subscribers.
+            let _ = alive_tx_clone.send(false);
         });
 
         Ok(Self {
@@ -120,6 +136,7 @@ impl RpcClient {
             pending,
             tx,
             next_stream_id: Arc::new(AtomicU32::new(1)),
+            alive_tx,
         })
     }
 
@@ -268,5 +285,67 @@ mod tests {
             .unwrap();
         let result = client.send(Message::Ping { nonce: 1 }, Lane::Raft).await;
         assert!(matches!(result, Err(NetError::Timeout(_))));
+    }
+
+    #[tokio::test]
+    async fn alive_watch_starts_true() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let addr = start_echo_server(&config).await;
+
+        let client = RpcClient::connect(Arc::new(config), uuid::Uuid::new_v4(), addr)
+            .await
+            .unwrap();
+        let alive_rx = client.alive_rx();
+        assert!(*alive_rx.borrow(), "alive_rx should start as true");
+    }
+
+    #[tokio::test]
+    async fn alive_watch_signals_false_on_connection_drop() {
+        use tokio::net::TcpListener;
+
+        // Bind a minimal TCP listener that performs the Ferrosa handshake so
+        // `RpcClient::connect` succeeds, then immediately drops the connection.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Spawn a task that accepts one connection, completes the server-side
+        // handshake, then drops the stream (simulating a peer crash).
+        tokio::spawn(async move {
+            use crate::handshake::accept_handshake;
+            use tokio_util::codec::Framed;
+
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let config = NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                ..NetConfig::default()
+            };
+            let mut framed = Framed::new(stream, InternodeCodec::new(config.max_frame_body_size));
+            // Complete the handshake so the client's `finish_connect` succeeds.
+            let _ = accept_handshake(&mut framed, &config, uuid::Uuid::new_v4()).await;
+            // Drop `framed` here — EOF is sent to the client's read loop.
+        });
+
+        let config = Arc::new(NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        });
+        let client = RpcClient::connect(config, uuid::Uuid::new_v4(), addr)
+            .await
+            .unwrap();
+        let mut alive_rx = client.alive_rx();
+
+        // Wait for the watch to signal false (connection dropped).
+        tokio::time::timeout(std::time::Duration::from_secs(2), alive_rx.changed())
+            .await
+            .expect("timed out waiting for alive_rx to change")
+            .expect("alive_rx channel unexpectedly closed");
+
+        assert!(
+            !*alive_rx.borrow(),
+            "alive_rx should be false after connection drop"
+        );
     }
 }

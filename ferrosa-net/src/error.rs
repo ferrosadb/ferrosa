@@ -22,6 +22,10 @@ pub enum NetError {
     Overloaded,
     /// I/O error from the transport layer.
     Io(std::io::Error),
+    /// Lane is currently reconnecting; request cannot be served.
+    Reconnecting,
+    /// Lane has exhausted all reconnection attempts and is permanently failed.
+    LaneFailed,
 }
 
 impl fmt::Display for NetError {
@@ -38,6 +42,10 @@ impl fmt::Display for NetError {
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Self::Overloaded => write!(f, "max internode connections reached"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Reconnecting => write!(f, "lane is reconnecting; retry later"),
+            Self::LaneFailed => {
+                write!(f, "lane permanently failed after max reconnection attempts")
+            }
         }
     }
 }

@@ -1014,7 +1014,9 @@ async fn route_create_keyspace(
         replication: ReplicationParams { strategy, options },
     };
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             state.schema.create_keyspace(ks_meta, ctx.auth)?;
         }
@@ -1023,9 +1025,8 @@ async fn route_create_keyspace(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::CreateKeyspace(ks_meta);
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1071,7 +1072,9 @@ async fn route_alter_keyspace(
         durable_writes: s.durable_writes,
     };
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             state.schema.alter_keyspace(&s.name, updates, ctx.auth)?;
         }
@@ -1083,9 +1086,11 @@ async fn route_alter_keyspace(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::AlterKeyspace {
+                name: s.name.clone(),
+                updates,
+            };
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1113,7 +1118,9 @@ async fn route_drop_keyspace(
         &Resource::Keyspace(s.name.clone()),
     )?;
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             // Collect tables before drop so we can unregister from storage.
             let table_ids: Vec<_> = state
@@ -1134,9 +1141,8 @@ async fn route_drop_keyspace(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::DropKeyspace(s.name.clone());
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1231,7 +1237,9 @@ async fn route_create_table(
         is_system: false,
     };
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             // Register with schema
             state.schema.create_table(table_meta.clone(), ctx.auth)?;
@@ -1245,9 +1253,8 @@ async fn route_create_table(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::CreateTable(Box::new(table_meta));
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1297,7 +1304,9 @@ async fn route_alter_table(
         extensions: None,
     };
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             state.schema.alter_table(ks, &s.table, updates, ctx.auth)?;
         }
@@ -1310,9 +1319,12 @@ async fn route_alter_table(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::AlterTable {
+                keyspace: ks.to_string(),
+                table: s.table.clone(),
+                updates: Box::new(updates),
+            };
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1342,7 +1354,9 @@ async fn route_drop_table(
         &Resource::Table(ks.to_string(), s.table.clone()),
     )?;
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             state.schema.drop_table(ks, &s.table, ctx.auth)?;
             let tid = ferrosa_storage::TableId::new(ks, &s.table);
@@ -1356,9 +1370,11 @@ async fn route_drop_table(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::DropTable {
+                keyspace: ks.to_string(),
+                table: s.table.clone(),
+            };
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1491,7 +1507,9 @@ async fn route_create_index(
         options: options_map,
     };
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             state.schema.create_index(index_meta, ctx.auth)?;
         }
@@ -1500,9 +1518,8 @@ async fn route_create_index(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::CreateIndex(index_meta);
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1557,7 +1574,9 @@ async fn route_drop_index(
         &Resource::Table(ks.to_string(), table_name.clone()),
     )?;
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             state
                 .schema
@@ -1572,9 +1591,12 @@ async fn route_drop_index(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::DropIndex {
+                keyspace: ks.to_string(),
+                table: table_name.clone(),
+                index: s.name.clone(),
+            };
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1610,7 +1632,9 @@ async fn route_create_role(
         member_of: HashSet::new(),
     };
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             state
                 .schema
@@ -1621,9 +1645,8 @@ async fn route_create_role(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::CreateRole(role);
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1652,7 +1675,9 @@ async fn route_alter_role(
         member_of: None,
     };
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             state.schema.alter_role(&s.name, updates, ctx.auth)?;
         }
@@ -1664,9 +1689,11 @@ async fn route_alter_role(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::AlterRole {
+                name: s.name.clone(),
+                updates,
+            };
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1688,7 +1715,9 @@ async fn route_drop_role(
         .schema
         .check_permission(ctx.auth, Permission::Drop, &Resource::Role(s.name.clone()))?;
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             state.schema.drop_role(&s.name, ctx.auth)?;
         }
@@ -1697,9 +1726,8 @@ async fn route_drop_role(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::DropRole(s.name.clone());
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1728,7 +1756,9 @@ async fn route_grant(
     let resource = ast_resource_to_schema(&s.resource, ctx.current_keyspace)?;
     let perms = parse_permissions(&s.permissions)?;
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             state.schema.grant(&s.role, &resource, perms, ctx.auth)?;
         }
@@ -1741,9 +1771,12 @@ async fn route_grant(
             coordinator.coordinate_ddl(op).await?;
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            let op = DdlOperation::Grant(GrantEntry {
+                role: s.role.clone(),
+                resource,
+                permissions: perms,
+            });
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -1770,7 +1803,9 @@ async fn route_revoke(
     let resource = ast_resource_to_schema(&s.resource, ctx.current_keyspace)?;
     let perms = parse_permissions(&s.permissions)?;
 
-    match &**state.ddl_path.load() {
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
         DdlPath::Direct { .. } => {
             state.schema.revoke(&s.role, &resource, perms, ctx.auth)?;
         }
@@ -1787,9 +1822,15 @@ async fn route_revoke(
             }
         }
         DdlPath::Cluster(_) => {
-            return Err(CqlError::ServerError(
-                "DDL via Raft not yet implemented".to_string(),
-            ));
+            // Same as Pair: one Raft proposal per permission for atomic replication.
+            for perm in perms {
+                let op = DdlOperation::Revoke {
+                    role: s.role.clone(),
+                    resource: resource.clone(),
+                    permission: perm,
+                };
+                ddl.execute(op).await.map_err(CqlError::from)?;
+            }
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(

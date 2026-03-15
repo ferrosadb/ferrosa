@@ -4,11 +4,14 @@ pub mod controller;
 pub mod coordinator;
 pub mod ddl_path;
 pub mod error;
+pub mod hints;
 pub mod mode;
 pub mod pair;
 pub mod raft;
+pub mod rebalance;
 pub mod ring;
 pub mod state;
+pub mod streaming;
 pub mod write_path;
 
 pub use config::ClusterConfig;

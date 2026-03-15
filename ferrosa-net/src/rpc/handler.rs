@@ -44,6 +44,11 @@ impl HandlerRegistry {
         self.handlers.write().insert(msg_type, handler);
     }
 
+    /// Check if a handler is registered for the given message type.
+    pub fn has_handler(&self, msg_type: MsgType) -> bool {
+        self.handlers.read().contains_key(&msg_type)
+    }
+
     pub async fn dispatch(&self, from: PeerId, msg_type: MsgType, msg: Message) -> Option<Message> {
         let handler = self.handlers.read().get(&msg_type).cloned();
         match handler {

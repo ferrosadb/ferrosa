@@ -7,7 +7,7 @@
 //! Snapshots are serialized with bincode because `serde_json` does not support
 //! non-string map keys (our `BTreeMap<(String, String), _>` tuple keys).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -60,6 +60,8 @@ pub struct RaftState {
     pub token_map: BTreeMap<Token, u64>,
     /// Cluster-wide configuration.
     pub config: ClusterConfig,
+    /// Set of host IDs that have been explicitly approved to join the cluster.
+    pub approved_nodes: BTreeSet<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +352,11 @@ impl FerrosStateMachine {
             // ---- Config ------------------------------------------------
             RaftCommand::UpdateConfig(config) => {
                 self.state.config = config;
+            }
+
+            // ---- Node admission ----------------------------------------
+            RaftCommand::ApproveNode { host_id } => {
+                self.state.approved_nodes.insert(host_id);
             }
         }
 
@@ -979,5 +986,38 @@ mod tests {
         sm.apply(vec![entry]).await.unwrap();
 
         assert_eq!(sm.state().config.cluster_name, "my-cluster");
+    }
+
+    #[tokio::test]
+    async fn state_machine_applies_approve_node() {
+        let mut sm = FerrosStateMachine::new();
+        let host_id = Uuid::new_v4();
+
+        let entry = make_entry(1, 1, RaftCommand::ApproveNode { host_id });
+        sm.apply(vec![entry]).await.unwrap();
+
+        assert!(sm.state().approved_nodes.contains(&host_id));
+    }
+
+    #[tokio::test]
+    async fn approved_nodes_survive_snapshot() {
+        let mut sm = FerrosStateMachine::new();
+        let host_id = Uuid::new_v4();
+
+        let entry = make_entry(1, 1, RaftCommand::ApproveNode { host_id });
+        sm.apply(vec![entry]).await.unwrap();
+
+        // Build a snapshot.
+        let snapshot = sm.build_snapshot().await.unwrap();
+        let snap_meta = snapshot.meta.clone();
+        let snap_bytes = snapshot.snapshot.into_inner();
+
+        // Install into a fresh state machine.
+        let mut sm2 = FerrosStateMachine::new();
+        sm2.install_snapshot(&snap_meta, Box::new(Cursor::new(snap_bytes)))
+            .await
+            .unwrap();
+
+        assert!(sm2.state().approved_nodes.contains(&host_id));
     }
 }
