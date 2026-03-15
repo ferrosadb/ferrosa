@@ -16,7 +16,11 @@ use super::ClusterCoordinator;
 /// Result of a single replica write attempt.
 enum ReplicaResult {
     Ack,
-    Failure,
+    /// Write to a remote replica failed.  Carries the peer's `host_id` so the
+    /// coordinator can store a hint when the overall write still meets quorum.
+    Failure {
+        host_id: Option<uuid::Uuid>,
+    },
 }
 
 impl ClusterCoordinator {
@@ -26,7 +30,8 @@ impl ClusterCoordinator {
     /// 2. Verify enough replicas available for the consistency level.
     /// 3. Fan out concurrently: local write if self is replica, `MutationForward` for remote.
     /// 4. Collect ACKs until `block_for(CL)` reached.
-    /// 5. Return success or `WriteTimeout`.
+    /// 5. If quorum met, store hints for any failed remote replicas.
+    /// 6. Return success or `WriteTimeout`.
     pub async fn coordinate_write(
         &self,
         table_id: &TableId,
@@ -82,19 +87,19 @@ impl ClusterCoordinator {
                     if replica_id == local_node_id {
                         match storage.write(&table_id, &key, row, timestamp) {
                             Ok(()) => ReplicaResult::Ack,
-                            Err(_) => ReplicaResult::Failure,
+                            Err(_) => ReplicaResult::Failure { host_id: None },
                         }
                     } else {
                         match host_id {
-                            None => ReplicaResult::Failure, // node not in ring metadata
+                            None => ReplicaResult::Failure { host_id: None }, // node not in ring metadata
                             Some(hid) => {
                                 match peer_manager
                                     .send(hid, Message::MutationForward(body), Lane::Data)
                                     .await
                                 {
                                     Ok(Message::MutationAck(_)) => ReplicaResult::Ack,
-                                    Ok(_) => ReplicaResult::Failure, // unexpected response
-                                    Err(_) => ReplicaResult::Failure, // replica failed
+                                    Ok(_) => ReplicaResult::Failure { host_id: Some(hid) }, // unexpected response
+                                    Err(_) => ReplicaResult::Failure { host_id: Some(hid) }, // replica failed
                                 }
                             }
                         }
@@ -103,20 +108,49 @@ impl ClusterCoordinator {
             })
             .collect();
 
-        // Drain futures, counting ACKs. Stop early once CL is satisfied.
+        // Drain all futures, collecting ACKs and failed replica host_ids.
+        // We must drain the full set (not just until CL met) so we know which
+        // replicas failed — those get hints if quorum was reached.
         let mut acks = 0usize;
+        let mut failed_replicas: Vec<uuid::Uuid> = Vec::new();
         while let Some(result) = fan_out.next().await {
-            if matches!(result, ReplicaResult::Ack) {
-                acks += 1;
-            }
-            if acks >= required {
-                break;
+            match result {
+                ReplicaResult::Ack => {
+                    acks += 1;
+                }
+                ReplicaResult::Failure { host_id: Some(hid) } => {
+                    failed_replicas.push(hid);
+                }
+                ReplicaResult::Failure { host_id: None } => {}
             }
         }
 
         if acks >= required {
+            // Store hints for replicas that failed to ack.
+            if let Some(ref hint_store) = self.hint_store {
+                let hint_row = body.to_vec(); // full encoded mutation bytes
+                let hint_key = key.key.as_bytes().to_vec();
+                for peer_id in &failed_replicas {
+                    if let Err(e) = hint_store.store(
+                        *peer_id,
+                        &table_id.keyspace,
+                        &table_id.table,
+                        hint_key.clone(),
+                        hint_row.clone(),
+                        timestamp,
+                    ) {
+                        tracing::warn!(
+                            peer = %peer_id,
+                            "failed to store hint for replica: {e}"
+                        );
+                    }
+                }
+            }
             Ok(())
         } else {
+            // Write failed — do NOT store hints.  Hints are only stored when
+            // the write succeeds at quorum; a failed write is not a replicated
+            // mutation and should not be delivered to any replica later.
             Err(ClusterError::WriteTimeout {
                 consistency: self.default_cl.to_string(),
                 received: acks,
@@ -510,5 +544,177 @@ mod tests {
             let stored = storage.read(&table_id, &key).unwrap();
             assert!(stored.is_some(), "local replica must have written");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Hint-on-failure tests (Task 13)
+    // -----------------------------------------------------------------------
+
+    fn make_hint_store(dir: &std::path::Path) -> Arc<crate::hints::HintStore> {
+        use crate::hints::{HintConfig, HintStore};
+        let config = HintConfig {
+            dir: dir.join("hints"),
+            ..HintConfig::default()
+        };
+        Arc::new(HintStore::new(config).unwrap())
+    }
+
+    /// 3-node ring (local=1, remote=2, remote=3), RF=3, CL=QUORUM.
+    /// Remote replicas have no real connection, so they fail.
+    /// Local ACK (1) + 0 remote = WriteTimeout.
+    /// BUT with CL=ONE the local ACK satisfies quorum, so any 1 remote failure
+    /// should be hinted.
+    ///
+    /// We use RF=3, CL=ONE so: required=1, local ACKs, both remotes fail.
+    /// After the write, both failed remote peers should have a pending hint.
+    #[tokio::test]
+    async fn write_at_quorum_stores_hint_for_failed_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+        let hint_store = make_hint_store(dir.path());
+
+        let local_node_id = 1u64;
+        let remote_uuid_2 = Uuid::new_v4();
+        let remote_uuid_3 = Uuid::new_v4();
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        // Register the peer entries so the ring can resolve host_ids,
+        // but there are no real connections — sends will fail.
+        pm.add_peer_entry((remote_uuid_2, "10.0.0.2:7000".parse().unwrap()))
+            .await;
+        pm.add_peer_entry((remote_uuid_3, "10.0.0.3:7000".parse().unwrap()))
+            .await;
+
+        let mut node2 = make_node("10.0.0.2:7000");
+        node2.host_id = remote_uuid_2;
+        let mut node3 = make_node("10.0.0.3:7000");
+        node3.host_id = remote_uuid_3;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.add_node(2u64, node2);
+        ring.add_node(3u64, node3);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+        ring.assign_tokens(3u64, &[200]);
+
+        // CL=ONE: local ACK is sufficient for quorum.  Both remote replicas
+        // will fail their sends, and hints should be stored for them.
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            pm,
+            local_node_id,
+            storage.clone(),
+            3,                     // RF=3
+            ConsistencyLevel::One, // required=1
+        )
+        .with_hint_store(hint_store.clone());
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let row = test_row();
+
+        // Write should succeed (local ACK meets CL=ONE).
+        coordinator
+            .coordinate_write(&table_id, &key, row, 1000)
+            .await
+            .unwrap();
+
+        // Both failed remote replicas should each have exactly 1 pending hint.
+        assert_eq!(
+            hint_store.pending_count(remote_uuid_2),
+            1,
+            "remote_2 should have 1 hint"
+        );
+        assert_eq!(
+            hint_store.pending_count(remote_uuid_3),
+            1,
+            "remote_3 should have 1 hint"
+        );
+    }
+
+    /// 3-node ring, RF=3, CL=QUORUM (required=2).
+    /// All 3 nodes fail (local storage write fails because table doesn't exist,
+    /// remote sends also fail).  Write returns WriteTimeout.
+    /// No hints should be stored for any peer.
+    ///
+    /// We simulate a total failure by using an empty ring (required > alive),
+    /// which returns Unavailable — so instead we use a 3-node ring where the
+    /// local write succeeds but both remotes fail, giving acks=1 < required=2.
+    #[tokio::test]
+    async fn write_below_quorum_does_not_store_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+        let hint_store = make_hint_store(dir.path());
+
+        let local_node_id = 1u64;
+        let remote_uuid_2 = Uuid::new_v4();
+        let remote_uuid_3 = Uuid::new_v4();
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        pm.add_peer_entry((remote_uuid_2, "10.0.0.2:7000".parse().unwrap()))
+            .await;
+        pm.add_peer_entry((remote_uuid_3, "10.0.0.3:7000".parse().unwrap()))
+            .await;
+
+        let mut node2 = make_node("10.0.0.2:7000");
+        node2.host_id = remote_uuid_2;
+        let mut node3 = make_node("10.0.0.3:7000");
+        node3.host_id = remote_uuid_3;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.add_node(2u64, node2);
+        ring.add_node(3u64, node3);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+        ring.assign_tokens(3u64, &[200]);
+
+        // CL=QUORUM with RF=3: required=2.
+        // local ACK=1, remote fails=2 → acks(1) < required(2) → WriteTimeout.
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            pm,
+            local_node_id,
+            storage.clone(),
+            3,
+            ConsistencyLevel::Quorum,
+        )
+        .with_hint_store(hint_store.clone());
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let row = test_row();
+
+        let result = coordinator
+            .coordinate_write(&table_id, &key, row, 1000)
+            .await;
+
+        assert!(
+            matches!(result, Err(ClusterError::WriteTimeout { .. })),
+            "expected WriteTimeout, got: {result:?}"
+        );
+
+        // No hints stored — write did not succeed.
+        assert_eq!(
+            hint_store.pending_count(remote_uuid_2),
+            0,
+            "no hints for remote_2 on failed write"
+        );
+        assert_eq!(
+            hint_store.pending_count(remote_uuid_3),
+            0,
+            "no hints for remote_3 on failed write"
+        );
     }
 }
