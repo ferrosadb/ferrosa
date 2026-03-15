@@ -223,14 +223,12 @@
   <a href="index.html" class="back-link">&larr; Back to homepage</a>
 
   <h1>Getting <span>Started</span></h1>
-  <p class="subtitle">Build from source and run a single-node Ferrosa instance in minutes. Everything you need to connect existing CQL drivers and start querying.</p>
+  <p class="subtitle">Install Ferrosa and run a single-node instance in minutes. Everything you need to connect existing CQL drivers and start querying.</p>
 
   <div class="toc">
     <h4>On this page</h4>
     <ul>
       <li><a href="#install">Install from Package</a></li>
-      <li><a href="#prerequisites">Prerequisites (Build from Source)</a></li>
-      <li><a href="#build">Build from Source</a></li>
       <li><a href="#run">Run Ferrosa</a></li>
       <li><a href="#connect">Connect a CQL Driver</a></li>
       <li><a href="#config">Configuration Reference</a></li>
@@ -262,40 +260,6 @@
     <strong>What's in the package:</strong> <code>ferrosa</code> server binary, <code>ferrosa-ctl</code> admin CLI, systemd service unit (<code>ferrosa.service</code>), default configuration, and smoke tests.
   </div>
 
-  <!-- ── Prerequisites ── -->
-  <h2 id="prerequisites">Prerequisites (Build from Source)</h2>
-
-  <p>If you prefer to build from source instead of using the .deb package:</p>
-
-  <ul>
-    <li><strong>Rust 1.75+</strong> — install via <a href="https://rustup.rs">rustup.rs</a></li>
-    <li><strong>Git</strong> — to clone the repository</li>
-    <li><strong>S3 bucket</strong> (optional) — for durable storage; local-only mode works without it</li>
-  </ul>
-
-  <!-- ── Build ── -->
-  <h2 id="build">Build from Source</h2>
-
-  <pre><span class="cm"># Install build dependencies and download source</span>
-<span class="kw">sudo</span> apt install -y build-essential pkg-config libssl-dev
-<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_0.1.0.orig.tar.gz
-<span class="kw">tar</span> xzf ferrosa_0.1.0.orig.tar.gz
-<span class="kw">cd</span> ferrosadb-0.1.0
-
-<span class="cm"># Build all crates (release mode recommended for performance)</span>
-<span class="kw">cargo</span> build --release
-
-<span class="cm"># Run the test suite</span>
-<span class="kw">cargo</span> test
-
-<span class="cm"># Check for lint issues</span>
-<span class="kw">cargo</span> clippy --all-targets</pre>
-
-  <p>The build produces two binaries:</p>
-  <ul>
-    <li><code>target/release/ferrosa</code> — the database server</li>
-    <li><code>target/release/ferrosa-ctl</code> — the CLI admin tool</li>
-  </ul>
 
   <!-- ── Run ── -->
   <h2 id="run">Run Ferrosa</h2>

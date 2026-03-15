@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — Cypher Query Reference</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #111118;
+      --bg-card: #16161f;
+      --bg-card-hover: #1c1c28;
+      --text-primary: #e8e8ed;
+      --text-secondary: #9494a3;
+      --text-muted: #6b6b7a;
+      --accent: #e2725b;
+      --accent-warm: #d4a574;
+      --accent-green: #6bc9a0;
+      --accent-cool: #7c9cf5;
+      --border: #1e1e2a;
+      --code-bg: #0d0d14;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 4rem 2rem 6rem;
+    }
+
+    .back-link {
+      display: inline-block;
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      margin-bottom: 2rem;
+    }
+    .back-link:hover { text-decoration: underline; }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.5rem;
+    }
+    h1 span { color: var(--accent); }
+
+    .subtitle {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      margin-bottom: 3rem;
+      max-width: 640px;
+      line-height: 1.7;
+    }
+
+    h2 {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1.5rem;
+      margin-top: 4rem;
+    }
+
+    h3 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+      margin-top: 2rem;
+    }
+
+    p, li {
+      color: var(--text-secondary);
+      margin-bottom: 1rem;
+      max-width: 720px;
+      line-height: 1.7;
+    }
+
+    ul, ol { padding-left: 1.5rem; margin-bottom: 1.5rem; }
+    li { margin-bottom: 0.5rem; }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.875em;
+      background: var(--code-bg);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      color: var(--accent-cool);
+    }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      overflow-x: auto;
+      margin-bottom: 1.5rem;
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      line-height: 1.8;
+      color: var(--text-secondary);
+    }
+
+    pre .cm { color: #546e7a; }
+    pre .kw { color: #c792ea; }
+    pre .str { color: #c3e88d; }
+    pre .var { color: #f78c6c; }
+    pre .type { color: #ffcb6b; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    th {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    td { color: var(--text-secondary); }
+    td:first-child { color: var(--text-primary); font-weight: 600; font-family: var(--font-mono); font-size: 0.875rem; }
+
+    .check { color: var(--accent-green); }
+    .cross { color: var(--text-muted); }
+    .partial { color: var(--accent-warm); }
+
+    .note {
+      background: rgba(226, 114, 91, 0.08);
+      border: 1px solid rgba(226, 114, 91, 0.2);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+    }
+
+    .note strong { color: var(--accent); }
+
+    .extension {
+      background: rgba(107, 201, 160, 0.08);
+      border: 1px solid rgba(107, 201, 160, 0.2);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1.5rem 0;
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+    }
+
+    .extension strong { color: var(--accent-green); }
+
+    .toc {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem 2rem;
+      margin-bottom: 2rem;
+    }
+
+    .toc h4 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
+      margin-bottom: 0.75rem;
+    }
+
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin-bottom: 0.375rem; }
+    .toc a { font-size: 0.9375rem; font-weight: 500; }
+
+    @media (max-width: 640px) {
+      table { font-size: 0.8125rem; }
+      th, td { padding: 0.5rem 0.625rem; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <a href="index.html" class="back-link">&larr; Back to homepage</a>
+
+  <h1>Cypher <span>Reference</span></h1>
+  <p class="subtitle">Ferrosa's native graph query layer. Run Cypher queries against your CQL tables — no separate graph database, no data duplication, no ETL pipelines.</p>
+
+  <div class="extension">
+    <strong>Ferrosa Extension:</strong> Cypher support is Ferrosa's native graph query layer built on top of your existing CQL data model. Mark any CQL table as a vertex or edge type, and query it with Cypher via a standard HTTP/JSON API on port 7474.
+  </div>
+
+  <div class="toc">
+    <h4>On this page</h4>
+    <ul>
+      <li><a href="#overview">Overview</a></li>
+      <li><a href="#http-api">HTTP API</a></li>
+      <li><a href="#schema-setup">Schema Setup</a></li>
+      <li><a href="#match">MATCH</a></li>
+      <li><a href="#node-patterns">Node Patterns</a></li>
+      <li><a href="#relationship-patterns">Relationship Patterns</a></li>
+      <li><a href="#where">WHERE Clause</a></li>
+      <li><a href="#return">RETURN Clause</a></li>
+      <li><a href="#create-set-delete">CREATE, SET, DELETE</a></li>
+      <li><a href="#subscribe">SUBSCRIBE</a></li>
+      <li><a href="#resource-limits">Resource Limits</a></li>
+      <li><a href="#adjacency-index">Adjacency Index</a></li>
+      <li><a href="#drivers">Drivers &amp; Integration</a></li>
+      <li><a href="#not-yet">Not Yet Supported</a></li>
+    </ul>
+  </div>
+
+  <!-- ── Overview ── -->
+  <h2 id="overview">Overview</h2>
+
+  <p>Ferrosa lets you run graph queries against your existing CQL tables without a separate graph database. The workflow is:</p>
+  <ol>
+    <li>Create your tables with standard CQL (CREATE TABLE, INSERT, etc.)</li>
+    <li>Annotate tables as vertices or edges using <code>ALTER TABLE ... WITH extensions</code></li>
+    <li>Query the graph with Cypher via the HTTP API on port 7474</li>
+  </ol>
+
+  <p>Ferrosa automatically maintains an adjacency index for efficient multi-hop traversals. Your CQL tables remain the source of truth — the graph layer is a query interface, not a separate data store.</p>
+
+  <!-- ── HTTP API ── -->
+  <h2 id="http-api">HTTP API</h2>
+
+  <h3>Endpoints</h3>
+  <table>
+    <thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>POST</td><td>/graph/query</td><td>Execute a Cypher query</td></tr>
+      <tr><td>POST</td><td>/graph/explain</td><td>Show query execution plan</td></tr>
+      <tr><td>GET</td><td>/graph/schema</td><td>List vertex and edge labels</td></tr>
+      <tr><td>GET</td><td>/graph/health</td><td>Health check (no auth required)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Authentication</h3>
+  <p>All endpoints except <code>/graph/health</code> require HTTP Basic authentication using the same credentials as CQL (default: <code>cassandra:cassandra</code>). Disable with <code>FERROSA_AUTH_DISABLED=true</code> for development.</p>
+
+  <h3>Request format</h3>
+  <p>Queries are sent as JSON with a <code>query</code> string and an optional <code>keyspace</code>:</p>
+  <pre><span class="cm">// POST /graph/query</span>
+{
+  <span class="str">"query"</span>: <span class="str">"MATCH (n:Person) RETURN n"</span>,
+  <span class="str">"keyspace"</span>: <span class="str">"social"</span>
+}</pre>
+
+  <h3>Response format</h3>
+  <p>Responses are JSON with a <code>columns</code> array and a <code>rows</code> array:</p>
+  <pre>{
+  <span class="str">"columns"</span>: [<span class="str">"n.name"</span>, <span class="str">"n.email"</span>],
+  <span class="str">"rows"</span>: [
+    [<span class="str">"Alice"</span>, <span class="str">"alice@example.com"</span>],
+    [<span class="str">"Bob"</span>, <span class="str">"bob@example.com"</span>]
+  ]
+}</pre>
+
+  <h3>Default port</h3>
+  <p>The graph HTTP API listens on port <strong>7474</strong> by default. Configure with <code>FERROSA_GRAPH_PORT</code>.</p>
+
+  <!-- ── Schema Setup ── -->
+  <h2 id="schema-setup">Schema Setup</h2>
+
+  <p>Ferrosa's graph layer works on top of existing CQL tables. You annotate tables as vertex or edge types using the <code>extensions</code> table property:</p>
+
+  <h3>Vertex tables</h3>
+  <pre><span class="cm">-- Mark a table as a graph vertex type</span>
+<span class="kw">ALTER TABLE</span> social.users
+  <span class="kw">WITH</span> extensions = {<span class="str">'graph.type'</span>: <span class="str">'vertex'</span>, <span class="str">'graph.label'</span>: <span class="str">'Person'</span>};</pre>
+
+  <p>The <code>graph.label</code> becomes the node label used in Cypher patterns (e.g., <code>(:Person)</code>). The table's primary key columns become the vertex identifier.</p>
+
+  <h3>Edge tables</h3>
+  <pre><span class="cm">-- Mark a table as a graph edge type</span>
+<span class="kw">ALTER TABLE</span> social.follows
+  <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'edge'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'FOLLOWS'</span>,
+    <span class="str">'graph.source'</span>: <span class="str">'Person'</span>,
+    <span class="str">'graph.target'</span>: <span class="str">'Person'</span>
+  };</pre>
+
+  <p>Edge tables require <code>graph.source</code> and <code>graph.target</code> to specify which vertex labels the edge connects. Source and target can be different labels (e.g., <code>Person</code> to <code>Company</code>).</p>
+
+  <h3>Full example</h3>
+  <pre><span class="cm">-- Create the keyspace and tables</span>
+<span class="kw">CREATE KEYSPACE</span> <span class="type">social</span> <span class="kw">WITH</span> replication = {
+  <span class="str">'class'</span>: <span class="str">'SimpleStrategy'</span>,
+  <span class="str">'replication_factor'</span>: <span class="var">3</span>
+};
+
+<span class="kw">CREATE TABLE</span> <span class="type">social.users</span> (
+  user_id <span class="type">uuid</span>,
+  name <span class="type">text</span>,
+  email <span class="type">text</span>,
+  age <span class="type">int</span>,
+  <span class="kw">PRIMARY KEY</span> (user_id)
+);
+
+<span class="kw">CREATE TABLE</span> <span class="type">social.follows</span> (
+  follower_id <span class="type">uuid</span>,
+  followed_id <span class="type">uuid</span>,
+  since <span class="type">timestamp</span>,
+  <span class="kw">PRIMARY KEY</span> (follower_id, followed_id)
+);
+
+<span class="cm">-- Annotate as graph types</span>
+<span class="kw">ALTER TABLE</span> social.users
+  <span class="kw">WITH</span> extensions = {<span class="str">'graph.type'</span>: <span class="str">'vertex'</span>, <span class="str">'graph.label'</span>: <span class="str">'Person'</span>};
+
+<span class="kw">ALTER TABLE</span> social.follows
+  <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'edge'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'FOLLOWS'</span>,
+    <span class="str">'graph.source'</span>: <span class="str">'Person'</span>,
+    <span class="str">'graph.target'</span>: <span class="str">'Person'</span>
+  };</pre>
+
+  <!-- ── MATCH ── -->
+  <h2 id="match">MATCH</h2>
+
+  <p>MATCH is the primary read statement in Cypher. It describes a pattern to find in the graph and returns matching results.</p>
+
+  <pre><span class="cm">-- Simple node match</span>
+<span class="kw">MATCH</span> (n:<span class="type">Person</span>) <span class="kw">RETURN</span> n
+
+<span class="cm">-- Traversal with filter</span>
+<span class="kw">MATCH</span> (a:<span class="type">Person</span>)-[:<span class="type">KNOWS</span>]->(b:<span class="type">Person</span>)
+<span class="kw">WHERE</span> a.age > <span class="var">30</span>
+<span class="kw">RETURN</span> a.name, b.name
+<span class="kw">ORDER BY</span> a.age <span class="kw">DESC</span> <span class="kw">LIMIT</span> <span class="var">10</span>
+
+<span class="cm">-- Multi-hop traversal</span>
+<span class="kw">MATCH</span> (a:<span class="type">Person</span>)-[:<span class="type">FOLLOWS</span>]->(b:<span class="type">Person</span>)-[:<span class="type">FOLLOWS</span>]->(c:<span class="type">Person</span>)
+<span class="kw">WHERE</span> a.name = <span class="str">'Alice'</span>
+<span class="kw">RETURN</span> c.name</pre>
+
+  <p>Patterns are compiled into a query plan that resolves vertex lookups via the CQL tables and edge traversals via the adjacency index.</p>
+
+  <!-- ── Node Patterns ── -->
+  <h2 id="node-patterns">Node Patterns</h2>
+
+  <p>Nodes are enclosed in parentheses. A node pattern can include a variable name, a label, and inline property filters:</p>
+
+  <table>
+    <thead><tr><th>Pattern</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>(n)</td><td>Any node, bound to variable <code>n</code></td></tr>
+      <tr><td>(n:Person)</td><td>Node with label <code>Person</code></td></tr>
+      <tr><td>(:Person)</td><td>Node with label, no variable binding</td></tr>
+      <tr><td>(n:Person {name: 'Alice'})</td><td>Node with inline property filter</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Inline property filters</h3>
+  <p>Properties specified inside <code>{}</code> are equality checks applied during pattern matching:</p>
+  <pre><span class="cm">-- Find a specific person and their followers</span>
+<span class="kw">MATCH</span> (n:<span class="type">Person</span> {name: <span class="str">'Alice'</span>})-[:<span class="type">FOLLOWS</span>]->(f:<span class="type">Person</span>)
+<span class="kw">RETURN</span> f.name, f.email</pre>
+
+  <!-- ── Relationship Patterns ── -->
+  <h2 id="relationship-patterns">Relationship Patterns</h2>
+
+  <p>Relationships (edges) connect two nodes with an arrow indicating direction:</p>
+
+  <table>
+    <thead><tr><th>Pattern</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>(a)-[r]->(b)</td><td>Directed relationship from <code>a</code> to <code>b</code></td></tr>
+      <tr><td>(a)<-[r]-(b)</td><td>Directed relationship from <code>b</code> to <code>a</code></td></tr>
+      <tr><td>(a)-[r]-(b)</td><td>Undirected — matches either direction</td></tr>
+      <tr><td>(a)-[:FOLLOWS]->(b)</td><td>Relationship with type <code>FOLLOWS</code></td></tr>
+      <tr><td>(a)-[r:FOLLOWS]->(b)</td><td>Typed relationship bound to variable <code>r</code></td></tr>
+    </tbody>
+  </table>
+
+  <h3>Examples</h3>
+  <pre><span class="cm">-- Directed: who does Alice follow?</span>
+<span class="kw">MATCH</span> (a:<span class="type">Person</span> {name: <span class="str">'Alice'</span>})-[:<span class="type">FOLLOWS</span>]->(b:<span class="type">Person</span>)
+<span class="kw">RETURN</span> b.name
+
+<span class="cm">-- Reverse direction: who follows Alice?</span>
+<span class="kw">MATCH</span> (a:<span class="type">Person</span> {name: <span class="str">'Alice'</span>})<-[:<span class="type">FOLLOWS</span>]-(b:<span class="type">Person</span>)
+<span class="kw">RETURN</span> b.name
+
+<span class="cm">-- Undirected: all connections regardless of direction</span>
+<span class="kw">MATCH</span> (a:<span class="type">Person</span>)-[:<span class="type">WORKS_AT</span>]-(b:<span class="type">Company</span>)
+<span class="kw">RETURN</span> a, b</pre>
+
+  <!-- ── WHERE ── -->
+  <h2 id="where">WHERE Clause</h2>
+
+  <p>WHERE filters the results of a MATCH pattern. It supports comparison operators, boolean logic, and null checks.</p>
+
+  <h3>Operators</h3>
+  <table>
+    <thead><tr><th>Operator</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>=</td><td>Equals</td></tr>
+      <tr><td><></td><td>Not equals</td></tr>
+      <tr><td><</td><td>Less than</td></tr>
+      <tr><td>></td><td>Greater than</td></tr>
+      <tr><td><=</td><td>Less than or equal</td></tr>
+      <tr><td>>=</td><td>Greater than or equal</td></tr>
+      <tr><td>AND</td><td>Logical AND</td></tr>
+      <tr><td>OR</td><td>Logical OR</td></tr>
+      <tr><td>NOT</td><td>Logical negation</td></tr>
+      <tr><td>IS NULL</td><td>Check for null value</td></tr>
+      <tr><td>IS NOT NULL</td><td>Check for non-null value</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Examples</h3>
+  <pre><span class="cm">-- Comparison operators</span>
+<span class="kw">MATCH</span> (n:<span class="type">Person</span>)
+<span class="kw">WHERE</span> n.age >= <span class="var">21</span> <span class="kw">AND</span> n.age < <span class="var">65</span>
+<span class="kw">RETURN</span> n.name, n.age
+
+<span class="cm">-- Boolean logic</span>
+<span class="kw">MATCH</span> (n:<span class="type">Person</span>)
+<span class="kw">WHERE</span> n.city = <span class="str">'NYC'</span> <span class="kw">OR</span> n.city = <span class="str">'SF'</span>
+<span class="kw">RETURN</span> n.name
+
+<span class="cm">-- NOT and null checks</span>
+<span class="kw">MATCH</span> (n:<span class="type">Person</span>)
+<span class="kw">WHERE</span> <span class="kw">NOT</span> n.email <span class="kw">IS NULL</span>
+<span class="kw">RETURN</span> n.name, n.email</pre>
+
+  <!-- ── RETURN ── -->
+  <h2 id="return">RETURN Clause</h2>
+
+  <p>RETURN specifies which variables and properties to include in the result set. It supports aliases, DISTINCT, ORDER BY, and LIMIT.</p>
+
+  <h3>Syntax</h3>
+  <pre><span class="cm">-- Return specific properties</span>
+<span class="kw">MATCH</span> (n:<span class="type">Person</span>) <span class="kw">RETURN</span> n.name, n.email
+
+<span class="cm">-- Aliases with AS</span>
+<span class="kw">MATCH</span> (n:<span class="type">Person</span>) <span class="kw">RETURN</span> n.name <span class="kw">AS</span> person_name
+
+<span class="cm">-- DISTINCT to remove duplicates</span>
+<span class="kw">MATCH</span> (a:<span class="type">Person</span>)-[:<span class="type">FOLLOWS</span>]->(b:<span class="type">Person</span>)
+<span class="kw">RETURN DISTINCT</span> b.name
+
+<span class="cm">-- ORDER BY and LIMIT</span>
+<span class="kw">MATCH</span> (n:<span class="type">Person</span>)
+<span class="kw">RETURN</span> n.name, n.age
+<span class="kw">ORDER BY</span> n.age <span class="kw">DESC</span>
+<span class="kw">LIMIT</span> <span class="var">25</span>
+
+<span class="cm">-- Return entire node</span>
+<span class="kw">MATCH</span> (n:<span class="type">Person</span>) <span class="kw">RETURN</span> n</pre>
+
+  <!-- ── CREATE, SET, DELETE ── -->
+  <h2 id="create-set-delete">CREATE, SET, DELETE</h2>
+
+  <div class="note">
+    <strong>Coming Soon:</strong> CREATE, SET, and DELETE statements are fully parsed by the Cypher parser. Execution is coming in Phase 2. For now, use CQL INSERT/UPDATE/DELETE to mutate data — the graph layer will reflect the changes automatically via the adjacency index.
+  </div>
+
+  <h3>CREATE</h3>
+  <pre><span class="cm">-- Create a vertex</span>
+<span class="kw">CREATE</span> (n:<span class="type">Person</span> {name: <span class="str">'Alice'</span>, age: <span class="var">30</span>})
+
+<span class="cm">-- Create a relationship</span>
+<span class="kw">MATCH</span> (a:<span class="type">Person</span> {name: <span class="str">'Alice'</span>}), (b:<span class="type">Person</span> {name: <span class="str">'Bob'</span>})
+<span class="kw">CREATE</span> (a)-[:<span class="type">FOLLOWS</span>]->(b)</pre>
+
+  <h3>SET</h3>
+  <pre><span class="cm">-- Update a property</span>
+<span class="kw">MATCH</span> (n:<span class="type">Person</span> {name: <span class="str">'Alice'</span>})
+<span class="kw">SET</span> n.age = <span class="var">31</span></pre>
+
+  <h3>DELETE</h3>
+  <pre><span class="cm">-- Delete a node (must have no relationships)</span>
+<span class="kw">MATCH</span> (n) <span class="kw">WHERE</span> n.status = <span class="str">'inactive'</span>
+<span class="kw">DELETE</span> n
+
+<span class="cm">-- Delete a node and all its relationships</span>
+<span class="kw">MATCH</span> (n) <span class="kw">WHERE</span> n.status = <span class="str">'inactive'</span>
+<span class="kw">DETACH DELETE</span> n</pre>
+
+  <!-- ── SUBSCRIBE ── -->
+  <h2 id="subscribe">SUBSCRIBE</h2>
+
+  <div class="extension">
+    <strong>Ferrosa Extension:</strong> SUBSCRIBE extends Cypher with real-time streaming capabilities.
+    Subscribe to any MATCH pattern and receive updates as the graph changes.
+  </div>
+
+  <p>SUBSCRIBE supports two modes for real-time graph change streaming:</p>
+
+  <table>
+    <thead><tr><th>Mode</th><th>Syntax</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td>EVERY</td><td><code>EVERY 5s</code></td><td>Re-executes the graph query at the given interval and pushes results</td></tr>
+      <tr><td>DELTA</td><td><code>DELTA</code></td><td>Push-on-write — only sends changes as they occur via the commit log</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Examples</h3>
+  <pre><span class="cm">-- Poll for changes every 5 seconds</span>
+<span class="kw">SUBSCRIBE MATCH</span> (n:<span class="type">Person</span>) <span class="kw">RETURN</span> n <span class="kw">EVERY</span> <span class="var">5</span>s
+
+<span class="cm">-- Push-on-write for relationship changes</span>
+<span class="kw">SUBSCRIBE MATCH</span> (a)-[:<span class="type">FOLLOWS</span>]->(b) <span class="kw">RETURN</span> a, b <span class="kw">DELTA</span>
+
+<span class="cm">-- Subscribe to a filtered traversal</span>
+<span class="kw">SUBSCRIBE MATCH</span> (a:<span class="type">Person</span> {name: <span class="str">'Alice'</span>})-[:<span class="type">FOLLOWS</span>]->(b:<span class="type">Person</span>)
+<span class="kw">RETURN</span> b.name, b.email
+<span class="kw">EVERY</span> <span class="var">10</span>s</pre>
+
+  <!-- ── Resource Limits ── -->
+  <h2 id="resource-limits">Resource Limits</h2>
+
+  <p>Ferrosa enforces resource limits on graph queries to prevent unbounded traversals from impacting cluster stability:</p>
+
+  <table>
+    <thead><tr><th>Limit</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>Query timeout</td><td>30 seconds</td><td>Maximum wall-clock time for a single query</td></tr>
+      <tr><td>Max result rows</td><td>10,000</td><td>Maximum rows returned in a single response</td></tr>
+      <tr><td>Max fan-out per hop</td><td>10,000</td><td>Maximum edges traversed at each hop in a multi-hop pattern</td></tr>
+    </tbody>
+  </table>
+
+  <p>These defaults are tunable per query or globally via configuration. When a limit is reached, the query returns a partial result set with a <code>truncated: true</code> flag in the response.</p>
+
+  <!-- ── Adjacency Index ── -->
+  <h2 id="adjacency-index">Adjacency Index</h2>
+
+  <p>When you annotate an edge table with <code>graph.type: 'edge'</code>, Ferrosa automatically creates and maintains a system adjacency table for efficient graph traversals:</p>
+
+  <pre><span class="cm">-- Automatically created by Ferrosa:</span>
+<span class="cm">-- system_graph_&lt;keyspace&gt;.adjacency</span>
+<span class="cm">--</span>
+<span class="cm">-- Schema (internal):</span>
+<span class="cm">--   source_label text</span>
+<span class="cm">--   source_id    blob</span>
+<span class="cm">--   direction    text   (OUT or IN)</span>
+<span class="cm">--   edge_label   text</span>
+<span class="cm">--   target_label text</span>
+<span class="cm">--   target_id    blob</span></pre>
+
+  <h3>How it works</h3>
+  <ul>
+    <li><strong>Dual-direction indexing</strong> — every edge is indexed in both OUT and IN directions, so traversals in either direction are equally fast</li>
+    <li><strong>WriteObserver pattern</strong> — the adjacency index is kept in sync with edge mutations through the WriteObserver hook in the storage engine, not through polling or background jobs</li>
+    <li><strong>Automatic lifecycle</strong> — the index is created when you add <code>graph.type: 'edge'</code> to a table and dropped when you remove it</li>
+    <li><strong>Transparent to CQL</strong> — the adjacency table lives in a <code>system_graph_*</code> keyspace and is invisible to normal CQL queries</li>
+  </ul>
+
+  <p>This design means that MATCH traversals resolve edge lookups via efficient partition-key reads on the adjacency table, rather than scanning the edge table.</p>
+
+  <!-- ── Drivers & Integration ── -->
+  <h2 id="drivers">Drivers &amp; Integration</h2>
+
+  <p>Ferrosa's graph endpoint is a standard HTTP/JSON API — any language with an HTTP client works. No special driver required.</p>
+
+  <h3>curl</h3>
+  <pre>curl -X POST http://localhost:<span class="var">7474</span>/graph/query \
+  -u cassandra:cassandra \
+  -H <span class="str">'Content-Type: application/json'</span> \
+  -d <span class="str">'{"query": "MATCH (n:Person) RETURN n", "keyspace": "social"}'</span></pre>
+
+  <h3>Python</h3>
+  <pre><span class="kw">import</span> requests
+
+r = requests.post(<span class="str">'http://localhost:7474/graph/query'</span>,
+    auth=(<span class="str">'cassandra'</span>, <span class="str">'cassandra'</span>),
+    json={<span class="str">'query'</span>: <span class="str">'MATCH (n:Person) RETURN n'</span>, <span class="str">'keyspace'</span>: <span class="str">'social'</span>})
+
+data = r.json()
+<span class="kw">for</span> row <span class="kw">in</span> data[<span class="str">'rows'</span>]:
+    print(row)</pre>
+
+  <h3>JavaScript (Node.js / fetch)</h3>
+  <pre><span class="kw">const</span> resp = <span class="kw">await</span> fetch(<span class="str">'http://localhost:7474/graph/query'</span>, {
+  method: <span class="str">'POST'</span>,
+  headers: {
+    <span class="str">'Content-Type'</span>: <span class="str">'application/json'</span>,
+    <span class="str">'Authorization'</span>: <span class="str">'Basic '</span> + btoa(<span class="str">'cassandra:cassandra'</span>)
+  },
+  body: JSON.stringify({
+    query: <span class="str">'MATCH (n:Person) RETURN n'</span>,
+    keyspace: <span class="str">'social'</span>
+  })
+});
+
+<span class="kw">const</span> data = <span class="kw">await</span> resp.json();</pre>
+
+  <h3>Query plan inspection</h3>
+  <pre>curl -X POST http://localhost:<span class="var">7474</span>/graph/explain \
+  -u cassandra:cassandra \
+  -H <span class="str">'Content-Type: application/json'</span> \
+  -d <span class="str">'{"query": "MATCH (a:Person)-[:FOLLOWS]->(b:Person) RETURN b.name", "keyspace": "social"}'</span></pre>
+
+  <!-- ── Not Yet ── -->
+  <h2 id="not-yet">Not Yet Supported</h2>
+
+  <p>The following Cypher features are planned for future releases:</p>
+
+  <table>
+    <thead><tr><th>Feature</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Variable-length paths (-[*]->)</td><td>Planned</td></tr>
+      <tr><td>Aggregation functions (COUNT, SUM, AVG, MIN, MAX)</td><td>Planned</td></tr>
+      <tr><td>UNION</td><td>Planned</td></tr>
+      <tr><td>WITH (query chaining)</td><td>Planned</td></tr>
+      <tr><td>CASE expressions</td><td>Planned</td></tr>
+      <tr><td>Full property retrieval on RETURN n</td><td>Planned — Phase 1 returns vertex IDs</td></tr>
+      <tr><td>Subqueries</td><td>Planned</td></tr>
+      <tr><td>MERGE (upsert)</td><td>Planned</td></tr>
+      <tr><td>OPTIONAL MATCH</td><td>Planned</td></tr>
+      <tr><td>Path expressions</td><td>Planned</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>Note:</strong> Even without these features, Ferrosa's Cypher support covers the most common
+    graph query patterns: node lookups, directed and undirected traversals, multi-hop paths,
+    property filters, sorting, and pagination. For mutations, use CQL directly — the graph layer
+    reflects changes automatically.
+  </div>
+
+</div>
+
+</body>
+</html>
