@@ -8,6 +8,7 @@ pub mod hints;
 pub mod mode;
 pub mod pair;
 pub mod raft;
+pub mod rebalance;
 pub mod ring;
 pub mod state;
 pub mod streaming;
