@@ -292,8 +292,8 @@ mod tests {
 
     #[test]
     fn max_cas_retries_is_reasonable() {
-        assert!(MAX_CAS_RETRIES >= 2);
-        assert!(MAX_CAS_RETRIES <= 10);
+        const { assert!(MAX_CAS_RETRIES >= 2) };
+        const { assert!(MAX_CAS_RETRIES <= 10) };
     }
 
     #[tokio::test]
