@@ -1,8 +1,10 @@
+use serde::{Deserialize, Serialize};
+
 /// CQL consistency levels for read and write operations.
 ///
 /// Each level defines how many replica acknowledgements are required
 /// before the coordinator responds to the client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ConsistencyLevel {
     One,
     Two,
