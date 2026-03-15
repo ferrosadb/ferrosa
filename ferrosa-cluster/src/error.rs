@@ -27,12 +27,18 @@ pub enum ClusterError {
     PairWriteUnavailable,
     /// Operation requires primary role but this node is secondary.
     NotPrimary,
+    /// This node is not the Raft leader; client should retry on the leader.
+    ///
+    /// `leader_id` is the openraft `NodeId` of the current leader, if known.
+    NotLeader { leader_id: Option<u64> },
     /// Attempted mode transition that is not allowed.
     ModeTransitionRejected(String),
     /// Replication to peer failed.
     ReplicationFailed(String),
     /// Peer is too far behind; full catch-up or bootstrap required.
     CatchUpRequired,
+    /// Raft consensus error (fatal or unexpected).
+    RaftError(String),
     /// Underlying storage error.
     Storage(ferrosa_common::Error),
     /// Underlying network error.
@@ -77,9 +83,14 @@ impl fmt::Display for ClusterError {
             }
             Self::PairWriteUnavailable => write!(f, "pair mode: primary unavailable"),
             Self::NotPrimary => write!(f, "this node is not the primary"),
+            Self::NotLeader { leader_id } => match leader_id {
+                Some(id) => write!(f, "not Raft leader; forward to node {id}"),
+                None => write!(f, "not Raft leader; leader unknown"),
+            },
             Self::ModeTransitionRejected(reason) => write!(f, "mode transition rejected: {reason}"),
             Self::ReplicationFailed(reason) => write!(f, "replication failed: {reason}"),
             Self::CatchUpRequired => write!(f, "peer requires full catch-up"),
+            Self::RaftError(msg) => write!(f, "raft error: {msg}"),
             Self::Storage(e) => write!(f, "storage: {e}"),
             Self::Net(e) => write!(f, "net: {e}"),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
