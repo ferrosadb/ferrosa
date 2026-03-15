@@ -286,6 +286,8 @@ mod tests {
         fn on_peer_connected(&self, _: PeerId) {}
         fn on_peer_disconnected(&self, _: PeerId) {}
         fn on_peer_suspected(&self, _: PeerId) {}
+        fn on_peer_recovered(&self, _: uuid::Uuid) {}
+        fn on_peer_failed(&self, _: uuid::Uuid) {}
     }
 
     fn make_peer_manager() -> Arc<PeerManager> {

@@ -209,6 +209,8 @@ mod tests {
         fn on_peer_connected(&self, _peer: PeerId) {}
         fn on_peer_disconnected(&self, _peer: PeerId) {}
         fn on_peer_suspected(&self, _peer: PeerId) {}
+        fn on_peer_recovered(&self, _peer_id: uuid::Uuid) {}
+        fn on_peer_failed(&self, _peer_id: uuid::Uuid) {}
     }
 
     fn make_coordinator(

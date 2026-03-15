@@ -755,6 +755,15 @@ impl PeerEventListener for ModeController {
         let (host_id, _addr) = peer;
         tracing::warn!(peer = %host_id, "peer suspected dead (not transitioning)");
     }
+
+    fn on_peer_recovered(&self, peer_id: uuid::Uuid) {
+        tracing::info!(%peer_id, "peer recovered");
+        // Hint delivery will be wired in Slice 3 (Task 14)
+    }
+
+    fn on_peer_failed(&self, peer_id: uuid::Uuid) {
+        tracing::warn!(%peer_id, "peer failed — excluding from replica set");
+    }
 }
 
 impl InboundPeerCallback for ModeController {

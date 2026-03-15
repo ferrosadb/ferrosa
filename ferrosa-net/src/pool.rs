@@ -103,6 +103,17 @@ impl ReconnectContext {
     }
 }
 
+/// Outcome of checking all lane states in a [`PriorityPool`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum LaneOutcome {
+    /// All 3 lanes are `Connected`.
+    AllConnected,
+    /// At least one lane has `Failed` (exhausted all retry attempts).
+    AnyFailed,
+    /// At least one lane is still `Reconnecting` and none has `Failed`.
+    StillReconnecting,
+}
+
 /// Maintains 3 connections to a peer — one per priority lane.
 ///
 /// Each lane is independently monitored: if its TCP connection drops, a
@@ -266,6 +277,29 @@ impl PriorityPool {
         self.reconnect_lane(Lane::Raft);
         self.reconnect_lane(Lane::Data);
         self.reconnect_lane(Lane::Bulk);
+    }
+
+    /// Inspect the current state of all lanes without blocking.
+    ///
+    /// Returns:
+    /// - [`LaneOutcome::AllConnected`] — all 3 lanes are `Connected`.
+    /// - [`LaneOutcome::AnyFailed`] — at least one lane has exhausted retries.
+    /// - [`LaneOutcome::StillReconnecting`] — all lanes are either `Connected`
+    ///   or `Reconnecting`, with at least one still `Reconnecting`.
+    pub async fn all_lanes_resolved(&self) -> LaneOutcome {
+        let mut any_reconnecting = false;
+        for slot in [&self.raft, &self.data, &self.bulk] {
+            match &*slot.lock().await {
+                LaneState::Failed => return LaneOutcome::AnyFailed,
+                LaneState::Reconnecting { .. } => any_reconnecting = true,
+                LaneState::Connected(_) => {}
+            }
+        }
+        if any_reconnecting {
+            LaneOutcome::StillReconnecting
+        } else {
+            LaneOutcome::AllConnected
+        }
     }
 }
 
