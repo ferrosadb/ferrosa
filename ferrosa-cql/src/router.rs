@@ -521,9 +521,37 @@ fn route_select_user_table(
             ),
             None => vec![],
         }
-    } else if s.allow_filtering {
-        // No PK — full table scan with ALLOW FILTERING
-        tracing::warn!(table = %s.table, "executing full scan with ALLOW FILTERING");
+    } else {
+        // No PK — check for secondary indexes on WHERE columns
+        let where_columns: Vec<&str> = s.where_clauses.iter().map(|w| w.column.as_str()).collect();
+        let has_matching_index = snap.indexes.iter().any(|((idx_ks, idx_tbl, _), meta)| {
+            idx_ks == ks
+                && idx_tbl == &s.table
+                && meta
+                    .target_columns
+                    .iter()
+                    .any(|c| where_columns.contains(&c.as_str()))
+        });
+
+        if !has_matching_index && !s.allow_filtering {
+            return Err(CqlError::Invalid(
+                "Cannot execute this query as it might involve data filtering and \
+                 thus may have unpredictable performance. If you want to execute \
+                 this query despite the performance unpredictability, use ALLOW FILTERING"
+                    .into(),
+            ));
+        }
+
+        // TODO: When IndexReader is available on StorageEngine, use it here
+        // for index-accelerated lookups instead of full scan. For now, the
+        // presence of a matching index allows the query without ALLOW FILTERING,
+        // but execution still falls through to a full scan + post-filter.
+        if has_matching_index {
+            tracing::debug!(table = %s.table, "index exists for WHERE columns; full scan until index readers are wired");
+        } else {
+            tracing::warn!(table = %s.table, "executing full scan with ALLOW FILTERING");
+        }
+
         let limit = s.limit.map(|l| l as usize).unwrap_or(10_000);
         let partitions = state.engine.read_range(&table_id, None, None, limit)?;
         let mut all_rows = Vec::new();
@@ -546,13 +574,6 @@ fn route_select_user_table(
             evaluate_where_predicates(row, &s.where_clauses, &all_col_names, table_meta)
         });
         all_rows
-    } else {
-        return Err(CqlError::Invalid(
-            "Cannot execute this query as it might involve data filtering and \
-             thus may have unpredictable performance. If you want to execute \
-             this query despite the performance unpredictability, use ALLOW FILTERING"
-                .into(),
-        ));
     };
 
     // Apply column selection if not Star
