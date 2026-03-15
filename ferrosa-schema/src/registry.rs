@@ -183,6 +183,9 @@ impl Schema {
         schema.virtual_table_registry.register(Arc::new(
             crate::system::index_tables::SystemSchemaIndexesTable::new(schema.snapshot_handle()),
         ));
+        schema.virtual_table_registry.register(Arc::new(
+            crate::system::type_tables::SystemSchemaTypesTable::new(schema.snapshot_handle()),
+        ));
 
         // Emit bootstrap audit event
         schema.emit_audit(AuditEventKind::SchemaBootstrapped);

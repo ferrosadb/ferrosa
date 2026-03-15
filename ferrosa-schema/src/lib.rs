@@ -46,6 +46,7 @@ pub use system::peers::{query_peers, ClusterState, PeerInfo};
 pub use system::schema_tables::{
     query_columns, query_keyspaces, query_tables, ColumnRow, KeyspaceRow, TableRow,
 };
+pub use system::type_tables::SystemSchemaTypesTable;
 pub use virtual_registry::VirtualTableRegistry;
 pub use virtual_table::{
     ColumnFilter, PredicateOp, RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow,
