@@ -225,6 +225,10 @@
   <h1>Getting <span>Started</span></h1>
   <p class="subtitle">Install Ferrosa and run a single-node instance in minutes. Everything you need to connect existing CQL drivers and start querying.</p>
 
+  <div class="note">
+    <strong>Beta:</strong> Ferrosa is currently in beta. APIs and configuration may change between releases. Not yet recommended for production workloads without thorough testing.
+  </div>
+
   <div class="toc">
     <h4>On this page</h4>
     <ul>
@@ -243,10 +247,10 @@
   <p>The quickest way to get started. The .deb package includes the ferrosa server, ferrosa-ctl admin tool, systemd service unit, and smoke tests.</p>
 
   <pre><span class="cm"># Download the latest release</span>
-<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_0.1.0_amd64.deb
+<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_0.1.0-beta_amd64.deb
 
 <span class="cm"># Install</span>
-<span class="kw">sudo</span> dpkg -i ferrosa_0.1.0_amd64.deb
+<span class="kw">sudo</span> dpkg -i ferrosa_0.1.0-beta_amd64.deb
 
 <span class="cm"># Start the service</span>
 <span class="kw">sudo</span> systemctl start ferrosa
@@ -279,9 +283,9 @@
 ./target/release/ferrosa</pre>
 
   <div class="note">
-    <strong>Note:</strong> Ferrosa starts in single-node mode by default. Two-node pair mode
+    <strong>Note:</strong> Ferrosa starts in standalone mode by default. Two-node pair mode
     is available via <code>FERROSA_SEED</code> configuration. Full cluster mode (3+ nodes)
-    uses Raft consensus and a Murmur3 token ring — set <code>FERROSA_CLUSTER_MODE=ring</code>.
+    uses Raft consensus and a Murmur3 token ring — set <code>FERROSA_CLUSTER_MODE=cluster</code>.
   </div>
 
   <h3>Default ports</h3>
@@ -379,7 +383,7 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
     <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>FERROSA_CLUSTER_NAME</code></td><td><code>ferrosa</code></td><td>Cluster name (must match across nodes)</td></tr>
-      <tr><td><code>FERROSA_CLUSTER_MODE</code></td><td><code>single</code></td><td>Cluster mode: <code>single</code>, <code>pair</code>, or <code>ring</code></td></tr>
+      <tr><td><code>FERROSA_CLUSTER_MODE</code></td><td><code>standalone</code></td><td>Cluster mode: <code>standalone</code>, <code>pair</code>, or <code>cluster</code></td></tr>
       <tr><td><code>FERROSA_SEED</code></td><td>—</td><td>Comma-separated seed addresses</td></tr>
       <tr><td><code>FERROSA_INTERNODE_BIND</code></td><td><code>0.0.0.0:7000</code></td><td>Internode protocol bind address</td></tr>
       <tr><td><code>FERROSA_INTERNODE_BROADCAST</code></td><td>—</td><td>Address other nodes use to reach this node</td></tr>
@@ -387,11 +391,12 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
       <tr><td><code>FERROSA_DATA_CENTER</code></td><td><code>dc1</code></td><td>Data center name</td></tr>
       <tr><td><code>FERROSA_RACK</code></td><td><code>rack1</code></td><td>Rack name within the data center</td></tr>
       <tr><td><code>FERROSA_NUM_TOKENS</code></td><td><code>256</code></td><td>Number of tokens on the ring</td></tr>
-      <tr><td><code>FERROSA_DEFAULT_CL</code></td><td><code>ONE</code></td><td>Default consistency level</td></tr>
+      <tr><td><code>FERROSA_DEFAULT_CL</code></td><td><code>QUORUM</code></td><td>Default consistency level</td></tr>
       <tr><td><code>FERROSA_HEARTBEAT_INTERVAL_MS</code></td><td><code>1000</code></td><td>Heartbeat interval between peers</td></tr>
       <tr><td><code>FERROSA_HEARTBEAT_TIMEOUT_MS</code></td><td><code>5000</code></td><td>Timeout before marking a peer as down</td></tr>
       <tr><td><code>FERROSA_MAX_INTERNODE_CONNECTIONS</code></td><td><code>64</code></td><td>Max concurrent internode connections</td></tr>
-      <tr><td><code>FERROSA_AUTO_JOIN</code></td><td><code>true</code></td><td>Automatically join the ring on startup</td></tr>
+      <tr><td><code>FERROSA_AUTO_JOIN</code></td><td><code>true</code></td><td>Automatically join the ring on startup (dev mode)</td></tr>
+      <tr><td><code>FERROSA_HINTED_HANDOFF_MAX_MB</code></td><td><code>1024</code></td><td>Max disk space for hinted handoff per peer (MB)</td></tr>
     </tbody>
   </table>
 
@@ -452,9 +457,19 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
 <span class="kw">ferrosa-ctl</span> storage
 
 <span class="cm"># Live TUI dashboard (ratatui)</span>
-<span class="kw">ferrosa-ctl</span> monitor</pre>
+<span class="kw">ferrosa-ctl</span> monitor
+
+<span class="cm"># Cluster management</span>
+<span class="kw">ferrosa-ctl</span> add-node <span class="str">10.0.0.5:7000</span>        <span class="cm"># Pre-approve a node for cluster join</span>
+<span class="kw">ferrosa-ctl</span> decommission <span class="str">10.0.0.3:7000</span>   <span class="cm"># Gracefully remove a node</span>
+<span class="kw">ferrosa-ctl</span> ring                          <span class="cm"># Show token ring distribution</span>
+<span class="kw">ferrosa-ctl</span> rebalance                     <span class="cm"># Trigger token rebalancing</span></pre>
 
   <p>The <code>monitor</code> command launches a terminal dashboard with 5 panels showing connections, active queries, storage stats, and more. Navigate with arrow keys, refresh is automatic. Connect to a specific host with <code>--host 10.0.0.1:9042</code>.</p>
+
+  <div class="note">
+    <strong>Prometheus metrics:</strong> The <code>/metrics</code> endpoint is available on the web console port (default <code>9090</code>) without authentication. Scrape it directly from Prometheus or any compatible monitoring system.
+  </div>
 
   <!-- ── Architecture ── -->
   <h2 id="architecture">Architecture Overview</h2>

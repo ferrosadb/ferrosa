@@ -1,23 +1,24 @@
 # Ferrosa Development Status
 
-> Last updated: 2026-03-14
+> Last updated: 2026-03-15
 > Status: Living document
 
 ## Overview
 
-Ferrosa is a **distributed CQL-compatible database** with graph query support,
-built-in observability, and S3-backed storage. The internode transport (ferrosa-net
-Phase 1), pair mode cluster (ferrosa-cluster Phase 1), and cluster building blocks
-(ferrosa-cluster Phase 2) are complete: DDL replication, write forwarding, failover,
-catch-up, Raft consensus, token ring, and coordinator pattern.
+Ferrosa is a **distributed CQL-compatible database** with graph
+query support, built-in observability, and S3-backed storage. The production cluster
+sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff,
+node lifecycle (join/decommission/rebalance), reconnection, and integration tests.
+All 25 tasks merged on the feature/production-cluster branch. Hardening and
+observability wiring sprints are also complete. Preparing for beta release.
 
 | Metric | Value |
 |--------|-------|
 | Crates | 11 of 11 planned |
-| Source files | ~194 |
-| Source LOC | ~68,000 |
-| Test functions | ~1,370 |
-| Integration test files | 22 |
+| Source files | ~233 |
+| Source LOC | ~106,500 |
+| Test functions | ~1,550+ |
+| Integration test files | 30+ |
 
 ## Maturity Assessment
 
@@ -25,15 +26,15 @@ catch-up, Raft consensus, token ring, and coordinator pattern.
                Spec'd   Coded   Tested   Prod-ready
 common         ██████   ██████  ██████   ████░░
 sstable        ██████   ██████  ██████   ████░░
-storage        ██████   ██████  █████░   ███░░░
+storage        ██████   ██████  █████▌   ████░░
 schema         ████░░   █████░  █████░   ███░░░
 index          █████░   █████░  ████░░   ██░░░░
 cql            ██████   ██████  ██████   ████░░
 graph          █████░   ██████  ████░░   ███░░░
-ctl            ██████   ██████  ███░░░   ███░░░
-binary         █████░   ██████  ███░░░   ███░░░
-net            █████░   █████░  ████░░   ██░░░░
-cluster        ██████   █████░  ████░░   ██░░░░
+ctl            ██████   ██████  ████░░   ████░░
+binary         ██████   ██████  ████░░   ████░░
+net            ██████   ██████  █████░   ███░░░
+cluster        ██████   ██████  █████░   ███░░░
 ```
 
 ## Crate Status
@@ -61,7 +62,7 @@ cluster        ██████   █████░  ████░░   █
 
 ### ferrosa-storage — Mostly Complete (Parts A/B/C)
 
-- **LOC:** 9,278 (29 files) | **Tests:** 204
+- **LOC:** ~10,500 (32 files) | **Tests:** ~230
 - **Modules:** `cache`, `commitlog` (7 submodules), `compaction` (3 submodules),
   `engine`, `flush`, `index` (tracker, scheduler, virtual_table), `manifest`,
   `memtable` (2 impls), `merge`, `observer`, `store`, `subscription_observer`,
@@ -170,39 +171,44 @@ cluster        ██████   █████░  ████░░   █
 
 ### ferrosa-ctl — Complete
 
-- **LOC:** 1,047 (3 files) | **Tests:** 31
+- **LOC:** ~1,400 (4 files) | **Tests:** ~45
 - **Modules:** `commands`, `tui`
 - **What's done:** CLI admin tool (clap). Commands: `query`, `describe`, `monitor`,
-  `metrics`. TUI monitor dashboard (ratatui/crossterm) with 5 panels, auto-refresh,
-  keyboard navigation.
+  `metrics`, `status`, `connections`, `queries`, `storage`, `topology`, `peers`.
+  TUI monitor dashboard (ratatui/crossterm) with 5 panels, auto-refresh,
+  keyboard navigation. Cluster management subcommands: `add-node`, `decommission`,
+  `ring`, `rebalance`.
 - **Remaining:**
   - [x] ~~Integration tests~~ (11 tests covering connections, queries, system tables)
 
-### ferrosa (binary) — Complete (pair-mode, production-ready)
+### ferrosa (binary) — Complete (cluster-mode)
 
-- **LOC:** ~870 (6 files) | **Tests:** ~18
+- **LOC:** ~1,200 (8 files) | **Tests:** ~30
 - **Modules:** `maintenance`, `web` (api, static_files)
 - **What's done:** Composes all crates. CQL server on :9042, graph HTTP on :7474,
-  web console on :9090. Connection + query tracker wiring, REST API for
+  web console + cluster API on :9090, Prometheus metrics endpoint (`/metrics`).
+  Connection + query tracker wiring, REST API for
   metrics/schema/queries/cluster management, embedded static assets via rust-embed.
   Cluster management endpoints: `GET /api/cluster/status`,
-  `POST /api/cluster/promote`, `POST /api/cluster/switchover`.
+  `POST /api/cluster/promote`, `POST /api/cluster/switchover`,
+  `POST /api/cluster/add-node`, `POST /api/cluster/decommission`,
+  `GET /api/cluster/ring`, `POST /api/cluster/rebalance`.
   Background maintenance loop (auto-flush, compaction polling, commit log GC).
   Graceful shutdown with configurable timeout (drains in-flight requests).
-  Per-connection request limiting for backpressure under load. Exponential backoff
-  reconnection for internode links. Ships as .deb via `scripts/build-deb.sh` with
-  systemd service unit.
+  Internode drain on shutdown. Per-connection request limiting for backpressure
+  under load. Exponential backoff reconnection for internode links. Ships as
+  .deb via `scripts/build-deb.sh` with systemd service unit.
 - **Remaining:**
   - [x] ~~Graceful shutdown sequencing~~ (done)
   - [x] ~~Configuration file support~~ (TOML with env var override)
   - [x] ~~Flush + S3 sync on graceful shutdown~~ (zero data loss on SIGTERM)
   - [x] ~~Configurable flush interval~~ (FERROSA_FLUSH_INTERVAL_SECS)
 
-### ferrosa-net — Phase 1 Complete (PR #39)
+### ferrosa-net — Phase 1 + Reconnection Complete
 
-- **LOC:** 2,383 (14 files) | **Tests:** 43 (40 unit + 3 integration)
+- **LOC:** ~3,800 (18 files) | **Tests:** ~75 (unit + integration)
 - **Modules:** `codec`, `config`, `discovery` (seeds), `error`, `handshake`, `message`,
-  `peer`, `pool`, `rpc` (handler, server, client)
+  `peer`, `pool`, `reconnect`, `rpc` (handler, server, client)
 - **What's done:** 12-byte binary wire protocol with 3 priority lanes (Raft/Data/Bulk),
   24 message types (including schema replication: PairSchemaSync, PairDdlForward,
   PairDdlAck), PSK-authenticated handshake (HMAC-SHA256), RPC server with connection
@@ -210,23 +216,25 @@ cluster        ██████   █████░  ████░░   █
   `PriorityPool` (3 TCP connections per peer), static seed discovery, `PeerManager` with
   heartbeat-based failure detection. Proptest fuzzing for message decode. No dependency
   on ferrosa-common.
-- **Remaining (Phase 2):**
   - [x] ~~TLS via rustls for internode encryption~~ (server + client, self-signed support)
-  - [ ] Connection reconnection and backoff
-  - [ ] Graceful shutdown / drain
+  - [x] ~~Connection reconnection and backoff~~ (alive watch channel + exponential backoff state machine)
+  - [x] ~~Graceful shutdown / drain~~ (CancellationToken-based drain)
+  - [x] ~~PeerManager reconnection orchestration~~
+- **Remaining:**
   - [ ] Compression (LZ4/Snappy frame-level)
   - [ ] Metrics and tracing integration
   - [ ] Zero-copy serialization (Cap'n Proto / FlatBuffers / rkyv) for wire protocol
 - **Spec:** [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 - **Threat Model:** [Net/Cluster Threats](threat-model-net-cluster.md)
 
-### ferrosa-cluster — Phase 2 Complete (Raft + Token Ring + Coordinator)
+### ferrosa-cluster — Phase 3 Complete (Production Cluster)
 
-- **LOC:** 6,262 (25 files) | **Tests:** 91 (87 unit + 4 integration)
+- **LOC:** ~14,500 (45+ files) | **Tests:** ~280 (unit + integration)
 - **Modules:** `config`, `consistency`, `controller`, `ddl_path`, `error`, `mode`,
   `pair` (catchup, coordinator, ddl, handler, node, switchover), `state`, `write_path`,
   `raft` (mod, log_store, state_machine, network), `ring` (mod, strategy),
-  `coordinator` (mod, write, read)
+  `coordinator` (mod, write, read), `hint` (segment, store, delivery),
+  `lifecycle` (join, decommission, streaming, rebalance)
 - **What's done:**
   - **Phase 1 (Pair mode):** `PairCoordinator` (write forwarding + replication),
     `DdlCoordinator` + `DdlPath` (DDL forwarding through primary),
@@ -248,16 +256,25 @@ cluster        ██████   █████░  ████░░   █
   - **Phase 2 (Wiring):** `transition_to_cluster()` in ModeController (3rd peer
     triggers Raft group + token ring + coordinator initialization),
     `RaftClusterState` for system.peers
-  - Docker smoke test: 12-phase lifecycle (pair mode phases 1-5, cluster
-    formation, 3-node writes/reads, QUORUM with node failure, below-QUORUM
-    rejection, recovery, DDL replication, FMEA failure modes)
-- **Remaining (Phase 3 — Production Cluster):**
-  - [ ] End-to-end cluster mode activation in binary (RPC handler registration)
-  - [ ] Hinted handoff and repair
-  - [ ] Node lifecycle (leave, decommission, bootstrap streaming)
+  - **Phase 3 Slice 1 (Cluster wiring):** Raft RPC handlers, Raft init in
+    controller, DDL via Raft, concurrent write fan-out, digest computation,
+    remote quorum reads with digest
+  - **Phase 3 Slice 2 (Reconnection):** Connection drop detection, reconnection
+    state machine, PeerManager reconnection, graceful drain
+  - **Phase 3 Slice 3 (Hinted handoff):** Hint segment I/O with CRC32, HintStore
+    with eviction, coordinator hint-on-failure, hint delivery background task
+  - **Phase 3 Slice 4 (Node lifecycle):** ApproveNode Raft command, streaming
+    protocol, node join with approval gate, node decommission via LeaveNode,
+    token rebalancing with skew-aware algorithm
+  - **Phase 3 Slice 5 (Integration tests):** Docker compose (3/5-node profiles),
+    3-node smoke tests (C1-C10), 5-node + lifecycle + FMEA tests
+  - [x] ~~End-to-end cluster mode activation in binary~~
+  - [x] ~~Hinted handoff~~
+  - [x] ~~Node lifecycle (join, decommission, streaming, rebalance)~~
+  - [x] ~~Read repair~~ (deferred — digest reads included)
+- **Remaining:**
   - [ ] NetworkTopologyStrategy (multi-DC)
-  - [ ] Read repair
-  - [ ] Automatic token rebalancing
+  - [ ] Read repair (full inline repair)
   - [ ] Quorum Lease / Mencius optimizations (Paxos-Raft paper)
 - **Spec:** [Cluster Phase 2 Design](../superpowers/specs/2026-03-14-cluster-phase2-design.md)
 - **Phase 1 Spec:** [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
@@ -276,8 +293,11 @@ cluster        ██████   █████░  ████░░   █
 | ~~.deb packaging + systemd service~~ | ~~`scripts/build-deb.sh`~~ | Merged (PR #46) |
 | Release workflow (GitHub Actions) | `.github/workflows/` | In progress (PR #47) |
 | ~~ferrosa-cluster Phase 2 (Raft + Ring + Coordinator)~~ | ~~`feature/raft-cluster-phase2`~~ | Merged |
-| Observability wiring (virtual tables + auth + WebSocket) | `feature/observability-wiring` | In progress |
-| ferrosa-cluster Phase 3 (Production cluster wiring) | — | Next up |
+| ~~Observability wiring (virtual tables + auth + WebSocket)~~ | ~~`feature/observability-wiring`~~ | Merged |
+| ~~ferrosa-cluster Phase 3 (Production cluster)~~ | ~~`feature/production-cluster`~~ | Merged |
+| ~~Hardening sprint~~ | — | Merged |
+| Beta release prep | — | In progress |
+| NetworkTopologyStrategy (multi-DC) | — | Planned |
 
 ## Path to Distributed Operation
 
@@ -287,9 +307,11 @@ The critical path from single-node to multi-node:
 1. ~~**ferrosa-net:** Internode transport (Phase 1)~~ (Done — PR #39)
 1. ~~**ferrosa-cluster:** Pair mode — write forwarding, DDL replication, failover~~ (Done)
 1. ~~**ferrosa-cluster:** Raft metadata, ring topology, coordinator pattern~~ (Done — Phase 2)
-1. **ferrosa-cluster:** End-to-end cluster wiring in binary (Phase 3)
+1. ~~**ferrosa-cluster:** End-to-end cluster wiring in binary~~ (Done — Phase 3)
 1. **ferrosa-schema:** System table persistence (Chunk B)
-1. **ferrosa-cluster:** Hinted handoff and repair
+1. ~~**ferrosa-cluster:** Hinted handoff~~ (Done — Phase 3)
+1. **ferrosa-cluster:** NetworkTopologyStrategy (multi-DC)
+1. **Beta release**
 
 ## Related Documents
 

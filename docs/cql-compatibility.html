@@ -213,6 +213,10 @@
   <h1>CQL <span>Reference</span></h1>
   <p class="subtitle">Ferrosa implements CQL native protocol v5. This page documents what's supported, what's different, and what Ferrosa adds on top.</p>
 
+  <div class="note">
+    <strong>Beta:</strong> Ferrosa is currently in beta. CQL compatibility is under active development. Report any protocol or type handling issues on <a href="https://github.com/ferrosadb/ferrosadb/issues">GitHub</a>.
+  </div>
+
   <div class="toc">
     <h4>On this page</h4>
     <ul>
@@ -298,7 +302,7 @@
       <tr><td>set&lt;T&gt;</td><td>0x0022</td><td><span class="check">Supported</span></td></tr>
       <tr><td>tuple&lt;...&gt;</td><td>0x0031</td><td><span class="check">Supported</span></td></tr>
       <tr><td>frozen&lt;T&gt;</td><td>—</td><td><span class="check">Supported</span></td></tr>
-      <tr><td>duration</td><td>0x0015</td><td><span class="cross">Deferred</span></td></tr>
+      <tr><td>duration</td><td>0x0015</td><td><span class="check">Supported</span></td></tr>
       <tr><td>UDT</td><td>0x0030</td><td><span class="cross">Deferred</span></td></tr>
     </tbody>
   </table>
@@ -365,6 +369,20 @@
 
   <h3>Comparison operators</h3>
   <p>WHERE clauses support: <code>=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>!=</code>, <code>IN</code></p>
+
+  <h3>Consistency levels</h3>
+  <p>Ferrosa supports the following consistency levels for reads and writes:</p>
+  <ul>
+    <li><code>ONE</code></li>
+    <li><code>TWO</code></li>
+    <li><code>THREE</code></li>
+    <li><code>QUORUM</code></li>
+    <li><code>ALL</code></li>
+    <li><code>LOCAL_ONE</code></li>
+    <li><code>LOCAL_QUORUM</code></li>
+    <li><code>EACH_QUORUM</code></li>
+  </ul>
+  <p>Set per-query via the standard CQL protocol flags, or configure a default with <code>FERROSA_DEFAULT_CL</code> (default: <code>QUORUM</code>).</p>
 
   <!-- ── Auth ── -->
   <h2 id="auth-roles">Auth &amp; Roles</h2>
@@ -601,9 +619,9 @@
     <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
     <tbody>
       <tr><td>MATCH ... RETURN</td><td><span class="check">Supported</span></td><td>Pattern matching, WHERE clause, multi-hop</td></tr>
-      <tr><td>CREATE</td><td><span class="check">Supported</span></td><td>Create vertices and edges</td></tr>
-      <tr><td>SET</td><td><span class="check">Supported</span></td><td>Update properties via MATCH ... SET</td></tr>
-      <tr><td>DELETE / DETACH DELETE</td><td><span class="check">Supported</span></td><td>Remove vertices/edges</td></tr>
+      <tr><td>CREATE</td><td><span class="check">Parsed</span></td><td>Parsed; mutate via CQL INSERT (see <a href="cypher.html#create-set-delete">Cypher reference</a>)</td></tr>
+      <tr><td>SET</td><td><span class="check">Parsed</span></td><td>Parsed; mutate via CQL UPDATE</td></tr>
+      <tr><td>DELETE / DETACH DELETE</td><td><span class="check">Parsed</span></td><td>Parsed; mutate via CQL DELETE</td></tr>
       <tr><td>SUBSCRIBE MATCH</td><td><span class="check">Supported</span></td><td>Real-time subscription to graph traversals with EVERY/DELTA</td></tr>
     </tbody>
   </table>
@@ -627,16 +645,12 @@
   <table>
     <thead><tr><th>Feature</th><th>Status</th></tr></thead>
     <tbody>
-      <tr><td>CQL TLS (rustls)</td><td>Planned — critical priority</td></tr>
-      <tr><td>EVENT push notifications</td><td>Planned</td></tr>
-      <tr><td>ALLOW FILTERING</td><td>Planned</td></tr>
       <tr><td>Logged batch atomicity</td><td>Planned</td></tr>
       <tr><td>User-defined types (UDT)</td><td>Planned</td></tr>
       <tr><td>Query tracing</td><td>Planned</td></tr>
       <tr><td>Materialized views</td><td>Planned</td></tr>
       <tr><td>User-defined functions</td><td>Planned — WebAssembly (no Java/JS)</td></tr>
       <tr><td>Lightweight transactions (LWT)</td><td>Planned</td></tr>
-      <tr><td>duration type</td><td>Deferred</td></tr>
     </tbody>
   </table>
 

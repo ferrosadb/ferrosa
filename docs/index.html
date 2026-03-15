@@ -5,7 +5,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Ferrosa — Cassandra Reimagined in Rust, Backed by S3</title>
-  <meta name="description" content="Ferrosa is a drop-in Cassandra replacement built in Rust with S3-backed storage. Zero GC pauses, ephemeral nodes, native graph queries, and 10x lower storage costs.">
+  <meta name="description" content="Ferrosa is a drop-in Cassandra replacement built in Rust with S3-backed storage. Zero GC pauses, ephemeral nodes, production cluster mode with Raft consensus, and 10x lower storage costs. Currently in beta.">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <style>
     :root {
@@ -109,7 +109,7 @@
 
     /* ── Hero ── */
     .hero {
-      padding-top: 10rem;
+      padding-top: 11rem;
       padding-bottom: 6rem;
       text-align: center;
       position: relative;
@@ -676,6 +676,33 @@
 
     footer .footer-links a:hover { color: var(--text-secondary); }
 
+    /* ── Beta Banner ── */
+    .beta-banner {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      text-align: center;
+      padding: 0.5rem 1rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      position: fixed;
+      top: 64px;
+      width: 100%;
+      z-index: 99;
+    }
+
+    .beta-tag {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff;
+      font-size: 0.6875rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      padding: 0.125rem 0.5rem;
+      border-radius: 4px;
+      margin-right: 0.375rem;
+      vertical-align: middle;
+    }
+
     /* ── Responsive ── */
     @media (max-width: 768px) {
       .stats-bar { grid-template-columns: repeat(2, 1fr); }
@@ -685,6 +712,7 @@
       }
       .features-grid { grid-template-columns: 1fr; }
       nav .nav-links { display: none; }
+      .beta-banner { top: 64px; font-size: 0.75rem; }
       .comparison-table { font-size: 0.8125rem; }
       .comparison-table th,
       .comparison-table td { padding: 0.75rem 0.75rem; }
@@ -715,11 +743,15 @@
   </div>
 </nav>
 
+<div class="beta-banner">
+  <span class="beta-tag">BETA</span> Ferrosa is in active development. APIs may change before 1.0.
+</div>
+
 <!-- ═══════════════════ Hero ═══════════════════ -->
 <section class="hero">
   <div class="hero-badge">
     <span class="dot"></span>
-    Active development
+    Beta release — active development
   </div>
   <h1>
     Cassandra. <span class="gradient">Reimagined.</span><br>
@@ -728,7 +760,9 @@
   <p>
     Drop-in CQL compatibility. No GC pauses. Ephemeral nodes that recover in seconds.
     Start on a single node in development, promote to a pair for HA, then scale to
-    a full ring with multi-DC replication — same binary, same config, no migration.
+    a full production cluster with Raft consensus, tunable consistency, and hinted handoff
+    — same binary, same config, no migration.
+    Production-quality code in active development.
   </p>
   <div class="hero-actions">
     <a href="#get-started" class="btn-primary">Get Started</a>
@@ -924,7 +958,7 @@
         <div class="feature-icon index">◎</div>
         <h3>Pluggable Secondary Indexes</h3>
         <p>
-          Six index types behind a single trait: B-tree for range scans, hash for O(1) lookups,
+          Eight index types behind a single trait: B-tree for range scans, hash for O(1) lookups,
           composite for multi-column queries, phonetic for fuzzy string matching (Soundex,
           Metaphone, Double Metaphone, Caverphone), and two vector index methods for
           approximate nearest neighbor search.
@@ -977,26 +1011,78 @@
       <div class="feature-icon observe">📊</div>
       <h3>Built-In Observability</h3>
       <p>
-        Query cluster state with CQL — connections, storage stats, active queries, topology.
-        SUBSCRIBE for streaming updates. Prometheus metrics at /metrics.
-        CLI tool with live TUI dashboards. Authenticated web console with real-time
-        WebSocket push. No external agents required.
+        Query cluster state through virtual tables in the <code>system_observability</code>
+        keyspace — connections, storage stats, active queries, topology. Native Prometheus
+        <code>/metrics</code> endpoint with no exporter needed. Web console with REST API
+        and WebSocket live updates. <code>ferrosa-ctl</code> CLI with TUI dashboard for
+        real-time monitoring. SUBSCRIBE to any view for streaming updates.
       </p>
-      <span class="metric">SELECT * FROM system_observability.*</span>
+      <span class="metric">virtual tables · /metrics · WebSocket · ferrosa-ctl TUI</span>
     </div>
 
-    <!-- Production Ready -->
+    <!-- Production Cluster -->
     <div class="feature-card">
       <div class="feature-icon" style="background: rgba(140, 200, 120, 0.12);">⛨</div>
-      <h3>Production Ready</h3>
+      <h3>Production Cluster Mode</h3>
       <p>
-        Background maintenance loop handles auto-flush, compaction polling, and commit log GC
-        without operator intervention. Graceful shutdown with configurable timeout drains
-        in-flight requests before stopping. Per-connection request limiting provides backpressure
-        under load. Exponential backoff reconnection for internode links. Ships as a systemd
-        service with .deb packaging.
+        5-node clusters with Raft consensus, 8 tunable consistency levels (ONE through ALL,
+        LOCAL_ONE, LOCAL_QUORUM, EACH_QUORUM), and hinted handoff for replica failure recovery.
+        Operator-controlled node join with approval gate, graceful decommission with streaming
+        protocol, and skew-aware token rebalancing. Background maintenance handles auto-flush,
+        compaction, and commit log GC. Ships as a systemd service with .deb packaging
+        and Docker Compose support.
       </p>
-      <span class="metric">auto-flush · compaction · backpressure · graceful shutdown</span>
+      <span class="metric">Raft · tunable CL · hinted handoff · token rebalancing</span>
+    </div>
+
+    <!-- Reconnection & Resilience -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(100, 200, 220, 0.12);">↻</div>
+      <h3>Reconnection &amp; Resilience</h3>
+      <p>
+        Automatic reconnection with exponential backoff for internode links. Graceful drain
+        with configurable timeout ensures in-flight requests complete before shutdown.
+        Connection drop detection and per-connection request limiting provide backpressure
+        under load. Production-quality code built to handle real-world failure scenarios.
+      </p>
+      <span class="metric">auto-reconnect · graceful drain · backpressure</span>
+    </div>
+
+    <!-- Hinted Handoff -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(107, 201, 160, 0.12);">📋</div>
+      <h3>Hinted Handoff</h3>
+      <p>
+        When a replica is temporarily unavailable, writes are stored as hints and replayed
+        automatically when the node recovers. Configurable hint window and TTL ensure data
+        consistency without manual repair for transient failures.
+      </p>
+      <span class="metric">auto hint storage · replay on recovery</span>
+    </div>
+
+    <!-- Node Lifecycle -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(244, 162, 97, 0.12);">🔄</div>
+      <h3>Node Lifecycle Management</h3>
+      <p>
+        Operator-controlled join with approval gate prevents accidental cluster changes.
+        Graceful decommission streams data to remaining nodes before removal. Token
+        rebalancing with skew-aware algorithm redistributes load evenly across the ring.
+      </p>
+      <span class="metric">join · decommission · rebalance</span>
+    </div>
+
+    <!-- Prometheus Metrics -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(240, 200, 100, 0.12);">📈</div>
+      <h3>Prometheus Metrics</h3>
+      <p>
+        Native <code>/metrics</code> endpoint exposes cluster health, query latencies,
+        storage utilization, and connection counts in Prometheus format. No sidecar exporter
+        needed — scrape directly from each Ferrosa node. Integrates with Grafana, Datadog,
+        and any Prometheus-compatible monitoring stack.
+      </p>
+      <span class="metric">native /metrics · no exporter · Grafana-ready</span>
     </div>
 
     <!-- WASM User-Defined Functions -->
@@ -1226,7 +1312,7 @@ user = session.execute(stmt, [user_id])
         </tr>
         <tr>
           <td>Secondary Indexes</td>
-          <td class="ferrosa-col">6 types</td>
+          <td class="ferrosa-col">8 types</td>
           <td>SAI / 2i</td>
           <td>SI</td>
           <td>GSI / LSI</td>
@@ -1258,7 +1344,7 @@ user = session.execute(stmt, [user_id])
         </tr>
         <tr>
           <td>Production Ops</td>
-          <td class="ferrosa-col">Auto-maintenance, graceful shutdown, backpressure, systemd</td>
+          <td class="ferrosa-col">Hinted handoff, auto-reconnect, graceful drain, token rebalance, systemd</td>
           <td>Manual (nodetool)</td>
           <td>Manual + Operator</td>
           <td>Managed</td>
@@ -1330,10 +1416,10 @@ user = session.execute(stmt, [user_id])
       <div class="arch-layer">
         <span class="arch-layer-label">Observe</span>
         <div class="arch-layer-items">
-          <span class="arch-item">Virtual Tables</span>
-          <span class="arch-item">Prometheus</span>
-          <span class="arch-item">Web Console + WS</span>
-          <span class="arch-item">ferrosa-ctl</span>
+          <span class="arch-item">system_observability</span>
+          <span class="arch-item">/metrics (Prometheus)</span>
+          <span class="arch-item">REST API + WebSocket</span>
+          <span class="arch-item">ferrosa-ctl TUI</span>
         </div>
       </div>
       <div class="arch-layer">
@@ -1381,11 +1467,14 @@ user = session.execute(stmt, [user_id])
         <span class="arch-layer-label">Cluster</span>
         <div class="arch-layer-items">
           <span class="arch-item">ferrosa-cluster</span>
-          <span class="arch-item">Pair Mode (HA)</span>
-          <span class="arch-item">DDL Replication</span>
+          <span class="arch-item">Single / Pair / Full Cluster</span>
           <span class="arch-item">Raft (openraft)</span>
+          <span class="arch-item">Tunable CL</span>
+          <span class="arch-item">Hinted Handoff</span>
           <span class="arch-item">Token Ring</span>
           <span class="arch-item">Coordinator</span>
+          <span class="arch-item">Streaming</span>
+          <span class="arch-item">Token Rebalancing</span>
         </div>
       </div>
     </div>
@@ -1411,9 +1500,9 @@ user = session.execute(stmt, [user_id])
       <h3>Dev to production without re-architecting</h3>
       <p>
         Start with a single node on your laptop. Add a second node for high availability
-        with automatic pair mode. Scale to 3+ nodes and Ferrosa forms a full ring with
-        Raft consensus, tunable consistency levels, and multi-DC replication. Same binary,
-        same config format — just add nodes.
+        with automatic pair mode. Scale to 3+ nodes and Ferrosa forms a full production cluster with
+        Raft consensus, tunable consistency levels, hinted handoff, and node lifecycle
+        management. Same binary, same config format — just add nodes.
       </p>
     </div>
     <div class="use-case">
@@ -1459,12 +1548,15 @@ user = session.execute(stmt, [user_id])
       </div>
       <div class="use-case">
         <p class="use-case-label graph-uc">3+ Nodes</p>
-        <h3>Full ring with Raft consensus</h3>
+        <h3>Full production cluster</h3>
         <p>
-          Add a third node and Ferrosa automatically transitions to cluster mode:
-          Raft consensus for metadata (openraft + sled), Murmur3 token ring for data
-          sharding, and a coordinator pattern for tunable consistency writes and reads.
-          QUORUM survives single-node failures. Petabyte-scale with S3-backed storage economics.
+          Add a third node and Ferrosa transitions to full cluster mode:
+          Raft consensus for metadata (openraft), Murmur3 token ring for data
+          sharding, and a coordinator pattern with tunable consistency levels
+          (ONE, QUORUM, ALL, LOCAL_QUORUM, EACH_QUORUM). Hinted handoff stores
+          writes for temporarily failed replicas and replays on recovery. Streaming
+          protocol handles node bootstrap and decommission. Skew-aware token rebalancing
+          keeps load evenly distributed. Deploy with Docker Compose or bare metal.
         </p>
       </div>
     </div>
@@ -1482,10 +1574,10 @@ user = session.execute(stmt, [user_id])
   <div style="max-width: 700px; margin: 0 auto;">
     <div class="code-demo">
       <pre class="code-block active" style="display: block;"><span class="cm"># Download the latest release</span>
-<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_0.1.0_amd64.deb
+<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_0.1.0-beta_amd64.deb
 
 <span class="cm"># Install</span>
-<span class="kw">sudo</span> dpkg -i ferrosa_0.1.0_amd64.deb
+<span class="kw">sudo</span> dpkg -i ferrosa_0.1.0-beta_amd64.deb
 
 <span class="cm"># Start the service</span>
 <span class="kw">sudo</span> systemctl start ferrosa
@@ -1505,10 +1597,10 @@ user = session.execute(stmt, [user_id])
 <section class="cta-section" id="get-started">
   <h2>Ready to leave GC pauses behind?</h2>
   <p>
-    Ferrosa is open source. Get started in minutes.
+    Ferrosa is open source and in beta. Get started in minutes.
   </p>
   <div class="cta-actions">
-    <a href="https://github.com/ferrosadb/ferrosadb/releases/latest" class="btn-primary">Download Latest Release</a>
+    <a href="https://github.com/ferrosadb/ferrosadb/releases/latest" class="btn-primary">Download Beta Release</a>
     <a href="https://github.com/ferrosadb/ferrosadb" class="btn-secondary">View on GitHub</a>
     <a href="getting-started.html" class="btn-secondary">Read the Docs</a>
   </div>
