@@ -331,6 +331,49 @@ mod tests {
         assert_eq!(rows[0]["data"], "<binary>");
     }
 
+    struct NamedStubTable {
+        table_name: &'static str,
+    }
+
+    impl VirtualTable for NamedStubTable {
+        fn name(&self) -> &str {
+            self.table_name
+        }
+        fn keyspace(&self) -> &str {
+            "system_observability"
+        }
+        fn columns(&self) -> &[VirtualColumnDef] {
+            &[]
+        }
+        fn primary_key_columns(&self) -> &[usize] {
+            &[]
+        }
+        fn read(&self, _: Option<&RowPredicate>) -> Vec<VirtualRow> {
+            vec![]
+        }
+        fn subscription_mode(&self) -> SubscriptionMode {
+            SubscriptionMode::Pollable
+        }
+    }
+
+    #[test]
+    fn virtual_table_registration_lists_both_tables() {
+        let registry = VirtualTableRegistry::new();
+        registry.register(Arc::new(NamedStubTable {
+            table_name: "connections",
+        }));
+        registry.register(Arc::new(NamedStubTable {
+            table_name: "active_queries",
+        }));
+
+        let tables = registry.list("system_observability");
+        assert_eq!(tables.len(), 2);
+
+        let names: Vec<&str> = tables.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"connections"));
+        assert!(names.contains(&"active_queries"));
+    }
+
     #[test]
     fn virtual_table_to_json_multiple_columns() {
         let registry = VirtualTableRegistry::new();
