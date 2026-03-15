@@ -172,6 +172,64 @@ impl Default for Manifest {
     }
 }
 
+// ── Schema snapshot persistence ────────────────────────────────────────────
+
+/// Save a serialized schema snapshot to S3 alongside the manifest.
+///
+/// Stored at `{prefix}/schema.json`. This is an unconditional PUT
+/// (no CAS) — last writer wins, which is safe because DDL operations
+/// are serialized through the schema registry.
+pub async fn save_schema_snapshot(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    snapshot_json: &[u8],
+) -> ferrosa_common::Result<()> {
+    let path = schema_path(prefix);
+    store
+        .put(
+            &path,
+            PutPayload::from(Bytes::copy_from_slice(snapshot_json)),
+        )
+        .await
+        .map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("failed to save schema snapshot: {e}"))
+        })?;
+    eprintln!(
+        "schema snapshot saved to S3 ({} bytes)",
+        snapshot_json.len()
+    );
+    Ok(())
+}
+
+/// Load a schema snapshot from S3. Returns `None` if not found.
+pub async fn load_schema_snapshot(
+    store: &dyn ObjectStore,
+    prefix: &str,
+) -> ferrosa_common::Result<Option<Vec<u8>>> {
+    let path = schema_path(prefix);
+    match store.get(&path).await {
+        Ok(result) => {
+            let data = result.bytes().await.map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!("failed to read schema snapshot: {e}"))
+            })?;
+            eprintln!("schema snapshot loaded from S3 ({} bytes)", data.len());
+            Ok(Some(data.to_vec()))
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
+            "failed to load schema snapshot: {e}"
+        ))),
+    }
+}
+
+fn schema_path(prefix: &str) -> ObjectPath {
+    if prefix.is_empty() {
+        ObjectPath::from("schema.json")
+    } else {
+        ObjectPath::from(format!("{prefix}/schema.json"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +323,30 @@ mod tests {
 
             let (loaded, _) = Manifest::load(&store, "").await.unwrap();
             assert_eq!(loaded.sstables["t"].len(), 1);
+        });
+    }
+
+    #[test]
+    fn schema_snapshot_save_load_roundtrip() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let store = InMemory::new();
+            let snapshot_json = br#"{"version":"00000000-0000-0000-0000-000000000001","keyspaces":{},"tables":{},"roles":{},"grants":{},"indexes":{}}"#;
+
+            save_schema_snapshot(&store, "", snapshot_json).await.unwrap();
+            let loaded = load_schema_snapshot(&store, "").await.unwrap();
+            assert!(loaded.is_some());
+            assert_eq!(loaded.unwrap(), snapshot_json.to_vec());
+        });
+    }
+
+    #[test]
+    fn schema_snapshot_not_found_returns_none() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let store = InMemory::new();
+            let loaded = load_schema_snapshot(&store, "").await.unwrap();
+            assert!(loaded.is_none());
         });
     }
 }

@@ -78,6 +78,90 @@ fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
     id
 }
 
+/// Bootstrap schema and table registrations from S3.
+///
+/// On a cold restart (local data wiped, S3 has data), this function:
+/// 1. Loads the schema snapshot from S3 (`schema.json`)
+/// 2. Applies it to the in-memory schema (creates keyspaces + tables)
+/// 3. Registers each table with the StorageEngine so reads can proceed
+async fn bootstrap_from_s3(
+    storage: &ferrosa_storage::StorageEngine,
+    schema: &ferrosa_schema::Schema,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (os_config, store) = storage.object_store_and_config()?;
+    let prefix = &os_config.prefix;
+
+    // Load schema snapshot
+    let snapshot_data = ferrosa_storage::load_schema_snapshot(store.as_ref(), prefix).await?;
+    let snapshot_data = match snapshot_data {
+        Some(data) => data,
+        None => {
+            tracing::info!("no schema snapshot in S3 — starting fresh");
+            return Ok(());
+        }
+    };
+
+    let snapshot: ferrosa_schema::SchemaSnapshot =
+        serde_json::from_slice(&snapshot_data).map_err(|e| format!("bad schema.json: {e}"))?;
+
+    let table_count = snapshot.tables.len();
+    let ks_count = snapshot.keyspaces.len();
+
+    // Apply schema (creates keyspaces, tables, roles, grants)
+    schema.apply_snapshot(snapshot)?;
+
+    // Register each table with the StorageEngine
+    let snap = schema.snapshot();
+    for ((_ks, _tbl), table_meta) in &snap.tables {
+        if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
+            continue;
+        }
+        let storage_schema = table_meta.to_storage_schema();
+        if let Err(e) = storage.register_table(storage_schema) {
+            tracing::warn!(
+                table = %table_meta.name,
+                ks = %table_meta.keyspace,
+                "failed to register table from S3 bootstrap: {e}"
+            );
+        }
+    }
+
+    // Also load the manifest to know about SSTables
+    let (manifest, _version) = ferrosa_storage::Manifest::load(store.as_ref(), prefix).await?;
+    let sstable_count: usize = manifest.sstables.values().map(|v| v.len()).sum();
+
+    tracing::info!(
+        ks_count,
+        table_count,
+        sstable_count,
+        "S3 bootstrap complete: schema and tables restored"
+    );
+
+    Ok(())
+}
+
+/// Persist the current schema snapshot to S3 for cold restart recovery.
+async fn persist_schema_to_s3(
+    storage: &ferrosa_storage::StorageEngine,
+    schema: &ferrosa_schema::Schema,
+) {
+    let Ok((os_config, store)) = storage.object_store_and_config() else {
+        return;
+    };
+    let snap = schema.snapshot();
+    match serde_json::to_vec_pretty(&*snap) {
+        Ok(json) => {
+            if let Err(e) =
+                ferrosa_storage::save_schema_snapshot(store.as_ref(), &os_config.prefix, &json)
+                    .await
+            {
+                tracing::warn!("failed to persist schema to S3: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("failed to serialize schema snapshot: {e}"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize tracing
@@ -127,6 +211,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mode: ferrosa_schema::DeploymentMode::Development,
     };
     let schema = Arc::new(ferrosa_schema::Schema::new(schema_config)?);
+
+    // 4b. S3 bootstrap: if S3 is configured and local data is empty,
+    //     try to recover schema + table registrations from S3.
+    if storage.has_s3() {
+        let sstables_dir = Path::new(&data_dir).join("sstables");
+        let local_empty = !sstables_dir.exists()
+            || std::fs::read_dir(&sstables_dir)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true);
+
+        if local_empty {
+            tracing::info!("S3 configured, local data empty — attempting S3 bootstrap");
+            if let Err(e) = bootstrap_from_s3(&storage, &schema).await {
+                tracing::warn!("S3 bootstrap failed (non-fatal, starting fresh): {e}");
+            }
+        }
+    }
 
     // 5. Create ModeController — starts in standalone mode
     let cluster_config = Arc::new(ferrosa_cluster::ClusterConfig::from_env());
@@ -344,13 +445,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 12. Background maintenance loop: periodic flush, compaction polling, commit log GC
+    // 12. Background maintenance loop: periodic flush, compaction polling, commit log GC,
+    //     and S3 schema persistence.
     let maintenance_engine = storage.clone();
+    let maintenance_schema = schema.clone();
     let has_s3 = maintenance_engine.has_s3();
     tokio::spawn(async move {
         let mut flush_interval = tokio::time::interval(std::time::Duration::from_secs(30));
         let mut compact_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        // Persist schema snapshot to S3 every 60s (catches DDL changes).
+        let mut schema_sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
         let mut s3_warned = false;
+        let mut last_schema_version = uuid::Uuid::nil();
 
         loop {
             tokio::select! {
@@ -373,17 +479,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = compact_interval.tick() => {
                     maintenance_engine.poll_compactions();
 
-                    // TODO: S3 upload should be triggered from flush/compaction results.
-                    // The UploadManager infrastructure exists but wiring it requires
-                    // knowing which SSTable files were produced by each flush — that's
-                    // a larger refactor to make flush() and poll_compactions() return
-                    // SSTable handles.
                     if has_s3 && !s3_warned {
                         tracing::warn!(
                             "S3 object storage configured but automatic upload not yet wired; \
                              SSTables will remain on local disk only"
                         );
                         s3_warned = true;
+                    }
+                }
+                _ = schema_sync_interval.tick() => {
+                    if !has_s3 { continue; }
+                    // Only save if schema changed since last sync.
+                    let snap = maintenance_schema.snapshot();
+                    if snap.version != last_schema_version {
+                        persist_schema_to_s3(&maintenance_engine, &maintenance_schema).await;
+                        last_schema_version = snap.version;
                     }
                 }
             }

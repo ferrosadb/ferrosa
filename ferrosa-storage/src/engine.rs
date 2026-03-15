@@ -755,6 +755,19 @@ impl StorageEngine {
         self.upload_manager.is_some()
     }
 
+    /// Returns the S3 object store and config, if S3 is configured.
+    pub fn object_store_and_config(
+        &self,
+    ) -> ferrosa_common::Result<(&ObjectStoreConfig, Arc<dyn object_store::ObjectStore>)> {
+        let os_config = self
+            .config
+            .object_store
+            .as_ref()
+            .ok_or_else(|| ferrosa_common::Error::InvalidFormat("S3 not configured".into()))?;
+        let store = os_config.build_object_store()?;
+        Ok((os_config, Arc::from(store)))
+    }
+
     /// Discards commit log segments that have no remaining dirty tables.
     ///
     /// Called from the background maintenance loop. Returns the number of

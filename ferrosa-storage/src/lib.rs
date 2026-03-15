@@ -38,7 +38,7 @@ pub use compaction::{
 };
 pub use engine::{StorageEngine, StorageEngineConfig};
 pub use flush::{FileFlushTarget, FlushTarget, InMemoryFlushTarget};
-pub use manifest::Manifest;
+pub use manifest::{load_schema_snapshot, save_schema_snapshot, Manifest};
 pub use memtable::sharded::ShardedBTreeMemtable;
 #[cfg(feature = "skiplist-memtable")]
 pub use memtable::skiplist::SkipListMemtable;
