@@ -11,6 +11,7 @@
 //!   4. Peer reconnects → auto re-pair, promoted node stays primary
 //!   5. Operator can `switchover()` to swap roles
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,7 +49,7 @@ use crate::raft::handlers::{
 use crate::raft::log_store::SledLogStore;
 use crate::raft::network::FerrosRaftNetworkFactory;
 use crate::raft::state_machine::FerrosStateMachine;
-use crate::raft::{uuid_to_node_id, FerrosRaft, NodeInfo, NodeState};
+use crate::raft::{uuid_to_node_id, FerrosRaft, NodeInfo, NodeState, RaftCommand};
 use crate::ring::TokenRing;
 use crate::state::{PairClusterState, RaftClusterState};
 use crate::write_path::WritePath;
@@ -107,6 +108,11 @@ pub struct ModeController {
     hint_store: Arc<HintStore>,
     /// Hint delivery configuration — batch size, interval, etc.
     hint_config: HintConfig,
+    /// Set of host IDs approved to join the cluster.
+    ///
+    /// Mirrors `RaftState.approved_nodes` for synchronous access in join checks.
+    /// Updated when `ApproveNode` commands are committed.
+    approved_nodes: Mutex<BTreeSet<Uuid>>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -177,6 +183,7 @@ impl ModeController {
             raft_instance: Arc::new(ArcSwap::from_pointee(None)),
             hint_store,
             hint_config,
+            approved_nodes: Mutex::new(BTreeSet::new()),
         });
 
         let handles = ModeControllerHandles {
@@ -221,6 +228,84 @@ impl ModeController {
     /// [`ClusterCoordinator::with_hint_store`].
     pub fn hint_store(&self) -> Arc<HintStore> {
         self.hint_store.clone()
+    }
+
+    /// Record that a node has been approved to join the cluster.
+    ///
+    /// This mirrors the `ApproveNode` Raft command's effect on
+    /// `RaftState.approved_nodes` so that the controller can perform
+    /// synchronous approval checks in `handle_join_request`.
+    pub fn approve_node(&self, host_id: Uuid) {
+        self.approved_nodes.lock().unwrap().insert(host_id);
+    }
+
+    /// Handle a join request from a new node.
+    ///
+    /// 1. Check `approved_nodes` unless `auto_join=true`.
+    /// 2. Compute delta mutations (for now: empty — S3 bootstrap covers most data).
+    /// 3. If delta needed, stream via `StreamSender`.
+    /// 4. Generate deterministic tokens for the new node.
+    /// 5. Propose `JoinNode` + `AssignTokens` via Raft.
+    pub async fn handle_join_request(
+        &self,
+        peer_host_id: Uuid,
+        peer_node_id: u64,
+        _manifest_state: Option<()>, // placeholder for ManifestState
+    ) -> Result<()> {
+        // 1. Approval check — unless auto_join is enabled.
+        //    Checked before Raft access so unapproved nodes are rejected fast.
+        if !self.config.auto_join {
+            let approved = self.approved_nodes.lock().unwrap();
+            if !approved.contains(&peer_host_id) {
+                return Err(ClusterError::NotApproved(peer_host_id));
+            }
+        }
+
+        let raft = self
+            .raft()
+            .ok_or_else(|| ClusterError::Internal("raft not initialized".into()))?;
+
+        // 2. Delta computation — S3 bootstrap covers most data, so delta is empty for MVP.
+        // In the future, compare manifest_state with current S3 state to compute delta.
+
+        // 3. No delta streaming needed for MVP.
+
+        // 4. Generate deterministic tokens for the new node.
+        let num_tokens = self.config.num_tokens as usize;
+        let tokens: Vec<i64> = (0..num_tokens)
+            .map(|i| generate_deterministic_token(peer_node_id, i))
+            .collect();
+
+        // 5. Propose JoinNode via Raft.
+        let node_info = NodeInfo {
+            host_id: peer_host_id,
+            addr: String::new(), // will be filled by the connecting peer
+            data_center: self.config.data_center.clone(),
+            rack: self.config.rack.clone(),
+            state: NodeState::Normal,
+        };
+
+        let join_cmd = RaftCommand::JoinNode(node_info);
+        raft.client_write(join_cmd)
+            .await
+            .map_err(|e| ClusterError::RaftError(format!("JoinNode proposal failed: {e}")))?;
+
+        // Propose AssignTokens via Raft.
+        let assign_cmd = RaftCommand::AssignTokens {
+            node_id: peer_node_id,
+            tokens,
+        };
+        raft.client_write(assign_cmd)
+            .await
+            .map_err(|e| ClusterError::RaftError(format!("AssignTokens proposal failed: {e}")))?;
+
+        tracing::info!(
+            host_id = %peer_host_id,
+            node_id = peer_node_id,
+            "node join complete: JoinNode + AssignTokens committed"
+        );
+
+        Ok(())
     }
 
     /// Force-promote this node to standalone primary.
@@ -867,7 +952,7 @@ impl InboundPeerCallback for ModeController {
 /// Uses a hash-like mixing of node_id and token index to produce well-distributed
 /// token values across the i64 range. All nodes running the same code will compute
 /// the same token assignments for the same (node_id, index) pair.
-fn generate_deterministic_token(node_id: u64, index: usize) -> i64 {
+pub(crate) fn generate_deterministic_token(node_id: u64, index: usize) -> i64 {
     // Simple but effective: use wrapping multiply with a prime and XOR to spread bits.
     let mut h = node_id.wrapping_mul(0x517cc1b727220a95);
     h ^= (index as u64).wrapping_mul(0x6c62272e07bb0142);
@@ -1214,5 +1299,117 @@ mod tests {
         // Different node IDs produce different tokens
         let t4 = generate_deterministic_token(99u64, 0);
         assert_ne!(t1, t4, "different nodes should produce different tokens");
+    }
+
+    // ---- Task 17: Node join tests ----------------------------------------
+
+    #[tokio::test]
+    async fn unapproved_node_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let schema = test_schema();
+        let config = Arc::new(ClusterConfig {
+            auto_join: false,
+            ..ClusterConfig::default()
+        });
+        let net_config = Arc::new(NetConfig::default());
+        let local_id = Uuid::new_v4();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) =
+            ModeController::new(config, net_config, local_id, storage, schema, registry);
+
+        let peer_host_id = Uuid::new_v4();
+        let peer_node_id = uuid_to_node_id(peer_host_id);
+
+        // auto_join=false, node not in approved_nodes -> Err(NotApproved)
+        let result = controller
+            .handle_join_request(peer_host_id, peer_node_id, None)
+            .await;
+        assert!(
+            matches!(result, Err(ClusterError::NotApproved(id)) if id == peer_host_id),
+            "unapproved node must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_node_passes_approval_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let schema = test_schema();
+        let config = Arc::new(ClusterConfig {
+            auto_join: false,
+            ..ClusterConfig::default()
+        });
+        let net_config = Arc::new(NetConfig::default());
+        let local_id = Uuid::new_v4();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) =
+            ModeController::new(config, net_config, local_id, storage, schema, registry);
+
+        let peer_host_id = Uuid::new_v4();
+        let peer_node_id = uuid_to_node_id(peer_host_id);
+
+        // Approve the node first
+        controller.approve_node(peer_host_id);
+
+        // auto_join=false, node in approved_nodes -> passes approval,
+        // but fails at raft check (expected — raft not initialized in standalone)
+        let result = controller
+            .handle_join_request(peer_host_id, peer_node_id, None)
+            .await;
+        assert!(
+            matches!(result, Err(ClusterError::Internal(_))),
+            "approved node should pass approval check but fail on raft: got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_join_bypasses_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let schema = test_schema();
+        let config = Arc::new(ClusterConfig {
+            auto_join: true,
+            ..ClusterConfig::default()
+        });
+        let net_config = Arc::new(NetConfig::default());
+        let local_id = Uuid::new_v4();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) =
+            ModeController::new(config, net_config, local_id, storage, schema, registry);
+
+        let peer_host_id = Uuid::new_v4();
+        let peer_node_id = uuid_to_node_id(peer_host_id);
+
+        // auto_join=true -> bypasses approval, but fails at raft check
+        let result = controller
+            .handle_join_request(peer_host_id, peer_node_id, None)
+            .await;
+        // Should NOT be NotApproved — should be Internal (raft not initialized)
+        assert!(
+            matches!(result, Err(ClusterError::Internal(_))),
+            "auto_join should bypass approval check: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn join_generates_correct_token_count() {
+        // Verify that generate_deterministic_token produces num_tokens unique tokens.
+        let node_id = 12345u64;
+        let num_tokens = 256;
+        let tokens: Vec<i64> = (0..num_tokens)
+            .map(|i| generate_deterministic_token(node_id, i))
+            .collect();
+
+        // All tokens should be unique.
+        let unique: std::collections::HashSet<i64> = tokens.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            num_tokens,
+            "all 256 tokens must be unique for a given node"
+        );
     }
 }

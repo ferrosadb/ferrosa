@@ -93,6 +93,22 @@ impl TokenRing {
     pub fn node_ids(&self) -> Vec<u64> {
         self.nodes.keys().copied().collect()
     }
+
+    /// Get all tokens assigned to a specific node.
+    pub fn tokens_for_node(&self, node_id: u64) -> Vec<Token> {
+        self.ring
+            .iter()
+            .filter(|(_, &n)| n == node_id)
+            .map(|(&t, _)| t)
+            .collect()
+    }
+
+    /// Update the lifecycle state of a node.
+    pub fn set_node_state(&mut self, node_id: u64, state: crate::raft::NodeState) {
+        if let Some(info) = self.nodes.get_mut(&node_id) {
+            info.state = state;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,5 +247,39 @@ mod tests {
         ring.remove_node(42);
         assert_eq!(ring.node_count(), 0);
         assert!(ring.get_node(42).is_none());
+    }
+
+    #[test]
+    fn tokens_for_node_returns_assigned_tokens() {
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node("10.0.0.1:7000"));
+        ring.add_node(2, make_node("10.0.0.2:7000"));
+
+        ring.assign_tokens(1, &[10, 20, 30]);
+        ring.assign_tokens(2, &[40, 50]);
+
+        let mut node1_tokens = ring.tokens_for_node(1);
+        node1_tokens.sort_unstable();
+        assert_eq!(node1_tokens, vec![10, 20, 30]);
+
+        let mut node2_tokens = ring.tokens_for_node(2);
+        node2_tokens.sort_unstable();
+        assert_eq!(node2_tokens, vec![40, 50]);
+
+        // Non-existent node returns empty
+        assert!(ring.tokens_for_node(99).is_empty());
+    }
+
+    #[test]
+    fn set_node_state_updates_state() {
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node("10.0.0.1:7000"));
+        assert_eq!(ring.get_node(1).unwrap().state, NodeState::Normal);
+
+        ring.set_node_state(1, NodeState::Leaving);
+        assert_eq!(ring.get_node(1).unwrap().state, NodeState::Leaving);
+
+        ring.set_node_state(1, NodeState::Decommissioned);
+        assert_eq!(ring.get_node(1).unwrap().state, NodeState::Decommissioned);
     }
 }

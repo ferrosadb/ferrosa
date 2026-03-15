@@ -1,5 +1,7 @@
 use std::fmt;
 
+use uuid::Uuid;
+
 /// Errors produced by ferrosa-cluster.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -39,6 +41,8 @@ pub enum ClusterError {
     CatchUpRequired,
     /// Raft consensus error (fatal or unexpected).
     RaftError(String),
+    /// Node has not been approved to join the cluster.
+    NotApproved(Uuid),
     /// Underlying storage error.
     Storage(ferrosa_common::Error),
     /// Underlying network error.
@@ -90,6 +94,7 @@ impl fmt::Display for ClusterError {
             Self::ModeTransitionRejected(reason) => write!(f, "mode transition rejected: {reason}"),
             Self::ReplicationFailed(reason) => write!(f, "replication failed: {reason}"),
             Self::CatchUpRequired => write!(f, "peer requires full catch-up"),
+            Self::NotApproved(host_id) => write!(f, "node {host_id} not approved to join"),
             Self::RaftError(msg) => write!(f, "raft error: {msg}"),
             Self::Storage(e) => write!(f, "storage: {e}"),
             Self::Net(e) => write!(f, "net: {e}"),
