@@ -1,0 +1,36 @@
+# Static musl build for Ferrosa
+#
+# Produces a statically-linked binary suitable for Firecracker guests,
+# Alpine containers, or any Linux system without glibc.
+#
+# Usage:
+#   docker build -f Dockerfile.musl -t ferrosa-musl .
+#   docker create --name extract ferrosa-musl
+#   docker cp extract:/ferrosa .
+#   docker cp extract:/ferrosa-ctl .
+#   docker rm extract
+#
+# Or via make:
+#   make build-musl-docker
+
+FROM rust:1.86 AS builder
+
+RUN apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/*
+RUN rustup target add x86_64-unknown-linux-musl
+
+WORKDIR /build
+COPY . .
+
+# Configure musl linker
+RUN mkdir -p .cargo && printf '[target.x86_64-unknown-linux-musl]\nlinker = "musl-gcc"\nrustflags = ["-C", "target-feature=+crt-static"]\n' > .cargo/config.toml
+
+RUN cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl
+
+RUN strip target/x86_64-unknown-linux-musl/release/ferrosa \
+    && strip target/x86_64-unknown-linux-musl/release/ferrosa-ctl \
+    && file target/x86_64-unknown-linux-musl/release/ferrosa | grep -q "statically linked"
+
+# Minimal output image with just the binaries
+FROM scratch
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/ferrosa /ferrosa
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/ferrosa-ctl /ferrosa-ctl

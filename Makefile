@@ -1,10 +1,11 @@
 # Ferrosa build targets
 #
-# Default (glibc):  make build
-# Static (musl):    make build-musl
-# Both:             make all
+# Default (glibc):       make build
+# Static (musl, local):  make build-musl
+# Static (musl, Docker): make build-musl-docker   (no local musl-tools needed)
+# Both:                  make all
 #
-# Prerequisites for musl:
+# Prerequisites for local musl:
 #   rustup target add x86_64-unknown-linux-musl
 #   sudo apt install musl-tools   # Ubuntu/Debian
 #   sudo dnf install musl-gcc     # Fedora
@@ -19,7 +20,7 @@ MUSL_TARGET := x86_64-unknown-linux-musl
 MUSL_DIR    := $(TARGET_DIR)/$(MUSL_TARGET)/release
 BINARIES    := ferrosa ferrosa-ctl
 
-.PHONY: build build-musl all clean test check fmt clippy
+.PHONY: build build-musl build-musl-docker all clean test check fmt clippy
 
 # Default: standard glibc build
 build:
@@ -35,6 +36,20 @@ build-musl:
 	$(CARGO) build --release --target $(MUSL_TARGET)
 	@echo ""
 	@echo "Static binaries:"
+	@for bin in $(BINARIES); do \
+		echo "  $(MUSL_DIR)/$$bin ($$(file $(MUSL_DIR)/$$bin | grep -o 'statically linked'))"; \
+	done
+
+# Static musl build via Docker (no local musl-tools needed)
+build-musl-docker:
+	docker build -f Dockerfile.musl -t ferrosa-musl .
+	@mkdir -p $(MUSL_DIR)
+	docker create --name ferrosa-musl-extract ferrosa-musl 2>/dev/null || true
+	docker cp ferrosa-musl-extract:/ferrosa $(MUSL_DIR)/ferrosa
+	docker cp ferrosa-musl-extract:/ferrosa-ctl $(MUSL_DIR)/ferrosa-ctl
+	docker rm ferrosa-musl-extract
+	@echo ""
+	@echo "Static binaries (built in Docker):"
 	@for bin in $(BINARIES); do \
 		echo "  $(MUSL_DIR)/$$bin ($$(file $(MUSL_DIR)/$$bin | grep -o 'statically linked'))"; \
 	done
