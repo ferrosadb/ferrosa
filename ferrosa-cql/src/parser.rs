@@ -763,6 +763,7 @@ impl<'input> Parser<'input> {
 
         let mut add_columns = vec![];
         let mut drop_columns = vec![];
+        let mut extensions = None;
 
         let tok = self.lexer.peek()?;
         match &tok.kind {
@@ -777,11 +778,27 @@ impl<'input> Parser<'input> {
                 let col_name = self.parse_ident()?;
                 drop_columns.push(col_name);
             }
+            TokenKind::Keyword(Keyword::With) => {
+                let with_pos = tok.pos;
+                self.lexer.next_token()?;
+                // Expect `extensions = { ... }`
+                let prop_name = self.parse_ident()?;
+                if prop_name != "extensions" {
+                    return Err(CqlError::SyntaxError(format!(
+                        "expected 'extensions' after WITH in ALTER TABLE, got '{}' at position {}",
+                        prop_name, with_pos
+                    )));
+                }
+                self.lexer.expect(&TokenKind::Eq)?;
+                extensions = Some(self.parse_string_map()?);
+            }
             _ => {
+                let kind = tok.kind.clone();
+                let pos = tok.pos;
                 return Err(CqlError::SyntaxError(format!(
-                    "expected ADD or DROP after ALTER TABLE, got {:?} at position {}",
-                    tok.kind, tok.pos
-                )))
+                    "expected ADD, DROP, or WITH after ALTER TABLE, got {:?} at position {}",
+                    kind, pos
+                )));
             }
         }
 
@@ -790,6 +807,7 @@ impl<'input> Parser<'input> {
             table,
             add_columns,
             drop_columns,
+            extensions,
         })
     }
 
@@ -802,6 +820,9 @@ impl<'input> Parser<'input> {
         let tok = self.lexer.peek()?;
         match &tok.kind {
             TokenKind::Keyword(Keyword::Table) => self.parse_drop_table().map(Statement::DropTable),
+            TokenKind::Keyword(Keyword::Keyspace) => {
+                self.parse_drop_keyspace().map(Statement::DropKeyspace)
+            }
             TokenKind::Keyword(Keyword::Index) => self.parse_drop_index().map(Statement::DropIndex),
             TokenKind::Keyword(Keyword::Type) => self.parse_drop_type(),
             TokenKind::Keyword(Keyword::Function) => self.parse_drop_function(),
@@ -811,6 +832,14 @@ impl<'input> Parser<'input> {
                 tok.kind, tok.pos
             ))),
         }
+    }
+
+    fn parse_drop_keyspace(&mut self) -> Result<DropKeyspaceStatement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Keyspace))?;
+        let if_exists = self.parse_if_exists()?;
+        let name = self.parse_ident()?;
+
+        Ok(DropKeyspaceStatement { name, if_exists })
     }
 
     fn parse_drop_table(&mut self) -> Result<DropTableStatement, CqlError> {
@@ -2235,6 +2264,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_alter_table_with_extensions() {
+        let stmt =
+            parse("ALTER TABLE ks.tbl WITH extensions = {'vertex_label': 'Person'}").unwrap();
+        match stmt {
+            Statement::AlterTable(s) => {
+                assert_eq!(s.keyspace, Some("ks".into()));
+                assert_eq!(s.table, "tbl");
+                assert!(s.add_columns.is_empty());
+                assert!(s.drop_columns.is_empty());
+                let ext = s.extensions.expect("extensions should be Some");
+                assert_eq!(ext.len(), 1);
+                assert_eq!(ext[0], ("vertex_label".into(), "Person".into()));
+            }
+            other => panic!("expected AlterTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_with_extensions_multi() {
+        let stmt = parse(
+            "ALTER TABLE social.users WITH extensions = {'graph.type': 'vertex', 'graph.label': 'Person'}"
+        ).unwrap();
+        match stmt {
+            Statement::AlterTable(s) => {
+                assert_eq!(s.keyspace, Some("social".into()));
+                assert_eq!(s.table, "users");
+                let ext = s.extensions.expect("extensions should be Some");
+                assert_eq!(ext.len(), 2);
+                assert_eq!(ext[0], ("graph.type".into(), "vertex".into()));
+                assert_eq!(ext[1], ("graph.label".into(), "Person".into()));
+            }
+            other => panic!("expected AlterTable, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_drop_table() {
         let stmt = parse("DROP TABLE IF EXISTS ks.users").unwrap();
         match stmt {
@@ -2244,6 +2309,30 @@ mod tests {
                 assert_eq!(s.table, "users");
             }
             other => panic!("expected DropTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_drop_keyspace() {
+        let stmt = parse("DROP KEYSPACE my_ks").unwrap();
+        match stmt {
+            Statement::DropKeyspace(s) => {
+                assert_eq!(s.name, "my_ks");
+                assert!(!s.if_exists);
+            }
+            other => panic!("expected DropKeyspace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_drop_keyspace_if_exists() {
+        let stmt = parse("DROP KEYSPACE IF EXISTS my_ks").unwrap();
+        match stmt {
+            Statement::DropKeyspace(s) => {
+                assert_eq!(s.name, "my_ks");
+                assert!(s.if_exists);
+            }
+            other => panic!("expected DropKeyspace, got {:?}", other),
         }
     }
 

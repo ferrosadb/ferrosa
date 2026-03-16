@@ -110,7 +110,7 @@ pub fn query_local(schema: &Schema, node_config: &NodeConfig) -> LocalInfo {
         partitioner: "org.apache.cassandra.dht.Murmur3Partitioner".to_string(),
         native_protocol_version: "5".to_string(),
         cql_version: "3.4.7".to_string(),
-        release_version: "5.1.0-ferrosa".to_string(),
+        release_version: crate::system::RELEASE_VERSION.to_string(),
         schema_version: snap.version,
         rpc_port: node_config.rpc_port,
         listen_address: node_config.listen_address,
@@ -168,5 +168,18 @@ mod tests {
         );
         assert_eq!(info.native_protocol_version, "5");
         assert_eq!(info.schema_version, schema.snapshot().version);
+    }
+
+    /// BUG-020: release_version must use the shared RELEASE_VERSION constant.
+    #[test]
+    fn query_local_release_version_uses_constant() {
+        let schema = test_schema();
+        let node_config = NodeConfig::default();
+        let info = query_local(&schema, &node_config);
+        assert_eq!(
+            info.release_version,
+            crate::system::RELEASE_VERSION,
+            "system.local release_version must match the shared constant"
+        );
     }
 }

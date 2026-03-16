@@ -119,7 +119,7 @@ mod tests {
                     native_port: 9042,
                     schema_version: Uuid::nil(), // will be overwritten
                     tokens: vec!["-9223372036854775808".to_string()],
-                    release_version: "5.1.0-ferrosa".to_string(),
+                    release_version: crate::system::RELEASE_VERSION.to_string(),
                 }]
             }
         }

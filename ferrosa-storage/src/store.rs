@@ -293,6 +293,21 @@ impl<F: FlushTarget> TableStore<F> {
         self.view.load().active.partition_count()
     }
 
+    /// Truncate (clear) all data: replaces the memtable with a fresh one
+    /// and drops all SSTable references.
+    ///
+    /// Existing readers holding `Arc` references to the old memtable or
+    /// SSTables will complete normally; the data is freed once those
+    /// references drop. On-disk SSTable files remain until GC.
+    pub fn truncate(&self) {
+        let _guard = self.flush_guard.lock();
+        self.view.store(Arc::new(StoreView {
+            active: new_memtable(),
+            flushing: None,
+            sstables: Arc::new(vec![]),
+        }));
+    }
+
     /// Atomically replace input SSTables with a compacted output SSTable.
     ///
     /// Removes the `input_count` oldest SSTables (from the end of the

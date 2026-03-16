@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use openraft::storage::RaftStateMachine;
 use openraft::{
     BasicNode, Entry, EntryPayload, LogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta,
@@ -32,6 +33,7 @@ use ferrosa_storage::TableId;
 
 use crate::config::ClusterConfig;
 use crate::raft::{FerrosRaftConfig, NodeInfo, RaftCommand, RaftResponse, Token};
+use crate::ring::TokenRing;
 
 // ---------------------------------------------------------------------------
 // RaftState
@@ -108,6 +110,9 @@ pub struct FerrosStateMachine {
     schema: Option<Arc<Schema>>,
     /// Optional local storage engine for table registration side effects.
     engine: Option<Arc<StorageEngine>>,
+    /// Optional live token ring — updated after topology commands
+    /// (`JoinNode`, `LeaveNode`, `AssignTokens`).
+    ring: Option<Arc<ArcSwap<TokenRing>>>,
 }
 
 impl FerrosStateMachine {
@@ -120,6 +125,7 @@ impl FerrosStateMachine {
             current_snapshot: None,
             schema: None,
             engine: None,
+            ring: None,
         }
     }
 
@@ -133,12 +139,43 @@ impl FerrosStateMachine {
             current_snapshot: None,
             schema: Some(schema),
             engine: Some(engine),
+            ring: None,
         }
+    }
+
+    /// Wire a live token ring for topology side effects.
+    ///
+    /// When set, topology commands (`JoinNode`, `LeaveNode`, `AssignTokens`)
+    /// will rebuild the ring from `RaftState` and store it via `ArcSwap`.
+    pub fn set_ring(&mut self, ring: Arc<ArcSwap<TokenRing>>) {
+        self.ring = Some(ring);
     }
 
     /// Read-only access to the current cluster state.
     pub fn state(&self) -> &RaftState {
         &self.state
+    }
+
+    /// Rebuild the live `TokenRing` from current `RaftState` and store it.
+    ///
+    /// Called after every topology-changing command so that the
+    /// `ArcSwap<TokenRing>` always reflects the committed Raft state.
+    fn sync_ring(&self) {
+        if let Some(ring_swap) = &self.ring {
+            let mut ring = TokenRing::new();
+
+            // Populate nodes.
+            for (&node_id, info) in &self.state.members {
+                ring.add_node(node_id, info.clone());
+            }
+
+            // Populate token assignments.
+            for (&token, &node_id) in &self.state.token_map {
+                ring.assign_tokens(node_id, &[token]);
+            }
+
+            ring_swap.store(Arc::new(ring));
+        }
     }
 
     /// Apply a single [`RaftCommand`] to `self.state`, updating BTreeMaps
@@ -424,15 +461,18 @@ impl FerrosStateMachine {
             RaftCommand::JoinNode(node_info) => {
                 let node_id = super::uuid_to_node_id(node_info.host_id);
                 self.state.members.insert(node_id, node_info);
+                self.sync_ring();
             }
             RaftCommand::LeaveNode { node_id } => {
                 self.state.members.remove(&node_id);
                 self.state.token_map.retain(|_, n| *n != node_id);
+                self.sync_ring();
             }
             RaftCommand::AssignTokens { node_id, tokens } => {
                 for token in tokens {
                     self.state.token_map.insert(token, node_id);
                 }
+                self.sync_ring();
             }
 
             // ---- Config ------------------------------------------------
@@ -547,6 +587,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             current_snapshot: self.current_snapshot.clone(),
             schema: None, // snapshot builder doesn't need side effects
             engine: None,
+            ring: None, // snapshot builder doesn't need live ring
         }
     }
 
@@ -1232,6 +1273,100 @@ mod tests {
                 .types
                 .contains_key(&("doomed".into(), "address".into())),
             "types in dropped keyspace should be removed"
+        );
+    }
+
+    // ---- BUG-011: topology changes must update live ring ----------------
+
+    #[tokio::test]
+    async fn join_node_updates_live_ring() {
+        use crate::ring::TokenRing;
+        use arc_swap::ArcSwap;
+
+        let ring = Arc::new(ArcSwap::from_pointee(TokenRing::new()));
+        let mut sm = FerrosStateMachine::new();
+        sm.set_ring(ring.clone());
+
+        let host_id = Uuid::new_v4();
+        let node_id = super::super::uuid_to_node_id(host_id);
+        let node = NodeInfo {
+            host_id,
+            addr: "10.0.0.1:7000".to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+        };
+
+        let entries = vec![
+            make_entry(1, 1, RaftCommand::JoinNode(node)),
+            make_entry(
+                1,
+                2,
+                RaftCommand::AssignTokens {
+                    node_id,
+                    tokens: vec![-100, 0, 100],
+                },
+            ),
+        ];
+        sm.apply(entries).await.unwrap();
+
+        // The live ring must now contain the new node and its tokens.
+        let live_ring = ring.load();
+        assert!(
+            live_ring.get_node(node_id).is_some(),
+            "live ring must contain the new node after JoinNode"
+        );
+        assert_eq!(
+            live_ring.tokens_for_node(node_id).len(),
+            3,
+            "live ring must have 3 tokens after AssignTokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn leave_node_updates_live_ring() {
+        use crate::ring::TokenRing;
+        use arc_swap::ArcSwap;
+
+        let ring = Arc::new(ArcSwap::from_pointee(TokenRing::new()));
+        let mut sm = FerrosStateMachine::new();
+        sm.set_ring(ring.clone());
+
+        let host_id = Uuid::new_v4();
+        let node_id = super::super::uuid_to_node_id(host_id);
+        let node = NodeInfo {
+            host_id,
+            addr: "10.0.0.1:7000".to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+        };
+
+        // Join, assign tokens, then leave.
+        let entries = vec![
+            make_entry(1, 1, RaftCommand::JoinNode(node)),
+            make_entry(
+                1,
+                2,
+                RaftCommand::AssignTokens {
+                    node_id,
+                    tokens: vec![10, 20, 30],
+                },
+            ),
+            make_entry(1, 3, RaftCommand::LeaveNode { node_id }),
+        ];
+        sm.apply(entries).await.unwrap();
+
+        // After leave, the node must be gone from the live ring.
+        let live_ring = ring.load();
+        assert!(
+            live_ring.get_node(node_id).is_none(),
+            "live ring must not contain the node after LeaveNode"
+        );
+        assert_eq!(
+            live_ring.token_count(),
+            0,
+            "live ring must have no tokens after LeaveNode"
         );
     }
 }

@@ -556,6 +556,19 @@ impl StorageEngine {
         }
     }
 
+    /// Truncates a table: clears the memtable and drops all SSTable references.
+    ///
+    /// Subsequent reads for this table will return empty results. Existing
+    /// readers holding `Arc` references to old data will complete normally.
+    pub fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        let tables = self.tables.read();
+        let state = tables.get(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state.store.truncate();
+        Ok(())
+    }
+
     /// Replay mutations from a given commit log position forward.
     ///
     /// Returns mutations with positions after `position`. If the segment

@@ -116,6 +116,12 @@ pub struct ModeController {
     /// Live token ring, set when transitioning to cluster mode.
     /// `None` in standalone and pair modes.
     ring: Arc<ArcSwap<Option<Arc<TokenRing>>>>,
+    /// Peers whose join has been triggered via `handle_join_request`.
+    ///
+    /// Tracked so that the same peer is not re-admitted on reconnect and
+    /// for testability (unit tests can inspect pending joins without
+    /// requiring a full Raft cluster).
+    pending_joins: Mutex<Vec<Uuid>>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -188,6 +194,7 @@ impl ModeController {
             hint_config,
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
+            pending_joins: Mutex::new(Vec::new()),
         });
 
         let handles = ModeControllerHandles {
@@ -885,6 +892,87 @@ impl ModeController {
         });
     }
 
+    /// Trigger join admission for a peer that connected while in cluster mode.
+    ///
+    /// Checks de-duplication (via `pending_joins`), approval (via `approved_nodes`
+    /// or `auto_join`), and spawns an async task to propose `JoinNode` +
+    /// `AssignTokens` via Raft.
+    fn trigger_cluster_join(&self, host_id: Uuid, addr: std::net::SocketAddr) {
+        // De-duplicate: skip if already pending.
+        {
+            let mut pending = self.pending_joins.lock().unwrap();
+            if pending.contains(&host_id) {
+                tracing::info!(peer = %host_id, "peer already pending join, skipping");
+                return;
+            }
+            pending.push(host_id);
+        }
+
+        // Capture state needed by the spawned task.
+        let approved_nodes = self.approved_nodes.lock().unwrap().clone();
+        let peer_node_id = uuid_to_node_id(host_id);
+        let raft_instance = self.raft_instance.clone();
+        let config_clone = self.config.clone();
+
+        tokio::spawn(async move {
+            // Check approval before touching Raft.
+            if !config_clone.auto_join && !approved_nodes.contains(&host_id) {
+                tracing::warn!(
+                    peer = %host_id,
+                    "peer not approved to join cluster, ignoring"
+                );
+                return;
+            }
+
+            let raft = match &**raft_instance.load() {
+                Some(r) => r.clone(),
+                None => {
+                    tracing::warn!(
+                        peer = %host_id,
+                        "raft not initialized yet, cannot admit peer"
+                    );
+                    return;
+                }
+            };
+
+            // Propose JoinNode via Raft.
+            let node_info = NodeInfo {
+                host_id,
+                addr: addr.to_string(),
+                data_center: config_clone.data_center.clone(),
+                rack: config_clone.rack.clone(),
+                state: NodeState::Normal,
+            };
+
+            let join_cmd = RaftCommand::JoinNode(node_info);
+            if let Err(e) = raft.client_write(join_cmd).await {
+                tracing::warn!(peer = %host_id, %e, "JoinNode proposal failed");
+                return;
+            }
+
+            // Propose AssignTokens via Raft.
+            let num_tokens = config_clone.num_tokens as usize;
+            let tokens: Vec<i64> = (0..num_tokens)
+                .map(|i| generate_deterministic_token(peer_node_id, i))
+                .collect();
+
+            let assign_cmd = RaftCommand::AssignTokens {
+                node_id: peer_node_id,
+                tokens,
+            };
+            if let Err(e) = raft.client_write(assign_cmd).await {
+                tracing::warn!(peer = %host_id, %e, "AssignTokens proposal failed");
+                return;
+            }
+
+            tracing::info!(
+                peer = %host_id,
+                node_id = peer_node_id,
+                "peer admitted to cluster via on_peer_connected"
+            );
+        });
+    }
+
     /// Transition to degraded state: writes unavailable, reads still work.
     fn transition_to_degraded(&self) {
         self.write_path.store(Arc::new(WritePath::unavailable()));
@@ -925,8 +1013,9 @@ impl PeerEventListener for ModeController {
                 }
             }
             DeploymentMode::Cluster => {
-                // Already in cluster mode — new node will join via Raft membership
-                tracing::info!(peer = %host_id, "new peer connected in cluster mode");
+                // Already in cluster mode — trigger join admission for the new peer.
+                tracing::info!(peer = %host_id, "new peer connected in cluster mode, triggering join");
+                self.trigger_cluster_join(host_id, addr);
             }
         }
     }
@@ -1009,7 +1098,8 @@ impl InboundPeerCallback for ModeController {
                 }
             }
             DeploymentMode::Cluster => {
-                tracing::info!(peer = %host_id, "new inbound peer in cluster mode");
+                tracing::info!(peer = %host_id, "new inbound peer in cluster mode, triggering join");
+                self.trigger_cluster_join(host_id, addr);
             }
         }
     }
@@ -1482,6 +1572,58 @@ mod tests {
     }
 
     // ---- Task 18: Node decommission tests --------------------------------
+
+    /// BUG-010: Approved cluster nodes are never admitted — on_peer_connected()
+    /// in cluster mode must trigger handle_join_request() for approved peers.
+    #[tokio::test]
+    async fn approved_peer_triggers_join_in_cluster_mode() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let storage = test_storage(dir.path());
+        let schema = test_schema();
+        let config = Arc::new(ClusterConfig {
+            auto_join: true, // bypass approval check for simplicity
+            raft_data_dir: Some(dir.path().join("raft")),
+            ..ClusterConfig::default()
+        });
+        let net_config = Arc::new(NetConfig::default());
+        let local_id = Uuid::new_v4();
+        let peer1_id = Uuid::new_v4();
+        let peer2_id = Uuid::new_v4();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) = ModeController::new(
+            config,
+            net_config.clone(),
+            local_id,
+            storage,
+            schema,
+            registry,
+        );
+
+        let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+        controller.set_peer_manager(pm);
+
+        // First peer -> pair, second peer -> cluster
+        let peer1_addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        controller.on_peer_connected((peer1_id, peer1_addr));
+        let peer2_addr: SocketAddr = "127.0.0.2:7002".parse().unwrap();
+        controller.on_peer_connected((peer2_id, peer2_addr));
+        assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+        // Now a new (3rd) peer connects in cluster mode.
+        // The controller should trigger a join for this peer.
+        let new_peer_id = Uuid::new_v4();
+        let new_peer_addr: SocketAddr = "127.0.0.3:7003".parse().unwrap();
+        controller.on_peer_connected((new_peer_id, new_peer_addr));
+
+        // Verify the join was queued via pending_joins.
+        let pending = controller.pending_joins.lock().unwrap();
+        assert!(
+            pending.contains(&new_peer_id),
+            "new peer should be in pending_joins after on_peer_connected in cluster mode"
+        );
+    }
 
     #[tokio::test]
     async fn decommission_requires_raft() {

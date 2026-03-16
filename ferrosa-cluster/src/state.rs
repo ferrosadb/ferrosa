@@ -57,7 +57,7 @@ impl ClusterState for PairClusterState {
             native_port: 9042,
             schema_version: uuid::Uuid::nil(),
             tokens: vec![],
-            release_version: env!("CARGO_PKG_VERSION").to_string(),
+            release_version: ferrosa_schema::system::RELEASE_VERSION.to_string(),
         }]
     }
 }
@@ -101,7 +101,7 @@ impl ClusterState for RaftClusterState {
                     native_port: 9042,
                     schema_version: uuid::Uuid::nil(),
                     tokens: vec![],
-                    release_version: env!("CARGO_PKG_VERSION").to_string(),
+                    release_version: ferrosa_schema::system::RELEASE_VERSION.to_string(),
                 })
             })
             .collect()
@@ -140,5 +140,28 @@ mod tests {
         assert_eq!(peers[0].host_id, peer_id);
         assert_eq!(peers[0].peer, "10.0.1.5".parse::<IpAddr>().unwrap());
         assert_eq!(peers[0].peer_port, 7000);
+    }
+
+    /// BUG-020: system.peers release_version must match system.local
+    /// (Cassandra-compatible "5.1.0-ferrosa"), not the Cargo crate version.
+    #[test]
+    fn peer_release_version_matches_system_local() {
+        let config = Arc::new(ClusterConfig::default());
+        let peer_id = Uuid::new_v4();
+        let peer_addr = "10.0.1.5:7000".parse().unwrap();
+        let state = Arc::new(RwLock::new(PairState::new(
+            PairRole::Primary,
+            peer_id,
+            peer_addr,
+        )));
+        let cluster_state = PairClusterState::new(config, state);
+
+        let peers = cluster_state.peers();
+        assert_eq!(peers.len(), 1);
+        // system.local reports "5.1.0-ferrosa"; system.peers must match.
+        assert_eq!(
+            peers[0].release_version, "5.1.0-ferrosa",
+            "peer release_version should be Cassandra-compatible, not CARGO_PKG_VERSION"
+        );
     }
 }
