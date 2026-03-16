@@ -57,4 +57,22 @@ mod tests {
         assert_eq!(config.max_wasm_size, 10 * 1024 * 1024);
         assert_eq!(config.max_aggregate_fuel, 10_000_000);
     }
+
+    #[test]
+    fn custom_config_values() {
+        let config = SandboxConfig {
+            max_memory_bytes: 4 * 1024 * 1024,
+            max_fuel: 500_000,
+            max_execution_time: Duration::from_millis(250),
+            cache_capacity: 64,
+            max_wasm_size: 1024 * 1024,
+            max_aggregate_fuel: 2_000_000,
+        };
+        assert_eq!(config.max_memory_bytes, 4 * 1024 * 1024);
+        assert_eq!(config.max_fuel, 500_000);
+        assert_eq!(config.max_execution_time, Duration::from_millis(250));
+        assert_eq!(config.cache_capacity, 64);
+        assert_eq!(config.max_wasm_size, 1024 * 1024);
+        assert_eq!(config.max_aggregate_fuel, 2_000_000);
+    }
 }

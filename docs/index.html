@@ -751,7 +751,7 @@
 <section class="hero">
   <div class="hero-badge">
     <span class="dot"></span>
-    Beta release — active development
+    v1.0.0-beta.2 — active development
   </div>
   <h1>
     Cassandra. <span class="gradient">Reimagined.</span><br>
@@ -1091,11 +1091,13 @@
       <h3>WebAssembly Functions <span style="font-size: 0.7em; color: var(--accent-secondary); font-weight: 600;">COMING SOON</span></h3>
       <p>
         User-defined functions execute as sandboxed WebAssembly — no Java, no JavaScript.
-        Upload a compiled WASM binary to a table, reference it in CREATE FUNCTION with an AS clause.
-        Write functions in Rust (preferred), C, Go, or any language that compiles to WASM.
+        The WIT contract, sandbox configuration, and executor scaffold are implemented;
+        Wasmtime integration is in active development. Upload a compiled WASM binary to a table,
+        reference it in CREATE FUNCTION with an AS clause. Write functions in Rust (preferred),
+        C, Go, or any language that compiles to WASM.
         Memory-limited, CPU-time-limited, no network or filesystem access. Deterministic execution guaranteed.
       </p>
-      <span class="metric">WASM sandbox · Rust-native · deterministic · no GC runtime</span>
+      <span class="metric">WASM sandbox · WIT contract · executor scaffold · Wasmtime integration in progress</span>
     </div>
   </div>
 </section>
@@ -1328,7 +1330,7 @@ user = session.execute(stmt, [user_id])
         </tr>
         <tr>
           <td>UDF Language</td>
-          <td class="ferrosa-col">WASM (any language)</td>
+          <td class="ferrosa-col">WASM (in progress)</td>
           <td>Java</td>
           <td>Lua / WASM</td>
           <td>N/A</td>
@@ -1574,10 +1576,10 @@ user = session.execute(stmt, [user_id])
   <div style="max-width: 700px; margin: 0 auto;">
     <div class="code-demo">
       <pre class="code-block active" style="display: block;"><span class="cm"># Download the latest release</span>
-<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_0.1.0-beta_amd64.deb
+<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_1.0.0-beta.2_amd64.deb
 
 <span class="cm"># Install</span>
-<span class="kw">sudo</span> dpkg -i ferrosa_0.1.0-beta_amd64.deb
+<span class="kw">sudo</span> dpkg -i ferrosa_1.0.0-beta.2_amd64.deb
 
 <span class="cm"># Start the service</span>
 <span class="kw">sudo</span> systemctl start ferrosa

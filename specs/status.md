@@ -130,7 +130,7 @@ cluster        ██████   ██████  █████░   █
 
 ### ferrosa-udf — Done (WASM UDF/UDA)
 
-- **LOC:** ~1,240 (6 files) | **Tests:** ~49
+- **LOC:** ~1,800 (6 files) | **Tests:** ~68
 - **Modules:** `executor`, `sandbox`, `error`, `convert`, `wit/ferrosa-udf.wit`
 - **What's done:** WIT contract defining CQL value types for WASM Component Model,
   `UdfExecutor` with moka compilation cache (256 entries) and real Wasmtime
@@ -151,8 +151,10 @@ cluster        ██████   ██████  █████░   █
   - [x] ~~`system_schema.functions` virtual table~~ (+ `system_schema.aggregates`)
   - [x] ~~Aggregate UDF (UDA) support~~ — CREATE/DROP AGGREGATE with state/final functions
   - [x] ~~DdlOperation::CreateFunction/DropFunction for cluster replication~~
-  - [ ] wit-bindgen invoke integration (`call()` has documented TODO for wit-bindgen host-side binding)
-  - [ ] UDF binary storage (persist WASM to schema/storage)
+  - [x] ~~Val encoding for all 26 CQL types~~ (recursive Val::Variant encoding, wit-bindgen not usable due to recursive type limitation)
+  - [ ] Function calls in SELECT expressions (requires expression executor)
+  - [ ] GRANT/REVOKE on function resources
+  - [ ] Aggregate state/final function orchestration in query path
 
 ### ferrosa-cql — Complete (Parts A-D + Compression)
 

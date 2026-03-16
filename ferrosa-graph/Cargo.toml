@@ -1,6 +1,6 @@
 [package]
 name = "ferrosa-graph"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Graph query engine for ferrosa — Cypher/GQL endpoint"
 

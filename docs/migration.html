@@ -302,7 +302,7 @@
       <tr><td>Node lifecycle</td><td><span class="check">Compatible</span></td><td>Join and decommission via <code>ferrosa-ctl</code></td></tr>
       <tr><td>Token rebalancing</td><td><span class="check">Compatible</span></td><td>Operator-triggered via <code>ferrosa-ctl rebalance</code></td></tr>
       <tr><td>Secondary indexes</td><td><span class="check">Compatible</span></td><td>8 index types including vector (HNSW, IVFFlat)</td></tr>
-      <tr><td>UDTs</td><td><span class="cross">Not yet</span></td><td>Planned</td></tr>
+      <tr><td>UDTs</td><td><span class="check">Supported</span></td><td>CREATE/ALTER/DROP TYPE fully implemented</td></tr>
       <tr><td>Materialized views</td><td><span class="cross">Not yet</span></td><td>Planned</td></tr>
       <tr><td>LWT</td><td><span class="cross">Not yet</span></td><td>Planned</td></tr>
       <tr><td>Gossip protocol</td><td><span class="cross">Replaced</span></td><td>Ferrosa uses Raft for metadata (not wire-compatible)</td></tr>
@@ -324,13 +324,13 @@
     <div class="step-content">
       <h3>Audit your schema</h3>
       <p>Export your Cassandra schema and check for unsupported features.
-        Ferrosa supports all standard CQL types, partition/clustering keys, and table options.
-        Check for UDTs, materialized views, or UDFs — these are not yet supported.</p>
+        Ferrosa supports all standard CQL types, partition/clustering keys, table options, and UDTs.
+        Check for materialized views or UDFs — these are not yet supported.</p>
       <pre><span class="cm"># Export schema from Cassandra</span>
 <span class="kw">cqlsh</span> -e <span class="str">"DESCRIBE SCHEMA"</span> > schema.cql
 
 <span class="cm"># Check for unsupported features</span>
-<span class="kw">grep</span> -i <span class="str">"CREATE TYPE\|MATERIALIZED VIEW\|CREATE FUNCTION"</span> schema.cql</pre>
+<span class="kw">grep</span> -i <span class="str">"MATERIALIZED VIEW\|CREATE FUNCTION"</span> schema.cql</pre>
     </div>
 
     <div class="step-num">2</div>

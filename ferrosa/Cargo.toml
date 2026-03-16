@@ -1,6 +1,6 @@
 [package]
 name = "ferrosa"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Ferrosa — distributed database with CQL and Cypher"
 

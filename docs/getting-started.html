@@ -247,10 +247,10 @@
   <p>The quickest way to get started. The .deb package includes the ferrosa server, ferrosa-ctl admin tool, systemd service unit, and smoke tests.</p>
 
   <pre><span class="cm"># Download the latest release</span>
-<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_0.1.0-beta_amd64.deb
+<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_1.0.0-beta.2_amd64.deb
 
 <span class="cm"># Install</span>
-<span class="kw">sudo</span> dpkg -i ferrosa_0.1.0-beta_amd64.deb
+<span class="kw">sudo</span> dpkg -i ferrosa_1.0.0-beta.2_amd64.deb
 
 <span class="cm"># Start the service</span>
 <span class="kw">sudo</span> systemctl start ferrosa
@@ -474,7 +474,7 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
   <!-- ── Architecture ── -->
   <h2 id="architecture">Architecture Overview</h2>
 
-  <p>Ferrosa is composed of 11 independent Rust crates that can be used together or embedded individually.</p>
+  <p>Ferrosa is composed of 12 independent Rust crates that can be used together or embedded individually.</p>
 
   <div class="card-grid">
     <div class="card">
@@ -500,6 +500,10 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
     <div class="card">
       <h4>ferrosa-cql</h4>
       <p>CQL v5 framing, LL(2) parser, prepared cache, LZ4/Snappy compression, SUBSCRIBE.</p>
+    </div>
+    <div class="card">
+      <h4>ferrosa-udf</h4>
+      <p>WebAssembly UDF executor: WIT contract, Wasmtime sandbox, per-function CPU/memory limits. In development.</p>
     </div>
     <div class="card">
       <h4>ferrosa-graph</h4>

@@ -28,6 +28,18 @@ mod tests {
     use super::*;
     use ferrosa_index::FilterOp;
 
+    fn make_index(name: &str, index_type: IndexType, columns: Vec<&str>) -> IndexMetadata {
+        IndexMetadata {
+            keyspace: "ks".into(),
+            table: "tbl".into(),
+            name: name.into(),
+            index_type,
+            target_columns: columns.into_iter().map(String::from).collect(),
+            filter_predicate: None,
+            options: HashMap::new(),
+        }
+    }
+
     #[test]
     fn index_metadata_serde_roundtrip() {
         let meta = IndexMetadata {
@@ -63,5 +75,88 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         let back: IndexMetadata = serde_json::from_str(&json).unwrap();
         assert!(back.filter_predicate.is_some());
+    }
+
+    #[test]
+    fn index_metadata_hash_roundtrip_all_fields() {
+        let mut opts = HashMap::new();
+        opts.insert("capacity".into(), "1024".into());
+        let meta = IndexMetadata {
+            keyspace: "ks".into(),
+            table: "tbl".into(),
+            name: "idx_hash".into(),
+            index_type: IndexType::Hash,
+            target_columns: vec!["user_id".into()],
+            filter_predicate: None,
+            options: opts,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: IndexMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.keyspace, "ks");
+        assert_eq!(back.table, "tbl");
+        assert_eq!(back.name, "idx_hash");
+        assert!(matches!(back.index_type, IndexType::Hash));
+        assert_eq!(back.target_columns, vec!["user_id"]);
+        assert!(back.filter_predicate.is_none());
+        assert_eq!(
+            back.options.get("capacity").map(String::as_str),
+            Some("1024")
+        );
+    }
+
+    #[test]
+    fn index_metadata_composite_roundtrip_all_fields() {
+        let meta = make_index("idx_comp", IndexType::Composite, vec!["a", "b", "c"]);
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: IndexMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.keyspace, "ks");
+        assert_eq!(back.table, "tbl");
+        assert_eq!(back.name, "idx_comp");
+        assert!(matches!(back.index_type, IndexType::Composite));
+        assert_eq!(back.target_columns, vec!["a", "b", "c"]);
+        assert!(back.filter_predicate.is_none());
+        assert!(back.options.is_empty());
+    }
+
+    #[test]
+    fn index_metadata_phonetic_roundtrip_all_fields() {
+        let meta = make_index("idx_phonetic", IndexType::Phonetic, vec!["last_name"]);
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: IndexMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.keyspace, "ks");
+        assert_eq!(back.table, "tbl");
+        assert_eq!(back.name, "idx_phonetic");
+        assert!(matches!(back.index_type, IndexType::Phonetic));
+        assert_eq!(back.target_columns, vec!["last_name"]);
+        assert!(back.filter_predicate.is_none());
+        assert!(back.options.is_empty());
+    }
+
+    #[test]
+    fn index_metadata_filtered_roundtrip_all_fields() {
+        let meta = IndexMetadata {
+            keyspace: "ks".into(),
+            table: "tbl".into(),
+            name: "idx_filtered".into(),
+            index_type: IndexType::Filtered,
+            target_columns: vec!["status".into()],
+            filter_predicate: Some(FilterPredicate {
+                column_position: 0,
+                op: FilterOp::Eq,
+                value: b"active".to_vec(),
+            }),
+            options: HashMap::new(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: IndexMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.keyspace, "ks");
+        assert_eq!(back.table, "tbl");
+        assert_eq!(back.name, "idx_filtered");
+        assert!(matches!(back.index_type, IndexType::Filtered));
+        assert_eq!(back.target_columns, vec!["status"]);
+        let pred = back.filter_predicate.unwrap();
+        assert_eq!(pred.column_position, 0);
+        assert!(matches!(pred.op, FilterOp::Eq));
+        assert_eq!(pred.value, b"active");
     }
 }
