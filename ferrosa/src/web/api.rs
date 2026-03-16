@@ -24,7 +24,7 @@ struct AddNodeRequest {
 
 #[derive(serde::Deserialize)]
 struct DecommissionRequest {
-    host_id: String,
+    host_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -177,14 +177,18 @@ async fn decommission_handler(
     State(mc): State<Arc<ModeController>>,
     Json(body): Json<DecommissionRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let host_id = match body.host_id.parse::<Uuid>() {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("invalid host_id UUID: {e}") })),
-            );
-        }
+    // When host_id is omitted, decommission the local node.
+    let host_id = match body.host_id {
+        Some(id_str) => match id_str.parse::<Uuid>() {
+            Ok(id) => id,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("invalid host_id UUID: {e}") })),
+                );
+            }
+        },
+        None => mc.host_id(),
     };
 
     match mc.initiate_decommission(host_id).await {
@@ -780,6 +784,28 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// BUG-009: Decommission with empty body (no host_id) should decommission
+    /// the local node, not return a deserialization error.
+    #[tokio::test]
+    async fn api_decommission_empty_body_targets_local_node() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/cluster/decommission")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // Should NOT be 422 (Unprocessable Entity — JSON parse failure).
+        // The API should accept an empty body and decommission the local node.
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "empty body should not cause deserialization failure"
+        );
     }
 
     /// Rebalance endpoint returns 503 when Raft is not initialized.
