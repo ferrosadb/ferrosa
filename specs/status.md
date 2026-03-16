@@ -1,6 +1,6 @@
 # Ferrosa Development Status
 
-> Last updated: 2026-03-15
+> Last updated: 2026-03-16
 > Status: Living document
 
 ## Overview
@@ -11,7 +11,10 @@ sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff
 node lifecycle (join/decommission/rebalance), reconnection, and integration tests.
 Hardening and observability wiring sprints are also complete. UDT/UDF with WASM
 sandboxing is complete (parser, schema, DDL replication, Wasmtime compilation, router
-wiring). Secondary and vector indexes consolidated into the main branch.
+wiring). Secondary and vector indexes consolidated into the main branch. Graph engine
+is feature-complete: Cypher parser, CREATE/SET/DELETE planner+executor, result
+projection with property extraction, ORDER BY/LIMIT/DISTINCT, and full adjacency
+reconciliation.
 
 | Metric | Value |
 |--------|-------|
@@ -32,7 +35,7 @@ schema         █████░   █████▌  █████░   █
 index          █████░   ██████  █████░   ██░░░░
 udf            █████░   █████░  ████░░   ███░░░
 cql            ██████   ██████  ██████   ████░░
-graph          █████░   ██████  ████░░   ███░░░
+graph          ██████   ██████  █████░   ███░░░
 ctl            ██████   ██████  ████░░   ████░░
 binary         ██████   ██████  ████░░   ████░░
 net            ██████   ██████  █████░   ███░░░
@@ -184,18 +187,23 @@ cluster        ██████   ██████  █████░   █
   - [ ] Logged batch atomicity
   - [ ] Query tracing
 
-### ferrosa-graph — Phase 1 Complete
+### ferrosa-graph — Feature Complete
 
-- **LOC:** 5,547 (20 files) | **Tests:** 121
+- **LOC:** ~7,500 (20 files) | **Tests:** 139
 - **Modules:** `adjacency` (observer, reconcile, schema), `engine`, `error`,
   `executor` (expand, result), `http`, `parser` (ast, lexer, parse_impl, token),
   `planner` (logical, physical)
-- **What's done:** Cypher subset parser, logical planner with label resolution +
-  per-hop auth, physical planner, expand executor with resource limits, adjacency
-  index with WriteObserver, background reconciliation, HTTP/JSON endpoint with
-  auth, TLS, error sanitization, audit logging.
-- **Future (Phases 2-3):**
-  - [ ] Full adjacency reconciliation scan (T5 — stub, needs row-level verification)
+- **What's done:** Full Cypher parser, logical planner with label resolution +
+  per-hop auth, physical planner for MATCH/CREATE/SET/DELETE, expand executor with
+  result projection (property extraction from rows), ORDER BY/LIMIT/DISTINCT,
+  resource limits (T4), adjacency index with WriteObserver, full background
+  reconciliation (edge scan + orphan cleanup), HTTP/JSON endpoint with auth, TLS,
+  error sanitization, audit logging.
+- **Future:**
+  - [x] ~~Full adjacency reconciliation scan~~ (T5 — edge scan + orphan cleanup)
+  - [x] ~~CREATE/SET/DELETE planning and execution~~
+  - [x] ~~Result projection with property extraction~~
+  - [x] ~~ORDER BY, LIMIT, DISTINCT~~
   - [ ] WCO (worst-case optimal) joins
   - [ ] Leapfrog triejoin
   - [ ] Variable-length paths
@@ -319,13 +327,14 @@ cluster        ██████   ██████  █████░   █
 
 | Item | Location | State |
 |------|----------|-------|
-| ~~UDT/UDF with WASM sandboxing~~ | ~~`feature/udt-udf-wasm`~~ | Done (pending merge) |
-| Secondary + vector indexes consolidated | `feature/udt-udf-wasm` | Merged into branch |
+| ~~UDT/UDF with WASM sandboxing~~ | — | Done (merged) |
+| ~~Secondary + vector indexes consolidated~~ | — | Done (merged) |
 | ~~Release workflow (GitHub Actions)~~ | ~~`.github/workflows/`~~ | Merged (PR #47) |
 | ~~Hardening sprint~~ | — | Merged (PR #55) |
 | ~~Observability wiring~~ | — | Merged (PR #53) |
 | ~~Production cluster (Phase 3)~~ | — | Merged (PR #57) |
 | ~~Beta release v1.0.0-beta.1~~ | — | Released (PR #58, #59) |
+| Beta release v1.0.0-beta.3 | — | In progress |
 | NetworkTopologyStrategy (multi-DC) | — | Planned |
 
 ## Path to Distributed Operation
