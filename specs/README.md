@@ -14,7 +14,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | ferrosa-schema | Done (DDL, auth, audit, system KS, graph extensions, virtual tables, UDT metadata, index metadata) |
 | ferrosa-cql | Done (Parts A-D + observability + LZ4/Snappy frame compression + UDT DDL + UDF DDL parsing) |
 | ferrosa-index | Done (8 secondary index types + 2 vector index types: HNSW, IVFFlat) |
-| ferrosa-udf | In progress (WIT contract, executor scaffold, sandbox config; Wasmtime integration deferred) |
+| ferrosa-udf | Done (parser, schema, DDL replication, Wasmtime compilation, router wiring; wit-bindgen invoke TODO) |
 | ferrosa-graph | Done (Phase 1: parser, planner, executor, adjacency index, HTTP endpoint) |
 | ferrosa-net | Done (Phase 1 + reconnection, graceful drain) |
 | ferrosa-cluster | Done (Phase 1-3 + UDT/index DDL replication) |

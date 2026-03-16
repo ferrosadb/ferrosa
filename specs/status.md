@@ -9,8 +9,9 @@ Ferrosa is a **distributed CQL-compatible database** with graph
 query support, built-in observability, and S3-backed storage. The production cluster
 sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff,
 node lifecycle (join/decommission/rebalance), reconnection, and integration tests.
-Hardening and observability wiring sprints are also complete. Active work: UDT/UDF
-with WASM sandboxing, secondary and vector indexes consolidated into the main branch.
+Hardening and observability wiring sprints are also complete. UDT/UDF with WASM
+sandboxing is complete (parser, schema, DDL replication, Wasmtime compilation, router
+wiring). Secondary and vector indexes consolidated into the main branch.
 
 | Metric | Value |
 |--------|-------|
@@ -29,7 +30,7 @@ sstable        ██████   ██████  ██████   █
 storage        ██████   ██████  █████▌   ████░░
 schema         █████░   █████▌  █████░   ███░░░
 index          █████░   ██████  █████░   ██░░░░
-udf            ████░░   ███░░░  ██░░░░   █░░░░░
+udf            █████░   █████░  ████░░   ███░░░
 cql            ██████   ██████  ██████   ████░░
 graph          █████░   ██████  ████░░   ███░░░
 ctl            ██████   ██████  ████░░   ████░░
@@ -127,21 +128,30 @@ cluster        ██████   ██████  █████░   █
   - [ ] Distributed index coordination in cluster mode
 - **Spec:** [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md)
 
-### ferrosa-udf — In Progress (WASM UDF Scaffold)
+### ferrosa-udf — Done (WASM UDF/UDA)
 
-- **LOC:** ~800 (7 files) | **Tests:** ~20
+- **LOC:** ~1,240 (6 files) | **Tests:** ~49
 - **Modules:** `executor`, `sandbox`, `error`, `convert`, `wit/ferrosa-udf.wit`
 - **What's done:** WIT contract defining CQL value types for WASM Component Model,
-  `UdfExecutor` with moka compilation cache (256 entries), `SandboxConfig` with
-  resource limits (16MB memory, 1M fuel, 5s timeout, 10MB binary upload limit),
+  `UdfExecutor` with moka compilation cache (256 entries) and real Wasmtime
+  compilation (`wasmtime::component::Component`), `SandboxConfig` with resource
+  limits (16MB memory, 1M fuel, 5s timeout, 10MB binary upload limit),
   `CqlValue` to WIT `cql-value` conversion layer covering all CQL types including
-  collections, UDTs, temporal types, and decimal/varint.
+  collections, UDTs, temporal types, and decimal/varint. CQL parser handles
+  CREATE/DROP FUNCTION and CREATE/DROP AGGREGATE. Schema has `FunctionMetadata`,
+  `AggregateMetadata`, and registry methods. `system_schema.functions` and
+  `system_schema.aggregates` virtual tables. DDL replication via
+  `DdlOperation::CreateFunction/DropFunction/CreateAggregate/DropAggregate` and
+  corresponding `RaftCommand` variants. Router wires CREATE/DROP FUNCTION/AGGREGATE
+  through `DdlPath` with permission checks. Binary initializes `UdfExecutor` at
+  startup.
 - **Remaining:**
-  - [ ] Wasmtime component instantiation and invocation (Task 12)
-  - [ ] UDF execution wiring in CQL router
-  - [ ] `system_schema.functions` virtual table
-  - [ ] Aggregate UDF (UDA) support — CREATE/DROP AGGREGATE
-  - [ ] DdlOperation::CreateFunction/DropFunction for cluster replication
+  - [x] ~~Wasmtime component compilation~~ (real `wasmtime::component::Component` instantiation)
+  - [x] ~~UDF execution wiring in CQL router~~ (CREATE/DROP FUNCTION routed through DdlPath)
+  - [x] ~~`system_schema.functions` virtual table~~ (+ `system_schema.aggregates`)
+  - [x] ~~Aggregate UDF (UDA) support~~ — CREATE/DROP AGGREGATE with state/final functions
+  - [x] ~~DdlOperation::CreateFunction/DropFunction for cluster replication~~
+  - [ ] wit-bindgen invoke integration (`call()` has documented TODO for wit-bindgen host-side binding)
   - [ ] UDF binary storage (persist WASM to schema/storage)
 
 ### ferrosa-cql — Complete (Parts A-D + Compression)
@@ -168,8 +178,8 @@ cluster        ██████   ██████  █████░   █
   - [x] ~~UDT DDL support~~ — CREATE/ALTER/DROP TYPE parsing, routing, cluster replication
   - [x] ~~UDF DDL parsing~~ — CREATE/DROP FUNCTION AST and parser support
   - [x] ~~UDT wire encoding~~ — protocol type 0x0030, type resolution in bridge
+  - [x] ~~UDF execution wiring~~ (CREATE/DROP FUNCTION/AGGREGATE routed through DdlPath)
   - [ ] Logged batch atomicity
-  - [ ] UDF execution wiring (route CREATE FUNCTION → ferrosa-udf)
   - [ ] Query tracing
 
 ### ferrosa-graph — Phase 1 Complete
@@ -293,6 +303,7 @@ cluster        ██████   ██████  █████░   █
   - [x] ~~Hinted handoff~~
   - [x] ~~Node lifecycle (join, decommission, streaming, rebalance)~~
   - [x] ~~Read repair~~ (deferred — digest reads included)
+  - [x] ~~UDF/UDA DDL replication~~ (CreateFunction/DropFunction/CreateAggregate/DropAggregate RaftCommand variants)
 - **Remaining:**
   - [ ] NetworkTopologyStrategy (multi-DC)
   - [ ] Read repair (full inline repair)
@@ -306,7 +317,7 @@ cluster        ██████   ██████  █████░   █
 
 | Item | Location | State |
 |------|----------|-------|
-| UDT/UDF with WASM sandboxing | `feature/udt-udf-wasm` | In progress |
+| ~~UDT/UDF with WASM sandboxing~~ | ~~`feature/udt-udf-wasm`~~ | Done (pending merge) |
 | Secondary + vector indexes consolidated | `feature/udt-udf-wasm` | Merged into branch |
 | ~~Release workflow (GitHub Actions)~~ | ~~`.github/workflows/`~~ | Merged (PR #47) |
 | ~~Hardening sprint~~ | — | Merged (PR #55) |

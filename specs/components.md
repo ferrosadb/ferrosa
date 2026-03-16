@@ -103,14 +103,14 @@ graph BT
 - **Purpose**: WASM-sandboxed user-defined function execution
 - **Location**: `ferrosa-udf/`
 - **Dependencies**: `ferrosa-common`, `wasmtime` (component-model), `moka`, `num-bigint`, `uuid`, `thiserror`, `tracing`
-- **Status**: In progress — WIT contract and executor scaffold complete, Wasmtime integration deferred
+- **Status**: Done — parser, schema, DDL replication, Wasmtime compilation, router wiring all complete. Remaining: wit-bindgen invoke integration.
 - **Modules**:
   - `wit/ferrosa-udf.wit` — WebAssembly Component Model contract defining `cql-value` type (all CQL types including UDTs, collections, temporal) with single `invoke(args) -> result<cql-value, string>` export
-  - `executor.rs` — `UdfExecutor` with moka compilation cache (configurable capacity, default 256), `compile()`, `invalidate()`, `call()` methods
+  - `executor.rs` — `UdfExecutor` with moka compilation cache (configurable capacity, default 256), real Wasmtime `Component` compilation, `compile()`, `invalidate()`, `call()` methods
   - `sandbox.rs` — `SandboxConfig` with resource limits: 16MB memory, 1M fuel, 5s timeout, 10MB binary upload limit, 10M aggregate fuel
   - `convert.rs` — `CqlValue` to WIT `cql-value` bidirectional conversion covering primitives, collections, UDTs, decimal/varint
   - `error.rs` — `UdfError` enum: CompilationFailed, NotFound, ResourceExhausted, ExecutionFailed, TypeMismatch, BinaryTooLarge
-- **Design**: UDFs are uploaded as WASM binaries via `CREATE FUNCTION ... LANGUAGE wasm AS <hex>`. The executor compiles and caches modules, enforcing per-invocation resource limits via Wasmtime fuel and epoch interruption. Rust is the preferred authoring language but any language targeting WASM Component Model works.
+- **Design**: UDFs are uploaded as WASM binaries via `CREATE FUNCTION ... LANGUAGE wasm AS <hex>`. The executor compiles and caches modules with real Wasmtime `Component` instantiation, enforcing per-invocation resource limits via Wasmtime fuel and epoch interruption. CREATE/DROP FUNCTION and CREATE/DROP AGGREGATE are parsed by the CQL parser, routed through `DdlPath` with permission checks, and replicated via `DdlOperation`/`RaftCommand`. `FunctionMetadata` and `AggregateMetadata` are stored in the schema registry with `system_schema.functions` and `system_schema.aggregates` virtual tables. Rust is the preferred authoring language but any language targeting WASM Component Model works.
 
 ### ferrosa-storage
 

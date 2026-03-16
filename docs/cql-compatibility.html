@@ -303,7 +303,7 @@
       <tr><td>tuple&lt;...&gt;</td><td>0x0031</td><td><span class="check">Supported</span></td></tr>
       <tr><td>frozen&lt;T&gt;</td><td>—</td><td><span class="check">Supported</span></td></tr>
       <tr><td>duration</td><td>0x0015</td><td><span class="check">Supported</span></td></tr>
-      <tr><td>UDT</td><td>0x0030</td><td><span class="cross">Deferred</span></td></tr>
+      <tr><td>UDT</td><td>0x0030</td><td><span class="check">Supported</span></td></tr>
     </tbody>
   </table>
 
@@ -322,8 +322,8 @@
       <tr><td>CREATE INDEX</td><td><span class="check">Supported</span></td><td>USING type, WITH OPTIONS, IF NOT EXISTS — <a href="#indexes">see below</a></td></tr>
       <tr><td>DROP INDEX</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
       <tr><td>CREATE MATERIALIZED VIEW</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
-      <tr><td>CREATE TYPE (UDT)</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
-      <tr><td>CREATE FUNCTION / AGGREGATE</td><td><span class="cross">Not yet</span></td><td>WASM-based UDFs planned (no Java/JS)</td></tr>
+      <tr><td>CREATE TYPE (UDT)</td><td><span class="check">Supported</span></td><td>CREATE TYPE, ALTER TYPE, DROP TYPE — full UDT DDL lifecycle</td></tr>
+      <tr><td>CREATE FUNCTION / AGGREGATE</td><td><span class="check">Supported</span></td><td>CREATE/DROP FUNCTION (WASM), CREATE/DROP AGGREGATE — full DDL lifecycle with cluster replication</td></tr>
     </tbody>
   </table>
 
@@ -646,10 +646,8 @@
     <thead><tr><th>Feature</th><th>Status</th></tr></thead>
     <tbody>
       <tr><td>Logged batch atomicity</td><td>Planned</td></tr>
-      <tr><td>User-defined types (UDT)</td><td>Planned</td></tr>
       <tr><td>Query tracing</td><td>Planned</td></tr>
       <tr><td>Materialized views</td><td>Planned</td></tr>
-      <tr><td>User-defined functions</td><td>Planned — WebAssembly (no Java/JS)</td></tr>
       <tr><td>Lightweight transactions (LWT)</td><td>Planned</td></tr>
     </tbody>
   </table>
