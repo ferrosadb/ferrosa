@@ -737,8 +737,10 @@ fn route_select_user_table(
             tracing::warn!(table = %s.table, "executing full scan with ALLOW FILTERING");
         }
 
-        let limit = s.limit.map(|l| l as usize).unwrap_or(10_000);
-        let partitions = state.engine.read_range(&table_id, None, None, limit)?;
+        // Use a large scan window — LIMIT is applied *after* filtering,
+        // not before, to avoid cutting off matching rows (FRSA-BUG-003).
+        let scan_limit = 10_000;
+        let partitions = state.engine.read_range(&table_id, None, None, scan_limit)?;
         let mut all_rows = Vec::new();
         for partition in &partitions {
             let mut prows = bridge::partition_to_rows(
@@ -749,10 +751,6 @@ fn route_select_user_table(
                 &ck_indices,
             );
             all_rows.append(&mut prows);
-            if all_rows.len() >= limit {
-                all_rows.truncate(limit);
-                break;
-            }
         }
         // Apply WHERE predicates as post-filter
         all_rows.retain(|row| {
