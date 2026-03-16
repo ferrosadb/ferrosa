@@ -8,6 +8,7 @@ use ferrosa_net::message::Message;
 use ferrosa_sstable::types::Row;
 use ferrosa_storage::{Mutation, TableId};
 
+use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
 use crate::pair::coordinator::encode_mutation;
 
@@ -39,13 +40,36 @@ impl ClusterCoordinator {
         row: Row,
         timestamp: i64,
     ) -> crate::error::Result<()> {
+        self.coordinate_write_with(
+            table_id,
+            key,
+            row,
+            timestamp,
+            self.default_cl,
+            self.default_rf,
+        )
+        .await
+    }
+
+    /// Coordinate a write with explicit consistency level and replication factor.
+    ///
+    /// Use this when the query specifies a CL or the keyspace has a non-default RF.
+    pub async fn coordinate_write_with(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        row: Row,
+        timestamp: i64,
+        cl: ConsistencyLevel,
+        rf: usize,
+    ) -> crate::error::Result<()> {
         let ring = self.ring.load();
-        let replicas = ring.replicas(key.token.0, self.default_rf);
-        let required = self.default_cl.block_for(self.default_rf);
+        let replicas = ring.replicas(key.token.0, rf);
+        let required = cl.block_for(rf);
 
         if replicas.len() < required {
             return Err(ClusterError::Unavailable {
-                consistency: self.default_cl.to_string(),
+                consistency: cl.to_string(),
                 required,
                 alive: replicas.len(),
             });
@@ -152,7 +176,7 @@ impl ClusterCoordinator {
             // the write succeeds at quorum; a failed write is not a replicated
             // mutation and should not be delivered to any replica later.
             Err(ClusterError::WriteTimeout {
-                consistency: self.default_cl.to_string(),
+                consistency: cl.to_string(),
                 received: acks,
                 required,
             })

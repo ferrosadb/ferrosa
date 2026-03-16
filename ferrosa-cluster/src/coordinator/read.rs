@@ -79,13 +79,27 @@ impl ClusterCoordinator {
         table_id: &TableId,
         key: &DecoratedKey,
     ) -> crate::error::Result<Option<Vec<Row>>> {
+        self.coordinate_read_with(table_id, key, self.default_cl, self.default_rf)
+            .await
+    }
+
+    /// Coordinate a read with explicit consistency level and replication factor.
+    ///
+    /// Use this when the query specifies a CL or the keyspace has a non-default RF.
+    pub async fn coordinate_read_with(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        rf: usize,
+    ) -> crate::error::Result<Option<Vec<Row>>> {
         let ring = self.ring.load();
-        let replicas = ring.replicas(key.token.0, self.default_rf);
-        let required = self.default_cl.block_for(self.default_rf);
+        let replicas = ring.replicas(key.token.0, rf);
+        let required = cl.block_for(rf);
 
         if replicas.len() < required {
             return Err(ClusterError::Unavailable {
-                consistency: self.default_cl.to_string(),
+                consistency: cl.to_string(),
                 required,
                 alive: replicas.len(),
             });
@@ -94,8 +108,7 @@ impl ClusterCoordinator {
         // -------------------------------------------------------------------
         // CL = ONE fast path: single replica, prefer local.
         // -------------------------------------------------------------------
-        if self.default_cl == ConsistencyLevel::One || self.default_cl == ConsistencyLevel::LocalOne
-        {
+        if cl == ConsistencyLevel::One || cl == ConsistencyLevel::LocalOne {
             return self.read_one_replica(table_id, key, &replicas, &ring).await;
         }
 
@@ -301,7 +314,7 @@ impl ClusterCoordinator {
         // Fail if we didn't get enough responses.
         if received < required || full_partition.is_none() {
             return Err(ClusterError::ReadTimeout {
-                consistency: self.default_cl.to_string(),
+                consistency: cl.to_string(),
                 received,
                 required,
                 data_present: full_partition.is_some(),
@@ -788,5 +801,57 @@ mod tests {
             }
             other => panic!("expected ReadTimeout, got: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG-012: per-query CL override
+    // -----------------------------------------------------------------------
+
+    /// Coordinator constructed with CL=QUORUM but query specifies CL=ONE.
+    /// The coordinator must use the per-query CL, not the hard-coded default.
+    #[tokio::test]
+    async fn coordinate_read_uses_per_query_cl() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        // Coordinator default is QUORUM, RF=3 — which would require 2 replicas.
+        // But we only have 1 node. With CL=ONE override, it should succeed.
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            3,                        // RF=3 (default)
+            ConsistencyLevel::Quorum, // default CL
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let row = test_row(1000);
+        storage.write(&table_id, &key, row, 1000).unwrap();
+
+        // Without override: QUORUM with 1 node in the ring should fail.
+        let result = coordinator.coordinate_read(&table_id, &key).await;
+        assert!(
+            result.is_err(),
+            "default QUORUM read with 1 node should fail"
+        );
+
+        // With per-query override to CL=ONE, RF=1: should succeed.
+        let result = coordinator
+            .coordinate_read_with(&table_id, &key, ConsistencyLevel::One, 1)
+            .await;
+        assert!(
+            result.is_ok(),
+            "CL=ONE override should succeed: got {:?}",
+            result
+        );
+        assert!(result.unwrap().is_some());
     }
 }
