@@ -78,6 +78,42 @@ jobs:
           fi
           echo "Coverage ${COVERAGE}% meets threshold ${THRESHOLD}%"
 
+  # ── Stage 2b: Musl static build ───────────────────────────────────
+  musl:
+    name: Static Build (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build static binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Verify statically linked
+        run: |
+          file target/x86_64-unknown-linux-musl/release/ferrosa
+          file target/x86_64-unknown-linux-musl/release/ferrosa | grep -q "statically linked"
+          echo "Binary size: $(du -h target/x86_64-unknown-linux-musl/release/ferrosa | cut -f1)"
+      - name: Strip and report
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/ferrosa
+          strip target/x86_64-unknown-linux-musl/release/ferrosa-ctl
+          echo "Stripped ferrosa: $(du -h target/x86_64-unknown-linux-musl/release/ferrosa | cut -f1)"
+          echo "Stripped ferrosa-ctl: $(du -h target/x86_64-unknown-linux-musl/release/ferrosa-ctl | cut -f1)"
+      - name: Upload musl binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrosa-musl-static
+          path: |
+            target/x86_64-unknown-linux-musl/release/ferrosa
+            target/x86_64-unknown-linux-musl/release/ferrosa-ctl
+          retention-days: 14
+
   # ── Stage 3: Documentation ─────────────────────────────────────────
   docs:
     name: Docs
