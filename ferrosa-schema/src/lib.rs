@@ -30,7 +30,7 @@ pub use error::{Result, SchemaError};
 pub use metadata::{
     CachingParams, ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata, IndexMetadata,
     KeyspaceMetadata, KeyspaceUpdates, ReplicationParams, TableFlag, TableMetadata, TableParams,
-    TableUpdates, UserTypeMetadata,
+    TableUpdates, UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata,
 };
 pub use registry::{is_system_keyspace, AuthMethod, Schema, SchemaConfig, SchemaSnapshot};
 pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};
