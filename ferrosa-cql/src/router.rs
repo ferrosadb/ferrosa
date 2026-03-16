@@ -2002,7 +2002,13 @@ fn route_truncate(
         &Resource::Table(ks.to_string(), s.table.clone()),
     )?;
 
-    // Truncation is a follow-on storage feature; return Void for now.
+    // Truncate the table's data in the storage engine.
+    let table_id = ferrosa_storage::TableId::new(ks, &s.table);
+    state
+        .engine
+        .truncate(&table_id)
+        .map_err(|e| CqlError::ServerError(format!("truncate failed: {e}")))?;
+
     Ok(result::encode_void())
 }
 
