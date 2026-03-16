@@ -1505,11 +1505,13 @@ async fn route_alter_table(
         })
         .collect();
 
+    let extensions = s.extensions.map(|pairs| pairs.into_iter().collect());
+
     let updates = TableUpdates {
         params: None,
         add_columns,
         drop_columns: s.drop_columns.clone(),
-        extensions: None,
+        extensions,
     };
 
     let ddl_guard = state.ddl_path.load();
@@ -4185,6 +4187,51 @@ mod tests {
                     count, 3,
                     "without LIMIT should return all 3 matching rows, got {count}"
                 );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    // ── BUG-018: ALLOW FILTERING rejected at runtime ────────────────
+
+    #[tokio::test]
+    async fn allow_filtering_select_star_with_non_pk_predicate() {
+        // Reproduces the exact pattern from the bug report:
+        // SELECT * FROM bbqa.t WHERE v > 20 ALLOW FILTERING
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE bbqa WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE bbqa.t (k int PRIMARY KEY, v int)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        for (k, v) in [(1, 10), (2, 20), (3, 30)] {
+            let stmt =
+                crate::parser::parse(&format!("INSERT INTO bbqa.t (k, v) VALUES ({k}, {v})"))
+                    .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // This is the exact query from the bug report.
+        let stmt =
+            crate::parser::parse("SELECT * FROM bbqa.t WHERE v > 20 ALLOW FILTERING").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALLOW FILTERING should not be rejected: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(count, 1, "v > 20 should match 1 row (v=30), got {count}");
             }
             _ => panic!("expected Result"),
         }
