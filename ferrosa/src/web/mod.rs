@@ -1,15 +1,19 @@
 //! Web observability console — HTTP server on a dedicated port (default 9090).
 //!
 //! Routes:
-//!   `GET /`                       → embedded `index.html` (rust-embed)
-//!   `GET /metrics`                → Prometheus text exposition (no auth)
-//!   `GET /api/tables`             → list of registered virtual tables
-//!   `GET /api/connections`        → CQL connection rows
-//!   `GET /api/storage_stats`      → per-table storage metrics
-//!   `GET /api/active_queries`     → active query rows
-//!   `GET /api/cluster/status`     → cluster mode, role, host_id
-//!   `POST /api/cluster/promote`   → force-promote to standalone primary
-//!   `POST /api/cluster/switchover`→ swap primary/secondary roles
+//!   `GET /`                         → embedded `index.html` (rust-embed)
+//!   `GET /metrics`                  → Prometheus text exposition (no auth)
+//!   `GET /api/tables`               → list of registered virtual tables
+//!   `GET /api/connections`          → CQL connection rows
+//!   `GET /api/storage_stats`        → per-table storage metrics
+//!   `GET /api/active_queries`       → active query rows
+//!   `GET /api/cluster/status`       → cluster mode, role, host_id
+//!   `POST /api/cluster/promote`     → force-promote to standalone primary
+//!   `POST /api/cluster/switchover`  → swap primary/secondary roles
+//!   `POST /api/cluster/add-node`    → pre-approve a node for cluster admission
+//!   `POST /api/cluster/decommission`→ initiate graceful removal of a node
+//!   `GET /api/cluster/ring`         → token ring topology
+//!   `POST /api/cluster/rebalance`   → rebalance token distribution
 
 pub mod api;
 pub mod auth;
