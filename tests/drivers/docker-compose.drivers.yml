@@ -1,0 +1,160 @@
+# Driver smoke-test infrastructure.
+#
+# Starts a single Ferrosa node with S3 via RustFS (MinIO-compatible),
+# then runs language-specific driver test containers against it.
+#
+# Usage:
+#   ./tests/drivers/run-all.sh
+#
+# Or manually:
+#   docker compose -f tests/drivers/docker-compose.drivers.yml up -d ferrosa
+#   docker compose -f tests/drivers/docker-compose.drivers.yml run python-tests
+#   docker compose -f tests/drivers/docker-compose.drivers.yml down -v
+
+services:
+
+  # -------------------------------------------------------------------------
+  # Volume permissions -- RustFS runs as UID 10001
+  # -------------------------------------------------------------------------
+  volume-permissions:
+    image: alpine
+    volumes:
+      - rustfs-data:/data
+    command: >
+      sh -c "chown -R 10001:10001 /data && echo 'permissions fixed'"
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # S3-compatible object store
+  # -------------------------------------------------------------------------
+  rustfs:
+    image: rustfs/rustfs:latest
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
+    environment:
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # -------------------------------------------------------------------------
+  # Bucket bootstrap
+  # -------------------------------------------------------------------------
+  rustfs-init:
+    image: minio/mc
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+             mc mb local/ferrosa-drivers --ignore-existing &&
+             echo 'bucket ferrosa-drivers ready'"
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # Single Ferrosa node (auth disabled, graph enabled)
+  # -------------------------------------------------------------------------
+  ferrosa:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "9042:9042"   # CQL
+      - "9090:9090"   # Web / observability
+      - "7474:7474"   # Graph HTTP
+    environment:
+      FERROSA_HOST_ID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-driver-test"
+      FERROSA_GRAPH_ENABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-drivers"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+    volumes:
+      - ferrosa-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9042 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # -------------------------------------------------------------------------
+  # Python driver tests (CQL + Graph HTTP)
+  # -------------------------------------------------------------------------
+  python-tests:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    depends_on:
+      ferrosa:
+        condition: service_healthy
+    environment:
+      FERROSA_HOST: ferrosa
+      FERROSA_CQL_PORT: "9042"
+      FERROSA_GRAPH_PORT: "7474"
+
+  # -------------------------------------------------------------------------
+  # Go driver tests (CQL)
+  # -------------------------------------------------------------------------
+  go-tests:
+    build:
+      context: ./go
+      dockerfile: Dockerfile
+    depends_on:
+      ferrosa:
+        condition: service_healthy
+    environment:
+      FERROSA_HOST: ferrosa
+      FERROSA_CQL_PORT: "9042"
+
+  # -------------------------------------------------------------------------
+  # Node.js driver tests (CQL)
+  # -------------------------------------------------------------------------
+  node-tests:
+    build:
+      context: ./node
+      dockerfile: Dockerfile
+    depends_on:
+      ferrosa:
+        condition: service_healthy
+    environment:
+      FERROSA_HOST: ferrosa
+      FERROSA_CQL_PORT: "9042"
+
+  # -------------------------------------------------------------------------
+  # Java driver tests (CQL)
+  # -------------------------------------------------------------------------
+  java-tests:
+    build:
+      context: ./java
+      dockerfile: Dockerfile
+    depends_on:
+      ferrosa:
+        condition: service_healthy
+    environment:
+      FERROSA_HOST: ferrosa
+      FERROSA_CQL_PORT: "9042"
+
+volumes:
+  rustfs-data:
+  ferrosa-data:
