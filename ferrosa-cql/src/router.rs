@@ -2093,7 +2093,15 @@ fn evaluate_where_predicates(
         let matches = match wc.op {
             ComparisonOp::Eq => *actual == expected,
             ComparisonOp::Ne => *actual != expected,
-            _ => true, // TODO: implement GT/LT/GE/LE comparisons
+            ComparisonOp::Gt => *actual > expected,
+            ComparisonOp::Lt => *actual < expected,
+            ComparisonOp::Ge => *actual >= expected,
+            ComparisonOp::Le => *actual <= expected,
+            ComparisonOp::In => {
+                // IN comparison: check if actual is in the expected list.
+                // For now, treat as equality (single-value IN).
+                *actual == expected
+            }
         };
         if !matches {
             return false;
@@ -3898,5 +3906,369 @@ mod tests {
     async fn route_hex_decode_valid() {
         let result = super::hex_decode("deadbeef").unwrap();
         assert_eq!(result, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    // ── Helper: extract row count from a Rows result body ────────────
+
+    /// Parse a Rows RESULT body and return the row count.
+    /// Wire format: [i32 kind][i32 flags][i32 col_count][string ks][string table]
+    ///              per-column: [string name][u16 type_id][type params]
+    ///              [i32 row_count]
+    fn extract_row_count(buf: &[u8]) -> i32 {
+        assert_eq!(
+            &buf[0..4],
+            &0x0002i32.to_be_bytes(),
+            "expected Rows result kind"
+        );
+        let col_count = i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let mut off = 12;
+        // Skip keyspace string
+        let ks_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        // Skip table string
+        let tbl_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+        // Skip column specs
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+            off += 2 + name_len;
+            let type_id = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2, // List/Set: element type_id
+                0x0021 => off += 4,          // Map: key + val type_ids
+                0x0031 => {
+                    // Tuple: [u16 n][type_id * n]
+                    let n = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + n * 2;
+                }
+                _ => {}
+            }
+        }
+        // row_count
+        i32::from_be_bytes(buf[off..off + 4].try_into().unwrap())
+    }
+
+    // ── BUG-001: TRUNCATE must actually delete data ──────────────────
+
+    #[tokio::test]
+    async fn truncate_deletes_data() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Setup: create keyspace and table
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE ks.t (id int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert data
+        let stmt = crate::parser::parse("INSERT INTO ks.t (id, v) VALUES (1, 'hello')").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("INSERT INTO ks.t (id, v) VALUES (2, 'world')").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Verify data exists
+        let stmt = crate::parser::parse("SELECT * FROM ks.t WHERE id = 1").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_row_count(b), 1, "should have 1 row before truncate")
+            }
+            _ => panic!("expected Result"),
+        }
+
+        // TRUNCATE
+        let stmt = crate::parser::parse("TRUNCATE ks.t").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // SELECT after truncate should return 0 rows
+        let stmt = crate::parser::parse("SELECT * FROM ks.t WHERE id = 1").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_row_count(b), 0, "should have 0 rows after truncate")
+            }
+            _ => panic!("expected Result"),
+        }
+
+        // Full scan should also return 0 rows
+        let stmt = crate::parser::parse("SELECT * FROM ks.t ALLOW FILTERING").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => assert_eq!(
+                extract_row_count(b),
+                0,
+                "full scan should return 0 rows after truncate"
+            ),
+            _ => panic!("expected Result"),
+        }
+    }
+
+    // ── BUG-002: ALLOW FILTERING range predicates ────────────────────
+
+    #[tokio::test]
+    async fn allow_filtering_range_predicates() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Setup
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE ks.t (id int PRIMARY KEY, score int)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert rows with varying scores: 10, 20, 30, 40, 50
+        for (id, score) in [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)] {
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO ks.t (id, score) VALUES ({id}, {score})"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // SELECT with score > 25 ALLOW FILTERING => should return rows with score 30, 40, 50
+        let stmt =
+            crate::parser::parse("SELECT * FROM ks.t WHERE score > 25 ALLOW FILTERING").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(b);
+                assert_eq!(count, 3, "score > 25 should match 3 rows, got {count}");
+            }
+            _ => panic!("expected Result"),
+        }
+
+        // SELECT with score < 25 ALLOW FILTERING => should return rows with score 10, 20
+        let stmt =
+            crate::parser::parse("SELECT * FROM ks.t WHERE score < 25 ALLOW FILTERING").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(b);
+                assert_eq!(count, 2, "score < 25 should match 2 rows, got {count}");
+            }
+            _ => panic!("expected Result"),
+        }
+
+        // SELECT with score >= 30 ALLOW FILTERING => should return rows with score 30, 40, 50
+        let stmt =
+            crate::parser::parse("SELECT * FROM ks.t WHERE score >= 30 ALLOW FILTERING").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(b);
+                assert_eq!(count, 3, "score >= 30 should match 3 rows, got {count}");
+            }
+            _ => panic!("expected Result"),
+        }
+
+        // SELECT with score <= 20 ALLOW FILTERING => should return rows with score 10, 20
+        let stmt =
+            crate::parser::parse("SELECT * FROM ks.t WHERE score <= 20 ALLOW FILTERING").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(b);
+                assert_eq!(count, 2, "score <= 20 should match 2 rows, got {count}");
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    // ── BUG-003: LIMIT applied before post-filtering ─────────────────
+
+    #[tokio::test]
+    async fn limit_applied_after_filtering() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Setup
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE ks.t (id int PRIMARY KEY, flag int)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert 10 rows, only 3 have flag = 1
+        for id in 1..=10 {
+            let flag = if id <= 3 { 1 } else { 0 };
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO ks.t (id, flag) VALUES ({id}, {flag})"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // SELECT with flag = 1 LIMIT 2 ALLOW FILTERING
+        // Should return exactly 2 rows (out of the 3 that match)
+        let stmt =
+            crate::parser::parse("SELECT * FROM ks.t WHERE flag = 1 LIMIT 2 ALLOW FILTERING")
+                .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(b);
+                assert_eq!(
+                    count, 2,
+                    "LIMIT 2 after filtering should return 2 matching rows, got {count}"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+
+        // Also verify without LIMIT we get all 3
+        let stmt =
+            crate::parser::parse("SELECT * FROM ks.t WHERE flag = 1 ALLOW FILTERING").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(b);
+                assert_eq!(
+                    count, 3,
+                    "without LIMIT should return all 3 matching rows, got {count}"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    // ── BUG-004: ORDER BY parsed but not executed ────────────────────
+
+    #[tokio::test]
+    async fn order_by_sorts_results() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Setup: table with composite key (pk, ck) and a value column
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.t (pk int, ck int, v text, PRIMARY KEY (pk, ck))",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert rows with same pk but different ck values
+        for ck in [3, 1, 4, 1, 5] {
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO ks.t (pk, ck, v) VALUES (1, {ck}, 'val{ck}')"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // SELECT with ORDER BY ck ASC
+        let stmt = crate::parser::parse("SELECT * FROM ks.t WHERE pk = 1 ORDER BY ck ASC").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let rows_asc = match &result {
+            RouteResult::Result(b) => extract_int_column_values(b, "ck"),
+            _ => panic!("expected Result"),
+        };
+        let mut sorted = rows_asc.clone();
+        sorted.sort();
+        assert_eq!(
+            rows_asc, sorted,
+            "ORDER BY ck ASC should return sorted ascending: got {rows_asc:?}"
+        );
+
+        // SELECT with ORDER BY ck DESC
+        let stmt =
+            crate::parser::parse("SELECT * FROM ks.t WHERE pk = 1 ORDER BY ck DESC").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let rows_desc = match &result {
+            RouteResult::Result(b) => extract_int_column_values(b, "ck"),
+            _ => panic!("expected Result"),
+        };
+        let mut sorted_desc = rows_desc.clone();
+        sorted_desc.sort_by(|a, b| b.cmp(a));
+        assert_eq!(
+            rows_desc, sorted_desc,
+            "ORDER BY ck DESC should return sorted descending: got {rows_desc:?}"
+        );
+    }
+
+    /// Extract values for a named int column from a Rows result.
+    fn extract_int_column_values(buf: &[u8], target_col: &str) -> Vec<i32> {
+        assert_eq!(&buf[0..4], &0x0002i32.to_be_bytes());
+        let col_count = i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let mut off = 12;
+        // Skip keyspace string
+        let ks_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        // Skip table string
+        let tbl_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+        // Read column names and types to find the target column index
+        let mut target_idx = None;
+        let mut col_type_ids = Vec::new();
+        for i in 0..col_count {
+            let name_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+            off += 2;
+            let name = std::str::from_utf8(&buf[off..off + name_len]).unwrap();
+            if name == target_col {
+                target_idx = Some(i);
+            }
+            off += name_len;
+            let type_id = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            col_type_ids.push(type_id);
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2,
+                0x0021 => off += 4,
+                0x0031 => {
+                    let n = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + n * 2;
+                }
+                _ => {}
+            }
+        }
+        let target_idx = target_idx.expect("target column not found in result");
+        let row_count = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+
+        let mut values = Vec::new();
+        for _ in 0..row_count {
+            for col in 0..col_count {
+                let cell_len = i32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+                off += 4;
+                if cell_len >= 0 {
+                    let cell_bytes = &buf[off..off + cell_len as usize];
+                    if col == target_idx {
+                        let val = i32::from_be_bytes(cell_bytes.try_into().unwrap());
+                        values.push(val);
+                    }
+                    off += cell_len as usize;
+                }
+                // cell_len == -1 means null; skip
+            }
+        }
+        values
     }
 }
