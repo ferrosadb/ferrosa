@@ -12,6 +12,10 @@ pub mod peers;
 pub mod schema_tables;
 pub mod type_tables;
 
+/// Cassandra-compatible release version reported by `system.local` and
+/// `system.peers`. This must be consistent across all code paths.
+pub const RELEASE_VERSION: &str = "5.1.0-ferrosa";
+
 pub use aggregate_tables::SystemSchemaAggregatesTable;
 pub use auth_tables::{RoleMemberRow, RolePermissionRow, RoleRow};
 pub use function_tables::SystemSchemaFunctionsTable;

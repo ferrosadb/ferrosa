@@ -24,7 +24,7 @@ struct AddNodeRequest {
 
 #[derive(serde::Deserialize)]
 struct DecommissionRequest {
-    host_id: String,
+    host_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -177,14 +177,18 @@ async fn decommission_handler(
     State(mc): State<Arc<ModeController>>,
     Json(body): Json<DecommissionRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let host_id = match body.host_id.parse::<Uuid>() {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("invalid host_id UUID: {e}") })),
-            );
-        }
+    // When host_id is omitted, decommission the local node.
+    let host_id = match body.host_id {
+        Some(id_str) => match id_str.parse::<Uuid>() {
+            Ok(id) => id,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("invalid host_id UUID: {e}") })),
+                );
+            }
+        },
+        None => mc.host_id(),
     };
 
     match mc.initiate_decommission(host_id).await {
@@ -782,6 +786,28 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
+    /// BUG-009: Decommission with empty body (no host_id) should decommission
+    /// the local node, not return a deserialization error.
+    #[tokio::test]
+    async fn api_decommission_empty_body_targets_local_node() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/cluster/decommission")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // Should NOT be 422 (Unprocessable Entity — JSON parse failure).
+        // The API should accept an empty body and decommission the local node.
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "empty body should not cause deserialization failure"
+        );
+    }
+
     /// Rebalance endpoint returns 503 when Raft is not initialized.
     #[tokio::test]
     async fn api_rebalance_returns_503_when_raft_not_initialized() {
@@ -794,6 +820,42 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// BUG-019: All documented cluster management endpoints must be routable
+    /// (i.e. return a non-404 status). The handler may return 400, 503, etc.
+    /// depending on preconditions, but never 404 — that would mean the route
+    /// itself is missing.
+    #[tokio::test]
+    async fn api_cluster_management_endpoints_are_routable() {
+        let state = make_state();
+
+        // (method, uri, body) for each endpoint that was previously returning 404.
+        let cases: Vec<(&str, &str, &str)> = vec![
+            (
+                "POST",
+                "/api/cluster/add-node",
+                r#"{"host_id":"00000000-0000-0000-0000-000000000001"}"#,
+            ),
+            ("POST", "/api/cluster/decommission", "{}"),
+            ("GET", "/api/cluster/ring", ""),
+            ("POST", "/api/cluster/rebalance", ""),
+        ];
+
+        for (method, uri, body) in cases {
+            let router = crate::web::build_router(state.clone());
+            let mut builder = Request::builder().method(method).uri(uri);
+            if !body.is_empty() {
+                builder = builder.header("content-type", "application/json");
+            }
+            let req = builder.body(Body::from(body.to_string())).unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "{method} {uri} must not return 404 (BUG-019)"
+            );
+        }
     }
 
     #[tokio::test]
