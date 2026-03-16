@@ -10,7 +10,7 @@ use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 
 /// CQL data type with protocol type ID.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum CqlType {
     Ascii,                           // 0x0001
     Bigint,                          // 0x0002

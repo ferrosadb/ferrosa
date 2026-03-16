@@ -19,6 +19,9 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use ferrosa_common::CqlType;
+use ferrosa_schema::metadata::aggregate::UserAggregateMetadata;
+use ferrosa_schema::metadata::function::UserFunctionMetadata;
 use ferrosa_schema::metadata::index::IndexMetadata;
 use ferrosa_schema::metadata::keyspace::KeyspaceMetadata;
 use ferrosa_schema::metadata::table::TableMetadata;
@@ -57,6 +60,12 @@ pub struct RaftState {
     pub indexes: BTreeMap<(String, String, String), IndexMetadata>,
     /// All user-defined types, keyed by (keyspace, type_name).
     pub types: BTreeMap<(String, String), UserTypeMetadata>,
+    /// All user-defined functions, keyed by (keyspace, name, arg_types).
+    #[serde(default)]
+    pub functions: BTreeMap<(String, String, Vec<CqlType>), UserFunctionMetadata>,
+    /// All user-defined aggregates, keyed by (keyspace, name, arg_types).
+    #[serde(default)]
+    pub aggregates: BTreeMap<(String, String, Vec<CqlType>), UserAggregateMetadata>,
     /// Cluster members, keyed by openraft NodeId.
     pub members: BTreeMap<u64, NodeInfo>,
     /// Token ring: token → NodeId mapping.
@@ -161,6 +170,9 @@ impl FerrosStateMachine {
                 self.state.indexes.retain(|(ks, _, _), _| ks != &name);
                 // Also drop types in this keyspace.
                 self.state.types.retain(|(ks, _), _| ks != &name);
+                // Also drop functions and aggregates in this keyspace.
+                self.state.functions.retain(|(ks, _, _), _| ks != &name);
+                self.state.aggregates.retain(|(ks, _, _), _| ks != &name);
                 if let Some(schema) = &self.schema {
                     let _ = schema.drop_keyspace_internal(&name);
                 }
@@ -283,6 +295,60 @@ impl FerrosStateMachine {
                 self.state.types.remove(&(keyspace.clone(), name.clone()));
                 if let Some(schema) = &self.schema {
                     let _ = schema.drop_type_internal(&keyspace, &name);
+                }
+            }
+
+            // ---- DDL: User-Defined Functions ---------------------------
+            RaftCommand::CreateFunction(func) => {
+                let key = (
+                    func.keyspace.clone(),
+                    func.name.clone(),
+                    func.arg_types.clone(),
+                );
+                self.state
+                    .functions
+                    .entry(key)
+                    .or_insert_with(|| func.clone());
+                if let Some(schema) = &self.schema {
+                    let _ = schema.create_function_internal(&func);
+                }
+            }
+            RaftCommand::DropFunction {
+                keyspace,
+                name,
+                arg_types,
+            } => {
+                let key = (keyspace.clone(), name.clone(), arg_types.clone());
+                self.state.functions.remove(&key);
+                if let Some(schema) = &self.schema {
+                    let _ = schema.drop_function_internal(&keyspace, &name, &arg_types);
+                }
+            }
+
+            // ---- DDL: User-Defined Aggregates --------------------------
+            RaftCommand::CreateAggregate(agg) => {
+                let key = (
+                    agg.keyspace.clone(),
+                    agg.name.clone(),
+                    agg.arg_types.clone(),
+                );
+                self.state
+                    .aggregates
+                    .entry(key)
+                    .or_insert_with(|| agg.clone());
+                if let Some(schema) = &self.schema {
+                    let _ = schema.create_aggregate_internal(&agg);
+                }
+            }
+            RaftCommand::DropAggregate {
+                keyspace,
+                name,
+                arg_types,
+            } => {
+                let key = (keyspace.clone(), name.clone(), arg_types.clone());
+                self.state.aggregates.remove(&key);
+                if let Some(schema) = &self.schema {
+                    let _ = schema.drop_aggregate_internal(&keyspace, &name, &arg_types);
                 }
             }
 
@@ -547,8 +613,18 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
-                functions: std::collections::HashMap::new(),
-                aggregates: std::collections::HashMap::new(),
+                functions: self
+                    .state
+                    .functions
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                aggregates: self
+                    .state
+                    .aggregates
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             };
             let _ = schema.apply_snapshot(snap);
         }

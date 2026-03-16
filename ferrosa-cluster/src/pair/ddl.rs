@@ -11,10 +11,13 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use ferrosa_common::CqlType;
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+use ferrosa_schema::metadata::aggregate::UserAggregateMetadata;
+use ferrosa_schema::metadata::function::UserFunctionMetadata;
 use ferrosa_schema::metadata::index::IndexMetadata;
 use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
 use ferrosa_schema::metadata::table::{TableMetadata, TableUpdates};
@@ -73,6 +76,18 @@ pub enum DdlOperation {
     DropType {
         keyspace: String,
         name: String,
+    },
+    CreateFunction(UserFunctionMetadata),
+    DropFunction {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<CqlType>,
+    },
+    CreateAggregate(UserAggregateMetadata),
+    DropAggregate {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<CqlType>,
     },
 }
 
@@ -250,6 +265,34 @@ impl DdlCoordinator {
                     .drop_type_internal(keyspace, name)
                     .map_err(|e| ClusterError::Internal(format!("drop_type: {e}")))?;
             }
+            DdlOperation::CreateFunction(ref func) => {
+                self.schema
+                    .create_function_internal(func)
+                    .map_err(|e| ClusterError::Internal(format!("create_function: {e}")))?;
+            }
+            DdlOperation::DropFunction {
+                ref keyspace,
+                ref name,
+                ref arg_types,
+            } => {
+                self.schema
+                    .drop_function_internal(keyspace, name, arg_types)
+                    .map_err(|e| ClusterError::Internal(format!("drop_function: {e}")))?;
+            }
+            DdlOperation::CreateAggregate(ref agg) => {
+                self.schema
+                    .create_aggregate_internal(agg)
+                    .map_err(|e| ClusterError::Internal(format!("create_aggregate: {e}")))?;
+            }
+            DdlOperation::DropAggregate {
+                ref keyspace,
+                ref name,
+                ref arg_types,
+            } => {
+                self.schema
+                    .drop_aggregate_internal(keyspace, name, arg_types)
+                    .map_err(|e| ClusterError::Internal(format!("drop_aggregate: {e}")))?;
+            }
         }
         Ok(())
     }
@@ -367,6 +410,7 @@ impl RpcHandler for PairDdlForwardHandler {
 /// which serde_json can't serialize (tuple keys aren't valid JSON keys).
 /// This struct converts tables to a `Vec` for wire transmission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::type_complexity)]
 pub struct WireSchemaSnapshot {
     pub version: Uuid,
     pub keyspaces: std::collections::HashMap<String, KeyspaceMetadata>,
@@ -377,6 +421,10 @@ pub struct WireSchemaSnapshot {
     pub grants: std::collections::HashMap<String, Vec<GrantEntry>>,
     #[serde(default)]
     pub types: Vec<((String, String), UserTypeMetadata)>,
+    #[serde(default)]
+    pub functions: Vec<((String, String, Vec<CqlType>), UserFunctionMetadata)>,
+    #[serde(default)]
+    pub aggregates: Vec<((String, String, Vec<CqlType>), UserAggregateMetadata)>,
 }
 
 impl WireSchemaSnapshot {
@@ -402,6 +450,16 @@ impl WireSchemaSnapshot {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            functions: snap
+                .functions
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            aggregates: snap
+                .aggregates
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         }
     }
 
@@ -415,8 +473,8 @@ impl WireSchemaSnapshot {
             roles: self.roles,
             grants: self.grants,
             types: self.types.into_iter().collect(),
-            functions: std::collections::HashMap::new(),
-            aggregates: std::collections::HashMap::new(),
+            functions: self.functions.into_iter().collect(),
+            aggregates: self.aggregates.into_iter().collect(),
         }
     }
 }
@@ -821,6 +879,8 @@ mod tests {
             roles: std::collections::HashMap::new(),
             grants: std::collections::HashMap::new(),
             types,
+            functions: std::collections::HashMap::new(),
+            aggregates: std::collections::HashMap::new(),
         };
 
         let wire = WireSchemaSnapshot::from_snapshot(&snap);

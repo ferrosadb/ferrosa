@@ -15,6 +15,9 @@ use std::io::Cursor;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use ferrosa_common::CqlType;
+use ferrosa_schema::metadata::aggregate::UserAggregateMetadata;
+use ferrosa_schema::metadata::function::UserFunctionMetadata;
 use ferrosa_schema::metadata::index::IndexMetadata;
 use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
 use ferrosa_schema::metadata::table::{TableMetadata, TableUpdates};
@@ -135,6 +138,18 @@ pub enum RaftCommand {
     DropType {
         keyspace: String,
         name: String,
+    },
+    CreateFunction(UserFunctionMetadata),
+    DropFunction {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<CqlType>,
+    },
+    CreateAggregate(UserAggregateMetadata),
+    DropAggregate {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<CqlType>,
     },
 
     // ---- Topology (node-membership mutations) ---------------------------
