@@ -20,6 +20,8 @@ use crate::auth::role::{AuthContext, RoleMetadata, RoleUpdates};
 use crate::error::SchemaError;
 use ferrosa_common::CqlType;
 
+use crate::metadata::aggregate::UserAggregateMetadata;
+use crate::metadata::function::UserFunctionMetadata;
 use crate::metadata::index::IndexMetadata;
 use crate::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
 use crate::metadata::table::{TableMetadata, TableUpdates};
@@ -50,6 +52,12 @@ pub struct SchemaSnapshot {
     /// All user-defined types, keyed by (keyspace, type_name).
     #[serde(default)]
     pub types: HashMap<(String, String), UserTypeMetadata>,
+    /// All user-defined functions, keyed by (keyspace, name, arg_types).
+    #[serde(default)]
+    pub functions: HashMap<(String, String, Vec<CqlType>), UserFunctionMetadata>,
+    /// All user-defined aggregates, keyed by (keyspace, name, arg_types).
+    #[serde(default)]
+    pub aggregates: HashMap<(String, String, Vec<CqlType>), UserAggregateMetadata>,
 }
 
 impl SchemaSnapshot {
@@ -63,6 +71,8 @@ impl SchemaSnapshot {
             grants: HashMap::new(),
             indexes: HashMap::new(),
             types: HashMap::new(),
+            functions: HashMap::new(),
+            aggregates: HashMap::new(),
         }
     }
 }
@@ -1347,6 +1357,130 @@ impl Schema {
         self.inner.store(Arc::new(snap));
         Ok(())
     }
+
+    // ---- User-Defined Function (UDF) operations ----
+
+    /// Create a user-defined function. Returns error if function already exists
+    /// (same keyspace, name, and arg_types) or keyspace not found.
+    pub fn create_function_internal(&self, func: &UserFunctionMetadata) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let key = (
+            func.keyspace.clone(),
+            func.name.clone(),
+            func.arg_types.clone(),
+        );
+        if snap.functions.contains_key(&key) {
+            return Err(SchemaError::FunctionExists(
+                func.keyspace.clone(),
+                func.name.clone(),
+            ));
+        }
+        if !snap.keyspaces.contains_key(&func.keyspace) {
+            return Err(SchemaError::KeyspaceNotFound(func.keyspace.clone()));
+        }
+        snap.functions.insert(key, func.clone());
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Drop a user-defined function. Returns error if function not found.
+    pub fn drop_function_internal(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: &[CqlType],
+    ) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let key = (keyspace.to_string(), name.to_string(), arg_types.to_vec());
+        if !snap.functions.contains_key(&key) {
+            return Err(SchemaError::FunctionNotFound(
+                keyspace.to_string(),
+                name.to_string(),
+            ));
+        }
+        snap.functions.remove(&key);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Look up a user-defined function by keyspace, name, and arg types.
+    pub fn get_function(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: &[CqlType],
+    ) -> Option<UserFunctionMetadata> {
+        let snap = self.snapshot();
+        snap.functions
+            .get(&(keyspace.to_string(), name.to_string(), arg_types.to_vec()))
+            .cloned()
+    }
+
+    // ---- User-Defined Aggregate (UDA) operations ----
+
+    /// Create a user-defined aggregate. Returns error if aggregate already exists
+    /// (same keyspace, name, and arg_types) or keyspace not found.
+    pub fn create_aggregate_internal(&self, agg: &UserAggregateMetadata) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let key = (
+            agg.keyspace.clone(),
+            agg.name.clone(),
+            agg.arg_types.clone(),
+        );
+        if snap.aggregates.contains_key(&key) {
+            return Err(SchemaError::AggregateExists(
+                agg.keyspace.clone(),
+                agg.name.clone(),
+            ));
+        }
+        if !snap.keyspaces.contains_key(&agg.keyspace) {
+            return Err(SchemaError::KeyspaceNotFound(agg.keyspace.clone()));
+        }
+        snap.aggregates.insert(key, agg.clone());
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Drop a user-defined aggregate. Returns error if aggregate not found.
+    pub fn drop_aggregate_internal(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: &[CqlType],
+    ) -> crate::Result<()> {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        let key = (keyspace.to_string(), name.to_string(), arg_types.to_vec());
+        if !snap.aggregates.contains_key(&key) {
+            return Err(SchemaError::AggregateNotFound(
+                keyspace.to_string(),
+                name.to_string(),
+            ));
+        }
+        snap.aggregates.remove(&key);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Look up a user-defined aggregate by keyspace, name, and arg types.
+    pub fn get_aggregate(
+        &self,
+        keyspace: &str,
+        name: &str,
+        arg_types: &[CqlType],
+    ) -> Option<UserAggregateMetadata> {
+        let snap = self.snapshot();
+        snap.aggregates
+            .get(&(keyspace.to_string(), name.to_string(), arg_types.to_vec()))
+            .cloned()
+    }
 }
 
 #[cfg(test)]
@@ -2509,6 +2643,8 @@ mod tests {
             roles: HashMap::new(),
             grants: HashMap::new(),
             types: HashMap::new(),
+            functions: HashMap::new(),
+            aggregates: HashMap::new(),
         };
 
         let ks = KeyspaceMetadata {
@@ -2538,6 +2674,8 @@ mod tests {
             roles: HashMap::new(),
             grants: HashMap::new(),
             types: HashMap::new(),
+            functions: HashMap::new(),
+            aggregates: HashMap::new(),
         };
 
         let ks = KeyspaceMetadata {
@@ -2592,6 +2730,8 @@ mod tests {
             roles: HashMap::new(),
             grants: HashMap::new(),
             types: HashMap::new(),
+            functions: HashMap::new(),
+            aggregates: HashMap::new(),
         };
 
         let ks = KeyspaceMetadata {

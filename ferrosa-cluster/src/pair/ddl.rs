@@ -415,6 +415,8 @@ impl WireSchemaSnapshot {
             roles: self.roles,
             grants: self.grants,
             types: self.types.into_iter().collect(),
+            functions: std::collections::HashMap::new(),
+            aggregates: std::collections::HashMap::new(),
         }
     }
 }

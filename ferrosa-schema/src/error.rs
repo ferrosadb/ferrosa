@@ -49,6 +49,14 @@ pub enum SchemaError {
     FieldExists(String, String, String),
     /// Field not found in a user-defined type (keyspace, type, field).
     FieldNotFound(String, String, String),
+    /// User-defined function already exists (keyspace, function).
+    FunctionExists(String, String),
+    /// User-defined function not found (keyspace, function).
+    FunctionNotFound(String, String),
+    /// User-defined aggregate already exists (keyspace, aggregate).
+    AggregateExists(String, String),
+    /// User-defined aggregate not found (keyspace, aggregate).
+    AggregateNotFound(String, String),
     /// Generic schema validation error.
     InvalidSchema(String),
 }
@@ -95,6 +103,18 @@ impl fmt::Display for SchemaError {
             }
             Self::FieldNotFound(ks, t, field) => {
                 write!(f, "field not found: {field} in type {ks}.{t}")
+            }
+            Self::FunctionExists(ks, func) => {
+                write!(f, "function already exists: {ks}.{func}")
+            }
+            Self::FunctionNotFound(ks, func) => {
+                write!(f, "function not found: {ks}.{func}")
+            }
+            Self::AggregateExists(ks, agg) => {
+                write!(f, "aggregate already exists: {ks}.{agg}")
+            }
+            Self::AggregateNotFound(ks, agg) => {
+                write!(f, "aggregate not found: {ks}.{agg}")
             }
             Self::InvalidSchema(msg) => write!(f, "invalid schema: {msg}"),
         }
@@ -165,6 +185,10 @@ mod tests {
             SchemaError::TypeNotFound("ks".into(), "t".into()),
             SchemaError::FieldExists("ks".into(), "t".into(), "f".into()),
             SchemaError::FieldNotFound("ks".into(), "t".into(), "f".into()),
+            SchemaError::FunctionExists("ks".into(), "f".into()),
+            SchemaError::FunctionNotFound("ks".into(), "f".into()),
+            SchemaError::AggregateExists("ks".into(), "a".into()),
+            SchemaError::AggregateNotFound("ks".into(), "a".into()),
             SchemaError::InvalidSchema("bad".into()),
         ];
         for err in &errors {

@@ -547,6 +547,8 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
+                functions: std::collections::HashMap::new(),
+                aggregates: std::collections::HashMap::new(),
             };
             let _ = schema.apply_snapshot(snap);
         }
