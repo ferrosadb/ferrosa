@@ -243,11 +243,16 @@ graph TB
 | T10 | Audit gap on graph operations | **6 High** | **Mitigated** — audit event variants added |
 | T11 | Unencrypted HTTP transport | **6 High** | **Mitigated** — TLS via axum-server + rustls |
 | T1 | Parser exploitation | **4 High** | **Mitigated** — proptests + depth limit + CatchPanicLayer |
-| T5 | Adjacency index inconsistency | **4 High** | **Partially mitigated** — reconciliation task runs but scan is stub |
+| T5 | Adjacency index inconsistency | **4 High** | **Mitigated** — full reconciliation: edge scan + orphan cleanup |
 | T6 | Table extension poisoning | **4 High** | **Mitigated** — Permission::Create required for graph.* extensions |
 | T7 | Cross-protocol data leakage | **4 High** | **Mitigated** — system tables protected, is_system flag |
 | T9 | Observer amplification | **4 High** | **Mitigated** — bounded channel backpressure |
 | T8 | HTTP error info disclosure | **2 Medium** | **Mitigated** — error sanitization in http.rs |
+| T13 | Variable-length path explosion | **9 Critical** | **Open** — max hops cap + visited budget needed |
+| T12 | SUBSCRIBE resource exhaustion | **4 High** | **Open** — per-connection + global subscription limits |
+| T14 | Aggregation memory amplification | **4 High** | **Open** — group count + collect size limits |
+| T15 | Bolt protocol injection | **6 High** | **Open** — deferred until Bolt implementation |
+| T16 | Expression evaluator type confusion | **4 High** | **Open** — NULL propagation + type-safe comparison |
 
 ## Implementation Status
 
@@ -266,12 +271,78 @@ All critical and high-priority mitigations from Phase 1 have been implemented. R
 1. **System table protection** — `is_system` flag, `SystemTableProtected` error on DROP/ALTER
 1. **Error sanitization** — `error_to_response()` maps to HTTP status codes without leaking internals
 
+### Completed (Phase 2 — Gap Closure Prep)
+
+1. **Full adjacency reconciliation scan** — Two-phase: edge table scan + orphan cleanup with repair mutations
+1. **CREATE/SET/DELETE execution** — Mutation paths through storage engine with proper auth checks
+
 ### Remaining (Follow-on)
 
-1. **Full adjacency reconciliation scan** — Background task runs but scan logic is a stub (counts edge tables, does not do row-level verification)
 1. **Graceful reconciliation shutdown** — `CancellationToken` for clean task termination
 1. **Query memory budget tracking** — Per-query memory accounting not yet implemented
 1. **Separate thread pool for graph queries** — Currently shares Tokio runtime with CQL
+
+### New Threats from Gap Closure (T12–T16)
+
+### T12: SUBSCRIBE Resource Exhaustion
+
+| Field | Value |
+|-------|-------|
+| **STRIDE** | Denial of Service |
+| **Component** | SUBSCRIBE executor, SSE endpoint |
+| **Threat** | Attacker opens many SUBSCRIBE streams, each spawning a background re-query task. Unbounded subscriptions exhaust memory and executor threads. |
+| **Likelihood** | 2 — Requires authenticated access but trivial to exploit |
+| **Impact** | 2 — Degrades graph+CQL performance |
+| **Risk** | **4 (High)** |
+| **Mitigation** | (1) Per-connection subscription limit (e.g., 8, matching CQL). (2) Global subscription limit. (3) Subscription timeout/TTL. (4) Subscription registry with cleanup on disconnect. |
+
+### T13: Variable-Length Path Explosion
+
+| Field | Value |
+|-------|-------|
+| **STRIDE** | Denial of Service |
+| **Component** | Variable-length path executor |
+| **Threat** | `MATCH (a)-[*1..100]->(b)` on a dense graph produces exponential expansion. Even with per-hop fan-out limits, total work is `fan_out^max_hops`. |
+| **Likelihood** | 3 — Trivial to craft |
+| **Impact** | 3 — Memory exhaustion, CQL starvation |
+| **Risk** | **9 (Critical)** |
+| **Mitigation** | (1) Hard cap on max hops (e.g., 10). (2) Total visited-vertex budget (not just per-hop). (3) Existing query timeout applies. (4) BFS with cycle detection (visited set prevents infinite loops). |
+
+### T14: Aggregation Memory Amplification
+
+| Field | Value |
+|-------|-------|
+| **STRIDE** | Denial of Service |
+| **Component** | Aggregation executor |
+| **Threat** | `collect()` aggregation on a large result set materializes all values in memory. High-cardinality GROUP BY creates many accumulator instances. |
+| **Likelihood** | 2 — Requires crafted query on large dataset |
+| **Impact** | 2 — OOM or degraded performance |
+| **Risk** | **4 (High)** |
+| **Mitigation** | (1) Max group count limit. (2) `collect()` size limit. (3) Existing max_result_rows applies to pre-aggregation input. |
+
+### T15: Bolt Protocol Injection
+
+| Field | Value |
+|-------|-------|
+| **STRIDE** | Tampering, Elevation of Privilege |
+| **Component** | Bolt codec (future) |
+| **Threat** | Malformed PackStream messages cause deserialization panics or buffer overflows in the Bolt codec. Binary protocols have larger attack surface than HTTP/JSON. |
+| **Likelihood** | 2 — Binary parsing is error-prone |
+| **Impact** | 3 — Process crash or RCE |
+| **Risk** | **6 (High)** |
+| **Mitigation** | (1) Message size limits at frame layer. (2) Proptest/fuzz testing on PackStream decoder. (3) Catch panics at connection boundary. (4) Same auth+authz as HTTP path. |
+
+### T16: Expression Evaluator Type Confusion
+
+| Field | Value |
+|-------|-------|
+| **STRIDE** | Tampering |
+| **Component** | Expression evaluator (eval.rs) |
+| **Threat** | WHERE/RETURN expressions with type mismatches (e.g., `n.age > 'text'`) cause panics or incorrect filtering, leaking rows that should be excluded. |
+| **Likelihood** | 2 — Type errors in dynamic evaluation are common |
+| **Impact** | 2 — Information disclosure via incorrect filtering |
+| **Risk** | **4 (High)** |
+| **Mitigation** | (1) Type-safe comparison with explicit NULL handling (NULL propagation). (2) Type mismatch returns NULL (not panic). (3) Test coverage for all type combinations. |
 
 ## Assumptions
 
