@@ -2,9 +2,13 @@
 //!
 //! The WIT contract defines a `cql-value` variant type. This module
 //! converts between `ferrosa_common::CqlValue` and an intermediate Rust
-//! enum that mirrors the WIT representation. When wasmtime component
-//! bindgen is integrated (Task 12), these conversions will bridge to the
-//! generated types.
+//! enum (`WitCqlValue`) that mirrors the WIT representation. The executor
+//! module then converts `WitCqlValue` to/from `Val::Variant` for the
+//! dynamic component model API.
+//!
+//! Note: `wasmtime::component::bindgen!` cannot be used because the WIT
+//! `cql-value` type is recursive (list/set/map/tuple/udt variants contain
+//! `cql-value`), which is not supported by the component model's bindgen.
 
 use ferrosa_common::{CqlType, CqlValue};
 use num_bigint::BigInt;
@@ -12,8 +16,10 @@ use num_bigint::BigInt;
 use crate::error::UdfError;
 
 /// Intermediate representation mirroring the WIT `cql-value` variant.
-/// When wasmtime component bindgen is integrated, this will be replaced
-/// by the generated type.
+///
+/// Each variant maps 1:1 to a case in the WIT `cql-value` variant type.
+/// The executor converts these to `Val::Variant` with the matching
+/// kebab-case discriminant name for the component model's dynamic API.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WitCqlValue {
     Null,
