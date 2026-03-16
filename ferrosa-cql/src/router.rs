@@ -662,13 +662,21 @@ fn route_select_user_table(
     let pk_indices: Vec<usize> = table_meta
         .partition_key
         .iter()
-        .map(|name| table_meta.columns.get_index_of(name).unwrap())
-        .collect();
+        .map(|name| {
+            table_meta.columns.get_index_of(name).ok_or_else(|| {
+                CqlError::Invalid(format!("partition key column '{}' not found", name))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let ck_indices: Vec<usize> = table_meta
         .clustering_key
         .iter()
-        .map(|(name, _)| table_meta.columns.get_index_of(name).unwrap())
-        .collect();
+        .map(|(name, _)| {
+            table_meta.columns.get_index_of(name).ok_or_else(|| {
+                CqlError::Invalid(format!("clustering key column '{}' not found", name))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
 
     // Try PK-based lookup first; fall back to full scan with ALLOW FILTERING
@@ -886,12 +894,13 @@ async fn route_insert(
     let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
-    let timestamp = s.using_timestamp.unwrap_or_else(|| {
-        std::time::SystemTime::now()
+    let timestamp = match s.using_timestamp {
+        Some(ts) => ts,
+        None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64
-    });
+            .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+            .as_micros() as i64,
+    };
 
     for (i, col_name) in s.columns.iter().enumerate() {
         let col_meta = table_meta
@@ -905,7 +914,10 @@ async fn route_insert(
             ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
             ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
             ColumnKind::Regular | ColumnKind::Static => {
-                let col_idx = table_meta.columns.get_index_of(col_name).unwrap() as u16;
+                let col_idx =
+                    table_meta.columns.get_index_of(col_name).ok_or_else(|| {
+                        CqlError::Invalid(format!("column '{}' not found", col_name))
+                    })? as u16;
                 regular_cells.push((col_idx, value));
             }
         }
@@ -956,12 +968,13 @@ async fn route_update(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = s.using_timestamp.unwrap_or_else(|| {
-        std::time::SystemTime::now()
+    let timestamp = match s.using_timestamp {
+        Some(ts) => ts,
+        None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64
-    });
+            .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+            .as_micros() as i64,
+    };
 
     // Extract PK and CK values from WHERE clauses
     let pk_values = extract_pk_values(
@@ -1005,7 +1018,11 @@ async fn route_update(
             .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?;
         let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
         let value = bridge::term_to_cql_value(term, &cql_type)?;
-        let col_idx = table_meta.columns.get_index_of(col_name).unwrap() as u16;
+        let col_idx = table_meta
+            .columns
+            .get_index_of(col_name)
+            .ok_or_else(|| CqlError::Invalid(format!("column '{}' not found", col_name)))?
+            as u16;
         regular_cells.push((col_idx, value));
     }
 
@@ -1043,12 +1060,13 @@ async fn route_delete(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = s.using_timestamp.unwrap_or_else(|| {
-        std::time::SystemTime::now()
+    let timestamp = match s.using_timestamp {
+        Some(ts) => ts,
+        None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64
-    });
+            .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+            .as_micros() as i64,
+    };
 
     // Extract PK values from WHERE
     let pk_values = extract_pk_values(
@@ -2566,7 +2584,12 @@ async fn route_drop_function(
                     }
                     return Err(CqlError::Invalid(format!("function {ks}.{name} not found")));
                 }
-                1 => matching.into_iter().next().unwrap(),
+                1 => {
+                    // SAFETY: len() == 1 guarantees next() returns Some
+                    matching.into_iter().next().ok_or_else(|| {
+                        CqlError::ServerError(format!("function {ks}.{name} lookup inconsistency"))
+                    })?
+                }
                 _ => {
                     return Err(CqlError::Invalid(format!(
                         "ambiguous function {ks}.{name}: multiple overloads exist, specify argument types"
@@ -2818,7 +2841,12 @@ async fn route_drop_aggregate(
                         "aggregate {ks}.{name} not found"
                     )));
                 }
-                1 => matching.into_iter().next().unwrap(),
+                1 => {
+                    // SAFETY: len() == 1 guarantees next() returns Some
+                    matching.into_iter().next().ok_or_else(|| {
+                        CqlError::ServerError(format!("aggregate {ks}.{name} lookup inconsistency"))
+                    })?
+                }
                 _ => {
                     return Err(CqlError::Invalid(format!(
                         "ambiguous aggregate {ks}.{name}: multiple overloads exist, specify argument types"
