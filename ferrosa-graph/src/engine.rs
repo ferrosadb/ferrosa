@@ -229,6 +229,46 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             out.push('}');
             out
         }
+        PhysicalPlan::CreateNodes { creates } => {
+            let mut out = String::new();
+            out.push_str("CreateNodes {\n");
+            for (i, op) in creates.iter().enumerate() {
+                out.push_str(&format!(
+                    "  create[{}]: {}.{} (var: {:?}, props: {})\n",
+                    i,
+                    op.table.keyspace,
+                    op.table.table,
+                    op.var,
+                    op.props.len()
+                ));
+            }
+            out.push('}');
+            out
+        }
+        PhysicalPlan::SetProperties {
+            expand,
+            assignments,
+        } => {
+            let mut out = String::new();
+            out.push_str("SetProperties {\n");
+            out.push_str(&format!("  expand: {}\n", format_plan(expand)));
+            out.push_str(&format!("  assignments: {}\n", assignments.len()));
+            out.push('}');
+            out
+        }
+        PhysicalPlan::DeleteNodes {
+            expand,
+            variables,
+            detach,
+        } => {
+            let mut out = String::new();
+            out.push_str("DeleteNodes {\n");
+            out.push_str(&format!("  expand: {}\n", format_plan(expand)));
+            out.push_str(&format!("  variables: {:?}\n", variables));
+            out.push_str(&format!("  detach: {}\n", detach));
+            out.push('}');
+            out
+        }
     }
 }
 

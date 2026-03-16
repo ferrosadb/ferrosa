@@ -103,7 +103,7 @@ impl WriteObserver for AdjacencyIndexObserver {
 }
 
 /// Build an adjacency table mutation.
-fn make_adjacency_mutation(
+pub(crate) fn make_adjacency_mutation(
     adj_keyspace: &str,
     vertex_id: &[u8],
     direction: u8,

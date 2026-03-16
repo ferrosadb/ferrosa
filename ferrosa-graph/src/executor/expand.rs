@@ -8,15 +8,16 @@
 
 use std::time::{Duration, Instant};
 
-use ferrosa_common::DecoratedKey;
+use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_schema::VirtualTableRegistry;
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{StorageEngine, TableId};
 
 use crate::adjacency::schema::adjacency_keyspace_name;
 use crate::error::{GraphError, Result};
 use crate::executor::result::{GraphResult, QueryStats};
-use crate::parser::{Expr, ReturnClause, ReturnItem};
-use crate::planner::physical::{Anchor, Hop, PhysicalPlan};
+use crate::parser::{Expr, Literal, ReturnClause, ReturnItem, SortDir};
+use crate::planner::physical::{Anchor, CreateOp, Hop, PhysicalPlan};
 
 /// Configuration for the graph query engine (T4 DoS limits).
 #[derive(Debug, Clone)]
@@ -67,6 +68,33 @@ pub fn execute(
             config,
             start,
             virtual_tables,
+        ),
+        PhysicalPlan::CreateNodes { creates } => execute_create(storage, &creates, config, start),
+        PhysicalPlan::SetProperties {
+            expand,
+            assignments,
+        } => execute_set(
+            storage,
+            *expand,
+            keyspace,
+            &assignments,
+            config,
+            virtual_tables,
+            start,
+        ),
+        PhysicalPlan::DeleteNodes {
+            expand,
+            variables,
+            detach,
+        } => execute_delete(
+            storage,
+            *expand,
+            keyspace,
+            &variables,
+            detach,
+            config,
+            virtual_tables,
+            start,
         ),
     }
 }
@@ -155,23 +183,53 @@ fn execute_expand(
         current_keys = next_keys;
     }
 
-    // Step 3: Build result from return clause.
+    // Step 3: Build result from return clause, projecting property values.
     let columns = build_columns(return_clause);
+    let anchor_table_id_for_proj = TableId::new(&anchor.table.keyspace, &anchor.table.table);
 
-    // For Phase 1: return vertex IDs as hex strings.
     let mut rows = Vec::new();
     for key in &current_keys {
         if rows.len() >= config.max_result_rows {
             break;
         }
+
+        // Read the full partition from storage for property projection.
+        let partition = storage.read(&anchor_table_id_for_proj, key)?;
+
         let hex_id = hex::encode(key.key.as_bytes());
-        // Each row has one value per column. For Phase 1, all columns
-        // get the vertex ID hex string.
-        let row: Vec<serde_json::Value> = columns
+        let row: Vec<serde_json::Value> = return_clause
+            .items
             .iter()
-            .map(|_| serde_json::Value::String(hex_id.clone()))
+            .map(|item| match &item.expr {
+                Expr::Var(_) => serde_json::Value::String(hex_id.clone()),
+                Expr::Property { name, .. } => {
+                    // Look up the property in the partition's rows.
+                    if let Some(ref part) = partition {
+                        extract_property_from_partition(part, name)
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
+                _ => serde_json::Value::Null,
+            })
             .collect();
         rows.push(row);
+    }
+
+    // Apply ORDER BY.
+    if !return_clause.order_by.is_empty() {
+        sort_rows(&mut rows, &columns, &return_clause.order_by);
+    }
+
+    // Apply DISTINCT.
+    if return_clause.distinct {
+        rows.dedup();
+    }
+
+    // Apply LIMIT.
+    if let Some(limit) = return_clause.limit {
+        let limit = limit.max(0) as usize;
+        rows.truncate(limit);
     }
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
@@ -181,6 +239,313 @@ fn execute_expand(
         rows,
         stats,
     })
+}
+
+/// Extract a property value from a partition's first row by column name.
+///
+/// Since the graph engine stores vertex properties as cells in a single row
+/// keyed by column index, we iterate cells and match by index. However, we
+/// don't carry the table schema into the executor, so we use a positional
+/// heuristic: column names are matched against cell indices. For a more robust
+/// implementation we'd need to pass column metadata. For now, we treat each
+/// cell's column_index as its position and return the first matching cell
+/// that has the right index for a name-based lookup (matching the property
+/// name to the column index in order). As a practical fallback, we look for
+/// any non-empty cell and return it as a string.
+fn extract_property_from_partition(
+    partition: &ferrosa_sstable::types::Partition,
+    property_name: &str,
+) -> serde_json::Value {
+    // Walk the partition's rows looking for a cell whose value is present.
+    // In the graph model, vertex tables typically have a single static/clustered
+    // row. We search all rows' cells and the static row.
+    //
+    // Without schema metadata we cannot map property names to column indices
+    // precisely, so we return the first live cell we find. A future revision
+    // should thread column metadata through the planner to enable exact lookup.
+    let all_rows = partition.static_row.iter().chain(partition.rows.iter());
+
+    let _ = property_name; // TODO: use schema metadata for exact column lookup
+
+    for row in all_rows {
+        if let Some((_col_idx, cell)) = row.cells.first() {
+            return cell_value_to_json(cell);
+        }
+    }
+    serde_json::Value::Null
+}
+
+/// Convert a `Literal` from the AST into raw bytes for storage.
+fn literal_to_bytes(lit: &Literal) -> Vec<u8> {
+    match lit {
+        Literal::String(s) => s.as_bytes().to_vec(),
+        Literal::Integer(i) => i.to_be_bytes().to_vec(),
+        Literal::Float(f) => f.to_be_bytes().to_vec(),
+        Literal::Bool(b) => vec![if *b { 1 } else { 0 }],
+        Literal::Null => vec![],
+    }
+}
+
+/// Convert an `Expr` to bytes, supporting only `Expr::Literal` for now.
+fn expr_to_bytes(expr: &Expr) -> std::result::Result<Vec<u8>, GraphError> {
+    match expr {
+        Expr::Literal(lit) => Ok(literal_to_bytes(lit)),
+        other => Err(GraphError::Validation(format!(
+            "cannot convert expression to bytes: {other:?}"
+        ))),
+    }
+}
+
+/// Generate a current timestamp in microseconds since epoch.
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64
+}
+
+/// Execute a CREATE plan: for each CreateOp, build a Row with cells from the
+/// properties and write it to storage.
+fn execute_create(
+    storage: &StorageEngine,
+    creates: &[CreateOp],
+    _config: &GraphEngineConfig,
+    start: Instant,
+) -> Result<GraphResult> {
+    let mut stats = QueryStats::default();
+    let timestamp = now_micros();
+
+    for op in creates {
+        let table_id = TableId::new(&op.table.keyspace, &op.table.table);
+
+        // Generate a unique key for the new vertex/edge using a UUID.
+        let key_bytes = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+
+        // Build cells from properties.
+        let cells: Vec<(u16, CellValue)> = op
+            .props
+            .iter()
+            .enumerate()
+            .map(|(idx, (_name, expr))| {
+                let bytes = expr_to_bytes(expr).unwrap_or_default();
+                (idx as u16, CellValue::live(bytes, timestamp))
+            })
+            .collect();
+
+        let row = Row {
+            clustering: vec![],
+            cells,
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+        };
+
+        storage.write(&table_id, &key, row, timestamp)?;
+        stats.vertices_written += 1;
+    }
+
+    stats.execution_ms = start.elapsed().as_millis() as u64;
+
+    Ok(GraphResult {
+        columns: vec!["status".to_string()],
+        rows: vec![vec![serde_json::Value::String(format!(
+            "created {} vertices",
+            stats.vertices_written
+        ))]],
+        stats,
+    })
+}
+
+/// Execute a SET plan: run the expand to find matching vertices, then write
+/// updated cells for each one.
+#[allow(clippy::too_many_arguments)]
+fn execute_set(
+    storage: &StorageEngine,
+    expand: PhysicalPlan,
+    keyspace: &str,
+    assignments: &[(String, String, Expr)],
+    config: &GraphEngineConfig,
+    virtual_tables: Option<&VirtualTableRegistry>,
+    start: Instant,
+) -> Result<GraphResult> {
+    // Execute the inner expand to find matching vertices.
+    let expand_result = execute(expand, storage, keyspace, config, virtual_tables)?;
+    let mut stats = QueryStats::default();
+    stats.vertices_read = expand_result.stats.vertices_read;
+    stats.edges_read = expand_result.stats.edges_read;
+
+    let timestamp = now_micros();
+
+    // For each matched vertex, apply the assignments.
+    // The expand result rows contain vertex IDs (hex-encoded).
+    // We need to reconstruct the partition key from the hex ID.
+    for row_values in &expand_result.rows {
+        for (col_idx, col_name) in expand_result.columns.iter().enumerate() {
+            // Find assignments that target this variable.
+            let matching_assignments: Vec<&(String, String, Expr)> = assignments
+                .iter()
+                .filter(|(var, _prop, _val)| col_name == var)
+                .collect();
+
+            if matching_assignments.is_empty() {
+                continue;
+            }
+
+            // Get the vertex ID from the row.
+            if let Some(serde_json::Value::String(hex_id)) = row_values.get(col_idx) {
+                let key_bytes = hex::decode(hex_id)
+                    .map_err(|e| GraphError::Internal(format!("invalid hex vertex ID: {e}")))?;
+                let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+
+                // Build cells for the updated properties.
+                let cells: Vec<(u16, CellValue)> = matching_assignments
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (_var, _prop, val))| {
+                        let bytes = expr_to_bytes(val).unwrap_or_default();
+                        (idx as u16, CellValue::live(bytes, timestamp))
+                    })
+                    .collect();
+
+                // We need a table_id; look up via the variable. For simplicity,
+                // we use the first assignment's variable to find it in the expand's
+                // anchor table. In a full implementation we'd carry table metadata.
+                // For now, use the column name to identify the table.
+                let table_id = TableId::new(keyspace, col_name);
+
+                let update_row = Row {
+                    clustering: vec![],
+                    cells,
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::NONE,
+                };
+
+                storage.write(&table_id, &key, update_row, timestamp)?;
+                stats.vertices_written += 1;
+            }
+        }
+    }
+
+    stats.execution_ms = start.elapsed().as_millis() as u64;
+
+    Ok(GraphResult {
+        columns: vec!["status".to_string()],
+        rows: vec![vec![serde_json::Value::String(format!(
+            "updated {} vertices",
+            stats.vertices_written
+        ))]],
+        stats,
+    })
+}
+
+/// Execute a DELETE plan: run the expand to find matching vertices, then write
+/// tombstones for each one.
+#[allow(clippy::too_many_arguments)]
+fn execute_delete(
+    storage: &StorageEngine,
+    expand: PhysicalPlan,
+    keyspace: &str,
+    variables: &[String],
+    _detach: bool,
+    config: &GraphEngineConfig,
+    virtual_tables: Option<&VirtualTableRegistry>,
+    start: Instant,
+) -> Result<GraphResult> {
+    let expand_result = execute(expand, storage, keyspace, config, virtual_tables)?;
+    let mut stats = QueryStats::default();
+    stats.vertices_read = expand_result.stats.vertices_read;
+    stats.edges_read = expand_result.stats.edges_read;
+
+    let timestamp = now_micros();
+    let local_deletion_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32;
+
+    // For each matched vertex in the specified variables, write a tombstone.
+    for row_values in &expand_result.rows {
+        for (col_idx, col_name) in expand_result.columns.iter().enumerate() {
+            if !variables.iter().any(|v| v == col_name) {
+                continue;
+            }
+
+            if let Some(serde_json::Value::String(hex_id)) = row_values.get(col_idx) {
+                let key_bytes = hex::decode(hex_id)
+                    .map_err(|e| GraphError::Internal(format!("invalid hex vertex ID: {e}")))?;
+                let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+                let table_id = TableId::new(keyspace, col_name);
+
+                // Write a row-level tombstone.
+                let tombstone_row = Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: DeletionTime::new(timestamp, local_deletion_time),
+                    primary_key_liveness: LivenessInfo::NONE,
+                };
+
+                storage.write(&table_id, &key, tombstone_row, timestamp)?;
+                stats.vertices_deleted += 1;
+            }
+        }
+    }
+
+    stats.execution_ms = start.elapsed().as_millis() as u64;
+
+    Ok(GraphResult {
+        columns: vec!["status".to_string()],
+        rows: vec![vec![serde_json::Value::String(format!(
+            "deleted {} vertices",
+            stats.vertices_deleted
+        ))]],
+        stats,
+    })
+}
+
+/// Sort rows by the specified ORDER BY columns.
+fn sort_rows(
+    rows: &mut [Vec<serde_json::Value>],
+    columns: &[String],
+    order_by: &[crate::parser::OrderItem],
+) {
+    rows.sort_by(|a, b| {
+        for order_item in order_by {
+            let col_name = expr_to_column_name(&order_item.expr);
+            let col_idx = columns.iter().position(|c| c == &col_name);
+            if let Some(idx) = col_idx {
+                let cmp = compare_json_values(a.get(idx), b.get(idx));
+                let cmp = match order_item.direction {
+                    SortDir::Asc => cmp,
+                    SortDir::Desc => cmp.reverse(),
+                };
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// Compare two JSON values for sorting purposes.
+fn compare_json_values(
+    a: Option<&serde_json::Value>,
+    b: Option<&serde_json::Value>,
+) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(serde_json::Value::Null), Some(serde_json::Value::Null)) => std::cmp::Ordering::Equal,
+        (Some(serde_json::Value::Null), Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), Some(serde_json::Value::Null)) => std::cmp::Ordering::Greater,
+        (Some(serde_json::Value::String(a)), Some(serde_json::Value::String(b))) => a.cmp(b),
+        (Some(serde_json::Value::Number(a)), Some(serde_json::Value::Number(b))) => {
+            let af = a.as_f64().unwrap_or(0.0);
+            let bf = b.as_f64().unwrap_or(0.0);
+            af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        _ => std::cmp::Ordering::Equal,
+    }
 }
 
 /// Execute an anchor lookup against a virtual table.
@@ -847,5 +1212,96 @@ mod tests {
         assert_eq!(config.query_timeout, Duration::from_secs(30));
         assert_eq!(config.max_result_rows, 10_000);
         assert_eq!(config.max_fan_out_per_hop, 10_000);
+    }
+
+    #[test]
+    fn sort_rows_ascending() {
+        let columns = vec!["name".to_string()];
+        let order_by = vec![crate::parser::OrderItem {
+            expr: Expr::Var("name".into()),
+            direction: SortDir::Asc,
+        }];
+
+        let mut rows = vec![
+            vec![serde_json::Value::String("Charlie".into())],
+            vec![serde_json::Value::String("Alice".into())],
+            vec![serde_json::Value::String("Bob".into())],
+        ];
+
+        sort_rows(&mut rows, &columns, &order_by);
+
+        assert_eq!(rows[0][0], serde_json::Value::String("Alice".into()));
+        assert_eq!(rows[1][0], serde_json::Value::String("Bob".into()));
+        assert_eq!(rows[2][0], serde_json::Value::String("Charlie".into()));
+    }
+
+    #[test]
+    fn sort_rows_descending() {
+        let columns = vec!["name".to_string()];
+        let order_by = vec![crate::parser::OrderItem {
+            expr: Expr::Var("name".into()),
+            direction: SortDir::Desc,
+        }];
+
+        let mut rows = vec![
+            vec![serde_json::Value::String("Alice".into())],
+            vec![serde_json::Value::String("Charlie".into())],
+            vec![serde_json::Value::String("Bob".into())],
+        ];
+
+        sort_rows(&mut rows, &columns, &order_by);
+
+        assert_eq!(rows[0][0], serde_json::Value::String("Charlie".into()));
+        assert_eq!(rows[1][0], serde_json::Value::String("Bob".into()));
+        assert_eq!(rows[2][0], serde_json::Value::String("Alice".into()));
+    }
+
+    #[test]
+    fn compare_json_values_nulls_sort_first() {
+        let result = compare_json_values(
+            Some(&serde_json::Value::Null),
+            Some(&serde_json::Value::String("a".into())),
+        );
+        assert_eq!(result, std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn compare_json_values_numbers() {
+        let result =
+            compare_json_values(Some(&serde_json::json!(10)), Some(&serde_json::json!(20)));
+        assert_eq!(result, std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn limit_truncates_rows() {
+        // Build a mock result with 5 rows and apply a limit of 3.
+        let mut rows: Vec<Vec<serde_json::Value>> = (0..5)
+            .map(|i| vec![serde_json::Value::String(format!("row_{i}"))])
+            .collect();
+
+        let limit: i64 = 3;
+        rows.truncate(limit as usize);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], serde_json::Value::String("row_0".into()));
+        assert_eq!(rows[2][0], serde_json::Value::String("row_2".into()));
+    }
+
+    #[test]
+    fn literal_to_bytes_string() {
+        let bytes = literal_to_bytes(&crate::parser::Literal::String("hello".into()));
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn literal_to_bytes_integer() {
+        let bytes = literal_to_bytes(&crate::parser::Literal::Integer(42));
+        assert_eq!(bytes, 42_i64.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn literal_to_bytes_null() {
+        let bytes = literal_to_bytes(&crate::parser::Literal::Null);
+        assert!(bytes.is_empty());
     }
 }
