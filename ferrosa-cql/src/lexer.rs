@@ -122,6 +122,7 @@ pub enum Keyword {
     Stype,
     Finalfunc,
     Initcond,
+    As,
 }
 
 /// Compile-time keyword map. Case-insensitive lookup is done by
@@ -234,6 +235,7 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "STYPE" => Keyword::Stype,
     "FINALFUNC" => Keyword::Finalfunc,
     "INITCOND" => Keyword::Initcond,
+    "AS" => Keyword::As,
 };
 
 /// Token kind produced by the lexer.
