@@ -1,31 +1,73 @@
-//! Phonetic index: encodes text values using phonetic algorithms for
-//! fuzzy name matching.
+//! Phonetic encoding algorithms and phonetic index factory.
 //!
-//! Supports [`IndexCapabilities::POINT_LOOKUP`] and [`IndexCapabilities::PHONETIC`].
-//! Lookups encode the query text with the same algorithm and find all rows
-//! whose indexed column produced the same phonetic code.
+//! Phonetic indexes allow fuzzy name matching: "Smith" and "Smythe" both
+//! encode to the same Soundex code "S530", so a phonetic index lookup for
+//! either name will return both rows.
 
 pub mod caverphone;
 pub mod double_metaphone;
 pub mod metaphone;
 pub mod soundex;
 
+use std::collections::HashMap;
+use std::ops::Bound;
+use std::path::PathBuf;
+
+use ferrosa_common::CellValue;
+
 use crate::{
     IndexBuilder, IndexCapabilities, IndexConfig, IndexError, IndexFactory, IndexFileMeta,
-    IndexFiles, IndexKey, IndexReader, IndexResult, IndexType, PhoneticAlgorithm, RowPosition,
+    IndexFiles, IndexKey, IndexReader, IndexResult, IndexType, RowPosition,
 };
-use ferrosa_common::CellValue;
-use std::collections::HashMap;
-use std::io::{Read as _, Write as _};
-use std::ops::Bound;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Trait for phonetic encoding algorithms.
+// ── PhoneticEncoder trait ────────────────────────────────────────────────────
+
+/// A phonetic encoding algorithm that maps strings to pronunciation-based codes.
 pub trait PhoneticEncoder: Send + Sync {
+    /// Encode the input string into a phonetic code.
     fn encode(&self, input: &str) -> String;
 }
 
-/// Factory for creating phonetic index builders and readers.
+// ── Algorithm selection ──────────────────────────────────────────────────────
+
+/// Which phonetic algorithm to use.
+#[derive(Debug, Clone, Copy)]
+pub enum PhoneticAlgorithm {
+    Soundex,
+    Metaphone,
+    DoubleMetaphone,
+    Caverphone,
+}
+
+impl PhoneticAlgorithm {
+    fn encoder(&self) -> Box<dyn PhoneticEncoder> {
+        match self {
+            PhoneticAlgorithm::Soundex => Box::new(soundex::SoundexEncoder),
+            PhoneticAlgorithm::Metaphone => Box::new(metaphone::MetaphoneEncoder),
+            PhoneticAlgorithm::DoubleMetaphone => {
+                Box::new(double_metaphone::DoubleMetaphoneEncoder)
+            }
+            PhoneticAlgorithm::Caverphone => Box::new(caverphone::CaverphoneEncoder),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            PhoneticAlgorithm::Soundex => "soundex",
+            PhoneticAlgorithm::Metaphone => "metaphone",
+            PhoneticAlgorithm::DoubleMetaphone => "double_metaphone",
+            PhoneticAlgorithm::Caverphone => "caverphone",
+        }
+    }
+}
+
+// ── PhoneticIndexFactory ─────────────────────────────────────────────────────
+
+/// Factory that builds and reads phonetic indexes.
+///
+/// During build, each row's cell value at the configured column is interpreted
+/// as UTF-8 text, encoded with the chosen phonetic algorithm, and the mapping
+/// `(phonetic_code -> Vec<RowPosition>)` is persisted to a binary file.
 pub struct PhoneticIndexFactory {
     algorithm: PhoneticAlgorithm,
 }
@@ -34,58 +76,46 @@ impl PhoneticIndexFactory {
     pub fn new(algorithm: PhoneticAlgorithm) -> Self {
         Self { algorithm }
     }
-
-    fn create_encoder(algorithm: &PhoneticAlgorithm) -> Box<dyn PhoneticEncoder> {
-        match algorithm {
-            PhoneticAlgorithm::Soundex => Box::new(soundex::Soundex),
-            PhoneticAlgorithm::Metaphone => Box::new(metaphone::Metaphone::default()),
-            PhoneticAlgorithm::DoubleMetaphone => {
-                Box::new(double_metaphone::DoubleMetaphone::default())
-            }
-            PhoneticAlgorithm::Caverphone => Box::new(caverphone::Caverphone),
-        }
-    }
 }
 
 impl IndexFactory for PhoneticIndexFactory {
     fn create_builder(&self, config: &IndexConfig) -> IndexResult<Box<dyn IndexBuilder>> {
+        let file_path = config.output_dir.join(format!(
+            "{}.phonetic_{}.idx",
+            config.name,
+            self.algorithm.name()
+        ));
         Ok(Box::new(PhoneticBuilder {
-            entries: Vec::new(),
-            config: config.clone(),
-            encoder: Self::create_encoder(&self.algorithm),
-            algorithm: self.algorithm.clone(),
+            encoder: self.algorithm.encoder(),
+            entries: HashMap::new(),
+            file_path,
         }))
     }
 
     fn open_reader(&self, files: &IndexFiles) -> IndexResult<Box<dyn IndexReader>> {
-        let data = std::fs::read(&files.data_path)?;
-        let entries = deserialize_entries(&data)?;
-        let mut map: HashMap<String, Vec<RowPosition>> = HashMap::new();
-        for (code, pos) in entries {
-            map.entry(code).or_default().push(pos);
-        }
+        let data = std::fs::read(&files.data.path)?;
+        let entries = deserialize_phonetic(&data)?;
         Ok(Box::new(PhoneticReader {
-            map,
-            encoder: Self::create_encoder(&self.algorithm),
+            encoder: self.algorithm.encoder(),
+            entries,
         }))
     }
 
-    fn merge(
-        &self,
-        readers: Vec<Box<dyn IndexReader>>,
-        builder: Box<dyn IndexBuilder>,
-    ) -> IndexResult<IndexFiles> {
-        let _ = readers;
-        builder.finish()
+    fn index_type(&self) -> IndexType {
+        IndexType::Phonetic
+    }
+
+    fn capabilities(&self) -> IndexCapabilities {
+        IndexCapabilities::POINT_LOOKUP | IndexCapabilities::PHONETIC
     }
 }
 
-/// Accumulates (phonetic_code, RowPosition) entries during index build.
+// ── Builder ──────────────────────────────────────────────────────────────────
+
 struct PhoneticBuilder {
-    entries: Vec<(String, RowPosition)>,
-    config: IndexConfig,
     encoder: Box<dyn PhoneticEncoder>,
-    algorithm: PhoneticAlgorithm,
+    entries: HashMap<String, Vec<RowPosition>>,
+    file_path: PathBuf,
 }
 
 impl IndexBuilder for PhoneticBuilder {
@@ -93,117 +123,67 @@ impl IndexBuilder for PhoneticBuilder {
         &mut self,
         partition_key: &[u8],
         clustering_key: &[u8],
-        cells: &[(u16, CellValue)],
+        cells: &[CellValue],
+        column_positions: &[usize],
     ) -> IndexResult<()> {
-        let col_pos = self
-            .config
-            .column_positions
-            .first()
-            .copied()
-            .ok_or_else(|| IndexError::Build("no column positions configured".into()))?;
-
-        let cell = cells
-            .iter()
-            .find(|(pos, _)| *pos as usize == col_pos)
-            .map(|(_, cv)| cv);
-
-        let cell = match cell {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-
-        if cell.is_tombstone() {
+        if column_positions.is_empty() {
             return Ok(());
         }
 
-        let value_bytes = match &cell.value {
+        let col_pos = column_positions[0];
+        if col_pos >= cells.len() {
+            return Err(IndexError::MissingColumn(col_pos));
+        }
+
+        let cell = &cells[col_pos];
+        let value = match &cell.value {
             Some(v) => v,
-            None => return Ok(()),
+            None => return Ok(()), // skip tombstones
         };
 
-        // Interpret cell bytes as UTF-8 text for phonetic encoding.
-        let text = match std::str::from_utf8(value_bytes) {
-            Ok(s) => s,
-            Err(_) => return Ok(()), // Non-UTF-8 data cannot be phonetically encoded; skip.
-        };
-
-        let code = self.encoder.encode(text);
-        if code.is_empty() {
-            return Ok(());
+        // Interpret cell value as UTF-8 text
+        if let Ok(text) = std::str::from_utf8(value) {
+            if !text.is_empty() {
+                let code = self.encoder.encode(text);
+                if !code.is_empty() {
+                    self.entries.entry(code).or_default().push(RowPosition {
+                        partition_key: partition_key.to_vec(),
+                        clustering_key: clustering_key.to_vec(),
+                    });
+                }
+            }
         }
-
-        self.entries.push((
-            code,
-            RowPosition {
-                partition_key: partition_key.to_vec(),
-                clustering_key: clustering_key.to_vec(),
-            },
-        ));
 
         Ok(())
     }
 
     fn finish(self: Box<Self>) -> IndexResult<IndexFiles> {
-        let row_count = self.entries.len() as u64;
-        let data = serialize_entries(&self.entries);
+        let data = serialize_phonetic(&self.entries);
+        std::fs::write(&self.file_path, &data)?;
 
-        let data_path = self.config.output_dir.join(format!(
-            "{}-{}.db",
-            self.config.sstable_prefix, self.config.index_name
-        ));
-        let meta_path = self.config.output_dir.join(format!(
-            "{}-{}.meta",
-            self.config.sstable_prefix, self.config.index_name
-        ));
-
-        std::fs::create_dir_all(&self.config.output_dir)?;
-        std::fs::write(&data_path, &data)?;
-
-        let checksum = crc32(&data);
-        let file_size = data.len() as u64;
-        let build_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let meta = IndexFileMeta {
-            index_type: IndexType::Phonetic {
-                algorithm: self.algorithm.clone(),
-            },
-            index_name: self.config.index_name.clone(),
-            row_count,
-            build_timestamp,
-            sstable_id: self.config.sstable_prefix.clone(),
-            file_size,
-            checksum,
-        };
-
-        let meta_json = serde_json::to_vec(&meta)
-            .map_err(|e| IndexError::Build(format!("meta serialization: {e}")))?;
-        std::fs::write(&meta_path, &meta_json)?;
-
+        let size = data.len() as u64;
         Ok(IndexFiles {
-            data_path,
-            meta_path,
-            meta,
+            data: IndexFileMeta {
+                path: self.file_path,
+                size,
+            },
         })
     }
 }
 
-/// Reads a phonetic index: on lookup, encodes query text and finds matching rows.
+// ── Reader ───────────────────────────────────────────────────────────────────
+
 struct PhoneticReader {
-    map: HashMap<String, Vec<RowPosition>>,
     encoder: Box<dyn PhoneticEncoder>,
+    entries: HashMap<String, Vec<RowPosition>>,
 }
 
 impl IndexReader for PhoneticReader {
     fn lookup(&self, key: &IndexKey) -> IndexResult<Vec<RowPosition>> {
-        let text = extract_text(key)?;
+        let text = std::str::from_utf8(&key.0)
+            .map_err(|e| IndexError::Corrupt(format!("invalid UTF-8 in lookup key: {e}")))?;
         let code = self.encoder.encode(text);
-        if code.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(self.map.get(&code).cloned().unwrap_or_default())
+        Ok(self.entries.get(&code).cloned().unwrap_or_default())
     }
 
     fn range(
@@ -212,18 +192,13 @@ impl IndexReader for PhoneticReader {
         _end: Bound<&IndexKey>,
     ) -> IndexResult<Vec<RowPosition>> {
         Err(IndexError::Unsupported(
-            "range scan not supported by phonetic index".into(),
+            "phonetic indexes do not support range scans".to_string(),
         ))
     }
 
-    fn nearest(
-        &self,
-        _query: &[f32],
-        _k: usize,
-        _ef_search: Option<u16>,
-    ) -> IndexResult<Vec<(RowPosition, f32)>> {
+    fn nearest(&self, _key: &IndexKey) -> IndexResult<Vec<RowPosition>> {
         Err(IndexError::Unsupported(
-            "nearest not supported by phonetic index".into(),
+            "phonetic indexes do not support nearest lookup".to_string(),
         ))
     }
 
@@ -232,353 +207,225 @@ impl IndexReader for PhoneticReader {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ── Serialization ────────────────────────────────────────────────────────────
 
-fn extract_text(key: &IndexKey) -> IndexResult<&str> {
-    match key {
-        IndexKey::Text(s) => Ok(s.as_str()),
-        IndexKey::Bytes(b) => std::str::from_utf8(b)
-            .map_err(|e| IndexError::Query(format!("phonetic index requires UTF-8 text: {e}"))),
-        _ => Err(IndexError::Query(
-            "phonetic index only supports Text or Bytes keys".into(),
-        )),
-    }
-}
-
-/// Serialization format for phonetic entries:
+/// Binary format:
 /// ```text
-/// entry_count: u64
-/// entries[]:
-///   code_len: u32
-///   code:     [u8; code_len]   (UTF-8 phonetic code)
-///   pk_len:   u32
-///   pk:       [u8; pk_len]
-///   ck_len:   u32
-///   ck:       [u8; ck_len]
+/// num_codes: u32 LE
+/// for each code:
+///     code_len: u32 LE
+///     code_bytes
+///     num_positions: u32 LE
+///     for each position:
+///         pk_len: u32 LE, pk_bytes
+///         ck_len: u32 LE, ck_bytes
 /// ```
-fn serialize_entries(entries: &[(String, RowPosition)]) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::new();
-    buf.write_all(&(entries.len() as u64).to_le_bytes())
-        .unwrap();
-    for (code, pos) in entries {
+fn serialize_phonetic(entries: &HashMap<String, Vec<RowPosition>>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+
+    for (code, positions) in entries {
         let code_bytes = code.as_bytes();
-        buf.write_all(&(code_bytes.len() as u32).to_le_bytes())
-            .unwrap();
-        buf.write_all(code_bytes).unwrap();
-        buf.write_all(&(pos.partition_key.len() as u32).to_le_bytes())
-            .unwrap();
-        buf.write_all(&pos.partition_key).unwrap();
-        buf.write_all(&(pos.clustering_key.len() as u32).to_le_bytes())
-            .unwrap();
-        buf.write_all(&pos.clustering_key).unwrap();
+        buf.extend_from_slice(&(code_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(code_bytes);
+
+        buf.extend_from_slice(&(positions.len() as u32).to_le_bytes());
+        for pos in positions {
+            buf.extend_from_slice(&(pos.partition_key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&pos.partition_key);
+            buf.extend_from_slice(&(pos.clustering_key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&pos.clustering_key);
+        }
     }
+
     buf
 }
 
-fn deserialize_entries(data: &[u8]) -> IndexResult<Vec<(String, RowPosition)>> {
-    let mut cursor = std::io::Cursor::new(data);
-    let mut buf8 = [0u8; 8];
-    let mut buf4 = [0u8; 4];
+fn deserialize_phonetic(data: &[u8]) -> IndexResult<HashMap<String, Vec<RowPosition>>> {
+    if data.len() < 4 {
+        return Err(IndexError::Corrupt(
+            "phonetic index file too short".to_string(),
+        ));
+    }
 
-    cursor
-        .read_exact(&mut buf8)
-        .map_err(|e| IndexError::Query(format!("read entry_count: {e}")))?;
-    let count = u64::from_le_bytes(buf8) as usize;
+    let num_codes = read_u32(data, 0)? as usize;
+    let mut offset = 4;
+    let mut entries = HashMap::with_capacity(num_codes);
 
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        cursor
-            .read_exact(&mut buf4)
-            .map_err(|e| IndexError::Query(format!("read code_len: {e}")))?;
-        let code_len = u32::from_le_bytes(buf4) as usize;
-        let mut code_bytes = vec![0u8; code_len];
-        cursor
-            .read_exact(&mut code_bytes)
-            .map_err(|e| IndexError::Query(format!("read code: {e}")))?;
+    for _ in 0..num_codes {
+        let code_bytes = read_len_prefixed(data, &mut offset)?;
         let code = String::from_utf8(code_bytes)
-            .map_err(|e| IndexError::Query(format!("invalid UTF-8 in code: {e}")))?;
+            .map_err(|e| IndexError::Corrupt(format!("invalid UTF-8 in phonetic code: {e}")))?;
 
-        cursor
-            .read_exact(&mut buf4)
-            .map_err(|e| IndexError::Query(format!("read pk_len: {e}")))?;
-        let pk_len = u32::from_le_bytes(buf4) as usize;
-        let mut pk = vec![0u8; pk_len];
-        cursor
-            .read_exact(&mut pk)
-            .map_err(|e| IndexError::Query(format!("read pk: {e}")))?;
+        let num_positions = read_u32(data, offset)? as usize;
+        offset += 4;
 
-        cursor
-            .read_exact(&mut buf4)
-            .map_err(|e| IndexError::Query(format!("read ck_len: {e}")))?;
-        let ck_len = u32::from_le_bytes(buf4) as usize;
-        let mut ck = vec![0u8; ck_len];
-        cursor
-            .read_exact(&mut ck)
-            .map_err(|e| IndexError::Query(format!("read ck: {e}")))?;
-
-        entries.push((
-            code,
-            RowPosition {
+        let mut positions = Vec::with_capacity(num_positions);
+        for _ in 0..num_positions {
+            let pk = read_len_prefixed(data, &mut offset)?;
+            let ck = read_len_prefixed(data, &mut offset)?;
+            positions.push(RowPosition {
                 partition_key: pk,
                 clustering_key: ck,
-            },
-        ));
+            });
+        }
+
+        entries.insert(code, positions);
     }
 
     Ok(entries)
 }
 
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        let idx = ((crc ^ byte as u32) & 0xFF) as usize;
-        crc = CRC32_TABLE[idx] ^ (crc >> 8);
+fn read_u32(data: &[u8], offset: usize) -> IndexResult<u32> {
+    if offset + 4 > data.len() {
+        return Err(IndexError::Corrupt(format!(
+            "unexpected EOF at offset {offset} reading u32"
+        )));
     }
-    !crc
+    Ok(u32::from_le_bytes(
+        data[offset..offset + 4].try_into().unwrap(),
+    ))
 }
 
-#[rustfmt::skip]
-static CRC32_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let poly: u32 = 0xEDB88320;
-    let mut i = 0;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ poly;
-            } else {
-                crc >>= 1;
-            }
-            j += 1;
-        }
-        table[i] = crc;
-        i += 1;
+fn read_len_prefixed(data: &[u8], offset: &mut usize) -> IndexResult<Vec<u8>> {
+    let len = read_u32(data, *offset)? as usize;
+    *offset += 4;
+    if *offset + len > data.len() {
+        return Err(IndexError::Corrupt(format!(
+            "unexpected EOF at offset {offset} reading {len} bytes"
+        )));
     }
-    table
-};
+    let bytes = data[*offset..*offset + len].to_vec();
+    *offset += len;
+    Ok(bytes)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_config(dir: &std::path::Path, algorithm: PhoneticAlgorithm) -> IndexConfig {
-        IndexConfig {
-            index_type: IndexType::Phonetic { algorithm },
-            column_positions: vec![0],
-            output_dir: dir.to_path_buf(),
-            sstable_prefix: "sstable-001".into(),
-            index_name: "idx_name_phonetic".into(),
-        }
-    }
-
-    fn cell(value: &[u8]) -> CellValue {
-        CellValue::live(value.to_vec(), 1000)
-    }
-
-    fn tombstone_cell() -> CellValue {
-        CellValue::tombstone(1000, 1_700_000_000)
-    }
+    use ferrosa_common::CellValue;
+    use tempfile::tempdir;
 
     #[test]
     fn phonetic_index_matches_similar_names() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path(), PhoneticAlgorithm::Soundex);
+        let dir = tempdir().unwrap();
         let factory = PhoneticIndexFactory::new(PhoneticAlgorithm::Soundex);
+        let config = IndexConfig {
+            index_type: IndexType::Phonetic,
+            column_positions: vec![0],
+            output_dir: dir.path().to_path_buf(),
+            name: "test_phonetic".to_string(),
+        };
+
         let mut builder = factory.create_builder(&config).unwrap();
 
+        // Add rows with similar-sounding names
         builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"Smith"))])
+            .add_row(b"pk1", b"", &[CellValue::live(b"Smith".to_vec(), 1)], &[0])
             .unwrap();
         builder
-            .add_row(b"pk2", b"ck2", &[(0, cell(b"Smythe"))])
+            .add_row(b"pk2", b"", &[CellValue::live(b"Smythe".to_vec(), 2)], &[0])
             .unwrap();
         builder
-            .add_row(b"pk3", b"ck3", &[(0, cell(b"Johnson"))])
+            .add_row(b"pk3", b"", &[CellValue::live(b"Jones".to_vec(), 3)], &[0])
             .unwrap();
 
         let files = builder.finish().unwrap();
         let reader = factory.open_reader(&files).unwrap();
 
-        // Looking up "Smith" should find both Smith and Smythe (same Soundex S530)
-        let results = reader.lookup(&IndexKey::Text("Smith".into())).unwrap();
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().any(|r| r.partition_key == b"pk1"));
-        assert!(results.iter().any(|r| r.partition_key == b"pk2"));
+        assert!(reader
+            .capabilities()
+            .contains(IndexCapabilities::POINT_LOOKUP));
+        assert!(reader.capabilities().contains(IndexCapabilities::PHONETIC));
 
-        // Looking up "Smythe" should also find both
-        let results = reader.lookup(&IndexKey::Text("Smythe".into())).unwrap();
+        // "Smyth" should match both Smith and Smythe (all encode to S530)
+        let mut results = reader.lookup(&IndexKey(b"Smyth".to_vec())).unwrap();
+        results.sort_by(|a, b| a.partition_key.cmp(&b.partition_key));
         assert_eq!(results.len(), 2);
+        assert_eq!(results[0].partition_key, b"pk1");
+        assert_eq!(results[1].partition_key, b"pk2");
 
-        // Looking up "Johnson" should find only Johnson
-        let results = reader.lookup(&IndexKey::Text("Johnson".into())).unwrap();
+        // "Jones" should only match itself
+        let results = reader.lookup(&IndexKey(b"Jones".to_vec())).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].partition_key, b"pk3");
 
-        // Looking up a non-matching name
-        let results = reader.lookup(&IndexKey::Text("Zzzzz".into())).unwrap();
-        assert!(results.is_empty());
+        // Range should return unsupported
+        assert!(reader.range(Bound::Unbounded, Bound::Unbounded).is_err());
+    }
+
+    #[test]
+    fn phonetic_index_skips_tombstones() {
+        let dir = tempdir().unwrap();
+        let factory = PhoneticIndexFactory::new(PhoneticAlgorithm::Soundex);
+        let config = IndexConfig {
+            index_type: IndexType::Phonetic,
+            column_positions: vec![0],
+            output_dir: dir.path().to_path_buf(),
+            name: "test_tombstone".to_string(),
+        };
+
+        let mut builder = factory.create_builder(&config).unwrap();
+        builder
+            .add_row(b"pk1", b"", &[CellValue::live(b"Smith".to_vec(), 1)], &[0])
+            .unwrap();
+        builder
+            .add_row(b"pk2", b"", &[CellValue::tombstone(2, 1700000000)], &[0])
+            .unwrap();
+
+        let files = builder.finish().unwrap();
+        let reader = factory.open_reader(&files).unwrap();
+
+        let results = reader.lookup(&IndexKey(b"Smith".to_vec())).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].partition_key, b"pk1");
     }
 
     #[test]
     fn phonetic_index_with_metaphone() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path(), PhoneticAlgorithm::Metaphone);
+        let dir = tempdir().unwrap();
         let factory = PhoneticIndexFactory::new(PhoneticAlgorithm::Metaphone);
-        let mut builder = factory.create_builder(&config).unwrap();
+        let config = IndexConfig {
+            index_type: IndexType::Phonetic,
+            column_positions: vec![0],
+            output_dir: dir.path().to_path_buf(),
+            name: "test_metaphone".to_string(),
+        };
 
+        let mut builder = factory.create_builder(&config).unwrap();
         builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"Smith"))])
+            .add_row(b"pk1", b"", &[CellValue::live(b"Smith".to_vec(), 1)], &[0])
             .unwrap();
         builder
-            .add_row(b"pk2", b"ck2", &[(0, cell(b"Smyth"))])
+            .add_row(b"pk2", b"", &[CellValue::live(b"Smythe".to_vec(), 2)], &[0])
             .unwrap();
 
         let files = builder.finish().unwrap();
         let reader = factory.open_reader(&files).unwrap();
 
-        // Smith and Smyth produce the same Metaphone code
-        let results = reader.lookup(&IndexKey::Text("Smith".into())).unwrap();
+        // Metaphone: Smith and Smythe should encode the same
+        let results = reader.lookup(&IndexKey(b"Smith".to_vec())).unwrap();
         assert_eq!(results.len(), 2);
     }
 
     #[test]
-    fn phonetic_index_with_double_metaphone() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path(), PhoneticAlgorithm::DoubleMetaphone);
-        let factory = PhoneticIndexFactory::new(PhoneticAlgorithm::DoubleMetaphone);
-        let mut builder = factory.create_builder(&config).unwrap();
-
-        builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"Smith"))])
-            .unwrap();
-        builder
-            .add_row(b"pk2", b"ck2", &[(0, cell(b"Smyth"))])
-            .unwrap();
-
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let results = reader.lookup(&IndexKey::Text("Smith".into())).unwrap();
-        assert_eq!(results.len(), 2);
-    }
-
-    #[test]
-    fn phonetic_index_with_caverphone() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path(), PhoneticAlgorithm::Caverphone);
-        let factory = PhoneticIndexFactory::new(PhoneticAlgorithm::Caverphone);
-        let mut builder = factory.create_builder(&config).unwrap();
-
-        // Smith and Smyth produce the same Caverphone code
-        builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"Smith"))])
-            .unwrap();
-        builder
-            .add_row(b"pk2", b"ck2", &[(0, cell(b"Smyth"))])
-            .unwrap();
-
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        // Smith and Smyth should match with Caverphone
-        let results = reader.lookup(&IndexKey::Text("Smith".into())).unwrap();
-        assert_eq!(results.len(), 2);
-    }
-
-    #[test]
-    fn empty_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path(), PhoneticAlgorithm::Soundex);
+    fn phonetic_empty_index() {
+        let dir = tempdir().unwrap();
         let factory = PhoneticIndexFactory::new(PhoneticAlgorithm::Soundex);
+        let config = IndexConfig {
+            index_type: IndexType::Phonetic,
+            column_positions: vec![0],
+            output_dir: dir.path().to_path_buf(),
+            name: "test_empty".to_string(),
+        };
+
         let builder = factory.create_builder(&config).unwrap();
         let files = builder.finish().unwrap();
         let reader = factory.open_reader(&files).unwrap();
 
-        assert_eq!(files.meta.row_count, 0);
-        let results = reader.lookup(&IndexKey::Text("anything".into())).unwrap();
+        let results = reader.lookup(&IndexKey(b"anything".to_vec())).unwrap();
         assert!(results.is_empty());
-    }
-
-    #[test]
-    fn tombstone_skip() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path(), PhoneticAlgorithm::Soundex);
-        let factory = PhoneticIndexFactory::new(PhoneticAlgorithm::Soundex);
-        let mut builder = factory.create_builder(&config).unwrap();
-
-        builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"Alice"))])
-            .unwrap();
-        builder
-            .add_row(b"pk2", b"ck2", &[(0, tombstone_cell())])
-            .unwrap();
-
-        let files = builder.finish().unwrap();
-        assert_eq!(files.meta.row_count, 1);
-    }
-
-    #[test]
-    fn bytes_key_lookup() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path(), PhoneticAlgorithm::Soundex);
-        let factory = PhoneticIndexFactory::new(PhoneticAlgorithm::Soundex);
-        let mut builder = factory.create_builder(&config).unwrap();
-
-        builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"Smith"))])
-            .unwrap();
-
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        // Should also work with Bytes key containing UTF-8
-        let results = reader.lookup(&IndexKey::Bytes(b"Smith".to_vec())).unwrap();
-        assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn range_unsupported() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path(), PhoneticAlgorithm::Soundex);
-        let factory = PhoneticIndexFactory::new(PhoneticAlgorithm::Soundex);
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let result = reader.range(Bound::Unbounded, Bound::Unbounded);
-        assert!(matches!(result, Err(IndexError::Unsupported(_))));
-    }
-
-    #[test]
-    fn nearest_unsupported() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path(), PhoneticAlgorithm::Soundex);
-        let factory = PhoneticIndexFactory::new(PhoneticAlgorithm::Soundex);
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let result = reader.nearest(&[1.0, 2.0], 5, None);
-        assert!(matches!(result, Err(IndexError::Unsupported(_))));
-    }
-
-    #[test]
-    fn capabilities_correct() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path(), PhoneticAlgorithm::Soundex);
-        let factory = PhoneticIndexFactory::new(PhoneticAlgorithm::Soundex);
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let caps = reader.capabilities();
-        assert!(caps.contains(IndexCapabilities::POINT_LOOKUP));
-        assert!(caps.contains(IndexCapabilities::PHONETIC));
-        assert!(!caps.contains(IndexCapabilities::RANGE_SCAN));
-        assert!(!caps.contains(IndexCapabilities::NEAREST));
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "ferrosa-udf"
+version.workspace = true
+edition = "2021"
+description = "WASM-sandboxed User-Defined Function execution for Ferrosa"
+
+[dependencies]
+ferrosa-common = { path = "../ferrosa-common" }
+wasmtime = { version = "29", features = ["component-model"] }
+moka = { version = "0.12", features = ["sync"] }
+num-bigint = "0.4"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

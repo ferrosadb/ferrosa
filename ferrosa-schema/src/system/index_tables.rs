@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ferrosa_common::{CellValue, DataType};
-use ferrosa_index::{IndexType, VectorMethod};
+use ferrosa_index::IndexType;
 
 use crate::registry::SchemaSnapshot;
 use crate::virtual_table::{
@@ -64,24 +64,16 @@ fn index_type_kind(index_type: &IndexType) -> &'static str {
     match index_type {
         IndexType::BTree => "btree",
         IndexType::Hash => "hash",
-        IndexType::Composite { .. } => "composite",
-        IndexType::Phonetic { .. } => "phonetic",
-        IndexType::Filtered { inner, .. } => index_type_kind(inner),
-        IndexType::Vector {
-            method: VectorMethod::Hnsw { .. },
-            ..
-        } => "vector_hnsw",
-        IndexType::Vector {
-            method: VectorMethod::IvfFlat { .. },
-            ..
-        } => "vector_ivfflat",
+        IndexType::Composite => "composite",
+        IndexType::Phonetic => "phonetic",
+        IndexType::Filtered => "filtered",
     }
 }
 
 /// Format target columns for display.
 fn format_target(target_columns: &[String], index_type: &IndexType) -> String {
     match index_type {
-        IndexType::Composite { .. } => {
+        IndexType::Composite => {
             format!("({})", target_columns.join(", "))
         }
         _ => target_columns.join(", "),
@@ -214,9 +206,7 @@ mod tests {
                 keyspace: "ks1".into(),
                 table: "tbl1".into(),
                 name: "idx_composite".into(),
-                index_type: IndexType::Composite {
-                    columns: vec!["a".into(), "b".into()],
-                },
+                index_type: IndexType::Composite,
                 target_columns: vec!["a".into(), "b".into()],
                 filter_predicate: None,
                 options: HashMap::new(),
@@ -244,5 +234,98 @@ mod tests {
         let table = SystemSchemaIndexesTable::new(snap);
         let rows = table.read(None);
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn index_type_kind_hash() {
+        assert_eq!(index_type_kind(&IndexType::Hash), "hash");
+    }
+
+    #[test]
+    fn index_type_kind_phonetic() {
+        assert_eq!(index_type_kind(&IndexType::Phonetic), "phonetic");
+    }
+
+    #[test]
+    fn index_type_kind_filtered() {
+        assert_eq!(index_type_kind(&IndexType::Filtered), "filtered");
+    }
+
+    #[test]
+    fn indexes_table_hash_kind_in_row() {
+        let mut snap = SchemaSnapshot::new();
+        snap.indexes.insert(
+            ("ks1".into(), "tbl1".into(), "idx_hash".into()),
+            IndexMetadata {
+                keyspace: "ks1".into(),
+                table: "tbl1".into(),
+                name: "idx_hash".into(),
+                index_type: IndexType::Hash,
+                target_columns: vec!["user_id".into()],
+                filter_predicate: None,
+                options: HashMap::new(),
+            },
+        );
+        let handle = Arc::new(ArcSwap::new(Arc::new(snap)));
+        let table = SystemSchemaIndexesTable::new(handle);
+        let rows = table.read(None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cells[3].value.as_deref(), Some(b"hash".as_slice()));
+    }
+
+    #[test]
+    fn indexes_table_phonetic_kind_in_row() {
+        let mut snap = SchemaSnapshot::new();
+        snap.indexes.insert(
+            ("ks1".into(), "tbl1".into(), "idx_phonetic".into()),
+            IndexMetadata {
+                keyspace: "ks1".into(),
+                table: "tbl1".into(),
+                name: "idx_phonetic".into(),
+                index_type: IndexType::Phonetic,
+                target_columns: vec!["last_name".into()],
+                filter_predicate: None,
+                options: HashMap::new(),
+            },
+        );
+        let handle = Arc::new(ArcSwap::new(Arc::new(snap)));
+        let table = SystemSchemaIndexesTable::new(handle);
+        let rows = table.read(None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].cells[3].value.as_deref(),
+            Some(b"phonetic".as_slice())
+        );
+    }
+
+    #[test]
+    fn indexes_table_filtered_kind_in_row() {
+        use ferrosa_index::FilterOp;
+        use ferrosa_index::FilterPredicate;
+        let mut snap = SchemaSnapshot::new();
+        snap.indexes.insert(
+            ("ks1".into(), "tbl1".into(), "idx_filtered".into()),
+            IndexMetadata {
+                keyspace: "ks1".into(),
+                table: "tbl1".into(),
+                name: "idx_filtered".into(),
+                index_type: IndexType::Filtered,
+                target_columns: vec!["status".into()],
+                filter_predicate: Some(FilterPredicate {
+                    column_position: 0,
+                    op: FilterOp::Eq,
+                    value: b"active".to_vec(),
+                }),
+                options: HashMap::new(),
+            },
+        );
+        let handle = Arc::new(ArcSwap::new(Arc::new(snap)));
+        let table = SystemSchemaIndexesTable::new(handle);
+        let rows = table.read(None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].cells[3].value.as_deref(),
+            Some(b"filtered".as_slice())
+        );
     }
 }

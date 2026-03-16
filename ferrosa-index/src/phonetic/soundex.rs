@@ -1,22 +1,18 @@
-//! Soundex phonetic encoding algorithm.
+//! Standard Soundex encoding algorithm.
 //!
-//! The American Soundex algorithm encodes a name into a letter followed by
-//! three digits (e.g., "Robert" -> "R163", "Smith" -> "S530"). Names that
-//! sound alike produce the same code.
+//! Soundex maps names to a 4-character code: the first letter (uppercased)
+//! followed by three digits derived from consonant groups. Vowels and
+//! H/W/Y are dropped; adjacent identical codes are collapsed.
 //!
-//! Rules:
-//! 1. Retain the first letter.
-//! 2. Map remaining consonants to digits.
-//! 3. Collapse adjacent identical digits.
-//! 4. Remove vowels, H, W, Y.
-//! 5. Pad or truncate to exactly 4 characters.
+//! Reference: <https://en.wikipedia.org/wiki/Soundex>
 
 use super::PhoneticEncoder;
 
-/// Standard American Soundex encoder.
-pub struct Soundex;
+/// Standard Soundex encoder.
+pub struct SoundexEncoder;
 
-impl Soundex {
+impl SoundexEncoder {
+    /// Map a character to its Soundex digit, or `0` for letters that are dropped.
     fn soundex_code(c: char) -> Option<char> {
         match c.to_ascii_uppercase() {
             'B' | 'F' | 'P' | 'V' => Some('1'),
@@ -25,43 +21,49 @@ impl Soundex {
             'L' => Some('4'),
             'M' | 'N' => Some('5'),
             'R' => Some('6'),
-            _ => None, // A, E, I, O, U, H, W, Y
+            'A' | 'E' | 'I' | 'O' | 'U' | 'H' | 'W' | 'Y' => Some('0'),
+            _ => None,
         }
     }
 }
 
-impl PhoneticEncoder for Soundex {
+impl PhoneticEncoder for SoundexEncoder {
     fn encode(&self, input: &str) -> String {
-        let input = input.trim();
-        if input.is_empty() {
+        // Filter to ASCII letters only
+        let chars: Vec<char> = input.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        if chars.is_empty() {
             return String::new();
         }
 
-        let mut chars = input.chars().filter(|c| c.is_ascii_alphabetic());
-        let first = match chars.next() {
-            Some(c) => c.to_ascii_uppercase(),
-            None => return String::new(),
-        };
-
         let mut result = String::with_capacity(4);
-        result.push(first);
+        // First letter is retained as uppercase
+        result.push(chars[0].to_ascii_uppercase());
 
-        let mut last_code = Self::soundex_code(first);
+        // The code of the first letter (used to skip duplicates)
+        let first_code = Self::soundex_code(chars[0]);
 
-        for c in chars {
+        let mut last_code = first_code;
+        for &c in &chars[1..] {
             if result.len() >= 4 {
                 break;
             }
             let code = Self::soundex_code(c);
-            if let Some(digit) = code {
-                if code != last_code {
-                    result.push(digit);
+            match code {
+                Some('0') => {
+                    // Vowels and H/W/Y: H and W do NOT separate identical codes
+                    // per the standard algorithm, but vowels do.
+                    let upper = c.to_ascii_uppercase();
+                    if upper != 'H' && upper != 'W' {
+                        last_code = Some('0');
+                    }
                 }
-            }
-            // H and W don't update last_code (they are "transparent")
-            let upper = c.to_ascii_uppercase();
-            if upper != 'H' && upper != 'W' {
-                last_code = code;
+                Some(digit) => {
+                    if Some(digit) != last_code {
+                        result.push(digit);
+                    }
+                    last_code = Some(digit);
+                }
+                None => {}
             }
         }
 
@@ -79,51 +81,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn standard_examples() {
-        let s = Soundex;
-        assert_eq!(s.encode("Robert"), "R163");
-        assert_eq!(s.encode("Rupert"), "R163");
-        assert_eq!(s.encode("Smith"), "S530");
-        assert_eq!(s.encode("Smythe"), "S530");
-        assert_eq!(s.encode("Ashcraft"), "A261");
-        assert_eq!(s.encode("Ashcroft"), "A261");
-        assert_eq!(s.encode("Tymczak"), "T522");
-        assert_eq!(s.encode("Pfister"), "P236");
+    fn soundex_standard_cases() {
+        let enc = SoundexEncoder;
+        assert_eq!(enc.encode("Robert"), "R163");
+        assert_eq!(enc.encode("Rupert"), "R163");
+        assert_eq!(enc.encode("Smith"), "S530");
+        assert_eq!(enc.encode("Smythe"), "S530");
+        assert_eq!(enc.encode("Ashcraft"), "A261");
+        assert_eq!(enc.encode(""), "");
     }
 
     #[test]
-    fn single_letter() {
-        let s = Soundex;
-        assert_eq!(s.encode("A"), "A000");
-        assert_eq!(s.encode("Z"), "Z000");
+    fn soundex_padding() {
+        let enc = SoundexEncoder;
+        assert_eq!(enc.encode("A"), "A000");
+        assert_eq!(enc.encode("Al"), "A400");
     }
 
     #[test]
-    fn empty_input() {
-        let s = Soundex;
-        assert_eq!(s.encode(""), "");
-        assert_eq!(s.encode("   "), "");
+    fn soundex_truncation() {
+        let enc = SoundexEncoder;
+        let code = enc.encode("Washington");
+        assert_eq!(code.len(), 4);
+        assert_eq!(code, "W252");
     }
 
     #[test]
-    fn case_insensitive() {
-        let s = Soundex;
-        assert_eq!(s.encode("robert"), s.encode("ROBERT"));
-        assert_eq!(s.encode("smith"), s.encode("SMITH"));
+    fn soundex_adjacent_same_codes() {
+        let enc = SoundexEncoder;
+        // P and F both map to 1, should collapse
+        assert_eq!(enc.encode("Pfister"), "P236");
     }
 
     #[test]
-    fn similar_sounding_names() {
-        let s = Soundex;
-        // These should produce the same code
-        assert_eq!(s.encode("Smith"), s.encode("Smythe"));
-        assert_eq!(s.encode("Robert"), s.encode("Rupert"));
+    fn soundex_hw_rule() {
+        let enc = SoundexEncoder;
+        // H does not separate S and C (both code 2), so the second 2 is dropped
+        assert_eq!(enc.encode("Ashcraft"), "A261");
     }
 
     #[test]
-    fn hw_transparency() {
-        let s = Soundex;
-        // H and W between same-coded consonants should not separate them
-        assert_eq!(s.encode("Ashcraft"), s.encode("Ashcroft"));
+    fn soundex_case_insensitive() {
+        let enc = SoundexEncoder;
+        assert_eq!(enc.encode("SMITH"), enc.encode("smith"));
+        assert_eq!(enc.encode("Smith"), enc.encode("sMiTh"));
+    }
+
+    #[test]
+    fn soundex_tymczak() {
+        let enc = SoundexEncoder;
+        assert_eq!(enc.encode("Tymczak"), "T522");
     }
 }

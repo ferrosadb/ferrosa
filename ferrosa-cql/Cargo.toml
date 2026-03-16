@@ -15,6 +15,7 @@ ferrosa-index = { path = "../ferrosa-index" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-storage = { path = "../ferrosa-storage" }
+ferrosa-udf = { path = "../ferrosa-udf" }
 futures = "0.3"
 indexmap = "2"
 lz4_flex = "0.11"

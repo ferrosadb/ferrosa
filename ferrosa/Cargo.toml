@@ -1,6 +1,6 @@
 [package]
 name = "ferrosa"
-version = "1.0.0-beta.1"
+version.workspace = true
 edition = "2021"
 description = "Ferrosa — distributed database with CQL and Cypher"
 
@@ -19,6 +19,7 @@ ferrosa-graph = { path = "../ferrosa-graph" }
 ferrosa-net = { path = "../ferrosa-net" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-storage = { path = "../ferrosa-storage" }
+ferrosa-udf = { path = "../ferrosa-udf" }
 futures = "0.3"
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }

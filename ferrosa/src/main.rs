@@ -357,6 +357,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection_tracker =
         Arc::new(ferrosa_cql::virtual_tables::connections::ConnectionTracker::new());
     let query_tracker = Arc::new(ferrosa_cql::virtual_tables::active_queries::QueryTracker::new());
+    let udf_executor = Arc::new(
+        ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default())
+            .expect("failed to initialize UDF executor"),
+    );
     let shared_state = Arc::new(ferrosa_cql::router::SharedState {
         engine: storage.clone(),
         schema: schema.clone(),
@@ -367,6 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prepared_cache: Arc::new(ferrosa_cql::prepared::PreparedCache::new(64 * 1024 * 1024)),
         connection_tracker,
         query_tracker,
+        udf_executor,
         event_sender: tokio::sync::broadcast::channel(64).0,
     });
     let auth_disabled = cql_config.auth_disabled;

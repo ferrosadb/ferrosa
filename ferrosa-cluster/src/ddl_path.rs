@@ -165,6 +165,47 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &StorageEngine) -> R
                 .drop_index_internal(keyspace, table, index)
                 .map_err(|e| ClusterError::Internal(format!("drop_index: {e}")))?;
         }
+        DdlOperation::CreateType(ref udt) => {
+            schema
+                .create_type_internal(udt)
+                .map_err(|e| ClusterError::Internal(format!("create_type: {e}")))?;
+        }
+        DdlOperation::DropType {
+            ref keyspace,
+            ref name,
+        } => {
+            schema
+                .drop_type_internal(keyspace, name)
+                .map_err(|e| ClusterError::Internal(format!("drop_type: {e}")))?;
+        }
+        DdlOperation::CreateFunction(ref func) => {
+            schema
+                .create_function_internal(func)
+                .map_err(|e| ClusterError::Internal(format!("create_function: {e}")))?;
+        }
+        DdlOperation::DropFunction {
+            ref keyspace,
+            ref name,
+            ref arg_types,
+        } => {
+            schema
+                .drop_function_internal(keyspace, name, arg_types)
+                .map_err(|e| ClusterError::Internal(format!("drop_function: {e}")))?;
+        }
+        DdlOperation::CreateAggregate(ref agg) => {
+            schema
+                .create_aggregate_internal(agg)
+                .map_err(|e| ClusterError::Internal(format!("create_aggregate: {e}")))?;
+        }
+        DdlOperation::DropAggregate {
+            ref keyspace,
+            ref name,
+            ref arg_types,
+        } => {
+            schema
+                .drop_aggregate_internal(keyspace, name, arg_types)
+                .map_err(|e| ClusterError::Internal(format!("drop_aggregate: {e}")))?;
+        }
     }
     Ok(())
 }
@@ -214,6 +255,28 @@ fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
             keyspace,
             table,
             index,
+        },
+        DdlOperation::CreateType(udt) => RaftCommand::CreateType(udt),
+        DdlOperation::DropType { keyspace, name } => RaftCommand::DropType { keyspace, name },
+        DdlOperation::CreateFunction(func) => RaftCommand::CreateFunction(func),
+        DdlOperation::DropFunction {
+            keyspace,
+            name,
+            arg_types,
+        } => RaftCommand::DropFunction {
+            keyspace,
+            name,
+            arg_types,
+        },
+        DdlOperation::CreateAggregate(agg) => RaftCommand::CreateAggregate(agg),
+        DdlOperation::DropAggregate {
+            keyspace,
+            name,
+            arg_types,
+        } => RaftCommand::DropAggregate {
+            keyspace,
+            name,
+            arg_types,
         },
     }
 }

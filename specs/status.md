@@ -9,15 +9,16 @@ Ferrosa is a **distributed CQL-compatible database** with graph
 query support, built-in observability, and S3-backed storage. The production cluster
 sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff,
 node lifecycle (join/decommission/rebalance), reconnection, and integration tests.
-All 25 tasks merged on the feature/production-cluster branch. Hardening and
-observability wiring sprints are also complete. Preparing for beta release.
+Hardening and observability wiring sprints are also complete. UDT/UDF with WASM
+sandboxing is complete (parser, schema, DDL replication, Wasmtime compilation, router
+wiring). Secondary and vector indexes consolidated into the main branch.
 
 | Metric | Value |
 |--------|-------|
-| Crates | 11 of 11 planned |
-| Source files | ~233 |
-| Source LOC | ~106,500 |
-| Test functions | ~1,550+ |
+| Crates | 12 (11 core + ferrosa-udf) |
+| Source files | ~250+ |
+| Source LOC | ~115,000+ |
+| Test functions | ~1,650+ |
 | Integration test files | 30+ |
 
 ## Maturity Assessment
@@ -27,8 +28,9 @@ observability wiring sprints are also complete. Preparing for beta release.
 common         ██████   ██████  ██████   ████░░
 sstable        ██████   ██████  ██████   ████░░
 storage        ██████   ██████  █████▌   ████░░
-schema         ████░░   █████░  █████░   ███░░░
-index          █████░   █████░  ████░░   ██░░░░
+schema         █████░   █████▌  █████░   ███░░░
+index          █████░   ██████  █████░   ██░░░░
+udf            █████░   █████░  ████░░   ███░░░
 cql            ██████   ██████  ██████   ████░░
 graph          █████░   ██████  ████░░   ███░░░
 ctl            ██████   ██████  ████░░   ████░░
@@ -98,8 +100,8 @@ cluster        ██████   ██████  █████░   █
   cleanup on `DROP TABLE` (removes associated indexes).
 - **Remaining (Chunks B-F):**
   - [x] ~~DDL validation rules~~ (table name, PK, RF constraints)
+  - [x] ~~UDT (user-defined type) support~~ — `UserTypeMetadata`, `system_schema.types` virtual table, schema registry integration
   - [ ] System table persistence to SSTable
-  - [ ] UDT (user-defined type) support
   - [ ] Role hierarchy with inheritance
   - [ ] Audit sink composition
 
@@ -126,6 +128,34 @@ cluster        ██████   ██████  █████░   █
   - [ ] Distributed index coordination in cluster mode
 - **Spec:** [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md)
 
+### ferrosa-udf — Done (WASM UDF/UDA)
+
+- **LOC:** ~1,800 (6 files) | **Tests:** ~68
+- **Modules:** `executor`, `sandbox`, `error`, `convert`, `wit/ferrosa-udf.wit`
+- **What's done:** WIT contract defining CQL value types for WASM Component Model,
+  `UdfExecutor` with moka compilation cache (256 entries) and real Wasmtime
+  compilation (`wasmtime::component::Component`), `SandboxConfig` with resource
+  limits (16MB memory, 1M fuel, 5s timeout, 10MB binary upload limit),
+  `CqlValue` to WIT `cql-value` conversion layer covering all CQL types including
+  collections, UDTs, temporal types, and decimal/varint. CQL parser handles
+  CREATE/DROP FUNCTION and CREATE/DROP AGGREGATE. Schema has `FunctionMetadata`,
+  `AggregateMetadata`, and registry methods. `system_schema.functions` and
+  `system_schema.aggregates` virtual tables. DDL replication via
+  `DdlOperation::CreateFunction/DropFunction/CreateAggregate/DropAggregate` and
+  corresponding `RaftCommand` variants. Router wires CREATE/DROP FUNCTION/AGGREGATE
+  through `DdlPath` with permission checks. Binary initializes `UdfExecutor` at
+  startup.
+- **Remaining:**
+  - [x] ~~Wasmtime component compilation~~ (real `wasmtime::component::Component` instantiation)
+  - [x] ~~UDF execution wiring in CQL router~~ (CREATE/DROP FUNCTION routed through DdlPath)
+  - [x] ~~`system_schema.functions` virtual table~~ (+ `system_schema.aggregates`)
+  - [x] ~~Aggregate UDF (UDA) support~~ — CREATE/DROP AGGREGATE with state/final functions
+  - [x] ~~DdlOperation::CreateFunction/DropFunction for cluster replication~~
+  - [x] ~~Val encoding for all 26 CQL types~~ (recursive Val::Variant encoding, wit-bindgen not usable due to recursive type limitation)
+  - [ ] Function calls in SELECT expressions (requires expression executor)
+  - [ ] GRANT/REVOKE on function resources
+  - [ ] Aggregate state/final function orchestration in query path
+
 ### ferrosa-cql — Complete (Parts A-D + Compression)
 
 - **LOC:** ~12,200 (20 files) | **Tests:** ~248 | **Largest crate**
@@ -147,8 +177,11 @@ cluster        ██████   ██████  █████░   █
   - [x] ~~SUBSCRIBE EVERY polling mode~~ (streaming frames, max 8 per connection)
   - [x] ~~Secondary index checks in SELECT path~~ (allows query without ALLOW FILTERING when index exists)
   - [x] ~~CQL Duration type (0x0015)~~ (zigzag vint encoding)
+  - [x] ~~UDT DDL support~~ — CREATE/ALTER/DROP TYPE parsing, routing, cluster replication
+  - [x] ~~UDF DDL parsing~~ — CREATE/DROP FUNCTION AST and parser support
+  - [x] ~~UDT wire encoding~~ — protocol type 0x0030, type resolution in bridge
+  - [x] ~~UDF execution wiring~~ (CREATE/DROP FUNCTION/AGGREGATE routed through DdlPath)
   - [ ] Logged batch atomicity
-  - [ ] UDT support
   - [ ] Query tracing
 
 ### ferrosa-graph — Phase 1 Complete
@@ -272,6 +305,7 @@ cluster        ██████   ██████  █████░   █
   - [x] ~~Hinted handoff~~
   - [x] ~~Node lifecycle (join, decommission, streaming, rebalance)~~
   - [x] ~~Read repair~~ (deferred — digest reads included)
+  - [x] ~~UDF/UDA DDL replication~~ (CreateFunction/DropFunction/CreateAggregate/DropAggregate RaftCommand variants)
 - **Remaining:**
   - [ ] NetworkTopologyStrategy (multi-DC)
   - [ ] Read repair (full inline repair)
@@ -285,18 +319,13 @@ cluster        ██████   ██████  █████░   █
 
 | Item | Location | State |
 |------|----------|-------|
-| ~~Storage replay + compaction execution~~ | ~~`.worktrees/storage-replay-compaction`~~ | Merged (PR #38) |
-| ~~ferrosa-net Phase 1~~ | ~~`ferrosa-net/`~~ | Merged (PR #39) |
-| ~~ferrosa-cluster Phase 1 (Pair mode)~~ | ~~`feature/pair-integration`~~ | Merged |
-| ~~ferrosa-index Phase 1 (8 index types)~~ | ~~`feature/secondary-indexes-design`~~ | Merged (PR #44) |
-| ~~DDL completeness (AlterKS/AlterTable, Role DDL, Index DDL)~~ | ~~`ferrosa-cluster/`~~ | Merged (PR #45) |
-| ~~.deb packaging + systemd service~~ | ~~`scripts/build-deb.sh`~~ | Merged (PR #46) |
-| Release workflow (GitHub Actions) | `.github/workflows/` | In progress (PR #47) |
-| ~~ferrosa-cluster Phase 2 (Raft + Ring + Coordinator)~~ | ~~`feature/raft-cluster-phase2`~~ | Merged |
-| ~~Observability wiring (virtual tables + auth + WebSocket)~~ | ~~`feature/observability-wiring`~~ | Merged |
-| ~~ferrosa-cluster Phase 3 (Production cluster)~~ | ~~`feature/production-cluster`~~ | Merged |
-| ~~Hardening sprint~~ | — | Merged |
-| Beta release prep | — | In progress |
+| ~~UDT/UDF with WASM sandboxing~~ | ~~`feature/udt-udf-wasm`~~ | Done (pending merge) |
+| Secondary + vector indexes consolidated | `feature/udt-udf-wasm` | Merged into branch |
+| ~~Release workflow (GitHub Actions)~~ | ~~`.github/workflows/`~~ | Merged (PR #47) |
+| ~~Hardening sprint~~ | — | Merged (PR #55) |
+| ~~Observability wiring~~ | — | Merged (PR #53) |
+| ~~Production cluster (Phase 3)~~ | — | Merged (PR #57) |
+| ~~Beta release v1.0.0-beta.1~~ | — | Released (PR #58, #59) |
 | NetworkTopologyStrategy (multi-DC) | — | Planned |
 
 ## Path to Distributed Operation

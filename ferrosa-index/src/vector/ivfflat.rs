@@ -1,315 +1,80 @@
-//! IVFFlat (Inverted File with Flat vectors) index.
+//! IVFFlat (Inverted File with Flat vectors) index for approximate
+//! nearest-neighbor search.
 //!
-//! Partitions the vector space into Voronoi cells using k-means clustering.
-//! At query time, probes the nearest centroids and scans the corresponding
-//! inverted lists. Supports [`IndexCapabilities::NEAREST`] only.
+//! IVFFlat partitions the vector space using k-means clustering:
+//! - At build time, all vectors are accumulated, then k-means is run to
+//!   compute `lists` centroids. Each vector is assigned to its nearest
+//!   centroid.
+//! - At query time, the `probes` nearest centroids are found, and a
+//!   brute-force search is performed within those clusters.
+//!
+//! This is a simpler approach than HNSW with lower build cost but
+//! potentially less accurate results (depending on `probes`).
 
-use crate::{
-    DistanceMetric, IndexBuilder, IndexCapabilities, IndexConfig, IndexError, IndexFactory,
-    IndexFileMeta, IndexFiles, IndexKey, IndexReader, IndexResult, IndexType, RowPosition,
-    VectorMethod,
-};
-use ferrosa_common::CellValue;
+use std::path::Path;
+
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
-use std::ops::Bound;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::distance;
-
-/// Factory for creating IVFFlat index builders and readers.
-pub struct IvfFlatFactory;
-
-impl IndexFactory for IvfFlatFactory {
-    fn create_builder(&self, config: &IndexConfig) -> IndexResult<Box<dyn IndexBuilder>> {
-        let (lists, metric, dimensions) = match &config.index_type {
-            IndexType::Vector {
-                method: VectorMethod::IvfFlat { lists },
-                metric,
-                dimensions,
-            } => (*lists, metric.clone(), *dimensions),
-            _ => {
-                return Err(IndexError::Build(
-                    "IvfFlatFactory requires Vector/IvfFlat index type".into(),
-                ))
-            }
-        };
-        Ok(Box::new(IvfFlatBuilder {
-            vectors: Vec::new(),
-            positions: Vec::new(),
-            n_lists: lists as usize,
-            metric,
-            dimensions: dimensions as usize,
-            config: config.clone(),
-        }))
-    }
-
-    fn open_reader(&self, files: &IndexFiles) -> IndexResult<Box<dyn IndexReader>> {
-        let data = std::fs::read(&files.data_path)?;
-        let index: SerializedIvfFlat = serde_json::from_slice(&data)
-            .map_err(|e| IndexError::Query(format!("deserialize IVFFlat index: {e}")))?;
-        Ok(Box::new(IvfFlatReader { index }))
-    }
-
-    fn merge(
-        &self,
-        readers: Vec<Box<dyn IndexReader>>,
-        builder: Box<dyn IndexBuilder>,
-    ) -> IndexResult<IndexFiles> {
-        let _ = readers;
-        builder.finish()
-    }
-}
-
-/// Accumulates vectors during index build. On finish, runs k-means clustering
-/// and assigns each vector to its nearest centroid.
-struct IvfFlatBuilder {
-    vectors: Vec<Vec<f32>>,
-    positions: Vec<RowPosition>,
-    n_lists: usize,
-    metric: DistanceMetric,
-    dimensions: usize,
-    config: IndexConfig,
-}
-
-impl IndexBuilder for IvfFlatBuilder {
-    fn add_row(
-        &mut self,
-        partition_key: &[u8],
-        clustering_key: &[u8],
-        cells: &[(u16, CellValue)],
-    ) -> IndexResult<()> {
-        let col_pos = self
-            .config
-            .column_positions
-            .first()
-            .copied()
-            .ok_or_else(|| IndexError::Build("no column positions configured".into()))?;
-
-        let cell = cells
-            .iter()
-            .find(|(pos, _)| *pos as usize == col_pos)
-            .map(|(_, cv)| cv);
-
-        let cell = match cell {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-
-        if cell.is_tombstone() {
-            return Ok(());
-        }
-
-        let raw = match &cell.value {
-            Some(v) => v,
-            None => return Ok(()),
-        };
-
-        let vec = super::bytes_to_vector(raw);
-        if vec.len() != self.dimensions {
-            return Err(IndexError::Build(format!(
-                "expected {} dimensions, got {}",
-                self.dimensions,
-                vec.len()
-            )));
-        }
-
-        self.vectors.push(vec);
-        self.positions.push(RowPosition {
-            partition_key: partition_key.to_vec(),
-            clustering_key: clustering_key.to_vec(),
-        });
-
-        Ok(())
-    }
-
-    fn finish(self: Box<Self>) -> IndexResult<IndexFiles> {
-        let index = build_ivfflat(
-            &self.vectors,
-            &self.positions,
-            self.n_lists,
-            &self.metric,
-            self.dimensions,
-        );
-
-        let row_count = self.positions.len() as u64;
-        let data = serde_json::to_vec(&index)
-            .map_err(|e| IndexError::Build(format!("serialize IVFFlat index: {e}")))?;
-
-        let data_path = self.config.output_dir.join(format!(
-            "{}-{}.db",
-            self.config.sstable_prefix, self.config.index_name
-        ));
-        let meta_path = self.config.output_dir.join(format!(
-            "{}-{}.meta",
-            self.config.sstable_prefix, self.config.index_name
-        ));
-
-        std::fs::create_dir_all(&self.config.output_dir)?;
-        std::fs::write(&data_path, &data)?;
-
-        let checksum = crc32_simple(&data);
-        let file_size = data.len() as u64;
-        let build_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let meta = IndexFileMeta {
-            index_type: self.config.index_type.clone(),
-            index_name: self.config.index_name.clone(),
-            row_count,
-            build_timestamp,
-            sstable_id: self.config.sstable_prefix.clone(),
-            file_size,
-            checksum,
-        };
-
-        let meta_json = serde_json::to_vec(&meta)
-            .map_err(|e| IndexError::Build(format!("meta serialization: {e}")))?;
-        std::fs::write(&meta_path, &meta_json)?;
-
-        Ok(IndexFiles {
-            data_path,
-            meta_path,
-            meta,
-        })
-    }
-}
-
-/// Reads a serialized IVFFlat index and performs ANN queries by probing
-/// the nearest centroids.
-struct IvfFlatReader {
-    index: SerializedIvfFlat,
-}
-
-impl IndexReader for IvfFlatReader {
-    fn lookup(&self, _key: &IndexKey) -> IndexResult<Vec<RowPosition>> {
-        Err(IndexError::Unsupported(
-            "point lookup not supported by IVFFlat index".into(),
-        ))
-    }
-
-    fn range(
-        &self,
-        _start: Bound<&IndexKey>,
-        _end: Bound<&IndexKey>,
-    ) -> IndexResult<Vec<RowPosition>> {
-        Err(IndexError::Unsupported(
-            "range scan not supported by IVFFlat index".into(),
-        ))
-    }
-
-    fn nearest(
-        &self,
-        query: &[f32],
-        k: usize,
-        _ef_search: Option<u16>,
-    ) -> IndexResult<Vec<(RowPosition, f32)>> {
-        if self.index.lists.is_empty() {
-            return Ok(Vec::new());
-        }
-        let results = search_ivfflat(&self.index, query, k);
-        Ok(results)
-    }
-
-    fn capabilities(&self) -> IndexCapabilities {
-        IndexCapabilities::NEAREST
-    }
-}
+use super::{
+    bytes_to_vec_f32, DistanceMetric, IndexBuilder, IndexCapability, IndexError, IndexFactory,
+    IndexReader, IndexResult, RowPosition,
+};
+use ferrosa_common::CellValue;
 
 // ---------------------------------------------------------------------------
-// Serialized structures
+// Serializable index data
 // ---------------------------------------------------------------------------
 
+/// A single entry in an inverted list: a row position and its vector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedIvfFlat {
-    metric: DistanceMetric,
-    dimensions: usize,
-    n_probes: usize,
+struct IvfEntry {
+    position: RowPosition,
+    vector: Vec<f32>,
+}
+
+/// The serialized IVFFlat index, stored as JSON on disk.
+#[derive(Debug, Serialize, Deserialize)]
+struct IvfFlatData {
+    /// Centroid vectors, one per cluster.
     centroids: Vec<Vec<f32>>,
-    lists: Vec<InvertedList>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct InvertedList {
-    vectors: Vec<Vec<f32>>,
-    positions: Vec<RowPosition>,
-}
-
-// ---------------------------------------------------------------------------
-// K-means clustering and index construction
-// ---------------------------------------------------------------------------
-
-fn build_ivfflat(
-    vectors: &[Vec<f32>],
-    positions: &[RowPosition],
-    n_lists: usize,
-    metric: &DistanceMetric,
+    /// Inverted lists: `lists[i]` contains the entries assigned to centroid `i`.
+    lists: Vec<Vec<IvfEntry>>,
+    /// Number of clusters.
+    num_lists: usize,
+    /// Distance metric.
+    metric: DistanceMetric,
+    /// Vector dimensionality (0 if empty).
     dimensions: usize,
-) -> SerializedIvfFlat {
-    if vectors.is_empty() {
-        return SerializedIvfFlat {
-            metric: metric.clone(),
-            dimensions,
-            n_probes: 1,
-            centroids: Vec::new(),
-            lists: Vec::new(),
-        };
-    }
-
-    // Clamp n_lists to number of vectors
-    let k = n_lists.min(vectors.len());
-
-    // Run k-means to find centroids
-    let centroids = kmeans(vectors, k, dimensions, metric, 20);
-
-    // Assign each vector to its nearest centroid
-    let mut lists: Vec<InvertedList> = (0..k)
-        .map(|_| InvertedList {
-            vectors: Vec::new(),
-            positions: Vec::new(),
-        })
-        .collect();
-
-    for (i, vec) in vectors.iter().enumerate() {
-        let nearest = find_nearest_centroid(vec, &centroids, metric);
-        lists[nearest].vectors.push(vec.clone());
-        lists[nearest].positions.push(positions[i].clone());
-    }
-
-    // Default probe count: sqrt(n_lists), at least 1
-    let n_probes = ((k as f64).sqrt().ceil() as usize).max(1);
-
-    SerializedIvfFlat {
-        metric: metric.clone(),
-        dimensions,
-        n_probes,
-        centroids,
-        lists,
-    }
 }
 
-/// Simple k-means clustering with random initialization.
+// ---------------------------------------------------------------------------
+// K-means implementation
+// ---------------------------------------------------------------------------
+
+/// Run k-means clustering on the given vectors.
+///
+/// Returns `(centroids, assignments)` where `assignments[i]` is the cluster
+/// index for `vectors[i]`.
 fn kmeans(
     vectors: &[Vec<f32>],
     k: usize,
-    dimensions: usize,
     metric: &DistanceMetric,
     max_iterations: usize,
-) -> Vec<Vec<f32>> {
-    if vectors.len() <= k {
-        // Fewer vectors than clusters: each vector is its own centroid
-        return vectors.to_vec();
+) -> (Vec<Vec<f32>>, Vec<usize>) {
+    if vectors.is_empty() || k == 0 {
+        return (Vec::new(), Vec::new());
     }
 
-    // Initialize centroids by selecting k evenly-spaced vectors.
-    // This is more deterministic than random init for testing.
-    let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(k);
-    let step = vectors.len() as f64 / k as f64;
-    for i in 0..k {
-        let idx = (i as f64 * step) as usize;
-        centroids.push(vectors[idx].clone());
-    }
+    let k = k.min(vectors.len());
+    let dim = vectors[0].len();
+
+    // Random initialization: pick k distinct vectors as initial centroids
+    let mut rng = rand::thread_rng();
+    let mut indices: Vec<usize> = (0..vectors.len()).collect();
+    indices.shuffle(&mut rng);
+    let mut centroids: Vec<Vec<f32>> = indices[..k].iter().map(|&i| vectors[i].clone()).collect();
 
     let mut assignments = vec![0usize; vectors.len()];
 
@@ -317,9 +82,17 @@ fn kmeans(
         // Assignment step: assign each vector to nearest centroid
         let mut changed = false;
         for (i, vec) in vectors.iter().enumerate() {
-            let nearest = find_nearest_centroid(vec, &centroids, metric);
-            if assignments[i] != nearest {
-                assignments[i] = nearest;
+            let mut best_cluster = 0;
+            let mut best_dist = f32::INFINITY;
+            for (c, centroid) in centroids.iter().enumerate() {
+                let d = distance(metric, vec, centroid);
+                if d < best_dist {
+                    best_dist = d;
+                    best_cluster = c;
+                }
+            }
+            if assignments[i] != best_cluster {
+                assignments[i] = best_cluster;
                 changed = true;
             }
         }
@@ -328,280 +101,404 @@ fn kmeans(
             break;
         }
 
-        // Update step: recompute centroids
-        let mut sums = vec![vec![0.0f32; dimensions]; k];
+        // Update step: recompute centroids as mean of assigned vectors
+        let mut sums = vec![vec![0.0f64; dim]; k];
         let mut counts = vec![0usize; k];
 
         for (i, vec) in vectors.iter().enumerate() {
-            let cluster = assignments[i];
-            counts[cluster] += 1;
+            let c = assignments[i];
+            counts[c] += 1;
             for (j, &val) in vec.iter().enumerate() {
-                sums[cluster][j] += val;
+                sums[c][j] += val as f64;
             }
         }
 
         for c in 0..k {
             if counts[c] > 0 {
-                for j in 0..dimensions {
-                    centroids[c][j] = sums[c][j] / counts[c] as f32;
+                for j in 0..dim {
+                    centroids[c][j] = (sums[c][j] / counts[c] as f64) as f32;
                 }
             }
             // If a cluster is empty, keep its centroid unchanged
         }
     }
 
-    centroids
+    (centroids, assignments)
 }
 
-/// Find the index of the nearest centroid to a given vector.
-fn find_nearest_centroid(vec: &[f32], centroids: &[Vec<f32>], metric: &DistanceMetric) -> usize {
-    let mut best_idx = 0;
-    let mut best_dist = f32::INFINITY;
-    for (i, centroid) in centroids.iter().enumerate() {
-        let d = distance(metric, vec, centroid);
-        if d < best_dist {
-            best_dist = d;
-            best_idx = i;
+// ---------------------------------------------------------------------------
+// IvfFlatFactory
+// ---------------------------------------------------------------------------
+
+/// Factory for creating IVFFlat index builders and readers.
+pub struct IvfFlatFactory {
+    /// Number of clusters (inverted lists).
+    pub lists: usize,
+    /// Distance metric.
+    pub metric: DistanceMetric,
+}
+
+impl IvfFlatFactory {
+    pub fn new(lists: usize, metric: DistanceMetric) -> Self {
+        Self { lists, metric }
+    }
+}
+
+impl IndexFactory for IvfFlatFactory {
+    fn create_builder(&self, dir: &Path) -> Result<Box<dyn IndexBuilder>, IndexError> {
+        Ok(Box::new(IvfFlatBuilder {
+            vectors: Vec::new(),
+            positions: Vec::new(),
+            num_lists: self.lists,
+            metric: self.metric,
+            dir: dir.to_path_buf(),
+        }))
+    }
+
+    fn open_reader(&self, dir: &Path) -> Result<Box<dyn IndexReader>, IndexError> {
+        let db_path = dir.join("ivfflat.db");
+        let data_bytes = std::fs::read(&db_path)?;
+        let data: IvfFlatData = serde_json::from_slice(&data_bytes)?;
+        Ok(Box::new(IvfFlatReader { data }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IvfFlatBuilder
+// ---------------------------------------------------------------------------
+
+/// Accumulates all vectors, then runs k-means on finish.
+pub struct IvfFlatBuilder {
+    vectors: Vec<Vec<f32>>,
+    positions: Vec<RowPosition>,
+    num_lists: usize,
+    metric: DistanceMetric,
+    dir: std::path::PathBuf,
+}
+
+impl IndexBuilder for IvfFlatBuilder {
+    fn add_row(&mut self, position: RowPosition, value: &CellValue) -> Result<(), IndexError> {
+        let bytes = value
+            .value
+            .as_ref()
+            .ok_or_else(|| IndexError::Format("cannot index tombstone cell".to_string()))?;
+        let vector = bytes_to_vec_f32(bytes)?;
+        self.vectors.push(vector);
+        self.positions.push(position);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), IndexError> {
+        std::fs::create_dir_all(&self.dir)?;
+
+        let data = if self.vectors.is_empty() {
+            IvfFlatData {
+                centroids: Vec::new(),
+                lists: Vec::new(),
+                num_lists: self.num_lists,
+                metric: self.metric,
+                dimensions: 0,
+            }
+        } else {
+            let dim = self.vectors[0].len();
+            let (centroids, assignments) = kmeans(&self.vectors, self.num_lists, &self.metric, 100);
+            let k = centroids.len();
+
+            let mut lists: Vec<Vec<IvfEntry>> = vec![Vec::new(); k];
+            for (i, (vec, &pos)) in self.vectors.iter().zip(self.positions.iter()).enumerate() {
+                lists[assignments[i]].push(IvfEntry {
+                    position: pos,
+                    vector: vec.clone(),
+                });
+            }
+
+            IvfFlatData {
+                centroids,
+                lists,
+                num_lists: k,
+                metric: self.metric,
+                dimensions: dim,
+            }
+        };
+
+        let json = serde_json::to_vec(&data)?;
+        std::fs::write(self.dir.join("ivfflat.db"), json)?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IvfFlatReader
+// ---------------------------------------------------------------------------
+
+/// Reads a previously built IVFFlat index and answers nearest-neighbor queries.
+pub struct IvfFlatReader {
+    data: IvfFlatData,
+}
+
+impl IndexReader for IvfFlatReader {
+    fn capabilities(&self) -> Vec<IndexCapability> {
+        vec![IndexCapability::Nearest]
+    }
+
+    fn lookup(&self, _value: &CellValue) -> Result<Vec<IndexResult>, IndexError> {
+        Err(IndexError::Unsupported(
+            "IVFFlat index does not support point lookups".to_string(),
+        ))
+    }
+
+    fn range(&self, _start: &CellValue, _end: &CellValue) -> Result<Vec<IndexResult>, IndexError> {
+        Err(IndexError::Unsupported(
+            "IVFFlat index does not support range scans".to_string(),
+        ))
+    }
+
+    fn nearest(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<IndexResult>, IndexError> {
+        if self.data.centroids.is_empty() {
+            return Ok(Vec::new());
         }
-    }
-    best_idx
-}
 
-// ---------------------------------------------------------------------------
-// Query
-// ---------------------------------------------------------------------------
-
-fn search_ivfflat(index: &SerializedIvfFlat, query: &[f32], k: usize) -> Vec<(RowPosition, f32)> {
-    if index.centroids.is_empty() {
-        return Vec::new();
-    }
-
-    // Find the n_probes nearest centroids
-    let mut centroid_dists: Vec<(f32, usize)> = index
-        .centroids
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (distance(&index.metric, query, c), i))
-        .collect();
-    centroid_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let n_probes = index.n_probes.min(centroid_dists.len());
-
-    // Scan the inverted lists for the nearest centroids
-    let mut candidates: Vec<(f32, RowPosition)> = Vec::new();
-    for &(_, list_idx) in centroid_dists.iter().take(n_probes) {
-        let list = &index.lists[list_idx];
-        for (i, vec) in list.vectors.iter().enumerate() {
-            let d = distance(&index.metric, query, vec);
-            candidates.push((d, list.positions[i].clone()));
+        // Validate dimensions
+        if query.len() != self.data.dimensions {
+            return Err(IndexError::DimensionMismatch {
+                expected: self.data.dimensions,
+                got: query.len(),
+            });
         }
-    }
 
-    // Sort by distance, take top k
-    candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    candidates.truncate(k);
+        // Determine number of probes: default 1, but ef_search can override
+        let probes = if ef_search > 0 {
+            ef_search.min(self.data.centroids.len())
+        } else {
+            1
+        };
 
-    candidates
-        .into_iter()
-        .map(|(dist, pos)| (pos, dist))
-        .collect()
-}
+        // Find the nearest `probes` centroids
+        let mut centroid_dists: Vec<(f32, usize)> = self
+            .data
+            .centroids
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (distance(&self.data.metric, query, c), i))
+            .collect();
+        centroid_dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn crc32_simple(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    let poly: u32 = 0xEDB8_8320;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ poly;
-            } else {
-                crc >>= 1;
+        // Brute-force search within the selected clusters
+        let mut candidates: Vec<(f32, RowPosition)> = Vec::new();
+        for &(_, cluster_idx) in centroid_dists.iter().take(probes) {
+            for entry in &self.data.lists[cluster_idx] {
+                let d = distance(&self.data.metric, query, &entry.vector);
+                candidates.push((d, entry.position));
             }
         }
+
+        // Sort by distance and return top k
+        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(k);
+
+        Ok(candidates
+            .into_iter()
+            .map(|(score, position)| IndexResult { position, score })
+            .collect())
     }
-    !crc
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::IndexConfig;
+    use crate::vec_f32_to_bytes;
 
-    fn make_config(dir: &std::path::Path) -> IndexConfig {
-        IndexConfig {
-            index_type: IndexType::Vector {
-                method: VectorMethod::IvfFlat { lists: 2 },
-                metric: DistanceMetric::L2,
-                dimensions: 3,
-            },
-            column_positions: vec![0],
-            output_dir: dir.to_path_buf(),
-            sstable_prefix: "sstable-001".into(),
-            index_name: "idx_vec".into(),
-        }
-    }
-
-    fn vector_cell(v: &[f32]) -> CellValue {
-        let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
-        CellValue::live(bytes, 1000)
+    fn make_vector_cell(v: &[f32]) -> CellValue {
+        CellValue::live(vec_f32_to_bytes(v), 1)
     }
 
     #[test]
-    fn build_and_query_nearest() {
+    fn ivfflat_build_and_nearest() {
         let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = IvfFlatFactory;
-        let mut builder = factory.create_builder(&config).unwrap();
+        // Two clear clusters: cluster A near (10, 0, 0), cluster B near (0, 10, 0)
+        let factory = IvfFlatFactory::new(2, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
 
-        let vecs = [
-            [1.0f32, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [1.0, 1.0, 1.0],
-        ];
+        // Cluster A
+        builder
+            .add_row(RowPosition::new(0), &make_vector_cell(&[10.0, 0.0, 0.0]))
+            .unwrap();
+        builder
+            .add_row(RowPosition::new(100), &make_vector_cell(&[10.1, 0.1, 0.0]))
+            .unwrap();
+        builder
+            .add_row(RowPosition::new(200), &make_vector_cell(&[9.9, -0.1, 0.0]))
+            .unwrap();
 
-        for (i, v) in vecs.iter().enumerate() {
-            let pk = format!("pk{}", i);
-            let ck = format!("ck{}", i);
-            builder
-                .add_row(pk.as_bytes(), ck.as_bytes(), &[(0, vector_cell(v))])
-                .unwrap();
-        }
+        // Cluster B
+        builder
+            .add_row(RowPosition::new(300), &make_vector_cell(&[0.0, 10.0, 0.0]))
+            .unwrap();
+        builder
+            .add_row(RowPosition::new(400), &make_vector_cell(&[0.1, 10.1, 0.0]))
+            .unwrap();
+        builder
+            .add_row(RowPosition::new(500), &make_vector_cell(&[-0.1, 9.9, 0.0]))
+            .unwrap();
 
-        let files = builder.finish().unwrap();
-        assert_eq!(files.meta.row_count, 4);
+        builder.finish().unwrap();
 
-        let reader = factory.open_reader(&files).unwrap();
-
-        // Query near [1,1,1] - should find [1,1,1] as closest
-        let results = reader.nearest(&[1.0, 1.0, 1.0], 2, None).unwrap();
-        assert!(!results.is_empty());
-        assert_eq!(results[0].0.partition_key, b"pk3");
-        assert!((results[0].1).abs() < 1e-6);
-    }
-
-    #[test]
-    fn empty_index_nearest() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = IvfFlatFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let results = reader.nearest(&[1.0, 0.0, 0.0], 5, None).unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn lookup_unsupported() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = IvfFlatFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let result = reader.lookup(&IndexKey::Bytes(b"test".to_vec()));
-        assert!(matches!(result, Err(IndexError::Unsupported(_))));
-    }
-
-    #[test]
-    fn range_unsupported() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = IvfFlatFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let result = reader.range(Bound::Unbounded, Bound::Unbounded);
-        assert!(matches!(result, Err(IndexError::Unsupported(_))));
-    }
-
-    #[test]
-    fn capabilities_nearest_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = IvfFlatFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let caps = reader.capabilities();
-        assert!(caps.contains(IndexCapabilities::NEAREST));
-        assert!(!caps.contains(IndexCapabilities::POINT_LOOKUP));
-        assert!(!caps.contains(IndexCapabilities::RANGE_SCAN));
-    }
-
-    #[test]
-    fn nearest_returns_sorted_by_distance() {
-        let dir = tempfile::tempdir().unwrap();
-        // Use a single list to ensure all vectors are probed
-        let config = IndexConfig {
-            index_type: IndexType::Vector {
-                method: VectorMethod::IvfFlat { lists: 1 },
-                metric: DistanceMetric::L2,
-                dimensions: 3,
-            },
-            column_positions: vec![0],
-            output_dir: dir.path().to_path_buf(),
-            sstable_prefix: "sstable-001".into(),
-            index_name: "idx_vec".into(),
-        };
-        let factory = IvfFlatFactory;
-        let mut builder = factory.create_builder(&config).unwrap();
-
-        let vecs = [
-            [10.0f32, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
-            [5.0, 0.0, 0.0],
-            [2.0, 0.0, 0.0],
-        ];
-
-        for (i, v) in vecs.iter().enumerate() {
-            let pk = format!("pk{}", i);
-            builder
-                .add_row(pk.as_bytes(), b"ck", &[(0, vector_cell(v))])
-                .unwrap();
-        }
-
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let results = reader.nearest(&[0.0, 0.0, 0.0], 4, None).unwrap();
-        assert_eq!(results.len(), 4);
-        for pair in results.windows(2) {
+        // Query near cluster A with probes=1
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let results = reader.nearest(&[10.0, 0.0, 0.0], 2, 1).unwrap();
+        assert_eq!(results.len(), 2);
+        // Both results should be from cluster A (offsets 0, 100, or 200)
+        for r in &results {
             assert!(
-                pair[0].1 <= pair[1].1,
-                "results should be sorted by distance"
+                r.position.offset <= 200,
+                "expected cluster A result, got offset {}",
+                r.position.offset
+            );
+        }
+
+        // Query near cluster B with probes=1
+        let results = reader.nearest(&[0.0, 10.0, 0.0], 2, 1).unwrap();
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert!(
+                r.position.offset >= 300,
+                "expected cluster B result, got offset {}",
+                r.position.offset
             );
         }
     }
 
     #[test]
-    fn kmeans_convergence() {
+    fn ivfflat_empty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = IvfFlatFactory::new(4, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
+        builder.finish().unwrap();
+
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let results = reader.nearest(&[1.0, 0.0, 0.0], 5, 1).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn ivfflat_lookup_returns_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = IvfFlatFactory::new(4, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
+        builder.finish().unwrap();
+
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let cell = CellValue::live(b"hello".to_vec(), 1);
+        let result = reader.lookup(&cell);
+        assert!(result.is_err());
+        match result {
+            Err(IndexError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ivfflat_range_returns_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = IvfFlatFactory::new(4, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
+        builder.finish().unwrap();
+
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let cell = CellValue::live(b"x".to_vec(), 1);
+        let result = reader.range(&cell, &cell);
+        assert!(result.is_err());
+        match result {
+            Err(IndexError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ivfflat_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = IvfFlatFactory::new(4, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
+        builder.finish().unwrap();
+
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let caps = reader.capabilities();
+        assert_eq!(caps, vec![IndexCapability::Nearest]);
+    }
+
+    #[test]
+    fn ivfflat_dimension_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = IvfFlatFactory::new(2, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
+        builder
+            .add_row(RowPosition::new(0), &make_vector_cell(&[1.0, 0.0, 0.0]))
+            .unwrap();
+        builder.finish().unwrap();
+
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let result = reader.nearest(&[1.0, 0.0], 1, 1);
+        assert!(result.is_err());
+        match result {
+            Err(IndexError::DimensionMismatch {
+                expected: 3,
+                got: 2,
+            }) => {}
+            other => panic!("expected DimensionMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ivfflat_multi_probe_finds_cross_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = IvfFlatFactory::new(2, DistanceMetric::L2);
+        let mut builder = factory.create_builder(dir.path()).unwrap();
+
+        // Cluster A: near (10, 0)
+        builder
+            .add_row(RowPosition::new(0), &make_vector_cell(&[10.0, 0.0]))
+            .unwrap();
+        builder
+            .add_row(RowPosition::new(100), &make_vector_cell(&[10.1, 0.1]))
+            .unwrap();
+
+        // Cluster B: near (0, 10)
+        builder
+            .add_row(RowPosition::new(200), &make_vector_cell(&[0.0, 10.0]))
+            .unwrap();
+        builder
+            .add_row(RowPosition::new(300), &make_vector_cell(&[0.1, 10.1]))
+            .unwrap();
+
+        builder.finish().unwrap();
+
+        // With probes=2, we search both clusters, so k=4 should return all
+        let reader = factory.open_reader(dir.path()).unwrap();
+        let results = reader.nearest(&[5.0, 5.0], 4, 2).unwrap();
+        assert_eq!(results.len(), 4);
+    }
+
+    #[test]
+    fn kmeans_basic() {
         // Two well-separated clusters
         let vectors = vec![
             vec![0.0, 0.0],
-            vec![0.1, 0.0],
-            vec![0.0, 0.1],
+            vec![0.1, 0.1],
             vec![10.0, 10.0],
-            vec![10.1, 10.0],
-            vec![10.0, 10.1],
+            vec![10.1, 10.1],
         ];
-        let centroids = kmeans(&vectors, 2, 2, &DistanceMetric::L2, 50);
+        let (centroids, assignments) = kmeans(&vectors, 2, &DistanceMetric::L2, 100);
         assert_eq!(centroids.len(), 2);
-
-        // Each centroid should be near one of the two clusters
-        let near_origin = centroids.iter().any(|c| c[0] < 1.0 && c[1] < 1.0);
-        let near_ten = centroids.iter().any(|c| c[0] > 9.0 && c[1] > 9.0);
-        assert!(near_origin, "should have a centroid near origin");
-        assert!(near_ten, "should have a centroid near (10,10)");
+        // Vectors 0 and 1 should be in the same cluster
+        assert_eq!(assignments[0], assignments[1]);
+        // Vectors 2 and 3 should be in the same cluster
+        assert_eq!(assignments[2], assignments[3]);
+        // The two groups should be in different clusters
+        assert_ne!(assignments[0], assignments[2]);
     }
 }

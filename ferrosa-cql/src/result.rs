@@ -13,7 +13,7 @@
 
 use bytes::{BufMut, BytesMut};
 
-use crate::types::{CqlType, CqlValue};
+use crate::types::{encode_value, CqlType, CqlValue};
 
 // ── Public encoders ────────────────────────────────────────────────────────
 
@@ -184,7 +184,7 @@ fn encode_cell(buf: &mut BytesMut, value: &Option<CqlValue>) {
         None => buf.put_i32(-1),
         Some(CqlValue::Null) => buf.put_i32(-1),
         Some(val) => {
-            let bytes = val.encode_value();
+            let bytes = encode_value(val);
             buf.put_i32(bytes.len() as i32);
             buf.put_slice(&bytes);
         }

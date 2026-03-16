@@ -108,6 +108,21 @@ pub enum Keyword {
     Unsubscribe,
     Every,
     Delta,
+    Type,
+    Rename,
+    Add,
+    Function,
+    Returns,
+    Language,
+    Called,
+    Input,
+    Replace,
+    Aggregate,
+    Sfunc,
+    Stype,
+    Finalfunc,
+    Initcond,
+    As,
 }
 
 /// Compile-time keyword map. Case-insensitive lookup is done by
@@ -206,6 +221,21 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "UNSUBSCRIBE" => Keyword::Unsubscribe,
     "EVERY" => Keyword::Every,
     "DELTA" => Keyword::Delta,
+    "TYPE" => Keyword::Type,
+    "RENAME" => Keyword::Rename,
+    "ADD" => Keyword::Add,
+    "FUNCTION" => Keyword::Function,
+    "RETURNS" => Keyword::Returns,
+    "LANGUAGE" => Keyword::Language,
+    "CALLED" => Keyword::Called,
+    "INPUT" => Keyword::Input,
+    "REPLACE" => Keyword::Replace,
+    "AGGREGATE" => Keyword::Aggregate,
+    "SFUNC" => Keyword::Sfunc,
+    "STYPE" => Keyword::Stype,
+    "FINALFUNC" => Keyword::Finalfunc,
+    "INITCOND" => Keyword::Initcond,
+    "AS" => Keyword::As,
 };
 
 /// Token kind produced by the lexer.
@@ -1076,5 +1106,42 @@ mod tests {
         assert!(tokens
             .iter()
             .any(|t| matches!(t, TokenKind::Keyword(Keyword::Unsubscribe))));
+    }
+
+    #[test]
+    fn lexer_recognizes_type_keyword() {
+        let tokens = lex_all("CREATE TYPE");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Keyword(Keyword::Create),
+                TokenKind::Keyword(Keyword::Type),
+            ]
+        );
+    }
+
+    #[test]
+    fn lexer_recognizes_type_case_insensitive() {
+        let tokens = lex_all("type Type TYPE");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Keyword(Keyword::Type),
+                TokenKind::Keyword(Keyword::Type),
+                TokenKind::Keyword(Keyword::Type),
+            ]
+        );
+    }
+
+    #[test]
+    fn lexer_recognizes_add_and_rename_keywords() {
+        let tokens = lex_all("ADD RENAME");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Keyword(Keyword::Add),
+                TokenKind::Keyword(Keyword::Rename),
+            ]
+        );
     }
 }

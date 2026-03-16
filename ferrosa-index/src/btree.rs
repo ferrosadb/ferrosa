@@ -1,18 +1,15 @@
-//! B-tree index implementation: sorted key-value entries with binary search.
+//! B-tree secondary index.
 //!
-//! Supports [`IndexCapabilities::POINT_LOOKUP`] and [`IndexCapabilities::RANGE_SCAN`].
-//! Keys are extracted from the first column position in [`IndexConfig::column_positions`].
+//! Stores sorted `(key_bytes, RowPosition)` entries, supporting both point
+//! lookups via binary search and range scans.
 //!
-//! Binary format (little-endian):
+//! ## File format
+//!
 //! ```text
-//! entry_count: u64
-//! entries[]:
-//!   key_len:  u32
-//!   key:      [u8; key_len]
-//!   pk_len:   u32
-//!   pk:       [u8; pk_len]
-//!   ck_len:   u32
-//!   ck:       [u8; ck_len]
+//! header:  entry_count (u64 LE)
+//! entries: key_len (u32 LE) | key_bytes
+//!          pk_len  (u32 LE) | pk_bytes
+//!          ck_len  (u32 LE) | ck_bytes
 //! ```
 
 use crate::{
@@ -20,42 +17,51 @@ use crate::{
     IndexFiles, IndexKey, IndexReader, IndexResult, IndexType, RowPosition,
 };
 use ferrosa_common::CellValue;
-use std::io::{Read as _, Write as _};
 use std::ops::Bound;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+
+/// Entry stored in the B-tree index: a key and its corresponding row position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BTreeEntry {
+    key: Vec<u8>,
+    position: RowPosition,
+}
+
+// ── Factory ──────────────────────────────────────────────────────────────────
 
 /// Factory for creating B-tree index builders and readers.
 pub struct BTreeIndexFactory;
 
 impl IndexFactory for BTreeIndexFactory {
     fn create_builder(&self, config: &IndexConfig) -> IndexResult<Box<dyn IndexBuilder>> {
+        let file_path = config.output_dir.join(format!("{}.btree", config.name));
         Ok(Box::new(BTreeBuilder {
             entries: Vec::new(),
-            config: config.clone(),
+            file_path,
         }))
     }
 
     fn open_reader(&self, files: &IndexFiles) -> IndexResult<Box<dyn IndexReader>> {
-        let data = std::fs::read(&files.data_path)?;
+        let data = std::fs::read(&files.data.path)?;
         let entries = deserialize_entries(&data)?;
         Ok(Box::new(BTreeReader { entries }))
     }
 
-    fn merge(
-        &self,
-        readers: Vec<Box<dyn IndexReader>>,
-        builder: Box<dyn IndexBuilder>,
-    ) -> IndexResult<IndexFiles> {
-        let _ = readers;
-        // For now, just finish the builder (merge is a future enhancement).
-        builder.finish()
+    fn index_type(&self) -> IndexType {
+        IndexType::BTree
+    }
+
+    fn capabilities(&self) -> IndexCapabilities {
+        IndexCapabilities::POINT_LOOKUP | IndexCapabilities::RANGE_SCAN
     }
 }
 
-/// Accumulates sorted (key, RowPosition) entries during index build.
+// ── Builder ──────────────────────────────────────────────────────────────────
+
+/// Accumulates rows and writes a sorted B-tree index file.
 pub struct BTreeBuilder {
-    entries: Vec<(Vec<u8>, RowPosition)>,
-    config: IndexConfig,
+    entries: Vec<BTreeEntry>,
+    file_path: PathBuf,
 }
 
 impl IndexBuilder for BTreeBuilder {
@@ -63,110 +69,72 @@ impl IndexBuilder for BTreeBuilder {
         &mut self,
         partition_key: &[u8],
         clustering_key: &[u8],
-        cells: &[(u16, CellValue)],
+        cells: &[CellValue],
+        column_positions: &[usize],
     ) -> IndexResult<()> {
-        let col_pos = self
-            .config
-            .column_positions
-            .first()
-            .copied()
-            .ok_or_else(|| IndexError::Build("no column positions configured".into()))?;
-
-        // Find the cell for the indexed column.
-        let cell = cells
-            .iter()
-            .find(|(pos, _)| *pos as usize == col_pos)
-            .map(|(_, cv)| cv);
-
-        let cell = match cell {
-            Some(c) => c,
-            None => return Ok(()), // Column not present in this row; skip.
-        };
-
-        // Skip tombstones.
-        if cell.is_tombstone() {
+        if column_positions.is_empty() {
             return Ok(());
         }
 
-        let key_bytes = match &cell.value {
+        let col_pos = column_positions[0];
+        if col_pos >= cells.len() {
+            return Err(IndexError::MissingColumn(col_pos));
+        }
+
+        let cell = &cells[col_pos];
+        // Skip tombstones
+        let value = match &cell.value {
             Some(v) => v.clone(),
-            None => return Ok(()), // No value (shouldn't happen after tombstone check, but be safe).
+            None => return Ok(()),
         };
 
-        self.entries.push((
-            key_bytes,
-            RowPosition {
+        self.entries.push(BTreeEntry {
+            key: value,
+            position: RowPosition {
                 partition_key: partition_key.to_vec(),
                 clustering_key: clustering_key.to_vec(),
             },
-        ));
+        });
 
         Ok(())
     }
 
     fn finish(mut self: Box<Self>) -> IndexResult<IndexFiles> {
-        // Sort by key bytes for binary search.
-        self.entries.sort_by(|a, b| a.0.cmp(&b.0));
+        // Sort by key bytes for binary search
+        self.entries.sort_by(|a, b| a.key.cmp(&b.key));
 
-        let row_count = self.entries.len() as u64;
         let data = serialize_entries(&self.entries);
+        std::fs::write(&self.file_path, &data)?;
 
-        let data_path = self.config.output_dir.join(format!(
-            "{}-{}.db",
-            self.config.sstable_prefix, self.config.index_name
-        ));
-        let meta_path = self.config.output_dir.join(format!(
-            "{}-{}.meta",
-            self.config.sstable_prefix, self.config.index_name
-        ));
-
-        std::fs::create_dir_all(&self.config.output_dir)?;
-        std::fs::write(&data_path, &data)?;
-
-        let checksum = crc32(&data);
-        let file_size = data.len() as u64;
-        let build_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let meta = IndexFileMeta {
-            index_type: IndexType::BTree,
-            index_name: self.config.index_name.clone(),
-            row_count,
-            build_timestamp,
-            sstable_id: self.config.sstable_prefix.clone(),
-            file_size,
-            checksum,
-        };
-
-        let meta_json = serde_json::to_vec(&meta)
-            .map_err(|e| IndexError::Build(format!("meta serialization: {e}")))?;
-        std::fs::write(&meta_path, &meta_json)?;
-
+        let size = data.len() as u64;
         Ok(IndexFiles {
-            data_path,
-            meta_path,
-            meta,
+            data: IndexFileMeta {
+                path: self.file_path,
+                size,
+            },
         })
     }
 }
 
-/// Reads a B-tree index from a deserialized sorted entry vector.
+// ── Reader ───────────────────────────────────────────────────────────────────
+
+/// Reads a sorted B-tree index, supporting binary-search lookups and range scans.
 pub struct BTreeReader {
-    entries: Vec<(Vec<u8>, RowPosition)>,
+    entries: Vec<BTreeEntry>,
 }
 
 impl IndexReader for BTreeReader {
     fn lookup(&self, key: &IndexKey) -> IndexResult<Vec<RowPosition>> {
-        let needle = extract_bytes(key)?;
-        // Binary search to the first match, then scan forward for duplicates.
-        let idx = self.entries.partition_point(|(k, _)| k.as_slice() < needle);
+        let key_bytes = &key.0;
+        // Find the first entry >= key via binary search
+        let start = self
+            .entries
+            .partition_point(|e| e.key.as_slice() < key_bytes.as_slice());
 
         let mut results = Vec::new();
-        for (k, pos) in &self.entries[idx..] {
-            if k.as_slice() == needle {
-                results.push(pos.clone());
+        for entry in &self.entries[start..] {
+            if entry.key == *key_bytes {
+                results.push(entry.position.clone());
             } else {
                 break;
             }
@@ -180,48 +148,33 @@ impl IndexReader for BTreeReader {
         end: Bound<&IndexKey>,
     ) -> IndexResult<Vec<RowPosition>> {
         let start_idx = match start {
-            Bound::Included(k) => {
-                let needle = extract_bytes(k)?;
-                self.entries
-                    .partition_point(|(key, _)| key.as_slice() < needle)
-            }
-            Bound::Excluded(k) => {
-                let needle = extract_bytes(k)?;
-                self.entries
-                    .partition_point(|(key, _)| key.as_slice() <= needle)
-            }
+            Bound::Included(key) => self
+                .entries
+                .partition_point(|e| e.key.as_slice() < key.0.as_slice()),
+            Bound::Excluded(key) => self
+                .entries
+                .partition_point(|e| e.key.as_slice() <= key.0.as_slice()),
             Bound::Unbounded => 0,
         };
 
-        let end_idx = match end {
-            Bound::Included(k) => {
-                let needle = extract_bytes(k)?;
-                self.entries
-                    .partition_point(|(key, _)| key.as_slice() <= needle)
+        let mut results = Vec::new();
+        for entry in &self.entries[start_idx..] {
+            let include = match end {
+                Bound::Included(key) => entry.key.as_slice() <= key.0.as_slice(),
+                Bound::Excluded(key) => entry.key.as_slice() < key.0.as_slice(),
+                Bound::Unbounded => true,
+            };
+            if !include {
+                break;
             }
-            Bound::Excluded(k) => {
-                let needle = extract_bytes(k)?;
-                self.entries
-                    .partition_point(|(key, _)| key.as_slice() < needle)
-            }
-            Bound::Unbounded => self.entries.len(),
-        };
-
-        let results = self.entries[start_idx..end_idx]
-            .iter()
-            .map(|(_, pos)| pos.clone())
-            .collect();
+            results.push(entry.position.clone());
+        }
         Ok(results)
     }
 
-    fn nearest(
-        &self,
-        _query: &[f32],
-        _k: usize,
-        _ef_search: Option<u16>,
-    ) -> IndexResult<Vec<(RowPosition, f32)>> {
+    fn nearest(&self, _key: &IndexKey) -> IndexResult<Vec<RowPosition>> {
         Err(IndexError::Unsupported(
-            "nearest not supported by B-tree index".into(),
+            "nearest lookup not supported by B-tree index".to_string(),
         ))
     }
 
@@ -230,328 +183,284 @@ impl IndexReader for BTreeReader {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ── Serialization ────────────────────────────────────────────────────────────
 
-fn extract_bytes(key: &IndexKey) -> IndexResult<&[u8]> {
-    match key {
-        IndexKey::Bytes(b) => Ok(b.as_slice()),
-        _ => Err(IndexError::Query(
-            "B-tree index only supports Bytes keys".into(),
-        )),
-    }
-}
+fn serialize_entries(entries: &[BTreeEntry]) -> Vec<u8> {
+    let mut buf = Vec::new();
 
-fn serialize_entries(entries: &[(Vec<u8>, RowPosition)]) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::new();
-    buf.write_all(&(entries.len() as u64).to_le_bytes())
-        .unwrap();
-    for (key, pos) in entries {
-        buf.write_all(&(key.len() as u32).to_le_bytes()).unwrap();
-        buf.write_all(key).unwrap();
-        buf.write_all(&(pos.partition_key.len() as u32).to_le_bytes())
-            .unwrap();
-        buf.write_all(&pos.partition_key).unwrap();
-        buf.write_all(&(pos.clustering_key.len() as u32).to_le_bytes())
-            .unwrap();
-        buf.write_all(&pos.clustering_key).unwrap();
+    // Header: entry count
+    buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+
+    for entry in entries {
+        // key_len + key_bytes
+        buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&entry.key);
+
+        // pk_len + pk_bytes
+        buf.extend_from_slice(&(entry.position.partition_key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&entry.position.partition_key);
+
+        // ck_len + ck_bytes
+        buf.extend_from_slice(&(entry.position.clustering_key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&entry.position.clustering_key);
     }
+
     buf
 }
 
-fn deserialize_entries(data: &[u8]) -> IndexResult<Vec<(Vec<u8>, RowPosition)>> {
-    let mut cursor = std::io::Cursor::new(data);
-    let mut buf8 = [0u8; 8];
-    let mut buf4 = [0u8; 4];
+fn deserialize_entries(data: &[u8]) -> IndexResult<Vec<BTreeEntry>> {
+    if data.len() < 8 {
+        return Err(IndexError::Corrupt("file too short for header".to_string()));
+    }
 
-    cursor
-        .read_exact(&mut buf8)
-        .map_err(|e| IndexError::Query(format!("read entry_count: {e}")))?;
-    let count = u64::from_le_bytes(buf8) as usize;
+    let entry_count = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
+    let mut entries = Vec::with_capacity(entry_count);
+    let mut offset = 8;
 
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        cursor
-            .read_exact(&mut buf4)
-            .map_err(|e| IndexError::Query(format!("read key_len: {e}")))?;
-        let key_len = u32::from_le_bytes(buf4) as usize;
-        let mut key = vec![0u8; key_len];
-        cursor
-            .read_exact(&mut key)
-            .map_err(|e| IndexError::Query(format!("read key: {e}")))?;
+    for _ in 0..entry_count {
+        let key = read_length_prefixed(data, &mut offset)?;
+        let pk = read_length_prefixed(data, &mut offset)?;
+        let ck = read_length_prefixed(data, &mut offset)?;
 
-        cursor
-            .read_exact(&mut buf4)
-            .map_err(|e| IndexError::Query(format!("read pk_len: {e}")))?;
-        let pk_len = u32::from_le_bytes(buf4) as usize;
-        let mut pk = vec![0u8; pk_len];
-        cursor
-            .read_exact(&mut pk)
-            .map_err(|e| IndexError::Query(format!("read pk: {e}")))?;
-
-        cursor
-            .read_exact(&mut buf4)
-            .map_err(|e| IndexError::Query(format!("read ck_len: {e}")))?;
-        let ck_len = u32::from_le_bytes(buf4) as usize;
-        let mut ck = vec![0u8; ck_len];
-        cursor
-            .read_exact(&mut ck)
-            .map_err(|e| IndexError::Query(format!("read ck: {e}")))?;
-
-        entries.push((
+        entries.push(BTreeEntry {
             key,
-            RowPosition {
+            position: RowPosition {
                 partition_key: pk,
                 clustering_key: ck,
             },
-        ));
+        });
     }
 
     Ok(entries)
 }
 
-/// Simple CRC-32 (Castagnoli / CRC-32C) using a lookup table.
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        let idx = ((crc ^ byte as u32) & 0xFF) as usize;
-        crc = CRC32_TABLE[idx] ^ (crc >> 8);
+fn read_length_prefixed(data: &[u8], offset: &mut usize) -> IndexResult<Vec<u8>> {
+    if *offset + 4 > data.len() {
+        return Err(IndexError::Corrupt(format!(
+            "unexpected EOF at offset {offset} reading length"
+        )));
     }
-    !crc
-}
+    let len = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+    *offset += 4;
 
-/// Pre-computed CRC-32C table (Castagnoli polynomial 0x1EDC6F41).
-#[rustfmt::skip]
-static CRC32_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let poly: u32 = 0xEDB88320;
-    let mut i = 0;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ poly;
-            } else {
-                crc >>= 1;
-            }
-            j += 1;
-        }
-        table[i] = crc;
-        i += 1;
+    if *offset + len > data.len() {
+        return Err(IndexError::Corrupt(format!(
+            "unexpected EOF at offset {offset} reading {len} bytes"
+        )));
     }
-    table
-};
+    let bytes = data[*offset..*offset + len].to_vec();
+    *offset += len;
+    Ok(bytes)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrosa_common::CellValue;
+    use tempfile::tempdir;
 
-    fn make_config(dir: &std::path::Path) -> IndexConfig {
-        IndexConfig {
+    /// Helper: build an index from rows and return a reader.
+    fn build_and_read(
+        rows: Vec<(&[u8], &[u8], Vec<CellValue>)>,
+        column_positions: &[usize],
+    ) -> Box<dyn IndexReader> {
+        let dir = tempdir().unwrap();
+        let config = IndexConfig {
             index_type: IndexType::BTree,
-            column_positions: vec![0],
-            output_dir: dir.to_path_buf(),
-            sstable_prefix: "sstable-001".into(),
-            index_name: "idx_email".into(),
-        }
-    }
-
-    fn cell(value: &[u8]) -> CellValue {
-        CellValue::live(value.to_vec(), 1000)
-    }
-
-    fn tombstone_cell() -> CellValue {
-        CellValue::tombstone(1000, 1_700_000_000)
-    }
-
-    #[test]
-    fn point_lookup() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
+            column_positions: column_positions.to_vec(),
+            output_dir: dir.path().to_path_buf(),
+            name: "test_btree".to_string(),
+        };
         let factory = BTreeIndexFactory;
         let mut builder = factory.create_builder(&config).unwrap();
 
-        builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"alice"))])
-            .unwrap();
-        builder
-            .add_row(b"pk2", b"ck2", &[(0, cell(b"bob"))])
-            .unwrap();
-        builder
-            .add_row(b"pk3", b"ck3", &[(0, cell(b"alice"))])
-            .unwrap();
+        for (pk, ck, cells) in &rows {
+            builder.add_row(pk, ck, cells, column_positions).unwrap();
+        }
 
         let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
+        factory.open_reader(&files).unwrap()
+    }
 
-        let results = reader.lookup(&IndexKey::Bytes(b"alice".to_vec())).unwrap();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].partition_key, b"pk1");
-        assert_eq!(results[1].partition_key, b"pk3");
+    #[test]
+    fn point_lookup_finds_correct_row() {
+        let reader = build_and_read(
+            vec![
+                (b"pk1", b"ck1", vec![CellValue::live(b"alpha".to_vec(), 1)]),
+                (b"pk2", b"ck2", vec![CellValue::live(b"beta".to_vec(), 2)]),
+                (b"pk3", b"ck3", vec![CellValue::live(b"gamma".to_vec(), 3)]),
+            ],
+            &[0],
+        );
 
-        let results = reader.lookup(&IndexKey::Bytes(b"bob".to_vec())).unwrap();
+        let results = reader.lookup(&IndexKey(b"beta".to_vec())).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].partition_key, b"pk2");
+        assert_eq!(results[0].clustering_key, b"ck2");
+    }
 
-        let results = reader
-            .lookup(&IndexKey::Bytes(b"charlie".to_vec()))
-            .unwrap();
+    #[test]
+    fn point_lookup_not_found_returns_empty() {
+        let reader = build_and_read(
+            vec![(b"pk1", b"ck1", vec![CellValue::live(b"alpha".to_vec(), 1)])],
+            &[0],
+        );
+
+        let results = reader.lookup(&IndexKey(b"missing".to_vec())).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
-    fn range_scan() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = BTreeIndexFactory;
-        let mut builder = factory.create_builder(&config).unwrap();
-
-        builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"aaa"))])
-            .unwrap();
-        builder
-            .add_row(b"pk2", b"ck2", &[(0, cell(b"bbb"))])
-            .unwrap();
-        builder
-            .add_row(b"pk3", b"ck3", &[(0, cell(b"ccc"))])
-            .unwrap();
-        builder
-            .add_row(b"pk4", b"ck4", &[(0, cell(b"ddd"))])
-            .unwrap();
-
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
+    fn range_scan_returns_correct_subset() {
+        let reader = build_and_read(
+            vec![
+                (b"pk1", b"ck1", vec![CellValue::live(b"aaa".to_vec(), 1)]),
+                (b"pk2", b"ck2", vec![CellValue::live(b"bbb".to_vec(), 2)]),
+                (b"pk3", b"ck3", vec![CellValue::live(b"ccc".to_vec(), 3)]),
+                (b"pk4", b"ck4", vec![CellValue::live(b"ddd".to_vec(), 4)]),
+            ],
+            &[0],
+        );
 
         // Inclusive range [bbb, ccc]
         let results = reader
             .range(
-                Bound::Included(&IndexKey::Bytes(b"bbb".to_vec())),
-                Bound::Included(&IndexKey::Bytes(b"ccc".to_vec())),
+                Bound::Included(&IndexKey(b"bbb".to_vec())),
+                Bound::Included(&IndexKey(b"ccc".to_vec())),
             )
             .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].partition_key, b"pk2");
         assert_eq!(results[1].partition_key, b"pk3");
+    }
 
-        // Exclusive start (bbb, ccc]
+    #[test]
+    fn range_scan_exclusive_bounds() {
+        let reader = build_and_read(
+            vec![
+                (b"pk1", b"ck1", vec![CellValue::live(b"aaa".to_vec(), 1)]),
+                (b"pk2", b"ck2", vec![CellValue::live(b"bbb".to_vec(), 2)]),
+                (b"pk3", b"ck3", vec![CellValue::live(b"ccc".to_vec(), 3)]),
+                (b"pk4", b"ck4", vec![CellValue::live(b"ddd".to_vec(), 4)]),
+            ],
+            &[0],
+        );
+
+        // Exclusive range (aaa, ddd)
         let results = reader
             .range(
-                Bound::Excluded(&IndexKey::Bytes(b"bbb".to_vec())),
-                Bound::Included(&IndexKey::Bytes(b"ccc".to_vec())),
-            )
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].partition_key, b"pk3");
-
-        // Unbounded start
-        let results = reader
-            .range(
-                Bound::Unbounded,
-                Bound::Excluded(&IndexKey::Bytes(b"ccc".to_vec())),
+                Bound::Excluded(&IndexKey(b"aaa".to_vec())),
+                Bound::Excluded(&IndexKey(b"ddd".to_vec())),
             )
             .unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].partition_key, b"pk1");
-        assert_eq!(results[1].partition_key, b"pk2");
-
-        // Fully unbounded
-        let results = reader.range(Bound::Unbounded, Bound::Unbounded).unwrap();
-        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].partition_key, b"pk2");
+        assert_eq!(results[1].partition_key, b"pk3");
     }
 
     #[test]
-    fn empty_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = BTreeIndexFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
+    fn range_scan_unbounded() {
+        let reader = build_and_read(
+            vec![
+                (b"pk1", b"ck1", vec![CellValue::live(b"aaa".to_vec(), 1)]),
+                (b"pk2", b"ck2", vec![CellValue::live(b"bbb".to_vec(), 2)]),
+            ],
+            &[0],
+        );
 
-        assert_eq!(files.meta.row_count, 0);
-        let results = reader
-            .lookup(&IndexKey::Bytes(b"anything".to_vec()))
-            .unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn tombstone_skip() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = BTreeIndexFactory;
-        let mut builder = factory.create_builder(&config).unwrap();
-
-        builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"alive"))])
-            .unwrap();
-        builder
-            .add_row(b"pk2", b"ck2", &[(0, tombstone_cell())])
-            .unwrap();
-        builder
-            .add_row(b"pk3", b"ck3", &[(0, cell(b"also_alive"))])
-            .unwrap();
-
-        let files = builder.finish().unwrap();
-        assert_eq!(files.meta.row_count, 2);
-
-        let reader = factory.open_reader(&files).unwrap();
         let results = reader.range(Bound::Unbounded, Bound::Unbounded).unwrap();
         assert_eq!(results.len(), 2);
     }
 
     #[test]
-    fn duplicate_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = BTreeIndexFactory;
-        let mut builder = factory.create_builder(&config).unwrap();
+    fn empty_index_returns_empty_results() {
+        let reader = build_and_read(vec![], &[0]);
 
-        builder
-            .add_row(b"pk1", b"ck1", &[(0, cell(b"same"))])
-            .unwrap();
-        builder
-            .add_row(b"pk2", b"ck2", &[(0, cell(b"same"))])
-            .unwrap();
-        builder
-            .add_row(b"pk3", b"ck3", &[(0, cell(b"same"))])
-            .unwrap();
+        let lookup = reader.lookup(&IndexKey(b"anything".to_vec())).unwrap();
+        assert!(lookup.is_empty());
 
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
-        let results = reader.lookup(&IndexKey::Bytes(b"same".to_vec())).unwrap();
-        assert_eq!(results.len(), 3);
+        let range = reader.range(Bound::Unbounded, Bound::Unbounded).unwrap();
+        assert!(range.is_empty());
     }
 
     #[test]
-    fn nearest_unsupported() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = BTreeIndexFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
+    fn tombstone_rows_are_skipped() {
+        let reader = build_and_read(
+            vec![
+                (b"pk1", b"ck1", vec![CellValue::live(b"alpha".to_vec(), 1)]),
+                (b"pk2", b"ck2", vec![CellValue::tombstone(2, 1700000000)]),
+                (b"pk3", b"ck3", vec![CellValue::live(b"gamma".to_vec(), 3)]),
+            ],
+            &[0],
+        );
 
-        let result = reader.nearest(&[1.0, 2.0], 5, None);
+        // Tombstone row should not appear
+        let all = reader.range(Bound::Unbounded, Bound::Unbounded).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].partition_key, b"pk1");
+        assert_eq!(all[1].partition_key, b"pk3");
+    }
+
+    #[test]
+    fn multiple_rows_with_same_key() {
+        let reader = build_and_read(
+            vec![
+                (b"pk1", b"ck1", vec![CellValue::live(b"same".to_vec(), 1)]),
+                (b"pk2", b"ck2", vec![CellValue::live(b"same".to_vec(), 2)]),
+                (b"pk3", b"ck3", vec![CellValue::live(b"other".to_vec(), 3)]),
+            ],
+            &[0],
+        );
+
+        let results = reader.lookup(&IndexKey(b"same".to_vec())).unwrap();
+        assert_eq!(results.len(), 2);
+        // Both pk1 and pk2 should be returned (order is stable since keys are equal)
+        let pks: Vec<&[u8]> = results.iter().map(|r| r.partition_key.as_slice()).collect();
+        assert!(pks.contains(&b"pk1".as_slice()));
+        assert!(pks.contains(&b"pk2".as_slice()));
+    }
+
+    #[test]
+    fn nearest_returns_unsupported() {
+        let reader = build_and_read(
+            vec![(b"pk1", b"ck1", vec![CellValue::live(b"alpha".to_vec(), 1)])],
+            &[0],
+        );
+
+        let result = reader.nearest(&IndexKey(b"alpha".to_vec()));
+        assert!(result.is_err());
         assert!(matches!(result, Err(IndexError::Unsupported(_))));
     }
 
     #[test]
-    fn capabilities_correct() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = make_config(dir.path());
-        let factory = BTreeIndexFactory;
-        let builder = factory.create_builder(&config).unwrap();
-        let files = builder.finish().unwrap();
-        let reader = factory.open_reader(&files).unwrap();
-
+    fn capabilities_include_point_and_range() {
+        let reader = build_and_read(vec![], &[0]);
         let caps = reader.capabilities();
         assert!(caps.contains(IndexCapabilities::POINT_LOOKUP));
         assert!(caps.contains(IndexCapabilities::RANGE_SCAN));
-        assert!(!caps.contains(IndexCapabilities::NEAREST));
-        assert!(!caps.contains(IndexCapabilities::PHONETIC));
+    }
+
+    #[test]
+    fn serialization_roundtrip() {
+        let entries = vec![
+            BTreeEntry {
+                key: b"key1".to_vec(),
+                position: RowPosition {
+                    partition_key: b"pk1".to_vec(),
+                    clustering_key: b"ck1".to_vec(),
+                },
+            },
+            BTreeEntry {
+                key: b"key2".to_vec(),
+                position: RowPosition {
+                    partition_key: b"pk2".to_vec(),
+                    clustering_key: vec![],
+                },
+            },
+        ];
+
+        let data = serialize_entries(&entries);
+        let roundtripped = deserialize_entries(&data).unwrap();
+        assert_eq!(entries, roundtripped);
     }
 }

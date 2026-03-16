@@ -418,6 +418,23 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Index) => {
                 self.parse_create_index().map(Statement::CreateIndex)
             }
+            TokenKind::Keyword(Keyword::Type) => self.parse_create_type(),
+            TokenKind::Keyword(Keyword::Function) => self.parse_create_function(false),
+            TokenKind::Keyword(Keyword::Aggregate) => self.parse_create_aggregate(false),
+            TokenKind::Keyword(Keyword::Or) => {
+                // CREATE OR REPLACE FUNCTION/AGGREGATE
+                self.lexer.next_token()?; // consume OR
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Replace))?;
+                let tok = self.lexer.peek()?;
+                match &tok.kind {
+                    TokenKind::Keyword(Keyword::Function) => self.parse_create_function(true),
+                    TokenKind::Keyword(Keyword::Aggregate) => self.parse_create_aggregate(true),
+                    _ => Err(CqlError::SyntaxError(format!(
+                        "expected FUNCTION or AGGREGATE after CREATE OR REPLACE, got {:?} at position {}",
+                        tok.kind, tok.pos
+                    ))),
+                }
+            }
             _ => Err(CqlError::SyntaxError(format!(
                 "CREATE {:?} not yet supported at position {}",
                 tok.kind, tok.pos
@@ -732,6 +749,7 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Table) => {
                 self.parse_alter_table().map(Statement::AlterTable)
             }
+            TokenKind::Keyword(Keyword::Type) => self.parse_alter_type(),
             _ => Err(CqlError::SyntaxError(format!(
                 "ALTER {:?} not yet supported at position {}",
                 tok.kind, tok.pos
@@ -748,7 +766,7 @@ impl<'input> Parser<'input> {
 
         let tok = self.lexer.peek()?;
         match &tok.kind {
-            TokenKind::Ident(s) if s.eq_ignore_ascii_case("add") => {
+            TokenKind::Keyword(Keyword::Add) => {
                 self.lexer.next_token()?;
                 let col_name = self.parse_ident()?;
                 let col_type = self.parse_cql_type_name()?;
@@ -785,6 +803,9 @@ impl<'input> Parser<'input> {
         match &tok.kind {
             TokenKind::Keyword(Keyword::Table) => self.parse_drop_table().map(Statement::DropTable),
             TokenKind::Keyword(Keyword::Index) => self.parse_drop_index().map(Statement::DropIndex),
+            TokenKind::Keyword(Keyword::Type) => self.parse_drop_type(),
+            TokenKind::Keyword(Keyword::Function) => self.parse_drop_function(),
+            TokenKind::Keyword(Keyword::Aggregate) => self.parse_drop_aggregate(),
             _ => Err(CqlError::SyntaxError(format!(
                 "DROP {:?} not yet supported at position {}",
                 tok.kind, tok.pos
@@ -800,6 +821,294 @@ impl<'input> Parser<'input> {
         Ok(DropTableStatement {
             keyspace,
             table,
+            if_exists,
+        })
+    }
+
+    // ---------------------------------------------------------------
+    // CREATE/ALTER/DROP TYPE (UDT)
+    // ---------------------------------------------------------------
+
+    fn parse_create_type(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Type))?;
+
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (keyspace, name) = self.parse_table_ref()?;
+
+        self.lexer.expect(&TokenKind::LParen)?;
+
+        let mut fields: Vec<(String, CqlTypeName)> = vec![];
+        loop {
+            let tok = self.lexer.peek()?;
+            if tok.kind == TokenKind::RParen {
+                break;
+            }
+            let field_name = self.parse_ident()?;
+            let field_type = self.parse_cql_type_name()?;
+            fields.push((field_name, field_type));
+            if !self.lexer.eat(&TokenKind::Comma)? {
+                break;
+            }
+        }
+
+        self.lexer.expect(&TokenKind::RParen)?;
+
+        Ok(Statement::CreateType {
+            keyspace,
+            name,
+            if_not_exists,
+            fields,
+        })
+    }
+
+    fn parse_alter_type(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Type))?;
+
+        let (keyspace, name) = self.parse_table_ref()?;
+
+        let mut alterations = vec![];
+        let tok = self.lexer.peek()?;
+        match &tok.kind {
+            TokenKind::Keyword(Keyword::Add) => {
+                self.lexer.next_token()?;
+                let field_name = self.parse_ident()?;
+                let field_type = self.parse_cql_type_name()?;
+                alterations.push(TypeAlteration::AddField {
+                    name: field_name,
+                    field_type,
+                });
+            }
+            TokenKind::Keyword(Keyword::Rename) => {
+                self.lexer.next_token()?;
+                let from = self.parse_ident()?;
+                self.lexer.expect(&TokenKind::Keyword(Keyword::To))?;
+                let to = self.parse_ident()?;
+                alterations.push(TypeAlteration::RenameField { from, to });
+            }
+            _ => {
+                return Err(CqlError::SyntaxError(format!(
+                    "expected ADD or RENAME after ALTER TYPE, got {:?} at position {}",
+                    tok.kind, tok.pos
+                )))
+            }
+        }
+
+        Ok(Statement::AlterType {
+            keyspace,
+            name,
+            alterations,
+        })
+    }
+
+    fn parse_drop_type(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Type))?;
+        let if_exists = self.parse_if_exists()?;
+        let (keyspace, name) = self.parse_table_ref()?;
+
+        Ok(Statement::DropType {
+            keyspace,
+            name,
+            if_exists,
+        })
+    }
+
+    // ---------------------------------------------------------------
+    // CREATE/DROP FUNCTION and AGGREGATE (UDF/UDA)
+    // ---------------------------------------------------------------
+
+    fn parse_create_function(&mut self, or_replace: bool) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Function))?;
+
+        let if_not_exists = self.parse_if_not_exists()?;
+        if or_replace && if_not_exists {
+            return Err(CqlError::SyntaxError(
+                "cannot combine OR REPLACE with IF NOT EXISTS".to_string(),
+            ));
+        }
+
+        let (keyspace, name) = self.parse_table_ref()?;
+
+        // Parameter list: ( param_name type [, param_name type ]* )
+        self.lexer.expect(&TokenKind::LParen)?;
+        let mut params: Vec<(String, CqlTypeName)> = vec![];
+        loop {
+            let tok = self.lexer.peek()?;
+            if tok.kind == TokenKind::RParen {
+                break;
+            }
+            let param_name = self.parse_ident()?;
+            let param_type = self.parse_cql_type_name()?;
+            params.push((param_name, param_type));
+            if !self.lexer.eat(&TokenKind::Comma)? {
+                break;
+            }
+        }
+        self.lexer.expect(&TokenKind::RParen)?;
+
+        // Null-input behavior:
+        //   CALLED ON NULL INPUT
+        //   RETURNS NULL ON NULL INPUT
+        let called_on_null = if self.lexer.eat(&TokenKind::Keyword(Keyword::Called))? {
+            self.lexer.expect(&TokenKind::Keyword(Keyword::On))?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::Null))?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::Input))?;
+            true
+        } else {
+            self.lexer.expect(&TokenKind::Keyword(Keyword::Returns))?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::Null))?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::On))?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::Null))?;
+            self.lexer.expect(&TokenKind::Keyword(Keyword::Input))?;
+            false
+        };
+
+        // RETURNS return_type
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Returns))?;
+        let return_type = self.parse_cql_type_name()?;
+
+        // LANGUAGE language_name
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Language))?;
+        let language = self.parse_ident()?;
+
+        // AS 'body'
+        self.lexer.expect(&TokenKind::Keyword(Keyword::As))?;
+        let body = self.expect_string_literal()?;
+
+        Ok(Statement::CreateFunction {
+            keyspace,
+            name,
+            or_replace,
+            if_not_exists,
+            params,
+            called_on_null,
+            return_type,
+            language,
+            body,
+        })
+    }
+
+    fn parse_drop_function(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Function))?;
+        let if_exists = self.parse_if_exists()?;
+        let (keyspace, name) = self.parse_table_ref()?;
+
+        // Optional argument type list: ( type [, type ]* )
+        let arg_types = if self.lexer.eat(&TokenKind::LParen)? {
+            let mut types = vec![];
+            loop {
+                let tok = self.lexer.peek()?;
+                if tok.kind == TokenKind::RParen {
+                    break;
+                }
+                types.push(self.parse_cql_type_name()?);
+                if !self.lexer.eat(&TokenKind::Comma)? {
+                    break;
+                }
+            }
+            self.lexer.expect(&TokenKind::RParen)?;
+            Some(types)
+        } else {
+            None
+        };
+
+        Ok(Statement::DropFunction {
+            keyspace,
+            name,
+            arg_types,
+            if_exists,
+        })
+    }
+
+    fn parse_create_aggregate(&mut self, or_replace: bool) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Aggregate))?;
+
+        let if_not_exists = self.parse_if_not_exists()?;
+        if or_replace && if_not_exists {
+            return Err(CqlError::SyntaxError(
+                "cannot combine OR REPLACE with IF NOT EXISTS".to_string(),
+            ));
+        }
+
+        let (keyspace, name) = self.parse_table_ref()?;
+
+        // Argument type list: ( type [, type ]* )
+        self.lexer.expect(&TokenKind::LParen)?;
+        let mut arg_types = vec![];
+        loop {
+            let tok = self.lexer.peek()?;
+            if tok.kind == TokenKind::RParen {
+                break;
+            }
+            arg_types.push(self.parse_cql_type_name()?);
+            if !self.lexer.eat(&TokenKind::Comma)? {
+                break;
+            }
+        }
+        self.lexer.expect(&TokenKind::RParen)?;
+
+        // SFUNC sfunc_name
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Sfunc))?;
+        let state_func = self.parse_ident()?;
+
+        // STYPE state_type
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Stype))?;
+        let state_type = self.parse_cql_type_name()?;
+
+        // Optional: FINALFUNC finalfunc_name
+        let final_func = if self.lexer.eat(&TokenKind::Keyword(Keyword::Finalfunc))? {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+
+        // Optional: INITCOND init_value
+        let init_cond = if self.lexer.eat(&TokenKind::Keyword(Keyword::Initcond))? {
+            Some(self.parse_term()?)
+        } else {
+            None
+        };
+
+        Ok(Statement::CreateAggregate {
+            keyspace,
+            name,
+            or_replace,
+            if_not_exists,
+            arg_types,
+            state_func,
+            state_type,
+            final_func,
+            init_cond,
+        })
+    }
+
+    fn parse_drop_aggregate(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Aggregate))?;
+        let if_exists = self.parse_if_exists()?;
+        let (keyspace, name) = self.parse_table_ref()?;
+
+        // Optional argument type list: ( type [, type ]* )
+        let arg_types = if self.lexer.eat(&TokenKind::LParen)? {
+            let mut types = vec![];
+            loop {
+                let tok = self.lexer.peek()?;
+                if tok.kind == TokenKind::RParen {
+                    break;
+                }
+                types.push(self.parse_cql_type_name()?);
+                if !self.lexer.eat(&TokenKind::Comma)? {
+                    break;
+                }
+            }
+            self.lexer.expect(&TokenKind::RParen)?;
+            Some(types)
+        } else {
+            None
+        };
+
+        Ok(Statement::DropAggregate {
+            keyspace,
+            name,
+            arg_types,
             if_exists,
         })
     }
@@ -1582,6 +1891,21 @@ impl<'input> Parser<'input> {
             Keyword::Unsubscribe => "unsubscribe",
             Keyword::Every => "every",
             Keyword::Delta => "delta",
+            Keyword::Type => "type",
+            Keyword::Rename => "rename",
+            Keyword::Add => "add",
+            Keyword::Function => "function",
+            Keyword::Returns => "returns",
+            Keyword::Language => "language",
+            Keyword::Called => "called",
+            Keyword::Input => "input",
+            Keyword::Replace => "replace",
+            Keyword::Aggregate => "aggregate",
+            Keyword::Sfunc => "sfunc",
+            Keyword::Stype => "stype",
+            Keyword::Finalfunc => "finalfunc",
+            Keyword::Initcond => "initcond",
+            Keyword::As => "as",
         }
         .to_string()
     }
@@ -1985,8 +2309,8 @@ mod tests {
 
     #[test]
     fn parse_unsupported_returns_error() {
-        // CREATE TYPE is not yet supported
-        let err = parse("CREATE TYPE address (street text, city text)").unwrap_err();
+        // CREATE MATERIALIZED VIEW is not yet supported
+        let err = parse("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t").unwrap_err();
         match err {
             CqlError::SyntaxError(msg) => assert!(
                 msg.contains("not yet supported"),
@@ -2377,6 +2701,353 @@ mod tests {
     #[test]
     fn parse_subscribe_enforces_min_interval() {
         assert!(parse("SUBSCRIBE SELECT * FROM t EVERY 100ms").is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // CREATE/ALTER/DROP TYPE tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_create_type_basic() {
+        let stmt = parse("CREATE TYPE ks.address (street text, city text, zip int)").unwrap();
+        match stmt {
+            Statement::CreateType {
+                keyspace,
+                name,
+                fields,
+                if_not_exists,
+            } => {
+                assert_eq!(keyspace, Some("ks".to_string()));
+                assert_eq!(name, "address");
+                assert_eq!(fields.len(), 3);
+                assert!(!if_not_exists);
+            }
+            _ => panic!("expected CreateType"),
+        }
+    }
+
+    #[test]
+    fn parse_create_type_if_not_exists() {
+        let stmt = parse("CREATE TYPE IF NOT EXISTS ks.address (street text)").unwrap();
+        match stmt {
+            Statement::CreateType { if_not_exists, .. } => assert!(if_not_exists),
+            _ => panic!("expected CreateType"),
+        }
+    }
+
+    #[test]
+    fn parse_create_type_no_keyspace() {
+        let stmt = parse("CREATE TYPE address (street text, city text)").unwrap();
+        match stmt {
+            Statement::CreateType { keyspace, name, .. } => {
+                assert_eq!(keyspace, None);
+                assert_eq!(name, "address");
+            }
+            _ => panic!("expected CreateType"),
+        }
+    }
+
+    #[test]
+    fn parse_create_type_frozen_field() {
+        let stmt = parse("CREATE TYPE ks.contact (addr frozen<text>, phone text)").unwrap();
+        match stmt {
+            Statement::CreateType { fields, .. } => {
+                assert_eq!(fields.len(), 2);
+                match &fields[0].1 {
+                    CqlTypeName::Frozen(_) => {}
+                    _ => panic!("expected Frozen type for first field"),
+                }
+            }
+            _ => panic!("expected CreateType"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_type_add() {
+        let stmt = parse("ALTER TYPE ks.address ADD country text").unwrap();
+        match stmt {
+            Statement::AlterType {
+                keyspace,
+                name,
+                alterations,
+            } => {
+                assert_eq!(keyspace, Some("ks".to_string()));
+                assert_eq!(name, "address");
+                assert_eq!(alterations.len(), 1);
+                match &alterations[0] {
+                    TypeAlteration::AddField { name, .. } => assert_eq!(name, "country"),
+                    _ => panic!("expected AddField"),
+                }
+            }
+            _ => panic!("expected AlterType"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_type_rename() {
+        let stmt = parse("ALTER TYPE ks.address RENAME street TO street_name").unwrap();
+        match stmt {
+            Statement::AlterType { alterations, .. } => match &alterations[0] {
+                TypeAlteration::RenameField { from, to } => {
+                    assert_eq!(from, "street");
+                    assert_eq!(to, "street_name");
+                }
+                _ => panic!("expected RenameField"),
+            },
+            _ => panic!("expected AlterType"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_type() {
+        let stmt = parse("DROP TYPE ks.address").unwrap();
+        match stmt {
+            Statement::DropType {
+                keyspace,
+                name,
+                if_exists,
+            } => {
+                assert_eq!(keyspace, Some("ks".to_string()));
+                assert_eq!(name, "address");
+                assert!(!if_exists);
+            }
+            _ => panic!("expected DropType"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_type_if_exists() {
+        let stmt = parse("DROP TYPE IF EXISTS ks.address").unwrap();
+        match stmt {
+            Statement::DropType { if_exists, .. } => assert!(if_exists),
+            _ => panic!("expected DropType"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // CREATE/DROP FUNCTION and AGGREGATE tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_create_function() {
+        let stmt = parse(
+            "CREATE FUNCTION ks.double_it (val int) \
+             CALLED ON NULL INPUT \
+             RETURNS int LANGUAGE wasm AS 'deadbeef'",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateFunction {
+                keyspace,
+                name,
+                params,
+                called_on_null,
+                language,
+                body,
+                or_replace,
+                if_not_exists,
+                ..
+            } => {
+                assert_eq!(keyspace, Some("ks".to_string()));
+                assert_eq!(name, "double_it");
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].0, "val");
+                assert!(called_on_null);
+                assert_eq!(language, "wasm");
+                assert_eq!(body, "deadbeef");
+                assert!(!or_replace);
+                assert!(!if_not_exists);
+            }
+            _ => panic!("expected CreateFunction"),
+        }
+    }
+
+    #[test]
+    fn parse_create_or_replace_function() {
+        let stmt = parse(
+            "CREATE OR REPLACE FUNCTION ks.f (a int) \
+             RETURNS NULL ON NULL INPUT \
+             RETURNS text LANGUAGE wasm AS 'cafe'",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateFunction {
+                or_replace,
+                called_on_null,
+                ..
+            } => {
+                assert!(or_replace);
+                assert!(!called_on_null);
+            }
+            _ => panic!("expected CreateFunction"),
+        }
+    }
+
+    #[test]
+    fn parse_create_function_if_not_exists() {
+        let stmt = parse(
+            "CREATE FUNCTION IF NOT EXISTS ks.f (a int) \
+             CALLED ON NULL INPUT \
+             RETURNS int LANGUAGE wasm AS 'body'",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateFunction { if_not_exists, .. } => {
+                assert!(if_not_exists);
+            }
+            _ => panic!("expected CreateFunction"),
+        }
+    }
+
+    #[test]
+    fn parse_create_function_or_replace_and_if_not_exists_fails() {
+        let result = parse(
+            "CREATE OR REPLACE FUNCTION IF NOT EXISTS ks.f (a int) \
+             CALLED ON NULL INPUT \
+             RETURNS int LANGUAGE wasm AS 'body'",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_drop_function_with_arg_types() {
+        let stmt = parse("DROP FUNCTION IF EXISTS ks.double_it (int)").unwrap();
+        match stmt {
+            Statement::DropFunction {
+                name,
+                arg_types,
+                if_exists,
+                keyspace,
+            } => {
+                assert_eq!(keyspace, Some("ks".to_string()));
+                assert_eq!(name, "double_it");
+                assert!(if_exists);
+                assert!(arg_types.is_some());
+                assert_eq!(arg_types.unwrap().len(), 1);
+            }
+            _ => panic!("expected DropFunction"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_function_without_arg_types() {
+        let stmt = parse("DROP FUNCTION ks.double_it").unwrap();
+        match stmt {
+            Statement::DropFunction { arg_types, .. } => {
+                assert!(arg_types.is_none());
+            }
+            _ => panic!("expected DropFunction"),
+        }
+    }
+
+    #[test]
+    fn parse_create_aggregate() {
+        let stmt = parse(
+            "CREATE AGGREGATE ks.my_avg (int) \
+             SFUNC avg_state STYPE bigint \
+             FINALFUNC avg_final INITCOND 0",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateAggregate {
+                keyspace,
+                name,
+                state_func,
+                final_func,
+                init_cond,
+                arg_types,
+                ..
+            } => {
+                assert_eq!(keyspace, Some("ks".to_string()));
+                assert_eq!(name, "my_avg");
+                assert_eq!(state_func, "avg_state");
+                assert_eq!(final_func, Some("avg_final".to_string()));
+                assert!(init_cond.is_some());
+                assert_eq!(arg_types.len(), 1);
+            }
+            _ => panic!("expected CreateAggregate"),
+        }
+    }
+
+    #[test]
+    fn parse_create_aggregate_minimal() {
+        let stmt = parse(
+            "CREATE AGGREGATE ks.my_sum (int) \
+             SFUNC sum_state STYPE bigint",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateAggregate {
+                final_func,
+                init_cond,
+                ..
+            } => {
+                assert_eq!(final_func, None);
+                assert_eq!(init_cond, None);
+            }
+            _ => panic!("expected CreateAggregate"),
+        }
+    }
+
+    #[test]
+    fn parse_create_or_replace_aggregate() {
+        let stmt = parse(
+            "CREATE OR REPLACE AGGREGATE ks.my_avg (int) \
+             SFUNC avg_state STYPE bigint",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateAggregate { or_replace, .. } => {
+                assert!(or_replace);
+            }
+            _ => panic!("expected CreateAggregate"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_aggregate() {
+        let stmt = parse("DROP AGGREGATE IF EXISTS ks.my_avg (int)").unwrap();
+        match stmt {
+            Statement::DropAggregate {
+                name,
+                if_exists,
+                keyspace,
+                arg_types,
+            } => {
+                assert_eq!(keyspace, Some("ks".to_string()));
+                assert_eq!(name, "my_avg");
+                assert!(if_exists);
+                assert!(arg_types.is_some());
+            }
+            _ => panic!("expected DropAggregate"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_aggregate_without_arg_types() {
+        let stmt = parse("DROP AGGREGATE ks.my_avg").unwrap();
+        match stmt {
+            Statement::DropAggregate { arg_types, .. } => {
+                assert!(arg_types.is_none());
+            }
+            _ => panic!("expected DropAggregate"),
+        }
+    }
+
+    #[test]
+    fn parse_create_function_no_params() {
+        let stmt = parse(
+            "CREATE FUNCTION ks.get_time () \
+             CALLED ON NULL INPUT \
+             RETURNS timestamp LANGUAGE wasm AS 'aabb'",
+        )
+        .unwrap();
+        match stmt {
+            Statement::CreateFunction { params, .. } => {
+                assert_eq!(params.len(), 0);
+            }
+            _ => panic!("expected CreateFunction"),
+        }
     }
 }
 

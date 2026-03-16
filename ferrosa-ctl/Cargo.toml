@@ -25,6 +25,7 @@ arc-swap = "1.7"
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-storage = { path = "../ferrosa-storage" }
+ferrosa-udf = { path = "../ferrosa-udf" }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 uuid = { version = "1", features = ["v4"] }

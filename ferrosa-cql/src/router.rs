@@ -18,17 +18,18 @@ use indexmap::IndexMap;
 use ferrosa_cluster::pair::ddl::DdlOperation;
 use ferrosa_cluster::{DdlPath, WritePath};
 use ferrosa_common::DataType;
-use ferrosa_index::{DistanceMetric, IndexType, PhoneticAlgorithm, VectorMethod};
+use ferrosa_index::IndexType;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local, query_peers, query_role_members,
     query_role_permissions, query_roles, query_tables, AuthContext,
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
     IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
     Resource, RoleMetadata, RoleUpdates, Schema, TableMetadata, TableParams, TableUpdates,
-    VirtualColumnDef, VirtualRow,
+    UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata, VirtualColumnDef, VirtualRow,
 };
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
+use ferrosa_udf::UdfExecutor;
 
 use crate::ast::*;
 use crate::bridge;
@@ -53,6 +54,8 @@ pub struct SharedState {
     pub prepared_cache: Arc<PreparedCache>,
     pub connection_tracker: Arc<ConnectionTracker>,
     pub query_tracker: Arc<QueryTracker>,
+    /// WASM UDF executor for compiling and invoking user-defined functions.
+    pub udf_executor: Arc<UdfExecutor>,
     /// Broadcast channel for CQL EVENT push notifications.
     pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
 }
@@ -175,6 +178,94 @@ pub async fn route(
             })
         }
         Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
+        Statement::CreateType {
+            keyspace,
+            name,
+            if_not_exists,
+            fields,
+        } => route_create_type(state, ctx, keyspace, name, if_not_exists, fields)
+            .await
+            .map(RouteResult::Result),
+        Statement::AlterType {
+            keyspace,
+            name,
+            alterations,
+        } => route_alter_type(state, ctx, keyspace, name, alterations)
+            .await
+            .map(RouteResult::Result),
+        Statement::DropType {
+            keyspace,
+            name,
+            if_exists,
+        } => route_drop_type(state, ctx, keyspace, name, if_exists)
+            .await
+            .map(RouteResult::Result),
+        Statement::CreateFunction {
+            keyspace,
+            name,
+            or_replace,
+            if_not_exists,
+            params,
+            called_on_null,
+            return_type,
+            language,
+            body,
+        } => route_create_function(
+            state,
+            ctx,
+            keyspace,
+            name,
+            or_replace,
+            if_not_exists,
+            params,
+            called_on_null,
+            return_type,
+            language,
+            body,
+        )
+        .await
+        .map(RouteResult::Result),
+        Statement::DropFunction {
+            keyspace,
+            name,
+            arg_types,
+            if_exists,
+        } => route_drop_function(state, ctx, keyspace, name, arg_types, if_exists)
+            .await
+            .map(RouteResult::Result),
+        Statement::CreateAggregate {
+            keyspace,
+            name,
+            or_replace,
+            if_not_exists,
+            arg_types,
+            state_func,
+            state_type,
+            final_func,
+            init_cond,
+        } => route_create_aggregate(
+            state,
+            ctx,
+            keyspace,
+            name,
+            or_replace,
+            if_not_exists,
+            arg_types,
+            state_func,
+            state_type,
+            final_func,
+            init_cond,
+        )
+        .await
+        .map(RouteResult::Result),
+        Statement::DropAggregate {
+            keyspace,
+            name,
+            arg_types,
+            if_exists,
+        } => route_drop_aggregate(state, ctx, keyspace, name, arg_types, if_exists)
+            .await
+            .map(RouteResult::Result),
     }
 }
 
@@ -471,18 +562,61 @@ fn route_select(
                 &rows,
             ))
         }
+        ("system_schema", "types") => {
+            let snap = state.schema.snapshot();
+            let col_names: Vec<String> = vec![
+                "keyspace_name".into(),
+                "type_name".into(),
+                "field_names".into(),
+                "field_types".into(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+            ];
+            let rows: Vec<Vec<Option<CqlValue>>> = snap
+                .types
+                .values()
+                .map(|udt| {
+                    let field_names: Vec<String> = udt
+                        .fields
+                        .iter()
+                        .map(|(n, _)| format!("\"{}\"", n))
+                        .collect();
+                    let field_types: Vec<String> = udt
+                        .fields
+                        .iter()
+                        .map(|(_, t)| format!("\"{}\"", bridge::cql_type_display_name(t)))
+                        .collect();
+                    vec![
+                        Some(CqlValue::Text(udt.keyspace.clone())),
+                        Some(CqlValue::Text(udt.name.clone())),
+                        Some(CqlValue::Text(format!("[{}]", field_names.join(", ")))),
+                        Some(CqlValue::Text(format!("[{}]", field_types.join(", ")))),
+                    ]
+                })
+                .collect();
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_schema",
+                "types",
+                &rows,
+            ))
+        }
         // cqlsh queries these system_schema tables during startup introspection.
         // Return empty results for tables we don't populate yet.
-        (
-            "system_schema",
-            "types" | "functions" | "aggregates" | "triggers" | "views" | "indexes",
-        ) => Ok(result::encode_rows(
-            &["keyspace_name".into(), "type_name".into()],
-            &[CqlType::Varchar, CqlType::Varchar],
-            "system_schema",
-            s.table.as_str(),
-            &[],
-        )),
+        ("system_schema", "functions" | "aggregates" | "triggers" | "views" | "indexes") => {
+            Ok(result::encode_rows(
+                &["keyspace_name".into(), "type_name".into()],
+                &[CqlType::Varchar, CqlType::Varchar],
+                "system_schema",
+                s.table.as_str(),
+                &[],
+            ))
+        }
         _ => {
             // Virtual table: check registry before storage lookup.
             if let Some(vtable) = state.schema.virtual_tables().get(ks, &s.table) {
@@ -517,35 +651,49 @@ fn route_select_user_table(
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
     // Build column info for result
-    let (col_names, col_types) = build_column_info(table_meta, &s.columns)?;
+    let (col_names, col_types) = build_column_info(table_meta, &s.columns, ks, &state.schema)?;
 
     let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
     let all_col_types: Vec<CqlType> = table_meta
         .columns
         .values()
-        .map(|c| bridge::parse_cql_type(&c.column_type))
+        .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
         .collect::<Result<Vec<_>, _>>()?;
     let pk_indices: Vec<usize> = table_meta
         .partition_key
         .iter()
-        .map(|name| table_meta.columns.get_index_of(name).unwrap())
-        .collect();
+        .map(|name| {
+            table_meta.columns.get_index_of(name).ok_or_else(|| {
+                CqlError::Invalid(format!("partition key column '{}' not found", name))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let ck_indices: Vec<usize> = table_meta
         .clustering_key
         .iter()
-        .map(|(name, _)| table_meta.columns.get_index_of(name).unwrap())
-        .collect();
+        .map(|(name, _)| {
+            table_meta.columns.get_index_of(name).ok_or_else(|| {
+                CqlError::Invalid(format!("clustering key column '{}' not found", name))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
 
     // Try PK-based lookup first; fall back to full scan with ALLOW FILTERING
-    let pk_result = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta);
+    let pk_result = extract_pk_values(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        table_meta,
+        ks,
+        &state.schema,
+    );
 
     let rows = if let Ok(pk_values) = pk_result {
         // PK present — single partition lookup
         let pk_types: Vec<CqlType> = table_meta
             .partition_key
             .iter()
-            .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+            .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
             .collect::<Result<Vec<_>, _>>()?;
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
         match state.engine.read(&table_id, &decorated_key)? {
@@ -608,7 +756,14 @@ fn route_select_user_table(
         }
         // Apply WHERE predicates as post-filter
         all_rows.retain(|row| {
-            evaluate_where_predicates(row, &s.where_clauses, &all_col_names, table_meta)
+            evaluate_where_predicates(
+                row,
+                &s.where_clauses,
+                &all_col_names,
+                table_meta,
+                ks,
+                &state.schema,
+            )
         });
         all_rows
     };
@@ -739,26 +894,30 @@ async fn route_insert(
     let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
-    let timestamp = s.using_timestamp.unwrap_or_else(|| {
-        std::time::SystemTime::now()
+    let timestamp = match s.using_timestamp {
+        Some(ts) => ts,
+        None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64
-    });
+            .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+            .as_micros() as i64,
+    };
 
     for (i, col_name) in s.columns.iter().enumerate() {
         let col_meta = table_meta
             .columns
             .get(col_name)
             .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?;
-        let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+        let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
         let value = bridge::term_to_cql_value(&s.values[i], &cql_type)?;
 
         match col_meta.kind {
             ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
             ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
             ColumnKind::Regular | ColumnKind::Static => {
-                let col_idx = table_meta.columns.get_index_of(col_name).unwrap() as u16;
+                let col_idx =
+                    table_meta.columns.get_index_of(col_name).ok_or_else(|| {
+                        CqlError::Invalid(format!("column '{}' not found", col_name))
+                    })? as u16;
                 regular_cells.push((col_idx, value));
             }
         }
@@ -772,7 +931,7 @@ async fn route_insert(
     let pk_types: Vec<CqlType> = table_meta
         .partition_key
         .iter()
-        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
         .collect::<Result<Vec<_>, _>>()?;
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
@@ -809,19 +968,26 @@ async fn route_update(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = s.using_timestamp.unwrap_or_else(|| {
-        std::time::SystemTime::now()
+    let timestamp = match s.using_timestamp {
+        Some(ts) => ts,
+        None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64
-    });
+            .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+            .as_micros() as i64,
+    };
 
     // Extract PK and CK values from WHERE clauses
-    let pk_values = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta)?;
+    let pk_values = extract_pk_values(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        table_meta,
+        ks,
+        &state.schema,
+    )?;
     let pk_types: Vec<CqlType> = table_meta
         .partition_key
         .iter()
-        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Extract CK values from WHERE
@@ -835,7 +1001,7 @@ async fn route_update(
         for wc in &s.where_clauses {
             if wc.column == *ck_name && wc.op == ComparisonOp::Eq {
                 let col_meta = &table_meta.columns[ck_name];
-                let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
                 let val = bridge::term_to_cql_value(&wc.value, &cql_type)?;
                 ck_values.push(val);
                 break;
@@ -850,9 +1016,13 @@ async fn route_update(
             .columns
             .get(col_name)
             .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?;
-        let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+        let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
         let value = bridge::term_to_cql_value(term, &cql_type)?;
-        let col_idx = table_meta.columns.get_index_of(col_name).unwrap() as u16;
+        let col_idx = table_meta
+            .columns
+            .get_index_of(col_name)
+            .ok_or_else(|| CqlError::Invalid(format!("column '{}' not found", col_name)))?
+            as u16;
         regular_cells.push((col_idx, value));
     }
 
@@ -890,19 +1060,26 @@ async fn route_delete(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    let timestamp = s.using_timestamp.unwrap_or_else(|| {
-        std::time::SystemTime::now()
+    let timestamp = match s.using_timestamp {
+        Some(ts) => ts,
+        None => std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64
-    });
+            .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+            .as_micros() as i64,
+    };
 
     // Extract PK values from WHERE
-    let pk_values = extract_pk_values(&s.where_clauses, &table_meta.partition_key, table_meta)?;
+    let pk_values = extract_pk_values(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        table_meta,
+        ks,
+        &state.schema,
+    )?;
     let pk_types: Vec<CqlType> = table_meta
         .partition_key
         .iter()
-        .map(|name| bridge::parse_cql_type(&table_meta.columns[name].column_type))
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Extract CK values from WHERE
@@ -916,7 +1093,7 @@ async fn route_delete(
         for wc in &s.where_clauses {
             if wc.column == *ck_name && wc.op == ComparisonOp::Eq {
                 let col_meta = &table_meta.columns[ck_name];
-                let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
                 let val = bridge::term_to_cql_value(&wc.value, &cql_type)?;
                 ck_values.push(val);
                 break;
@@ -1395,79 +1572,15 @@ async fn route_drop_table(
 /// Resolve the USING string to an IndexType.
 fn resolve_index_type(
     using: Option<&str>,
-    columns: &[String],
-    options: &HashMap<String, String>,
+    _columns: &[String],
+    _options: &HashMap<String, String>,
 ) -> Result<IndexType, CqlError> {
     match using {
         None | Some("btree") => Ok(IndexType::BTree),
         Some("hash") => Ok(IndexType::Hash),
-        Some("composite") => Ok(IndexType::Composite {
-            columns: columns.to_vec(),
-        }),
-        Some("phonetic") => {
-            let algorithm = match options.get("algorithm").map(|s| s.as_str()) {
-                Some("soundex") | None => PhoneticAlgorithm::Soundex,
-                Some("metaphone") => PhoneticAlgorithm::Metaphone,
-                Some("double_metaphone") => PhoneticAlgorithm::DoubleMetaphone,
-                Some("caverphone") => PhoneticAlgorithm::Caverphone,
-                Some(other) => {
-                    return Err(CqlError::Invalid(format!(
-                        "unknown phonetic algorithm: {other}"
-                    )))
-                }
-            };
-            Ok(IndexType::Phonetic { algorithm })
-        }
-        Some("vector") => {
-            let dimensions: u32 = options
-                .get("dimensions")
-                .ok_or_else(|| {
-                    CqlError::Invalid("vector index requires 'dimensions' option".to_string())
-                })?
-                .parse()
-                .map_err(|_| CqlError::Invalid("invalid dimensions value".to_string()))?;
-
-            let metric = match options.get("metric").map(|s| s.as_str()) {
-                Some("cosine") | None => DistanceMetric::Cosine,
-                Some("l2") => DistanceMetric::L2,
-                Some("inner_product") => DistanceMetric::InnerProduct,
-                Some(other) => {
-                    return Err(CqlError::Invalid(format!(
-                        "unknown distance metric: {other}"
-                    )))
-                }
-            };
-
-            let method = match options.get("method").map(|s| s.as_str()) {
-                Some("hnsw") | None => {
-                    let m = options
-                        .get("m")
-                        .map(|s| s.parse().unwrap_or(16))
-                        .unwrap_or(16);
-                    let ef_construction = options
-                        .get("ef_construction")
-                        .map(|s| s.parse().unwrap_or(200))
-                        .unwrap_or(200);
-                    VectorMethod::Hnsw { m, ef_construction }
-                }
-                Some("ivfflat") => {
-                    let lists = options
-                        .get("lists")
-                        .map(|s| s.parse().unwrap_or(100))
-                        .unwrap_or(100);
-                    VectorMethod::IvfFlat { lists }
-                }
-                Some(other) => {
-                    return Err(CqlError::Invalid(format!("unknown vector method: {other}")))
-                }
-            };
-
-            Ok(IndexType::Vector {
-                method,
-                metric,
-                dimensions,
-            })
-        }
+        Some("composite") => Ok(IndexType::Composite),
+        Some("phonetic") => Ok(IndexType::Phonetic),
+        Some("filtered") => Ok(IndexType::Filtered),
         Some(other) => Err(CqlError::Invalid(format!("unknown index type: {other}"))),
     }
 }
@@ -1879,6 +1992,8 @@ fn resolve_keyspace<'a>(
 fn build_column_info(
     table_meta: &TableMetadata,
     select_columns: &[SelectColumn],
+    ks: &str,
+    schema: &Schema,
 ) -> Result<(Vec<String>, Vec<CqlType>), CqlError> {
     // Check for Star
     let has_star = select_columns
@@ -1890,7 +2005,7 @@ fn build_column_info(
         let types: Vec<CqlType> = table_meta
             .columns
             .values()
-            .map(|c| bridge::parse_cql_type(&c.column_type))
+            .map(|c| resolve_col_type(&c.column_type, ks, schema))
             .collect::<Result<Vec<_>, _>>()?;
         return Ok((names, types));
     }
@@ -1906,7 +2021,12 @@ fn build_column_info(
                     .get(name)
                     .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", name)))?;
                 names.push(name.clone());
-                types.push(bridge::parse_cql_type(&col.column_type)?);
+                types.push(resolve_col_type(&col.column_type, ks, schema)?);
+            }
+            SelectColumn::FunctionCall { .. } => {
+                return Err(CqlError::Invalid(
+                    "function calls in SELECT not yet implemented".into(),
+                ));
             }
         }
     }
@@ -1918,6 +2038,8 @@ fn extract_pk_values(
     where_clauses: &[WhereClause],
     pk_names: &[String],
     table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
 ) -> Result<Vec<CqlValue>, CqlError> {
     let mut values = Vec::with_capacity(pk_names.len());
     for pk_name in pk_names {
@@ -1931,7 +2053,7 @@ fn extract_pk_values(
                 ))
             })?;
         let col_meta = &table_meta.columns[pk_name];
-        let cql_type = bridge::parse_cql_type(&col_meta.column_type)?;
+        let cql_type = resolve_col_type(&col_meta.column_type, ks, schema)?;
         let val = bridge::term_to_cql_value(&wc.value, &cql_type)?;
         values.push(val);
     }
@@ -1944,6 +2066,8 @@ fn evaluate_where_predicates(
     where_clauses: &[WhereClause],
     all_col_names: &[String],
     table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
 ) -> bool {
     for wc in where_clauses {
         let col_idx = match all_col_names.iter().position(|n| n == &wc.column) {
@@ -1954,7 +2078,7 @@ fn evaluate_where_predicates(
             Some(m) => m,
             None => return false,
         };
-        let cql_type = match bridge::parse_cql_type(&col_meta.column_type) {
+        let cql_type = match resolve_col_type(&col_meta.column_type, ks, schema) {
             Ok(t) => t,
             Err(_) => return false,
         };
@@ -2015,6 +2139,12 @@ fn ast_resource_to_schema(
         }
         GrantResource::AllRoles => Ok(Resource::AllRoles),
         GrantResource::Role(name) => Ok(Resource::Role(name.clone())),
+        GrantResource::Function { .. } => Err(CqlError::Invalid(
+            "GRANT/REVOKE on functions not yet implemented".into(),
+        )),
+        GrantResource::AllFunctions { .. } => Err(CqlError::Invalid(
+            "GRANT/REVOKE on functions not yet implemented".into(),
+        )),
     }
 }
 
@@ -2065,6 +2195,14 @@ fn parse_permissions(perm_strings: &[String]) -> Result<HashSet<Permission>, Cql
     Ok(perms)
 }
 
+/// Resolve a column type string using schema context for UDT resolution.
+///
+/// Wrapper around `bridge::parse_cql_type_in_keyspace` that provides
+/// the keyspace and schema needed to resolve user-defined type names.
+fn resolve_col_type(col_type: &str, ks: &str, schema: &Schema) -> Result<CqlType, CqlError> {
+    bridge::parse_cql_type_in_keyspace(col_type, ks, schema)
+}
+
 /// Convert an AST `CqlTypeName` to a column_type string for `ColumnMetadata`.
 fn cql_type_name_to_string(type_name: &CqlTypeName) -> String {
     match type_name {
@@ -2082,6 +2220,711 @@ fn cql_type_name_to_string(type_name: &CqlTypeName) -> String {
         }
         CqlTypeName::Frozen(inner) => format!("frozen<{}>", cql_type_name_to_string(inner)),
     }
+}
+
+// ── DDL: User-Defined Types ──────────────────────────────────────────────
+
+async fn route_create_type(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    keyspace: Option<String>,
+    name: String,
+    if_not_exists: bool,
+    fields: Vec<(String, CqlTypeName)>,
+) -> Result<BytesMut, CqlError> {
+    let ks = keyspace
+        .or_else(|| ctx.current_keyspace.clone())
+        .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
+
+    // Permission check (M8)
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Create,
+        &Resource::Keyspace(ks.clone()),
+    )?;
+
+    // IF NOT EXISTS check
+    if if_not_exists && state.schema.get_type(&ks, &name).is_some() {
+        return Ok(result::encode_schema_change(
+            "CREATED",
+            "TYPE",
+            &[&ks, &name],
+        ));
+    }
+
+    // Resolve field types using bridge::resolve_type_name
+    let resolved_fields: Vec<(String, CqlType)> = fields
+        .iter()
+        .map(|(fname, ftype)| {
+            let resolved = bridge::resolve_type_name(ftype, &ks, &state.schema)?;
+            Ok((fname.clone(), resolved))
+        })
+        .collect::<Result<_, CqlError>>()?;
+
+    let udt = UserTypeMetadata {
+        keyspace: ks.clone(),
+        name: name.clone(),
+        fields: resolved_fields,
+    };
+
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
+        DdlPath::Direct { .. } => {
+            ddl.execute(DdlOperation::CreateType(udt))
+                .await
+                .map_err(CqlError::from)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::CreateType(udt);
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            let op = DdlOperation::CreateType(udt);
+            ddl.execute(op).await.map_err(CqlError::from)?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "CREATED",
+        "TYPE",
+        &[&ks, &name],
+    ))
+}
+
+async fn route_alter_type(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    keyspace: Option<String>,
+    name: String,
+    alterations: Vec<TypeAlteration>,
+) -> Result<BytesMut, CqlError> {
+    let ks = keyspace
+        .or_else(|| ctx.current_keyspace.clone())
+        .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
+
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Alter, &Resource::Keyspace(ks.clone()))?;
+
+    for alt in alterations {
+        match alt {
+            TypeAlteration::AddField {
+                name: fname,
+                field_type,
+            } => {
+                let resolved = bridge::resolve_type_name(&field_type, &ks, &state.schema)?;
+                state
+                    .schema
+                    .alter_type_add_field(&ks, &name, &fname, resolved)
+                    .map_err(|e| CqlError::Invalid(format!("alter type: {e}")))?;
+            }
+            TypeAlteration::RenameField { from, to } => {
+                state
+                    .schema
+                    .alter_type_rename_field(&ks, &name, &from, &to)
+                    .map_err(|e| CqlError::Invalid(format!("alter type: {e}")))?;
+            }
+            TypeAlteration::AlterField { .. } => {
+                // ALTER TYPE ... ALTER field TYPE is deprecated in Cassandra; defer
+            }
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "UPDATED",
+        "TYPE",
+        &[&ks, &name],
+    ))
+}
+
+async fn route_drop_type(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    keyspace: Option<String>,
+    name: String,
+    if_exists: bool,
+) -> Result<BytesMut, CqlError> {
+    let ks = keyspace
+        .or_else(|| ctx.current_keyspace.clone())
+        .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
+
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Drop, &Resource::Keyspace(ks.clone()))?;
+
+    // IF EXISTS check
+    if if_exists && state.schema.get_type(&ks, &name).is_none() {
+        return Ok(result::encode_schema_change(
+            "DROPPED",
+            "TYPE",
+            &[&ks, &name],
+        ));
+    }
+
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
+        DdlPath::Direct { .. } => {
+            ddl.execute(DdlOperation::DropType {
+                keyspace: ks.clone(),
+                name: name.clone(),
+            })
+            .await
+            .map_err(CqlError::from)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::DropType {
+                keyspace: ks.clone(),
+                name: name.clone(),
+            };
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            let op = DdlOperation::DropType {
+                keyspace: ks.clone(),
+                name: name.clone(),
+            };
+            ddl.execute(op).await.map_err(CqlError::from)?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "DROPPED",
+        "TYPE",
+        &[&ks, &name],
+    ))
+}
+
+// ── UDF/UDA DDL routing ──────────────────────────────────────────────────
+
+/// Decode a hex-encoded string to bytes.
+fn hex_decode(hex: &str) -> Result<Vec<u8>, CqlError> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(CqlError::Invalid("hex body has odd length".into()));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|_| CqlError::Invalid(format!("invalid hex at offset {i}")))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_create_function(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    keyspace: Option<String>,
+    name: String,
+    or_replace: bool,
+    if_not_exists: bool,
+    params: Vec<(String, CqlTypeName)>,
+    called_on_null: bool,
+    return_type: CqlTypeName,
+    language: String,
+    body: String,
+) -> Result<BytesMut, CqlError> {
+    let ks = keyspace
+        .or_else(|| ctx.current_keyspace.clone())
+        .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
+
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Alter, &Resource::Keyspace(ks.clone()))?;
+
+    // Only WASM language is supported
+    if !language.eq_ignore_ascii_case("wasm") {
+        return Err(CqlError::Invalid(format!(
+            "unsupported UDF language '{}': only 'wasm' is supported",
+            language
+        )));
+    }
+
+    // Resolve parameter types
+    let (arg_names, arg_types): (Vec<String>, Vec<ferrosa_common::CqlType>) = params
+        .iter()
+        .map(|(pname, ptype)| {
+            let resolved = bridge::resolve_type_name(ptype, &ks, &state.schema)?;
+            Ok((pname.clone(), cql_type_to_common(&resolved)))
+        })
+        .collect::<Result<Vec<_>, CqlError>>()?
+        .into_iter()
+        .unzip();
+
+    // Resolve return type
+    let resolved_return = bridge::resolve_type_name(&return_type, &ks, &state.schema)?;
+    let common_return = cql_type_to_common(&resolved_return);
+
+    // Decode hex body to WASM bytes and compile
+    let wasm_bytes = hex_decode(&body)?;
+    state
+        .udf_executor
+        .compile(&ks, &name, &wasm_bytes)
+        .map_err(CqlError::from)?;
+
+    // Check for existing function
+    let existing = state.schema.get_function(&ks, &name, &arg_types);
+    if existing.is_some() {
+        if or_replace {
+            // Drop the old one first, then create the new one
+            state.udf_executor.invalidate(&ks, &name);
+        } else if if_not_exists {
+            return Ok(result::encode_schema_change(
+                "CREATED",
+                "FUNCTION",
+                &[&ks, &name],
+            ));
+        } else {
+            return Err(CqlError::Invalid(format!(
+                "function {ks}.{name} already exists"
+            )));
+        }
+    }
+
+    let func_meta = UserFunctionMetadata {
+        keyspace: ks.clone(),
+        name: name.clone(),
+        arg_names,
+        arg_types,
+        return_type: common_return,
+        called_on_null,
+        language: language.to_ascii_lowercase(),
+        body,
+    };
+
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
+        DdlPath::Direct { .. } => {
+            ddl.execute(DdlOperation::CreateFunction(func_meta))
+                .await
+                .map_err(CqlError::from)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::CreateFunction(func_meta);
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            let op = DdlOperation::CreateFunction(func_meta);
+            ddl.execute(op).await.map_err(CqlError::from)?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "CREATED",
+        "FUNCTION",
+        &[&ks, &name],
+    ))
+}
+
+async fn route_drop_function(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    keyspace: Option<String>,
+    name: String,
+    arg_type_names: Option<Vec<CqlTypeName>>,
+    if_exists: bool,
+) -> Result<BytesMut, CqlError> {
+    let ks = keyspace
+        .or_else(|| ctx.current_keyspace.clone())
+        .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
+
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Alter, &Resource::Keyspace(ks.clone()))?;
+
+    // Resolve arg types to find the exact function
+    let resolved_arg_types: Vec<ferrosa_common::CqlType> = match arg_type_names {
+        Some(type_names) => type_names
+            .iter()
+            .map(|tn| {
+                let resolved = bridge::resolve_type_name(tn, &ks, &state.schema)?;
+                Ok(cql_type_to_common(&resolved))
+            })
+            .collect::<Result<_, CqlError>>()?,
+        None => {
+            // No arg types specified — find function by name only.
+            // Search all functions in this keyspace with this name.
+            let snap = state.schema.snapshot();
+            let matching: Vec<Vec<ferrosa_common::CqlType>> = snap
+                .functions
+                .keys()
+                .filter(|(fks, fname, _)| fks == &ks && fname == &name)
+                .map(|(_, _, arg_types)| arg_types.clone())
+                .collect();
+            match matching.len() {
+                0 => {
+                    if if_exists {
+                        return Ok(result::encode_schema_change(
+                            "DROPPED",
+                            "FUNCTION",
+                            &[&ks, &name],
+                        ));
+                    }
+                    return Err(CqlError::Invalid(format!("function {ks}.{name} not found")));
+                }
+                1 => {
+                    // SAFETY: len() == 1 guarantees next() returns Some
+                    matching.into_iter().next().ok_or_else(|| {
+                        CqlError::ServerError(format!("function {ks}.{name} lookup inconsistency"))
+                    })?
+                }
+                _ => {
+                    return Err(CqlError::Invalid(format!(
+                        "ambiguous function {ks}.{name}: multiple overloads exist, specify argument types"
+                    )));
+                }
+            }
+        }
+    };
+
+    // IF EXISTS check
+    if if_exists
+        && state
+            .schema
+            .get_function(&ks, &name, &resolved_arg_types)
+            .is_none()
+    {
+        return Ok(result::encode_schema_change(
+            "DROPPED",
+            "FUNCTION",
+            &[&ks, &name],
+        ));
+    }
+
+    // Invalidate cached compilation
+    state.udf_executor.invalidate(&ks, &name);
+
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
+        DdlPath::Direct { .. } => {
+            ddl.execute(DdlOperation::DropFunction {
+                keyspace: ks.clone(),
+                name: name.clone(),
+                arg_types: resolved_arg_types,
+            })
+            .await
+            .map_err(CqlError::from)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::DropFunction {
+                keyspace: ks.clone(),
+                name: name.clone(),
+                arg_types: resolved_arg_types,
+            };
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            let op = DdlOperation::DropFunction {
+                keyspace: ks.clone(),
+                name: name.clone(),
+                arg_types: resolved_arg_types,
+            };
+            ddl.execute(op).await.map_err(CqlError::from)?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "DROPPED",
+        "FUNCTION",
+        &[&ks, &name],
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_create_aggregate(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    keyspace: Option<String>,
+    name: String,
+    or_replace: bool,
+    if_not_exists: bool,
+    ast_arg_types: Vec<CqlTypeName>,
+    state_func: String,
+    state_type: CqlTypeName,
+    final_func: Option<String>,
+    init_cond: Option<Term>,
+) -> Result<BytesMut, CqlError> {
+    let ks = keyspace
+        .or_else(|| ctx.current_keyspace.clone())
+        .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
+
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Alter, &Resource::Keyspace(ks.clone()))?;
+
+    // Resolve argument types
+    let arg_types: Vec<ferrosa_common::CqlType> = ast_arg_types
+        .iter()
+        .map(|tn| {
+            let resolved = bridge::resolve_type_name(tn, &ks, &state.schema)?;
+            Ok(cql_type_to_common(&resolved))
+        })
+        .collect::<Result<_, CqlError>>()?;
+
+    // Resolve state type
+    let resolved_state_type = bridge::resolve_type_name(&state_type, &ks, &state.schema)?;
+    let common_state_type = cql_type_to_common(&resolved_state_type);
+
+    // Validate state function exists. The state function takes (state_type, arg_types...) as params.
+    let mut sfunc_arg_types = vec![common_state_type.clone()];
+    sfunc_arg_types.extend(arg_types.iter().cloned());
+    if state
+        .schema
+        .get_function(&ks, &state_func, &sfunc_arg_types)
+        .is_none()
+    {
+        return Err(CqlError::Invalid(format!(
+            "state function {ks}.{state_func} not found with expected signature"
+        )));
+    }
+
+    // Determine return type: final_func return type if present, otherwise state_type.
+    let return_type = if let Some(ref ff_name) = final_func {
+        // Final function takes a single arg of the state type
+        let ff_args = vec![common_state_type.clone()];
+        match state.schema.get_function(&ks, ff_name, &ff_args) {
+            Some(ff_meta) => ff_meta.return_type.clone(),
+            None => {
+                return Err(CqlError::Invalid(format!(
+                    "final function {ks}.{ff_name} not found with expected signature"
+                )));
+            }
+        }
+    } else {
+        common_state_type.clone()
+    };
+
+    // Resolve init_cond if present
+    let resolved_init_cond = if let Some(ref term) = init_cond {
+        let cql_state_type = &resolved_state_type;
+        Some(bridge::term_to_cql_value(term, cql_state_type)?)
+    } else {
+        None
+    };
+
+    // Convert the CqlValue (wire type) to common CqlValue
+    let common_init_cond = resolved_init_cond.map(|v| cql_value_to_common(&v));
+
+    // Check for existing aggregate
+    let existing = state.schema.get_aggregate(&ks, &name, &arg_types);
+    if existing.is_some() {
+        if or_replace {
+            // Will be replaced by the new creation
+        } else if if_not_exists {
+            return Ok(result::encode_schema_change(
+                "CREATED",
+                "AGGREGATE",
+                &[&ks, &name],
+            ));
+        } else {
+            return Err(CqlError::Invalid(format!(
+                "aggregate {ks}.{name} already exists"
+            )));
+        }
+    }
+
+    let agg_meta = UserAggregateMetadata {
+        keyspace: ks.clone(),
+        name: name.clone(),
+        arg_types,
+        state_func,
+        state_type: common_state_type,
+        final_func,
+        init_cond: common_init_cond,
+        return_type,
+    };
+
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
+        DdlPath::Direct { .. } => {
+            ddl.execute(DdlOperation::CreateAggregate(agg_meta))
+                .await
+                .map_err(CqlError::from)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::CreateAggregate(agg_meta);
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            let op = DdlOperation::CreateAggregate(agg_meta);
+            ddl.execute(op).await.map_err(CqlError::from)?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "CREATED",
+        "AGGREGATE",
+        &[&ks, &name],
+    ))
+}
+
+async fn route_drop_aggregate(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    keyspace: Option<String>,
+    name: String,
+    arg_type_names: Option<Vec<CqlTypeName>>,
+    if_exists: bool,
+) -> Result<BytesMut, CqlError> {
+    let ks = keyspace
+        .or_else(|| ctx.current_keyspace.clone())
+        .ok_or_else(|| CqlError::Invalid("No keyspace specified".into()))?;
+
+    // Permission check (M8)
+    state
+        .schema
+        .check_permission(ctx.auth, Permission::Alter, &Resource::Keyspace(ks.clone()))?;
+
+    // Resolve arg types to find the exact aggregate
+    let resolved_arg_types: Vec<ferrosa_common::CqlType> = match arg_type_names {
+        Some(type_names) => type_names
+            .iter()
+            .map(|tn| {
+                let resolved = bridge::resolve_type_name(tn, &ks, &state.schema)?;
+                Ok(cql_type_to_common(&resolved))
+            })
+            .collect::<Result<_, CqlError>>()?,
+        None => {
+            // No arg types specified — find aggregate by name only.
+            let snap = state.schema.snapshot();
+            let matching: Vec<Vec<ferrosa_common::CqlType>> = snap
+                .aggregates
+                .keys()
+                .filter(|(a_ks, a_name, _)| a_ks == &ks && a_name == &name)
+                .map(|(_, _, arg_types)| arg_types.clone())
+                .collect();
+            match matching.len() {
+                0 => {
+                    if if_exists {
+                        return Ok(result::encode_schema_change(
+                            "DROPPED",
+                            "AGGREGATE",
+                            &[&ks, &name],
+                        ));
+                    }
+                    return Err(CqlError::Invalid(format!(
+                        "aggregate {ks}.{name} not found"
+                    )));
+                }
+                1 => {
+                    // SAFETY: len() == 1 guarantees next() returns Some
+                    matching.into_iter().next().ok_or_else(|| {
+                        CqlError::ServerError(format!("aggregate {ks}.{name} lookup inconsistency"))
+                    })?
+                }
+                _ => {
+                    return Err(CqlError::Invalid(format!(
+                        "ambiguous aggregate {ks}.{name}: multiple overloads exist, specify argument types"
+                    )));
+                }
+            }
+        }
+    };
+
+    // IF EXISTS check
+    if if_exists
+        && state
+            .schema
+            .get_aggregate(&ks, &name, &resolved_arg_types)
+            .is_none()
+    {
+        return Ok(result::encode_schema_change(
+            "DROPPED",
+            "AGGREGATE",
+            &[&ks, &name],
+        ));
+    }
+
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
+        DdlPath::Direct { .. } => {
+            ddl.execute(DdlOperation::DropAggregate {
+                keyspace: ks.clone(),
+                name: name.clone(),
+                arg_types: resolved_arg_types,
+            })
+            .await
+            .map_err(CqlError::from)?;
+        }
+        DdlPath::Pair(coordinator) => {
+            let op = DdlOperation::DropAggregate {
+                keyspace: ks.clone(),
+                name: name.clone(),
+                arg_types: resolved_arg_types,
+            };
+            coordinator.coordinate_ddl(op).await?;
+        }
+        DdlPath::Cluster(_) => {
+            let op = DdlOperation::DropAggregate {
+                keyspace: ks.clone(),
+                name: name.clone(),
+                arg_types: resolved_arg_types,
+            };
+            ddl.execute(op).await.map_err(CqlError::from)?;
+        }
+        DdlPath::Unavailable => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+
+    Ok(result::encode_schema_change(
+        "DROPPED",
+        "AGGREGATE",
+        &[&ks, &name],
+    ))
+}
+
+/// Convert a CQL wire type to ferrosa_common::CqlType.
+///
+/// In Ferrosa, `CqlType` from the CQL crate and from ferrosa_common are the
+/// same type (`ferrosa_common::CqlType`), so this is an identity conversion.
+/// However, the bridge layer might use a different repr in the future.
+fn cql_type_to_common(cql_type: &CqlType) -> ferrosa_common::CqlType {
+    cql_type.clone()
+}
+
+/// Convert a CQL wire value to ferrosa_common::CqlValue.
+fn cql_value_to_common(val: &CqlValue) -> ferrosa_common::CqlValue {
+    // CqlValue in ferrosa-cql IS ferrosa_common::CqlValue — same type, identity conversion.
+    val.clone()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -2146,6 +2989,9 @@ mod tests {
             tokens: vec![],
         });
 
+        let udf_executor =
+            Arc::new(ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default()).unwrap());
+
         let state = SharedState {
             engine: engine.clone(),
             schema: schema.clone(),
@@ -2158,6 +3004,7 @@ mod tests {
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
+            udf_executor,
             event_sender: tokio::sync::broadcast::channel(64).0,
         };
         (state, dir)
@@ -2557,32 +3404,499 @@ mod tests {
     }
 
     #[test]
-    fn resolve_index_type_vector_hnsw() {
-        let mut opts = HashMap::new();
-        opts.insert("method".to_string(), "hnsw".to_string());
-        opts.insert("metric".to_string(), "cosine".to_string());
-        opts.insert("dimensions".to_string(), "768".to_string());
-        let result = resolve_index_type(Some("vector"), &["embed".to_string()], &opts);
+    fn resolve_index_type_phonetic() {
+        let result = resolve_index_type(Some("phonetic"), &["name".to_string()], &HashMap::new());
         assert!(result.is_ok());
-        match result.unwrap() {
-            IndexType::Vector {
-                method,
-                metric,
-                dimensions,
-            } => {
-                assert!(matches!(method, VectorMethod::Hnsw { .. }));
-                assert_eq!(metric, DistanceMetric::Cosine);
-                assert_eq!(dimensions, 768);
-            }
-            other => panic!("expected Vector, got {:?}", other),
-        }
+        assert_eq!(result.unwrap(), IndexType::Phonetic);
     }
 
     #[test]
-    fn resolve_index_type_vector_missing_dimensions_errors() {
-        let mut opts = HashMap::new();
-        opts.insert("method".to_string(), "hnsw".to_string());
-        let result = resolve_index_type(Some("vector"), &["embed".to_string()], &opts);
+    fn resolve_index_type_unknown_errors() {
+        let result = resolve_index_type(Some("nonexistent"), &["col".to_string()], &HashMap::new());
         assert!(result.is_err());
+    }
+
+    // ── UDT DDL routing tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn route_create_type_stores_in_schema() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace first
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // CREATE TYPE ks.address (street text, city text)
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text, city text)").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                // SchemaChange kind = 0x0005
+                assert_eq!(&b[0..4], &0x0005i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
+
+        // Verify type exists in schema
+        let udt = state.schema.get_type("ks", "address");
+        assert!(
+            udt.is_some(),
+            "type should exist in schema after CREATE TYPE"
+        );
+        let udt = udt.unwrap();
+        assert_eq!(udt.fields.len(), 2);
+        assert_eq!(udt.fields[0].0, "street");
+        assert_eq!(udt.fields[1].0, "city");
+    }
+
+    #[tokio::test]
+    async fn route_drop_type() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace + type
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text, city text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        assert!(state.schema.get_type("ks", "address").is_some());
+
+        // DROP TYPE
+        let stmt = crate::parser::parse("DROP TYPE ks.address").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(&b[0..4], &0x0005i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
+
+        assert!(
+            state.schema.get_type("ks", "address").is_none(),
+            "type should be gone after DROP TYPE"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_create_type_if_not_exists() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace + type
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text, city text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // CREATE TYPE IF NOT EXISTS with same name — should succeed without error
+        let stmt =
+            crate::parser::parse("CREATE TYPE IF NOT EXISTS ks.address (street text, city text)")
+                .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "IF NOT EXISTS should not error on duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_drop_type_if_exists() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // DROP TYPE IF EXISTS on non-existent type — should succeed
+        let stmt = crate::parser::parse("DROP TYPE IF EXISTS ks.address").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "IF EXISTS should not error on missing type");
+    }
+
+    #[tokio::test]
+    async fn route_alter_type_add_field() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace + type
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // ALTER TYPE ADD city text
+        let stmt = crate::parser::parse("ALTER TYPE ks.address ADD city text").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "ALTER TYPE ADD should succeed");
+
+        let udt = state.schema.get_type("ks", "address").unwrap();
+        assert_eq!(udt.fields.len(), 2);
+        assert_eq!(udt.fields[1].0, "city");
+    }
+
+    #[tokio::test]
+    async fn route_alter_type_rename_field() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace + type
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // ALTER TYPE RENAME street TO street_name
+        let stmt =
+            crate::parser::parse("ALTER TYPE ks.address RENAME street TO street_name").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "ALTER TYPE RENAME should succeed");
+
+        let udt = state.schema.get_type("ks", "address").unwrap();
+        assert_eq!(udt.fields[0].0, "street_name");
+    }
+
+    #[tokio::test]
+    async fn route_create_type_uses_session_keyspace() {
+        let (state, _dir) = setup();
+        let ks = Some("ks".to_string());
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &ks,
+        };
+
+        // Create keyspace first (with explicit ks in statement)
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // CREATE TYPE without explicit keyspace — should use session keyspace
+        let stmt = crate::parser::parse("CREATE TYPE address (street text)").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "should use session keyspace");
+
+        let udt = state.schema.get_type("ks", "address");
+        assert!(udt.is_some(), "type should be in session keyspace");
+    }
+
+    #[tokio::test]
+    async fn route_create_type_no_keyspace_errors() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // CREATE TYPE without keyspace and no session keyspace
+        let stmt = crate::parser::parse("CREATE TYPE address (street text)").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_err(), "should error without keyspace");
+    }
+
+    #[tokio::test]
+    async fn route_create_type_duplicate_without_if_not_exists() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace + type
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text, city text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // CREATE TYPE again without IF NOT EXISTS — should return an error
+        let stmt = crate::parser::parse("CREATE TYPE ks.address (street text, city text)").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_err(),
+            "duplicate CREATE TYPE without IF NOT EXISTS should error"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_drop_type_nonexistent_without_if_exists() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Create keyspace but no type
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // DROP TYPE on non-existent type without IF EXISTS — should return an error
+        let stmt = crate::parser::parse("DROP TYPE ks.address").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_err(),
+            "DROP TYPE on non-existent type without IF EXISTS should error"
+        );
+    }
+
+    // ── UDF/UDA DDL routing tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn route_create_function_rejects_non_wasm_language() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE FUNCTION ks.bad_func(val int) CALLED ON NULL INPUT RETURNS int LANGUAGE java AS '0061736d'"
+        ).unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        match result {
+            Err(ref e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("unsupported UDF language"),
+                    "error should mention unsupported language, got: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("non-wasm language should be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_create_function_rejects_invalid_hex() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE FUNCTION ks.bad_func(val int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS 'ZZZZ'"
+        ).unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        match result {
+            Err(ref e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("invalid hex"),
+                    "error should mention invalid hex, got: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("invalid hex should be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_create_function_rejects_invalid_wasm() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Valid hex but not valid WASM
+        let stmt = crate::parser::parse(
+            "CREATE FUNCTION ks.bad_func(val int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS 'deadbeef'"
+        ).unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        match result {
+            Err(ref e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("compilation failed"),
+                    "error should mention compilation failure, got: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("invalid wasm should be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_create_function_no_keyspace_errors() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE FUNCTION my_func(val int) CALLED ON NULL INPUT RETURNS int LANGUAGE wasm AS 'deadbeef'"
+        ).unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_err(), "should error without keyspace");
+    }
+
+    #[tokio::test]
+    async fn route_drop_function_if_exists_nonexistent() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // DROP FUNCTION IF EXISTS on non-existent function — should succeed
+        let stmt = crate::parser::parse("DROP FUNCTION IF EXISTS ks.nope").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "IF EXISTS should not error on missing function"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_drop_function_nonexistent_without_if_exists() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // DROP FUNCTION without IF EXISTS on non-existent function — should error
+        let stmt = crate::parser::parse("DROP FUNCTION ks.nope").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_err(),
+            "DROP FUNCTION on non-existent function without IF EXISTS should error"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_drop_aggregate_if_exists_nonexistent() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // DROP AGGREGATE IF EXISTS on non-existent aggregate — should succeed
+        let stmt = crate::parser::parse("DROP AGGREGATE IF EXISTS ks.nope").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "IF EXISTS should not error on missing aggregate"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_drop_aggregate_nonexistent_without_if_exists() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // DROP AGGREGATE without IF EXISTS on non-existent — should error
+        let stmt = crate::parser::parse("DROP AGGREGATE ks.nope").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_err(),
+            "DROP AGGREGATE on non-existent without IF EXISTS should error"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_hex_decode_odd_length() {
+        let result = super::hex_decode("abc");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn route_hex_decode_valid() {
+        let result = super::hex_decode("deadbeef").unwrap();
+        assert_eq!(result, vec![0xde, 0xad, 0xbe, 0xef]);
     }
 }

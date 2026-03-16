@@ -11,13 +11,17 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use ferrosa_common::CqlType;
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+use ferrosa_schema::metadata::aggregate::UserAggregateMetadata;
+use ferrosa_schema::metadata::function::UserFunctionMetadata;
 use ferrosa_schema::metadata::index::IndexMetadata;
 use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, KeyspaceUpdates};
 use ferrosa_schema::metadata::table::{TableMetadata, TableUpdates};
+use ferrosa_schema::metadata::user_type::UserTypeMetadata;
 use ferrosa_schema::{
     is_system_keyspace, GrantEntry, Permission, Resource, RoleMetadata, RoleUpdates, Schema,
     SchemaSnapshot,
@@ -67,6 +71,23 @@ pub enum DdlOperation {
         keyspace: String,
         table: String,
         index: String,
+    },
+    CreateType(UserTypeMetadata),
+    DropType {
+        keyspace: String,
+        name: String,
+    },
+    CreateFunction(UserFunctionMetadata),
+    DropFunction {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<CqlType>,
+    },
+    CreateAggregate(UserAggregateMetadata),
+    DropAggregate {
+        keyspace: String,
+        name: String,
+        arg_types: Vec<CqlType>,
     },
 }
 
@@ -231,6 +252,47 @@ impl DdlCoordinator {
                     .drop_index_internal(keyspace, table, index)
                     .map_err(|e| ClusterError::Internal(format!("drop_index: {e}")))?;
             }
+            DdlOperation::CreateType(ref udt) => {
+                self.schema
+                    .create_type_internal(udt)
+                    .map_err(|e| ClusterError::Internal(format!("create_type: {e}")))?;
+            }
+            DdlOperation::DropType {
+                ref keyspace,
+                ref name,
+            } => {
+                self.schema
+                    .drop_type_internal(keyspace, name)
+                    .map_err(|e| ClusterError::Internal(format!("drop_type: {e}")))?;
+            }
+            DdlOperation::CreateFunction(ref func) => {
+                self.schema
+                    .create_function_internal(func)
+                    .map_err(|e| ClusterError::Internal(format!("create_function: {e}")))?;
+            }
+            DdlOperation::DropFunction {
+                ref keyspace,
+                ref name,
+                ref arg_types,
+            } => {
+                self.schema
+                    .drop_function_internal(keyspace, name, arg_types)
+                    .map_err(|e| ClusterError::Internal(format!("drop_function: {e}")))?;
+            }
+            DdlOperation::CreateAggregate(ref agg) => {
+                self.schema
+                    .create_aggregate_internal(agg)
+                    .map_err(|e| ClusterError::Internal(format!("create_aggregate: {e}")))?;
+            }
+            DdlOperation::DropAggregate {
+                ref keyspace,
+                ref name,
+                ref arg_types,
+            } => {
+                self.schema
+                    .drop_aggregate_internal(keyspace, name, arg_types)
+                    .map_err(|e| ClusterError::Internal(format!("drop_aggregate: {e}")))?;
+            }
         }
         Ok(())
     }
@@ -348,6 +410,7 @@ impl RpcHandler for PairDdlForwardHandler {
 /// which serde_json can't serialize (tuple keys aren't valid JSON keys).
 /// This struct converts tables to a `Vec` for wire transmission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::type_complexity)]
 pub struct WireSchemaSnapshot {
     pub version: Uuid,
     pub keyspaces: std::collections::HashMap<String, KeyspaceMetadata>,
@@ -356,6 +419,12 @@ pub struct WireSchemaSnapshot {
     pub indexes: Vec<((String, String, String), IndexMetadata)>,
     pub roles: std::collections::HashMap<String, RoleMetadata>,
     pub grants: std::collections::HashMap<String, Vec<GrantEntry>>,
+    #[serde(default)]
+    pub types: Vec<((String, String), UserTypeMetadata)>,
+    #[serde(default)]
+    pub functions: Vec<((String, String, Vec<CqlType>), UserFunctionMetadata)>,
+    #[serde(default)]
+    pub aggregates: Vec<((String, String, Vec<CqlType>), UserAggregateMetadata)>,
 }
 
 impl WireSchemaSnapshot {
@@ -376,6 +445,21 @@ impl WireSchemaSnapshot {
                 .collect(),
             roles: snap.roles.clone(),
             grants: snap.grants.clone(),
+            types: snap
+                .types
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            functions: snap
+                .functions
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            aggregates: snap
+                .aggregates
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         }
     }
 
@@ -388,6 +472,9 @@ impl WireSchemaSnapshot {
             indexes: self.indexes.into_iter().collect(),
             roles: self.roles,
             grants: self.grants,
+            types: self.types.into_iter().collect(),
+            functions: self.functions.into_iter().collect(),
+            aggregates: self.aggregates.into_iter().collect(),
         }
     }
 }
@@ -727,5 +814,83 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn ddl_operation_create_type_roundtrip() {
+        use ferrosa_common::CqlType;
+        let op = DdlOperation::CreateType(UserTypeMetadata {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+            fields: vec![
+                ("street".to_string(), CqlType::Varchar),
+                ("city".to_string(), CqlType::Varchar),
+            ],
+        });
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::CreateType(udt) => {
+                assert_eq!(udt.keyspace, "ks");
+                assert_eq!(udt.name, "address");
+                assert_eq!(udt.fields.len(), 2);
+                assert_eq!(udt.fields[0].0, "street");
+                assert_eq!(udt.fields[1].0, "city");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ddl_operation_drop_type_roundtrip() {
+        let op = DdlOperation::DropType {
+            keyspace: "ks".to_string(),
+            name: "address".to_string(),
+        };
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::DropType { keyspace, name } => {
+                assert_eq!(keyspace, "ks");
+                assert_eq!(name, "address");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wire_schema_snapshot_preserves_types() {
+        use ferrosa_common::CqlType;
+        let mut types = std::collections::HashMap::new();
+        types.insert(
+            ("ks".to_string(), "address".to_string()),
+            UserTypeMetadata {
+                keyspace: "ks".to_string(),
+                name: "address".to_string(),
+                fields: vec![("street".to_string(), CqlType::Varchar)],
+            },
+        );
+
+        let snap = SchemaSnapshot {
+            version: Uuid::new_v4(),
+            keyspaces: std::collections::HashMap::new(),
+            tables: std::collections::HashMap::new(),
+            indexes: std::collections::HashMap::new(),
+            roles: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
+            types,
+            functions: std::collections::HashMap::new(),
+            aggregates: std::collections::HashMap::new(),
+        };
+
+        let wire = WireSchemaSnapshot::from_snapshot(&snap);
+        assert_eq!(wire.types.len(), 1);
+
+        let restored = wire.into_snapshot();
+        let udt = restored
+            .types
+            .get(&("ks".to_string(), "address".to_string()));
+        assert!(udt.is_some());
+        assert_eq!(udt.unwrap().fields.len(), 1);
     }
 }

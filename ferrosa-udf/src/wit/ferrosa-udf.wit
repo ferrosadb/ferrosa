@@ -1,0 +1,37 @@
+package ferrosa:udf@0.1.0;
+
+interface types {
+    variant cql-value {
+        null,
+        int-val(s32),
+        bigint-val(s64),
+        float-val(f32),
+        double-val(f64),
+        boolean-val(bool),
+        text-val(string),
+        blob-val(list<u8>),
+        uuid-val(string),
+        timestamp-val(s64),
+        date-val(s32),
+        time-val(s64),
+        smallint-val(s16),
+        tinyint-val(s8),
+        inet-val(string),
+        decimal-val(tuple<list<u8>, s32>),
+        varint-val(list<u8>),
+        duration-val(tuple<s32, s32, s64>),
+        ascii-val(string),
+        timeuuid-val(string),
+        list-val(list<cql-value>),
+        set-val(list<cql-value>),
+        map-val(list<tuple<cql-value, cql-value>>),
+        tuple-val(list<cql-value>),
+        udt-val(list<tuple<string, cql-value>>),
+        counter-val(s64),
+    }
+}
+
+world udf {
+    use types.{cql-value};
+    export invoke: func(args: list<cql-value>) -> result<cql-value, string>;
+}

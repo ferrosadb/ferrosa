@@ -174,6 +174,28 @@ impl From<ferrosa_cluster::ClusterError> for CqlError {
     }
 }
 
+impl From<ferrosa_udf::UdfError> for CqlError {
+    fn from(err: ferrosa_udf::UdfError) -> Self {
+        use ferrosa_udf::UdfError;
+        match err {
+            UdfError::CompilationFailed(msg) => {
+                Self::Invalid(format!("UDF compilation failed: {msg}"))
+            }
+            UdfError::NotFound { keyspace, name } => {
+                Self::Invalid(format!("function not found: {keyspace}.{name}"))
+            }
+            UdfError::BinaryTooLarge { size, max } => Self::Invalid(format!(
+                "WASM binary too large: {size} bytes exceeds {max} byte limit"
+            )),
+            UdfError::TypeMismatch(msg) => Self::Invalid(format!("UDF type mismatch: {msg}")),
+            UdfError::ResourceExhausted(msg) => {
+                Self::Invalid(format!("UDF resource exhausted: {msg}"))
+            }
+            UdfError::ExecutionFailed(msg) => Self::Invalid(format!("UDF execution failed: {msg}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

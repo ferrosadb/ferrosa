@@ -11,11 +11,13 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | ferrosa-common | Done |
 | ferrosa-sstable | Done |
 | ferrosa-storage | Done (core engine + observers + subscription observer + storage stats) |
-| ferrosa-schema | Done (DDL, auth, audit, system KS, graph extensions, virtual tables) |
-| ferrosa-cql | Done (Parts A-D + observability + LZ4/Snappy frame compression) |
+| ferrosa-schema | Done (DDL, auth, audit, system KS, graph extensions, virtual tables, UDT metadata, index metadata) |
+| ferrosa-cql | Done (Parts A-D + observability + LZ4/Snappy frame compression + UDT DDL + UDF DDL parsing) |
+| ferrosa-index | Done (8 secondary index types + 2 vector index types: HNSW, IVFFlat) |
+| ferrosa-udf | Done (parser, schema, DDL replication, Wasmtime compilation, router wiring; wit-bindgen invoke TODO) |
 | ferrosa-graph | Done (Phase 1: parser, planner, executor, adjacency index, HTTP endpoint) |
 | ferrosa-net | Done (Phase 1 + reconnection, graceful drain) |
-| ferrosa-cluster | Done (Phase 1: pair mode; Phase 2: Raft consensus, token ring, coordinator; Phase 3: production cluster with hinted handoff, node lifecycle, rebalancing) |
+| ferrosa-cluster | Done (Phase 1-3 + UDT/index DDL replication) |
 | ferrosa-ctl | Done (CLI + TUI + cluster management commands) |
 | ferrosa (binary) | Done (cluster-mode: CQL on 9042, graph on 7474, web console + cluster API on 9090, Prometheus metrics) |
 

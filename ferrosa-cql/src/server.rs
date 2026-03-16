@@ -349,6 +349,8 @@ mod tests {
             rpc_address: "127.0.0.1".parse().unwrap(),
             tokens: vec![],
         });
+        let udf_executor =
+            Arc::new(ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default()).unwrap());
         let state = Arc::new(SharedState {
             engine: engine.clone(),
             schema: schema.clone(),
@@ -364,6 +366,7 @@ mod tests {
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
+            udf_executor,
             event_sender: tokio::sync::broadcast::channel(64).0,
         });
         (state, dir)
