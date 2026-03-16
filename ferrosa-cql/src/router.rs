@@ -766,6 +766,39 @@ fn route_select_user_table(
         all_rows
     };
 
+    // Apply ORDER BY sorting (FRSA-BUG-004)
+    let rows = if !s.order_by.is_empty() {
+        let mut sorted = rows;
+        // Resolve column indices for ORDER BY columns
+        let order_specs: Vec<(usize, bool)> = s
+            .order_by
+            .iter()
+            .filter_map(|(col_name, dir)| {
+                let idx = all_col_names.iter().position(|n| n == col_name)?;
+                let ascending = *dir == OrderDirection::Asc;
+                Some((idx, ascending))
+            })
+            .collect();
+        sorted.sort_by(|a, b| {
+            for &(idx, ascending) in &order_specs {
+                let cmp = match (&a[idx], &b[idx]) {
+                    (Some(va), Some(vb)) => va.cmp(vb),
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+                let cmp = if ascending { cmp } else { cmp.reverse() };
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        sorted
+    } else {
+        rows
+    };
+
     // Apply column selection if not Star
     let selected_rows = select_columns(&rows, &all_col_names, &col_names);
 
