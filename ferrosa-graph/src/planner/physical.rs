@@ -3,6 +3,7 @@
 //! Converts a `LogicalPlan` into a `PhysicalPlan` describing how to
 //! execute the query against the storage engine.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::{GraphError, Result};
@@ -53,6 +54,32 @@ pub enum AggregateProjection {
     GroupKey(usize),
     /// An aggregate function (name + argument expression).
     AggregateFunc { name: String, arg: Expr },
+}
+
+/// A single relation in a WCO join pattern.
+#[derive(Debug, Clone)]
+pub struct JoinRelation {
+    /// Source variable.
+    pub src_var: String,
+    /// Target variable.
+    pub dst_var: String,
+    /// Direction of the edge traversal.
+    pub direction: Direction,
+    /// Edge label filter.
+    pub edge_label: Option<String>,
+    /// Resolved edge table.
+    pub edge_table: Option<ResolvedTable>,
+}
+
+/// Worst-case optimal join plan using leapfrog triejoin.
+#[derive(Debug, Clone)]
+pub struct WcoJoinPlan {
+    /// Variables involved in the join (elimination order).
+    pub variables: Vec<String>,
+    /// Relations to join (each produces a sorted iterator).
+    pub relations: Vec<JoinRelation>,
+    /// Resolved tables for variable bindings (for reading vertex data).
+    pub var_tables: HashMap<String, ResolvedTable>,
 }
 
 /// Maximum number of hops for variable-length path traversal.
@@ -126,6 +153,13 @@ pub enum PhysicalPlan {
         /// Maximum number of hops (inclusive). Capped at MAX_VAR_HOPS.
         max_hops: u32,
         /// Return clause.
+        return_clause: ReturnClause,
+    },
+    /// Worst-case optimal multi-way join via leapfrog triejoin.
+    WcoJoin {
+        /// The join plan describing variables, relations, and resolved tables.
+        plan: WcoJoinPlan,
+        /// Return clause for projecting results.
         return_clause: ReturnClause,
     },
 }
@@ -368,6 +402,132 @@ fn plan_subscribe(
     }
 }
 
+/// Detect whether a pattern forms a cycle suitable for WCO join.
+///
+/// Returns `Some(WcoJoinPlan)` if the pattern is cyclic with 3+ relationships
+/// (i.e., some variable appears as both source and target across different rels).
+/// Returns `None` for linear patterns, which should use Expand.
+fn detect_cyclic_pattern(
+    elements: &[&Pattern],
+    bindings: &HashMap<String, ResolvedTable>,
+) -> Option<WcoJoinPlan> {
+    // Extract (src_var, rel, dst_var) triples from the path.
+    let mut relations = Vec::new();
+    let mut all_vars = Vec::new();
+    let mut var_counts: HashMap<String, usize> = HashMap::new();
+
+    let mut i = 0;
+    while i < elements.len() {
+        match &elements[i] {
+            Pattern::Node { var: Some(v), .. } => {
+                if i == 0 || i == elements.len() - 1 {
+                    *var_counts.entry(v.clone()).or_insert(0) += 1;
+                }
+                i += 1;
+            }
+            Pattern::Node { var: None, .. } => {
+                i += 1;
+            }
+            Pattern::Rel {
+                rel_type,
+                direction,
+                length_range,
+                ..
+            } => {
+                // Variable-length paths cannot use WCO join.
+                if length_range.is_some() {
+                    return None;
+                }
+
+                // Get source node (previous element) and target node (next element).
+                let src_var = if i > 0 {
+                    match &elements[i - 1] {
+                        Pattern::Node { var: Some(v), .. } => v.clone(),
+                        _ => return None,
+                    }
+                } else {
+                    return None;
+                };
+
+                let dst_var = if i + 1 < elements.len() {
+                    match &elements[i + 1] {
+                        Pattern::Node { var: Some(v), .. } => v.clone(),
+                        _ => return None,
+                    }
+                } else {
+                    return None;
+                };
+
+                let edge_label = rel_type.clone();
+                let edge_table = rel_type.as_ref().and_then(|rt| {
+                    bindings
+                        .values()
+                        .find(|r| r.label.eq_ignore_ascii_case(rt) && r.graph_type == "edge")
+                        .cloned()
+                });
+
+                relations.push(JoinRelation {
+                    src_var: src_var.clone(),
+                    dst_var: dst_var.clone(),
+                    direction: *direction,
+                    edge_label,
+                    edge_table,
+                });
+
+                if !all_vars.contains(&src_var) {
+                    all_vars.push(src_var);
+                }
+                if !all_vars.contains(&dst_var) {
+                    all_vars.push(dst_var.clone());
+                }
+                *var_counts.entry(dst_var).or_insert(0) += 1;
+
+                i += 1;
+            }
+            Pattern::Path(_) => return None,
+        }
+    }
+
+    // A cycle requires 3+ relations and at least one variable appearing
+    // more than once as an endpoint (e.g., `a` in `(a)->...->(a)`).
+    if relations.len() < 3 {
+        return None;
+    }
+
+    // Check for cycle: the first and last variables must be the same,
+    // OR any variable must appear as both a source and target of different relations.
+    let has_cycle = var_counts.values().any(|&count| count > 1) || {
+        // Check if first node of pattern equals last node.
+        let first_var = match elements.first() {
+            Some(Pattern::Node { var: Some(v), .. }) => Some(v.as_str()),
+            _ => None,
+        };
+        let last_var = match elements.last() {
+            Some(Pattern::Node { var: Some(v), .. }) => Some(v.as_str()),
+            _ => None,
+        };
+        first_var.is_some() && first_var == last_var
+    };
+
+    if !has_cycle {
+        return None;
+    }
+
+    // Build var_tables from bindings.
+    let mut var_tables = HashMap::new();
+    for var in &all_vars {
+        if let Some(resolved) = bindings.get(var) {
+            var_tables.insert(var.clone(), resolved.clone());
+        }
+    }
+
+    Some(WcoJoinPlan {
+        variables: all_vars,
+        relations,
+        var_tables,
+    })
+}
+
 /// Plan a MATCH statement: find anchor and build hops.
 fn plan_match(
     patterns: &[Pattern],
@@ -385,6 +545,14 @@ fn plan_match(
     } else {
         patterns.iter().collect()
     };
+
+    // Check for cyclic patterns suitable for WCO join before building Expand.
+    if let Some(wco_plan) = detect_cyclic_pattern(&elements, bindings) {
+        return Ok(PhysicalPlan::WcoJoin {
+            plan: wco_plan,
+            return_clause,
+        });
+    }
 
     // Find the first labeled node as anchor.
     let mut anchor: Option<Anchor> = None;
@@ -1186,5 +1354,234 @@ mod tests {
             }
             other => panic!("expected ExpandVarLength plan, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_cycle_uses_wco_join() {
+        // Triangle: (a)-[:KNOWS]->(b)-[:KNOWS]->(c)-[:KNOWS]->(a)
+        let mut bindings = HashMap::new();
+        bindings.insert("a".to_string(), person_table());
+        bindings.insert("b".to_string(), person_table());
+        bindings.insert("c".to_string(), person_table());
+        bindings.insert("r1".to_string(), knows_table());
+        bindings.insert("r2".to_string(), knows_table());
+        bindings.insert("r3".to_string(), knows_table());
+
+        let return_clause = ReturnClause {
+            distinct: false,
+            items: vec![
+                ReturnItem {
+                    expr: Expr::Var("a".into()),
+                    alias: None,
+                },
+                ReturnItem {
+                    expr: Expr::Var("b".into()),
+                    alias: None,
+                },
+                ReturnItem {
+                    expr: Expr::Var("c".into()),
+                    alias: None,
+                },
+            ],
+            order_by: vec![],
+            limit: None,
+        };
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Match {
+                pattern: vec![Pattern::Path(vec![
+                    Pattern::Node {
+                        var: Some("a".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                    Pattern::Rel {
+                        var: Some("r1".into()),
+                        rel_type: Some("KNOWS".into()),
+                        direction: Direction::Out,
+                        props: vec![],
+                        length_range: None,
+                    },
+                    Pattern::Node {
+                        var: Some("b".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                    Pattern::Rel {
+                        var: Some("r2".into()),
+                        rel_type: Some("KNOWS".into()),
+                        direction: Direction::Out,
+                        props: vec![],
+                        length_range: None,
+                    },
+                    Pattern::Node {
+                        var: Some("c".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                    Pattern::Rel {
+                        var: Some("r3".into()),
+                        rel_type: Some("KNOWS".into()),
+                        direction: Direction::Out,
+                        props: vec![],
+                        length_range: None,
+                    },
+                    Pattern::Node {
+                        var: Some("a".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                ])],
+                where_clause: None,
+                return_clause,
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        match physical {
+            PhysicalPlan::WcoJoin { plan, .. } => {
+                assert_eq!(plan.variables.len(), 3);
+                assert!(plan.variables.contains(&"a".to_string()));
+                assert!(plan.variables.contains(&"b".to_string()));
+                assert!(plan.variables.contains(&"c".to_string()));
+                assert_eq!(plan.relations.len(), 3);
+            }
+            other => panic!("expected WcoJoin plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_linear_uses_expand() {
+        // Linear: (a)-[:KNOWS]->(b)-[:KNOWS]->(c) — no cycle.
+        let mut bindings = HashMap::new();
+        bindings.insert("a".to_string(), person_table());
+        bindings.insert("b".to_string(), person_table());
+        bindings.insert("c".to_string(), person_table());
+        bindings.insert("r1".to_string(), knows_table());
+        bindings.insert("r2".to_string(), knows_table());
+
+        let return_clause = ReturnClause {
+            distinct: false,
+            items: vec![ReturnItem {
+                expr: Expr::Var("c".into()),
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Match {
+                pattern: vec![Pattern::Path(vec![
+                    Pattern::Node {
+                        var: Some("a".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                    Pattern::Rel {
+                        var: Some("r1".into()),
+                        rel_type: Some("KNOWS".into()),
+                        direction: Direction::Out,
+                        props: vec![],
+                        length_range: None,
+                    },
+                    Pattern::Node {
+                        var: Some("b".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                    Pattern::Rel {
+                        var: Some("r2".into()),
+                        rel_type: Some("KNOWS".into()),
+                        direction: Direction::Out,
+                        props: vec![],
+                        length_range: None,
+                    },
+                    Pattern::Node {
+                        var: Some("c".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                ])],
+                where_clause: None,
+                return_clause,
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        assert!(
+            matches!(physical, PhysicalPlan::Expand { .. }),
+            "expected Expand plan for linear pattern, got {physical:?}"
+        );
+    }
+
+    #[test]
+    fn plan_two_hop_cycle_uses_expand() {
+        // Only 2 relationships — too few for WCO join, should use Expand.
+        // (a)-[:KNOWS]->(b)-[:KNOWS]->(a)
+        let mut bindings = HashMap::new();
+        bindings.insert("a".to_string(), person_table());
+        bindings.insert("b".to_string(), person_table());
+
+        let return_clause = ReturnClause {
+            distinct: false,
+            items: vec![ReturnItem {
+                expr: Expr::Var("a".into()),
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Match {
+                pattern: vec![Pattern::Path(vec![
+                    Pattern::Node {
+                        var: Some("a".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                    Pattern::Rel {
+                        var: None,
+                        rel_type: Some("KNOWS".into()),
+                        direction: Direction::Out,
+                        props: vec![],
+                        length_range: None,
+                    },
+                    Pattern::Node {
+                        var: Some("b".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                    Pattern::Rel {
+                        var: None,
+                        rel_type: Some("KNOWS".into()),
+                        direction: Direction::Out,
+                        props: vec![],
+                        length_range: None,
+                    },
+                    Pattern::Node {
+                        var: Some("a".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                ])],
+                where_clause: None,
+                return_clause,
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        // 2 relationships is not enough for WCO join.
+        assert!(
+            matches!(physical, PhysicalPlan::Expand { .. }),
+            "expected Expand plan for 2-hop cycle, got {physical:?}"
+        );
     }
 }

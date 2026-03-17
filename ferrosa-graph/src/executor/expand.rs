@@ -147,6 +147,18 @@ pub fn execute(
             start,
             virtual_tables,
         ),
+        PhysicalPlan::WcoJoin {
+            plan,
+            return_clause,
+        } => super::leapfrog::execute_wco_join(
+            storage,
+            keyspace,
+            &plan,
+            &return_clause,
+            config,
+            start,
+            virtual_tables,
+        ),
     }
 }
 

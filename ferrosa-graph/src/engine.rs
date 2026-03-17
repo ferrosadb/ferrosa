@@ -401,6 +401,26 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             out.push('}');
             out
         }
+        PhysicalPlan::WcoJoin {
+            plan,
+            return_clause,
+        } => {
+            let mut out = String::new();
+            out.push_str("WcoJoin (leapfrog triejoin) {\n");
+            out.push_str(&format!("  variables: {:?}\n", plan.variables));
+            for (i, rel) in plan.relations.iter().enumerate() {
+                out.push_str(&format!(
+                    "  relation[{}]: ({})--[{:?} {:?}]-->({})\n",
+                    i, rel.src_var, rel.edge_label, rel.direction, rel.dst_var
+                ));
+            }
+            out.push_str(&format!(
+                "  return: {} item(s)\n",
+                return_clause.items.len()
+            ));
+            out.push('}');
+            out
+        }
     }
 }
 
