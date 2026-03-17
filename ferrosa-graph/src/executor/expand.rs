@@ -35,6 +35,9 @@ pub struct GraphEngineConfig {
     pub max_groups: usize,
     /// Maximum number of values in a `collect()` accumulator (FMEA F6).
     pub max_collect_size: usize,
+    /// Maximum number of vertices visited during variable-length path BFS
+    /// (threat T13, FMEA F3: DoS protection for `[*]` patterns).
+    pub max_var_path_visited: usize,
 }
 
 impl Default for GraphEngineConfig {
@@ -45,6 +48,7 @@ impl Default for GraphEngineConfig {
             max_fan_out_per_hop: 10_000,
             max_groups: 100_000,
             max_collect_size: 10_000,
+            max_var_path_visited: 100_000,
         }
     }
 }
@@ -116,6 +120,28 @@ pub fn execute(
             *inner,
             &group_keys,
             &projections,
+            &return_clause,
+            config,
+            start,
+            virtual_tables,
+        ),
+        PhysicalPlan::Subscribe { inner, .. } => {
+            // Execute the initial snapshot from the inner plan.
+            execute(*inner, storage, keyspace, config, virtual_tables)
+        }
+        PhysicalPlan::ExpandVarLength {
+            anchor,
+            hop,
+            min_hops,
+            max_hops,
+            return_clause,
+        } => super::varpath::execute_var_length(
+            storage,
+            keyspace,
+            &anchor,
+            &hop,
+            min_hops,
+            max_hops,
             &return_clause,
             config,
             start,
@@ -772,7 +798,7 @@ fn eval_aggregate_arg(
 }
 
 /// Sort rows by the specified ORDER BY columns.
-fn sort_rows(
+pub fn sort_rows(
     rows: &mut [Vec<serde_json::Value>],
     columns: &[String],
     order_by: &[crate::parser::OrderItem],
@@ -901,7 +927,7 @@ fn cell_value_to_json(cell: &ferrosa_common::CellValue) -> serde_json::Value {
 }
 
 /// Build column names from the return clause.
-fn build_columns(return_clause: &ReturnClause) -> Vec<String> {
+pub fn build_columns(return_clause: &ReturnClause) -> Vec<String> {
     return_clause
         .items
         .iter()

@@ -3,6 +3,8 @@
 //! Converts a `LogicalPlan` into a `PhysicalPlan` describing how to
 //! execute the query against the storage engine.
 
+use std::time::Duration;
+
 use crate::error::{GraphError, Result};
 use crate::executor::aggregate::is_aggregate_function;
 use crate::parser::{Assignment, Direction, Expr, Pattern, PropMap, ReturnClause, Statement};
@@ -53,6 +55,10 @@ pub enum AggregateProjection {
     AggregateFunc { name: String, arg: Expr },
 }
 
+/// Maximum number of hops for variable-length path traversal.
+/// Prevents runaway BFS on unbounded `[*]` patterns (threat T13 mitigation).
+pub const MAX_VAR_HOPS: u32 = 10;
+
 /// Physical execution plan.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -98,6 +104,30 @@ pub enum PhysicalPlan {
         /// Whether to detach (delete relationships too).
         detach: bool,
     },
+    /// Subscribe to periodic re-execution of a query.
+    Subscribe {
+        /// The inner MATCH plan to re-execute.
+        inner: Box<PhysicalPlan>,
+        /// Poll interval.
+        interval: std::time::Duration,
+        /// Whether to send only changes (delta mode).
+        delta: bool,
+        /// Return clause for column names.
+        return_clause: ReturnClause,
+    },
+    /// Variable-length path expansion via BFS.
+    ExpandVarLength {
+        /// Starting vertex.
+        anchor: Anchor,
+        /// The relationship hop to repeat.
+        hop: Hop,
+        /// Minimum number of hops (inclusive).
+        min_hops: u32,
+        /// Maximum number of hops (inclusive). Capped at MAX_VAR_HOPS.
+        max_hops: u32,
+        /// Return clause.
+        return_clause: ReturnClause,
+    },
 }
 
 /// Convert a logical plan into a physical plan.
@@ -126,12 +156,17 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
             detach,
             variables,
         } => plan_delete(pattern, &logical.bindings, where_clause, variables, *detach),
-        Statement::Subscribe { .. } => Err(GraphError::Validation(
-            "SUBSCRIBE is not yet supported in graph query planner".to_string(),
-        )),
-        Statement::Unsubscribe { .. } => Err(GraphError::Validation(
-            "UNSUBSCRIBE is not yet supported in graph query planner".to_string(),
-        )),
+        Statement::Subscribe {
+            inner,
+            interval,
+            delta,
+        } => plan_subscribe(inner, &logical.bindings, *interval, *delta),
+        Statement::Unsubscribe { .. } => {
+            // Unsubscribe doesn't need a physical plan; the engine handles it directly.
+            Err(GraphError::Validation(
+                "UNSUBSCRIBE is handled directly by the engine, not the planner".to_string(),
+            ))
+        }
     }
 }
 
@@ -301,6 +336,38 @@ fn plan_delete(
     })
 }
 
+/// Default subscription poll interval (2 seconds).
+const DEFAULT_SUBSCRIBE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Plan a SUBSCRIBE statement: extract the inner MATCH, plan it as an Expand,
+/// and wrap in `PhysicalPlan::Subscribe`.
+fn plan_subscribe(
+    inner: &Statement,
+    bindings: &std::collections::HashMap<String, ResolvedTable>,
+    interval: Option<Duration>,
+    delta: bool,
+) -> Result<PhysicalPlan> {
+    match inner {
+        Statement::Match {
+            pattern,
+            where_clause,
+            return_clause,
+        } => {
+            let filters = extract_filters(where_clause);
+            let inner_plan = plan_match(pattern, bindings, filters, return_clause.clone())?;
+            Ok(PhysicalPlan::Subscribe {
+                inner: Box::new(inner_plan),
+                interval: interval.unwrap_or(DEFAULT_SUBSCRIBE_INTERVAL),
+                delta,
+                return_clause: return_clause.clone(),
+            })
+        }
+        _ => Err(GraphError::Validation(
+            "SUBSCRIBE requires a MATCH query as its inner statement".to_string(),
+        )),
+    }
+}
+
 /// Plan a MATCH statement: find anchor and build hops.
 fn plan_match(
     patterns: &[Pattern],
@@ -367,6 +434,7 @@ fn plan_match(
                 rel_type,
                 direction,
                 props,
+                length_range,
             } => {
                 if anchor.is_none() {
                     return Err(GraphError::Validation(
@@ -393,6 +461,35 @@ fn plan_match(
                 } else {
                     (None, None)
                 };
+
+                // If this is a variable-length path, we handle it specially
+                // by emitting an ExpandVarLength plan instead of adding a hop.
+                if let Some((min, max_opt)) = length_range {
+                    let hop = Hop {
+                        var: next_var,
+                        edge_label,
+                        direction: *direction,
+                        edge_table,
+                        vertex_table,
+                        prop_filters: props.clone(),
+                    };
+
+                    let clamped_max = max_opt.map(|m| m.min(MAX_VAR_HOPS)).unwrap_or(MAX_VAR_HOPS);
+
+                    let anchor_val = anchor.clone().ok_or_else(|| {
+                        GraphError::Validation("no anchor found for var-length path".to_string())
+                    })?;
+
+                    // Variable-length paths consume the rest of the pattern
+                    // and return immediately as an ExpandVarLength plan.
+                    return Ok(PhysicalPlan::ExpandVarLength {
+                        anchor: anchor_val,
+                        hop,
+                        min_hops: *min,
+                        max_hops: clamped_max,
+                        return_clause,
+                    });
+                }
 
                 hops.push(Hop {
                     var: next_var,
@@ -579,6 +676,7 @@ mod tests {
                         rel_type: Some("KNOWS".into()),
                         direction: Direction::Out,
                         props: vec![],
+                        length_range: None,
                     },
                     Pattern::Node {
                         var: Some("b".into()),
@@ -838,6 +936,7 @@ mod tests {
                             "since".into(),
                             Expr::Literal(crate::parser::Literal::Integer(2020)),
                         )],
+                        length_range: None,
                     },
                     Pattern::Node {
                         var: Some("b".into()),
@@ -887,6 +986,7 @@ mod tests {
                         rel_type: Some("KNOWS".into()),
                         direction: Direction::Out,
                         props: vec![],
+                        length_range: None,
                     },
                     Pattern::Node {
                         var: Some("b".into()),
@@ -907,6 +1007,184 @@ mod tests {
                 assert!(hops[0].prop_filters.is_empty());
             }
             _ => panic!("expected Expand plan"),
+        }
+    }
+
+    #[test]
+    fn plan_subscribe_match() {
+        let mut bindings = HashMap::new();
+        bindings.insert("n".to_string(), person_table());
+
+        let inner = Statement::Match {
+            pattern: vec![Pattern::Node {
+                var: Some("n".into()),
+                label: Some("Person".into()),
+                props: vec![],
+            }],
+            where_clause: None,
+            return_clause: simple_return(),
+        };
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Subscribe {
+                inner: Box::new(inner),
+                interval: Some(std::time::Duration::from_secs(5)),
+                delta: true,
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        match physical {
+            PhysicalPlan::Subscribe {
+                inner,
+                interval,
+                delta,
+                return_clause,
+            } => {
+                assert!(matches!(*inner, PhysicalPlan::Expand { .. }));
+                assert_eq!(interval, std::time::Duration::from_secs(5));
+                assert!(delta);
+                assert_eq!(return_clause.items.len(), 1);
+            }
+            other => panic!("expected Subscribe plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_subscribe_default_interval() {
+        let mut bindings = HashMap::new();
+        bindings.insert("n".to_string(), person_table());
+
+        let inner = Statement::Match {
+            pattern: vec![Pattern::Node {
+                var: Some("n".into()),
+                label: Some("Person".into()),
+                props: vec![],
+            }],
+            where_clause: None,
+            return_clause: simple_return(),
+        };
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Subscribe {
+                inner: Box::new(inner),
+                interval: None,
+                delta: false,
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        match physical {
+            PhysicalPlan::Subscribe {
+                interval, delta, ..
+            } => {
+                // Default is 2 seconds.
+                assert_eq!(interval, std::time::Duration::from_secs(2));
+                assert!(!delta);
+            }
+            other => panic!("expected Subscribe plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_varpath() {
+        let mut bindings = HashMap::new();
+        bindings.insert("a".to_string(), person_table());
+        bindings.insert("b".to_string(), person_table());
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Match {
+                pattern: vec![Pattern::Path(vec![
+                    Pattern::Node {
+                        var: Some("a".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                    Pattern::Rel {
+                        var: None,
+                        rel_type: Some("KNOWS".into()),
+                        direction: Direction::Out,
+                        props: vec![],
+                        length_range: Some((1, Some(5))),
+                    },
+                    Pattern::Node {
+                        var: Some("b".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                ])],
+                where_clause: None,
+                return_clause: simple_return(),
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        match physical {
+            PhysicalPlan::ExpandVarLength {
+                anchor,
+                hop,
+                min_hops,
+                max_hops,
+                ..
+            } => {
+                assert_eq!(anchor.var, Some("a".to_string()));
+                assert_eq!(hop.edge_label, Some("KNOWS".to_string()));
+                assert_eq!(min_hops, 1);
+                assert_eq!(max_hops, 5);
+            }
+            other => panic!("expected ExpandVarLength plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_varpath_max_hops_capped() {
+        let mut bindings = HashMap::new();
+        bindings.insert("a".to_string(), person_table());
+        bindings.insert("b".to_string(), person_table());
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Match {
+                pattern: vec![Pattern::Path(vec![
+                    Pattern::Node {
+                        var: Some("a".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                    Pattern::Rel {
+                        var: None,
+                        rel_type: Some("KNOWS".into()),
+                        direction: Direction::Out,
+                        props: vec![],
+                        length_range: Some((1, None)), // unbounded
+                    },
+                    Pattern::Node {
+                        var: Some("b".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                ])],
+                where_clause: None,
+                return_clause: simple_return(),
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        match physical {
+            PhysicalPlan::ExpandVarLength {
+                min_hops, max_hops, ..
+            } => {
+                assert_eq!(min_hops, 1);
+                assert_eq!(max_hops, MAX_VAR_HOPS);
+            }
+            other => panic!("expected ExpandVarLength plan, got {other:?}"),
         }
     }
 }

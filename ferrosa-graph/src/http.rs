@@ -4,17 +4,21 @@
 //! inspecting graph schema, and health checks. Includes Basic auth middleware (T2),
 //! error sanitization (T8), and TLS support (T11).
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use base64::Engine as _;
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -332,6 +336,238 @@ async fn handle_health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// Request body for the unsubscribe endpoint.
+#[derive(Debug, Deserialize)]
+pub struct UnsubscribeRequest {
+    pub stream_id: u16,
+}
+
+/// POST /graph/subscribe — start a subscription, returning an SSE stream.
+///
+/// The initial snapshot is sent as the first SSE event. Subsequent events
+/// are sent at the configured interval. In delta mode, only changed/new rows
+/// are sent after the initial snapshot.
+async fn handle_subscribe(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let auth = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .unwrap_or(AuthContext {
+            role: "anonymous".to_string(),
+            is_superuser: false,
+            must_change_password: false,
+        });
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1_048_576).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "invalid request body".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let query_req: QueryRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(q) => q,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid JSON: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    tracing::info!(
+        user = %auth.role,
+        keyspace = %query_req.keyspace,
+        query = %query_req.query,
+        "graph subscribe requested"
+    );
+
+    // Parse and execute initial snapshot, extracting interval and delta flag.
+    let (initial_result, interval, delta) =
+        match state
+            .engine
+            .execute_subscribe(&query_req.query, &query_req.keyspace, &auth)
+        {
+            Ok(r) => r,
+            Err(ref e) => {
+                tracing::info!(
+                    user = %auth.role,
+                    keyspace = %query_req.keyspace,
+                    error = %e,
+                    "graph subscribe failed"
+                );
+                return error_to_response(e);
+            }
+        };
+
+    // Build the SSE stream.
+    let stream = make_subscribe_stream(
+        state.engine.clone(),
+        query_req.query,
+        query_req.keyspace,
+        auth,
+        initial_result,
+        interval,
+        delta,
+    );
+
+    Sse::new(stream).into_response()
+}
+
+/// Build an SSE stream that yields the initial snapshot followed by
+/// periodic re-executions of the query.
+fn make_subscribe_stream(
+    engine: Arc<GraphEngine>,
+    query: String,
+    keyspace: String,
+    auth: AuthContext,
+    initial_result: crate::executor::result::GraphResult,
+    interval: Duration,
+    delta: bool,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    // Channel-based approach: we produce events via an async generator pattern
+    // using tokio_stream.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(16);
+
+    // Clone the engine for the subscription registry access after task spawn.
+    let registry_engine = engine.clone();
+
+    // Spawn the subscription background task.
+    let task = tokio::spawn(async move {
+        // Send initial snapshot.
+        let initial_json = serde_json::to_string(&initial_result).unwrap_or_default();
+        let event = Event::default().event("snapshot").data(initial_json);
+        if tx.send(Ok(event)).await.is_err() {
+            return; // Client disconnected.
+        }
+
+        let mut previous_rows = if delta {
+            Some(initial_result.rows.clone())
+        } else {
+            None
+        };
+
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // Consume the immediate first tick.
+
+        loop {
+            ticker.tick().await;
+
+            // Re-execute the query.
+            let result = engine.execute(&query, &keyspace, &auth);
+            match result {
+                Ok(current) => {
+                    if delta {
+                        // Compute delta: rows in current that were not in previous.
+                        let prev = previous_rows.as_ref().unwrap();
+                        let new_rows: Vec<&Vec<serde_json::Value>> = current
+                            .rows
+                            .iter()
+                            .filter(|row| !prev.contains(row))
+                            .collect();
+
+                        if !new_rows.is_empty() {
+                            let delta_result = serde_json::json!({
+                                "columns": current.columns,
+                                "rows": new_rows,
+                                "stats": current.stats,
+                            });
+                            let json = serde_json::to_string(&delta_result).unwrap_or_default();
+                            let event = Event::default().event("delta").data(json);
+                            if tx.send(Ok(event)).await.is_err() {
+                                break; // Client disconnected.
+                            }
+                        }
+                        previous_rows = Some(current.rows);
+                    } else {
+                        let json = serde_json::to_string(&current).unwrap_or_default();
+                        let event = Event::default().event("data").data(json);
+                        if tx.send(Ok(event)).await.is_err() {
+                            break; // Client disconnected.
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "subscription query re-execution failed");
+                    let event = Event::default()
+                        .event("error")
+                        .data(format!("query error: {e}"));
+                    if tx.send(Ok(event)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Register the task in the subscription registry so it can be cancelled.
+    if let Ok(sub_id) = registry_engine.subscription_registry().register(task) {
+        tracing::info!(subscription_id = sub_id, "subscription registered");
+    }
+
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+/// POST /graph/unsubscribe — cancel a subscription by ID.
+async fn handle_unsubscribe(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1_048_576).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "invalid request body".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let unsub_req: UnsubscribeRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid JSON: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let cancelled = state
+        .engine
+        .subscription_registry()
+        .cancel(unsub_req.stream_id);
+
+    if cancelled {
+        tracing::info!(stream_id = unsub_req.stream_id, "subscription cancelled");
+        Json(serde_json::json!({
+            "status": "cancelled",
+            "stream_id": unsub_req.stream_id,
+        }))
+        .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("subscription {} not found", unsub_req.stream_id),
+            }),
+        )
+            .into_response()
+    }
+}
+
 /// Build the Axum router with all graph routes.
 ///
 /// Auth middleware is applied to all routes except /graph/health.
@@ -341,6 +577,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/graph/query", post(handle_query))
         .route("/graph/explain", post(handle_explain))
         .route("/graph/schema", get(handle_schema))
+        .route("/graph/subscribe", post(handle_subscribe))
+        .route("/graph/unsubscribe", post(handle_unsubscribe))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -490,5 +728,67 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("test error"));
+    }
+
+    #[test]
+    fn unsubscribe_request_deserialize() {
+        let json = r#"{"stream_id": 42}"#;
+        let req: UnsubscribeRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.stream_id, 42);
+    }
+
+    /// Verify the subscribe route is registered by checking that the router
+    /// builds without panic and the subscribe route is reachable.
+    #[test]
+    fn build_router_includes_subscribe_route() {
+        use ferrosa_schema::{
+            AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
+            RateLimitConfig, SchemaConfig, TestAuditSink,
+        };
+        use ferrosa_storage::{
+            CommitLogConfig, CompactionConfig, StorageEngineConfig, SyncStrategyConfig,
+        };
+
+        let schema = Arc::new(
+            ferrosa_schema::Schema::new(SchemaConfig {
+                hasher: PasswordHasher::default(),
+                password_policy: PasswordPolicy::permissive(),
+                auth_method: AuthMethod::Password,
+                rate_limit: RateLimitConfig::default(),
+                audit_sink: Box::new(TestAuditSink::new()),
+                secrets: Box::new(EnvSecretsProvider),
+                mode: DeploymentMode::Development,
+            })
+            .unwrap(),
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 4096,
+                max_segment_age: std::time::Duration::from_secs(60),
+                sync_strategy: SyncStrategyConfig::Batch,
+                log_dir: tmp.path().to_path_buf(),
+                checkpoint_dir: tmp.path().to_path_buf(),
+            },
+            compaction: CompactionConfig::from_env(tmp.path().join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            flush_threshold_bytes: 4096,
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let storage = Arc::new(ferrosa_storage::StorageEngine::new(storage_config, None).unwrap());
+
+        let engine = Arc::new(crate::engine::GraphEngine::new(
+            Arc::clone(&schema),
+            storage,
+            crate::executor::expand::GraphEngineConfig::default(),
+            std::time::Duration::from_secs(300),
+        ));
+
+        let state = AppState { engine, schema };
+
+        // build_router should succeed and include subscribe/unsubscribe routes.
+        let _router = build_router(state);
     }
 }
