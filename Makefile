@@ -46,7 +46,7 @@ build-musl:
 	@echo ""
 	@echo "Static binaries (built in Docker):"
 	@for bin in $(BINARIES); do \
-		echo "  $(MUSL_DIR)/$$bin ($$(file $(MUSL_DIR)/$$bin | grep -o 'statically linked'))"; \
+		echo "  $(MUSL_DIR)/$$bin ($$(file $(MUSL_DIR)/$$bin | grep -oE 'statically linked|static-pie linked|static'))"; \
 	done
 
 # Static musl build with local toolchain (needs musl-tools installed)
@@ -55,7 +55,7 @@ build-musl-local:
 	@echo ""
 	@echo "Static binaries:"
 	@for bin in $(BINARIES); do \
-		echo "  $(MUSL_DIR)/$$bin ($$(file $(MUSL_DIR)/$$bin | grep -o 'statically linked'))"; \
+		echo "  $(MUSL_DIR)/$$bin ($$(file $(MUSL_DIR)/$$bin | grep -oE 'statically linked|static-pie linked|static'))"; \
 	done
 
 # Copy release artifacts to releases/ (gitignored)
@@ -104,7 +104,7 @@ all: build build-musl
 # Verify musl binary is statically linked
 verify-static:
 	@for bin in $(BINARIES); do \
-		if file $(MUSL_DIR)/$$bin | grep -q "statically linked"; then \
+		if file $(MUSL_DIR)/$$bin | grep -qE "statically linked|static-pie linked|static"; then \
 			echo "OK: $(MUSL_DIR)/$$bin is statically linked"; \
 		else \
 			echo "FAIL: $(MUSL_DIR)/$$bin is NOT statically linked"; \

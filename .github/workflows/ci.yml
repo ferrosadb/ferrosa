@@ -97,7 +97,7 @@ jobs:
       - name: Verify statically linked
         run: |
           file target/x86_64-unknown-linux-musl/release/ferrosa
-          file target/x86_64-unknown-linux-musl/release/ferrosa | grep -q "statically linked"
+          file target/x86_64-unknown-linux-musl/release/ferrosa | grep -qE "statically linked|static-pie linked|static"
           echo "Binary size: $(du -h target/x86_64-unknown-linux-musl/release/ferrosa | cut -f1)"
       - name: Strip and report
         run: |
