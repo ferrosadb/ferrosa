@@ -20,7 +20,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 base64 = "0.22"
 futures = "0.3"
 parking_lot = "0.12"
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.6", features = ["catch-panic", "limit"] }
 tracing = "0.1"
