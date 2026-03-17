@@ -4,7 +4,8 @@
 //! execute the query against the storage engine.
 
 use crate::error::{GraphError, Result};
-use crate::parser::{Assignment, Direction, Expr, Pattern, ReturnClause, Statement};
+use crate::executor::aggregate::is_aggregate_function;
+use crate::parser::{Assignment, Direction, Expr, Pattern, PropMap, ReturnClause, Statement};
 use crate::planner::logical::{LogicalPlan, ResolvedTable};
 
 /// A single hop in a graph traversal.
@@ -20,6 +21,8 @@ pub struct Hop {
     pub edge_table: Option<ResolvedTable>,
     /// Resolved vertex table at the end of this hop (if the label was resolved).
     pub vertex_table: Option<ResolvedTable>,
+    /// Property filter expressions from the relationship pattern.
+    pub prop_filters: PropMap,
 }
 
 /// The anchor (starting point) of a graph traversal.
@@ -41,6 +44,15 @@ pub struct CreateOp {
     pub props: Vec<(String, Expr)>,
 }
 
+/// A projection in an aggregate plan.
+#[derive(Debug, Clone)]
+pub enum AggregateProjection {
+    /// A group key (references a column by index in the inner result).
+    GroupKey(usize),
+    /// An aggregate function (name + argument expression).
+    AggregateFunc { name: String, arg: Expr },
+}
+
 /// Physical execution plan.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -52,6 +64,17 @@ pub enum PhysicalPlan {
         /// Sequence of edge+vertex hops.
         hops: Vec<Hop>,
         /// Return clause for projecting results.
+        return_clause: ReturnClause,
+    },
+    /// Aggregate results from an inner plan.
+    Aggregate {
+        /// Inner plan that produces rows to aggregate.
+        inner: Box<PhysicalPlan>,
+        /// Indices of return items that are group keys (not aggregates).
+        group_keys: Vec<usize>,
+        /// For each return item, either a group key index or an aggregate function name + arg expr.
+        projections: Vec<AggregateProjection>,
+        /// Return clause for column names.
         return_clause: ReturnClause,
     },
     /// Create nodes and/or relationships.
@@ -343,7 +366,7 @@ fn plan_match(
                 var: _,
                 rel_type,
                 direction,
-                ..
+                props,
             } => {
                 if anchor.is_none() {
                     return Err(GraphError::Validation(
@@ -377,6 +400,7 @@ fn plan_match(
                     direction: *direction,
                     edge_table,
                     vertex_table,
+                    prop_filters: props.clone(),
                 });
                 i += 2; // Skip rel + node
             }
@@ -395,11 +419,76 @@ fn plan_match(
         )
     })?;
 
-    Ok(PhysicalPlan::Expand {
-        anchor,
-        hops,
-        return_clause,
-    })
+    // Check if the return clause contains any aggregate functions.
+    let has_aggregates = return_clause.items.iter().any(
+        |item| matches!(&item.expr, Expr::Function { name, .. } if is_aggregate_function(name)),
+    );
+
+    if has_aggregates {
+        // Build projections: classify each return item as group key or aggregate.
+        let mut group_keys = Vec::new();
+        let mut projections = Vec::new();
+        // Build the inner return clause: flatten aggregate args and group keys
+        // into plain expressions so the Expand can project raw values.
+        let mut inner_items: Vec<crate::parser::ReturnItem> = Vec::new();
+        let mut group_key_idx = 0usize;
+
+        for item in &return_clause.items {
+            match &item.expr {
+                Expr::Function { name, args } if is_aggregate_function(name) => {
+                    // Determine the argument expression. For count(*) with no args,
+                    // use a Var("*") sentinel.
+                    let arg = if args.is_empty() {
+                        Expr::Var("*".to_string())
+                    } else {
+                        args[0].clone()
+                    };
+                    projections.push(AggregateProjection::AggregateFunc {
+                        name: name.to_lowercase(),
+                        arg: arg.clone(),
+                    });
+                    // Add the arg expression to the inner return clause so the
+                    // Expand plan produces the raw column the accumulator needs.
+                    inner_items.push(crate::parser::ReturnItem {
+                        expr: arg,
+                        alias: None,
+                    });
+                }
+                _ => {
+                    group_keys.push(inner_items.len());
+                    projections.push(AggregateProjection::GroupKey(group_key_idx));
+                    group_key_idx += 1;
+                    inner_items.push(item.clone());
+                }
+            }
+        }
+
+        let inner_return_clause = ReturnClause {
+            distinct: false,
+            items: inner_items,
+            order_by: vec![],
+            limit: None,
+        };
+
+        let expand = PhysicalPlan::Expand {
+            anchor,
+            hops,
+            return_clause: inner_return_clause,
+        };
+
+        Ok(PhysicalPlan::Aggregate {
+            inner: Box::new(expand),
+            group_keys,
+            projections,
+            return_clause,
+        })
+    } else {
+        Ok(PhysicalPlan::Expand {
+            anchor,
+            hops,
+            return_clause,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -631,6 +720,193 @@ mod tests {
                 assert!(detach);
             }
             other => panic!("expected DeleteNodes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_aggregate_count() {
+        let mut bindings = HashMap::new();
+        bindings.insert("n".to_string(), person_table());
+
+        let return_clause = ReturnClause {
+            distinct: false,
+            items: vec![ReturnItem {
+                expr: Expr::Function {
+                    name: "count".to_string(),
+                    args: vec![Expr::Var("n".into())],
+                },
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Match {
+                pattern: vec![Pattern::Node {
+                    var: Some("n".into()),
+                    label: Some("Person".into()),
+                    props: vec![],
+                }],
+                where_clause: None,
+                return_clause,
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        match physical {
+            PhysicalPlan::Aggregate {
+                inner,
+                group_keys,
+                projections,
+                ..
+            } => {
+                assert!(matches!(*inner, PhysicalPlan::Expand { .. }));
+                assert!(group_keys.is_empty());
+                assert_eq!(projections.len(), 1);
+                assert!(matches!(
+                    &projections[0],
+                    AggregateProjection::AggregateFunc { name, .. } if name == "count"
+                ));
+            }
+            other => panic!("expected Aggregate plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_no_aggregate_returns_expand() {
+        let mut bindings = HashMap::new();
+        bindings.insert("n".to_string(), person_table());
+
+        let return_clause = ReturnClause {
+            distinct: false,
+            items: vec![ReturnItem {
+                expr: Expr::Property {
+                    var: "n".into(),
+                    name: "name".into(),
+                },
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Match {
+                pattern: vec![Pattern::Node {
+                    var: Some("n".into()),
+                    label: Some("Person".into()),
+                    props: vec![],
+                }],
+                where_clause: None,
+                return_clause,
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        assert!(
+            matches!(physical, PhysicalPlan::Expand { .. }),
+            "expected Expand plan, got {physical:?}"
+        );
+    }
+
+    #[test]
+    fn plan_hop_with_props() {
+        let mut bindings = HashMap::new();
+        bindings.insert("a".to_string(), person_table());
+        bindings.insert("b".to_string(), person_table());
+        bindings.insert("r".to_string(), knows_table());
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Match {
+                pattern: vec![Pattern::Path(vec![
+                    Pattern::Node {
+                        var: Some("a".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                    Pattern::Rel {
+                        var: Some("r".into()),
+                        rel_type: Some("KNOWS".into()),
+                        direction: Direction::Out,
+                        props: vec![(
+                            "since".into(),
+                            Expr::Literal(crate::parser::Literal::Integer(2020)),
+                        )],
+                    },
+                    Pattern::Node {
+                        var: Some("b".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                ])],
+                where_clause: None,
+                return_clause: simple_return(),
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        match physical {
+            PhysicalPlan::Expand { hops, .. } => {
+                assert_eq!(hops.len(), 1);
+                assert_eq!(hops[0].prop_filters.len(), 1);
+                assert_eq!(hops[0].prop_filters[0].0, "since");
+                assert_eq!(
+                    hops[0].prop_filters[0].1,
+                    Expr::Literal(crate::parser::Literal::Integer(2020))
+                );
+            }
+            _ => panic!("expected Expand plan"),
+        }
+    }
+
+    #[test]
+    fn plan_hop_without_props() {
+        let mut bindings = HashMap::new();
+        bindings.insert("a".to_string(), person_table());
+        bindings.insert("b".to_string(), person_table());
+        bindings.insert("r".to_string(), knows_table());
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Match {
+                pattern: vec![Pattern::Path(vec![
+                    Pattern::Node {
+                        var: Some("a".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                    Pattern::Rel {
+                        var: Some("r".into()),
+                        rel_type: Some("KNOWS".into()),
+                        direction: Direction::Out,
+                        props: vec![],
+                    },
+                    Pattern::Node {
+                        var: Some("b".into()),
+                        label: Some("Person".into()),
+                        props: vec![],
+                    },
+                ])],
+                where_clause: None,
+                return_clause: simple_return(),
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        match physical {
+            PhysicalPlan::Expand { hops, .. } => {
+                assert_eq!(hops.len(), 1);
+                assert!(hops[0].prop_filters.is_empty());
+            }
+            _ => panic!("expected Expand plan"),
         }
     }
 }

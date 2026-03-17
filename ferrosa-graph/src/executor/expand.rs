@@ -6,6 +6,7 @@
 //! 2. For each hop, reading the adjacency index to find neighbors
 //! 3. Building a `GraphResult` with columns from the return clause
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
@@ -15,9 +16,11 @@ use ferrosa_storage::{StorageEngine, TableId};
 
 use crate::adjacency::schema::adjacency_keyspace_name;
 use crate::error::{GraphError, Result};
+use crate::executor::aggregate::{create_accumulator, Accumulator};
+use crate::executor::eval;
 use crate::executor::result::{GraphResult, QueryStats};
 use crate::parser::{Expr, Literal, ReturnClause, ReturnItem, SortDir};
-use crate::planner::physical::{Anchor, CreateOp, Hop, PhysicalPlan};
+use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, PhysicalPlan};
 
 /// Configuration for the graph query engine (T4 DoS limits).
 #[derive(Debug, Clone)]
@@ -28,6 +31,10 @@ pub struct GraphEngineConfig {
     pub max_result_rows: usize,
     /// Maximum fan-out per hop (T4: limits adjacency reads).
     pub max_fan_out_per_hop: usize,
+    /// Maximum number of groups in an aggregation (FMEA F7).
+    pub max_groups: usize,
+    /// Maximum number of values in a `collect()` accumulator (FMEA F6).
+    pub max_collect_size: usize,
 }
 
 impl Default for GraphEngineConfig {
@@ -36,6 +43,8 @@ impl Default for GraphEngineConfig {
             query_timeout: Duration::from_secs(30),
             max_result_rows: 10_000,
             max_fan_out_per_hop: 10_000,
+            max_groups: 100_000,
+            max_collect_size: 10_000,
         }
     }
 }
@@ -96,6 +105,22 @@ pub fn execute(
             virtual_tables,
             start,
         ),
+        PhysicalPlan::Aggregate {
+            inner,
+            group_keys,
+            projections,
+            return_clause,
+        } => execute_aggregate(
+            storage,
+            keyspace,
+            *inner,
+            &group_keys,
+            &projections,
+            &return_clause,
+            config,
+            start,
+            virtual_tables,
+        ),
     }
 }
 
@@ -140,9 +165,26 @@ fn execute_expand(
     stats.vertices_read += anchor_partitions.len();
     check_timeout(start, config.query_timeout)?;
 
-    // Collect anchor vertex keys.
-    let mut current_keys: Vec<DecoratedKey> =
-        anchor_partitions.iter().map(|p| p.key.clone()).collect();
+    // Apply WHERE filters to anchor partitions using the expression evaluator.
+    let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
+    let mut current_keys: Vec<DecoratedKey> = Vec::with_capacity(anchor_partitions.len());
+    for partition in &anchor_partitions {
+        let hex_id = hex::encode(partition.key.key.as_bytes());
+        let row_json = eval::partition_to_json(partition, &hex_id);
+        let mut bindings = HashMap::new();
+        bindings.insert(anchor_var.to_string(), row_json);
+
+        let mut passes = true;
+        for filter in &anchor.filters {
+            if !eval::filter_passes(filter, &bindings)? {
+                passes = false;
+                break;
+            }
+        }
+        if passes {
+            current_keys.push(partition.key.clone());
+        }
+    }
 
     // Step 2: For each hop, traverse adjacency index.
     let adj_ks = adjacency_keyspace_name(keyspace);
@@ -158,10 +200,33 @@ fn execute_expand(
             if let Some(partition) = adj_partition {
                 stats.edges_read += partition.rows.len();
 
+                // If this hop has property filters and an edge table, read
+                // the edge partition once so we can check edge properties.
+                let edge_partition = if !hop.prop_filters.is_empty() {
+                    if let Some(ref et) = hop.edge_table {
+                        let edge_tid = TableId::new(&et.keyspace, &et.table);
+                        storage.read(&edge_tid, vertex_key)?
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 for row in &partition.rows {
                     if let Some(neighbor_id) =
                         extract_neighbor_id(&row.clustering, hop.edge_label.as_deref())
                     {
+                        // Apply property filters if present.
+                        if !hop.prop_filters.is_empty()
+                            && !edge_row_passes_filters(
+                                edge_partition.as_ref(),
+                                &neighbor_id,
+                                &hop.prop_filters,
+                            )
+                        {
+                            continue;
+                        }
                         next_keys.push(DecoratedKey::new(ferrosa_common::PartitionKey::new(
                             neighbor_id,
                         )));
@@ -197,21 +262,22 @@ fn execute_expand(
         let partition = storage.read(&anchor_table_id_for_proj, key)?;
 
         let hex_id = hex::encode(key.key.as_bytes());
+
+        // Build bindings for eval_expr: the anchor variable maps to the
+        // partition's JSON representation so that RETURN expressions
+        // (arithmetic, function calls, property lookups) all work.
+        let row_json = if let Some(ref part) = partition {
+            eval::partition_to_json(part, &hex_id)
+        } else {
+            serde_json::Value::String(hex_id.clone())
+        };
+        let mut bindings = HashMap::new();
+        bindings.insert(anchor_var.to_string(), row_json);
+
         let row: Vec<serde_json::Value> = return_clause
             .items
             .iter()
-            .map(|item| match &item.expr {
-                Expr::Var(_) => serde_json::Value::String(hex_id.clone()),
-                Expr::Property { name, .. } => {
-                    // Look up the property in the partition's rows.
-                    if let Some(ref part) = partition {
-                        extract_property_from_partition(part, name)
-                    } else {
-                        serde_json::Value::Null
-                    }
-                }
-                _ => serde_json::Value::Null,
-            })
+            .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
             .collect();
         rows.push(row);
     }
@@ -241,38 +307,54 @@ fn execute_expand(
     })
 }
 
-/// Extract a property value from a partition's first row by column name.
+/// Check whether an edge row passes all property filters.
 ///
-/// Since the graph engine stores vertex properties as cells in a single row
-/// keyed by column index, we iterate cells and match by index. However, we
-/// don't carry the table schema into the executor, so we use a positional
-/// heuristic: column names are matched against cell indices. For a more robust
-/// implementation we'd need to pass column metadata. For now, we treat each
-/// cell's column_index as its position and return the first matching cell
-/// that has the right index for a name-based lookup (matching the property
-/// name to the column index in order). As a practical fallback, we look for
-/// any non-empty cell and return it as a string.
-fn extract_property_from_partition(
-    partition: &ferrosa_sstable::types::Partition,
-    property_name: &str,
-) -> serde_json::Value {
-    // Walk the partition's rows looking for a cell whose value is present.
-    // In the graph model, vertex tables typically have a single static/clustered
-    // row. We search all rows' cells and the static row.
-    //
-    // Without schema metadata we cannot map property names to column indices
-    // precisely, so we return the first live cell we find. A future revision
-    // should thread column metadata through the planner to enable exact lookup.
-    let all_rows = partition.static_row.iter().chain(partition.rows.iter());
+/// Looks up the edge row in the given edge partition by matching the
+/// clustering key to `neighbor_id`. Then for each `(prop_name, expected_expr)`
+/// in `prop_filters`, compares the cell byte value against the expected
+/// literal's byte encoding. Returns `true` only if ALL filters match.
+///
+/// Without schema metadata we cannot map property names to column indices.
+/// As a heuristic, we compare each filter's expected byte value against
+/// every cell in the matching row -- if any cell matches, that filter passes.
+/// A future revision should thread column metadata for exact name-based lookup.
+fn edge_row_passes_filters(
+    edge_partition: Option<&ferrosa_sstable::types::Partition>,
+    neighbor_id: &[u8],
+    prop_filters: &[(String, Expr)],
+) -> bool {
+    let partition = match edge_partition {
+        Some(p) => p,
+        None => return false, // No edge data available; filter fails.
+    };
 
-    let _ = property_name; // TODO: use schema metadata for exact column lookup
+    // Find the row whose clustering key matches the neighbor_id (target vertex).
+    let edge_row = partition.rows.iter().find(|r| r.clustering == neighbor_id);
 
-    for row in all_rows {
-        if let Some((_col_idx, cell)) = row.cells.first() {
-            return cell_value_to_json(cell);
+    let edge_row = match edge_row {
+        Some(r) => r,
+        None => return false, // No matching edge row found.
+    };
+
+    // Check each property filter.
+    for (_prop_name, expected_expr) in prop_filters {
+        let expected_bytes = match expr_to_bytes(expected_expr) {
+            Ok(b) => b,
+            Err(_) => return false, // Can't evaluate expression; filter fails.
+        };
+
+        // Check if any cell in the row matches the expected bytes.
+        let cell_matches = edge_row
+            .cells
+            .iter()
+            .any(|(_col_idx, cell)| cell.value.as_deref() == Some(expected_bytes.as_slice()));
+
+        if !cell_matches {
+            return false;
         }
     }
-    serde_json::Value::Null
+
+    true
 }
 
 /// Convert a `Literal` from the AST into raw bytes for storage.
@@ -501,6 +583,194 @@ fn execute_delete(
     })
 }
 
+/// Execute an Aggregate plan.
+///
+/// 1. Executes the inner plan to get all rows.
+/// 2. Groups rows by group key values.
+/// 3. For each group, creates accumulators, feeds values, builds output rows.
+/// 4. Enforces max group count (FMEA F7).
+#[allow(clippy::too_many_arguments)]
+fn execute_aggregate(
+    storage: &StorageEngine,
+    keyspace: &str,
+    inner: PhysicalPlan,
+    group_keys: &[usize],
+    projections: &[AggregateProjection],
+    return_clause: &ReturnClause,
+    config: &GraphEngineConfig,
+    start: Instant,
+    virtual_tables: Option<&VirtualTableRegistry>,
+) -> Result<GraphResult> {
+    // Step 1: Execute inner plan to get all rows.
+    let inner_result = execute(inner, storage, keyspace, config, virtual_tables)?;
+    check_timeout(start, config.query_timeout)?;
+
+    let inner_columns = &inner_result.columns;
+    let inner_rows = &inner_result.rows;
+
+    // Step 2: Group rows by group key values.
+    // Use a BTreeMap keyed by serialized group key for deterministic ordering.
+    let mut groups: std::collections::BTreeMap<String, Vec<&Vec<serde_json::Value>>> =
+        std::collections::BTreeMap::new();
+
+    for row in inner_rows {
+        // Build group key from the group_keys indices.
+        let group_key_values: Vec<&serde_json::Value> = group_keys
+            .iter()
+            .map(|&idx| row.get(idx).unwrap_or(&serde_json::Value::Null))
+            .collect();
+
+        let group_key_str = serde_json::to_string(&group_key_values).unwrap_or_default();
+
+        // Check group count limit (FMEA F7).
+        if !groups.contains_key(&group_key_str) && groups.len() >= config.max_groups {
+            return Err(GraphError::ResourceLimit(format!(
+                "aggregation group count limit exceeded: {} (limit: {})",
+                groups.len(),
+                config.max_groups
+            )));
+        }
+
+        groups.entry(group_key_str).or_default().push(row);
+    }
+
+    // If there are no group keys and no rows, produce a single group with empty rows
+    // so aggregates like count(*) return 0 rather than no rows.
+    if group_keys.is_empty() && groups.is_empty() {
+        groups.insert(String::new(), Vec::new());
+    }
+
+    // Step 3: Build output rows.
+    let columns = build_columns(return_clause);
+    let mut result_rows = Vec::new();
+
+    for group_rows in groups.values() {
+        // Create accumulators for each aggregate projection.
+        let mut accumulators: Vec<Option<Box<dyn Accumulator>>> = projections
+            .iter()
+            .map(|proj| match proj {
+                AggregateProjection::GroupKey(_) => Ok(None),
+                AggregateProjection::AggregateFunc { name, arg } => {
+                    let count_star = name == "count" && matches!(arg, Expr::Var(v) if v == "*");
+                    create_accumulator(name, count_star, config.max_collect_size).map(Some)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Feed rows into accumulators.
+        for row in group_rows {
+            for (proj_idx, proj) in projections.iter().enumerate() {
+                if let AggregateProjection::AggregateFunc { arg, .. } = proj {
+                    if let Some(ref mut acc) = accumulators[proj_idx] {
+                        let value = eval_aggregate_arg(arg, row, inner_columns);
+                        acc.accumulate(&value);
+                    }
+                }
+            }
+        }
+
+        // Check collect size limit (FMEA F6).
+        for acc in accumulators.iter().flatten() {
+            if acc.name() == "collect" {
+                let result = acc.finish();
+                if let serde_json::Value::Array(arr) = &result {
+                    if arr.len() >= config.max_collect_size {
+                        return Err(GraphError::ResourceLimit(format!(
+                            "collect() size limit exceeded: {} (limit: {})",
+                            arr.len(),
+                            config.max_collect_size,
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Build the output row.
+        let mut output_row = Vec::new();
+        let first_row = group_rows.first();
+
+        for (proj_idx, proj) in projections.iter().enumerate() {
+            match proj {
+                AggregateProjection::GroupKey(key_idx) => {
+                    let col_idx = group_keys.get(*key_idx).copied().unwrap_or(0);
+                    let value = first_row
+                        .and_then(|r| r.get(col_idx))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    output_row.push(value);
+                }
+                AggregateProjection::AggregateFunc { .. } => {
+                    let value = accumulators[proj_idx]
+                        .as_ref()
+                        .map(|a| a.finish())
+                        .unwrap_or(serde_json::Value::Null);
+                    output_row.push(value);
+                }
+            }
+        }
+
+        result_rows.push(output_row);
+    }
+
+    let mut stats = QueryStats::default();
+    stats.vertices_read = inner_result.stats.vertices_read;
+    stats.edges_read = inner_result.stats.edges_read;
+    stats.execution_ms = start.elapsed().as_millis() as u64;
+
+    Ok(GraphResult {
+        columns,
+        rows: result_rows,
+        stats,
+    })
+}
+
+/// Evaluate an aggregate function's argument expression against a row.
+///
+/// For `Var("*")` (count star), returns a non-null sentinel.
+/// For `Property { var, name }`, looks up the column in the inner result.
+/// For `Var(v)`, looks up the variable column.
+fn eval_aggregate_arg(
+    arg: &Expr,
+    row: &[serde_json::Value],
+    columns: &[String],
+) -> serde_json::Value {
+    match arg {
+        Expr::Var(v) if v == "*" => serde_json::json!(1), // sentinel for count(*)
+        Expr::Var(v) => {
+            let col_idx = columns.iter().position(|c| c == v);
+            col_idx
+                .and_then(|idx| row.get(idx))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        }
+        Expr::Property { var, name } => {
+            let col_name = format!("{var}.{name}");
+            let col_idx = columns.iter().position(|c| c == &col_name);
+            col_idx
+                .and_then(|idx| row.get(idx))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        }
+        Expr::Function { name, args } => {
+            // Nested function calls: for now just return the inner result column
+            let col_name = format!("{}({})", name, if args.is_empty() { "*" } else { "?" });
+            let col_idx = columns.iter().position(|c| c == &col_name);
+            col_idx
+                .and_then(|idx| row.get(idx))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        }
+        Expr::Literal(lit) => match lit {
+            Literal::Integer(i) => serde_json::json!(i),
+            Literal::Float(f) => serde_json::json!(f),
+            Literal::String(s) => serde_json::json!(s),
+            Literal::Bool(b) => serde_json::json!(b),
+            Literal::Null => serde_json::Value::Null,
+        },
+        _ => serde_json::Value::Null,
+    }
+}
+
 /// Sort rows by the specified ORDER BY columns.
 fn sort_rows(
     rows: &mut [Vec<serde_json::Value>],
@@ -578,27 +848,30 @@ fn execute_virtual_anchor(
     let vtable_columns = vtable.columns();
     let return_columns = build_columns(return_clause);
 
+    // Build a JSON object for each virtual row so eval_expr can project.
+    let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
+
     let mut rows = Vec::new();
     for vrow in &virtual_rows {
         if rows.len() >= config.max_result_rows {
             break;
         }
 
-        let row: Vec<serde_json::Value> = return_columns
+        // Construct a JSON object from virtual row cells, keyed by column name.
+        let mut obj = serde_json::Map::new();
+        for (idx, col_def) in vtable_columns.iter().enumerate() {
+            if idx < vrow.cells.len() {
+                obj.insert(col_def.name.clone(), cell_value_to_json(&vrow.cells[idx]));
+            }
+        }
+        let row_json = serde_json::Value::Object(obj);
+        let mut bindings = HashMap::new();
+        bindings.insert(anchor_var.to_string(), row_json);
+
+        let row: Vec<serde_json::Value> = return_clause
+            .items
             .iter()
-            .map(|col_name| {
-                // Try to find a matching column in the virtual table's schema.
-                // Column references may be "var.prop" (e.g. "n.peer_address")
-                // or just "prop" — extract the property name after the dot.
-                let prop_name = col_name.split('.').next_back().unwrap_or(col_name);
-
-                let col_idx = vtable_columns.iter().position(|c| c.name == prop_name);
-
-                match col_idx {
-                    Some(idx) if idx < vrow.cells.len() => cell_value_to_json(&vrow.cells[idx]),
-                    _ => serde_json::Value::Null,
-                }
-            })
+            .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
             .collect();
 
         rows.push(row);
@@ -649,6 +922,17 @@ fn expr_to_column_name(expr: &Expr) -> String {
     match expr {
         Expr::Property { var, name } => format!("{var}.{name}"),
         Expr::Var(v) => v.clone(),
+        Expr::Function { name, args } => {
+            let arg_str = if args.is_empty() {
+                "*".to_string()
+            } else {
+                args.iter()
+                    .map(expr_to_column_name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!("{name}({arg_str})")
+        }
         _ => "?".to_string(),
     }
 }
@@ -1303,5 +1587,96 @@ mod tests {
     fn literal_to_bytes_null() {
         let bytes = literal_to_bytes(&crate::parser::Literal::Null);
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn execute_aggregate_count() {
+        // Test end-to-end aggregation: count over a virtual table.
+        let registry = VirtualTableRegistry::new();
+        let vtable = Arc::new(TestVirtualTable {
+            table_name: "person_v".to_string(),
+            ks: "social".to_string(),
+            cols: vec![VirtualColumnDef {
+                name: "name".to_string(),
+                data_type: DataType::Text,
+            }],
+            rows: vec![
+                VirtualRow {
+                    cells: vec![CellValue::live(b"Alice".to_vec(), 1000)],
+                },
+                VirtualRow {
+                    cells: vec![CellValue::live(b"Bob".to_vec(), 1000)],
+                },
+                VirtualRow {
+                    cells: vec![CellValue::live(b"Charlie".to_vec(), 1000)],
+                },
+            ],
+        });
+        registry.register(vtable);
+
+        use crate::planner::logical::ResolvedTable;
+        use crate::planner::physical::{AggregateProjection, Anchor};
+
+        // The outer return clause has count(*) — no specific column arg.
+        let outer_return_clause = ReturnClause {
+            distinct: false,
+            items: vec![crate::parser::ReturnItem {
+                expr: Expr::Function {
+                    name: "count".to_string(),
+                    args: vec![],
+                },
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+
+        // The inner Expand uses Var("*") as a sentinel (the planner rewrites
+        // count() with no args into Var("*")). We return the anchor variable
+        // so each virtual table row produces one output row.
+        let inner_return_clause = ReturnClause {
+            distinct: false,
+            items: vec![crate::parser::ReturnItem {
+                expr: Expr::Var("*".to_string()),
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+
+        let inner_expand = PhysicalPlan::Expand {
+            anchor: Anchor {
+                var: Some("n".to_string()),
+                table: ResolvedTable {
+                    keyspace: "social".to_string(),
+                    table: "person_v".to_string(),
+                    graph_type: "vertex".to_string(),
+                    label: "Person".to_string(),
+                },
+                filters: vec![],
+            },
+            hops: vec![],
+            return_clause: inner_return_clause,
+        };
+
+        let agg_plan = PhysicalPlan::Aggregate {
+            inner: Box::new(inner_expand),
+            group_keys: vec![],
+            projections: vec![AggregateProjection::AggregateFunc {
+                name: "count".to_string(),
+                arg: Expr::Var("*".to_string()),
+            }],
+            return_clause: outer_return_clause,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = test_storage_engine(tmp.path());
+
+        let config = GraphEngineConfig::default();
+        let result = execute(agg_plan, &storage, "social", &config, Some(&registry)).unwrap();
+
+        assert_eq!(result.columns, vec!["count(*)"]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], serde_json::json!(3u64));
     }
 }

@@ -269,6 +269,34 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             out.push('}');
             out
         }
+        PhysicalPlan::Aggregate {
+            inner,
+            group_keys,
+            projections,
+            return_clause,
+        } => {
+            use crate::planner::physical::AggregateProjection;
+            let mut out = String::new();
+            out.push_str("Aggregate {\n");
+            out.push_str(&format!("  inner: {}\n", format_plan(inner)));
+            out.push_str(&format!("  group_keys: {:?}\n", group_keys));
+            for (i, proj) in projections.iter().enumerate() {
+                match proj {
+                    AggregateProjection::GroupKey(idx) => {
+                        out.push_str(&format!("  projection[{}]: GroupKey({})\n", i, idx));
+                    }
+                    AggregateProjection::AggregateFunc { name, .. } => {
+                        out.push_str(&format!("  projection[{}]: {}()\n", i, name));
+                    }
+                }
+            }
+            out.push_str(&format!(
+                "  return: {} item(s)\n",
+                return_clause.items.len()
+            ));
+            out.push('}');
+            out
+        }
     }
 }
 
