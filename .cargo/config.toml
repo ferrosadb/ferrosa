@@ -1,0 +1,12 @@
+# Cargo build configuration for Ferrosa
+#
+# Default target: x86_64-unknown-linux-gnu (standard glibc)
+# Musl target:    x86_64-unknown-linux-musl (static, for Firecracker guests)
+#
+# To build musl: make build-musl
+# Prerequisites:  rustup target add x86_64-unknown-linux-musl
+#                 sudo apt install musl-tools  (Ubuntu/Debian)
+
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,6 +1,7 @@
 .superpowers/
 .fastembed_cache/
 /target/
+/releases/
 Cargo.lock
 
 # .claude/skills/ contains symlinks to the research repo (~/.claude/skills/).
