@@ -5,6 +5,7 @@
 //! entry points consumed by the HTTP endpoint.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -14,10 +15,11 @@ use ferrosa_storage::StorageEngine;
 
 use crate::adjacency::observer::AdjacencyIndexObserver;
 use crate::adjacency::reconcile::spawn_reconciliation;
-use crate::error::Result;
+use crate::error::{GraphError, Result};
 use crate::executor::expand::{execute, GraphEngineConfig};
 use crate::executor::result::GraphResult;
-use crate::parser::parse;
+use crate::executor::subscribe::SubscriptionRegistry;
+use crate::parser::{parse, Statement};
 use crate::planner::logical::validate;
 use crate::planner::physical::{plan, PhysicalPlan};
 
@@ -40,12 +42,16 @@ impl Default for GraphConfig {
     }
 }
 
+/// Default per-connection subscription limit (FMEA F5).
+const DEFAULT_MAX_SUBSCRIPTIONS: usize = 8;
+
 /// Central coordinator for graph query processing.
 pub struct GraphEngine {
     schema: Arc<Schema>,
     storage: Arc<StorageEngine>,
     config: GraphEngineConfig,
     reconciliation_handles: Vec<tokio::task::JoinHandle<()>>,
+    subscription_registry: Arc<SubscriptionRegistry>,
 }
 
 /// Information about a vertex or edge label in the graph schema.
@@ -111,6 +117,7 @@ impl GraphEngine {
             storage,
             config,
             reconciliation_handles,
+            subscription_registry: Arc::new(SubscriptionRegistry::new(DEFAULT_MAX_SUBSCRIPTIONS)),
         }
     }
 
@@ -136,6 +143,60 @@ impl GraphEngine {
         let logical = validate(&snap, auth, keyspace, statement)?;
         let physical = plan(logical)?;
         Ok(format_plan(&physical))
+    }
+
+    /// Execute a subscribe query. Returns the initial snapshot, subscription ID,
+    /// poll interval, and delta flag. The HTTP layer manages the actual SSE stream.
+    pub fn execute_subscribe(
+        &self,
+        query: &str,
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<(GraphResult, Duration, bool)> {
+        let statement = parse(query)?;
+
+        // Verify this is actually a SUBSCRIBE statement.
+        match &statement {
+            Statement::Subscribe { .. } => {}
+            Statement::Unsubscribe { .. } => {
+                return Err(GraphError::Validation(
+                    "use the unsubscribe endpoint for UNSUBSCRIBE queries".to_string(),
+                ));
+            }
+            _ => {
+                return Err(GraphError::Validation(
+                    "expected a SUBSCRIBE statement".to_string(),
+                ));
+            }
+        }
+
+        let snap = self.schema.snapshot();
+        let logical = validate(&snap, auth, keyspace, statement)?;
+        let physical = plan(logical)?;
+
+        // Extract interval and delta from the Subscribe plan.
+        let (interval, delta) = match &physical {
+            PhysicalPlan::Subscribe {
+                interval, delta, ..
+            } => (*interval, *delta),
+            _ => unreachable!("SUBSCRIBE statement must produce Subscribe plan"),
+        };
+
+        // Execute the initial snapshot.
+        let result = execute(
+            physical,
+            &self.storage,
+            keyspace,
+            &self.config,
+            Some(self.schema.virtual_tables()),
+        )?;
+
+        Ok((result, interval, delta))
+    }
+
+    /// Get a reference to the subscription registry.
+    pub fn subscription_registry(&self) -> &Arc<SubscriptionRegistry> {
+        &self.subscription_registry
     }
 
     /// List vertex and edge tables with their labels in a keyspace.
@@ -220,6 +281,137 @@ fn format_plan(plan: &PhysicalPlan) -> String {
                 out.push_str(&format!(
                     "  hop[{}]: edge_label={:?}, direction={:?}, var={:?}\n",
                     i, hop.edge_label, hop.direction, hop.var
+                ));
+            }
+            out.push_str(&format!(
+                "  return: {} item(s)\n",
+                return_clause.items.len()
+            ));
+            out.push('}');
+            out
+        }
+        PhysicalPlan::CreateNodes { creates } => {
+            let mut out = String::new();
+            out.push_str("CreateNodes {\n");
+            for (i, op) in creates.iter().enumerate() {
+                out.push_str(&format!(
+                    "  create[{}]: {}.{} (var: {:?}, props: {})\n",
+                    i,
+                    op.table.keyspace,
+                    op.table.table,
+                    op.var,
+                    op.props.len()
+                ));
+            }
+            out.push('}');
+            out
+        }
+        PhysicalPlan::SetProperties {
+            expand,
+            assignments,
+        } => {
+            let mut out = String::new();
+            out.push_str("SetProperties {\n");
+            out.push_str(&format!("  expand: {}\n", format_plan(expand)));
+            out.push_str(&format!("  assignments: {}\n", assignments.len()));
+            out.push('}');
+            out
+        }
+        PhysicalPlan::DeleteNodes {
+            expand,
+            variables,
+            detach,
+        } => {
+            let mut out = String::new();
+            out.push_str("DeleteNodes {\n");
+            out.push_str(&format!("  expand: {}\n", format_plan(expand)));
+            out.push_str(&format!("  variables: {:?}\n", variables));
+            out.push_str(&format!("  detach: {}\n", detach));
+            out.push('}');
+            out
+        }
+        PhysicalPlan::Aggregate {
+            inner,
+            group_keys,
+            projections,
+            return_clause,
+        } => {
+            use crate::planner::physical::AggregateProjection;
+            let mut out = String::new();
+            out.push_str("Aggregate {\n");
+            out.push_str(&format!("  inner: {}\n", format_plan(inner)));
+            out.push_str(&format!("  group_keys: {:?}\n", group_keys));
+            for (i, proj) in projections.iter().enumerate() {
+                match proj {
+                    AggregateProjection::GroupKey(idx) => {
+                        out.push_str(&format!("  projection[{}]: GroupKey({})\n", i, idx));
+                    }
+                    AggregateProjection::AggregateFunc { name, .. } => {
+                        out.push_str(&format!("  projection[{}]: {}()\n", i, name));
+                    }
+                }
+            }
+            out.push_str(&format!(
+                "  return: {} item(s)\n",
+                return_clause.items.len()
+            ));
+            out.push('}');
+            out
+        }
+        PhysicalPlan::Subscribe {
+            inner,
+            interval,
+            delta,
+            return_clause,
+        } => {
+            let mut out = String::new();
+            out.push_str("Subscribe {\n");
+            out.push_str(&format!("  inner: {}\n", format_plan(inner)));
+            out.push_str(&format!("  interval: {:?}\n", interval));
+            out.push_str(&format!("  delta: {}\n", delta));
+            out.push_str(&format!(
+                "  return: {} item(s)\n",
+                return_clause.items.len()
+            ));
+            out.push('}');
+            out
+        }
+        PhysicalPlan::ExpandVarLength {
+            anchor,
+            hop,
+            min_hops,
+            max_hops,
+            return_clause,
+        } => {
+            let mut out = String::new();
+            out.push_str("ExpandVarLength {\n");
+            out.push_str(&format!(
+                "  anchor: {}.{} (var: {:?})\n",
+                anchor.table.keyspace, anchor.table.table, anchor.var
+            ));
+            out.push_str(&format!(
+                "  hop: edge_label={:?}, direction={:?}, var={:?}\n",
+                hop.edge_label, hop.direction, hop.var
+            ));
+            out.push_str(&format!("  range: {}..{}\n", min_hops, max_hops));
+            out.push_str(&format!(
+                "  return: {} item(s)\n",
+                return_clause.items.len()
+            ));
+            out.push('}');
+            out
+        }
+        PhysicalPlan::WcoJoin {
+            plan,
+            return_clause,
+        } => {
+            let mut out = String::new();
+            out.push_str("WcoJoin (leapfrog triejoin) {\n");
+            out.push_str(&format!("  variables: {:?}\n", plan.variables));
+            for (i, rel) in plan.relations.iter().enumerate() {
+                out.push_str(&format!(
+                    "  relation[{}]: ({})--[{:?} {:?}]-->({})\n",
+                    i, rel.src_var, rel.edge_label, rel.direction, rel.dst_var
                 ));
             }
             out.push_str(&format!(

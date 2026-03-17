@@ -386,6 +386,7 @@ mod tests {
                     rel_type: Some("FOLLOWS".into()),
                     direction: crate::parser::Direction::Out,
                     props: vec![],
+                    length_range: None,
                 },
                 Pattern::Node {
                     var: Some("f".into()),

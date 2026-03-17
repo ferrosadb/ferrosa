@@ -110,6 +110,9 @@ pub enum Pattern {
         rel_type: Option<String>,
         direction: Direction,
         props: PropMap,
+        /// Variable-length path range: `[*1..5]`, `[*]`, `[*3]`
+        /// None = single hop (default). Some((min, max)) where max=None means unbounded.
+        length_range: Option<(u32, Option<u32>)>,
     },
     /// A path is an alternating sequence of nodes and relationships:
     /// `(a)-[:KNOWS]->(b)-[:WORKS_AT]->(c)`
@@ -203,6 +206,7 @@ mod tests {
                     rel_type: Some("KNOWS".into()),
                     direction: Direction::Out,
                     props: vec![],
+                    length_range: None,
                 },
                 Pattern::Node {
                     var: Some("b".into()),

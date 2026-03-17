@@ -18,6 +18,15 @@ use crate::parser::token::{Keyword, TokenKind};
 /// NOT/unary operators. (Threat model T1 mitigation.)
 const MAX_EXPR_DEPTH: usize = 64;
 
+/// Result of parsing the inside of a relationship bracket.
+/// `(var, rel_type, props, length_range)`
+type RelDetail = (
+    Option<String>,
+    Option<String>,
+    PropMap,
+    Option<(u32, Option<u32>)>,
+);
+
 /// Parser state wrapping a [`Lexer`] and tracking expression nesting depth.
 struct Parser<'input> {
     lexer: Lexer<'input>,
@@ -272,7 +281,7 @@ impl<'input> Parser<'input> {
             // -[:TYPE]-> or -[:TYPE]- or -[var:TYPE {props}]->
             TokenKind::DashBracket => {
                 self.lexer.next_token()?;
-                let (var, rel_type, props) = self.parse_rel_detail()?;
+                let (var, rel_type, props, length_range) = self.parse_rel_detail()?;
 
                 // Expect ]-> or ]- or ]
                 let close = self.lexer.peek()?;
@@ -312,13 +321,14 @@ impl<'input> Parser<'input> {
                     rel_type,
                     direction,
                     props,
+                    length_range,
                 })
             }
             // <-[:TYPE]- or <-[var:TYPE]-
             TokenKind::ArrowLeft => {
                 self.lexer.next_token()?;
                 self.lexer.expect(&TokenKind::LBracket)?;
-                let (var, rel_type, props) = self.parse_rel_detail()?;
+                let (var, rel_type, props, length_range) = self.parse_rel_detail()?;
                 // Expect ]- or ]
                 let close = self.lexer.peek()?;
                 match &close.kind {
@@ -341,6 +351,7 @@ impl<'input> Parser<'input> {
                     rel_type,
                     direction: Direction::In,
                     props,
+                    length_range,
                 })
             }
             // Bare - used in undirected: (a)-(b) — treated as Both
@@ -351,6 +362,7 @@ impl<'input> Parser<'input> {
                     rel_type: None,
                     direction: Direction::Both,
                     props: vec![],
+                    length_range: None,
                 })
             }
             _ => Err(ParseError::new(
@@ -363,11 +375,14 @@ impl<'input> Parser<'input> {
         }
     }
 
-    /// Parse the inside of `[ ... ]` in a relationship: `var:TYPE {props}`
-    fn parse_rel_detail(&mut self) -> ParseResult<(Option<String>, Option<String>, PropMap)> {
+    /// Parse the inside of `[ ... ]` in a relationship: `var:TYPE*min..max {props}`
+    ///
+    /// Returns `(var, rel_type, props, length_range)`.
+    fn parse_rel_detail(&mut self) -> ParseResult<RelDetail> {
         let mut var = None;
         let mut rel_type = None;
         let mut props = vec![];
+        let mut length_range = None;
 
         let tok = self.lexer.peek()?;
         match &tok.kind {
@@ -383,8 +398,52 @@ impl<'input> Parser<'input> {
                     rel_type = Some(self.parse_label()?);
                 }
             }
+            TokenKind::Star => {
+                // Bare star without label: -[*]-> or -[*1..5]->
+            }
             _ => {
                 // Empty brackets: -[]-
+            }
+        }
+
+        // Parse optional variable-length `*` syntax:
+        // `*` → (1, None), `*3` → (3, Some(3)), `*1..5` → (1, Some(5))
+        if self.lexer.eat(&TokenKind::Star)? {
+            let tok = self.lexer.peek()?;
+            match &tok.kind {
+                TokenKind::Integer(_) => {
+                    let num_tok = self.lexer.next_token()?;
+                    let min = if let TokenKind::Integer(n) = num_tok.kind {
+                        n as u32
+                    } else {
+                        unreachable!()
+                    };
+                    // Check for `..max`
+                    if self.lexer.peek()?.kind == TokenKind::Dot {
+                        self.lexer.next_token()?; // consume first dot
+                        self.lexer.expect(&TokenKind::Dot)?; // consume second dot
+                        let max_tok = self.lexer.next_token()?;
+                        let max = if let TokenKind::Integer(n) = max_tok.kind {
+                            n as u32
+                        } else {
+                            return Err(ParseError::new(
+                                format!(
+                                    "expected integer after '..' in variable-length path, got {:?}",
+                                    max_tok.kind
+                                ),
+                                max_tok.span,
+                            ));
+                        };
+                        length_range = Some((min, Some(max)));
+                    } else {
+                        // Exact hop count: *3 means exactly 3 hops.
+                        length_range = Some((min, Some(min)));
+                    }
+                }
+                _ => {
+                    // Bare `*` — unbounded: 1 to unlimited.
+                    length_range = Some((1, None));
+                }
             }
         }
 
@@ -392,7 +451,7 @@ impl<'input> Parser<'input> {
             props = self.parse_prop_map()?;
         }
 
-        Ok((var, rel_type, props))
+        Ok((var, rel_type, props, length_range))
     }
 
     /// Parse `:Label` — consume colon and return the label name.
@@ -1481,5 +1540,67 @@ mod tests {
             "expected minimum interval error, got: {}",
             err.message
         );
+    }
+
+    // --- Variable-length path parsing ---
+
+    #[test]
+    fn parse_varpath_unbounded() {
+        let stmt = parse("MATCH (a)-[*]->(b) RETURN b").unwrap();
+        if let Statement::Match { pattern, .. } = stmt {
+            if let Pattern::Path(elems) = &pattern[0] {
+                if let Pattern::Rel { length_range, .. } = &elems[1] {
+                    assert_eq!(*length_range, Some((1, None)));
+                } else {
+                    panic!("expected Rel");
+                }
+            } else {
+                panic!("expected Path");
+            }
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn parse_varpath_exact() {
+        let stmt = parse("MATCH (a)-[*3]->(b) RETURN b").unwrap();
+        if let Statement::Match { pattern, .. } = stmt {
+            if let Pattern::Path(elems) = &pattern[0] {
+                if let Pattern::Rel { length_range, .. } = &elems[1] {
+                    assert_eq!(*length_range, Some((3, Some(3))));
+                } else {
+                    panic!("expected Rel");
+                }
+            } else {
+                panic!("expected Path");
+            }
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn parse_varpath_range() {
+        let stmt = parse("MATCH (a)-[:KNOWS*1..5]->(b) RETURN b").unwrap();
+        if let Statement::Match { pattern, .. } = stmt {
+            if let Pattern::Path(elems) = &pattern[0] {
+                if let Pattern::Rel {
+                    rel_type,
+                    length_range,
+                    ..
+                } = &elems[1]
+                {
+                    assert_eq!(rel_type, &Some("KNOWS".to_string()));
+                    assert_eq!(*length_range, Some((1, Some(5))));
+                } else {
+                    panic!("expected Rel");
+                }
+            } else {
+                panic!("expected Path");
+            }
+        } else {
+            panic!("expected Match");
+        }
     }
 }

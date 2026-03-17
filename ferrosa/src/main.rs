@@ -407,6 +407,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
+    // Create a shutdown watch channel for services that need graceful shutdown
+    // notification (e.g. the Bolt server).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     if graph_enabled {
         let graph_config = ferrosa_graph::engine::GraphConfig {
             enabled: true,
@@ -425,9 +429,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             graph_config.reconciliation_interval,
         ));
 
+        // 10a. Graph HTTP server (port 7474)
         let schema_for_http = schema.clone();
         let state = ferrosa_graph::http::AppState {
-            engine: graph_engine,
+            engine: graph_engine.clone(),
             schema: schema_for_http,
         };
         tokio::spawn(async move {
@@ -435,6 +440,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::error!(%e, "graph HTTP server failed");
             }
         });
+
+        // 10b. Bolt server (port 7687)
+        let bolt_port: u16 = config_val(
+            "FERROSA_BOLT_PORT",
+            &file_config,
+            "graph",
+            "bolt_port",
+            "7687",
+        )
+        .parse()
+        .unwrap_or(7687);
+        let bolt_bind: std::net::SocketAddr = std::net::SocketAddr::from(([0, 0, 0, 0], bolt_port));
+        let bolt_config = ferrosa_graph::bolt::server::BoltConfig {
+            bind_addr: bolt_bind,
+            ..ferrosa_graph::bolt::server::BoltConfig::default()
+        };
+        let bolt_engine = graph_engine;
+        let bolt_schema = schema.clone();
+        let bolt_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ferrosa_graph::bolt::server::start_bolt_server(
+                bolt_engine,
+                bolt_schema,
+                bolt_config,
+                bolt_shutdown,
+            )
+            .await
+            {
+                tracing::error!(%e, "Bolt server failed");
+            }
+        });
+        tracing::info!(%bolt_bind, "Bolt server starting");
     } else {
         tracing::info!("graph engine disabled (set FERROSA_GRAPH_ENABLED=true to enable)");
     }
@@ -575,6 +612,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 14. Graceful shutdown: flush memtables, sync to S3, stop compaction
     tracing::info!("shutdown signal received, draining...");
+
+    // Signal Bolt server (and any other watch-based services) to stop.
+    let _ = shutdown_tx.send(true);
 
     let shutdown_timeout = std::time::Duration::from_secs(30);
     match tokio::time::timeout(shutdown_timeout, async {

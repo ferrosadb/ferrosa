@@ -15,11 +15,11 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | ferrosa-cql | Done (Parts A-D + observability + LZ4/Snappy frame compression + UDT DDL + UDF DDL parsing) |
 | ferrosa-index | Done (8 secondary index types + 2 vector index types: HNSW, IVFFlat) |
 | ferrosa-udf | Done (parser, schema, DDL replication, Wasmtime compilation, router wiring; wit-bindgen invoke TODO) |
-| ferrosa-graph | Done (Phase 1: parser, planner, executor, adjacency index, HTTP endpoint) |
+| ferrosa-graph | Done (eval, aggregations, var-length paths, SUBSCRIBE, leapfrog triejoin, Bolt v5, HTTP+auth) |
 | ferrosa-net | Done (Phase 1 + reconnection, graceful drain) |
 | ferrosa-cluster | Done (Phase 1-3 + UDT/index DDL replication) |
 | ferrosa-ctl | Done (CLI + TUI + cluster management commands) |
-| ferrosa (binary) | Done (cluster-mode: CQL on 9042, graph on 7474, web console + cluster API on 9090, Prometheus metrics) |
+| ferrosa (binary) | Done (CQL on 9042, graph HTTP on 7474, Bolt on 7687, web console + cluster API on 9090, Prometheus) |
 
 ## Specs Index
 
@@ -37,6 +37,9 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [Threat Model](threat-model.md) | STRIDE threat analysis: trust boundaries, threat inventory, mitigations | Draft |
 | [Threat Model — CQL B/C](threat-model-cql-bc.md) | STRIDE for CQL parser, routing, prepared cache | Approved |
 | [Threat Model — Graph](threat-model-graph.md) | STRIDE for graph engine, HTTP endpoint, adjacency index | Draft |
+| [Graph Gap Closure](graph-gap-closure.md) | Architecture for remaining graph gaps: SUBSCRIBE, aggregations, var-length paths, Bolt | Draft |
+| [Graph Gap FMEA](graph-gap-fmea.md) | Failure modes for graph gap closure (14 failure modes, 14 test cases) | Draft |
+| [Graph Gap Project Plan](graph-gap-project-plan.md) | 3-sprint plan: eval+agg, varpath+subscribe, Bolt | Draft |
 | [Threat Model — Net/Cluster](threat-model-net-cluster.md) | STRIDE for internode protocol, Raft, pair mode, coordinator | Draft |
 | [Threat Model — Schema Replication](threat-model-schema-replication.md) | STRIDE for schema snapshot sync, DDL forwarding (T21-T28) | Draft |
 | [Cluster Phase 2 Design](../superpowers/specs/2026-03-14-cluster-phase2-design.md) | Raft consensus, token ring, coordinator pattern | Implemented |
