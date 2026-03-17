@@ -1,6 +1,6 @@
 # Ferrosa Development Status
 
-> Last updated: 2026-03-16
+> Last updated: 2026-03-17
 > Status: Living document
 
 ## Overview
@@ -12,9 +12,10 @@ node lifecycle (join/decommission/rebalance), reconnection, and integration test
 Hardening and observability wiring sprints are also complete. UDT/UDF with WASM
 sandboxing is complete (parser, schema, DDL replication, Wasmtime compilation, router
 wiring). Secondary and vector indexes consolidated into the main branch. Graph engine
-is feature-complete: Cypher parser, CREATE/SET/DELETE planner+executor, result
-projection with property extraction, ORDER BY/LIMIT/DISTINCT, and full adjacency
-reconciliation.
+is fully complete: Cypher parser, expression evaluator, aggregation framework,
+variable-length paths with BFS, SUBSCRIBE/UNSUBSCRIBE with SSE streaming,
+leapfrog triejoin for worst-case optimal joins, Bolt v5 wire protocol with TCP
+server, and full adjacency reconciliation.
 
 | Metric | Value |
 |--------|-------|
@@ -35,7 +36,7 @@ schema         █████░   █████▌  █████░   █
 index          █████░   ██████  █████░   ██░░░░
 udf            █████░   █████░  ████░░   ███░░░
 cql            ██████   ██████  ██████   ████░░
-graph          ██████   ██████  █████░   ███░░░
+graph          ██████   ██████  ██████   ████░░
 ctl            ██████   ██████  ████░░   ████░░
 binary         ██████   ██████  ████░░   ████░░
 net            ██████   ██████  █████░   ███░░░
@@ -187,28 +188,33 @@ cluster        ██████   ██████  █████░   █
   - [ ] Logged batch atomicity
   - [ ] Query tracing
 
-### ferrosa-graph — Feature Complete
+### ferrosa-graph — Complete
 
-- **LOC:** ~7,500 (20 files) | **Tests:** 139
-- **Modules:** `adjacency` (observer, reconcile, schema), `engine`, `error`,
-  `executor` (expand, result), `http`, `parser` (ast, lexer, parse_impl, token),
-  `planner` (logical, physical)
-- **What's done:** Full Cypher parser, logical planner with label resolution +
-  per-hop auth, physical planner for MATCH/CREATE/SET/DELETE, expand executor with
-  result projection (property extraction from rows), ORDER BY/LIMIT/DISTINCT,
-  resource limits (T4), adjacency index with WriteObserver, full background
-  reconciliation (edge scan + orphan cleanup), HTTP/JSON endpoint with auth, TLS,
-  error sanitization, audit logging.
-- **Future:**
+- **LOC:** ~13,800 (28 files) | **Tests:** 268
+- **Modules:** `adjacency` (observer, reconcile, schema), `bolt` (codec, handshake,
+  message, server), `engine`, `error`, `executor` (aggregate, eval, expand,
+  leapfrog, result, subscribe, varpath), `http`, `parser` (ast, lexer, parse_impl,
+  token), `planner` (logical, physical)
+- **What's done:** Full Cypher parser, expression evaluator with NULL propagation +
+  three-valued logic + 10 built-in scalar functions, aggregation framework
+  (count/sum/avg/min/max/collect with GROUP BY), variable-length paths via BFS with
+  cycle detection + visited budget, SUBSCRIBE/UNSUBSCRIBE with SSE streaming + delta
+  mode, leapfrog triejoin for worst-case optimal cyclic pattern matching, Bolt v5
+  wire protocol (PackStream codec, chunked framing, version negotiation, TCP server
+  on port 7687 with auth), HTTP/JSON endpoint with auth + TLS + error sanitization,
+  hop property filtering, adjacency index with WriteObserver + full reconciliation.
+- **Completed:**
   - [x] ~~Full adjacency reconciliation scan~~ (T5 — edge scan + orphan cleanup)
   - [x] ~~CREATE/SET/DELETE planning and execution~~
   - [x] ~~Result projection with property extraction~~
   - [x] ~~ORDER BY, LIMIT, DISTINCT~~
-  - [ ] WCO (worst-case optimal) joins
-  - [ ] Leapfrog triejoin
-  - [ ] Variable-length paths
-  - [ ] Aggregations
-  - [ ] Bolt protocol support
+  - [x] ~~Expression evaluator with built-in functions~~
+  - [x] ~~Aggregation framework (count, sum, avg, min, max, collect, GROUP BY)~~
+  - [x] ~~Variable-length paths~~ (`[*]`, `[*3]`, `[*1..5]` syntax with BFS)
+  - [x] ~~SUBSCRIBE/UNSUBSCRIBE execution~~ (SSE streaming, delta mode, subscription registry)
+  - [x] ~~Hop property filtering~~ (relationship constraint evaluation during traversal)
+  - [x] ~~WCO joins / leapfrog triejoin~~ (automatic cycle detection, sorted adjacency intersection)
+  - [x] ~~Bolt v5 protocol~~ (PackStream, chunked framing, TCP server on port 7687)
 
 ### ferrosa-ctl — Complete
 
@@ -334,7 +340,8 @@ cluster        ██████   ██████  █████░   █
 | ~~Observability wiring~~ | — | Merged (PR #53) |
 | ~~Production cluster (Phase 3)~~ | — | Merged (PR #57) |
 | ~~Beta release v1.0.0-beta.1~~ | — | Released (PR #58, #59) |
-| Beta release v1.0.0-beta.3 | — | In progress |
+| ~~Beta release v1.0.0-beta.3~~ | — | Released |
+| Beta release v1.0.0-beta.4 | — | In progress |
 | NetworkTopologyStrategy (multi-DC) | — | Planned |
 
 ## Path to Distributed Operation

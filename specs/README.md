@@ -15,11 +15,11 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | ferrosa-cql | Done (Parts A-D + observability + LZ4/Snappy frame compression + UDT DDL + UDF DDL parsing) |
 | ferrosa-index | Done (8 secondary index types + 2 vector index types: HNSW, IVFFlat) |
 | ferrosa-udf | Done (parser, schema, DDL replication, Wasmtime compilation, router wiring; wit-bindgen invoke TODO) |
-| ferrosa-graph | Done (Feature complete: parser, MATCH/CREATE/SET/DELETE, adjacency index+reconciliation, HTTP endpoint) |
+| ferrosa-graph | Done (eval, aggregations, var-length paths, SUBSCRIBE, leapfrog triejoin, Bolt v5, HTTP+auth) |
 | ferrosa-net | Done (Phase 1 + reconnection, graceful drain) |
 | ferrosa-cluster | Done (Phase 1-3 + UDT/index DDL replication) |
 | ferrosa-ctl | Done (CLI + TUI + cluster management commands) |
-| ferrosa (binary) | Done (cluster-mode: CQL on 9042, graph on 7474, web console + cluster API on 9090, Prometheus metrics) |
+| ferrosa (binary) | Done (CQL on 9042, graph HTTP on 7474, Bolt on 7687, web console + cluster API on 9090, Prometheus) |
 
 ## Specs Index
 

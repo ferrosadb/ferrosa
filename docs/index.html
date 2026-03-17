@@ -751,7 +751,7 @@
 <section class="hero">
   <div class="hero-badge">
     <span class="dot"></span>
-    v1.0.0-beta.3 — active development
+    v1.0.0-beta.4 — active development
   </div>
   <h1>
     Cassandra. <span class="gradient">Reimagined.</span><br>
@@ -916,10 +916,11 @@
       <p>
         Cypher queries on your CQL tables. No separate graph database.
         Vertices and edges are normal tables with schema extensions.
-        Multi-hop traversals, pattern matching, and path queries — one database, two query languages.
-        SUBSCRIBE to graph query results for real-time updates with EVERY and DELTA modes.
+        Variable-length paths, aggregations (count, sum, avg), expression evaluation,
+        and worst-case optimal joins via leapfrog triejoin for cyclic pattern matching.
+        Bolt v5 wire protocol for Neo4j driver compatibility alongside HTTP/JSON.
       </p>
-      <span class="metric">MATCH (a)-[:KNOWS]->(b) RETURN b</span>
+      <span class="metric">Cypher · Bolt v5 · HTTP/JSON · leapfrog triejoin · SUBSCRIBE</span>
     </div>
 
     <!-- Real-time pub/sub — key differentiator, full width -->
@@ -1297,7 +1298,7 @@ user = session.execute(stmt, [user_id])
         </tr>
         <tr>
           <td>Graph Queries</td>
-          <td class="ferrosa-col"><span class="check">✓</span> Cypher</td>
+          <td class="ferrosa-col"><span class="check">✓</span> Cypher + Bolt</td>
           <td><span class="cross">✗</span></td>
           <td><span class="cross">✗</span></td>
           <td><span class="cross">✗</span></td>
@@ -1411,7 +1412,7 @@ user = session.execute(stmt, [user_id])
         <div class="arch-layer-items">
           <span class="arch-item">ferrosa-cql</span>
           <span class="arch-item">ferrosa-net</span>
-          <span class="arch-item">Graph HTTP</span>
+          <span class="arch-item">Graph HTTP + Bolt</span>
         </div>
       </div>
       <div class="arch-layer">
@@ -1575,10 +1576,10 @@ user = session.execute(stmt, [user_id])
   <div style="max-width: 700px; margin: 0 auto;">
     <div class="code-demo">
       <pre class="code-block active" style="display: block;"><span class="cm"># Download the latest release</span>
-<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_1.0.0-beta.3_amd64.deb
+<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_1.0.0-beta.4_amd64.deb
 
 <span class="cm"># Install</span>
-<span class="kw">sudo</span> dpkg -i ferrosa_1.0.0-beta.3_amd64.deb
+<span class="kw">sudo</span> dpkg -i ferrosa_1.0.0-beta.4_amd64.deb
 
 <span class="cm"># Start the service</span>
 <span class="kw">sudo</span> systemctl start ferrosa
