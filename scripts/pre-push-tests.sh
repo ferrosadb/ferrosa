@@ -34,7 +34,7 @@ REMOTE_REF=$(git rev-parse @{push} 2>/dev/null || git rev-parse origin/main 2>/d
 CHANGED_FILES=$(git diff --name-only "$REMOTE_REF"..HEAD 2>/dev/null || git diff --name-only HEAD~1..HEAD)
 
 # Map changed files to crate names
-declare -A CRATES_TO_TEST
+declare -A CRATES_TO_TEST=()
 for file in $CHANGED_FILES; do
   # Match ferrosa-*/... or ferrosa/...
   crate=$(echo "$file" | grep -oP '^(ferrosa(-[a-z]+)*)/' | tr -d '/' || true)
