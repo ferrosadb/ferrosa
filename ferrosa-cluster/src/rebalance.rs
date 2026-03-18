@@ -165,7 +165,10 @@ pub async fn execute_rebalance(
 
     // Propose AssignTokens for each target node.
     for (node_id, tokens) in by_target {
-        let cmd = crate::raft::RaftCommand::AssignTokens { node_id, tokens };
+        let cmd = crate::raft::RaftCommand {
+            op: crate::raft::RaftOp::AssignTokens { node_id, tokens },
+            schema_version: uuid::Uuid::new_v4(),
+        };
         raft.client_write(cmd).await.map_err(|e| {
             crate::error::ClusterError::RaftError(format!(
                 "rebalance: AssignTokens for node {node_id} failed: {e}"

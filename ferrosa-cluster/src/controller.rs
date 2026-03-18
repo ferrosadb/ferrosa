@@ -49,7 +49,7 @@ use crate::raft::handlers::{
 use crate::raft::log_store::SledLogStore;
 use crate::raft::network::FerrosRaftNetworkFactory;
 use crate::raft::state_machine::FerrosStateMachine;
-use crate::raft::{uuid_to_node_id, FerrosRaft, NodeInfo, NodeState, RaftCommand};
+use crate::raft::{uuid_to_node_id, FerrosRaft, NodeInfo, NodeState, RaftCommand, RaftOp};
 use crate::ring::TokenRing;
 use crate::state::{PairClusterState, RaftClusterState};
 use crate::write_path::WritePath;
@@ -312,15 +312,21 @@ impl ModeController {
             state: NodeState::Normal,
         };
 
-        let join_cmd = RaftCommand::JoinNode(node_info);
+        let join_cmd = RaftCommand {
+            op: RaftOp::JoinNode(node_info),
+            schema_version: Uuid::new_v4(),
+        };
         raft.client_write(join_cmd)
             .await
             .map_err(|e| ClusterError::RaftError(format!("JoinNode proposal failed: {e}")))?;
 
         // Propose AssignTokens via Raft.
-        let assign_cmd = RaftCommand::AssignTokens {
-            node_id: peer_node_id,
-            tokens,
+        let assign_cmd = RaftCommand {
+            op: RaftOp::AssignTokens {
+                node_id: peer_node_id,
+                tokens,
+            },
+            schema_version: Uuid::new_v4(),
         };
         raft.client_write(assign_cmd)
             .await
@@ -353,7 +359,10 @@ impl ModeController {
 
         // 1. Propose LeaveNode via Raft — this removes the node from membership
         //    and cleans up its tokens in the state machine.
-        let leave_cmd = RaftCommand::LeaveNode { node_id };
+        let leave_cmd = RaftCommand {
+            op: RaftOp::LeaveNode { node_id },
+            schema_version: Uuid::new_v4(),
+        };
         raft.client_write(leave_cmd)
             .await
             .map_err(|e| ClusterError::RaftError(format!("LeaveNode proposal failed: {e}")))?;
@@ -957,7 +966,10 @@ impl ModeController {
                 state: NodeState::Normal,
             };
 
-            let join_cmd = RaftCommand::JoinNode(node_info);
+            let join_cmd = RaftCommand {
+                op: RaftOp::JoinNode(node_info),
+                schema_version: Uuid::new_v4(),
+            };
             if let Err(e) = raft.client_write(join_cmd).await {
                 tracing::warn!(peer = %host_id, %e, "JoinNode proposal failed");
                 return;
@@ -969,9 +981,12 @@ impl ModeController {
                 .map(|i| generate_deterministic_token(peer_node_id, i))
                 .collect();
 
-            let assign_cmd = RaftCommand::AssignTokens {
-                node_id: peer_node_id,
-                tokens,
+            let assign_cmd = RaftCommand {
+                op: RaftOp::AssignTokens {
+                    node_id: peer_node_id,
+                    tokens,
+                },
+                schema_version: Uuid::new_v4(),
             };
             if let Err(e) = raft.client_write(assign_cmd).await {
                 tracing::warn!(peer = %host_id, %e, "AssignTokens proposal failed");

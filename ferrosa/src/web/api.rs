@@ -177,7 +177,10 @@ async fn add_node_handler(
 
     // If Raft is initialized, also propose ApproveNode so all replicas learn.
     if let Some(raft) = mc.raft() {
-        let cmd = ferrosa_cluster::raft::RaftCommand::ApproveNode { host_id };
+        let cmd = ferrosa_cluster::raft::RaftCommand {
+            op: ferrosa_cluster::raft::RaftOp::ApproveNode { host_id },
+            schema_version: uuid::Uuid::new_v4(),
+        };
         if let Err(e) = raft.client_write(cmd).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
