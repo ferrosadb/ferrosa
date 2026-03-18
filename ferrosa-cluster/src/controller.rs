@@ -663,7 +663,7 @@ impl ModeController {
         };
 
         // 2. Create state machine from current schema
-        let state_machine =
+        let mut state_machine =
             FerrosStateMachine::with_side_effects(self.schema.clone(), self.storage.clone());
 
         // 3. Create network factory
@@ -733,6 +733,26 @@ impl ModeController {
         }
 
         let ring_arc = Arc::new(ArcSwap::from_pointee(ring));
+
+        // Seed the state machine with the initial topology so that
+        // sync_ring() won't overwrite the ring with empty state.
+        {
+            let mut members = std::collections::BTreeMap::new();
+            let mut token_map = std::collections::BTreeMap::new();
+            let ring_snap = ring_arc.load();
+            for &nid in &all_node_ids {
+                if let Some(info) = ring_snap.get_node(nid) {
+                    members.insert(nid, info.clone());
+                }
+            }
+            for &nid in &all_node_ids {
+                for tok in ring_snap.tokens_for_node(nid) {
+                    token_map.insert(tok, nid);
+                }
+            }
+            state_machine.seed_topology(members, token_map);
+            state_machine.set_ring(ring_arc.clone());
+        }
 
         // Expose the live ring snapshot for observability (web API, CLI).
         // We capture a snapshot of the ring at this point; it will be updated

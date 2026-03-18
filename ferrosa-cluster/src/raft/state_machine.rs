@@ -151,6 +151,21 @@ impl FerrosStateMachine {
         self.ring = Some(ring);
     }
 
+    /// Seed the state machine with initial cluster topology.
+    ///
+    /// Called during `transition_to_cluster` so that the state machine's
+    /// internal `members` and `token_map` match the initial `TokenRing`.
+    /// Without this, the first `sync_ring()` call would rebuild from empty
+    /// state, wiping the ring that the coordinator is using.
+    pub fn seed_topology(
+        &mut self,
+        members: BTreeMap<u64, NodeInfo>,
+        token_map: BTreeMap<Token, u64>,
+    ) {
+        self.state.members = members;
+        self.state.token_map = token_map;
+    }
+
     /// Read-only access to the current cluster state.
     pub fn state(&self) -> &RaftState {
         &self.state
