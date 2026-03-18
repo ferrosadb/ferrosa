@@ -7,4 +7,3 @@ CREATE KEYSPACE IF NOT EXISTS setup_test WITH replication = {'class': 'SimpleStr
 CREATE TABLE IF NOT EXISTS setup_test.hello (id int PRIMARY KEY, message text);
 INSERT INTO setup_test.hello (id, message) VALUES (1, 'Hello from Ferrosa!');
 SELECT * FROM setup_test.hello;
-DROP KEYSPACE IF EXISTS setup_test;

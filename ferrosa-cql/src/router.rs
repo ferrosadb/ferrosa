@@ -15,6 +15,7 @@ use arc_swap::ArcSwap;
 use bytes::BytesMut;
 use indexmap::IndexMap;
 
+use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::pair::ddl::DdlOperation;
 use ferrosa_cluster::{DdlPath, WritePath};
 use ferrosa_common::DataType;
@@ -60,10 +61,12 @@ pub struct SharedState {
     pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
 }
 
-/// Per-request context: authentication and current keyspace.
+/// Per-request context: authentication, current keyspace, and consistency level.
 pub struct RequestContext<'a> {
     pub auth: &'a AuthContext,
     pub current_keyspace: &'a Option<String>,
+    /// Client-requested consistency level parsed from the CQL protocol frame.
+    pub consistency: ConsistencyLevel,
 }
 
 /// Result of routing a statement.
@@ -1060,11 +1063,19 @@ async fn route_insert(
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
     let table_id = TableId::new(ks, &s.table);
+    let rf = keyspace_rf(&state.schema, ks);
 
     state
         .write_path
         .load()
-        .write(&table_id, &decorated_key, row, timestamp)
+        .write(
+            &table_id,
+            &decorated_key,
+            row,
+            timestamp,
+            ctx.consistency,
+            rf,
+        )
         .await?;
     Ok(result::encode_void())
 }
@@ -1189,8 +1200,15 @@ async fn route_update(
                             ));
                         }
                     }
+                    CqlType::Map(key_type, _) => {
+                        // Map subtraction: RHS is a set of keys to remove.
+                        // Coerce the set literal to Set<K>, not Map<K,V>.
+                        let set_of_keys = CqlType::Set(key_type.clone());
+                        let val = bridge::term_to_cql_value(value, &set_of_keys)?;
+                        (column.as_str(), val)
+                    }
                     _ => {
-                        // Collection subtract: store new value (simplified)
+                        // Set/list subtraction: RHS is the same collection type.
                         let val = bridge::term_to_cql_value(value, &cql_type)?;
                         (column.as_str(), val)
                     }
@@ -1227,11 +1245,19 @@ async fn route_update(
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
     let table_id = TableId::new(ks, &s.table);
+    let rf = keyspace_rf(&state.schema, ks);
 
     state
         .write_path
         .load()
-        .write(&table_id, &decorated_key, row, timestamp)
+        .write(
+            &table_id,
+            &decorated_key,
+            row,
+            timestamp,
+            ctx.consistency,
+            rf,
+        )
         .await?;
     Ok(result::encode_void())
 }
@@ -1315,11 +1341,19 @@ async fn route_delete(
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let row = bridge::build_delete_row(&delete_columns, &ck_values, timestamp);
     let table_id = TableId::new(ks, &s.table);
+    let rf = keyspace_rf(&state.schema, ks);
 
     state
         .write_path
         .load()
-        .write(&table_id, &decorated_key, row, timestamp)
+        .write(
+            &table_id,
+            &decorated_key,
+            row,
+            timestamp,
+            ctx.consistency,
+            rf,
+        )
         .await?;
     Ok(result::encode_void())
 }
@@ -2244,6 +2278,18 @@ fn resolve_keyspace<'a>(
         .as_deref()
         .or(current.as_deref())
         .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))
+}
+
+/// Look up the replication factor for a keyspace from the schema.
+///
+/// Falls back to 1 if the keyspace is not found or the RF is not set.
+fn keyspace_rf(schema: &Schema, ks: &str) -> usize {
+    let snap = schema.snapshot();
+    snap.keyspaces
+        .get(ks)
+        .and_then(|km| km.replication.options.get("replication_factor"))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
 }
 
 /// Build column names and types for a SELECT result.
@@ -3306,6 +3352,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // CREATE KEYSPACE
@@ -3352,6 +3399,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("USE my_ks").unwrap();
         match route(&state, &ctx, stmt).await.unwrap() {
@@ -3369,6 +3417,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -3397,6 +3446,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -3449,6 +3499,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM users WHERE id = 1").unwrap();
         assert!(route(&state, &ctx, stmt).await.is_err());
@@ -3460,6 +3511,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         // Build a batch statement with > 500 entries programmatically
         let stmts: Vec<Statement> = (0..501)
@@ -3489,6 +3541,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.peers").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -3504,6 +3557,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system_schema.keyspaces").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -3563,6 +3617,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let _ = route(&state, &ctx, stmt).await;
@@ -3575,6 +3630,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace and table first
@@ -3659,6 +3715,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse("SELECT * FROM test_ks.test_vtable").unwrap();
@@ -3706,6 +3763,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace first
@@ -3744,6 +3802,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace + type
@@ -3780,6 +3839,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace + type
@@ -3809,6 +3869,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace
@@ -3830,6 +3891,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace + type
@@ -3858,6 +3920,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace + type
@@ -3887,6 +3950,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &ks,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace first (with explicit ks in statement)
@@ -3911,6 +3975,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // CREATE TYPE without keyspace and no session keyspace
@@ -3925,6 +3990,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace + type
@@ -3952,6 +4018,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace but no type
@@ -3978,6 +4045,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4008,6 +4076,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4038,6 +4107,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4069,6 +4139,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4084,6 +4155,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4107,6 +4179,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4130,6 +4203,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4153,6 +4227,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4231,6 +4306,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Setup: create keyspace and table
@@ -4294,6 +4370,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Setup
@@ -4372,6 +4449,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Setup
@@ -4437,6 +4515,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4496,6 +4575,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Setup: table with an index on `email` but NOT on `name`
@@ -4549,6 +4629,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4600,6 +4681,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4642,6 +4724,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Setup: table with composite key (pk, ck) and a value column
@@ -4782,6 +4865,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system_observability.connections").unwrap();
         let result = route(&state, &ctx, stmt).await;
@@ -4803,6 +4887,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt =
             crate::parser::parse("SELECT * FROM system_observability.active_queries").unwrap();
@@ -4831,6 +4916,7 @@ mod tests {
             &RequestContext {
                 auth: &dev,
                 current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
             },
             use_stmt,
         )
@@ -4849,6 +4935,7 @@ mod tests {
             &RequestContext {
                 auth: &dev,
                 current_keyspace: &Some(new_ks),
+                consistency: ConsistencyLevel::One,
             },
             sel_stmt,
         )

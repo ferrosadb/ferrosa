@@ -65,9 +65,9 @@ pub enum LaneState {
 
 /// Maximum number of reconnection attempts before moving to [`LaneState::Failed`].
 ///
-/// At 10 s cap the tail attempts are spaced 10 s apart.  36 attempts ≈ 5 min
+/// At 30 s cap the tail attempts are spaced 30 s apart.  12 attempts ≈ 3 min
 /// total worst-case exposure before the lane is declared permanently failed.
-pub const MAX_RECONNECT_ATTEMPTS: u32 = 36;
+pub const MAX_RECONNECT_ATTEMPTS: u32 = 12;
 
 /// Spawn a task that watches `alive_rx` and triggers `on_dead` whenever the
 /// connection transitions from alive to dead.
@@ -102,7 +102,7 @@ pub(crate) async fn connect_with_retry(
     lane: Lane,
     tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
 ) -> Option<RpcClient> {
-    let mut backoff = ExponentialBackoff::new(Duration::from_millis(100), Duration::from_secs(10));
+    let mut backoff = ExponentialBackoff::new(Duration::from_millis(500), Duration::from_secs(30));
 
     for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
         let delay = backoff.next_delay();

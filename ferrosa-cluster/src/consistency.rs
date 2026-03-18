@@ -43,6 +43,23 @@ impl ConsistencyLevel {
         }
     }
 
+    /// Decode from the CQL native protocol wire format (u16).
+    ///
+    /// See CQL native protocol v5 §2.2 for the consistency enum values.
+    pub fn from_wire(code: u16) -> Option<Self> {
+        match code {
+            0x0001 => Some(Self::One),
+            0x0002 => Some(Self::Two),
+            0x0003 => Some(Self::Three),
+            0x0004 => Some(Self::Quorum),
+            0x0005 => Some(Self::All),
+            0x0006 => Some(Self::LocalQuorum),
+            0x0007 => Some(Self::EachQuorum),
+            0x000A => Some(Self::LocalOne),
+            _ => None,
+        }
+    }
+
     /// Parse from CQL string representation.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {

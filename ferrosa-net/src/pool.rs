@@ -45,14 +45,18 @@ impl ReconnectContext {
     /// 4. On exhaustion: stores `Failed`.
     fn spawn_reconnect(self) {
         tokio::spawn(async move {
-            // Mark as Reconnecting immediately so callers see the right state.
+            // Dedup: skip if already reconnecting or permanently failed.
             {
                 let mut guard = self.slot.lock().await;
+                match &*guard {
+                    LaneState::Reconnecting { .. } | LaneState::Failed => return,
+                    LaneState::Connected(_) => {}
+                }
                 *guard = LaneState::Reconnecting {
                     attempt: 0,
                     backoff: ExponentialBackoff::new(
-                        Duration::from_millis(100),
-                        Duration::from_secs(10),
+                        Duration::from_millis(500),
+                        Duration::from_secs(30),
                     ),
                 };
             }

@@ -784,6 +784,21 @@ impl<'input> Lexer<'input> {
             });
         }
 
+        // UUID detection for pure-digit prefixes: e.g. 11111111-1111-1111-1111-111111111111
+        // The block above only handles prefixes with hex alpha chars (a-f); all-digit
+        // prefixes like "11111111" fall through here because '-' is not alphabetic.
+        let digit_text = &self.input[start..self.pos];
+        if digit_text.len() == 8 && self.pos < self.bytes.len() && self.bytes[self.pos] == b'-' {
+            let saved_pos = self.pos;
+            if let Some(uuid) = self.try_read_uuid_tail(digit_text) {
+                return Ok(Token {
+                    kind: TokenKind::UuidLiteral(uuid),
+                    pos: start,
+                });
+            }
+            self.pos = saved_pos;
+        }
+
         // Check for decimal point → float
         if self.pos < self.bytes.len()
             && self.bytes[self.pos] == b'.'
@@ -994,6 +1009,15 @@ mod tests {
         let tokens = lex_all("550e8400-e29b-41d4-a716-446655440000");
         let expected_uuid: uuid::Uuid = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
         assert_eq!(tokens, vec![TokenKind::UuidLiteral(expected_uuid)]);
+    }
+
+    #[test]
+    fn lex_uuid_all_digits() {
+        // UUIDs where the first 8 chars are all decimal digits must not be
+        // parsed as integer-minus-integer.
+        let tokens = lex_all("11111111-1111-1111-1111-111111111111");
+        let expected: uuid::Uuid = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+        assert_eq!(tokens, vec![TokenKind::UuidLiteral(expected)]);
     }
 
     #[test]
