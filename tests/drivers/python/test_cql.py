@@ -5,13 +5,14 @@ uses the ``python_test`` keyspace to avoid collisions with other drivers.
 """
 
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 
 import pytest
 from cassandra.cluster import Cluster
 from cassandra.policies import RoundRobinPolicy
-from cassandra.query import SimpleStatement
+from cassandra.query import BatchStatement, BatchType, SimpleStatement
 
 FERROSA_HOST = os.environ.get("FERROSA_HOST", "127.0.0.1")
 FERROSA_CQL_PORT = int(os.environ.get("FERROSA_CQL_PORT", "9042"))
@@ -27,6 +28,11 @@ def session():
         port=FERROSA_CQL_PORT,
         load_balancing_policy=RoundRobinPolicy(),
         protocol_version=5,
+        # Ferrosa's core CQL smoke coverage does not depend on driver-side
+        # schema/token metadata refresh, and disabling it avoids treating
+        # optional server event registration as a connection blocker.
+        schema_metadata_enabled=False,
+        token_metadata_enabled=False,
     )
     sess = cluster.connect()
     yield sess
@@ -250,6 +256,297 @@ class TestUDT:
         # The driver returns UDTs as named tuples or ordered dicts.
         addr = rows[0].home_address
         assert addr is not None
+
+
+# ---- Collections ---------------------------------------------------------
+
+
+class TestCollections:
+    @pytest.fixture(autouse=True)
+    def _set_keyspace(self, session):
+        session.set_keyspace(KEYSPACE)
+
+    def test_create_table_collections(self, session):
+        session.execute(
+            """
+            CREATE TABLE IF NOT EXISTS collections (
+                id int PRIMARY KEY,
+                tags list<text>,
+                scores set<int>,
+                props map<text, text>
+            )
+            """
+        )
+
+    def test_insert_list(self, session):
+        session.execute(
+            SimpleStatement("INSERT INTO collections (id, tags) VALUES (%s, %s)"),
+            (1, ["tag1", "tag2", "tag3"]),
+        )
+
+    def test_insert_set(self, session):
+        session.execute(
+            SimpleStatement("INSERT INTO collections (id, scores) VALUES (%s, %s)"),
+            (2, {10, 20, 30}),
+        )
+
+    def test_insert_map(self, session):
+        session.execute(
+            SimpleStatement("INSERT INTO collections (id, props) VALUES (%s, %s)"),
+            (3, {"key1": "val1", "key2": "val2"}),
+        )
+
+    def test_select_list(self, session):
+        rows = list(session.execute("SELECT tags FROM collections WHERE id = 1"))
+        assert len(rows) == 1
+        assert rows[0].tags == ["tag1", "tag2", "tag3"]
+
+    def test_select_set(self, session):
+        rows = list(session.execute("SELECT scores FROM collections WHERE id = 2"))
+        assert len(rows) == 1
+        # Sets are unordered but the driver returns a sorted set.
+        assert set(rows[0].scores) == {10, 20, 30}
+
+    def test_select_map(self, session):
+        rows = list(session.execute("SELECT props FROM collections WHERE id = 3"))
+        assert len(rows) == 1
+        assert rows[0].props == {"key1": "val1", "key2": "val2"}
+
+
+# ---- ALTER TABLE ---------------------------------------------------------
+
+
+class TestAlterTable:
+    @pytest.fixture(autouse=True)
+    def _set_keyspace(self, session):
+        session.set_keyspace(KEYSPACE)
+
+    def test_alter_add_column(self, session):
+        session.execute("ALTER TABLE users ADD phone text")
+        session.execute(
+            "INSERT INTO users (id, name, phone) VALUES (800, 'PhoneUser', '555-1234')"
+        )
+        rows = list(session.execute("SELECT name, phone FROM users WHERE id = 800"))
+        assert len(rows) == 1
+        assert rows[0].name == "PhoneUser"
+        assert rows[0].phone == "555-1234"
+
+
+# ---- DELETE / UPDATE / LWT ----------------------------------------------
+
+
+class TestDeleteUpdate:
+    @pytest.fixture(autouse=True)
+    def _set_keyspace(self, session):
+        session.set_keyspace(KEYSPACE)
+
+    def test_delete_row(self, session):
+        session.execute("INSERT INTO users (id, name) VALUES (900, 'ToDelete')")
+        rows = list(session.execute("SELECT * FROM users WHERE id = 900"))
+        assert len(rows) == 1
+
+        session.execute("DELETE FROM users WHERE id = 900")
+        rows = list(session.execute("SELECT * FROM users WHERE id = 900"))
+        assert len(rows) == 0
+
+    def test_update_row(self, session):
+        session.execute(
+            "INSERT INTO users (id, name, email) VALUES (901, 'BeforeUpdate', 'old@test.com')"
+        )
+        session.execute("UPDATE users SET email = 'new@test.com' WHERE id = 901")
+        rows = list(session.execute("SELECT email FROM users WHERE id = 901"))
+        assert len(rows) == 1
+        assert rows[0].email == "new@test.com"
+
+    def test_insert_if_not_exists(self, session):
+        # Ensure row does not exist first.
+        session.execute("DELETE FROM users WHERE id = 902")
+
+        # First INSERT IF NOT EXISTS should be applied.
+        rows = list(
+            session.execute(
+                "INSERT INTO users (id, name) VALUES (902, 'LWT') IF NOT EXISTS"
+            )
+        )
+        assert len(rows) == 1
+        assert rows[0].applied is True
+
+        # Second INSERT IF NOT EXISTS should NOT be applied.
+        rows = list(
+            session.execute(
+                "INSERT INTO users (id, name) VALUES (902, 'LWT2') IF NOT EXISTS"
+            )
+        )
+        assert len(rows) == 1
+        assert rows[0].applied is False
+
+
+# ---- Batch ---------------------------------------------------------------
+
+
+class TestBatch:
+    @pytest.fixture(autouse=True)
+    def _set_keyspace(self, session):
+        session.set_keyspace(KEYSPACE)
+
+    def test_batch_insert(self, session):
+        batch = BatchStatement(batch_type=BatchType.LOGGED)
+        batch.add(
+            SimpleStatement("INSERT INTO users (id, name) VALUES (%s, %s)"),
+            (701, "Batch1"),
+        )
+        batch.add(
+            SimpleStatement("INSERT INTO users (id, name) VALUES (%s, %s)"),
+            (702, "Batch2"),
+        )
+        batch.add(
+            SimpleStatement("INSERT INTO users (id, name) VALUES (%s, %s)"),
+            (703, "Batch3"),
+        )
+        session.execute(batch)
+
+        for uid, expected_name in [(701, "Batch1"), (702, "Batch2"), (703, "Batch3")]:
+            rows = list(
+                session.execute(
+                    SimpleStatement("SELECT name FROM users WHERE id = %s"), (uid,)
+                )
+            )
+            assert len(rows) == 1, f"expected 1 row for id={uid}"
+            assert rows[0].name == expected_name
+
+
+# ---- TTL -----------------------------------------------------------------
+
+
+class TestTTL:
+    @pytest.fixture(autouse=True)
+    def _set_keyspace(self, session):
+        session.set_keyspace(KEYSPACE)
+
+    def test_insert_with_ttl(self, session):
+        session.execute(
+            "INSERT INTO users (id, name) VALUES (950, 'Ephemeral') USING TTL 1"
+        )
+        # Verify it exists right away.
+        rows = list(session.execute("SELECT name FROM users WHERE id = 950"))
+        assert len(rows) == 1
+        assert rows[0].name == "Ephemeral"
+
+        # Wait for TTL to expire.
+        time.sleep(2)
+
+        rows = list(session.execute("SELECT name FROM users WHERE id = 950"))
+        assert len(rows) == 0
+
+
+# ---- LIMIT / COUNT ------------------------------------------------------
+
+
+class TestLimitCount:
+    @pytest.fixture(autouse=True)
+    def _set_keyspace(self, session):
+        session.set_keyspace(KEYSPACE)
+
+    def test_select_count(self, session):
+        rows = list(session.execute("SELECT COUNT(*) FROM users"))
+        assert len(rows) == 1
+        assert rows[0].count > 0
+
+    def test_select_limit(self, session):
+        # Ensure at least 3 rows exist so LIMIT 2 is meaningful.
+        session.execute("INSERT INTO users (id, name) VALUES (601, 'Limit1')")
+        session.execute("INSERT INTO users (id, name) VALUES (602, 'Limit2')")
+        session.execute("INSERT INTO users (id, name) VALUES (603, 'Limit3')")
+
+        rows = list(session.execute("SELECT * FROM users LIMIT 2"))
+        assert len(rows) == 2
+
+
+# ---- Error handling ------------------------------------------------------
+
+
+class TestErrorHandling:
+    @pytest.fixture(autouse=True)
+    def _set_keyspace(self, session):
+        session.set_keyspace(KEYSPACE)
+
+    def test_query_nonexistent_table(self, session):
+        from cassandra import InvalidRequest
+
+        with pytest.raises(InvalidRequest):
+            session.execute("SELECT * FROM nonexistent_table_xyz")
+
+    def test_invalid_syntax(self, session):
+        from cassandra import InvalidRequest, SyntaxException
+
+        with pytest.raises((SyntaxException, InvalidRequest)):
+            session.execute("SELEC BROKEN QUERY")
+
+
+# ---- system_schema introspection ----------------------------------------
+
+
+class TestSystemSchema:
+    @pytest.fixture(autouse=True)
+    def _set_keyspace(self, session):
+        session.set_keyspace(KEYSPACE)
+
+    def test_system_schema_keyspaces(self, session):
+        rows = list(
+            session.execute("SELECT keyspace_name FROM system_schema.keyspaces")
+        )
+        keyspace_names = [r.keyspace_name for r in rows]
+        assert KEYSPACE in keyspace_names
+
+    def test_system_schema_tables(self, session):
+        rows = list(
+            session.execute(
+                "SELECT table_name FROM system_schema.tables "
+                "WHERE keyspace_name = %s",
+                (KEYSPACE,),
+            )
+        )
+        table_names = [r.table_name for r in rows]
+        assert "users" in table_names
+
+
+# ---- NULL handling -------------------------------------------------------
+
+
+class TestNullHandling:
+    @pytest.fixture(autouse=True)
+    def _set_keyspace(self, session):
+        session.set_keyspace(KEYSPACE)
+
+    def test_insert_null(self, session):
+        session.execute(
+            SimpleStatement("INSERT INTO users (id, name) VALUES (%s, %s)"),
+            (960, None),
+        )
+        rows = list(session.execute("SELECT name FROM users WHERE id = 960"))
+        assert len(rows) == 1
+        assert rows[0].name is None
+
+    def test_insert_empty_string(self, session):
+        session.execute(
+            SimpleStatement("INSERT INTO users (id, name) VALUES (%s, %s)"),
+            (961, ""),
+        )
+        rows = list(session.execute("SELECT name FROM users WHERE id = 961"))
+        assert len(rows) == 1
+        assert rows[0].name == ""
+
+
+# ---- Secondary index -----------------------------------------------------
+
+
+class TestCreateIndex:
+    @pytest.fixture(autouse=True)
+    def _set_keyspace(self, session):
+        session.set_keyspace(KEYSPACE)
+
+    def test_create_index(self, session):
+        session.execute("CREATE INDEX IF NOT EXISTS idx_users_name ON users (name)")
 
 
 # ---- Cleanup (runs last by naming convention) ----------------------------

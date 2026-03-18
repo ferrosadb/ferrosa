@@ -235,6 +235,8 @@ pub struct CreateTableStatement {
     pub clustering_key: Vec<(String, ClusteringOrder)>,
     pub if_not_exists: bool,
     pub table_options: Vec<(String, String)>,
+    /// Table extensions (e.g. graph metadata: `WITH extensions = {'vertex_label': 'Person'}`).
+    pub extensions: Option<Vec<(String, String)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

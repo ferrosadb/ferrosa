@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.drivers.yml"
 
-DRIVERS=("python-tests" "go-tests" "node-tests" "java-tests")
+DRIVERS=("python-tests" "go-tests" "node-tests" "java-tests" "rust-tests" "csharp-tests")
 
 pass=0
 fail=0

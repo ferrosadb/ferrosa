@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fraud Detection Tutorial — Ferrosa</title>
+    <link rel="icon" type="image/svg+xml" href="../favicon.svg">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+:root{--bg-primary:#0a0a0f;--bg-secondary:#111118;--bg-card:#16161f;--bg-card-hover:#1c1c28;--text-primary:#e8e8ed;--text-secondary:#9494a3;--text-muted:#6b6b7a;--accent:#e2725b;--accent-warm:#d4a574;--accent-green:#6bc9a0;--accent-cool:#7c9cf5;--border:#1e1e2a;--code-bg:#0d0d14;--font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--font-mono:'JetBrains Mono','Fira Code',monospace}*{margin:0;padding:0;box-sizing:border-box}html{scroll-behavior:smooth}body{font-family:var(--font-sans);background:var(--bg-primary);color:var(--text-primary);line-height:1.6;-webkit-font-smoothing:antialiased}.container{max-width:960px;margin:0 auto;padding:4rem 2rem 6rem}.back-link{display:inline-block;color:var(--accent);text-decoration:none;font-size:.875rem;font-weight:500;margin-bottom:2rem}.back-link:hover{text-decoration:underline}h1{font-size:2.5rem;font-weight:800;letter-spacing:-.03em;margin-bottom:.5rem}h1 span{color:var(--accent)}.subtitle{font-size:1.125rem;color:var(--text-secondary);margin-bottom:3rem;max-width:640px;line-height:1.7}h2{font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--accent);margin-bottom:1.5rem;margin-top:4rem}h3{font-size:1.25rem;font-weight:700;margin-bottom:.75rem;margin-top:2rem}p,li{color:var(--text-secondary);margin-bottom:1rem;max-width:720px;line-height:1.7}ul,ol{padding-left:1.5rem;margin-bottom:1.5rem}li{margin-bottom:.5rem}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}code{font-family:var(--font-mono);font-size:.875em;background:var(--code-bg);padding:.15em .4em;border-radius:4px;border:1px solid var(--border);color:var(--accent-cool)}pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:1.25rem 1.5rem;overflow-x:auto;margin-bottom:1.5rem;font-family:var(--font-mono);font-size:.875rem;line-height:1.8;color:var(--text-secondary)}pre .cm{color:#546e7a}pre .kw{color:#c792ea}pre .str{color:#c3e88d}pre .var{color:#f78c6c}.note{background:rgba(226,114,91,.08);border:1px solid rgba(226,114,91,.2);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;font-size:.9375rem;color:var(--text-secondary)}.note strong{color:var(--accent)}.toc{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem 2rem;margin-bottom:2rem}.toc h4{font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;color:var(--text-muted);margin-bottom:.75rem}.toc ul{list-style:none;padding:0;margin:0}.toc li{margin-bottom:.375rem}.toc a{font-size:.9375rem;font-weight:500}table{width:100%;border-collapse:collapse;margin:1.5rem 0;font-size:.9375rem}th,td{text-align:left;padding:.75rem 1rem;border-bottom:1px solid var(--border)}th{font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);font-weight:600}td{color:var(--text-secondary)}td:first-child{color:var(--text-primary);font-weight:600}td code{font-size:.8125rem}@media(max-width:640px){h1{font-size:1.75rem}}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a href="index.html" class="back-link">&larr; Back to Examples</a>
+
+        <h1>Fraud <span>Detection</span></h1>
+        <p class="subtitle">Build a real-time fraud scoring system. Ingest financial transactions, detect suspicious patterns, and flag anomalies — all with sub-millisecond lookups.</p>
+
+        <div class="note">
+            <strong>Before you start:</strong> This tutorial assumes you have a running Ferrosa cluster. If you haven't set one up yet, follow the <a href="../getting-started.html">Getting Started</a> guide first. You should be able to connect with <code>cqlsh</code> before continuing.
+        </div>
+
+        <div class="toc">
+            <h4>In this tutorial</h4>
+            <ul>
+                <li><a href="#keyspace">1. Create the keyspace</a></li>
+                <li><a href="#schema">2. Design the schema</a></li>
+                <li><a href="#insert">3. Populate with sample data</a></li>
+                <li><a href="#queries">4. Query your data</a></li>
+                <li><a href="#learned">5. What you learned</a></li>
+            </ul>
+        </div>
+
+        <h2 id="keyspace">1. Create the keyspace</h2>
+
+        <p>Fraud detection systems need strong durability guarantees — you cannot afford to lose a transaction record. A replication factor of 3 means every transaction is stored on three separate nodes, so even if a node fails, your data is safe.</p>
+
+<pre><span class="kw">CREATE KEYSPACE</span> fraud
+  <span class="kw">WITH</span> replication = {<span class="str">'class'</span>: <span class="str">'SimpleStrategy'</span>, <span class="str">'replication_factor'</span>: <span class="var">3</span>};
+
+<span class="kw">USE</span> fraud;</pre>
+
+        <h2 id="schema">2. Design the schema</h2>
+
+        <p>A fraud detection system revolves around three things: transactions (the raw financial events), account profiles (behavioral baselines for each customer), and alerts (flagged anomalies that need investigation). We will create a table for each.</p>
+
+        <h3>Transactions table</h3>
+
+        <p>This is your primary data table. Every card swipe, wire transfer, and online purchase lands here. Partitioning by <code>account_id</code> keeps all of a customer's transactions together, and clustering by <code>transaction_time DESC</code> puts the newest ones first.</p>
+
+<pre><span class="kw">CREATE TABLE</span> transactions (
+    account_id        <span class="var">text</span>,
+    transaction_time  <span class="var">timestamp</span>,
+    transaction_id    <span class="var">uuid</span>,
+    amount            <span class="var">decimal</span>,
+    currency          <span class="var">text</span>,
+    merchant          <span class="var">text</span>,
+    merchant_category <span class="var">text</span>,
+    location          <span class="var">text</span>,
+    country           <span class="var">text</span>,
+    status            <span class="var">text</span>,
+    risk_score        <span class="var">int</span>,
+    <span class="kw">PRIMARY KEY</span> (account_id, transaction_time, transaction_id)
+) <span class="kw">WITH CLUSTERING ORDER BY</span> (transaction_time <span class="kw">DESC</span>);</pre>
+
+        <div class="note">
+            <strong>Why include transaction_id in the key?</strong> A customer could have two transactions at the exact same timestamp (think: a split-second double-tap on a payment terminal). Adding <code>transaction_id</code> as a tiebreaker guarantees uniqueness in the clustering order.
+        </div>
+
+        <h3>Account profile table</h3>
+
+        <p>This stores each customer's risk baseline: their typical spending patterns, home country, and whether they have been flagged. Your fraud scoring engine reads this to decide if a transaction looks normal.</p>
+
+<pre><span class="kw">CREATE TABLE</span> account_profile (
+    account_id           <span class="var">text</span> <span class="kw">PRIMARY KEY</span>,
+    customer_name        <span class="var">text</span>,
+    home_country         <span class="var">text</span>,
+    avg_transaction      <span class="var">decimal</span>,
+    max_transaction      <span class="var">decimal</span>,
+    last_transaction_time <span class="var">timestamp</span>,
+    flagged              <span class="var">boolean</span>,
+    risk_level           <span class="var">text</span>
+);</pre>
+
+        <h3>Alerts table</h3>
+
+        <p>When a transaction trips a fraud rule, an alert is created. We partition alerts by <code>alert_date</code> so you can efficiently pull all alerts for a given day — the most common query for fraud analysts working through their queue.</p>
+
+<pre><span class="kw">CREATE TABLE</span> alerts (
+    alert_date     <span class="var">date</span>,
+    alert_time     <span class="var">timestamp</span>,
+    alert_id       <span class="var">uuid</span>,
+    account_id     <span class="var">text</span>,
+    transaction_id <span class="var">uuid</span>,
+    rule_triggered <span class="var">text</span>,
+    severity       <span class="var">text</span>,
+    details        <span class="var">text</span>,
+    resolved       <span class="var">boolean</span>,
+    <span class="kw">PRIMARY KEY</span> (alert_date, alert_time, alert_id)
+) <span class="kw">WITH CLUSTERING ORDER BY</span> (alert_time <span class="kw">DESC</span>);</pre>
+
+        <p>Here is a quick reference for how these tables work together:</p>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Table</th>
+                    <th>Partition Key</th>
+                    <th>Clustering Key</th>
+                    <th>Serves</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>transactions</td>
+                    <td><code>account_id</code></td>
+                    <td><code>transaction_time DESC</code></td>
+                    <td>Per-account transaction history</td>
+                </tr>
+                <tr>
+                    <td>account_profile</td>
+                    <td><code>account_id</code></td>
+                    <td>—</td>
+                    <td>Behavioral baseline lookup</td>
+                </tr>
+                <tr>
+                    <td>alerts</td>
+                    <td><code>alert_date</code></td>
+                    <td><code>alert_time DESC</code></td>
+                    <td>Daily analyst queue</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p>Notice the pattern: each table is optimized for a specific workflow. The <code>transactions</code> table powers the investigation view, <code>account_profile</code> provides context, and <code>alerts</code> drives the analyst's daily queue.</p>
+
+        <p>Your schema is in place. Let's load it with realistic transaction data.</p>
+
+        <h2 id="insert">3. Populate with sample data</h2>
+
+        <h3>Create account profiles</h3>
+
+        <p>We will set up three customers with different spending patterns. Pay attention to the <code>avg_transaction</code> and <code>max_transaction</code> values — they establish what "normal" looks like for each account.</p>
+
+<pre><span class="cm">-- Regular consumer, moderate spending</span>
+<span class="kw">INSERT INTO</span> account_profile
+    (account_id, customer_name, home_country, avg_transaction, max_transaction,
+     last_transaction_time, flagged, risk_level)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-1001'</span>, <span class="str">'Sarah Chen'</span>, <span class="str">'US'</span>, <span class="var">85.50</span>, <span class="var">450.00</span>,
+    <span class="str">'2026-03-17 18:30:00+0000'</span>, <span class="var">false</span>, <span class="str">'low'</span>);
+
+<span class="cm">-- Business traveler, higher spending, multiple countries</span>
+<span class="kw">INSERT INTO</span> account_profile
+    (account_id, customer_name, home_country, avg_transaction, max_transaction,
+     last_transaction_time, flagged, risk_level)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-2002'</span>, <span class="str">'Marcus Johnson'</span>, <span class="str">'US'</span>, <span class="var">220.00</span>, <span class="var">3500.00</span>,
+    <span class="str">'2026-03-17 20:15:00+0000'</span>, <span class="var">false</span>, <span class="str">'medium'</span>);
+
+<span class="cm">-- New account, limited history</span>
+<span class="kw">INSERT INTO</span> account_profile
+    (account_id, customer_name, home_country, avg_transaction, max_transaction,
+     last_transaction_time, flagged, risk_level)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-3003'</span>, <span class="str">'Priya Patel'</span>, <span class="str">'GB'</span>, <span class="var">45.00</span>, <span class="var">200.00</span>,
+    <span class="str">'2026-03-17 14:00:00+0000'</span>, <span class="var">true</span>, <span class="str">'high'</span>);</pre>
+
+        <h3>Insert normal transactions</h3>
+
+        <p>First, some everyday transactions that look completely normal for each account:</p>
+
+<pre><span class="cm">-- Sarah's normal spending</span>
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-1001'</span>, <span class="str">'2026-03-17 08:15:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">4.75</span>, <span class="str">'USD'</span>, <span class="str">'Blue Bottle Coffee'</span>, <span class="str">'food_beverage'</span>, <span class="str">'San Francisco, CA'</span>, <span class="str">'US'</span>, <span class="str">'approved'</span>, <span class="var">2</span>);
+
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-1001'</span>, <span class="str">'2026-03-17 12:30:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">32.50</span>, <span class="str">'USD'</span>, <span class="str">'Whole Foods Market'</span>, <span class="str">'grocery'</span>, <span class="str">'San Francisco, CA'</span>, <span class="str">'US'</span>, <span class="str">'approved'</span>, <span class="var">1</span>);
+
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-1001'</span>, <span class="str">'2026-03-17 14:00:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">67.99</span>, <span class="str">'USD'</span>, <span class="str">'Target'</span>, <span class="str">'retail'</span>, <span class="str">'San Francisco, CA'</span>, <span class="str">'US'</span>, <span class="str">'approved'</span>, <span class="var">3</span>);
+
+<span class="cm">-- Marcus's business travel</span>
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-2002'</span>, <span class="str">'2026-03-16 09:00:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">189.00</span>, <span class="str">'USD'</span>, <span class="str">'Delta Airlines'</span>, <span class="str">'travel'</span>, <span class="str">'Atlanta, GA'</span>, <span class="str">'US'</span>, <span class="str">'approved'</span>, <span class="var">5</span>);
+
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-2002'</span>, <span class="str">'2026-03-16 19:30:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">245.00</span>, <span class="str">'USD'</span>, <span class="str">'Marriott Downtown'</span>, <span class="str">'lodging'</span>, <span class="str">'Chicago, IL'</span>, <span class="str">'US'</span>, <span class="str">'approved'</span>, <span class="var">4</span>);
+
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-2002'</span>, <span class="str">'2026-03-17 07:45:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">28.00</span>, <span class="str">'USD'</span>, <span class="str">'Starbucks'</span>, <span class="str">'food_beverage'</span>, <span class="str">'Chicago, IL'</span>, <span class="str">'US'</span>, <span class="str">'approved'</span>, <span class="var">1</span>);
+
+<span class="cm">-- Priya's normal UK spending</span>
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-3003'</span>, <span class="str">'2026-03-16 10:00:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">12.50</span>, <span class="str">'GBP'</span>, <span class="str">'Tesco Express'</span>, <span class="str">'grocery'</span>, <span class="str">'London'</span>, <span class="str">'GB'</span>, <span class="str">'approved'</span>, <span class="var">1</span>);
+
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-3003'</span>, <span class="str">'2026-03-16 15:20:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">35.00</span>, <span class="str">'GBP'</span>, <span class="str">'Boots Pharmacy'</span>, <span class="str">'pharmacy'</span>, <span class="str">'London'</span>, <span class="str">'GB'</span>, <span class="str">'approved'</span>, <span class="var">2</span>);</pre>
+
+        <h3>Insert suspicious transactions</h3>
+
+        <p>Now the interesting part. Let's add some transactions that should trigger fraud rules — large amounts, unusual countries, and rapid-fire purchases:</p>
+
+<pre><span class="cm">-- Sarah: sudden large purchase, way above her average</span>
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-1001'</span>, <span class="str">'2026-03-17 18:30:00+0000'</span>, <span class="var">d1a7e100-e39b-11ef-8001-000000000010</span>, <span class="var">2899.99</span>, <span class="str">'USD'</span>, <span class="str">'ElectroMart Online'</span>, <span class="str">'electronics'</span>, <span class="str">'San Francisco, CA'</span>, <span class="str">'US'</span>, <span class="str">'pending_review'</span>, <span class="var">85</span>);
+
+<span class="cm">-- Sarah: another large purchase 2 minutes later</span>
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-1001'</span>, <span class="str">'2026-03-17 18:32:00+0000'</span>, <span class="var">d1a7e100-e39b-11ef-8001-000000000011</span>, <span class="var">1549.00</span>, <span class="str">'USD'</span>, <span class="str">'LuxWatch.com'</span>, <span class="str">'luxury'</span>, <span class="str">'San Francisco, CA'</span>, <span class="str">'US'</span>, <span class="str">'declined'</span>, <span class="var">92</span>);
+
+<span class="cm">-- Marcus: transaction in a country he has never visited</span>
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-2002'</span>, <span class="str">'2026-03-17 20:15:00+0000'</span>, <span class="var">d1a7e100-e39b-11ef-8001-000000000012</span>, <span class="var">3200.00</span>, <span class="str">'EUR'</span>, <span class="str">'Premium Electronics GmbH'</span>, <span class="str">'electronics'</span>, <span class="str">'Berlin'</span>, <span class="str">'DE'</span>, <span class="str">'pending_review'</span>, <span class="var">78</span>);
+
+<span class="cm">-- Priya: card used in two countries within hours (impossible travel)</span>
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-3003'</span>, <span class="str">'2026-03-17 11:00:00+0000'</span>, <span class="var">d1a7e100-e39b-11ef-8001-000000000013</span>, <span class="var">850.00</span>, <span class="str">'USD'</span>, <span class="str">'Best Buy'</span>, <span class="str">'electronics'</span>, <span class="str">'New York, NY'</span>, <span class="str">'US'</span>, <span class="str">'declined'</span>, <span class="var">95</span>);
+
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-3003'</span>, <span class="str">'2026-03-17 12:30:00+0000'</span>, <span class="var">d1a7e100-e39b-11ef-8001-000000000014</span>, <span class="var">420.00</span>, <span class="str">'USD'</span>, <span class="str">'Amazon.com'</span>, <span class="str">'online_retail'</span>, <span class="str">'New York, NY'</span>, <span class="str">'US'</span>, <span class="str">'declined'</span>, <span class="var">88</span>);
+
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-3003'</span>, <span class="str">'2026-03-17 14:00:00+0000'</span>, <span class="var">d1a7e100-e39b-11ef-8001-000000000015</span>, <span class="var">199.99</span>, <span class="str">'GBP'</span>, <span class="str">'John Lewis'</span>, <span class="str">'retail'</span>, <span class="str">'London'</span>, <span class="str">'GB'</span>, <span class="str">'approved'</span>, <span class="var">15</span>);</pre>
+
+        <h3>Create alerts</h3>
+
+        <p>These alerts are what a fraud analyst sees in their dashboard. Each one links back to the transaction that triggered it:</p>
+
+<pre><span class="kw">INSERT INTO</span> alerts (alert_date, alert_time, alert_id, account_id, transaction_id, rule_triggered, severity, details, resolved)
+<span class="kw">VALUES</span> (<span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 18:30:05+0000'</span>, <span class="var">uuid()</span>,
+    <span class="str">'ACCT-1001'</span>, <span class="var">d1a7e100-e39b-11ef-8001-000000000010</span>,
+    <span class="str">'amount_exceeds_3x_average'</span>, <span class="str">'high'</span>,
+    <span class="str">'Transaction of $2899.99 is 33x above account average of $85.50'</span>, <span class="var">false</span>);
+
+<span class="kw">INSERT INTO</span> alerts (alert_date, alert_time, alert_id, account_id, transaction_id, rule_triggered, severity, details, resolved)
+<span class="kw">VALUES</span> (<span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 18:32:05+0000'</span>, <span class="var">uuid()</span>,
+    <span class="str">'ACCT-1001'</span>, <span class="var">d1a7e100-e39b-11ef-8001-000000000011</span>,
+    <span class="str">'rapid_succession'</span>, <span class="str">'critical'</span>,
+    <span class="str">'Two high-value transactions within 2 minutes. Combined: $4448.99'</span>, <span class="var">false</span>);
+
+<span class="kw">INSERT INTO</span> alerts (alert_date, alert_time, alert_id, account_id, transaction_id, rule_triggered, severity, details, resolved)
+<span class="kw">VALUES</span> (<span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 20:15:05+0000'</span>, <span class="var">uuid()</span>,
+    <span class="str">'ACCT-2002'</span>, <span class="var">d1a7e100-e39b-11ef-8001-000000000012</span>,
+    <span class="str">'unusual_country'</span>, <span class="str">'medium'</span>,
+    <span class="str">'Transaction in DE (Germany), account has no history in this country'</span>, <span class="var">false</span>);
+
+<span class="kw">INSERT INTO</span> alerts (alert_date, alert_time, alert_id, account_id, transaction_id, rule_triggered, severity, details, resolved)
+<span class="kw">VALUES</span> (<span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 12:30:05+0000'</span>, <span class="var">uuid()</span>,
+    <span class="str">'ACCT-3003'</span>, <span class="var">d1a7e100-e39b-11ef-8001-000000000013</span>,
+    <span class="str">'impossible_travel'</span>, <span class="str">'critical'</span>,
+    <span class="str">'Card used in US (New York) 1 hour after UK (London) purchase. Travel time: ~8 hours minimum.'</span>, <span class="var">false</span>);
+
+<span class="kw">INSERT INTO</span> alerts (alert_date, alert_time, alert_id, account_id, transaction_id, rule_triggered, severity, details, resolved)
+<span class="kw">VALUES</span> (<span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 12:30:10+0000'</span>, <span class="var">uuid()</span>,
+    <span class="str">'ACCT-3003'</span>, <span class="var">d1a7e100-e39b-11ef-8001-000000000014</span>,
+    <span class="str">'velocity_check'</span>, <span class="str">'high'</span>,
+    <span class="str">'3 transactions in 3 hours from a new-geography IP range'</span>, <span class="var">true</span>);</pre>
+
+        <p>Let's also add a few more normal transactions for completeness — these give the analyst more context when reviewing an account:</p>
+
+<pre><span class="cm">-- More of Sarah's routine spending</span>
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-1001'</span>, <span class="str">'2026-03-16 08:00:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">5.25</span>, <span class="str">'USD'</span>, <span class="str">'Blue Bottle Coffee'</span>, <span class="str">'food_beverage'</span>, <span class="str">'San Francisco, CA'</span>, <span class="str">'US'</span>, <span class="str">'approved'</span>, <span class="var">1</span>);
+
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-1001'</span>, <span class="str">'2026-03-16 12:45:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">18.90</span>, <span class="str">'USD'</span>, <span class="str">'Chipotle'</span>, <span class="str">'food_beverage'</span>, <span class="str">'San Francisco, CA'</span>, <span class="str">'US'</span>, <span class="str">'approved'</span>, <span class="var">1</span>);
+
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-1001'</span>, <span class="str">'2026-03-16 17:30:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">42.00</span>, <span class="str">'USD'</span>, <span class="str">'Shell Gas Station'</span>, <span class="str">'fuel'</span>, <span class="str">'San Francisco, CA'</span>, <span class="str">'US'</span>, <span class="str">'approved'</span>, <span class="var">2</span>);
+
+<span class="cm">-- Marcus's typical business expenses</span>
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-2002'</span>, <span class="str">'2026-03-17 12:00:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">78.50</span>, <span class="str">'USD'</span>, <span class="str">'Ruth Chris Steakhouse'</span>, <span class="str">'restaurant'</span>, <span class="str">'Chicago, IL'</span>, <span class="str">'US'</span>, <span class="str">'approved'</span>, <span class="var">3</span>);
+
+<span class="kw">INSERT INTO</span> transactions (account_id, transaction_time, transaction_id, amount, currency, merchant, merchant_category, location, country, status, risk_score)
+<span class="kw">VALUES</span> (<span class="str">'ACCT-2002'</span>, <span class="str">'2026-03-17 16:00:00+0000'</span>, <span class="var">uuid()</span>, <span class="var">35.00</span>, <span class="str">'USD'</span>, <span class="str">'Uber'</span>, <span class="str">'transportation'</span>, <span class="str">'Chicago, IL'</span>, <span class="str">'US'</span>, <span class="str">'approved'</span>, <span class="var">2</span>);</pre>
+
+        <p>You now have a rich dataset with over 20 transactions across three accounts, including normal spending patterns and suspicious anomalies, plus five alerts for the fraud analysts. Let's investigate.</p>
+
+        <h2 id="queries">4. Query your data</h2>
+
+        <h3>View recent transactions for an account</h3>
+
+        <p>The first thing a fraud analyst does when reviewing an alert is pull up the customer's recent activity. This is a single-partition read — fast and efficient:</p>
+
+<pre><span class="kw">SELECT</span> transaction_time, amount, currency, merchant, country, risk_score, status
+<span class="kw">FROM</span> transactions
+<span class="kw">WHERE</span> account_id = <span class="str">'ACCT-1001'</span>
+<span class="kw">LIMIT</span> <span class="var">10</span>;</pre>
+
+        <p>You will see Sarah's transactions in reverse chronological order, with the two suspicious electronics purchases at the top.</p>
+
+        <h3>Find high-risk transactions</h3>
+
+        <p>Pull all transactions for a given account that have an elevated risk score. This helps the analyst focus on what matters:</p>
+
+<pre><span class="kw">SELECT</span> transaction_time, amount, merchant, country, risk_score
+<span class="kw">FROM</span> transactions
+<span class="kw">WHERE</span> account_id = <span class="str">'ACCT-1001'</span>
+  <span class="kw">AND</span> transaction_time &gt;= <span class="str">'2026-03-17 00:00:00+0000'</span>
+  <span class="kw">AND</span> transaction_time &lt;= <span class="str">'2026-03-17 23:59:59+0000'</span>;</pre>
+
+        <p>This gives you all of Sarah's transactions from today. In your application code, you would filter for <code>risk_score > 70</code> after fetching the results.</p>
+
+        <h3>Review today's alerts</h3>
+
+        <p>Pull up the fraud analyst's daily queue — every alert generated today, newest first:</p>
+
+<pre><span class="kw">SELECT</span> alert_time, account_id, rule_triggered, severity, details, resolved
+<span class="kw">FROM</span> alerts
+<span class="kw">WHERE</span> alert_date = <span class="str">'2026-03-17'</span>;</pre>
+
+        <p>Because we partitioned by <code>alert_date</code>, this reads a single partition. Even with millions of historical alerts, today's queue loads instantly.</p>
+
+        <h3>Find unresolved alerts only</h3>
+
+        <p>Analysts want to see what still needs attention. Pull today's alerts and filter in your application for <code>resolved = false</code>:</p>
+
+<pre><span class="kw">SELECT</span> alert_time, account_id, rule_triggered, severity, details
+<span class="kw">FROM</span> alerts
+<span class="kw">WHERE</span> alert_date = <span class="str">'2026-03-17'</span>
+  <span class="kw">AND</span> resolved = <span class="var">false</span>
+<span class="kw">ALLOW FILTERING</span>;</pre>
+
+        <div class="note">
+            <strong>About ALLOW FILTERING:</strong> In production, you would typically handle this filter in your application layer or create a separate table for unresolved alerts. We use <code>ALLOW FILTERING</code> here because the partition is small (one day of alerts). For large partitions, always prefer a dedicated table.
+        </div>
+
+        <h3>Check an account's risk profile</h3>
+
+        <p>When investigating an alert, you need the customer's baseline. This is a single-row lookup by primary key:</p>
+
+<pre><span class="kw">SELECT</span> customer_name, home_country, avg_transaction, max_transaction, flagged, risk_level
+<span class="kw">FROM</span> account_profile
+<span class="kw">WHERE</span> account_id = <span class="str">'ACCT-3003'</span>;</pre>
+
+        <p>You will see that Priya's average transaction is only 45 GBP, her home country is GB, and she is already flagged. The 850 USD transaction from New York is wildly out of pattern.</p>
+
+        <h3>Detect unusual country patterns</h3>
+
+        <p>To find all of Priya's transactions from outside her home country, query her partition and filter by country in your application:</p>
+
+<pre><span class="kw">SELECT</span> transaction_time, amount, currency, merchant, country, risk_score
+<span class="kw">FROM</span> transactions
+<span class="kw">WHERE</span> account_id = <span class="str">'ACCT-3003'</span>;</pre>
+
+        <p>Looking at the results, you can see the pattern: legitimate UK purchases followed by a burst of US transactions — classic card-not-present fraud from a stolen card number.</p>
+
+        <h3>Review transactions in a specific time window</h3>
+
+        <p>To zoom in on the suspicious activity window for Sarah's account, use a time-range filter on the clustering key:</p>
+
+<pre><span class="kw">SELECT</span> transaction_time, amount, merchant, status, risk_score
+<span class="kw">FROM</span> transactions
+<span class="kw">WHERE</span> account_id = <span class="str">'ACCT-1001'</span>
+  <span class="kw">AND</span> transaction_time &gt;= <span class="str">'2026-03-17 18:00:00+0000'</span>
+  <span class="kw">AND</span> transaction_time &lt;= <span class="str">'2026-03-17 19:00:00+0000'</span>;</pre>
+
+        <p>This narrows the results to just that one-hour window where the suspicious activity occurred. Both high-value transactions will appear, making the rapid-succession pattern obvious.</p>
+
+        <h3>Compare a transaction against the account baseline</h3>
+
+        <p>A core fraud detection operation is comparing a transaction amount against the customer's historical average. First, fetch the profile:</p>
+
+<pre><span class="kw">SELECT</span> avg_transaction, max_transaction
+<span class="kw">FROM</span> account_profile
+<span class="kw">WHERE</span> account_id = <span class="str">'ACCT-1001'</span>;</pre>
+
+        <p>Sarah's average is $85.50 and her previous maximum was $450. That $2,899.99 electronics purchase is over 33 times her average and 6 times her previous max. In your application code, you would compute this ratio and assign the risk score accordingly.</p>
+
+        <h3>Resolve an alert</h3>
+
+        <p>After investigating, the analyst confirms the unusual-country alert for Marcus was actually him on a business trip. Mark it as resolved:</p>
+
+<pre><span class="kw">UPDATE</span> alerts
+<span class="kw">SET</span> resolved = <span class="var">true</span>
+<span class="kw">WHERE</span> alert_date = <span class="str">'2026-03-17'</span>
+  <span class="kw">AND</span> alert_time = <span class="str">'2026-03-17 20:15:05+0000'</span>
+  <span class="kw">AND</span> alert_id = <span class="cm">/* use the alert_id from your query results */</span>;</pre>
+
+        <div class="note">
+            <strong>Tip:</strong> In practice, you would capture the <code>alert_id</code> from your earlier query results. CQL requires all primary key columns in an <code>UPDATE</code> — this ensures you are modifying exactly the right row.
+        </div>
+
+        <h3>Update an account's risk level</h3>
+
+        <p>After investigating, the analyst decides to flag Sarah's account while the investigation is open:</p>
+
+<pre><span class="kw">UPDATE</span> account_profile
+<span class="kw">SET</span> flagged = <span class="var">true</span>, risk_level = <span class="str">'high'</span>
+<span class="kw">WHERE</span> account_id = <span class="str">'ACCT-1001'</span>;</pre>
+
+        <p>Verify the update:</p>
+
+<pre><span class="kw">SELECT</span> customer_name, flagged, risk_level
+<span class="kw">FROM</span> account_profile
+<span class="kw">WHERE</span> account_id = <span class="str">'ACCT-1001'</span>;</pre>
+
+        <h2 id="learned">5. What you learned</h2>
+
+        <p>You built the data layer for a real-time fraud detection system. Here is what you practiced:</p>
+
+        <ul>
+            <li><strong>Time-series partitioning for transactions.</strong> By partitioning on <code>account_id</code> and clustering on <code>transaction_time DESC</code>, you can pull any customer's recent activity in a single read. This pattern works at any scale — whether a customer has 10 transactions or 10 million.</li>
+            <li><strong>Date-bucketed alert queues.</strong> Partitioning alerts by <code>alert_date</code> keeps daily workloads bounded. An analyst's queue never touches historical data unless they explicitly query a different date.</li>
+            <li><strong>Composite clustering keys for uniqueness.</strong> Adding <code>transaction_id</code> after <code>transaction_time</code> prevents collisions when two transactions happen at the same instant. This is a common pattern in high-throughput systems.</li>
+            <li><strong>Risk scoring at write time.</strong> By computing the <code>risk_score</code> when the transaction is written, you avoid expensive recalculation on reads. The score is just another column — no joins, no subqueries.</li>
+            <li><strong>Profile lookups for context.</strong> The <code>account_profile</code> table gives O(1) access to behavioral baselines. Your fraud engine compares each transaction against these baselines to decide if it looks suspicious.</li>
+        </ul>
+
+        <p>From here, you could add a <code>merchant_risk</code> table to score merchants independently, a <code>device_fingerprints</code> table to track which devices are associated with each account, or a <code>blocked_cards</code> table for instant card-level blocks.</p>
+
+        <p>Well done — you have a fraud detection data layer that can handle millions of transactions per second with sub-millisecond lookups.</p>
+    </div>
+</body>
+</html>

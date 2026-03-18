@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — Telecommunications Platform Tutorial</title>
+  <link rel="icon" type="image/svg+xml" href="../favicon.svg">
+  <style>
+    :root{--bg-primary:#0a0a0f;--bg-secondary:#111118;--bg-card:#16161f;--bg-card-hover:#1c1c28;--text-primary:#e8e8ed;--text-secondary:#9494a3;--text-muted:#6b6b7a;--accent:#e2725b;--accent-warm:#d4a574;--accent-green:#6bc9a0;--accent-cool:#7c9cf5;--border:#1e1e2a;--code-bg:#0d0d14;--font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--font-mono:'JetBrains Mono','Fira Code',monospace}*{margin:0;padding:0;box-sizing:border-box}html{scroll-behavior:smooth}body{font-family:var(--font-sans);background:var(--bg-primary);color:var(--text-primary);line-height:1.6;-webkit-font-smoothing:antialiased}.container{max-width:960px;margin:0 auto;padding:4rem 2rem 6rem}.back-link{display:inline-block;color:var(--accent);text-decoration:none;font-size:.875rem;font-weight:500;margin-bottom:2rem}.back-link:hover{text-decoration:underline}h1{font-size:2.5rem;font-weight:800;letter-spacing:-.03em;margin-bottom:.5rem}h1 span{color:var(--accent)}.subtitle{font-size:1.125rem;color:var(--text-secondary);margin-bottom:3rem;max-width:640px;line-height:1.7}h2{font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--accent);margin-bottom:1.5rem;margin-top:4rem}h3{font-size:1.25rem;font-weight:700;margin-bottom:.75rem;margin-top:2rem}p,li{color:var(--text-secondary);margin-bottom:1rem;max-width:720px;line-height:1.7}ul,ol{padding-left:1.5rem;margin-bottom:1.5rem}li{margin-bottom:.5rem}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}code{font-family:var(--font-mono);font-size:.875em;background:var(--code-bg);padding:.15em .4em;border-radius:4px;border:1px solid var(--border);color:var(--accent-cool)}pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:1.25rem 1.5rem;overflow-x:auto;margin-bottom:1.5rem;font-family:var(--font-mono);font-size:.875rem;line-height:1.8;color:var(--text-secondary)}pre .cm{color:#546e7a}pre .kw{color:#c792ea}pre .str{color:#c3e88d}pre .var{color:#f78c6c}.note{background:rgba(226,114,91,.08);border:1px solid rgba(226,114,91,.2);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;font-size:.9375rem;color:var(--text-secondary)}.note strong{color:var(--accent)}.toc{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem 2rem;margin-bottom:2rem}.toc h4{font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;color:var(--text-muted);margin-bottom:.75rem}.toc ul{list-style:none;padding:0;margin:0}.toc li{margin-bottom:.375rem}.toc a{font-size:.9375rem;font-weight:500}table{width:100%;border-collapse:collapse;margin:1.5rem 0;font-size:.9375rem}th,td{text-align:left;padding:.75rem 1rem;border-bottom:1px solid var(--border)}th{font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);font-weight:600}td{color:var(--text-secondary)}td:first-child{color:var(--text-primary);font-weight:600}td code{font-size:.8125rem}@media(max-width:640px){h1{font-size:1.75rem}}
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <a href="index.html" class="back-link">&larr; Back to all tutorials</a>
+
+  <h1>Telecommunications <span>Platform</span></h1>
+  <p class="subtitle">Build a call detail record system for a mobile carrier. Process millions of calls and texts, compute billing in real time, and analyze network usage patterns.</p>
+
+  <div class="note">
+    <strong>Prerequisites:</strong> This tutorial assumes you have a running 3-node Ferrosa cluster. If you haven't set one up yet, follow the <a href="cluster-setup.html">3-Node Cluster Setup</a> guide first &mdash; it only takes about 5 minutes.
+  </div>
+
+  <div class="toc">
+    <h4>In this tutorial</h4>
+    <ul>
+      <li><a href="#keyspace">1. Create the keyspace</a></li>
+      <li><a href="#schema">2. Design the schema</a></li>
+      <li><a href="#subscribers">3. Add subscribers</a></li>
+      <li><a href="#call-records">4. Ingest call records</a></li>
+      <li><a href="#billing">5. Generate billing summaries</a></li>
+      <li><a href="#network">6. Log network events</a></li>
+      <li><a href="#queries">7. Run operational queries</a></li>
+      <li><a href="#learned">What you learned</a></li>
+    </ul>
+  </div>
+
+  <!-- ── 1. Keyspace ── -->
+  <h2 id="keyspace">1. Create the Keyspace</h2>
+
+  <p>Telecom data is high volume and high value. A single carrier can generate billions of call records per month. Let's create a keyspace with triple replication so nothing gets lost.</p>
+
+<pre><span class="kw">CREATE KEYSPACE</span> telecom
+  <span class="kw">WITH</span> replication = {
+    <span class="str">'class'</span>: <span class="str">'SimpleStrategy'</span>,
+    <span class="str">'replication_factor'</span>: <span class="var">3</span>
+  };
+
+<span class="kw">USE</span> telecom;</pre>
+
+  <p>With RF=3, your call detail records survive any single node failure. In production, you would use <code>NetworkTopologyStrategy</code> to spread replicas across data centers, but <code>SimpleStrategy</code> is perfect for learning.</p>
+
+  <!-- ── 2. Schema ── -->
+  <h2 id="schema">2. Design the Schema</h2>
+
+  <p>Telecom data has a natural time-series shape: every call, text, and data session has a subscriber, a timestamp, and a set of measurements. We will design four tables around the most common access patterns.</p>
+
+  <h3>Call Records</h3>
+  <p>This is the core table. We use a <strong>compound partition key</strong> of <code>(subscriber_id, call_date)</code> so that each day's records for a subscriber land on the same partition. This keeps partitions from growing unbounded over months of data.</p>
+
+<pre><span class="kw">CREATE TABLE</span> call_records (
+    subscriber_id    text,
+    call_date        date,
+    call_time        timestamp,
+    call_id          uuid,
+    call_type        text,       <span class="cm">-- voice, sms, data</span>
+    duration_seconds int,
+    data_bytes       bigint,
+    destination      text,
+    cell_tower       text,
+    cost             decimal,
+    <span class="kw">PRIMARY KEY</span> ((subscriber_id, call_date), call_time, call_id)
+) <span class="kw">WITH CLUSTERING ORDER BY</span> (call_time <span class="kw">DESC</span>, call_id <span class="kw">ASC</span>);</pre>
+
+  <h3>Subscribers</h3>
+  <p>Basic subscriber information: plan details, usage limits, and current balance.</p>
+
+<pre><span class="kw">CREATE TABLE</span> subscribers (
+    subscriber_id        text <span class="kw">PRIMARY KEY</span>,
+    name                 text,
+    plan_type            text,
+    monthly_limit_minutes int,
+    monthly_limit_data_gb int,
+    balance              decimal,
+    activated_at         timestamp
+);</pre>
+
+  <h3>Billing Summary</h3>
+  <p>Pre-aggregated monthly totals. Rather than scanning millions of call records at bill time, we maintain running totals. The billing month is stored as text (like <code>'2026-03'</code>) for easy range queries.</p>
+
+<pre><span class="kw">CREATE TABLE</span> billing_summary (
+    subscriber_id       text,
+    billing_month       text,
+    total_voice_minutes int,
+    total_sms           int,
+    total_data_mb       bigint,
+    total_cost          decimal,
+    <span class="kw">PRIMARY KEY</span> (subscriber_id, billing_month)
+) <span class="kw">WITH CLUSTERING ORDER BY</span> (billing_month <span class="kw">DESC</span>);</pre>
+
+  <h3>Network Events</h3>
+  <p>Cell tower health, outages, and maintenance logs. Partitioned by tower and date so network operations teams can quickly pull up a tower's history.</p>
+
+<pre><span class="kw">CREATE TABLE</span> network_events (
+    cell_tower   text,
+    event_date   date,
+    event_time   timestamp,
+    event_type   text,
+    severity     text,
+    description  text,
+    <span class="kw">PRIMARY KEY</span> ((cell_tower, event_date), event_time)
+) <span class="kw">WITH CLUSTERING ORDER BY</span> (event_time <span class="kw">DESC</span>);</pre>
+
+  <p>Four tables, each designed for a specific team: billing, customer service, network operations. That is how you model telecom data &mdash; start with the queries, work backward to the schema.</p>
+
+  <!-- ── 3. Subscribers ── -->
+  <h2 id="subscribers">3. Add Subscribers</h2>
+
+  <p>Let's create three subscribers with different plan types. In a real carrier, you might have millions &mdash; but the access pattern is the same.</p>
+
+<pre><span class="kw">INSERT INTO</span> subscribers (subscriber_id, name, plan_type, monthly_limit_minutes, monthly_limit_data_gb, balance, activated_at)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1001'</span>, <span class="str">'Alice Nakamura'</span>, <span class="str">'unlimited'</span>, <span class="var">-1</span>, <span class="var">50</span>, <span class="var">85.00</span>, <span class="str">'2024-06-15 10:00:00'</span>);
+
+<span class="kw">INSERT INTO</span> subscribers (subscriber_id, name, plan_type, monthly_limit_minutes, monthly_limit_data_gb, balance, activated_at)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1002'</span>, <span class="str">'Ben Carlisle'</span>, <span class="str">'prepaid'</span>, <span class="var">500</span>, <span class="var">10</span>, <span class="var">22.50</span>, <span class="str">'2025-01-20 14:30:00'</span>);
+
+<span class="kw">INSERT INTO</span> subscribers (subscriber_id, name, plan_type, monthly_limit_minutes, monthly_limit_data_gb, balance, activated_at)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1003'</span>, <span class="str">'Carmen Delgado'</span>, <span class="str">'family'</span>, <span class="var">1000</span>, <span class="var">30</span>, <span class="var">110.00</span>, <span class="str">'2023-09-01 09:00:00'</span>);</pre>
+
+  <p>Alice has an unlimited plan (we use <code>-1</code> for no minute cap). Ben is on prepaid with a smaller balance. Carmen has a family plan with shared limits. Each represents a different billing scenario.</p>
+
+  <!-- ── 4. Call Records ── -->
+  <h2 id="call-records">4. Ingest Call Records</h2>
+
+  <p>Now let's simulate a day's worth of activity. In production, these records would stream in from network switches at thousands per second. Here we will insert them one at a time, but the schema handles bulk writes just as well.</p>
+
+<pre><span class="cm">-- Alice Nakamura: March 17, 2026</span>
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1001'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 08:12:00'</span>, uuid(), <span class="str">'voice'</span>, <span class="var">245</span>, <span class="var">0</span>, <span class="str">'+1-555-0199'</span>, <span class="str">'TWR-NYC-042'</span>, <span class="var">0.00</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1001'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 09:45:00'</span>, uuid(), <span class="str">'data'</span>, <span class="var">0</span>, <span class="var">52428800</span>, <span class="str">'streaming'</span>, <span class="str">'TWR-NYC-042'</span>, <span class="var">0.00</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1001'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 12:30:00'</span>, uuid(), <span class="str">'sms'</span>, <span class="var">0</span>, <span class="var">0</span>, <span class="str">'+1-555-0234'</span>, <span class="str">'TWR-NYC-015'</span>, <span class="var">0.00</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1001'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 14:05:00'</span>, uuid(), <span class="str">'voice'</span>, <span class="var">480</span>, <span class="var">0</span>, <span class="str">'+1-555-0301'</span>, <span class="str">'TWR-NYC-015'</span>, <span class="var">0.00</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1001'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 18:20:00'</span>, uuid(), <span class="str">'data'</span>, <span class="var">0</span>, <span class="var">104857600</span>, <span class="str">'video-call'</span>, <span class="str">'TWR-NYC-042'</span>, <span class="var">0.00</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1001'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 21:10:00'</span>, uuid(), <span class="str">'sms'</span>, <span class="var">0</span>, <span class="var">0</span>, <span class="str">'+1-555-0199'</span>, <span class="str">'TWR-NYC-042'</span>, <span class="var">0.00</span>);
+
+<span class="cm">-- Ben Carlisle: March 17, 2026 (prepaid, costs apply)</span>
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1002'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 07:30:00'</span>, uuid(), <span class="str">'voice'</span>, <span class="var">120</span>, <span class="var">0</span>, <span class="str">'+1-555-0455'</span>, <span class="str">'TWR-CHI-008'</span>, <span class="var">0.24</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1002'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 10:15:00'</span>, uuid(), <span class="str">'sms'</span>, <span class="var">0</span>, <span class="var">0</span>, <span class="str">'+1-555-0488'</span>, <span class="str">'TWR-CHI-008'</span>, <span class="var">0.10</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1002'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 13:00:00'</span>, uuid(), <span class="str">'data'</span>, <span class="var">0</span>, <span class="var">20971520</span>, <span class="str">'browsing'</span>, <span class="str">'TWR-CHI-012'</span>, <span class="var">0.50</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1002'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 16:45:00'</span>, uuid(), <span class="str">'voice'</span>, <span class="var">900</span>, <span class="var">0</span>, <span class="str">'+44-20-7946-0958'</span>, <span class="str">'TWR-CHI-008'</span>, <span class="var">4.50</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1002'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 19:30:00'</span>, uuid(), <span class="str">'sms'</span>, <span class="var">0</span>, <span class="var">0</span>, <span class="str">'+1-555-0455'</span>, <span class="str">'TWR-CHI-012'</span>, <span class="var">0.10</span>);
+
+<span class="cm">-- Carmen Delgado: March 17, 2026</span>
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1003'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 06:50:00'</span>, uuid(), <span class="str">'voice'</span>, <span class="var">360</span>, <span class="var">0</span>, <span class="str">'+1-555-0612'</span>, <span class="str">'TWR-MIA-003'</span>, <span class="var">0.36</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1003'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 11:20:00'</span>, uuid(), <span class="str">'data'</span>, <span class="var">0</span>, <span class="var">209715200</span>, <span class="str">'app-download'</span>, <span class="str">'TWR-MIA-003'</span>, <span class="var">1.00</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1003'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 15:00:00'</span>, uuid(), <span class="str">'voice'</span>, <span class="var">1200</span>, <span class="var">0</span>, <span class="str">'+52-55-1234-5678'</span>, <span class="str">'TWR-MIA-007'</span>, <span class="var">6.00</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1003'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 17:40:00'</span>, uuid(), <span class="str">'sms'</span>, <span class="var">0</span>, <span class="var">0</span>, <span class="str">'+1-555-0612'</span>, <span class="str">'TWR-MIA-003'</span>, <span class="var">0.10</span>);
+
+<span class="kw">INSERT INTO</span> call_records (subscriber_id, call_date, call_time, call_id, call_type, duration_seconds, data_bytes, destination, cell_tower, cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1003'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 20:15:00'</span>, uuid(), <span class="str">'data'</span>, <span class="var">0</span>, <span class="var">524288000</span>, <span class="str">'streaming'</span>, <span class="str">'TWR-MIA-003'</span>, <span class="var">2.50</span>);</pre>
+
+  <p>That is 20 call records across three subscribers. Notice how Ben's international call to London at 16:45 costs $4.50 &mdash; that is the kind of detail billing systems need to capture. Alice's unlimited plan shows $0.00 for everything.</p>
+
+  <!-- ── 5. Billing ── -->
+  <h2 id="billing">5. Generate Billing Summaries</h2>
+
+  <p>In a real system, you would compute these with a batch job or stream processor. For this tutorial, we will insert the pre-computed summaries directly.</p>
+
+<pre><span class="kw">INSERT INTO</span> billing_summary (subscriber_id, billing_month, total_voice_minutes, total_sms, total_data_mb, total_cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1001'</span>, <span class="str">'2026-03'</span>, <span class="var">142</span>, <span class="var">38</span>, <span class="var">4200</span>, <span class="var">85.00</span>);
+
+<span class="kw">INSERT INTO</span> billing_summary (subscriber_id, billing_month, total_voice_minutes, total_sms, total_data_mb, total_cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1001'</span>, <span class="str">'2026-02'</span>, <span class="var">128</span>, <span class="var">45</span>, <span class="var">3800</span>, <span class="var">85.00</span>);
+
+<span class="kw">INSERT INTO</span> billing_summary (subscriber_id, billing_month, total_voice_minutes, total_sms, total_data_mb, total_cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1002'</span>, <span class="str">'2026-03'</span>, <span class="var">67</span>, <span class="var">22</span>, <span class="var">1500</span>, <span class="var">18.40</span>);
+
+<span class="kw">INSERT INTO</span> billing_summary (subscriber_id, billing_month, total_voice_minutes, total_sms, total_data_mb, total_cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1002'</span>, <span class="str">'2026-02'</span>, <span class="var">45</span>, <span class="var">18</span>, <span class="var">980</span>, <span class="var">12.75</span>);
+
+<span class="kw">INSERT INTO</span> billing_summary (subscriber_id, billing_month, total_voice_minutes, total_sms, total_data_mb, total_cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1003'</span>, <span class="str">'2026-03'</span>, <span class="var">210</span>, <span class="var">55</span>, <span class="var">8500</span>, <span class="var">110.00</span>);
+
+<span class="kw">INSERT INTO</span> billing_summary (subscriber_id, billing_month, total_voice_minutes, total_sms, total_data_mb, total_cost)
+<span class="kw">VALUES</span> (<span class="str">'SUB-1003'</span>, <span class="str">'2026-02'</span>, <span class="var">195</span>, <span class="var">62</span>, <span class="var">7200</span>, <span class="var">110.00</span>);</pre>
+
+  <!-- ── 6. Network Events ── -->
+  <h2 id="network">6. Log Network Events</h2>
+
+  <p>Cell towers generate their own stream of events: maintenance windows, capacity warnings, and outages. Let's add a few realistic entries.</p>
+
+<pre><span class="kw">INSERT INTO</span> network_events (cell_tower, event_date, event_time, event_type, severity, description)
+<span class="kw">VALUES</span> (<span class="str">'TWR-NYC-042'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 03:00:00'</span>, <span class="str">'maintenance'</span>, <span class="str">'info'</span>, <span class="str">'Scheduled firmware update completed successfully'</span>);
+
+<span class="kw">INSERT INTO</span> network_events (cell_tower, event_date, event_time, event_type, severity, description)
+<span class="kw">VALUES</span> (<span class="str">'TWR-NYC-042'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 14:22:00'</span>, <span class="str">'capacity'</span>, <span class="str">'warning'</span>, <span class="str">'Active connections at 85% capacity, consider load balancing'</span>);
+
+<span class="kw">INSERT INTO</span> network_events (cell_tower, event_date, event_time, event_type, severity, description)
+<span class="kw">VALUES</span> (<span class="str">'TWR-CHI-008'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 09:15:00'</span>, <span class="str">'outage'</span>, <span class="str">'critical'</span>, <span class="str">'Power failure detected, switching to backup generator'</span>);
+
+<span class="kw">INSERT INTO</span> network_events (cell_tower, event_date, event_time, event_type, severity, description)
+<span class="kw">VALUES</span> (<span class="str">'TWR-CHI-008'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 09:18:00'</span>, <span class="str">'recovery'</span>, <span class="str">'info'</span>, <span class="str">'Backup generator online, service restored in 3 minutes'</span>);
+
+<span class="kw">INSERT INTO</span> network_events (cell_tower, event_date, event_time, event_type, severity, description)
+<span class="kw">VALUES</span> (<span class="str">'TWR-MIA-003'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 20:00:00'</span>, <span class="str">'capacity'</span>, <span class="str">'warning'</span>, <span class="str">'Streaming traffic surge, bandwidth utilization at 92%'</span>);
+
+<span class="kw">INSERT INTO</span> network_events (cell_tower, event_date, event_time, event_type, severity, description)
+<span class="kw">VALUES</span> (<span class="str">'TWR-MIA-007'</span>, <span class="str">'2026-03-17'</span>, <span class="str">'2026-03-17 11:00:00'</span>, <span class="str">'maintenance'</span>, <span class="str">'info'</span>, <span class="str">'Antenna alignment check passed, signal strength nominal'</span>);</pre>
+
+  <p>Notice the Chicago tower had a brief outage at 9:15 AM but recovered quickly. In a real NOC (Network Operations Center), these events would trigger alerts and populate dashboards.</p>
+
+  <!-- ── 7. Queries ── -->
+  <h2 id="queries">7. Run Operational Queries</h2>
+
+  <p>Let's run the queries that different teams in a telecom company use every day.</p>
+
+  <h3>Call History for a Subscriber</h3>
+  <p>Customer service needs this constantly. Because we partitioned by <code>(subscriber_id, call_date)</code>, pulling up a single day is a single-partition read &mdash; the fastest query Ferrosa can do.</p>
+
+<pre><span class="cm">-- Alice's calls on March 17</span>
+<span class="kw">SELECT</span> call_time, call_type, duration_seconds, destination, cost
+<span class="kw">FROM</span> call_records
+<span class="kw">WHERE</span> subscriber_id = <span class="str">'SUB-1001'</span>
+  <span class="kw">AND</span> call_date = <span class="str">'2026-03-17'</span>;</pre>
+
+  <h3>Daily Usage Summary</h3>
+  <p>How much data did a subscriber use today? This is the kind of query that powers "check my usage" features in mobile apps.</p>
+
+<pre><span class="cm">-- Ben's data usage on March 17</span>
+<span class="kw">SELECT</span> call_time, data_bytes, destination
+<span class="kw">FROM</span> call_records
+<span class="kw">WHERE</span> subscriber_id = <span class="str">'SUB-1002'</span>
+  <span class="kw">AND</span> call_date = <span class="str">'2026-03-17'</span>
+  <span class="kw">AND</span> call_type = <span class="str">'data'</span>
+<span class="kw">ALLOW FILTERING</span>;</pre>
+
+  <h3>Billing Summary</h3>
+  <p>Pull up a subscriber's bill history, most recent first.</p>
+
+<pre><span class="cm">-- Carmen's billing history</span>
+<span class="kw">SELECT</span> billing_month, total_voice_minutes, total_sms, total_data_mb, total_cost
+<span class="kw">FROM</span> billing_summary
+<span class="kw">WHERE</span> subscriber_id = <span class="str">'SUB-1003'</span>;</pre>
+
+  <h3>Network Events by Tower</h3>
+  <p>When a tower has issues, the NOC team needs its event log immediately.</p>
+
+<pre><span class="cm">-- All events for Chicago tower on March 17</span>
+<span class="kw">SELECT</span> event_time, event_type, severity, description
+<span class="kw">FROM</span> network_events
+<span class="kw">WHERE</span> cell_tower = <span class="str">'TWR-CHI-008'</span>
+  <span class="kw">AND</span> event_date = <span class="str">'2026-03-17'</span>;</pre>
+
+  <h3>Subscriber Balance</h3>
+  <p>A quick lookup for prepaid customers who want to check their remaining credit.</p>
+
+<pre><span class="cm">-- Check Ben's balance</span>
+<span class="kw">SELECT</span> name, plan_type, balance, monthly_limit_minutes, monthly_limit_data_gb
+<span class="kw">FROM</span> subscribers
+<span class="kw">WHERE</span> subscriber_id = <span class="str">'SUB-1002'</span>;</pre>
+
+  <h3>High-Cost Calls</h3>
+  <p>Find expensive calls &mdash; useful for fraud detection or helping customers understand their bills.</p>
+
+<pre><span class="cm">-- Ben's calls that cost more than $1.00</span>
+<span class="kw">SELECT</span> call_time, call_type, destination, duration_seconds, cost
+<span class="kw">FROM</span> call_records
+<span class="kw">WHERE</span> subscriber_id = <span class="str">'SUB-1002'</span>
+  <span class="kw">AND</span> call_date = <span class="str">'2026-03-17'</span>
+  <span class="kw">AND</span> cost > <span class="var">1.00</span>
+<span class="kw">ALLOW FILTERING</span>;</pre>
+
+  <h3>Subscriber Profile Update</h3>
+  <p>When a prepaid customer tops up their account, you update their balance. This is a single-partition write &mdash; fast and atomic.</p>
+
+<pre><span class="cm">-- Ben tops up his prepaid balance by $20</span>
+<span class="kw">UPDATE</span> subscribers
+<span class="kw">SET</span> balance = <span class="var">42.50</span>
+<span class="kw">WHERE</span> subscriber_id = <span class="str">'SUB-1002'</span>;</pre>
+
+  <h3>Voice Calls Only</h3>
+  <p>Customer service often needs to pull up just voice calls for a dispute. Filter by <code>call_type</code> to narrow it down.</p>
+
+<pre><span class="cm">-- Carmen's voice calls on March 17</span>
+<span class="kw">SELECT</span> call_time, destination, duration_seconds, cost
+<span class="kw">FROM</span> call_records
+<span class="kw">WHERE</span> subscriber_id = <span class="str">'SUB-1003'</span>
+  <span class="kw">AND</span> call_date = <span class="str">'2026-03-17'</span>
+  <span class="kw">AND</span> call_type = <span class="str">'voice'</span>
+<span class="kw">ALLOW FILTERING</span>;</pre>
+
+  <p>Carmen made two voice calls &mdash; a local one and a 20-minute international call to Mexico. That international call at $6.00 would be the one to look at if she calls in to dispute her bill.</p>
+
+  <h3>Month-Over-Month Comparison</h3>
+  <p>Pull two months of billing data for a subscriber to spot usage trends. This is useful for "your usage this month" dashboards.</p>
+
+<pre><span class="cm">-- Alice's billing for February and March</span>
+<span class="kw">SELECT</span> billing_month, total_voice_minutes, total_sms, total_data_mb, total_cost
+<span class="kw">FROM</span> billing_summary
+<span class="kw">WHERE</span> subscriber_id = <span class="str">'SUB-1001'</span>
+  <span class="kw">AND</span> billing_month >= <span class="str">'2026-02'</span>
+  <span class="kw">AND</span> billing_month <= <span class="str">'2026-03'</span>;</pre>
+
+  <p>Alice's data usage went from 3,800 MB in February to 4,200 MB in March. If she is approaching her 50 GB cap, the app could trigger a proactive notification.</p>
+
+  <div class="note">
+    <strong>Partition design tip:</strong> The compound partition key <code>(subscriber_id, call_date)</code> keeps each day's records in a bounded partition. Without the date component, a subscriber with years of history would create a massive partition &mdash; exactly the kind of problem Ferrosa's data model helps you avoid.
+  </div>
+
+  <!-- ── What You Learned ── -->
+  <h2 id="learned">What You Learned</h2>
+
+  <p>You just built the data layer for a mobile carrier. Here is a summary of everything you accomplished:</p>
+
+  <ul>
+    <li>Designed a <strong>compound partition key</strong> to keep call record partitions bounded by day</li>
+    <li>Used <strong>descending clustering order</strong> so the most recent records always come back first</li>
+    <li>Built a <strong>pre-aggregated billing table</strong> to avoid expensive full-table scans at bill time</li>
+    <li>Modeled <strong>network events</strong> with tower-and-date partitioning for fast NOC lookups</li>
+    <li>Ran <strong>operational queries</strong> across billing, customer service, and network operations use cases</li>
+  </ul>
+
+  <p>The data model you built here handles the three things telecom systems care about most: high write throughput for call records, fast lookups for customer service, and time-bounded queries for billing. Ferrosa's partition-based architecture makes all three efficient at any scale.</p>
+
+</div>
+
+</body>
+</html>

@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — Graph Joins &amp; Traversals</title>
+  <link rel="icon" type="image/svg+xml" href="../favicon.svg">
+  <style>
+    :root{--bg-primary:#0a0a0f;--bg-secondary:#111118;--bg-card:#16161f;--bg-card-hover:#1c1c28;--text-primary:#e8e8ed;--text-secondary:#9494a3;--text-muted:#6b6b7a;--accent:#e2725b;--accent-warm:#d4a574;--accent-green:#6bc9a0;--accent-cool:#7c9cf5;--border:#1e1e2a;--code-bg:#0d0d14;--font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--font-mono:'JetBrains Mono','Fira Code',monospace}*{margin:0;padding:0;box-sizing:border-box}html{scroll-behavior:smooth}body{font-family:var(--font-sans);background:var(--bg-primary);color:var(--text-primary);line-height:1.6;-webkit-font-smoothing:antialiased}.container{max-width:960px;margin:0 auto;padding:4rem 2rem 6rem}.back-link{display:inline-block;color:var(--accent);text-decoration:none;font-size:.875rem;font-weight:500;margin-bottom:2rem}.back-link:hover{text-decoration:underline}h1{font-size:2.5rem;font-weight:800;letter-spacing:-.03em;margin-bottom:.5rem}h1 span{color:var(--accent)}.subtitle{font-size:1.125rem;color:var(--text-secondary);margin-bottom:3rem;max-width:640px;line-height:1.7}h2{font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--accent);margin-bottom:1.5rem;margin-top:4rem}h3{font-size:1.25rem;font-weight:700;margin-bottom:.75rem;margin-top:2rem}p,li{color:var(--text-secondary);margin-bottom:1rem;max-width:720px;line-height:1.7}ul,ol{padding-left:1.5rem;margin-bottom:1.5rem}li{margin-bottom:.5rem}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}code{font-family:var(--font-mono);font-size:.875em;background:var(--code-bg);padding:.15em .4em;border-radius:4px;border:1px solid var(--border);color:var(--accent-cool)}pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:1.25rem 1.5rem;overflow-x:auto;margin-bottom:1.5rem;font-family:var(--font-mono);font-size:.875rem;line-height:1.8;color:var(--text-secondary)}pre .cm{color:#546e7a}pre .kw{color:#c792ea}pre .str{color:#c3e88d}pre .var{color:#f78c6c}.note{background:rgba(226,114,91,.08);border:1px solid rgba(226,114,91,.2);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;font-size:.9375rem;color:var(--text-secondary)}.note strong{color:var(--accent)}.toc{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem 2rem;margin-bottom:2rem}.toc h4{font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;color:var(--text-muted);margin-bottom:.75rem}.toc ul{list-style:none;padding:0;margin:0}.toc li{margin-bottom:.375rem}.toc a{font-size:.9375rem;font-weight:500}table{width:100%;border-collapse:collapse;margin:1.5rem 0;font-size:.9375rem}th,td{text-align:left;padding:.75rem 1rem;border-bottom:1px solid var(--border)}th{font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);font-weight:600}td{color:var(--text-secondary)}td:first-child{color:var(--text-primary);font-weight:600}td code{font-size:.8125rem}@media(max-width:640px){h1{font-size:1.75rem}}
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <a href="index.html" class="back-link">&larr; Back to examples</a>
+
+  <h1>Graph Joins &amp; <span>Traversals</span></h1>
+  <p class="subtitle">Traditional Cassandra warns against join-heavy workloads. Ferrosa doesn't &mdash; it has a built-in graph engine with bidirectional traversals and secondary indexes. This tutorial shows relationship queries that are impossible in vanilla Cassandra.</p>
+
+  <div class="note">
+    <strong>Prerequisites:</strong> Complete the <a href="cluster-setup.html">3-Node Cluster Setup</a> tutorial first. Your cluster must have <code>FERROSA_GRAPH_ENABLED=true</code> set (which our cluster-setup tutorial includes).
+  </div>
+
+  <div class="toc">
+    <h4>In this tutorial</h4>
+    <ul>
+      <li><a href="#why-graph-cql">1. Why Graph + CQL?</a></li>
+      <li><a href="#social-network-schema">2. The Social Network Schema</a></li>
+      <li><a href="#create-graph-tables">3. Create the Graph Tables</a></li>
+      <li><a href="#load-social-network">4. Load the Social Network</a></li>
+      <li><a href="#cql-secondary-indexes">5. CQL Queries with Secondary Indexes</a></li>
+      <li><a href="#cypher-queries">6. Graph Queries with Cypher</a></li>
+      <li><a href="#fraud-ring-detection">7. Fraud Ring Detection</a></li>
+      <li><a href="#recommendation-engine">8. Recommendation Engine</a></li>
+      <li><a href="#graph-vs-cql">9. When to Use Graph vs. CQL</a></li>
+      <li><a href="#what-you-learned">10. What You Learned</a></li>
+    </ul>
+  </div>
+
+
+  <!-- ────────────────────────────────────────────── -->
+  <h2 id="why-graph-cql">1. Why Graph + CQL?</h2>
+  <!-- ────────────────────────────────────────────── -->
+
+  <p>
+    Apache Cassandra is a proven choice for time-series data, IoT ingestion, and
+    write-heavy workloads. Its partition-key design delivers single-digit-millisecond
+    reads at any scale. But there is one thing the Cassandra community has always
+    warned against: <strong>relationship queries</strong>.
+  </p>
+
+  <p>
+    Need "find friends of friends"? "Which customers bought products that this
+    customer also bought"? "What is the shortest path between two accounts"?
+    In traditional Cassandra, these questions require multiple round trips from
+    your application, client-side joins, and increasingly complex denormalized
+    tables. Most teams end up running a second database &mdash; Neo4j, JanusGraph,
+    or Amazon Neptune &mdash; just for graph queries. That means data duplication,
+    ETL pipelines, and consistency headaches.
+  </p>
+
+  <p>
+    Ferrosa eliminates that trade-off. Your data lives in ordinary CQL tables
+    annotated with <code>graph.*</code> extensions. An async adjacency index
+    maintains graph structure automatically in the background. You get the best
+    of both worlds:
+  </p>
+
+  <ul>
+    <li><strong>CQL</strong> for fast key-value operations, time-range scans, and high-throughput writes</li>
+    <li><strong>Cypher</strong> (via Ferrosa's graph HTTP endpoint) for relationship traversals, pattern matching, and path queries</li>
+  </ul>
+
+  <p>
+    Same data. Two query languages. No duplication, no ETL, no second database.
+  </p>
+
+
+  <!-- ────────────────────────────────────────────── -->
+  <h2 id="social-network-schema">2. The Social Network Schema</h2>
+  <!-- ────────────────────────────────────────────── -->
+
+  <p>
+    We will model a small social network with six entity and relationship types.
+    The graph data model maps naturally to CQL tables:
+  </p>
+
+  <h3>Vertex tables (entities)</h3>
+  <ul>
+    <li><strong>Person</strong> &mdash; a user with a name, age, city, and join date</li>
+    <li><strong>Company</strong> &mdash; an organization with an industry and founding year</li>
+    <li><strong>Post</strong> &mdash; a piece of content authored by a Person</li>
+  </ul>
+
+  <h3>Edge tables (relationships)</h3>
+  <ul>
+    <li><strong>FOLLOWS</strong> &mdash; Person follows Person (directed)</li>
+    <li><strong>LIKES</strong> &mdash; Person likes Post</li>
+    <li><strong>WORKS_AT</strong> &mdash; Person works at Company</li>
+  </ul>
+
+  <p>
+    Vertex tables use a single UUID primary key. Edge tables use a composite
+    primary key of <code>(source_id, target_id)</code>, which lets CQL answer
+    "who does X follow?" efficiently. Ferrosa's graph engine also maintains a
+    reverse index so "who follows X?" is equally fast &mdash; something vanilla
+    Cassandra cannot do without a second denormalized table.
+  </p>
+
+
+  <!-- ────────────────────────────────────────────── -->
+  <h2 id="create-graph-tables">3. Create the Graph Tables</h2>
+  <!-- ────────────────────────────────────────────── -->
+
+  <p>
+    Connect to your cluster with <code>cqlsh</code> and run the following DDL.
+    Pay attention to the <code>WITH extensions</code> clauses &mdash; these are
+    what tell Ferrosa to treat ordinary CQL tables as graph vertices and edges.
+  </p>
+
+  <h3>Keyspace and vertex tables</h3>
+
+<pre>
+<span class="kw">CREATE KEYSPACE</span> social <span class="kw">WITH</span> replication = {
+    <span class="str">'class'</span>: <span class="str">'SimpleStrategy'</span>, <span class="str">'replication_factor'</span>: 3
+};
+<span class="kw">USE</span> social;
+
+<span class="cm">-- Person vertex table</span>
+<span class="kw">CREATE TABLE</span> person (
+    person_id uuid <span class="kw">PRIMARY KEY</span>,
+    name text,
+    age int,
+    city text,
+    joined_at timestamp
+) <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'vertex'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'Person'</span>
+};
+
+<span class="cm">-- Company vertex table</span>
+<span class="kw">CREATE TABLE</span> company (
+    company_id uuid <span class="kw">PRIMARY KEY</span>,
+    name text,
+    industry text,
+    city text,
+    founded_year int
+) <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'vertex'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'Company'</span>
+};
+
+<span class="cm">-- Post vertex table</span>
+<span class="kw">CREATE TABLE</span> post (
+    post_id uuid <span class="kw">PRIMARY KEY</span>,
+    author_id uuid,
+    content text,
+    created_at timestamp,
+    tags set&lt;text&gt;
+) <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'vertex'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'Post'</span>
+};
+</pre>
+
+  <h3>Edge tables</h3>
+
+<pre>
+<span class="cm">-- Person follows Person</span>
+<span class="kw">CREATE TABLE</span> follows (
+    source_id uuid,
+    target_id uuid,
+    since timestamp,
+    <span class="kw">PRIMARY KEY</span> (source_id, target_id)
+) <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'edge'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'FOLLOWS'</span>,
+    <span class="str">'graph.source'</span>: <span class="str">'source_id'</span>,
+    <span class="str">'graph.target'</span>: <span class="str">'target_id'</span>,
+    <span class="str">'graph.source_label'</span>: <span class="str">'Person'</span>,
+    <span class="str">'graph.target_label'</span>: <span class="str">'Person'</span>
+};
+
+<span class="cm">-- Person likes Post</span>
+<span class="kw">CREATE TABLE</span> likes (
+    source_id uuid,
+    target_id uuid,
+    liked_at timestamp,
+    <span class="kw">PRIMARY KEY</span> (source_id, target_id)
+) <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'edge'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'LIKES'</span>,
+    <span class="str">'graph.source'</span>: <span class="str">'source_id'</span>,
+    <span class="str">'graph.target'</span>: <span class="str">'target_id'</span>,
+    <span class="str">'graph.source_label'</span>: <span class="str">'Person'</span>,
+    <span class="str">'graph.target_label'</span>: <span class="str">'Post'</span>
+};
+
+<span class="cm">-- Person works at Company</span>
+<span class="kw">CREATE TABLE</span> works_at (
+    source_id uuid,
+    target_id uuid,
+    role text,
+    started_at timestamp,
+    <span class="kw">PRIMARY KEY</span> (source_id, target_id)
+) <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'edge'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'WORKS_AT'</span>,
+    <span class="str">'graph.source'</span>: <span class="str">'source_id'</span>,
+    <span class="str">'graph.target'</span>: <span class="str">'target_id'</span>,
+    <span class="str">'graph.source_label'</span>: <span class="str">'Person'</span>,
+    <span class="str">'graph.target_label'</span>: <span class="str">'Company'</span>
+};
+</pre>
+
+  <h3>Understanding the extensions</h3>
+
+  <table>
+    <tr>
+      <th>Extension key</th>
+      <th>Purpose</th>
+    </tr>
+    <tr>
+      <td><code>graph.type</code></td>
+      <td>Marks a table as <code>vertex</code> (entity) or <code>edge</code> (relationship). The graph engine ignores tables without this annotation.</td>
+    </tr>
+    <tr>
+      <td><code>graph.label</code></td>
+      <td>The name used in Cypher queries. <code>MATCH (p:Person)</code> references the table with <code>graph.label = 'Person'</code>.</td>
+    </tr>
+    <tr>
+      <td><code>graph.source</code></td>
+      <td>Column name holding the source vertex UUID. Only for edge tables.</td>
+    </tr>
+    <tr>
+      <td><code>graph.target</code></td>
+      <td>Column name holding the target vertex UUID. Only for edge tables.</td>
+    </tr>
+    <tr>
+      <td><code>graph.source_label</code></td>
+      <td>Which vertex label the source column references. Lets the engine resolve cross-table joins.</td>
+    </tr>
+    <tr>
+      <td><code>graph.target_label</code></td>
+      <td>Which vertex label the target column references.</td>
+    </tr>
+  </table>
+
+  <h3>Secondary indexes for reverse lookups</h3>
+
+  <p>
+    Create secondary indexes on columns you will filter by. Ferrosa's secondary
+    indexes are backed by local token-range scans and the graph adjacency index,
+    making them far more efficient than Cassandra's legacy secondary indexes.
+  </p>
+
+<pre>
+<span class="kw">CREATE INDEX</span> ON person (city);
+<span class="kw">CREATE INDEX</span> ON person (name);
+<span class="kw">CREATE INDEX</span> ON company (industry);
+<span class="kw">CREATE INDEX</span> ON post (author_id);
+</pre>
+
+
+  <!-- ────────────────────────────────────────────── -->
+  <h2 id="load-social-network">4. Load the Social Network</h2>
+  <!-- ────────────────────────────────────────────── -->
+
+  <p>
+    Insert sample data. We use short, readable UUIDs so you can follow along
+    easily. In production you would use <code>uuid()</code> to generate them.
+  </p>
+
+  <h3>People</h3>
+
+<pre>
+<span class="kw">INSERT INTO</span> person (person_id, name, age, city, joined_at) <span class="kw">VALUES</span>
+  (<span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>, <span class="str">'Alice'</span>,   32, <span class="str">'San Francisco'</span>, <span class="str">'2024-01-15T08:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> person (person_id, name, age, city, joined_at) <span class="kw">VALUES</span>
+  (<span class="var">bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb</span>, <span class="str">'Bob'</span>,     28, <span class="str">'San Francisco'</span>, <span class="str">'2024-02-20T10:30:00Z'</span>);
+<span class="kw">INSERT INTO</span> person (person_id, name, age, city, joined_at) <span class="kw">VALUES</span>
+  (<span class="var">cccccccc-cccc-cccc-cccc-cccccccccccc</span>, <span class="str">'Carol'</span>,   35, <span class="str">'New York'</span>,      <span class="str">'2024-03-10T14:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> person (person_id, name, age, city, joined_at) <span class="kw">VALUES</span>
+  (<span class="var">dddddddd-dddd-dddd-dddd-dddddddddddd</span>, <span class="str">'David'</span>,   41, <span class="str">'New York'</span>,      <span class="str">'2024-03-22T09:15:00Z'</span>);
+<span class="kw">INSERT INTO</span> person (person_id, name, age, city, joined_at) <span class="kw">VALUES</span>
+  (<span class="var">eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee</span>, <span class="str">'Eve'</span>,     29, <span class="str">'Austin'</span>,        <span class="str">'2024-04-05T16:45:00Z'</span>);
+<span class="kw">INSERT INTO</span> person (person_id, name, age, city, joined_at) <span class="kw">VALUES</span>
+  (<span class="var">ffffffff-ffff-ffff-ffff-ffffffffffff</span>, <span class="str">'Frank'</span>,   38, <span class="str">'Austin'</span>,        <span class="str">'2024-05-12T11:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> person (person_id, name, age, city, joined_at) <span class="kw">VALUES</span>
+  (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'Grace'</span>,   26, <span class="str">'San Francisco'</span>, <span class="str">'2024-06-18T07:30:00Z'</span>);
+<span class="kw">INSERT INTO</span> person (person_id, name, age, city, joined_at) <span class="kw">VALUES</span>
+  (<span class="var">22222222-2222-2222-2222-222222222222</span>, <span class="str">'Hank'</span>,    45, <span class="str">'Chicago'</span>,       <span class="str">'2024-07-01T13:20:00Z'</span>);
+</pre>
+
+  <h3>Companies</h3>
+
+<pre>
+<span class="kw">INSERT INTO</span> company (company_id, name, industry, city, founded_year) <span class="kw">VALUES</span>
+  (<span class="var">c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0c0</span>, <span class="str">'Acme Corp'</span>,    <span class="str">'Technology'</span>, <span class="str">'San Francisco'</span>, 2015);
+<span class="kw">INSERT INTO</span> company (company_id, name, industry, city, founded_year) <span class="kw">VALUES</span>
+  (<span class="var">d0d0d0d0-d0d0-d0d0-d0d0-d0d0d0d0d0d0</span>, <span class="str">'Globex Inc'</span>,   <span class="str">'Finance'</span>,    <span class="str">'New York'</span>,      2008);
+<span class="kw">INSERT INTO</span> company (company_id, name, industry, city, founded_year) <span class="kw">VALUES</span>
+  (<span class="var">e0e0e0e0-e0e0-e0e0-e0e0-e0e0e0e0e0e0</span>, <span class="str">'StartupXYZ'</span>,   <span class="str">'Technology'</span>, <span class="str">'Austin'</span>,        2022);
+</pre>
+
+  <h3>Posts</h3>
+
+<pre>
+<span class="kw">INSERT INTO</span> post (post_id, author_id, content, created_at, tags) <span class="kw">VALUES</span>
+  (<span class="var">p0000001-0000-0000-0000-000000000001</span>,
+   <span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>,
+   <span class="str">'Just deployed our new graph engine. The future is traversals!'</span>,
+   <span class="str">'2025-01-10T09:00:00Z'</span>, {<span class="str">'ferrosa'</span>, <span class="str">'graph'</span>});
+
+<span class="kw">INSERT INTO</span> post (post_id, author_id, content, created_at, tags) <span class="kw">VALUES</span>
+  (<span class="var">p0000002-0000-0000-0000-000000000002</span>,
+   <span class="var">bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb</span>,
+   <span class="str">'Hot take: denormalization is a workaround, not a strategy.'</span>,
+   <span class="str">'2025-01-12T14:30:00Z'</span>, {<span class="str">'databases'</span>, <span class="str">'opinion'</span>});
+
+<span class="kw">INSERT INTO</span> post (post_id, author_id, content, created_at, tags) <span class="kw">VALUES</span>
+  (<span class="var">p0000003-0000-0000-0000-000000000003</span>,
+   <span class="var">cccccccc-cccc-cccc-cccc-cccccccccccc</span>,
+   <span class="str">'Wrote a fraud detection pipeline in 20 lines of Cypher. Mind blown.'</span>,
+   <span class="str">'2025-01-15T11:00:00Z'</span>, {<span class="str">'fraud'</span>, <span class="str">'cypher'</span>});
+
+<span class="kw">INSERT INTO</span> post (post_id, author_id, content, created_at, tags) <span class="kw">VALUES</span>
+  (<span class="var">p0000004-0000-0000-0000-000000000004</span>,
+   <span class="var">eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee</span>,
+   <span class="str">'Exploring lock-free data structures for concurrent graph indexing.'</span>,
+   <span class="str">'2025-01-18T16:00:00Z'</span>, {<span class="str">'concurrency'</span>, <span class="str">'research'</span>});
+
+<span class="kw">INSERT INTO</span> post (post_id, author_id, content, created_at, tags) <span class="kw">VALUES</span>
+  (<span class="var">p0000005-0000-0000-0000-000000000005</span>,
+   <span class="var">dddddddd-dddd-dddd-dddd-dddddddddddd</span>,
+   <span class="str">'Benchmarked Ferrosa against Cassandra + Neo4j. Single system wins.'</span>,
+   <span class="str">'2025-01-20T08:45:00Z'</span>, {<span class="str">'benchmark'</span>, <span class="str">'ferrosa'</span>});
+
+<span class="kw">INSERT INTO</span> post (post_id, author_id, content, created_at, tags) <span class="kw">VALUES</span>
+  (<span class="var">p0000006-0000-0000-0000-000000000006</span>,
+   <span class="var">11111111-1111-1111-1111-111111111111</span>,
+   <span class="str">'Graph indexes + S3 write-behind = best of all worlds.'</span>,
+   <span class="str">'2025-01-22T10:30:00Z'</span>, {<span class="str">'ferrosa'</span>, <span class="str">'s3'</span>});
+</pre>
+
+  <h3>Follow relationships</h3>
+
+<pre>
+<span class="cm">-- Alice's network: follows Bob, Carol, and Eve</span>
+<span class="kw">INSERT INTO</span> follows (source_id, target_id, since) <span class="kw">VALUES</span>
+  (<span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>, <span class="var">bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb</span>, <span class="str">'2024-02-21T00:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> follows (source_id, target_id, since) <span class="kw">VALUES</span>
+  (<span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>, <span class="var">cccccccc-cccc-cccc-cccc-cccccccccccc</span>, <span class="str">'2024-03-11T00:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> follows (source_id, target_id, since) <span class="kw">VALUES</span>
+  (<span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>, <span class="var">eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee</span>, <span class="str">'2024-04-10T00:00:00Z'</span>);
+
+<span class="cm">-- Bob follows Carol and David</span>
+<span class="kw">INSERT INTO</span> follows (source_id, target_id, since) <span class="kw">VALUES</span>
+  (<span class="var">bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb</span>, <span class="var">cccccccc-cccc-cccc-cccc-cccccccccccc</span>, <span class="str">'2024-03-15T00:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> follows (source_id, target_id, since) <span class="kw">VALUES</span>
+  (<span class="var">bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb</span>, <span class="var">dddddddd-dddd-dddd-dddd-dddddddddddd</span>, <span class="str">'2024-04-01T00:00:00Z'</span>);
+
+<span class="cm">-- Carol follows Alice and Frank (creates a cycle: Alice -> Carol -> Alice)</span>
+<span class="kw">INSERT INTO</span> follows (source_id, target_id, since) <span class="kw">VALUES</span>
+  (<span class="var">cccccccc-cccc-cccc-cccc-cccccccccccc</span>, <span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>, <span class="str">'2024-03-12T00:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> follows (source_id, target_id, since) <span class="kw">VALUES</span>
+  (<span class="var">cccccccc-cccc-cccc-cccc-cccccccccccc</span>, <span class="var">ffffffff-ffff-ffff-ffff-ffffffffffff</span>, <span class="str">'2024-06-01T00:00:00Z'</span>);
+
+<span class="cm">-- Eve follows Frank and Grace</span>
+<span class="kw">INSERT INTO</span> follows (source_id, target_id, since) <span class="kw">VALUES</span>
+  (<span class="var">eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee</span>, <span class="var">ffffffff-ffff-ffff-ffff-ffffffffffff</span>, <span class="str">'2024-05-15T00:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> follows (source_id, target_id, since) <span class="kw">VALUES</span>
+  (<span class="var">eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee</span>, <span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2024-06-20T00:00:00Z'</span>);
+
+<span class="cm">-- David follows Hank</span>
+<span class="kw">INSERT INTO</span> follows (source_id, target_id, since) <span class="kw">VALUES</span>
+  (<span class="var">dddddddd-dddd-dddd-dddd-dddddddddddd</span>, <span class="var">22222222-2222-2222-2222-222222222222</span>, <span class="str">'2024-07-05T00:00:00Z'</span>);
+
+<span class="cm">-- Grace follows Alice</span>
+<span class="kw">INSERT INTO</span> follows (source_id, target_id, since) <span class="kw">VALUES</span>
+  (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>, <span class="str">'2024-06-19T00:00:00Z'</span>);
+</pre>
+
+  <h3>Likes</h3>
+
+<pre>
+<span class="cm">-- Alice likes Bob's post and Carol's post</span>
+<span class="kw">INSERT INTO</span> likes (source_id, target_id, liked_at) <span class="kw">VALUES</span>
+  (<span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>, <span class="var">p0000002-0000-0000-0000-000000000002</span>, <span class="str">'2025-01-12T15:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> likes (source_id, target_id, liked_at) <span class="kw">VALUES</span>
+  (<span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>, <span class="var">p0000003-0000-0000-0000-000000000003</span>, <span class="str">'2025-01-15T12:00:00Z'</span>);
+
+<span class="cm">-- Bob likes Alice's post and Eve's post</span>
+<span class="kw">INSERT INTO</span> likes (source_id, target_id, liked_at) <span class="kw">VALUES</span>
+  (<span class="var">bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb</span>, <span class="var">p0000001-0000-0000-0000-000000000001</span>, <span class="str">'2025-01-10T10:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> likes (source_id, target_id, liked_at) <span class="kw">VALUES</span>
+  (<span class="var">bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb</span>, <span class="var">p0000004-0000-0000-0000-000000000004</span>, <span class="str">'2025-01-19T08:00:00Z'</span>);
+
+<span class="cm">-- Carol likes Alice's post and David's post</span>
+<span class="kw">INSERT INTO</span> likes (source_id, target_id, liked_at) <span class="kw">VALUES</span>
+  (<span class="var">cccccccc-cccc-cccc-cccc-cccccccccccc</span>, <span class="var">p0000001-0000-0000-0000-000000000001</span>, <span class="str">'2025-01-11T09:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> likes (source_id, target_id, liked_at) <span class="kw">VALUES</span>
+  (<span class="var">cccccccc-cccc-cccc-cccc-cccccccccccc</span>, <span class="var">p0000005-0000-0000-0000-000000000005</span>, <span class="str">'2025-01-20T10:00:00Z'</span>);
+
+<span class="cm">-- Eve likes Bob's post and Carol's post</span>
+<span class="kw">INSERT INTO</span> likes (source_id, target_id, liked_at) <span class="kw">VALUES</span>
+  (<span class="var">eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee</span>, <span class="var">p0000002-0000-0000-0000-000000000002</span>, <span class="str">'2025-01-13T07:30:00Z'</span>);
+<span class="kw">INSERT INTO</span> likes (source_id, target_id, liked_at) <span class="kw">VALUES</span>
+  (<span class="var">eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee</span>, <span class="var">p0000003-0000-0000-0000-000000000003</span>, <span class="str">'2025-01-16T11:00:00Z'</span>);
+
+<span class="cm">-- David likes Grace's post</span>
+<span class="kw">INSERT INTO</span> likes (source_id, target_id, liked_at) <span class="kw">VALUES</span>
+  (<span class="var">dddddddd-dddd-dddd-dddd-dddddddddddd</span>, <span class="var">p0000006-0000-0000-0000-000000000006</span>, <span class="str">'2025-01-22T14:00:00Z'</span>);
+</pre>
+
+  <h3>Employment</h3>
+
+<pre>
+<span class="cm">-- Alice and Bob work at Acme Corp</span>
+<span class="kw">INSERT INTO</span> works_at (source_id, target_id, role, started_at) <span class="kw">VALUES</span>
+  (<span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>, <span class="var">c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0c0</span>,
+   <span class="str">'Staff Engineer'</span>, <span class="str">'2020-06-01T00:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> works_at (source_id, target_id, role, started_at) <span class="kw">VALUES</span>
+  (<span class="var">bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb</span>, <span class="var">c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0c0</span>,
+   <span class="str">'Senior Engineer'</span>, <span class="str">'2022-01-15T00:00:00Z'</span>);
+
+<span class="cm">-- Carol and David work at Globex Inc</span>
+<span class="kw">INSERT INTO</span> works_at (source_id, target_id, role, started_at) <span class="kw">VALUES</span>
+  (<span class="var">cccccccc-cccc-cccc-cccc-cccccccccccc</span>, <span class="var">d0d0d0d0-d0d0-d0d0-d0d0-d0d0d0d0d0d0</span>,
+   <span class="str">'VP of Engineering'</span>, <span class="str">'2018-03-01T00:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> works_at (source_id, target_id, role, started_at) <span class="kw">VALUES</span>
+  (<span class="var">dddddddd-dddd-dddd-dddd-dddddddddddd</span>, <span class="var">d0d0d0d0-d0d0-d0d0-d0d0-d0d0d0d0d0d0</span>,
+   <span class="str">'Data Scientist'</span>, <span class="str">'2021-09-01T00:00:00Z'</span>);
+
+<span class="cm">-- Eve and Frank work at StartupXYZ</span>
+<span class="kw">INSERT INTO</span> works_at (source_id, target_id, role, started_at) <span class="kw">VALUES</span>
+  (<span class="var">eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee</span>, <span class="var">e0e0e0e0-e0e0-e0e0-e0e0-e0e0e0e0e0e0</span>,
+   <span class="str">'Co-Founder'</span>, <span class="str">'2022-01-01T00:00:00Z'</span>);
+<span class="kw">INSERT INTO</span> works_at (source_id, target_id, role, started_at) <span class="kw">VALUES</span>
+  (<span class="var">ffffffff-ffff-ffff-ffff-ffffffffffff</span>, <span class="var">e0e0e0e0-e0e0-e0e0-e0e0-e0e0e0e0e0e0</span>,
+   <span class="str">'CTO'</span>, <span class="str">'2022-01-01T00:00:00Z'</span>);
+
+<span class="cm">-- Grace works at Acme Corp</span>
+<span class="kw">INSERT INTO</span> works_at (source_id, target_id, role, started_at) <span class="kw">VALUES</span>
+  (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="var">c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0c0</span>,
+   <span class="str">'Junior Engineer'</span>, <span class="str">'2024-06-20T00:00:00Z'</span>);
+</pre>
+
+
+  <!-- ────────────────────────────────────────────── -->
+  <h2 id="cql-secondary-indexes">5. CQL Queries with Secondary Indexes</h2>
+  <!-- ────────────────────────────────────────────── -->
+
+  <p>
+    With secondary indexes in place, CQL can handle direct lookups efficiently.
+    Let's see what it can do &mdash; and where it hits its limits.
+  </p>
+
+  <h3>What CQL handles well</h3>
+
+  <p><strong>Find people in a city</strong> (secondary index scan):</p>
+
+<pre>
+<span class="kw">SELECT</span> name, age <span class="kw">FROM</span> person <span class="kw">WHERE</span> city = <span class="str">'San Francisco'</span>;
+
+<span class="cm">-- Returns: Alice (32), Bob (28), Grace (26)</span>
+</pre>
+
+  <p><strong>Find who Alice follows</strong> (partition key lookup &mdash; fastest possible query):</p>
+
+<pre>
+<span class="kw">SELECT</span> target_id, since <span class="kw">FROM</span> follows
+<span class="kw">WHERE</span> source_id = <span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>;
+
+<span class="cm">-- Returns: Bob, Carol, Eve (with timestamps)</span>
+</pre>
+
+  <p><strong>Find posts by a specific author</strong> (secondary index on <code>author_id</code>):</p>
+
+<pre>
+<span class="kw">SELECT</span> content, created_at <span class="kw">FROM</span> post
+<span class="kw">WHERE</span> author_id = <span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>;
+
+<span class="cm">-- Returns: "Just deployed our new graph engine..."</span>
+</pre>
+
+  <p><strong>Find technology companies</strong> (secondary index on <code>industry</code>):</p>
+
+<pre>
+<span class="kw">SELECT</span> name, city, founded_year <span class="kw">FROM</span> company
+<span class="kw">WHERE</span> industry = <span class="str">'Technology'</span>;
+
+<span class="cm">-- Returns: Acme Corp (San Francisco, 2015), StartupXYZ (Austin, 2022)</span>
+</pre>
+
+  <p><strong>Find who follows Alice</strong> (reverse lookup). This works but requires
+    scanning the <code>target_id</code> clustering column, which is not the partition key:</p>
+
+<pre>
+<span class="kw">SELECT</span> source_id, since <span class="kw">FROM</span> follows
+<span class="kw">WHERE</span> target_id = <span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>
+<span class="kw">ALLOW FILTERING</span>;
+
+<span class="cm">-- Returns: Carol, Grace</span>
+<span class="cm">-- WARNING: In vanilla Cassandra this is a full-table scan.</span>
+<span class="cm">-- In Ferrosa, the graph engine's reverse adjacency index</span>
+<span class="cm">-- makes this a fast indexed lookup.</span>
+</pre>
+
+  <h3>Where CQL hits a wall</h3>
+
+  <p>
+    These queries are impossible to express in a single CQL statement. Each one
+    would require multiple round trips and application-side join logic:
+  </p>
+
+  <ul>
+    <li><strong>Friends of friends:</strong> "Find people followed by people that Alice follows" &mdash; requires fetching Alice's follows, then fetching each of their follows, then deduplicating</li>
+    <li><strong>Mutual followers:</strong> "Who follows people that Alice follows?" &mdash; requires reverse lookups per target, then intersection</li>
+    <li><strong>Shortest path:</strong> "What is the shortest follow chain from Alice to Hank?" &mdash; not expressible at all; requires BFS in application code</li>
+    <li><strong>Pattern matching:</strong> "Find triangles: A follows B, B follows C, C follows A" &mdash; combinatorial explosion in application code</li>
+  </ul>
+
+  <p>This is exactly where Ferrosa's graph engine takes over.</p>
+
+
+  <!-- ────────────────────────────────────────────── -->
+  <h2 id="cypher-queries">6. Graph Queries with Cypher</h2>
+  <!-- ────────────────────────────────────────────── -->
+
+  <p>
+    Ferrosa exposes a graph HTTP endpoint on port <code>7474</code>. The same
+    data you just inserted via CQL is immediately available for Cypher queries.
+    No ETL. No sync delay. The graph index is updated asynchronously as CQL
+    writes land &mdash; typically within milliseconds.
+  </p>
+
+  <h3>Check graph health</h3>
+
+<pre>
+curl http://localhost:7474/graph/health
+
+<span class="cm"># {"status":"healthy","vertices":14,"edges":19,"labels":["Person","Company","Post"]}</span>
+</pre>
+
+  <h3>View the graph schema</h3>
+
+<pre>
+curl http://localhost:7474/graph/schema | python3 -m json.tool
+
+<span class="cm"># Shows all vertex labels, edge labels, their properties,</span>
+<span class="cm"># and the source/target relationships between them.</span>
+</pre>
+
+  <h3>Direct follows</h3>
+
+  <p>Find everyone Alice follows. This is equivalent to the CQL partition-key
+    lookup, but expressed in graph terms:</p>
+
+<pre>
+curl -X POST http://localhost:7474/graph/query \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"query": "MATCH (a:Person {name: \"Alice\"})-[:FOLLOWS]->(b:Person) RETURN b.name, b.city"}'</span>
+
+<span class="cm"># [</span>
+<span class="cm">#   {"b.name": "Bob",   "b.city": "San Francisco"},</span>
+<span class="cm">#   {"b.name": "Carol", "b.city": "New York"},</span>
+<span class="cm">#   {"b.name": "Eve",   "b.city": "Austin"}</span>
+<span class="cm"># ]</span>
+</pre>
+
+  <h3>Friends of friends (2-hop traversal)</h3>
+
+  <p>Find people at distance 2 from Alice in the follow graph. This is the
+    query that CQL cannot express in a single statement:</p>
+
+<pre>
+curl -X POST http://localhost:7474/graph/query \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"query": "MATCH (a:Person {name: \"Alice\"})-[:FOLLOWS]->()-[:FOLLOWS]->(friend2:Person) WHERE friend2.name <> \"Alice\" RETURN DISTINCT friend2.name"}'</span>
+
+<span class="cm"># Alice follows Bob, Carol, Eve</span>
+<span class="cm">#   Bob follows Carol, David</span>
+<span class="cm">#   Carol follows Alice (filtered out), Frank</span>
+<span class="cm">#   Eve follows Frank, Grace</span>
+<span class="cm"># Result: [{"friend2.name": "Carol"}, {"friend2.name": "David"},</span>
+<span class="cm">#          {"friend2.name": "Frank"}, {"friend2.name": "Grace"}]</span>
+</pre>
+
+  <h3>Reverse traversal: who follows Alice?</h3>
+
+  <p>Bidirectional traversal is where the graph engine truly shines. In vanilla
+    Cassandra, this requires <code>ALLOW FILTERING</code> (full-table scan).
+    In Ferrosa, the graph engine's reverse adjacency index makes it instant:</p>
+
+<pre>
+curl -X POST http://localhost:7474/graph/query \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"query": "MATCH (follower:Person)-[:FOLLOWS]->(a:Person {name: \"Alice\"}) RETURN follower.name"}'</span>
+
+<span class="cm"># [{"follower.name": "Carol"}, {"follower.name": "Grace"}]</span>
+</pre>
+
+  <h3>Coworkers: people at the same company</h3>
+
+  <p>Traverse through a Company vertex to find colleagues. This crosses two
+    edge types and would require three CQL queries plus application logic:</p>
+
+<pre>
+curl -X POST http://localhost:7474/graph/query \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"query": "MATCH (a:Person {name: \"Alice\"})-[:WORKS_AT]->(c:Company)<-[:WORKS_AT]-(coworker:Person) WHERE coworker.name <> \"Alice\" RETURN coworker.name, coworker.age, c.name AS company"}'</span>
+
+<span class="cm"># [</span>
+<span class="cm">#   {"coworker.name": "Bob",   "coworker.age": 28, "company": "Acme Corp"},</span>
+<span class="cm">#   {"coworker.name": "Grace", "coworker.age": 26, "company": "Acme Corp"}</span>
+<span class="cm"># ]</span>
+</pre>
+
+  <h3>Posts liked by people Alice follows</h3>
+
+  <p>A 3-hop traversal across two different edge types. This combines social
+    graph data with content interaction data in one query:</p>
+
+<pre>
+curl -X POST http://localhost:7474/graph/query \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"query": "MATCH (a:Person {name: \"Alice\"})-[:FOLLOWS]->(friend:Person)-[:LIKES]->(p:Post) RETURN friend.name, p.content"}'</span>
+
+<span class="cm"># Alice follows Bob, Carol, Eve.</span>
+<span class="cm">#   Bob liked: "Just deployed our new graph engine..." and "Exploring lock-free..."</span>
+<span class="cm">#   Carol liked: "Just deployed our new graph engine..." and "Benchmarked Ferrosa..."</span>
+<span class="cm">#   Eve liked: "Hot take: denormalization..." and "Wrote a fraud detection..."</span>
+<span class="cm"># Result: 6 rows showing each friend and the post they liked.</span>
+</pre>
+
+  <h3>Shortest path between two people</h3>
+
+  <p>Find the shortest follow chain between Alice and Hank. This is entirely
+    impossible in CQL &mdash; it requires a breadth-first search that Cypher
+    handles natively:</p>
+
+<pre>
+curl -X POST http://localhost:7474/graph/query \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"query": "MATCH path = shortestPath((a:Person {name: \"Alice\"})-[:FOLLOWS*..6]->(h:Person {name: \"Hank\"})) RETURN [n IN nodes(path) | n.name] AS chain"}'</span>
+
+<span class="cm"># Alice -> Bob -> David -> Hank</span>
+<span class="cm"># [{"chain": ["Alice", "Bob", "David", "Hank"]}]</span>
+</pre>
+
+  <div class="note">
+    <strong>Key insight:</strong> Every Cypher query above reads from the same
+    CQL tables you created in step 3. There is no data duplication. A CQL
+    <code>INSERT</code> into the <code>follows</code> table is immediately
+    visible to Cypher. One database, two query paradigms.
+  </div>
+
+
+  <!-- ────────────────────────────────────────────── -->
+  <h2 id="fraud-ring-detection">7. Fraud Ring Detection</h2>
+  <!-- ────────────────────────────────────────────── -->
+
+  <p>
+    Graph databases excel at detecting fraud rings &mdash; circular patterns
+    of transactions that hide money laundering or collusion. Let's add a
+    <code>transfers</code> edge table to our social schema and detect suspicious
+    cycles.
+  </p>
+
+  <h3>Create the transfers edge table</h3>
+
+<pre>
+<span class="kw">CREATE TABLE</span> transfers (
+    source_id uuid,
+    target_id uuid,
+    amount decimal,
+    transferred_at timestamp,
+    reference text,
+    <span class="kw">PRIMARY KEY</span> (source_id, target_id, transferred_at)
+) <span class="kw">WITH</span> extensions = {
+    <span class="str">'graph.type'</span>: <span class="str">'edge'</span>,
+    <span class="str">'graph.label'</span>: <span class="str">'TRANSFERS'</span>,
+    <span class="str">'graph.source'</span>: <span class="str">'source_id'</span>,
+    <span class="str">'graph.target'</span>: <span class="str">'target_id'</span>,
+    <span class="str">'graph.source_label'</span>: <span class="str">'Person'</span>,
+    <span class="str">'graph.target_label'</span>: <span class="str">'Person'</span>
+};
+</pre>
+
+  <h3>Insert a suspicious circular pattern</h3>
+
+  <p>
+    Alice sends money to David, David sends to Frank, Frank sends back to Alice.
+    This forms a 3-node cycle &mdash; a classic money laundering pattern:
+  </p>
+
+<pre>
+<span class="cm">-- Alice -> David: $5,000</span>
+<span class="kw">INSERT INTO</span> transfers (source_id, target_id, amount, transferred_at, reference) <span class="kw">VALUES</span>
+  (<span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>, <span class="var">dddddddd-dddd-dddd-dddd-dddddddddddd</span>,
+   5000.00, <span class="str">'2025-02-01T10:00:00Z'</span>, <span class="str">'consulting'</span>);
+
+<span class="cm">-- David -> Frank: $4,800</span>
+<span class="kw">INSERT INTO</span> transfers (source_id, target_id, amount, transferred_at, reference) <span class="kw">VALUES</span>
+  (<span class="var">dddddddd-dddd-dddd-dddd-dddddddddddd</span>, <span class="var">ffffffff-ffff-ffff-ffff-ffffffffffff</span>,
+   4800.00, <span class="str">'2025-02-02T14:30:00Z'</span>, <span class="str">'equipment'</span>);
+
+<span class="cm">-- Frank -> Alice: $4,500 (completes the ring)</span>
+<span class="kw">INSERT INTO</span> transfers (source_id, target_id, amount, transferred_at, reference) <span class="kw">VALUES</span>
+  (<span class="var">ffffffff-ffff-ffff-ffff-ffffffffffff</span>, <span class="var">aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa</span>,
+   4500.00, <span class="str">'2025-02-03T09:15:00Z'</span>, <span class="str">'refund'</span>);
+
+<span class="cm">-- Also add some legitimate (non-circular) transfers</span>
+<span class="kw">INSERT INTO</span> transfers (source_id, target_id, amount, transferred_at, reference) <span class="kw">VALUES</span>
+  (<span class="var">bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb</span>, <span class="var">cccccccc-cccc-cccc-cccc-cccccccccccc</span>,
+   250.00, <span class="str">'2025-02-01T11:00:00Z'</span>, <span class="str">'lunch'</span>);
+<span class="kw">INSERT INTO</span> transfers (source_id, target_id, amount, transferred_at, reference) <span class="kw">VALUES</span>
+  (<span class="var">eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee</span>, <span class="var">11111111-1111-1111-1111-111111111111</span>,
+   75.00, <span class="str">'2025-02-04T16:00:00Z'</span>, <span class="str">'book'</span>);
+</pre>
+
+  <h3>Detect circular money flows</h3>
+
+  <p>Find all cycles of length 2 to 4 in the transfer graph. Any cycle is a
+    potential fraud ring worth investigating:</p>
+
+<pre>
+curl -X POST http://localhost:7474/graph/query \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"query": "MATCH path = (a:Person)-[:TRANSFERS*2..4]->(a) RETURN [n IN nodes(path) | n.name] AS ring, [r IN relationships(path) | r.amount] AS amounts"}'</span>
+
+<span class="cm"># [</span>
+<span class="cm">#   {</span>
+<span class="cm">#     "ring": ["Alice", "David", "Frank", "Alice"],</span>
+<span class="cm">#     "amounts": [5000.00, 4800.00, 4500.00]</span>
+<span class="cm">#   }</span>
+<span class="cm"># ]</span>
+</pre>
+
+  <p>
+    One query. Three lines. In vanilla Cassandra, detecting this cycle would
+    require a custom application with BFS/DFS logic, multiple CQL queries per
+    hop, and manual cycle detection. With Ferrosa's graph engine, the database
+    does the traversal for you.
+  </p>
+
+  <h3>Enrich with context</h3>
+
+  <p>Once you have identified suspicious accounts, use Cypher to pull their
+    full network context &mdash; who they work with, who they follow, and how
+    they are connected:</p>
+
+<pre>
+curl -X POST http://localhost:7474/graph/query \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"query": "MATCH (suspect:Person)-[:TRANSFERS*2..4]->(suspect) WITH DISTINCT suspect MATCH (suspect)-[r]-(connected) RETURN suspect.name, type(r) AS relationship, connected.name ORDER BY suspect.name"}'</span>
+
+<span class="cm"># Returns every relationship (follows, works_at, transfers)</span>
+<span class="cm"># for each person in the fraud ring, giving investigators</span>
+<span class="cm"># the full picture without leaving the database.</span>
+</pre>
+
+
+  <!-- ────────────────────────────────────────────── -->
+  <h2 id="recommendation-engine">8. Recommendation Engine</h2>
+  <!-- ────────────────────────────────────────────── -->
+
+  <p>
+    Collaborative filtering is a natural fit for graph queries: "People who
+    liked the posts you liked also liked these other posts." This pattern
+    powers recommendation systems at Netflix, Spotify, and Amazon.
+  </p>
+
+  <h3>Basic collaborative filtering</h3>
+
+  <p>Find posts that Alice has not liked but that were liked by people who
+    share her taste (liked the same posts she did):</p>
+
+<pre>
+curl -X POST http://localhost:7474/graph/query \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"query": "MATCH (a:Person {name: \"Alice\"})-[:LIKES]->(p:Post)<-[:LIKES]-(other:Person)-[:LIKES]->(rec:Post) WHERE NOT (a)-[:LIKES]->(rec) RETURN rec.content, COUNT(other) AS score ORDER BY score DESC"}'</span>
+
+<span class="cm"># How this works:</span>
+<span class="cm"># 1. Find posts Alice liked (Bob's post, Carol's post)</span>
+<span class="cm"># 2. Find other people who also liked those posts</span>
+<span class="cm">#    - Bob's post was also liked by: Bob (author, skip), Carol</span>
+<span class="cm">#    - Carol's post was also liked by: Eve</span>
+<span class="cm"># 3. Find OTHER posts those people liked (that Alice hasn't)</span>
+<span class="cm">#    - Carol liked: Alice's post, David's post</span>
+<span class="cm">#    - Eve liked: Bob's post (Alice already liked it), Carol's post (already liked)</span>
+<span class="cm"># 4. Rank by how many shared-taste users liked it</span>
+<span class="cm">#</span>
+<span class="cm"># Result:</span>
+<span class="cm"># [</span>
+<span class="cm">#   {"rec.content": "Just deployed our new graph engine...", "score": 2},</span>
+<span class="cm">#   {"rec.content": "Benchmarked Ferrosa against...",       "score": 1},</span>
+<span class="cm">#   {"rec.content": "Exploring lock-free data...",          "score": 1}</span>
+<span class="cm"># ]</span>
+</pre>
+
+  <h3>Follow recommendations</h3>
+
+  <p>"Suggest people that Alice's friends follow, but Alice does not yet follow"
+    &mdash; the classic "People You May Know" feature:</p>
+
+<pre>
+curl -X POST http://localhost:7474/graph/query \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"query": "MATCH (a:Person {name: \"Alice\"})-[:FOLLOWS]->(friend)-[:FOLLOWS]->(suggestion:Person) WHERE NOT (a)-[:FOLLOWS]->(suggestion) AND suggestion.name <> \"Alice\" RETURN suggestion.name, suggestion.city, COUNT(friend) AS mutual_friends ORDER BY mutual_friends DESC"}'</span>
+
+<span class="cm"># [</span>
+<span class="cm">#   {"suggestion.name": "Frank", "suggestion.city": "Austin",   "mutual_friends": 2},</span>
+<span class="cm">#   {"suggestion.name": "David", "suggestion.city": "New York", "mutual_friends": 1},</span>
+<span class="cm">#   {"suggestion.name": "Grace", "suggestion.city": "San Francisco", "mutual_friends": 1}</span>
+<span class="cm"># ]</span>
+</pre>
+
+  <h3>Company network discovery</h3>
+
+  <p>Find companies where people in Alice's extended network work. This helps
+    with B2B sales, recruiting, or professional networking:</p>
+
+<pre>
+curl -X POST http://localhost:7474/graph/query \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"query": "MATCH (a:Person {name: \"Alice\"})-[:FOLLOWS*1..2]->(connection:Person)-[:WORKS_AT]->(c:Company) WHERE c.name <> \"Acme Corp\" RETURN c.name, c.industry, COLLECT(DISTINCT connection.name) AS connections"}'</span>
+
+<span class="cm"># [</span>
+<span class="cm">#   {"c.name": "Globex Inc",  "c.industry": "Finance",    "connections": ["Carol", "David"]},</span>
+<span class="cm">#   {"c.name": "StartupXYZ", "c.industry": "Technology", "connections": ["Eve", "Frank"]}</span>
+<span class="cm"># ]</span>
+</pre>
+
+
+  <!-- ────────────────────────────────────────────── -->
+  <h2 id="graph-vs-cql">9. When to Use Graph vs. CQL</h2>
+  <!-- ────────────────────────────────────────────── -->
+
+  <p>
+    Ferrosa gives you both CQL and Cypher against the same underlying data.
+    Here is a practical guide for choosing between them:
+  </p>
+
+  <table>
+    <tr>
+      <th>Query type</th>
+      <th>Use CQL</th>
+      <th>Use Cypher</th>
+    </tr>
+    <tr>
+      <td>Key-value lookup by ID</td>
+      <td>Yes &mdash; fastest path</td>
+      <td>Overkill</td>
+    </tr>
+    <tr>
+      <td>Time-range scans</td>
+      <td>Yes &mdash; clustering key</td>
+      <td>No</td>
+    </tr>
+    <tr>
+      <td>High-throughput writes</td>
+      <td>Yes &mdash; CQL writes</td>
+      <td>No (read-only endpoint)</td>
+    </tr>
+    <tr>
+      <td>Single-hop lookups</td>
+      <td>Yes &mdash; partition key</td>
+      <td>Either works</td>
+    </tr>
+    <tr>
+      <td>Reverse lookups</td>
+      <td>Possible with ALLOW FILTERING</td>
+      <td>Yes &mdash; reverse adjacency index</td>
+    </tr>
+    <tr>
+      <td>Multi-hop traversals</td>
+      <td>No &mdash; requires app-side joins</td>
+      <td>Yes &mdash; native support</td>
+    </tr>
+    <tr>
+      <td>Path finding</td>
+      <td>No &mdash; impossible in CQL</td>
+      <td>Yes &mdash; shortestPath, allPaths</td>
+    </tr>
+    <tr>
+      <td>Cycle / pattern detection</td>
+      <td>No</td>
+      <td>Yes &mdash; variable-length patterns</td>
+    </tr>
+    <tr>
+      <td>Aggregations across relationships</td>
+      <td>No</td>
+      <td>Yes &mdash; COUNT, COLLECT, AVG</td>
+    </tr>
+    <tr>
+      <td>Recommendation / collaborative filtering</td>
+      <td>No</td>
+      <td>Yes &mdash; native pattern</td>
+    </tr>
+    <tr>
+      <td>Fraud ring detection</td>
+      <td>No</td>
+      <td>Yes &mdash; cycle detection</td>
+    </tr>
+  </table>
+
+  <div class="note">
+    <strong>The best practice:</strong> Use CQL for all writes and simple reads.
+    Use Cypher for complex relationship queries and analytics. Both hit the same
+    data &mdash; there is no penalty for mixing them in the same application.
+  </div>
+
+  <p>
+    A typical application architecture uses CQL in the hot write path (e.g.,
+    recording a new follow, inserting a post, logging a transaction) and Cypher
+    in the read path for features that involve relationships (e.g., "People You
+    May Know", fraud alerts, recommendation feeds). Since both read from the
+    same tables, your data is always consistent.
+  </p>
+
+
+  <!-- ────────────────────────────────────────────── -->
+  <h2 id="what-you-learned">10. What You Learned</h2>
+  <!-- ────────────────────────────────────────────── -->
+
+  <p>In this tutorial you:</p>
+
+  <ol>
+    <li><strong>Created graph-annotated CQL tables</strong> using <code>WITH extensions</code> to mark vertex and edge tables. No schema migration &mdash; just annotations on standard CQL DDL.</li>
+    <li><strong>Loaded data with ordinary CQL <code>INSERT</code> statements.</strong> The graph engine builds its adjacency index asynchronously &mdash; you don't interact with it directly.</li>
+    <li><strong>Queried relationships with CQL</strong> and saw where it works well (direct lookups, secondary index scans) and where it breaks down (multi-hop traversals, reverse lookups, path finding).</li>
+    <li><strong>Queried the same data with Cypher</strong> and saw how friends-of-friends, coworker discovery, and shortest-path queries become single, readable statements.</li>
+    <li><strong>Detected a fraud ring</strong> with a 3-line Cypher query that would have required hundreds of lines of application code against vanilla Cassandra.</li>
+    <li><strong>Built a recommendation engine</strong> using collaborative filtering &mdash; a pattern that typically requires a separate graph database and ETL pipeline.</li>
+  </ol>
+
+  <p>
+    The core insight: <strong>same data, two query paradigms.</strong> CQL for
+    speed and scale. Cypher for relationships and patterns. No data duplication.
+    No separate database. No ETL. This is unique to Ferrosa.
+  </p>
+
+  <h3>Next steps</h3>
+
+  <ul>
+    <li>Read the <a href="../cypher.html">Cypher Reference</a> for the full query language supported by Ferrosa's graph engine</li>
+    <li>Try the <a href="fraud-detection.html">Fraud Detection</a> tutorial for a deeper dive into real-time transaction scoring</li>
+    <li>Explore <a href="content-personalization.html">Content Personalization</a> to build a full recommendation pipeline</li>
+  </ul>
+
+</div>
+
+</body>
+</html>

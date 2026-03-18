@@ -1,0 +1,12 @@
+[package]
+name = "ferrosa-rust-driver-test"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+scylla = "0.15"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"

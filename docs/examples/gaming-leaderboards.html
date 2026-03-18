@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — Gaming Leaderboards Tutorial</title>
+  <link rel="icon" type="image/svg+xml" href="../favicon.svg">
+  <style>
+    :root{--bg-primary:#0a0a0f;--bg-secondary:#111118;--bg-card:#16161f;--bg-card-hover:#1c1c28;--text-primary:#e8e8ed;--text-secondary:#9494a3;--text-muted:#6b6b7a;--accent:#e2725b;--accent-warm:#d4a574;--accent-green:#6bc9a0;--accent-cool:#7c9cf5;--border:#1e1e2a;--code-bg:#0d0d14;--font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--font-mono:'JetBrains Mono','Fira Code',monospace}*{margin:0;padding:0;box-sizing:border-box}html{scroll-behavior:smooth}body{font-family:var(--font-sans);background:var(--bg-primary);color:var(--text-primary);line-height:1.6;-webkit-font-smoothing:antialiased}.container{max-width:960px;margin:0 auto;padding:4rem 2rem 6rem}.back-link{display:inline-block;color:var(--accent);text-decoration:none;font-size:.875rem;font-weight:500;margin-bottom:2rem}.back-link:hover{text-decoration:underline}h1{font-size:2.5rem;font-weight:800;letter-spacing:-.03em;margin-bottom:.5rem}h1 span{color:var(--accent)}.subtitle{font-size:1.125rem;color:var(--text-secondary);margin-bottom:3rem;max-width:640px;line-height:1.7}h2{font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--accent);margin-bottom:1.5rem;margin-top:4rem}h3{font-size:1.25rem;font-weight:700;margin-bottom:.75rem;margin-top:2rem}p,li{color:var(--text-secondary);margin-bottom:1rem;max-width:720px;line-height:1.7}ul,ol{padding-left:1.5rem;margin-bottom:1.5rem}li{margin-bottom:.5rem}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}code{font-family:var(--font-mono);font-size:.875em;background:var(--code-bg);padding:.15em .4em;border-radius:4px;border:1px solid var(--border);color:var(--accent-cool)}pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:1.25rem 1.5rem;overflow-x:auto;margin-bottom:1.5rem;font-family:var(--font-mono);font-size:.875rem;line-height:1.8;color:var(--text-secondary)}pre .cm{color:#546e7a}pre .kw{color:#c792ea}pre .str{color:#c3e88d}pre .var{color:#f78c6c}.note{background:rgba(226,114,91,.08);border:1px solid rgba(226,114,91,.2);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;font-size:.9375rem;color:var(--text-secondary)}.note strong{color:var(--accent)}.toc{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem 2rem;margin-bottom:2rem}.toc h4{font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;color:var(--text-muted);margin-bottom:.75rem}.toc ul{list-style:none;padding:0;margin:0}.toc li{margin-bottom:.375rem}.toc a{font-size:.9375rem;font-weight:500}table{width:100%;border-collapse:collapse;margin:1.5rem 0;font-size:.9375rem}th,td{text-align:left;padding:.75rem 1rem;border-bottom:1px solid var(--border)}th{font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);font-weight:600}td{color:var(--text-secondary)}td:first-child{color:var(--text-primary);font-weight:600}td code{font-size:.8125rem}@media(max-width:640px){h1{font-size:1.75rem}}
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <a href="index.html" class="back-link">&larr; Back to all tutorials</a>
+
+  <h1>Gaming <span>Leaderboards</span></h1>
+  <p class="subtitle">Build a multiplayer game backend. Track player stats, maintain real-time leaderboards, record match history, and manage in-game inventories.</p>
+
+  <div class="note">
+    <strong>Prerequisites:</strong> This tutorial assumes you have a running 3-node Ferrosa cluster. If you haven't set one up yet, follow the <a href="cluster-setup.html">3-Node Cluster Setup</a> guide first &mdash; it only takes about 5 minutes.
+  </div>
+
+  <div class="toc">
+    <h4>In this tutorial</h4>
+    <ul>
+      <li><a href="#keyspace">1. Create the keyspace</a></li>
+      <li><a href="#schema">2. Design the schema</a></li>
+      <li><a href="#players">3. Register players</a></li>
+      <li><a href="#matches">4. Record matches</a></li>
+      <li><a href="#player-matches">5. Track per-player match stats</a></li>
+      <li><a href="#leaderboard">6. Build the leaderboard</a></li>
+      <li><a href="#queries">7. Run game queries</a></li>
+      <li><a href="#learned">What you learned</a></li>
+    </ul>
+  </div>
+
+  <!-- ── 1. Keyspace ── -->
+  <h2 id="keyspace">1. Create the Keyspace</h2>
+
+  <p>Gaming backends need low latency above all else. When a player finishes a match, they want to see the leaderboard update immediately &mdash; not wait for a cache refresh. Let's create a keyspace with full replication.</p>
+
+<pre><span class="kw">CREATE KEYSPACE</span> gaming
+  <span class="kw">WITH</span> replication = {
+    <span class="str">'class'</span>: <span class="str">'SimpleStrategy'</span>,
+    <span class="str">'replication_factor'</span>: <span class="var">3</span>
+  };
+
+<span class="kw">USE</span> gaming;</pre>
+
+  <p>With RF=3, player profiles and leaderboards survive any single node failure. Players stay in the game even during maintenance windows.</p>
+
+  <!-- ── 2. Schema ── -->
+  <h2 id="schema">2. Design the Schema</h2>
+
+  <p>A multiplayer game backend needs to answer four questions fast: Who is this player? What happened in a match? How did this player do over time? Who is at the top of the leaderboard? One table for each.</p>
+
+  <h3>Players</h3>
+  <p>The player profile: identity, progression, and lifetime stats. This table gets read every time a player logs in or another player inspects their profile.</p>
+
+<pre><span class="kw">CREATE TABLE</span> players (
+    player_id         uuid <span class="kw">PRIMARY KEY</span>,
+    username          text,
+    display_name      text,
+    level             int,
+    xp                bigint,
+    wins              int,
+    losses            int,
+    kill_death_ratio  float,
+    created_at        timestamp,
+    last_login        timestamp
+);</pre>
+
+  <h3>Matches</h3>
+  <p>The global match log. We partition by <code>game_mode</code> and cluster by <code>started_at</code> descending so you can efficiently pull up the most recent matches in each mode.</p>
+
+<pre><span class="kw">CREATE TABLE</span> matches (
+    game_mode         text,
+    started_at        timestamp,
+    match_id          uuid,
+    map_name          text,
+    duration_seconds  int,
+    winner_id         uuid,
+    players           <span class="kw">list</span>&lt;text&gt;,
+    <span class="kw">PRIMARY KEY</span> (game_mode, started_at, match_id)
+) <span class="kw">WITH CLUSTERING ORDER BY</span> (started_at <span class="kw">DESC</span>, match_id <span class="kw">ASC</span>);</pre>
+
+  <h3>Player Matches</h3>
+  <p>Each player's personal match history with their individual performance stats. This is the "Match History" tab on a player's profile.</p>
+
+<pre><span class="kw">CREATE TABLE</span> player_matches (
+    player_id    uuid,
+    match_time   timestamp,
+    match_id     uuid,
+    kills        int,
+    deaths       int,
+    assists      int,
+    score        int,
+    result       text,       <span class="cm">-- win, loss, draw</span>
+    <span class="kw">PRIMARY KEY</span> (player_id, match_time, match_id)
+) <span class="kw">WITH CLUSTERING ORDER BY</span> (match_time <span class="kw">DESC</span>, match_id <span class="kw">ASC</span>);</pre>
+
+  <h3>Leaderboard</h3>
+  <p>The ranked leaderboard for each game mode. Pre-sorted by rank so the "Top 10" query is a simple range read with no sorting required.</p>
+
+<pre><span class="kw">CREATE TABLE</span> leaderboard (
+    game_mode   text,
+    rank        int,
+    player_id   uuid,
+    username    text,
+    score       bigint,
+    <span class="kw">PRIMARY KEY</span> (game_mode, rank)
+);</pre>
+
+  <div class="note">
+    <strong>Design note:</strong> We denormalize the <code>username</code> into the leaderboard table. This means we can render the entire leaderboard in a single query without joining to the players table. If a player changes their display name, you update it in both places &mdash; a small price for fast reads.
+  </div>
+
+  <p>Four tables, each tailored for a specific game screen. Let's fill them with data.</p>
+
+  <!-- ── 3. Players ── -->
+  <h2 id="players">3. Register Players</h2>
+
+  <p>Let's create five players at various skill levels. In a real game, these profiles would be created during account registration and updated after every match.</p>
+
+<pre><span class="kw">INSERT INTO</span> players (player_id, username, display_name, level, xp, wins, losses, kill_death_ratio, created_at, last_login)
+<span class="kw">VALUES</span> (<span class="var">a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1</span>, <span class="str">'shadowfox'</span>, <span class="str">'ShadowFox'</span>, <span class="var">42</span>, <span class="var">185000</span>, <span class="var">312</span>, <span class="var">198</span>, <span class="var">1.85</span>, <span class="str">'2025-01-15 10:00:00'</span>, <span class="str">'2026-03-17 20:30:00'</span>);
+
+<span class="kw">INSERT INTO</span> players (player_id, username, display_name, level, xp, wins, losses, kill_death_ratio, created_at, last_login)
+<span class="kw">VALUES</span> (<span class="var">b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2</span>, <span class="str">'neonknight'</span>, <span class="str">'NeonKnight'</span>, <span class="var">38</span>, <span class="var">156000</span>, <span class="var">278</span>, <span class="var">222</span>, <span class="var">1.52</span>, <span class="str">'2025-03-08 14:30:00'</span>, <span class="str">'2026-03-17 22:15:00'</span>);
+
+<span class="kw">INSERT INTO</span> players (player_id, username, display_name, level, xp, wins, losses, kill_death_ratio, created_at, last_login)
+<span class="kw">VALUES</span> (<span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>, <span class="str">'pixelqueen'</span>, <span class="str">'PixelQueen'</span>, <span class="var">55</span>, <span class="var">274000</span>, <span class="var">445</span>, <span class="var">155</span>, <span class="var">2.34</span>, <span class="str">'2024-11-20 09:00:00'</span>, <span class="str">'2026-03-18 01:00:00'</span>);
+
+<span class="kw">INSERT INTO</span> players (player_id, username, display_name, level, xp, wins, losses, kill_death_ratio, created_at, last_login)
+<span class="kw">VALUES</span> (<span class="var">d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4</span>, <span class="str">'ironclad'</span>, <span class="str">'Ironclad'</span>, <span class="var">29</span>, <span class="var">98000</span>, <span class="var">189</span>, <span class="var">211</span>, <span class="var">1.12</span>, <span class="str">'2025-06-01 16:00:00'</span>, <span class="str">'2026-03-16 18:45:00'</span>);
+
+<span class="kw">INSERT INTO</span> players (player_id, username, display_name, level, xp, wins, losses, kill_death_ratio, created_at, last_login)
+<span class="kw">VALUES</span> (<span class="var">e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5</span>, <span class="str">'starbreaker'</span>, <span class="str">'StarBreaker'</span>, <span class="var">47</span>, <span class="var">210000</span>, <span class="var">368</span>, <span class="var">182</span>, <span class="var">2.01</span>, <span class="str">'2025-02-14 11:00:00'</span>, <span class="str">'2026-03-17 23:30:00'</span>);</pre>
+
+  <p>PixelQueen is the veteran here &mdash; level 55 with a 2.34 K/D ratio. Ironclad is still working their way up. A well-designed game backend makes every player's journey visible and motivating.</p>
+
+  <!-- ── 4. Matches ── -->
+  <h2 id="matches">4. Record Matches</h2>
+
+  <p>Let's record ten matches across two game modes. The <code>players</code> list stores usernames for quick display, and <code>winner_id</code> records who took the victory.</p>
+
+<pre><span class="cm">-- Ranked matches</span>
+<span class="kw">INSERT INTO</span> matches (game_mode, started_at, match_id, map_name, duration_seconds, winner_id, players)
+<span class="kw">VALUES</span> (<span class="str">'ranked'</span>, <span class="str">'2026-03-17 19:00:00'</span>, uuid(), <span class="str">'Crimson Fortress'</span>, <span class="var">1245</span>, <span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>, [<span class="str">'shadowfox'</span>, <span class="str">'neonknight'</span>, <span class="str">'pixelqueen'</span>, <span class="str">'ironclad'</span>]);
+
+<span class="kw">INSERT INTO</span> matches (game_mode, started_at, match_id, map_name, duration_seconds, winner_id, players)
+<span class="kw">VALUES</span> (<span class="str">'ranked'</span>, <span class="str">'2026-03-17 19:30:00'</span>, uuid(), <span class="str">'Neon District'</span>, <span class="var">980</span>, <span class="var">a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1</span>, [<span class="str">'shadowfox'</span>, <span class="str">'starbreaker'</span>, <span class="str">'ironclad'</span>]);
+
+<span class="kw">INSERT INTO</span> matches (game_mode, started_at, match_id, map_name, duration_seconds, winner_id, players)
+<span class="kw">VALUES</span> (<span class="str">'ranked'</span>, <span class="str">'2026-03-17 20:15:00'</span>, uuid(), <span class="str">'Skyfall Arena'</span>, <span class="var">1560</span>, <span class="var">e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5</span>, [<span class="str">'pixelqueen'</span>, <span class="str">'starbreaker'</span>, <span class="str">'neonknight'</span>, <span class="str">'shadowfox'</span>]);
+
+<span class="kw">INSERT INTO</span> matches (game_mode, started_at, match_id, map_name, duration_seconds, winner_id, players)
+<span class="kw">VALUES</span> (<span class="str">'ranked'</span>, <span class="str">'2026-03-17 21:00:00'</span>, uuid(), <span class="str">'Crimson Fortress'</span>, <span class="var">1100</span>, <span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>, [<span class="str">'pixelqueen'</span>, <span class="str">'ironclad'</span>, <span class="str">'starbreaker'</span>]);
+
+<span class="kw">INSERT INTO</span> matches (game_mode, started_at, match_id, map_name, duration_seconds, winner_id, players)
+<span class="kw">VALUES</span> (<span class="str">'ranked'</span>, <span class="str">'2026-03-17 22:00:00'</span>, uuid(), <span class="str">'Neon District'</span>, <span class="var">890</span>, <span class="var">e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5</span>, [<span class="str">'shadowfox'</span>, <span class="str">'neonknight'</span>, <span class="str">'starbreaker'</span>]);
+
+<span class="cm">-- Casual matches</span>
+<span class="kw">INSERT INTO</span> matches (game_mode, started_at, match_id, map_name, duration_seconds, winner_id, players)
+<span class="kw">VALUES</span> (<span class="str">'casual'</span>, <span class="str">'2026-03-17 18:30:00'</span>, uuid(), <span class="str">'Sunset Bay'</span>, <span class="var">720</span>, <span class="var">b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2</span>, [<span class="str">'neonknight'</span>, <span class="str">'ironclad'</span>]);
+
+<span class="kw">INSERT INTO</span> matches (game_mode, started_at, match_id, map_name, duration_seconds, winner_id, players)
+<span class="kw">VALUES</span> (<span class="str">'casual'</span>, <span class="str">'2026-03-17 19:15:00'</span>, uuid(), <span class="str">'Crystal Caves'</span>, <span class="var">540</span>, <span class="var">d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4</span>, [<span class="str">'ironclad'</span>, <span class="str">'shadowfox'</span>, <span class="str">'neonknight'</span>]);
+
+<span class="kw">INSERT INTO</span> matches (game_mode, started_at, match_id, map_name, duration_seconds, winner_id, players)
+<span class="kw">VALUES</span> (<span class="str">'casual'</span>, <span class="str">'2026-03-17 20:00:00'</span>, uuid(), <span class="str">'Sunset Bay'</span>, <span class="var">660</span>, <span class="var">a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1</span>, [<span class="str">'shadowfox'</span>, <span class="str">'pixelqueen'</span>]);
+
+<span class="kw">INSERT INTO</span> matches (game_mode, started_at, match_id, map_name, duration_seconds, winner_id, players)
+<span class="kw">VALUES</span> (<span class="str">'casual'</span>, <span class="str">'2026-03-17 21:30:00'</span>, uuid(), <span class="str">'Crystal Caves'</span>, <span class="var">480</span>, <span class="var">e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5</span>, [<span class="str">'starbreaker'</span>, <span class="str">'neonknight'</span>, <span class="str">'ironclad'</span>]);
+
+<span class="kw">INSERT INTO</span> matches (game_mode, started_at, match_id, map_name, duration_seconds, winner_id, players)
+<span class="kw">VALUES</span> (<span class="str">'casual'</span>, <span class="str">'2026-03-17 22:30:00'</span>, uuid(), <span class="str">'Sunset Bay'</span>, <span class="var">600</span>, <span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>, [<span class="str">'pixelqueen'</span>, <span class="str">'starbreaker'</span>]);</pre>
+
+  <p>Ten matches &mdash; five ranked, five casual. PixelQueen and StarBreaker are dominating tonight. Notice how the <code>list</code> type stores the player roster for each match.</p>
+
+  <!-- ── 5. Player Matches ── -->
+  <h2 id="player-matches">5. Track Per-Player Match Stats</h2>
+
+  <p>Every player gets their own match history with individual performance stats. This is the data behind the "Match History" screen. Let's add detailed stats for each player across the matches above.</p>
+
+<pre><span class="cm">-- ShadowFox's matches</span>
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1</span>, <span class="str">'2026-03-17 19:00:00'</span>, uuid(), <span class="var">18</span>, <span class="var">12</span>, <span class="var">7</span>, <span class="var">2150</span>, <span class="str">'loss'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1</span>, <span class="str">'2026-03-17 19:30:00'</span>, uuid(), <span class="var">24</span>, <span class="var">8</span>, <span class="var">5</span>, <span class="var">3200</span>, <span class="str">'win'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1</span>, <span class="str">'2026-03-17 20:00:00'</span>, uuid(), <span class="var">15</span>, <span class="var">6</span>, <span class="var">9</span>, <span class="var">2400</span>, <span class="str">'win'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1</span>, <span class="str">'2026-03-17 20:15:00'</span>, uuid(), <span class="var">20</span>, <span class="var">14</span>, <span class="var">6</span>, <span class="var">2600</span>, <span class="str">'loss'</span>);
+
+<span class="cm">-- NeonKnight's matches</span>
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2</span>, <span class="str">'2026-03-17 18:30:00'</span>, uuid(), <span class="var">14</span>, <span class="var">9</span>, <span class="var">3</span>, <span class="var">1850</span>, <span class="str">'win'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2</span>, <span class="str">'2026-03-17 19:00:00'</span>, uuid(), <span class="var">12</span>, <span class="var">15</span>, <span class="var">8</span>, <span class="var">1600</span>, <span class="str">'loss'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2</span>, <span class="str">'2026-03-17 19:15:00'</span>, uuid(), <span class="var">8</span>, <span class="var">11</span>, <span class="var">4</span>, <span class="var">1200</span>, <span class="str">'loss'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2</span>, <span class="str">'2026-03-17 22:00:00'</span>, uuid(), <span class="var">16</span>, <span class="var">10</span>, <span class="var">5</span>, <span class="var">2050</span>, <span class="str">'loss'</span>);
+
+<span class="cm">-- PixelQueen's matches</span>
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>, <span class="str">'2026-03-17 19:00:00'</span>, uuid(), <span class="var">28</span>, <span class="var">7</span>, <span class="var">4</span>, <span class="var">3800</span>, <span class="str">'win'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>, <span class="str">'2026-03-17 20:00:00'</span>, uuid(), <span class="var">10</span>, <span class="var">8</span>, <span class="var">6</span>, <span class="var">1800</span>, <span class="str">'loss'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>, <span class="str">'2026-03-17 21:00:00'</span>, uuid(), <span class="var">25</span>, <span class="var">9</span>, <span class="var">3</span>, <span class="var">3500</span>, <span class="str">'win'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>, <span class="str">'2026-03-17 22:30:00'</span>, uuid(), <span class="var">22</span>, <span class="var">5</span>, <span class="var">7</span>, <span class="var">3400</span>, <span class="str">'win'</span>);
+
+<span class="cm">-- Ironclad's matches</span>
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4</span>, <span class="str">'2026-03-17 18:30:00'</span>, uuid(), <span class="var">9</span>, <span class="var">14</span>, <span class="var">6</span>, <span class="var">1100</span>, <span class="str">'loss'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4</span>, <span class="str">'2026-03-17 19:00:00'</span>, uuid(), <span class="var">11</span>, <span class="var">16</span>, <span class="var">5</span>, <span class="var">1350</span>, <span class="str">'loss'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4</span>, <span class="str">'2026-03-17 19:15:00'</span>, uuid(), <span class="var">16</span>, <span class="var">10</span>, <span class="var">8</span>, <span class="var">2100</span>, <span class="str">'win'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4</span>, <span class="str">'2026-03-17 21:00:00'</span>, uuid(), <span class="var">13</span>, <span class="var">18</span>, <span class="var">4</span>, <span class="var">1500</span>, <span class="str">'loss'</span>);
+
+<span class="cm">-- StarBreaker's matches</span>
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5</span>, <span class="str">'2026-03-17 19:30:00'</span>, uuid(), <span class="var">19</span>, <span class="var">11</span>, <span class="var">6</span>, <span class="var">2500</span>, <span class="str">'loss'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5</span>, <span class="str">'2026-03-17 20:15:00'</span>, uuid(), <span class="var">26</span>, <span class="var">10</span>, <span class="var">4</span>, <span class="var">3300</span>, <span class="str">'win'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5</span>, <span class="str">'2026-03-17 21:30:00'</span>, uuid(), <span class="var">21</span>, <span class="var">7</span>, <span class="var">9</span>, <span class="var">3100</span>, <span class="str">'win'</span>);
+
+<span class="kw">INSERT INTO</span> player_matches (player_id, match_time, match_id, kills, deaths, assists, score, result)
+<span class="kw">VALUES</span> (<span class="var">e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5</span>, <span class="str">'2026-03-17 22:00:00'</span>, uuid(), <span class="var">22</span>, <span class="var">9</span>, <span class="var">5</span>, <span class="var">2900</span>, <span class="str">'win'</span>);</pre>
+
+  <p>Twenty player-match records across five players. PixelQueen's 28-kill game at 19:00 stands out &mdash; that is the kind of performance that puts you at the top of the leaderboard.</p>
+
+  <!-- ── 6. Leaderboard ── -->
+  <h2 id="leaderboard">6. Build the Leaderboard</h2>
+
+  <p>The leaderboard is a materialized view of player rankings. In production, a game server would recompute rankings after each match and update this table. For now, let's insert the current standings directly.</p>
+
+<pre><span class="cm">-- Ranked mode leaderboard</span>
+<span class="kw">INSERT INTO</span> leaderboard (game_mode, rank, player_id, username, score)
+<span class="kw">VALUES</span> (<span class="str">'ranked'</span>, <span class="var">1</span>, <span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>, <span class="str">'pixelqueen'</span>, <span class="var">274000</span>);
+
+<span class="kw">INSERT INTO</span> leaderboard (game_mode, rank, player_id, username, score)
+<span class="kw">VALUES</span> (<span class="str">'ranked'</span>, <span class="var">2</span>, <span class="var">e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5</span>, <span class="str">'starbreaker'</span>, <span class="var">210000</span>);
+
+<span class="kw">INSERT INTO</span> leaderboard (game_mode, rank, player_id, username, score)
+<span class="kw">VALUES</span> (<span class="str">'ranked'</span>, <span class="var">3</span>, <span class="var">a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1</span>, <span class="str">'shadowfox'</span>, <span class="var">185000</span>);
+
+<span class="kw">INSERT INTO</span> leaderboard (game_mode, rank, player_id, username, score)
+<span class="kw">VALUES</span> (<span class="str">'ranked'</span>, <span class="var">4</span>, <span class="var">b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2</span>, <span class="str">'neonknight'</span>, <span class="var">156000</span>);
+
+<span class="kw">INSERT INTO</span> leaderboard (game_mode, rank, player_id, username, score)
+<span class="kw">VALUES</span> (<span class="str">'ranked'</span>, <span class="var">5</span>, <span class="var">d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4</span>, <span class="str">'ironclad'</span>, <span class="var">98000</span>);
+
+<span class="cm">-- Casual mode leaderboard</span>
+<span class="kw">INSERT INTO</span> leaderboard (game_mode, rank, player_id, username, score)
+<span class="kw">VALUES</span> (<span class="str">'casual'</span>, <span class="var">1</span>, <span class="var">e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5</span>, <span class="str">'starbreaker'</span>, <span class="var">142000</span>);
+
+<span class="kw">INSERT INTO</span> leaderboard (game_mode, rank, player_id, username, score)
+<span class="kw">VALUES</span> (<span class="str">'casual'</span>, <span class="var">2</span>, <span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>, <span class="str">'pixelqueen'</span>, <span class="var">138000</span>);
+
+<span class="kw">INSERT INTO</span> leaderboard (game_mode, rank, player_id, username, score)
+<span class="kw">VALUES</span> (<span class="str">'casual'</span>, <span class="var">3</span>, <span class="var">a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1</span>, <span class="str">'shadowfox'</span>, <span class="var">115000</span>);
+
+<span class="kw">INSERT INTO</span> leaderboard (game_mode, rank, player_id, username, score)
+<span class="kw">VALUES</span> (<span class="str">'casual'</span>, <span class="var">4</span>, <span class="var">d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4</span>, <span class="str">'ironclad'</span>, <span class="var">67000</span>);
+
+<span class="kw">INSERT INTO</span> leaderboard (game_mode, rank, player_id, username, score)
+<span class="kw">VALUES</span> (<span class="str">'casual'</span>, <span class="var">5</span>, <span class="var">b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2</span>, <span class="str">'neonknight'</span>, <span class="var">62000</span>);</pre>
+
+  <p>PixelQueen leads ranked, but StarBreaker takes the top spot in casual. The leaderboard is ready for the spotlight.</p>
+
+  <!-- ── 7. Queries ── -->
+  <h2 id="queries">7. Run Game Queries</h2>
+
+  <p>Here are the queries that power the different screens in your game client.</p>
+
+  <h3>Player Profile</h3>
+  <p>The first thing a player sees when they open the game. One partition read, sub-millisecond response.</p>
+
+<pre><span class="cm">-- Look up PixelQueen's profile</span>
+<span class="kw">SELECT</span> display_name, level, xp, wins, losses, kill_death_ratio, last_login
+<span class="kw">FROM</span> players
+<span class="kw">WHERE</span> player_id = <span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>;</pre>
+
+  <h3>Match History</h3>
+  <p>A player's recent performance. The descending clustering order means the most recent matches appear first.</p>
+
+<pre><span class="cm">-- ShadowFox's last 5 matches</span>
+<span class="kw">SELECT</span> match_time, kills, deaths, assists, score, result
+<span class="kw">FROM</span> player_matches
+<span class="kw">WHERE</span> player_id = <span class="var">a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1</span>
+<span class="kw">LIMIT</span> <span class="var">5</span>;</pre>
+
+  <h3>Leaderboard Top 10</h3>
+  <p>The query everyone cares about. Because rank is the clustering key, this is a simple range read &mdash; no sorting needed.</p>
+
+<pre><span class="cm">-- Top 10 players in ranked mode</span>
+<span class="kw">SELECT</span> rank, username, score
+<span class="kw">FROM</span> leaderboard
+<span class="kw">WHERE</span> game_mode = <span class="str">'ranked'</span>
+<span class="kw">LIMIT</span> <span class="var">10</span>;</pre>
+
+  <h3>Recent Matches by Game Mode</h3>
+  <p>Show what is happening in the game right now. Great for a "Live Matches" or "Recent Activity" feed.</p>
+
+<pre><span class="cm">-- Last 5 ranked matches</span>
+<span class="kw">SELECT</span> started_at, map_name, duration_seconds, players
+<span class="kw">FROM</span> matches
+<span class="kw">WHERE</span> game_mode = <span class="str">'ranked'</span>
+<span class="kw">LIMIT</span> <span class="var">5</span>;</pre>
+
+  <h3>Player Stats Overview</h3>
+  <p>Calculate a quick win rate from the profile data. This is the kind of stat that appears on loading screens and profile cards.</p>
+
+<pre><span class="cm">-- StarBreaker's win/loss record</span>
+<span class="kw">SELECT</span> display_name, wins, losses, kill_death_ratio
+<span class="kw">FROM</span> players
+<span class="kw">WHERE</span> player_id = <span class="var">e5e5e5e5-e5e5-e5e5-e5e5-e5e5e5e5e5e5</span>;</pre>
+
+  <h3>Update Stats After a Match</h3>
+  <p>After each match, the game server updates the player's profile. Here is what that looks like for a player who just won.</p>
+
+<pre><span class="cm">-- PixelQueen won another match: increment wins and XP</span>
+<span class="kw">UPDATE</span> players
+<span class="kw">SET</span> wins = <span class="var">446</span>,
+    xp = <span class="var">277400</span>,
+    kill_death_ratio = <span class="var">2.36</span>,
+    last_login = <span class="str">'2026-03-18 01:15:00'</span>
+<span class="kw">WHERE</span> player_id = <span class="var">c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3</span>;</pre>
+
+  <div class="note">
+    <strong>Leaderboard update pattern:</strong> In production, you would also update the leaderboard table whenever a player's score changes enough to affect rankings. Some games recompute the full leaderboard periodically (every few minutes), while others update it in real time after each match. The best approach depends on your game's scale and how competitive the ranking needs to feel.
+  </div>
+
+  <!-- ── What You Learned ── -->
+  <h2 id="learned">What You Learned</h2>
+
+  <p>You just built the data layer for a multiplayer game. Here is what you accomplished:</p>
+
+  <ul>
+    <li>Designed a <strong>player profile</strong> table for sub-millisecond identity lookups</li>
+    <li>Built a <strong>match history</strong> table with per-player performance tracking using descending time order</li>
+    <li>Created a <strong>pre-ranked leaderboard</strong> partitioned by game mode for instant top-10 queries</li>
+    <li>Used <strong>CQL collection types</strong> (lists) to store variable-length player rosters in match records</li>
+    <li>Modeled <strong>denormalized data</strong> across tables to serve each game screen with a single partition read</li>
+    <li>Wrote <strong>update queries</strong> that a game server would run after each match to keep stats current</li>
+  </ul>
+
+  <p>This architecture is used by real game studios. The key principle is the same one that runs through every Ferrosa tutorial: design your tables around your queries, not the other way around. Each screen in the game client maps to exactly one table and one partition read. That is how you keep latency low even with millions of concurrent players.</p>
+
+</div>
+
+</body>
+</html>
