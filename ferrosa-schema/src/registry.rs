@@ -41,22 +41,23 @@ pub struct SchemaSnapshot {
     /// All keyspaces, keyed by name.
     pub keyspaces: HashMap<String, KeyspaceMetadata>,
     /// All tables, keyed by (keyspace, table) pair.
+    #[serde(with = "crate::serde_helpers::hash_map_as_vec")]
     pub tables: HashMap<(String, String), TableMetadata>,
     /// All roles, keyed by name.
     pub roles: HashMap<String, RoleMetadata>,
     /// All grants, keyed by role name.
     pub grants: HashMap<String, Vec<GrantEntry>>,
     /// All secondary indexes, keyed by (keyspace, table, index_name).
-    #[serde(default)]
+    #[serde(default, with = "crate::serde_helpers::hash_map_as_vec")]
     pub indexes: HashMap<(String, String, String), IndexMetadata>,
     /// All user-defined types, keyed by (keyspace, type_name).
-    #[serde(default)]
+    #[serde(default, with = "crate::serde_helpers::hash_map_as_vec")]
     pub types: HashMap<(String, String), UserTypeMetadata>,
     /// All user-defined functions, keyed by (keyspace, name, arg_types).
-    #[serde(default)]
+    #[serde(default, with = "crate::serde_helpers::hash_map_as_vec")]
     pub functions: HashMap<(String, String, Vec<CqlType>), UserFunctionMetadata>,
     /// All user-defined aggregates, keyed by (keyspace, name, arg_types).
-    #[serde(default)]
+    #[serde(default, with = "crate::serde_helpers::hash_map_as_vec")]
     pub aggregates: HashMap<(String, String, Vec<CqlType>), UserAggregateMetadata>,
 }
 
@@ -3161,5 +3162,88 @@ mod tests {
             .unwrap();
         let found = schema.get_type("ks", "address").unwrap();
         assert_eq!(found.fields[0].0, "street_name");
+    }
+
+    // ---- SchemaSnapshot JSON serialization roundtrip tests ----
+
+    #[test]
+    fn schema_snapshot_tables_json_roundtrip() {
+        let mut snap = SchemaSnapshot::new();
+        snap.tables.insert(
+            ("mykeyspace".to_string(), "users".to_string()),
+            test_table("mykeyspace", "users"),
+        );
+        let json = serde_json::to_string(&snap)
+            .expect("SchemaSnapshot with tuple-keyed tables must serialize to JSON");
+        let back: SchemaSnapshot =
+            serde_json::from_str(&json).expect("Deserialized SchemaSnapshot must round-trip");
+        let key = ("mykeyspace".to_string(), "users".to_string());
+        assert!(back.tables.contains_key(&key));
+        assert_eq!(back.version, snap.version);
+    }
+
+    #[test]
+    fn schema_snapshot_indexes_json_roundtrip() {
+        use crate::metadata::index::IndexMetadata;
+        use ferrosa_index::IndexType;
+
+        let mut snap = SchemaSnapshot::new();
+        snap.indexes.insert(
+            (
+                "mykeyspace".to_string(),
+                "users".to_string(),
+                "idx_email".to_string(),
+            ),
+            IndexMetadata {
+                keyspace: "mykeyspace".into(),
+                table: "users".into(),
+                name: "idx_email".into(),
+                index_type: IndexType::BTree,
+                target_columns: vec!["email".into()],
+                filter_predicate: None,
+                options: HashMap::new(),
+            },
+        );
+        let json = serde_json::to_string(&snap)
+            .expect("SchemaSnapshot with tuple-keyed indexes must serialize to JSON");
+        let back: SchemaSnapshot =
+            serde_json::from_str(&json).expect("Deserialized SchemaSnapshot must round-trip");
+        let key = (
+            "mykeyspace".to_string(),
+            "users".to_string(),
+            "idx_email".to_string(),
+        );
+        assert!(back.indexes.contains_key(&key));
+    }
+
+    #[test]
+    fn schema_snapshot_aggregates_json_roundtrip() {
+        use crate::metadata::aggregate::UserAggregateMetadata;
+
+        let mut snap = SchemaSnapshot::new();
+        let arg_types = vec![CqlType::Int, CqlType::Bigint];
+        snap.aggregates.insert(
+            (
+                "mykeyspace".to_string(),
+                "my_avg".to_string(),
+                arg_types.clone(),
+            ),
+            UserAggregateMetadata {
+                keyspace: "mykeyspace".into(),
+                name: "my_avg".into(),
+                arg_types: arg_types.clone(),
+                state_func: "avg_state".into(),
+                state_type: CqlType::Tuple(vec![CqlType::Bigint, CqlType::Int]),
+                final_func: Some("avg_final".into()),
+                init_cond: None,
+                return_type: CqlType::Double,
+            },
+        );
+        let json = serde_json::to_string(&snap)
+            .expect("SchemaSnapshot with tuple+vec-keyed aggregates must serialize to JSON");
+        let back: SchemaSnapshot =
+            serde_json::from_str(&json).expect("Deserialized SchemaSnapshot must round-trip");
+        let key = ("mykeyspace".to_string(), "my_avg".to_string(), arg_types);
+        assert!(back.aggregates.contains_key(&key));
     }
 }
