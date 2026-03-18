@@ -265,6 +265,7 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &StorageEngine) -> R
                 .map_err(|e| ClusterError::Internal(format!("drop_aggregate: {e}")))?;
         }
     }
+    schema.set_schema_version(Uuid::new_v4());
     Ok(())
 }
 

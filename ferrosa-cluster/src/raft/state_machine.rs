@@ -489,6 +489,9 @@ impl FerrosStateMachine {
 
         // Use the leader-generated schema version so all nodes agree.
         self.state.schema_version = schema_version;
+        if let Some(schema) = &self.schema {
+            schema.set_schema_version(schema_version);
+        }
         RaftResponse::Ok
     }
 }

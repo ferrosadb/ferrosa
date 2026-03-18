@@ -257,10 +257,20 @@ impl Schema {
                 .or_insert_with(|| grants.clone());
         }
 
-        current.version = Uuid::new_v4();
         self.inner.store(Arc::new(current));
         tracing::info!("applied schema snapshot");
         Ok(())
+    }
+
+    /// Set the schema snapshot version to a specific UUID.
+    ///
+    /// Used by the Raft state machine to apply the leader-generated version
+    /// so all nodes converge on the same schema version.
+    pub fn set_schema_version(&self, version: Uuid) {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        snap.version = version;
+        self.inner.store(Arc::new(snap));
     }
 
     /// Create a keyspace without auth checks. Idempotent — succeeds silently
@@ -273,7 +283,6 @@ impl Schema {
             return Ok(());
         }
         snap.keyspaces.insert(ks.name.clone(), ks);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -289,7 +298,6 @@ impl Schema {
             return Ok(());
         }
         snap.tables.insert(key, table);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -301,7 +309,6 @@ impl Schema {
         let mut snap = (**self.inner.load()).clone();
         snap.keyspaces.remove(name);
         snap.tables.retain(|(ks, _), _| ks != name);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -313,7 +320,6 @@ impl Schema {
         let mut snap = (**self.inner.load()).clone();
         snap.tables
             .remove(&(keyspace.to_string(), table.to_string()));
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -336,7 +342,6 @@ impl Schema {
         if let Some(durable_writes) = updates.durable_writes {
             ks.durable_writes = durable_writes;
         }
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -369,7 +374,6 @@ impl Schema {
                 tbl.extensions.insert(k, v);
             }
         }
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -383,7 +387,6 @@ impl Schema {
             return Ok(());
         }
         snap.roles.insert(role.name.clone(), role);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -412,7 +415,6 @@ impl Schema {
         if let Some(member_of) = updates.member_of {
             role.member_of = member_of;
         }
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -425,7 +427,6 @@ impl Schema {
         let mut snap = (**self.inner.load()).clone();
         snap.roles.remove(name);
         snap.grants.remove(name);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -444,7 +445,6 @@ impl Schema {
         } else {
             grants.push(entry);
         }
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -469,7 +469,6 @@ impl Schema {
                 snap.grants.remove(role);
             }
         }
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -549,7 +548,6 @@ impl Schema {
                 if let Some(r) = new_snap.roles.get_mut(username) {
                     if let Ok(new_hash) = self.hasher_config.hash_password(password) {
                         r.salted_hash = Some(new_hash);
-                        new_snap.version = Uuid::new_v4();
                         self.inner.store(Arc::new(new_snap));
                         self.emit_audit(AuditEventKind::PasswordChanged {
                             role: username.to_string(),
@@ -996,7 +994,6 @@ impl Schema {
             index.name.clone(),
         );
         snap.indexes.entry(key).or_insert(index);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1015,7 +1012,6 @@ impl Schema {
         let mut snap = (*self.inner.load_full()).clone();
         snap.indexes
             .remove(&(keyspace.to_string(), table.to_string(), name.to_string()));
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1286,7 +1282,6 @@ impl Schema {
             return Err(SchemaError::KeyspaceNotFound(udt.keyspace.clone()));
         }
         snap.types.insert(key, udt.clone());
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1303,7 +1298,6 @@ impl Schema {
             ));
         }
         snap.types.remove(&key);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1398,7 +1392,6 @@ impl Schema {
             return Err(SchemaError::KeyspaceNotFound(func.keyspace.clone()));
         }
         snap.functions.insert(key, func.clone());
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1420,7 +1413,6 @@ impl Schema {
             ));
         }
         snap.functions.remove(&key);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1460,7 +1452,6 @@ impl Schema {
             return Err(SchemaError::KeyspaceNotFound(agg.keyspace.clone()));
         }
         snap.aggregates.insert(key, agg.clone());
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1482,7 +1473,6 @@ impl Schema {
             ));
         }
         snap.aggregates.remove(&key);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
