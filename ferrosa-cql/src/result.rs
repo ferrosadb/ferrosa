@@ -103,13 +103,20 @@ pub fn encode_prepared(
     encode_rows_metadata(&mut buf, bound_names, bound_types, keyspace, table);
 
     // Result-column metadata
-    encode_rows_metadata(
-        &mut buf,
-        result_column_names,
-        result_column_types,
-        keyspace,
-        table,
-    );
+    if result_column_names.is_empty() {
+        // No result columns (INSERT/UPDATE/DELETE) — use No_metadata flag
+        // per CQL native protocol v5 spec section 4.2.5.4
+        buf.put_i32(0x0004); // flags: No_metadata
+        buf.put_i32(0); // columns_count: 0
+    } else {
+        encode_rows_metadata(
+            &mut buf,
+            result_column_names,
+            result_column_types,
+            keyspace,
+            table,
+        );
+    }
 
     buf
 }
@@ -259,5 +266,98 @@ mod tests {
         // Verify ID follows
         assert_eq!(u16::from_be_bytes([buf[4], buf[5]]), 16);
         assert_eq!(&buf[6..22], &[1u8; 16]);
+    }
+
+    /// For a prepared INSERT/UPDATE/DELETE (no result columns), the result
+    /// metadata section must use the No_metadata flag (0x0004) with column
+    /// count 0, and must NOT include keyspace/table strings after that.
+    ///
+    /// Buffer layout we parse forward through:
+    ///   [0..4]   kind = 0x0004 (Prepared)
+    ///   [4..6]   id_len = 16
+    ///   [6..22]  id bytes
+    ///   [22..]   bind metadata: flags(4) + col_count(4) + ks_str + tbl_str + per-column specs
+    ///            result metadata: flags(4) + col_count(4)
+    #[test]
+    fn encode_prepared_insert_no_result_columns_uses_no_metadata_flag() {
+        let id = [0xABu8; 16];
+        let keyspace = "ks";
+        let table = "users";
+        // Simulate INSERT: one bind variable, no result columns.
+        let buf = encode_prepared(
+            &id,
+            &["name".into()],
+            &[CqlType::Varchar],
+            &[], // no result columns
+            &[],
+            keyspace,
+            table,
+        );
+
+        // --- Parse forward ---
+
+        // kind
+        let mut pos = 0usize;
+        let kind = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(kind, 0x0004, "kind must be Prepared (0x0004)");
+        pos += 4;
+
+        // id_len + id
+        let id_len = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        assert_eq!(id_len, 16);
+        pos += 2 + id_len; // skip id bytes
+
+        // bind metadata: flags
+        let bind_flags = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        // bind metadata: col_count
+        let bind_col_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        if bind_flags & 0x0001 != 0 {
+            // Global_tables_spec: skip ks and table strings
+            let ks_len = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2 + ks_len;
+            let tbl_len = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2 + tbl_len;
+        }
+
+        // skip per-column specs for bind variables
+        for _ in 0..bind_col_count {
+            // column name string
+            let name_len = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2 + name_len;
+            // type_id u16
+            let type_id = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+            // skip type params (Varchar is simple — no extra bytes)
+            match type_id {
+                // List(0x0020) or Set(0x0022): 1 extra u16
+                0x0020 | 0x0022 => pos += 2,
+                // Map(0x0021): 2 extra u16s
+                0x0021 => pos += 4,
+                // Simple types: nothing extra
+                _ => {}
+            }
+        }
+
+        // --- Now at result metadata ---
+        let result_flags = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let result_col_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+
+        assert_eq!(
+            result_flags, 0x0004,
+            "result metadata flags must be No_metadata (0x0004)"
+        );
+        assert_eq!(result_col_count, 0, "result column count must be 0");
+
+        // No further bytes should follow the flags+count for a No_metadata section.
+        assert_eq!(
+            pos,
+            buf.len(),
+            "no keyspace/table strings should follow result metadata for INSERT"
+        );
     }
 }
