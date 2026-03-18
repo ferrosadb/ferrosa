@@ -29,13 +29,13 @@ jobs:
         run: docker compose build node1
 
       - name: Start 3-node cluster
-        run: docker compose up -d
+        run: docker compose up -d node1
 
       - name: Wait for CQL port
         run: |
           echo "Waiting for Ferrosa CQL port (9042)..."
           for i in $(seq 1 120); do
-            if docker compose exec -T node1 sh -c "nc -z 127.0.0.1 9042" 2>/dev/null; then
+            if cqlsh 127.0.0.1 9042 -e "SELECT cluster_name FROM system.local;" >/dev/null 2>&1; then
               echo "Ferrosa ready after ${i}s"
               break
             fi
