@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - 'examples/**'
+      - '.github/workflows/docs-examples.yml'
   pull_request:
     branches: [main]
     paths:
       - 'examples/**'
+      - '.github/workflows/docs-examples.yml'
 
 permissions:
   contents: write
