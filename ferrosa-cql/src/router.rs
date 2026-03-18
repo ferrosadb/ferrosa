@@ -1177,13 +1177,18 @@ async fn route_update(
                 key: _,
                 value,
             } => {
-                // Map/list element set: simplified — store the value for the column
+                // Map/list element set: coerce value to the element type, not the collection type
                 let col_meta = table_meta
                     .columns
                     .get(column)
                     .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
                 let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
-                let val = bridge::term_to_cql_value(value, &cql_type)?;
+                let value_type = match &cql_type {
+                    CqlType::Map(_, v) => (**v).clone(),
+                    CqlType::List(v) => (**v).clone(),
+                    _ => cql_type.clone(),
+                };
+                let val = bridge::term_to_cql_value(value, &value_type)?;
                 (column.as_str(), val)
             }
         };

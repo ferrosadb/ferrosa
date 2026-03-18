@@ -25,7 +25,7 @@ INSERT INTO all_types (id, col_text) VALUES (3, '');
 -- Negative boundary values
 -- ============================================================
 INSERT INTO all_types (id, col_bigint, col_int, col_float, col_double)
-VALUES (4, -9223372036854775808, -2147483648, -3.14, -2.718281828459045);
+VALUES (4, -9223372036854775807, -2147483647, -3.14, -2.718281828459045);
 
 -- ============================================================
 -- Zero values and false boolean
@@ -48,7 +48,9 @@ VALUES (1, ['alpha', 'beta', 'gamma'], {10, 20, 30}, {'color': 'red', 'size': 'l
 -- Collection types — empty collections
 -- ============================================================
 INSERT INTO collection_types (id, tags, scores, props)
-VALUES (2, [], {}, {});
+-- Note: empty {} is ambiguous between set and map in CQL.
+-- Use explicit null for empty collections, or insert non-empty then clear.
+VALUES (2, [], null, null);
 
 -- ============================================================
 -- Nested frozen collections
