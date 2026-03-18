@@ -134,8 +134,7 @@ for dir in $(find "$EXAMPLES_DIR" -mindepth 1 -maxdepth 1 -type d | sort); do
   ok=true
   for f in schema.cql data.cql queries.cql; do
     if [ -f "$dir/$f" ]; then
-      output=$(cqlsh "$FERROSA_HOST" "$FERROSA_CQL_PORT" -f "$dir/$f" 2>&1)
-      rc=$?
+      output=$(cqlsh "$FERROSA_HOST" "$FERROSA_CQL_PORT" -f "$dir/$f" 2>&1) && rc=0 || rc=$?
       if [ "$rc" -ne 0 ]; then
         # Exit code 2 = warnings only; fail only on real errors
         if [ "$rc" -eq 2 ] && ! echo "$output" | grep -qiE "Error from server|SyntaxException|InvalidRequest|NoHostAvailable|struct\.error|Connection refused"; then
