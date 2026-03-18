@@ -445,8 +445,11 @@ impl ModeController {
         };
 
         // If this node was force-promoted, override UUID election — stay primary.
+        // If transitioning from standalone, this node is the authoritative source
+        // of data and must be primary regardless of UUID ordering.
         let was_promoted = self.force_promoted.swap(false, Ordering::AcqRel);
-        let role = if was_promoted {
+        let current_mode = **self.mode.load();
+        let role = if was_promoted || current_mode == DeploymentMode::Standalone {
             PairRole::Primary
         } else {
             PairRole::elect(self.local_host_id, peer_host_id)
