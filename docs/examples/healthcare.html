@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — Healthcare Records Tutorial</title>
+  <link rel="icon" type="image/svg+xml" href="../favicon.svg">
+  <style>
+    :root{--bg-primary:#0a0a0f;--bg-secondary:#111118;--bg-card:#16161f;--bg-card-hover:#1c1c28;--text-primary:#e8e8ed;--text-secondary:#9494a3;--text-muted:#6b6b7a;--accent:#e2725b;--accent-warm:#d4a574;--accent-green:#6bc9a0;--accent-cool:#7c9cf5;--border:#1e1e2a;--code-bg:#0d0d14;--font-sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--font-mono:'JetBrains Mono','Fira Code',monospace}*{margin:0;padding:0;box-sizing:border-box}html{scroll-behavior:smooth}body{font-family:var(--font-sans);background:var(--bg-primary);color:var(--text-primary);line-height:1.6;-webkit-font-smoothing:antialiased}.container{max-width:960px;margin:0 auto;padding:4rem 2rem 6rem}.back-link{display:inline-block;color:var(--accent);text-decoration:none;font-size:.875rem;font-weight:500;margin-bottom:2rem}.back-link:hover{text-decoration:underline}h1{font-size:2.5rem;font-weight:800;letter-spacing:-.03em;margin-bottom:.5rem}h1 span{color:var(--accent)}.subtitle{font-size:1.125rem;color:var(--text-secondary);margin-bottom:3rem;max-width:640px;line-height:1.7}h2{font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--accent);margin-bottom:1.5rem;margin-top:4rem}h3{font-size:1.25rem;font-weight:700;margin-bottom:.75rem;margin-top:2rem}p,li{color:var(--text-secondary);margin-bottom:1rem;max-width:720px;line-height:1.7}ul,ol{padding-left:1.5rem;margin-bottom:1.5rem}li{margin-bottom:.5rem}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}code{font-family:var(--font-mono);font-size:.875em;background:var(--code-bg);padding:.15em .4em;border-radius:4px;border:1px solid var(--border);color:var(--accent-cool)}pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:1.25rem 1.5rem;overflow-x:auto;margin-bottom:1.5rem;font-family:var(--font-mono);font-size:.875rem;line-height:1.8;color:var(--text-secondary)}pre .cm{color:#546e7a}pre .kw{color:#c792ea}pre .str{color:#c3e88d}pre .var{color:#f78c6c}.note{background:rgba(226,114,91,.08);border:1px solid rgba(226,114,91,.2);border-radius:10px;padding:1rem 1.25rem;margin:1.5rem 0;font-size:.9375rem;color:var(--text-secondary)}.note strong{color:var(--accent)}.toc{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem 2rem;margin-bottom:2rem}.toc h4{font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;color:var(--text-muted);margin-bottom:.75rem}.toc ul{list-style:none;padding:0;margin:0}.toc li{margin-bottom:.375rem}.toc a{font-size:.9375rem;font-weight:500}table{width:100%;border-collapse:collapse;margin:1.5rem 0;font-size:.9375rem}th,td{text-align:left;padding:.75rem 1rem;border-bottom:1px solid var(--border)}th{font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);font-weight:600}td{color:var(--text-secondary)}td:first-child{color:var(--text-primary);font-weight:600}td code{font-size:.8125rem}@media(max-width:640px){h1{font-size:1.75rem}}
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <a href="index.html" class="back-link">&larr; Back to all tutorials</a>
+
+  <h1>Healthcare <span>Records</span></h1>
+  <p class="subtitle">Model electronic medical records with temporal versioning. Store patient histories, lab results, and medication logs with time-ordered clinical data.</p>
+
+  <div class="note">
+    <strong>Prerequisites:</strong> This tutorial assumes you have a running 3-node Ferrosa cluster. If you haven't set one up yet, follow the <a href="cluster-setup.html">3-Node Cluster Setup</a> guide first &mdash; it only takes about 5 minutes.
+  </div>
+
+  <div class="toc">
+    <h4>In this tutorial</h4>
+    <ul>
+      <li><a href="#keyspace">1. Create the keyspace</a></li>
+      <li><a href="#schema">2. Design the schema</a></li>
+      <li><a href="#patients">3. Register patients</a></li>
+      <li><a href="#events">4. Record clinical events</a></li>
+      <li><a href="#labs">5. Store lab results</a></li>
+      <li><a href="#medications">6. Track medications</a></li>
+      <li><a href="#queries">7. Query clinical data</a></li>
+      <li><a href="#learned">What you learned</a></li>
+    </ul>
+  </div>
+
+  <!-- ── 1. Keyspace ── -->
+  <h2 id="keyspace">1. Create the Keyspace</h2>
+
+  <p>Every Ferrosa project starts with a keyspace. Think of it as a namespace that groups your tables together and tells the cluster how many copies of your data to keep. For healthcare data, we definitely want redundancy.</p>
+
+  <p>Connect to your cluster and run:</p>
+
+<pre><span class="kw">CREATE KEYSPACE</span> healthcare
+  <span class="kw">WITH</span> replication = {
+    <span class="str">'class'</span>: <span class="str">'SimpleStrategy'</span>,
+    <span class="str">'replication_factor'</span>: <span class="var">3</span>
+  };
+
+<span class="kw">USE</span> healthcare;</pre>
+
+  <p>With a replication factor of 3, every piece of patient data is stored on all three nodes. If one node goes down, your records are still fully available. That is exactly the kind of reliability you want for medical data.</p>
+
+  <!-- ── 2. Schema ── -->
+  <h2 id="schema">2. Design the Schema</h2>
+
+  <p>We will create four tables that work together to model a patient's medical record. Each table is designed around the queries you will run most often.</p>
+
+  <h3>Patients</h3>
+  <p>The <code>patients</code> table stores demographic information. Each patient gets a unique UUID, and we use a <code>set</code> for allergies since a patient can have zero or many.</p>
+
+<pre><span class="kw">CREATE TABLE</span> patients (
+    patient_id      uuid <span class="kw">PRIMARY KEY</span>,
+    name            text,
+    dob             date,
+    blood_type      text,
+    allergies       <span class="kw">set</span>&lt;text&gt;,
+    emergency_contact text
+);</pre>
+
+  <h3>Clinical Events</h3>
+  <p>Clinical events form the patient's timeline: admissions, discharges, procedures, consultations. We cluster by <code>event_time</code> in descending order so the most recent events come back first &mdash; exactly what a nurse or doctor needs.</p>
+
+<pre><span class="kw">CREATE TABLE</span> clinical_events (
+    patient_id  uuid,
+    event_time  timestamp,
+    event_id    uuid,
+    event_type  text,
+    department  text,
+    provider    text,
+    notes       text,
+    <span class="kw">PRIMARY KEY</span> (patient_id, event_time, event_id)
+) <span class="kw">WITH CLUSTERING ORDER BY</span> (event_time <span class="kw">DESC</span>, event_id <span class="kw">ASC</span>);</pre>
+
+  <h3>Lab Results</h3>
+  <p>Lab results are keyed by patient and collection time. The <code>abnormal</code> flag makes it easy to filter for results that need attention.</p>
+
+<pre><span class="kw">CREATE TABLE</span> lab_results (
+    patient_id      uuid,
+    collected_at    timestamp,
+    test_name       text,
+    result_value    text,
+    unit            text,
+    reference_range text,
+    abnormal        boolean,
+    <span class="kw">PRIMARY KEY</span> (patient_id, collected_at)
+) <span class="kw">WITH CLUSTERING ORDER BY</span> (collected_at <span class="kw">DESC</span>);</pre>
+
+  <h3>Medications</h3>
+  <p>The medications table tracks current and past prescriptions. We partition by patient and cluster by medication name so you can look up any specific drug quickly.</p>
+
+<pre><span class="kw">CREATE TABLE</span> medications (
+    patient_id    uuid,
+    prescribed_at timestamp,
+    medication    text,
+    dosage        text,
+    frequency     text,
+    prescriber    text,
+    active        boolean,
+    <span class="kw">PRIMARY KEY</span> (patient_id, medication)
+);</pre>
+
+  <p>That is four tables, each optimized for a different access pattern. Nice work &mdash; the schema is the hardest part, and you have it done.</p>
+
+  <!-- ── 3. Patients ── -->
+  <h2 id="patients">3. Register Patients</h2>
+
+  <p>Let's add three patients. Notice how we use <code>uuid()</code> to generate unique identifiers and curly braces for the <code>set</code> of allergies.</p>
+
+<pre><span class="kw">INSERT INTO</span> patients (patient_id, name, dob, blood_type, allergies, emergency_contact)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>,
+        <span class="str">'Maria Chen'</span>, <span class="str">'1985-03-14'</span>, <span class="str">'A+'</span>,
+        {<span class="str">'penicillin'</span>, <span class="str">'sulfa'</span>}, <span class="str">'James Chen (spouse) 555-0142'</span>);
+
+<span class="kw">INSERT INTO</span> patients (patient_id, name, dob, blood_type, allergies, emergency_contact)
+<span class="kw">VALUES</span> (<span class="var">22222222-2222-2222-2222-222222222222</span>,
+        <span class="str">'Robert Okafor'</span>, <span class="str">'1972-11-28'</span>, <span class="str">'O-'</span>,
+        {<span class="str">'latex'</span>}, <span class="str">'Amara Okafor (daughter) 555-0198'</span>);
+
+<span class="kw">INSERT INTO</span> patients (patient_id, name, dob, blood_type, allergies, emergency_contact)
+<span class="kw">VALUES</span> (<span class="var">33333333-3333-3333-3333-333333333333</span>,
+        <span class="str">'Priya Sharma'</span>, <span class="str">'1998-07-02'</span>, <span class="str">'B+'</span>,
+        {}, <span class="str">'Dev Sharma (father) 555-0276'</span>);</pre>
+
+  <p>Priya has no known allergies, so we pass an empty set <code>{}</code>. Ferrosa stores that efficiently &mdash; no wasted space.</p>
+
+  <!-- ── 4. Clinical Events ── -->
+  <h2 id="events">4. Record Clinical Events</h2>
+
+  <p>Now let's build out a realistic timeline. We will add events across multiple departments for each patient. Each event captures who, what, where, and when.</p>
+
+<pre><span class="cm">-- Maria Chen: ER visit and follow-up</span>
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-10 08:15:00'</span>, uuid(), <span class="str">'admission'</span>, <span class="str">'Emergency'</span>, <span class="str">'Dr. Williams'</span>, <span class="str">'Patient presents with acute abdominal pain, onset 6 hours ago'</span>);
+
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-10 09:30:00'</span>, uuid(), <span class="str">'imaging'</span>, <span class="str">'Radiology'</span>, <span class="str">'Dr. Park'</span>, <span class="str">'CT abdomen with contrast ordered, pending penicillin allergy review'</span>);
+
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-10 11:00:00'</span>, uuid(), <span class="str">'procedure'</span>, <span class="str">'Surgery'</span>, <span class="str">'Dr. Reyes'</span>, <span class="str">'Laparoscopic appendectomy performed without complications'</span>);
+
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-11 07:00:00'</span>, uuid(), <span class="str">'discharge'</span>, <span class="str">'Surgery'</span>, <span class="str">'Dr. Reyes'</span>, <span class="str">'Discharged in stable condition, follow-up in 2 weeks'</span>);
+
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-15 14:00:00'</span>, uuid(), <span class="str">'consultation'</span>, <span class="str">'Primary Care'</span>, <span class="str">'Dr. Nguyen'</span>, <span class="str">'Post-op follow-up, incision healing well, no signs of infection'</span>);
+
+<span class="cm">-- Robert Okafor: cardiology workup</span>
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">22222222-2222-2222-2222-222222222222</span>, <span class="str">'2026-03-08 10:00:00'</span>, uuid(), <span class="str">'consultation'</span>, <span class="str">'Cardiology'</span>, <span class="str">'Dr. Adams'</span>, <span class="str">'Annual cardiac evaluation, patient reports occasional palpitations'</span>);
+
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">22222222-2222-2222-2222-222222222222</span>, <span class="str">'2026-03-08 11:30:00'</span>, uuid(), <span class="str">'diagnostic'</span>, <span class="str">'Cardiology'</span>, <span class="str">'Tech. Rivera'</span>, <span class="str">'12-lead ECG performed, sinus rhythm, no acute changes'</span>);
+
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">22222222-2222-2222-2222-222222222222</span>, <span class="str">'2026-03-09 08:00:00'</span>, uuid(), <span class="str">'diagnostic'</span>, <span class="str">'Cardiology'</span>, <span class="str">'Tech. Rivera'</span>, <span class="str">'24-hour Holter monitor placed'</span>);
+
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">22222222-2222-2222-2222-222222222222</span>, <span class="str">'2026-03-12 15:00:00'</span>, uuid(), <span class="str">'consultation'</span>, <span class="str">'Cardiology'</span>, <span class="str">'Dr. Adams'</span>, <span class="str">'Holter results normal, palpitations likely benign, follow-up in 6 months'</span>);
+
+<span class="cm">-- Priya Sharma: sports medicine</span>
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">33333333-3333-3333-3333-333333333333</span>, <span class="str">'2026-03-05 16:45:00'</span>, uuid(), <span class="str">'admission'</span>, <span class="str">'Emergency'</span>, <span class="str">'Dr. Kim'</span>, <span class="str">'Right ankle injury during soccer match, significant swelling'</span>);
+
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">33333333-3333-3333-3333-333333333333</span>, <span class="str">'2026-03-05 17:30:00'</span>, uuid(), <span class="str">'imaging'</span>, <span class="str">'Radiology'</span>, <span class="str">'Dr. Park'</span>, <span class="str">'X-ray right ankle: no fracture, grade 2 lateral sprain'</span>);
+
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">33333333-3333-3333-3333-333333333333</span>, <span class="str">'2026-03-05 18:15:00'</span>, uuid(), <span class="str">'discharge'</span>, <span class="str">'Emergency'</span>, <span class="str">'Dr. Kim'</span>, <span class="str">'RICE protocol, air cast fitted, follow-up with sports medicine'</span>);
+
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">33333333-3333-3333-3333-333333333333</span>, <span class="str">'2026-03-12 09:00:00'</span>, uuid(), <span class="str">'consultation'</span>, <span class="str">'Sports Medicine'</span>, <span class="str">'Dr. Torres'</span>, <span class="str">'Swelling reduced, starting physical therapy, 4-6 week recovery'</span>);
+
+<span class="kw">INSERT INTO</span> clinical_events (patient_id, event_time, event_id, event_type, department, provider, notes)
+<span class="kw">VALUES</span> (<span class="var">33333333-3333-3333-3333-333333333333</span>, <span class="str">'2026-03-17 09:00:00'</span>, uuid(), <span class="str">'therapy'</span>, <span class="str">'Physical Therapy'</span>, <span class="str">'PT. Marshall'</span>, <span class="str">'First PT session, range of motion exercises, patient tolerating well'</span>);</pre>
+
+  <p>That is 15 clinical events across three patients. Notice how each patient's events tell a coherent medical story &mdash; this is exactly how real EMR data looks.</p>
+
+  <!-- ── 5. Lab Results ── -->
+  <h2 id="labs">5. Store Lab Results</h2>
+
+  <p>Lab results are the backbone of clinical decision-making. Let's add a realistic panel for each patient.</p>
+
+<pre><span class="cm">-- Maria Chen: pre-surgical and post-op labs</span>
+<span class="kw">INSERT INTO</span> lab_results (patient_id, collected_at, test_name, result_value, unit, reference_range, abnormal)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-10 08:30:00'</span>, <span class="str">'WBC'</span>, <span class="str">'14.2'</span>, <span class="str">'x10^9/L'</span>, <span class="str">'4.5-11.0'</span>, <span class="var">true</span>);
+
+<span class="kw">INSERT INTO</span> lab_results (patient_id, collected_at, test_name, result_value, unit, reference_range, abnormal)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-10 08:30:01'</span>, <span class="str">'Hemoglobin'</span>, <span class="str">'13.8'</span>, <span class="str">'g/dL'</span>, <span class="str">'12.0-16.0'</span>, <span class="var">false</span>);
+
+<span class="kw">INSERT INTO</span> lab_results (patient_id, collected_at, test_name, result_value, unit, reference_range, abnormal)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-10 08:30:02'</span>, <span class="str">'CRP'</span>, <span class="str">'48.5'</span>, <span class="str">'mg/L'</span>, <span class="str">'0-10'</span>, <span class="var">true</span>);
+
+<span class="kw">INSERT INTO</span> lab_results (patient_id, collected_at, test_name, result_value, unit, reference_range, abnormal)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-11 06:00:00'</span>, <span class="str">'WBC'</span>, <span class="str">'9.1'</span>, <span class="str">'x10^9/L'</span>, <span class="str">'4.5-11.0'</span>, <span class="var">false</span>);
+
+<span class="cm">-- Robert Okafor: cardiac panel</span>
+<span class="kw">INSERT INTO</span> lab_results (patient_id, collected_at, test_name, result_value, unit, reference_range, abnormal)
+<span class="kw">VALUES</span> (<span class="var">22222222-2222-2222-2222-222222222222</span>, <span class="str">'2026-03-08 10:15:00'</span>, <span class="str">'Total Cholesterol'</span>, <span class="str">'242'</span>, <span class="str">'mg/dL'</span>, <span class="str">'&lt;200'</span>, <span class="var">true</span>);
+
+<span class="kw">INSERT INTO</span> lab_results (patient_id, collected_at, test_name, result_value, unit, reference_range, abnormal)
+<span class="kw">VALUES</span> (<span class="var">22222222-2222-2222-2222-222222222222</span>, <span class="str">'2026-03-08 10:15:01'</span>, <span class="str">'LDL'</span>, <span class="str">'158'</span>, <span class="str">'mg/dL'</span>, <span class="str">'&lt;100'</span>, <span class="var">true</span>);
+
+<span class="kw">INSERT INTO</span> lab_results (patient_id, collected_at, test_name, result_value, unit, reference_range, abnormal)
+<span class="kw">VALUES</span> (<span class="var">22222222-2222-2222-2222-222222222222</span>, <span class="str">'2026-03-08 10:15:02'</span>, <span class="str">'Troponin I'</span>, <span class="str">'0.02'</span>, <span class="str">'ng/mL'</span>, <span class="str">'&lt;0.04'</span>, <span class="var">false</span>);
+
+<span class="cm">-- Priya Sharma: routine bloods</span>
+<span class="kw">INSERT INTO</span> lab_results (patient_id, collected_at, test_name, result_value, unit, reference_range, abnormal)
+<span class="kw">VALUES</span> (<span class="var">33333333-3333-3333-3333-333333333333</span>, <span class="str">'2026-03-05 17:00:00'</span>, <span class="str">'Hemoglobin'</span>, <span class="str">'14.1'</span>, <span class="str">'g/dL'</span>, <span class="str">'12.0-16.0'</span>, <span class="var">false</span>);
+
+<span class="kw">INSERT INTO</span> lab_results (patient_id, collected_at, test_name, result_value, unit, reference_range, abnormal)
+<span class="kw">VALUES</span> (<span class="var">33333333-3333-3333-3333-333333333333</span>, <span class="str">'2026-03-05 17:00:01'</span>, <span class="str">'Platelets'</span>, <span class="str">'285'</span>, <span class="str">'x10^9/L'</span>, <span class="str">'150-400'</span>, <span class="var">false</span>);
+
+<span class="kw">INSERT INTO</span> lab_results (patient_id, collected_at, test_name, result_value, unit, reference_range, abnormal)
+<span class="kw">VALUES</span> (<span class="var">33333333-3333-3333-3333-333333333333</span>, <span class="str">'2026-03-05 17:00:02'</span>, <span class="str">'D-Dimer'</span>, <span class="str">'0.3'</span>, <span class="str">'mg/L'</span>, <span class="str">'&lt;0.5'</span>, <span class="var">false</span>);</pre>
+
+  <p>Notice Maria's elevated WBC and CRP on admission &mdash; classic markers for appendicitis. Her post-op WBC came back to normal. That is the kind of trend these time-ordered tables make easy to spot.</p>
+
+  <!-- ── 6. Medications ── -->
+  <h2 id="medications">6. Track Medications</h2>
+
+  <p>Let's record current and past prescriptions. The <code>active</code> column lets you quickly filter for what a patient is taking right now.</p>
+
+<pre><span class="cm">-- Maria Chen: post-surgical meds</span>
+<span class="kw">INSERT INTO</span> medications (patient_id, prescribed_at, medication, dosage, frequency, prescriber, active)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-11 07:00:00'</span>, <span class="str">'Acetaminophen'</span>, <span class="str">'500mg'</span>, <span class="str">'every 6 hours'</span>, <span class="str">'Dr. Reyes'</span>, <span class="var">true</span>);
+
+<span class="kw">INSERT INTO</span> medications (patient_id, prescribed_at, medication, dosage, frequency, prescriber, active)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-11 07:00:00'</span>, <span class="str">'Cephalexin'</span>, <span class="str">'500mg'</span>, <span class="str">'twice daily'</span>, <span class="str">'Dr. Reyes'</span>, <span class="var">true</span>);
+
+<span class="kw">INSERT INTO</span> medications (patient_id, prescribed_at, medication, dosage, frequency, prescriber, active)
+<span class="kw">VALUES</span> (<span class="var">11111111-1111-1111-1111-111111111111</span>, <span class="str">'2026-03-10 09:00:00'</span>, <span class="str">'Morphine IV'</span>, <span class="str">'4mg'</span>, <span class="str">'as needed'</span>, <span class="str">'Dr. Williams'</span>, <span class="var">false</span>);
+
+<span class="cm">-- Robert Okafor: cardiac meds</span>
+<span class="kw">INSERT INTO</span> medications (patient_id, prescribed_at, medication, dosage, frequency, prescriber, active)
+<span class="kw">VALUES</span> (<span class="var">22222222-2222-2222-2222-222222222222</span>, <span class="str">'2026-03-08 12:00:00'</span>, <span class="str">'Atorvastatin'</span>, <span class="str">'20mg'</span>, <span class="str">'once daily'</span>, <span class="str">'Dr. Adams'</span>, <span class="var">true</span>);
+
+<span class="kw">INSERT INTO</span> medications (patient_id, prescribed_at, medication, dosage, frequency, prescriber, active)
+<span class="kw">VALUES</span> (<span class="var">22222222-2222-2222-2222-222222222222</span>, <span class="str">'2026-03-08 12:00:00'</span>, <span class="str">'Aspirin'</span>, <span class="str">'81mg'</span>, <span class="str">'once daily'</span>, <span class="str">'Dr. Adams'</span>, <span class="var">true</span>);
+
+<span class="cm">-- Priya Sharma: sports injury meds</span>
+<span class="kw">INSERT INTO</span> medications (patient_id, prescribed_at, medication, dosage, frequency, prescriber, active)
+<span class="kw">VALUES</span> (<span class="var">33333333-3333-3333-3333-333333333333</span>, <span class="str">'2026-03-05 18:00:00'</span>, <span class="str">'Ibuprofen'</span>, <span class="str">'400mg'</span>, <span class="str">'three times daily'</span>, <span class="str">'Dr. Kim'</span>, <span class="var">true</span>);
+
+<span class="kw">INSERT INTO</span> medications (patient_id, prescribed_at, medication, dosage, frequency, prescriber, active)
+<span class="kw">VALUES</span> (<span class="var">33333333-3333-3333-3333-333333333333</span>, <span class="str">'2026-03-05 18:00:00'</span>, <span class="str">'Naproxen'</span>, <span class="str">'250mg'</span>, <span class="str">'twice daily'</span>, <span class="str">'Dr. Torres'</span>, <span class="var">false</span>);</pre>
+
+  <p>Notice that Maria is on Cephalexin (a cephalosporin) instead of penicillin-based antibiotics &mdash; her allergy record in the <code>patients</code> table flagged that. In a real system, you would enforce this with application-level checks.</p>
+
+  <!-- ── 7. Queries ── -->
+  <h2 id="queries">7. Query Clinical Data</h2>
+
+  <p>Now for the rewarding part. Let's run the kinds of queries that doctors, nurses, and analysts use every day.</p>
+
+  <h3>Patient Timeline</h3>
+  <p>Pull up everything that happened to a patient, most recent first. Because we used <code>CLUSTERING ORDER BY (event_time DESC)</code>, this is extremely fast.</p>
+
+<pre><span class="cm">-- Full clinical timeline for Maria Chen</span>
+<span class="kw">SELECT</span> event_time, event_type, department, provider, notes
+<span class="kw">FROM</span> clinical_events
+<span class="kw">WHERE</span> patient_id = <span class="var">11111111-1111-1111-1111-111111111111</span>;</pre>
+
+  <h3>Recent Lab Results</h3>
+  <p>Get the most recent labs for a patient. The <code>LIMIT</code> clause keeps it manageable.</p>
+
+<pre><span class="cm">-- Last 5 lab results for Robert Okafor</span>
+<span class="kw">SELECT</span> collected_at, test_name, result_value, unit, reference_range, abnormal
+<span class="kw">FROM</span> lab_results
+<span class="kw">WHERE</span> patient_id = <span class="var">22222222-2222-2222-2222-222222222222</span>
+<span class="kw">LIMIT</span> <span class="var">5</span>;</pre>
+
+  <h3>Active Medications</h3>
+  <p>What is a patient currently taking? Filter by <code>active = true</code> to get only current prescriptions.</p>
+
+<pre><span class="cm">-- Current medications for Maria Chen</span>
+<span class="kw">SELECT</span> medication, dosage, frequency, prescriber
+<span class="kw">FROM</span> medications
+<span class="kw">WHERE</span> patient_id = <span class="var">11111111-1111-1111-1111-111111111111</span>
+  <span class="kw">AND</span> active = <span class="var">true</span>
+<span class="kw">ALLOW FILTERING</span>;</pre>
+
+  <div class="note">
+    <strong>About ALLOW FILTERING:</strong> We need this because <code>active</code> is not part of the primary key. In production, you might create a separate <code>active_medications</code> table to avoid filtering. For now, with small datasets, it works just fine.
+  </div>
+
+  <h3>Abnormal Lab Results</h3>
+  <p>Quickly find results that are outside the normal range &mdash; the ones that need a doctor's attention.</p>
+
+<pre><span class="cm">-- All abnormal results for Maria Chen</span>
+<span class="kw">SELECT</span> collected_at, test_name, result_value, unit, reference_range
+<span class="kw">FROM</span> lab_results
+<span class="kw">WHERE</span> patient_id = <span class="var">11111111-1111-1111-1111-111111111111</span>
+  <span class="kw">AND</span> abnormal = <span class="var">true</span>
+<span class="kw">ALLOW FILTERING</span>;</pre>
+
+  <h3>Clinical Events by Type</h3>
+  <p>Filter the timeline to just procedures, just imaging, or any other event type you need.</p>
+
+<pre><span class="cm">-- All imaging events for Priya Sharma</span>
+<span class="kw">SELECT</span> event_time, provider, notes
+<span class="kw">FROM</span> clinical_events
+<span class="kw">WHERE</span> patient_id = <span class="var">33333333-3333-3333-3333-333333333333</span>
+  <span class="kw">AND</span> event_type = <span class="str">'imaging'</span>
+<span class="kw">ALLOW FILTERING</span>;</pre>
+
+  <h3>Patient Lookup</h3>
+  <p>Sometimes the simplest query is the most important one. When a patient arrives, the first thing staff need is their demographic information and allergy list.</p>
+
+<pre><span class="cm">-- Look up Maria Chen's full profile</span>
+<span class="kw">SELECT</span> name, dob, blood_type, allergies, emergency_contact
+<span class="kw">FROM</span> patients
+<span class="kw">WHERE</span> patient_id = <span class="var">11111111-1111-1111-1111-111111111111</span>;</pre>
+
+  <p>This returns instantly because <code>patient_id</code> is the partition key. No matter how many millions of patients your system holds, this lookup hits exactly one partition on one node.</p>
+
+  <h3>Time-Bounded Event Search</h3>
+  <p>Pull events from a specific date range. This is useful for generating discharge summaries or insurance claim documentation.</p>
+
+<pre><span class="cm">-- Maria's clinical events from March 10-11 (hospital stay)</span>
+<span class="kw">SELECT</span> event_time, event_type, department, provider, notes
+<span class="kw">FROM</span> clinical_events
+<span class="kw">WHERE</span> patient_id = <span class="var">11111111-1111-1111-1111-111111111111</span>
+  <span class="kw">AND</span> event_time >= <span class="str">'2026-03-10 00:00:00'</span>
+  <span class="kw">AND</span> event_time <= <span class="str">'2026-03-11 23:59:59'</span>;</pre>
+
+  <p>Because <code>event_time</code> is a clustering column, Ferrosa can efficiently seek to the start of the range and scan forward. No full-partition scan needed.</p>
+
+  <h3>All Medications for a Patient</h3>
+  <p>For a complete medication reconciliation &mdash; both active and discontinued &mdash; simply omit the filter on <code>active</code>.</p>
+
+<pre><span class="cm">-- Full medication history for Priya Sharma</span>
+<span class="kw">SELECT</span> medication, dosage, frequency, prescriber, active, prescribed_at
+<span class="kw">FROM</span> medications
+<span class="kw">WHERE</span> patient_id = <span class="var">33333333-3333-3333-3333-333333333333</span>;</pre>
+
+  <div class="note">
+    <strong>Schema design insight:</strong> Notice how each table serves a different audience. The <code>patients</code> table is for registration desks. The <code>clinical_events</code> table is for doctors reviewing a timeline. The <code>lab_results</code> table is for lab technicians and nurses. The <code>medications</code> table is for pharmacists. Designing tables around who reads the data &mdash; not just who writes it &mdash; is a core Ferrosa pattern.
+  </div>
+
+  <!-- ── What You Learned ── -->
+  <h2 id="learned">What You Learned</h2>
+
+  <p>You just built the foundation of an electronic medical records system. Here is what you accomplished:</p>
+
+  <ul>
+    <li>Created a <strong>replicated keyspace</strong> with RF=3 for data durability critical to healthcare</li>
+    <li>Designed a <strong>temporal schema</strong> with descending clustering order for instant access to the most recent events</li>
+    <li>Used <strong>CQL collection types</strong> (sets) to model multi-valued fields like allergies</li>
+    <li>Built a <strong>patient timeline</strong> that returns events in reverse chronological order without sorting</li>
+    <li>Wrote <strong>analytical queries</strong> to filter abnormal lab results and active medications</li>
+  </ul>
+
+  <p>The data model you built here scales to millions of patients. Each patient's data lives on the same partition, so lookups are always fast regardless of how large the cluster grows. That is the power of partition-based modeling.</p>
+
+</div>
+
+</body>
+</html>
