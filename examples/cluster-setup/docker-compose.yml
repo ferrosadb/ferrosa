@@ -77,7 +77,7 @@ services:
     volumes:
       - node1-data:/var/lib/ferrosa
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 9042 || exit 1"]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -115,7 +115,7 @@ services:
     volumes:
       - node2-data:/var/lib/ferrosa
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 9042 || exit 1"]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -155,7 +155,7 @@ services:
     volumes:
       - node3-data:/var/lib/ferrosa
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 9042 || exit 1"]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 30
