@@ -367,6 +367,11 @@ fn decode_vint(data: &[u8], offset: &mut usize) -> Result<i64, CqlError> {
 }
 
 /// Read the 4-byte element count from a collection header.
+///
+/// Validates that `count` does not exceed what the remaining buffer can
+/// possibly hold. Each collection element needs at least a 4-byte length
+/// prefix, so `count` cannot exceed `(remaining_bytes) / 4`. This prevents
+/// a corrupt or malicious count from triggering a multi-gigabyte allocation.
 fn read_collection_header(bytes: &[u8]) -> Result<(i32, usize), CqlError> {
     if bytes.len() < 4 {
         return Err(CqlError::Invalid("collection too short for count".into()));
@@ -374,6 +379,19 @@ fn read_collection_header(bytes: &[u8]) -> Result<(i32, usize), CqlError> {
     let count = i32::from_be_bytes(bytes[..4].try_into().unwrap());
     if count < 0 {
         return Err(CqlError::Invalid("negative collection count".into()));
+    }
+    let remaining = bytes.len() - 4;
+    if count as usize > remaining / 4 {
+        tracing::warn!(
+            count,
+            remaining,
+            first_bytes = ?&bytes[..std::cmp::min(16, bytes.len())],
+            "collection decode: count exceeds buffer — possible data corruption"
+        );
+        return Err(CqlError::Invalid(format!(
+            "collection count {} exceeds buffer capacity ({} bytes remaining)",
+            count, remaining
+        )));
     }
     Ok((count, 4))
 }
@@ -849,6 +867,32 @@ mod tests {
         let encoded = encode_value(&udt_val);
         let decoded = decode_value(&udt_type, &encoded).unwrap();
         assert_eq!(decoded, udt_val);
+    }
+
+    // === OOM bounds-check tests for corrupt collection counts ===
+
+    #[test]
+    fn decode_list_with_corrupt_count_returns_error() {
+        let bytes = [0x7F, 0xFF, 0xFF, 0xFF];
+        let result = decode_value(&CqlType::List(Box::new(CqlType::Int)), &bytes);
+        assert!(result.is_err(), "corrupt count must not trigger allocation");
+    }
+
+    #[test]
+    fn decode_set_with_corrupt_count_returns_error() {
+        let bytes = [0x7F, 0xFF, 0xFF, 0xFF];
+        let result = decode_value(&CqlType::Set(Box::new(CqlType::Int)), &bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_map_with_corrupt_count_returns_error() {
+        let bytes = [0x7F, 0xFF, 0xFF, 0xFF];
+        let result = decode_value(
+            &CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Int)),
+            &bytes,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
