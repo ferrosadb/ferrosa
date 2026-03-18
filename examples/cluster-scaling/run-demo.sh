@@ -39,11 +39,12 @@ wait_cql() {
   local elapsed=0
   local timeout=120
   echo "  Waiting for CQL on $HOST:$port (up to ${timeout}s)..."
-  while ! bash -c "echo >/dev/tcp/$HOST/$port" 2>/dev/null; do
-    sleep 1
-    elapsed=$((elapsed + 1))
+  while ! cqlsh "$HOST" "$port" -e "SELECT cluster_name FROM system.local;" >/dev/null 2>&1; do
+    sleep 2
+    elapsed=$((elapsed + 2))
     if [ "$elapsed" -ge "$timeout" ]; then
       echo "  TIMEOUT: CQL not available on port $port after ${timeout}s"
+      docker compose $CLUSTER logs --tail=20 2>/dev/null || true
       exit 1
     fi
   done
@@ -66,7 +67,7 @@ run_cql() {
 assert_count() {
   local label=$1 query=$2 expected=$3 port=${4:-$PORT}
   local result
-  result=$(cqlsh "$HOST" "$port" -e "$query" 2>/dev/null | grep -oP '\d+' | tail -1)
+  result=$(cqlsh "$HOST" "$port" -e "$query" 2>/dev/null | awk '/^[[:space:]]+[0-9]+/{print $1; exit}')
   if [ "${result:-}" = "$expected" ]; then
     echo "  ASSERT PASS: $label = $expected"
     pass=$((pass + 1))
@@ -81,7 +82,7 @@ start_bg_writes() {
     local i=0
     while true; do
       cqlsh "$HOST" "$PORT" -e \
-        "INSERT INTO app.events (tenant_id, event_date, event_id, event_type, payload) VALUES ('bg_writer', '2026-03-18', now(), 'heartbeat', '{\"seq\":$i}');" \
+        "INSERT INTO app.events (tenant_id, event_date, event_id, event_type, payload) VALUES ('bg_writer', '2026-03-18', $((10000 + i)), 'heartbeat', '{\"seq\":$i}');" \
         >/dev/null 2>&1 || true
       i=$((i + 1))
       sleep 1

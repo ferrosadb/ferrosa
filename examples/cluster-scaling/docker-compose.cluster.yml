@@ -1,44 +1,10 @@
 # docker-compose.cluster.yml — Phase 3: Add node3 in Raft cluster mode
 # Run with: docker compose -f docker-compose.yml -f docker-compose.pair.yml -f docker-compose.cluster.yml up -d
+#
+# Node1 and node2 stay as-is — they transition to cluster mode automatically
+# when node3 connects with cluster mode. This avoids recreating containers.
 
 services:
-
-  # ── Override node1 to cluster mode ──
-  node1:
-    environment:
-      FERROSA_HOST_ID: aa111111-1111-1111-1111-111111111111
-      FERROSA_DATA_DIR: /var/lib/ferrosa
-      FERROSA_AUTH_DISABLED: "true"
-      FERROSA_CQL_BIND: 0.0.0.0:9042
-      FERROSA_WEB_BIND: 0.0.0.0:9090
-      FERROSA_CLUSTER_NAME: ferrosa-scaling-demo
-      FERROSA_CLUSTER_MODE: cluster
-      FERROSA_S3_ENDPOINT: http://rustfs:9000
-      FERROSA_S3_BUCKET: ferrosa
-      FERROSA_S3_REGION: us-east-1
-      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
-      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
-      FERROSA_S3_ALLOW_HTTP: "true"
-      FERROSA_S3_PREFIX: node1
-
-  # ── Override node2 to cluster mode ──
-  node2:
-    environment:
-      FERROSA_HOST_ID: bb222222-2222-2222-2222-222222222222
-      FERROSA_DATA_DIR: /var/lib/ferrosa
-      FERROSA_AUTH_DISABLED: "true"
-      FERROSA_CQL_BIND: 0.0.0.0:9042
-      FERROSA_WEB_BIND: 0.0.0.0:9090
-      FERROSA_CLUSTER_NAME: ferrosa-scaling-demo
-      FERROSA_CLUSTER_MODE: cluster
-      FERROSA_SEED: node1:7000
-      FERROSA_S3_ENDPOINT: http://rustfs:9000
-      FERROSA_S3_BUCKET: ferrosa
-      FERROSA_S3_REGION: us-east-1
-      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
-      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
-      FERROSA_S3_ALLOW_HTTP: "true"
-      FERROSA_S3_PREFIX: node2
 
   # ── Node 3 (Raft cluster mode) ──
   node3:
@@ -60,6 +26,8 @@ services:
       FERROSA_CLUSTER_NAME: ferrosa-scaling-demo
       FERROSA_CLUSTER_MODE: cluster
       FERROSA_SEED: node1:7000
+      FERROSA_GRAPH_ENABLED: "true"
+
       FERROSA_S3_ENDPOINT: http://rustfs:9000
       FERROSA_S3_BUCKET: ferrosa
       FERROSA_S3_REGION: us-east-1

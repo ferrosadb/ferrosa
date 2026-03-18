@@ -70,6 +70,7 @@ services:
       FERROSA_WEB_BIND: 0.0.0.0:9090
       FERROSA_CLUSTER_NAME: ferrosa-scaling-demo
       FERROSA_CLUSTER_MODE: standalone
+      FERROSA_GRAPH_ENABLED: "true"
       FERROSA_S3_ENDPOINT: http://rustfs:9000
       FERROSA_S3_BUCKET: ferrosa
       FERROSA_S3_REGION: us-east-1
