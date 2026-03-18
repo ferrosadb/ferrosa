@@ -851,9 +851,9 @@ mod tests {
 
     // ---- Switchover endpoint tests ------------------------------------
 
-    /// Switchover on a node not in pair mode (Internal error) returns 500.
+    /// Switchover in standalone mode should return 409 Conflict (not 500).
     #[tokio::test]
-    async fn api_switchover_not_in_pair_mode_returns_500() {
+    async fn api_switchover_returns_409_when_not_in_pair_mode() {
         let state = make_state();
         let router = crate::web::build_router(state);
         let req = Request::builder()
@@ -862,8 +862,20 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
-        // Not in pair mode → Internal error → 500
-        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CONFLICT,
+            "switchover on standalone node should be 409 Conflict, not 500"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            parsed.get("error").is_some(),
+            "response should include error message"
+        );
     }
 
     /// When the controller returns NotPrimary, switchover must yield 409 Conflict.
@@ -1051,6 +1063,36 @@ mod tests {
                 "{method} {uri} must not return 404 (BUG-019)"
             );
         }
+    }
+
+    /// Verify the `/metrics` endpoint is reachable through the full router
+    /// (not just calling the handler directly).
+    #[tokio::test]
+    async fn metrics_endpoint_reachable_through_router() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "GET /metrics must not return 404"
+        );
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // Verify it returns the correct content type
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with("text/plain"),
+            "expected text/plain content type, got: {content_type}"
+        );
     }
 
     #[tokio::test]
