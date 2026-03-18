@@ -402,16 +402,18 @@ impl ModeController {
     pub async fn switchover(&self) -> Result<()> {
         let (role_arc, peer_host_id) = {
             let ctx = self.pair_context.lock().unwrap();
-            let ctx = ctx
-                .as_ref()
-                .ok_or(ClusterError::Internal("not in pair mode".into()))?;
+            let ctx = ctx.as_ref().ok_or(ClusterError::ModeTransitionRejected(
+                "switchover requires pair mode; current node is standalone".into(),
+            ))?;
             (ctx.role.clone(), ctx.peer_host_id)
         };
 
         let peer_manager = match &**self.peer_manager.load() {
             Some(pm) => pm.clone(),
             None => {
-                return Err(ClusterError::Internal("peer_manager not set".into()));
+                return Err(ClusterError::ModeTransitionRejected(
+                    "peer manager not initialized; peer may be disconnected".into(),
+                ));
             }
         };
 
