@@ -10,6 +10,9 @@ on:
     paths:
       - 'examples/**'
 
+permissions:
+  contents: write
+
 jobs:
   generate:
     name: AsciiDoc → HTML
