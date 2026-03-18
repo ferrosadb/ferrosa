@@ -1,0 +1,278 @@
+= Cybersecurity Monitoring
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Build a SIEM-style security event platform. Ingest network logs, detect threats, and investigate incidents with fast time-range queries.
+
+NOTE: This tutorial assumes you have a running Ferrosa cluster. If you have not set one up yet, follow the Getting Started guide first. You should be able to connect with `cqlsh` before continuing.
+
+== Create the keyspace
+
+Security event data is write-heavy and time-sensitive. You are going to be ingesting thousands of events per second and querying them by time range. A replication factor of 3 ensures no event is lost, even during node failures.
+
+[source,sql]
+----
+include::schema.cql[lines=4..7]
+----
+
+== Design the schema
+
+A security monitoring platform needs four core tables: a primary event log (partitioned by date for time-range queries), a secondary view by source IP (for investigating specific hosts), a threat intelligence lookup table, and an incident tracker. Let's build them one at a time.
+
+=== Events table
+
+This is your primary log. Every firewall event, IDS alert, and authentication attempt lands here. Partitioning by `event_date` means each day's events live in their own partition, which keeps time-range queries fast and gives you a natural data lifecycle -- old partitions can be archived or dropped.
+
+[source,sql]
+----
+include::schema.cql[lines=9..25]
+----
+
+NOTE: *Why partition by date?* Security analysts work in time windows -- "show me everything from the last hour" or "what happened yesterday between 2am and 4am." Date partitioning makes these queries hit a single partition (or at most two, if the window spans midnight).
+
+=== Events by source IP
+
+When investigating a specific host, you need to pull all events from that IP quickly. This table uses a compound partition key of `(source_ip, event_date)` to keep per-IP, per-day data together:
+
+[source,sql]
+----
+include::schema.cql[lines=27..37]
+----
+
+This is denormalization in action -- the same event data appears in both tables, optimized for different query patterns. You write to both tables when an event arrives.
+
+=== Threat intelligence table
+
+This stores known indicators of compromise (IOCs): malicious IP addresses, domain names, file hashes. Your detection engine checks incoming events against this table to flag known threats.
+
+[source,sql]
+----
+include::schema.cql[lines=39..49]
+----
+
+Partitioning by `indicator_type` (like "ip", "domain", or "hash") groups similar indicators together. Lookups by type and value are O(1).
+
+=== Incidents table
+
+When events are correlated into a confirmed security incident, the details go here. Each incident tracks its lifecycle from creation through investigation to resolution.
+
+[source,sql]
+----
+include::schema.cql[lines=51..62]
+----
+
+The `related_events` column uses a list to store references to the event UUIDs that make up this incident.
+
+Here is how the tables relate to each other:
+
+[cols="1,1,1,2", options="header"]
+|===
+| Table | Partition Key | Clustering Key | Serves
+
+| events
+| `event_date`
+| `event_time DESC`
+| Time-range event queries
+
+| events_by_source
+| `(source_ip, event_date)`
+| `event_time DESC`
+| Per-IP investigation
+
+| threat_intel
+| `indicator_type`
+| `indicator_value`
+| IOC lookups
+
+| incidents
+| `incident_id`
+| --
+| Incident lifecycle tracking
+|===
+
+Two tables for the same events (with different partition keys) is a deliberate choice. In Ferrosa, you optimize for the read path by duplicating writes. The cost of writing twice is trivial compared to the cost of a slow investigation query during an active breach.
+
+Your schema is ready -- let's fill it with security events.
+
+== Populate with sample data
+
+=== Insert normal network traffic
+
+First, some baseline activity that looks completely routine -- web browsing, DNS queries, and internal service communication:
+
+[source,sql]
+----
+include::data.cql[lines=6..22]
+----
+
+=== Insert SSH brute force attack
+
+Now let's simulate an attacker trying to brute-force SSH credentials. Notice the rapid succession of failed login attempts from the same source IP:
+
+[source,sql]
+----
+include::data.cql[lines=24..42]
+----
+
+=== Insert port scan activity
+
+[source,sql]
+----
+include::data.cql[lines=44..58]
+----
+
+=== Insert malware beacon
+
+This is the most dangerous pattern -- an internal host communicating with a known command-and-control server at regular intervals:
+
+[source,sql]
+----
+include::data.cql[lines=60..80]
+----
+
+=== Populate events_by_source for investigation
+
+In a production system, your ingestion pipeline would write to both tables simultaneously. For this tutorial, let's insert the key attack events into the source-IP view:
+
+[source,sql]
+----
+include::data.cql[lines=82..106]
+----
+
+=== Add threat intelligence
+
+[source,sql]
+----
+include::data.cql[lines=108..122]
+----
+
+=== Create an incident
+
+[source,sql]
+----
+include::data.cql[lines=124..140]
+----
+
+== Query your data
+
+=== View events in a time window
+
+The most common SIEM query: "show me everything that happened in the last hour." Because we partition by date and cluster by time, this is a fast range scan:
+
+[source,sql]
+----
+include::queries.cql[lines=6..10]
+----
+
+This returns only the events within that hour, in reverse chronological order. You will see the C2 beacons, lateral movement, and data exfiltration -- a clear attack timeline.
+
+=== Investigate a suspicious source IP
+
+When an alert fires on a specific IP, you need all its activity fast. The `events_by_source` table makes this a single-partition read:
+
+[source,sql]
+----
+include::queries.cql[lines=12..15]
+----
+
+The results clearly show a pattern: four SSH login failures in rapid succession against the same target, all on port 22. Textbook brute force.
+
+=== Find high-severity events
+
+During an active incident, analysts need to focus on the most critical events. Pull today's events and filter for high and critical severity:
+
+[source,sql]
+----
+include::queries.cql[lines=17..20]
+----
+
+In your application layer, filter for `severity IN ('high', 'critical')`. You will see the SSH brute force detection event, the port scan on RDP, all three C2 beacons, the lateral movement, and the data exfiltration -- a clear escalation from reconnaissance to compromise to data theft.
+
+NOTE: *Why filter in the application?* The `severity` column is not part of the primary key, so filtering on it in CQL would require `ALLOW FILTERING`. For a day's worth of events that easily fits in memory, application-side filtering is cleaner. For very high-volume environments, consider a separate `events_by_severity` table.
+
+=== Check all activity from the compromised host
+
+Now the critical investigation -- what has 10.0.1.200 been doing?
+
+[source,sql]
+----
+include::queries.cql[lines=22..25]
+----
+
+The timeline tells the whole story: C2 beacons at regular intervals, lateral movement to internal servers, and a large data exfiltration. This host is compromised and actively being used by an attacker.
+
+=== Look up threat intelligence
+
+Cross-reference the C2 server's IP against your threat intel database:
+
+[source,sql]
+----
+include::queries.cql[lines=27..30]
+----
+
+This confirms the IP is a known Cobalt Strike C2 server, first seen in January, reported by AlienVault OTX. The tags tell you exactly what you are dealing with.
+
+=== Review the incident
+
+Pull up the full incident record to see the investigation status and all related events:
+
+[source,sql]
+----
+include::queries.cql[lines=32..35]
+----
+
+The `related_events` list gives you direct references back to the individual events in the `events` table. In your application, you would loop through these UUIDs to build a complete attack timeline.
+
+=== Correlate: find all events targeting the same destination as a known threat
+
+Let's see if the SSH brute force attacker (203.0.113.42) was also targeting other hosts. First, confirm what we know about them:
+
+[source,sql]
+----
+include::queries.cql[lines=37..40]
+----
+
+The result confirms this IP is part of a known SSH brute force botnet. This is valuable context -- it tells you the attack is automated, not targeted, which changes your response posture.
+
+=== Search threat intel by type
+
+To see all known malicious IPs in your threat database:
+
+[source,sql]
+----
+include::queries.cql[lines=42..44]
+----
+
+This returns all IP-based indicators, sorted by the indicator value. You could feed these into your firewall rules or use them to enrich incoming events in real time.
+
+=== Look up domain-based threats
+
+[source,sql]
+----
+include::queries.cql[lines=46..49]
+----
+
+Your detection engine can check every outbound DNS query against this table. If a host resolves `evil-payload.example.net`, you know immediately that it is trying to reach a known malware distribution site.
+
+=== Update the incident with correlation findings
+
+Good investigations connect the dots. Let's update the incident to document what we found:
+
+[source,sql]
+----
+include::queries.cql[lines=51..56]
+----
+
+== What you learned
+
+You built a complete security event monitoring platform. Here is what you practiced:
+
+* *Date-partitioned event logs.* By partitioning on `event_date`, time-range queries stay fast regardless of how much historical data you have. Each day is its own partition, which also makes data retention easy -- drop old partitions when they expire.
+* *Dual-write denormalization.* The `events` and `events_by_source` tables store the same events optimized for different access patterns. One serves time-range queries, the other serves IP-based investigations. In Ferrosa, you model for the query, not the entity.
+* *Compound partition keys.* The `(source_ip, event_date)` partition key on `events_by_source` prevents any single IP from creating an unbounded partition. Even if one IP generates millions of events over its lifetime, each day's data is bounded.
+* *Threat intel as a lookup table.* Partitioning by `indicator_type` and clustering by `indicator_value` gives you O(1) lookups for any IOC. Your detection engine can check every incoming event against this table with minimal latency.
+* *Collection types for relationships.* The `list<uuid>` on incidents and `set<text>` on threat intel let you store structured relationships without separate join tables. This keeps your read path simple -- one query gets the full incident with all its related event IDs.
+* *Incident lifecycle tracking.* Using `UPDATE` to modify incident status and notes shows how Ferrosa handles mutable state alongside append-only event data. The incident evolves while the underlying events are immutable.
+
+From here, you could add a `blocked_ips` table for automated response, a `user_activity` table to track authentication patterns per user, or an `asset_inventory` table to enrich events with context about which hosts are critical.

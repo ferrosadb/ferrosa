@@ -1,0 +1,275 @@
+= IoT Sensor Data
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Build a sensor data platform that ingests millions of readings from thousands of devices.
+Learn time-series data modeling, the workhorse pattern of IoT applications.
+
+NOTE: Complete the <<cluster-setup.adoc#,3-Node Cluster Setup>> tutorial first, or have a running Ferrosa cluster accessible on `localhost:9042`.
+
+== The Use Case
+
+=== Smart building sensor monitoring
+
+Imagine you are building the backend for a smart building management system.
+The building has thousands of sensors -- temperature gauges in every room, humidity monitors in the HVAC ducts, and barometric pressure sensors on each floor.
+Every sensor sends a reading every 10 seconds, around the clock.
+
+Let's do some quick math.
+One sensor sends 6 readings per minute.
+Multiply that by 1,000 sensors and you get 6,000 writes per minute -- about 100 writes per second.
+A campus with 50 buildings?
+That is 5,000 writes per second, continuously, forever.
+
+A traditional relational database would struggle here for a few reasons:
+
+* The sheer volume of writes would overwhelm a single-node database. Row locking and transaction overhead add up fast when you are inserting thousands of rows per second.
+* The data grows without bound. After a year of operation, a single building generates over 3 billion rows. Queries against a table that large require careful indexing and partitioning that most relational databases were not designed for.
+* You need the system to stay up even when hardware fails. A single-server database is a single point of failure.
+
+Ferrosa (and the Cassandra data model it implements) was built for exactly this kind of workload.
+Writes are fast because they go to an append-only commit log.
+Data is automatically distributed across the cluster.
+And with a replication factor of 3, the system keeps running even if a node goes down.
+
+In this tutorial, you will model sensor data, insert realistic readings, and run the queries a real monitoring dashboard would need.
+
+== Design the Schema
+
+=== Understanding partition keys and clustering keys
+
+Before we write any CQL, let's talk about how Ferrosa organizes data on disk.
+Every table has a *primary key*, and the primary key has two parts:
+
+* The *partition key* determines which node in the cluster stores the row. All rows with the same partition key live on the same node (and its replicas). Think of it as a folder name.
+* The *clustering key* determines the sort order of rows within a partition. Think of it as the filing order inside that folder.
+
+For sensor data, this maps perfectly: the `device_id` is the partition key (all readings from one sensor go to the same partition), and the `reading_time` is the clustering key (readings are sorted by time within each partition).
+
+=== Create the keyspace
+
+First, connect to your cluster and create a keyspace.
+A keyspace is like a database in the relational world -- it is a namespace that holds your tables and defines how data is replicated.
+
+[source,sql]
+----
+include::schema.cql[lines=1..4]
+----
+
+This tells Ferrosa to keep 3 copies of every piece of data across your cluster nodes.
+With a 3-node cluster, every node will have a full copy -- which means any single node can go down and your data is still safe and queryable.
+
+=== Create the sensor readings table
+
+[source,sql]
+----
+include::schema.cql[lines=8..16]
+----
+
+Let's break this down column by column:
+
+[cols="1,1,3"]
+|===
+| Column | Type | Purpose
+
+| `device_id` | `text` | Unique identifier for each sensor (e.g., "temp-sensor-001")
+| `reading_time` | `timestamp` | When the reading was taken, down to the millisecond
+| `sensor_type` | `text` | What kind of sensor (temperature, humidity, pressure)
+| `value` | `double` | The actual measurement value
+| `unit` | `text` | Unit of measurement (celsius, percent, hPa)
+| `location` | `text` | Where the sensor is installed in the building
+|===
+
+The `PRIMARY KEY (device_id, reading_time)` means `device_id` is the partition key and `reading_time` is the clustering key.
+The `CLUSTERING ORDER BY (reading_time DESC)` clause tells Ferrosa to store readings newest-first.
+This is important because the most common query in IoT dashboards is "show me the latest readings" -- and with descending order, the latest readings are always at the top of the partition, making that query very fast.
+
+=== Create the latest readings table
+
+Dashboards often need to show the most recent reading from every device at a glance.
+While you could query the `sensor_readings` table for each device individually, that would mean one query per device -- not great when you have thousands of sensors.
+
+Instead, we create a separate table that stores only the latest reading from each device:
+
+[source,sql]
+----
+include::schema.cql[lines=18..25]
+----
+
+With `device_id` as the sole primary key, each device gets exactly one row.
+Every time a new reading arrives, your application writes to both `sensor_readings` (the full history) and `latest_reading` (overwriting the previous value).
+This is a common pattern in Cassandra-style databases called *denormalization* -- you trade a little extra write work for dramatically faster reads.
+
+NOTE: *Why two tables?* In a relational database, you would write one INSERT and use a query like `SELECT DISTINCT ON (device_id) ... ORDER BY reading_time DESC`. That works because relational databases can scan and sort arbitrary columns. In Ferrosa, queries must follow the primary key structure. By maintaining a separate `latest_reading` table, you get a single-partition, single-row lookup -- the fastest possible query.
+
+== Insert Sample Data
+
+=== Populate sensor readings
+
+Let's insert a day's worth of readings for three sensors.
+In a real system, your sensor gateway would do this automatically.
+Here, we will do it by hand so you can see the shape of the data.
+
+[source,sql]
+----
+include::data.cql[]
+----
+
+That gives us 22 readings across 3 devices, spanning a morning.
+In production, you would have millions of these rows, but the query patterns are identical.
+
+== Query Patterns
+
+=== Get the latest readings from a device
+
+The most common query in any IoT dashboard: "What are the 5 most recent readings from this sensor?"
+Because we used `CLUSTERING ORDER BY (reading_time DESC)`, the newest readings are stored first, and Ferrosa can return them without any sorting work.
+
+[source,sql]
+----
+SELECT * FROM sensor_readings
+WHERE device_id = 'temp-sensor-001'
+LIMIT 5;
+----
+
+This query hits exactly one partition (the one for `temp-sensor-001`) and reads the first 5 rows -- which are the newest 5 readings, thanks to the descending sort.
+It completes in single-digit milliseconds regardless of how many total readings the sensor has.
+
+=== Query a time range
+
+The second most common query: "Show me all readings from this sensor between 8 AM and noon."
+Because `reading_time` is the clustering key, Ferrosa can seek directly to the start of the range and scan forward -- no full-table scan needed.
+
+[source,sql]
+----
+SELECT device_id, reading_time, value, unit
+FROM sensor_readings
+WHERE device_id = 'temp-sensor-001'
+  AND reading_time >= '2024-01-15 08:00:00'
+  AND reading_time <= '2024-01-15 12:00:00';
+----
+
+This returns exactly the rows that fall within your time window.
+You are selecting specific columns instead of `*` here -- a good habit in production, because it reduces the amount of data transferred over the network.
+
+=== Dashboard overview: latest reading per device
+
+For a dashboard that shows all sensors at a glance, query the `latest_reading` table.
+One query, all devices:
+
+[source,sql]
+----
+SELECT * FROM latest_reading;
+----
+
+This is why we maintain a separate table.
+Without it, you would need to run a separate `SELECT ... LIMIT 1` query for each device.
+With thousands of sensors, that would be thousands of queries.
+The `latest_reading` table gives you everything in one read.
+
+=== Count readings for a device
+
+How many readings has a sensor sent?
+This is useful for monitoring sensor health -- if a device stops reporting, you will notice the count falling behind.
+
+[source,sql]
+----
+SELECT COUNT(*) FROM sensor_readings
+WHERE device_id = 'temp-sensor-001';
+----
+
+IMPORTANT: In Ferrosa, `COUNT(*)` needs to read every row in the partition to count them. For small to medium partitions (up to a few hundred thousand rows), this is fine. For partitions with millions of rows, consider maintaining a separate counter or using time-bucketed partitions (see the next section).
+
+=== Find readings above a threshold
+
+Suppose the server room humidity should never exceed 45%.
+You can query for all readings above that threshold within a time range:
+
+[source,sql]
+----
+SELECT reading_time, value
+FROM sensor_readings
+WHERE device_id = 'humidity-sensor-002'
+  AND reading_time >= '2024-01-15 06:00:00'
+  AND reading_time <= '2024-01-15 12:00:00';
+----
+
+Ferrosa returns the rows in the time range, and your application filters for `value > 45`.
+You could also use `ALLOW FILTERING` to push the filter down to the server, but for most IoT workloads, doing the filtering in your application code gives you more flexibility.
+
+== Real-World Considerations
+
+=== Auto-expire old data with TTL
+
+Sensor data is often only valuable for a limited time.
+Last month's temperature readings might be useful.
+Last year's readings?
+Probably not worth the storage cost.
+Ferrosa supports *TTL (Time To Live)* on every insert -- the row automatically disappears after the specified number of seconds.
+
+[source,sql]
+----
+-- This reading will automatically delete itself after 30 days
+INSERT INTO sensor_readings (device_id, reading_time, sensor_type, value, unit, location)
+VALUES ('temp-sensor-001', '2024-01-15 14:00:00', 'temperature', 23.7, 'celsius', 'building-a/floor-1/lobby')
+USING TTL 2592000;
+----
+
+The value `2592000` is 30 days in seconds (30 x 24 x 60 x 60).
+After 30 days, Ferrosa marks the row as expired and reclaims the space during the next compaction cycle.
+No cron jobs, no cleanup scripts -- it just happens.
+
+Common TTL values for IoT data:
+
+[cols="1,1,2"]
+|===
+| Retention | TTL (seconds) | Use case
+
+| 7 days | `604800` | Real-time monitoring, recent alerts
+| 30 days | `2592000` | Operational dashboards, trend analysis
+| 90 days | `7776000` | Quarterly reporting, compliance
+| 365 days | `31536000` | Annual analysis, capacity planning
+|===
+
+=== Partition bucketing for high-volume sensors
+
+With the current schema, all readings from one sensor go into a single partition.
+At 6 readings per minute, that is 8,640 per day and about 3.1 million per year.
+Partitions that grow beyond a few hundred megabytes can slow down reads and make compaction more expensive.
+
+The solution is *time bucketing*: include a date in the partition key so each partition holds only one day's worth of data.
+
+[source,sql]
+----
+include::schema.cql[lines=27..35]
+----
+
+Now each partition holds exactly one device's readings for one day -- about 8,640 rows.
+Partitions stay small and predictable.
+The tradeoff is that queries spanning multiple days need to specify each date:
+
+[source,sql]
+----
+SELECT * FROM sensor_readings_bucketed
+WHERE device_id = 'temp-sensor-001'
+  AND reading_date = '2024-01-15'
+LIMIT 10;
+----
+
+For most IoT dashboards, this tradeoff is well worth it.
+You almost always query a single day at a time anyway.
+
+== What You Learned
+
+Congratulations!
+You have just built the data layer for an IoT monitoring platform.
+Here is a recap of the key concepts:
+
+* *Partition keys group related data.* By using `device_id` as the partition key, all readings from one sensor are stored together on the same nodes, making per-device queries fast.
+* *Clustering keys define sort order.* `reading_time DESC` means the latest readings are always at the top of the partition, optimizing the most common query pattern.
+* *Denormalization is your friend.* The `latest_reading` table duplicates data from `sensor_readings`, but it turns a "query every device" dashboard into a single, lightning-fast read.
+* *TTL automates data retention.* Set a TTL on inserts and Ferrosa handles cleanup for you -- no maintenance scripts needed.
+* *Bucketing keeps partitions small.* For high-volume sensors, adding a date to the partition key bounds partition size and keeps performance predictable over time.
+
+Next, try the <<time-series-analytics.adoc#,Real-Time Analytics>> tutorial to learn about composite partition keys and pre-computed aggregations, or jump to the <<ecommerce.adoc#,E-Commerce Platform>> tutorial to explore collection types and denormalized query tables.

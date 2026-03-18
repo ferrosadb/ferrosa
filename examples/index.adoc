@@ -1,0 +1,56 @@
+= Tutorials & Examples
+:stylesheet: theme/ferrosa.css
+:linkcss:
+:icons: font
+:source-highlighter: rouge
+:nofooter:
+
+Step-by-step tutorials that take you from zero to a running workload on a 3-node Ferrosa cluster. Each guide starts from `docker compose up` and ends with live queries.
+
+NOTE: *Before you begin:* Every tutorial in this collection uses the same 3-node Docker cluster. If you haven't set one up yet, start with the link:cluster-setup.html[3-Node Cluster Setup] guide. It takes about 5 minutes.
+
+== Getting Started
+
+link:cluster-setup.html[*3-Node Cluster Setup*]::
+Install Docker and launch a production-like Ferrosa cluster in 5 minutes.
+
+== Data-Intensive Workloads
+
+link:iot-sensor-data.html[*IoT Sensor Data*]::
+Ingest millions of sensor readings with time-series tables.
+
+link:time-series-analytics.html[*Real-Time Analytics*]::
+Aggregate financial market data for dashboards.
+
+link:ecommerce.html[*E-Commerce*]::
+Product catalog, shopping cart, and order processing.
+
+link:messaging-chat.html[*Messaging & Chat*]::
+Store and retrieve conversation history at scale.
+
+== Security & Compliance
+
+link:fraud-detection.html[*Fraud Detection*]::
+Score transactions in real time with pattern matching.
+
+link:cybersecurity.html[*Cybersecurity Monitoring*]::
+SIEM-style event logs with fast threat lookup.
+
+link:healthcare.html[*Healthcare Records*]::
+Patient timelines with temporal versioning.
+
+== Industry-Specific
+
+link:content-personalization.html[*Content Personalization*]::
+Recommendation engine with user preference tracking.
+
+link:telecom.html[*Telecommunications*]::
+Call detail records and real-time billing.
+
+link:gaming-leaderboards.html[*Gaming Leaderboards*]::
+Player stats, rankings, and match history.
+
+== Ferrosa-Exclusive: Graph + CQL
+
+link:graph-joins.html[*Graph Joins & Traversals*]::
+Relationship queries that traditional Cassandra can't do -- using Ferrosa's built-in graph engine.

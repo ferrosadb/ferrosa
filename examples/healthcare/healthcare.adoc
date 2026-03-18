@@ -1,0 +1,203 @@
+= Healthcare Records
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Model electronic medical records with temporal versioning. Store patient histories, lab results, and medication logs with time-ordered clinical data.
+
+NOTE: This tutorial assumes you have a running 3-node Ferrosa cluster. If you have not set one up yet, follow the cluster-setup guide first -- it only takes about 5 minutes.
+
+== Create the Keyspace
+
+Every Ferrosa project starts with a keyspace. Think of it as a namespace that groups your tables together and tells the cluster how many copies of your data to keep. For healthcare data, we definitely want redundancy.
+
+Connect to your cluster and run:
+
+[source,sql]
+----
+include::schema.cql[lines=4..9]
+----
+
+With a replication factor of 3, every piece of patient data is stored on all three nodes. If one node goes down, your records are still fully available. That is exactly the kind of reliability you want for medical data.
+
+== Design the Schema
+
+We will create four tables that work together to model a patient's medical record. Each table is designed around the queries you will run most often.
+
+=== Patients
+
+The `patients` table stores demographic information. Each patient gets a unique UUID, and we use a `set` for allergies since a patient can have zero or many.
+
+[source,sql]
+----
+include::schema.cql[lines=12..19]
+----
+
+=== Clinical Events
+
+Clinical events form the patient's timeline: admissions, discharges, procedures, consultations. We cluster by `event_time` in descending order so the most recent events come back first -- exactly what a nurse or doctor needs.
+
+[source,sql]
+----
+include::schema.cql[lines=21..31]
+----
+
+=== Lab Results
+
+Lab results are keyed by patient and collection time. The `abnormal` flag makes it easy to filter for results that need attention.
+
+[source,sql]
+----
+include::schema.cql[lines=33..42]
+----
+
+=== Medications
+
+The medications table tracks current and past prescriptions. We partition by patient and cluster by medication name so you can look up any specific drug quickly.
+
+[source,sql]
+----
+include::schema.cql[lines=44..53]
+----
+
+That is four tables, each optimized for a different access pattern.
+
+== Register Patients
+
+Let's add three patients. Notice how we use `uuid()` to generate unique identifiers and curly braces for the `set` of allergies.
+
+[source,sql]
+----
+include::data.cql[lines=6..20]
+----
+
+Priya has no known allergies, so we pass an empty set `{}`. Ferrosa stores that efficiently -- no wasted space.
+
+== Record Clinical Events
+
+Now let's build out a realistic timeline. We will add events across multiple departments for each patient. Each event captures who, what, where, and when.
+
+[source,sql]
+----
+include::data.cql[lines=22..65]
+----
+
+That is 15 clinical events across three patients. Notice how each patient's events tell a coherent medical story -- this is exactly how real EMR data looks.
+
+== Store Lab Results
+
+Lab results are the backbone of clinical decision-making. Let's add a realistic panel for each patient.
+
+[source,sql]
+----
+include::data.cql[lines=67..96]
+----
+
+Notice Maria's elevated WBC and CRP on admission -- classic markers for appendicitis. Her post-op WBC came back to normal. That is the kind of trend these time-ordered tables make easy to spot.
+
+== Track Medications
+
+Let's record current and past prescriptions. The `active` column lets you quickly filter for what a patient is taking right now.
+
+[source,sql]
+----
+include::data.cql[lines=98..121]
+----
+
+Notice that Maria is on Cephalexin (a cephalosporin) instead of penicillin-based antibiotics -- her allergy record in the `patients` table flagged that. In a real system, you would enforce this with application-level checks.
+
+== Query Clinical Data
+
+Now for the rewarding part. Let's run the kinds of queries that doctors, nurses, and analysts use every day.
+
+=== Patient Timeline
+
+Pull up everything that happened to a patient, most recent first. Because we used `CLUSTERING ORDER BY (event_time DESC)`, this is extremely fast.
+
+[source,sql]
+----
+include::queries.cql[lines=6..9]
+----
+
+=== Recent Lab Results
+
+Get the most recent labs for a patient. The `LIMIT` clause keeps it manageable.
+
+[source,sql]
+----
+include::queries.cql[lines=11..15]
+----
+
+=== Active Medications
+
+What is a patient currently taking? Filter by `active = true` to get only current prescriptions.
+
+[source,sql]
+----
+include::queries.cql[lines=17..21]
+----
+
+IMPORTANT: *About ALLOW FILTERING:* We need this because `active` is not part of the primary key. In production, you might create a separate `active_medications` table to avoid filtering. For now, with small datasets, it works just fine.
+
+=== Abnormal Lab Results
+
+Quickly find results that are outside the normal range -- the ones that need a doctor's attention.
+
+[source,sql]
+----
+include::queries.cql[lines=23..28]
+----
+
+=== Clinical Events by Type
+
+Filter the timeline to just procedures, just imaging, or any other event type you need.
+
+[source,sql]
+----
+include::queries.cql[lines=30..34]
+----
+
+=== Patient Lookup
+
+Sometimes the simplest query is the most important one. When a patient arrives, the first thing staff need is their demographic information and allergy list.
+
+[source,sql]
+----
+include::queries.cql[lines=36..39]
+----
+
+This returns instantly because `patient_id` is the partition key. No matter how many millions of patients your system holds, this lookup hits exactly one partition on one node.
+
+=== Time-Bounded Event Search
+
+Pull events from a specific date range. This is useful for generating discharge summaries or insurance claim documentation.
+
+[source,sql]
+----
+include::queries.cql[lines=41..46]
+----
+
+Because `event_time` is a clustering column, Ferrosa can efficiently seek to the start of the range and scan forward. No full-partition scan needed.
+
+=== All Medications for a Patient
+
+For a complete medication reconciliation -- both active and discontinued -- simply omit the filter on `active`.
+
+[source,sql]
+----
+include::queries.cql[lines=48..51]
+----
+
+TIP: *Schema design insight:* Notice how each table serves a different audience. The `patients` table is for registration desks. The `clinical_events` table is for doctors reviewing a timeline. The `lab_results` table is for lab technicians and nurses. The `medications` table is for pharmacists. Designing tables around who reads the data -- not just who writes it -- is a core Ferrosa pattern.
+
+== What You Learned
+
+You just built the foundation of an electronic medical records system. Here is what you accomplished:
+
+* Created a *replicated keyspace* with RF=3 for data durability critical to healthcare
+* Designed a *temporal schema* with descending clustering order for instant access to the most recent events
+* Used *CQL collection types* (sets) to model multi-valued fields like allergies
+* Built a *patient timeline* that returns events in reverse chronological order without sorting
+* Wrote *analytical queries* to filter abnormal lab results and active medications
+
+The data model you built here scales to millions of patients. Each patient's data lives on the same partition, so lookups are always fast regardless of how large the cluster grows. That is the power of partition-based modeling.

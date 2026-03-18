@@ -1,0 +1,160 @@
+= Content Personalization
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Build a recommendation engine backend.
+Track user preferences, content interactions, and viewing history to deliver personalized experiences.
+
+NOTE: This tutorial assumes you have a running 3-node Ferrosa cluster.
+If you haven't set one up yet, follow the link:../cluster-setup.html[3-Node Cluster Setup] guide first -- it only takes about 5 minutes.
+
+== Create the Keyspace
+
+Personalization data needs to be fast and always available.
+When a user opens your app, they expect to see their recommendations instantly -- not a loading spinner.
+Let's create a keyspace with full replication across all three nodes.
+
+With RF=3, every user's preference data is available even if a node goes down.
+In a streaming service, downtime means lost engagement -- so redundancy is worth it.
+
+== Design the Schema
+
+A personalization engine needs four things: who the user is, what content exists, what the user has watched, and what to recommend next.
+One table for each.
+
+=== Users
+
+User profiles store preferences that drive recommendations.
+We use a `set` for genres because users can love multiple categories.
+
+=== Content
+
+The content catalog.
+Every movie, series, and documentary in the library.
+We use a `set` for tags so you can attach multiple descriptors to each title.
+
+=== Watch History
+
+Every time a user watches something, we record it.
+Partitioned by user, clustered by time descending.
+We denormalize the title into this table so we can display the history without joining to the content table.
+
+TIP: In Ferrosa (and Cassandra-style databases), joins are expensive.
+By storing the title in the watch history table, we can display "Continue Watching" lists with a single partition read.
+The small storage cost is worth the massive speed gain.
+
+=== Recommendations
+
+Pre-computed recommendations for each user, ranked by a relevance score.
+Your recommendation algorithm (collaborative filtering, content-based, etc.) writes to this table, and the app reads from it.
+
+Four tables, each serving a specific screen in the app: profile, catalog, history, and the "For You" page.
+
+The full schema (keyspace, tables, and index):
+
+[source,sql]
+----
+include::schema.cql[]
+----
+
+== Create User Profiles
+
+Let's create three users with different taste profiles.
+These preferences will drive the recommendations later.
+
+Lena loves sci-fi and documentaries.
+Marco is into comedies and dramas.
+Yuki gravitates toward anime and action.
+Three very different taste profiles that will produce very different recommendations.
+
+== Add Content Catalog
+
+Let's populate the catalog with a mix of content types and genres.
+Ten titles across sci-fi, comedy, drama, anime, documentary, and more.
+Each has tags that help the recommendation engine find similar content.
+
+== Record Watch History
+
+Every play event gets recorded.
+The `progress_pct` field lets you build "Continue Watching" rows, and the `rating` feeds back into the recommendation algorithm.
+
+Fifteen watch events across three users.
+Notice that Lena stopped "The Last Algorithm" at 60% and "The Silk Road Diaries" at 35% -- those are prime candidates for the "Continue Watching" row.
+A rating of `0` means the user hasn't rated it yet.
+
+== Store Recommendations
+
+In production, a recommendation algorithm would compute these scores.
+For this tutorial, we will insert them directly.
+Each user gets a ranked list with a human-readable reason explaining why the content was recommended.
+
+Each recommendation includes a `reason` that explains why it was suggested.
+This transparency builds trust -- users engage more when they understand why something was recommended to them.
+
+All data (users, content, watch history, and recommendations):
+
+[source,sql]
+----
+include::data.cql[]
+----
+
+== Power the Personalization Engine
+
+These are the queries that power the different screens in a streaming app.
+Each one is a single-partition read -- fast enough for real-time rendering.
+
+=== User's Watch History
+
+The "Recently Watched" row on the home screen.
+Most recent first, thanks to the descending clustering order.
+
+=== Recommendations for a User
+
+The "For You" section.
+Recommendations are pre-sorted by rank, so this query returns them in the right order with no extra work.
+
+=== Content by Genre
+
+Browsing by category.
+We use the secondary index on genre to make this query work without `ALLOW FILTERING`.
+
+IMPORTANT: Secondary indexes work well for low-cardinality columns like `genre` (where there are a limited number of distinct values).
+Avoid them on high-cardinality columns like `user_id` or `email` -- for those, create a dedicated lookup table instead.
+
+=== Top-Rated Content
+
+Build a "Top Picks" row by filtering for highly rated content.
+
+=== Update Viewing Progress
+
+When a user pauses a movie, update their progress so they can resume later.
+
+=== Find Users with Similar Taste
+
+Collaborative filtering starts with finding users who share genre preferences.
+This query finds everyone who likes sci-fi.
+
+Both Lena and Yuki will show up here -- which is why the recommendation engine suggested some of the same titles to both of them.
+
+All queries (selects, updates, and filters):
+
+[source,sql]
+----
+include::queries.cql[]
+----
+
+== What You Learned
+
+You just built the backend for a content recommendation engine. Here is what you accomplished:
+
+* Designed a *denormalized schema* where titles are duplicated across tables to avoid expensive joins
+* Used *CQL collection types* (sets) to model multi-valued preferences like genres and tags
+* Built a *watch history* table with descending time order for instant "Recently Watched" queries
+* Created a *pre-ranked recommendations* table that serves the "For You" page in a single read
+* Used a *secondary index* on genre for catalog browsing, and learned when indexes are appropriate
+* Queried *set membership* with `CONTAINS` to find users with overlapping taste profiles
+
+This architecture powers real streaming services.
+The key insight is that every screen in the app maps to a single-partition query.
+Ferrosa handles millions of users this way because each query touches exactly one partition -- no matter how large the cluster grows.

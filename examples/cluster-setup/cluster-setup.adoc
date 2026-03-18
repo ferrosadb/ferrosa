@@ -1,0 +1,256 @@
+= 3-Node Cluster Setup
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+:linkcss:
+:icons: font
+:source-highlighter: rouge
+
+This guide walks you through installing Docker, creating a Ferrosa cluster, and verifying it's working -- from a completely blank machine.
+
+NOTE: *Time estimate:* About 5 minutes if Docker is already installed, 10-15 minutes if you're starting from scratch. No prior database experience required.
+
+== Prerequisites
+
+You don't need any database knowledge to follow this guide. Here's what you do need:
+
+* A computer running *Linux*, *macOS*, or *Windows with WSL2*
+* At least *4 GB of RAM* available (the three Ferrosa nodes plus the object store will use about 2-3 GB total)
+* An *internet connection* to download Docker images on first run
+* A *terminal* -- Terminal.app on macOS, any terminal emulator on Linux, or Windows Terminal with WSL2
+
+That's it. Everything else gets installed in the steps below.
+
+== Install Docker
+
+Docker packages your Ferrosa cluster into containers so you don't have to install Rust, compile anything, or worry about dependencies. If you already have Docker installed, skip to <<create-files>>.
+
+=== Step 1: Install Docker Desktop or Docker Engine
+
+Follow the official instructions for your operating system:
+
+* https://docs.docker.com/desktop/install/mac-install/[macOS] -- download Docker Desktop from the Docker website
+* https://docs.docker.com/engine/install/[Linux] -- install Docker Engine via your package manager
+* https://docs.docker.com/desktop/install/windows-install/[Windows] -- install Docker Desktop with WSL2 backend
+
+=== Step 2: Verify Docker is working
+
+Open a terminal and run both of these commands. If they print version numbers, you're ready to go.
+
+[source,bash]
+----
+docker --version
+# Docker version 27.x.x, build xxxxxxx
+
+docker compose version
+# Docker Compose version v2.x.x
+----
+
+NOTE: On Linux, if you see a "permission denied" error, you may need to add your user to the `docker` group: `sudo usermod -aG docker $USER`, then log out and back in.
+
+[[create-files]]
+== Create the Cluster Files
+
+You only need one file: a Docker Compose configuration that defines all three Ferrosa nodes and a local S3-compatible object store. Let's create a working directory first.
+
+=== Step 3: Create a project directory
+
+Pick any location you like. We'll use your home directory.
+
+[source,bash]
+----
+mkdir ferrosa-cluster && cd ferrosa-cluster
+----
+
+=== Step 4: Create the docker-compose.yml file
+
+Copy the entire block below into a new file called `docker-compose.yml`. You can use any text editor -- VS Code, nano, vim, or even Notepad.
+
+[source,yaml]
+----
+include::docker-compose.yml[]
+----
+
+Let's break down what this file does:
+
+* *rustfs* -- A local S3-compatible object store. Ferrosa uses S3 as its durable storage backend, and RustFS gives you a lightweight local version for development.
+* *rustfs-init* -- A one-time helper that creates the `ferrosa` storage bucket. It runs once and exits.
+* *node1* -- The seed node. It starts first in `standalone` mode and acts as the initial contact point for the other nodes.
+* *node2* -- Joins node1 in `pair` mode, forming a two-node high-availability pair.
+* *node3* -- The third node triggers the transition to full `cluster` mode with Raft consensus.
+
+NOTE: *About the host IDs:* Each Ferrosa node needs a unique UUID. The simple values used here (`11111111-...`, `22222222-...`, `33333333-...`) are just for the tutorial. In production, you would use randomly generated UUIDs.
+
+== Start the Cluster
+
+=== Step 5: Launch all services
+
+From your `ferrosa-cluster` directory, run:
+
+[source,bash]
+----
+docker compose up -d
+----
+
+The `-d` flag runs everything in the background. Docker will download the images on the first run, which takes a minute or two depending on your internet connection. After that, subsequent starts take just a few seconds.
+
+=== Step 6: Watch the startup logs
+
+Follow the logs to see the cluster come online:
+
+[source,bash]
+----
+docker compose logs -f node1 node2 node3
+----
+
+Here's what you should see, in roughly this order:
+
+. *Node 1 starts in standalone mode* -- you'll see it bind to port 9042 and report "CQL server listening"
+. *Node 2 connects to node 1* -- the logs will show a peer handshake and pair formation: "Pair mode established with node1"
+. *Node 3 triggers the cluster transition* -- you'll see Raft leader election messages and "Cluster mode active, 3 nodes in ring"
+. *All three nodes report healthy* -- heartbeat messages confirm the cluster is stable
+
+Press `Ctrl+C` to stop following the logs. The cluster keeps running in the background.
+
+NOTE: *How long does startup take?* Node 1 is usually ready in 2-3 seconds. Node 2 joins within 5 seconds after node 1 is healthy. Node 3 joins and the Raft election completes within another 5-10 seconds. Total: about 15-20 seconds.
+
+== Verify the Cluster
+
+Let's make sure all three nodes are up and talking to each other.
+
+=== Step 7: Check cluster status via the web API
+
+Ferrosa's web console exposes a REST API. Query it to see the cluster topology:
+
+[source,bash]
+----
+curl http://localhost:9090/api/cluster/status | python3 -m json.tool
+----
+
+You should see a JSON response listing all three nodes with their status, host IDs, and token assignments. Every node should show `"status": "UP"`.
+
+=== Step 8: Confirm all containers are running
+
+A quick check that nothing crashed:
+
+[source,bash]
+----
+docker compose ps
+----
+
+You should see five services: `rustfs` running, `rustfs-init` exited (that's normal -- it only runs once), and `node1`, `node2`, `node3` all showing "healthy".
+
+.Service port mapping
+[cols="1,1,2", options="header"]
+|===
+| Service | Host Port | Purpose
+
+| node1 | `9042` | CQL (primary contact point)
+| node1 | `9090` | Web console & API
+| node1 | `7474` | Graph endpoint
+| node2 | `9043` | CQL
+| node2 | `9091` | Web console & API
+| node2 | `7475` | Graph endpoint
+| node3 | `9044` | CQL
+| node3 | `9092` | Web console & API
+| node3 | `7476` | Graph endpoint
+| rustfs | `9000` | S3 API
+| rustfs | `9001` | RustFS web console
+|===
+
+== Connect with cqlsh
+
+Now for the fun part: talking to your cluster. `cqlsh` is the standard CQL shell that works with both Apache Cassandra and Ferrosa.
+
+=== Step 9: Install cqlsh
+
+`cqlsh` is a Python tool. Install it with pip:
+
+[source,bash]
+----
+pip install cqlsh
+----
+
+=== Step 10: Connect to node 1
+
+Open a CQL session on the first node:
+
+[source,bash]
+----
+cqlsh localhost 9042
+----
+
+You should see a welcome banner and a `cqlsh>` prompt. You're now connected to your Ferrosa cluster. Let's create some data to confirm everything works end to end.
+
+=== Step 11: Create a keyspace and table
+
+Type (or paste) each command at the `cqlsh>` prompt:
+
+[source,sql]
+----
+include::setup.cql[]
+----
+
+You should see your row:
+
+[source]
+----
+ id | message
+----+---------------------
+  1 | Hello from Ferrosa!
+
+(1 rows)
+----
+
+=== Step 12: Verify replication across nodes
+
+Open a second terminal and connect to node 2 on port 9043:
+
+[source,bash]
+----
+cqlsh localhost 9043
+----
+
+Now query the same table. Because you set `replication_factor: 3`, every node has a copy of the data:
+
+[source,sql]
+----
+SELECT * FROM setup_test.hello;
+----
+
+You should see the exact same row. Your data is replicated across all three nodes.
+
+NOTE: *What just happened?* When you inserted data on node 1, Ferrosa's coordinator forwarded the write to all three replicas. The write succeeded after a quorum (2 out of 3) acknowledged it. When you queried node 2, it served the data from its own local copy. This is distributed database replication in action.
+
+== Next Steps
+
+Your cluster is up and running. Now pick a tutorial that matches what you want to build:
+
+* link:iot-sensor-data.html[IoT Sensor Data] -- Ingest millions of sensor readings with time-series tables.
+* link:time-series-analytics.html[Real-Time Analytics] -- Aggregate financial market data for dashboards.
+* link:ecommerce.html[E-Commerce] -- Product catalog, shopping cart, and order processing.
+* link:messaging-chat.html[Messaging & Chat] -- Store and retrieve conversation history at scale.
+* link:fraud-detection.html[Fraud Detection] -- Score transactions in real time with pattern matching.
+* link:graph-joins.html[Graph Joins & Traversals] -- Relationship queries using Ferrosa's built-in graph engine.
+
+TIP: Leave this cluster running as you work through the tutorials. Each tutorial creates its own keyspace so they don't interfere with each other.
+
+=== Useful commands for managing your cluster
+
+[source,bash]
+----
+# Stop the cluster (preserves data)
+docker compose stop
+
+# Start it again
+docker compose start
+
+# Stop and remove everything (deletes all data)
+docker compose down -v
+
+# View logs for a specific node
+docker compose logs -f node2
+
+# Restart a single node
+docker compose restart node3
+----

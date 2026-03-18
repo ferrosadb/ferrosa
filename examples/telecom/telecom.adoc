@@ -1,0 +1,206 @@
+= Telecommunications Platform
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Build a call detail record system for a mobile carrier. Process millions of calls and texts, compute billing in real time, and analyze network usage patterns.
+
+NOTE: This tutorial assumes you have a running 3-node Ferrosa cluster. If you have not set one up yet, follow the cluster-setup guide first -- it only takes about 5 minutes.
+
+== Create the Keyspace
+
+Telecom data is high volume and high value. A single carrier can generate billions of call records per month. Let's create a keyspace with triple replication so nothing gets lost.
+
+[source,sql]
+----
+include::schema.cql[lines=4..9]
+----
+
+With RF=3, your call detail records survive any single node failure. In production, you would use `NetworkTopologyStrategy` to spread replicas across data centers, but `SimpleStrategy` is perfect for learning.
+
+== Design the Schema
+
+Telecom data has a natural time-series shape: every call, text, and data session has a subscriber, a timestamp, and a set of measurements. We will design four tables around the most common access patterns.
+
+=== Call Records
+
+This is the core table. We use a *compound partition key* of `(subscriber_id, call_date)` so that each day's records for a subscriber land on the same partition. This keeps partitions from growing unbounded over months of data.
+
+[source,sql]
+----
+include::schema.cql[lines=12..25]
+----
+
+=== Subscribers
+
+Basic subscriber information: plan details, usage limits, and current balance.
+
+[source,sql]
+----
+include::schema.cql[lines=27..35]
+----
+
+=== Billing Summary
+
+Pre-aggregated monthly totals. Rather than scanning millions of call records at bill time, we maintain running totals. The billing month is stored as text (like `'2026-03'`) for easy range queries.
+
+[source,sql]
+----
+include::schema.cql[lines=37..45]
+----
+
+=== Network Events
+
+Cell tower health, outages, and maintenance logs. Partitioned by tower and date so network operations teams can quickly pull up a tower's history.
+
+[source,sql]
+----
+include::schema.cql[lines=47..55]
+----
+
+Four tables, each designed for a specific team: billing, customer service, network operations. That is how you model telecom data -- start with the queries, work backward to the schema.
+
+== Add Subscribers
+
+Let's create three subscribers with different plan types. In a real carrier, you might have millions -- but the access pattern is the same.
+
+[source,sql]
+----
+include::data.cql[lines=6..14]
+----
+
+Alice has an unlimited plan (we use `-1` for no minute cap). Ben is on prepaid with a smaller balance. Carmen has a family plan with shared limits. Each represents a different billing scenario.
+
+== Ingest Call Records
+
+Now let's simulate a day's worth of activity. In production, these records would stream in from network switches at thousands per second. Here we will insert them one at a time, but the schema handles bulk writes just as well.
+
+[source,sql]
+----
+include::data.cql[lines=16..68]
+----
+
+That is 20 call records across three subscribers. Notice how Ben's international call to London at 16:45 costs $4.50 -- that is the kind of detail billing systems need to capture. Alice's unlimited plan shows $0.00 for everything.
+
+== Generate Billing Summaries
+
+In a real system, you would compute these with a batch job or stream processor. For this tutorial, we will insert the pre-computed summaries directly.
+
+[source,sql]
+----
+include::data.cql[lines=70..88]
+----
+
+== Log Network Events
+
+Cell towers generate their own stream of events: maintenance windows, capacity warnings, and outages. Let's add a few realistic entries.
+
+[source,sql]
+----
+include::data.cql[lines=90..106]
+----
+
+Notice the Chicago tower had a brief outage at 9:15 AM but recovered quickly. In a real NOC (Network Operations Center), these events would trigger alerts and populate dashboards.
+
+== Run Operational Queries
+
+Let's run the queries that different teams in a telecom company use every day.
+
+=== Call History for a Subscriber
+
+Customer service needs this constantly. Because we partitioned by `(subscriber_id, call_date)`, pulling up a single day is a single-partition read -- the fastest query Ferrosa can do.
+
+[source,sql]
+----
+include::queries.cql[lines=6..9]
+----
+
+=== Daily Usage Summary
+
+How much data did a subscriber use today? This is the kind of query that powers "check my usage" features in mobile apps.
+
+[source,sql]
+----
+include::queries.cql[lines=11..16]
+----
+
+=== Billing Summary
+
+Pull up a subscriber's bill history, most recent first.
+
+[source,sql]
+----
+include::queries.cql[lines=18..20]
+----
+
+=== Network Events by Tower
+
+When a tower has issues, the NOC team needs its event log immediately.
+
+[source,sql]
+----
+include::queries.cql[lines=22..25]
+----
+
+=== Subscriber Balance
+
+A quick lookup for prepaid customers who want to check their remaining credit.
+
+[source,sql]
+----
+include::queries.cql[lines=27..30]
+----
+
+=== High-Cost Calls
+
+Find expensive calls -- useful for fraud detection or helping customers understand their bills.
+
+[source,sql]
+----
+include::queries.cql[lines=32..37]
+----
+
+=== Subscriber Profile Update
+
+When a prepaid customer tops up their account, you update their balance. This is a single-partition write -- fast and atomic.
+
+[source,sql]
+----
+include::queries.cql[lines=39..41]
+----
+
+=== Voice Calls Only
+
+Customer service often needs to pull up just voice calls for a dispute. Filter by `call_type` to narrow it down.
+
+[source,sql]
+----
+include::queries.cql[lines=43..48]
+----
+
+Carmen made two voice calls -- a local one and a 20-minute international call to Mexico. That international call at $6.00 would be the one to look at if she calls in to dispute her bill.
+
+=== Month-Over-Month Comparison
+
+Pull two months of billing data for a subscriber to spot usage trends. This is useful for "your usage this month" dashboards.
+
+[source,sql]
+----
+include::queries.cql[lines=50..54]
+----
+
+Alice's data usage went from 3,800 MB in February to 4,200 MB in March. If she is approaching her 50 GB cap, the app could trigger a proactive notification.
+
+TIP: *Partition design tip:* The compound partition key `(subscriber_id, call_date)` keeps each day's records in a bounded partition. Without the date component, a subscriber with years of history would create a massive partition -- exactly the kind of problem Ferrosa's data model helps you avoid.
+
+== What You Learned
+
+You just built the data layer for a mobile carrier. Here is a summary of everything you accomplished:
+
+* Designed a *compound partition key* to keep call record partitions bounded by day
+* Used *descending clustering order* so the most recent records always come back first
+* Built a *pre-aggregated billing table* to avoid expensive full-table scans at bill time
+* Modeled *network events* with tower-and-date partitioning for fast NOC lookups
+* Ran *operational queries* across billing, customer service, and network operations use cases
+
+The data model you built here handles the three things telecom systems care about most: high write throughput for call records, fast lookups for customer service, and time-bounded queries for billing. Ferrosa's partition-based architecture makes all three efficient at any scale.
