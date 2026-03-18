@@ -109,7 +109,7 @@ docker compose -f "$COMPOSE_FILE" up -d
 # Wait for CQL
 echo "Waiting for CQL port ($FERROSA_CQL_PORT)..."
 for i in $(seq 1 120); do
-  if docker compose -f "$COMPOSE_FILE" exec -T node1 sh -c "nc -z 127.0.0.1 9042" 2>/dev/null; then
+  if docker compose -f "$COMPOSE_FILE" exec -T node1 bash -c '</dev/tcp/127.0.0.1/9042' 2>/dev/null; then
     echo "Ferrosa ready after ${i}s"
     break
   fi

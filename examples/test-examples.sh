@@ -32,7 +32,7 @@ docker compose -f "$COMPOSE_FILE" up -d
 # ── Wait for CQL to become available ──
 echo "=== Waiting for CQL on ${FERROSA_HOST}:${FERROSA_CQL_PORT} (timeout: ${TIMEOUT}s) ==="
 elapsed=0
-while ! nc -z "$FERROSA_HOST" "$FERROSA_CQL_PORT" 2>/dev/null; do
+while ! bash -c "</dev/tcp/$FERROSA_HOST/$FERROSA_CQL_PORT" 2>/dev/null; do
   if [ "$elapsed" -ge "$TIMEOUT" ]; then
     echo "FAIL: CQL port ${FERROSA_CQL_PORT} not available after ${TIMEOUT}s"
     echo ""
