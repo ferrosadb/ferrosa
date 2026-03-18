@@ -27,6 +27,11 @@ def session():
         port=FERROSA_CQL_PORT,
         load_balancing_policy=RoundRobinPolicy(),
         protocol_version=5,
+        # Ferrosa's core CQL smoke coverage does not depend on driver-side
+        # schema/token metadata refresh, and disabling it avoids treating
+        # optional server event registration as a connection blocker.
+        schema_metadata_enabled=False,
+        token_metadata_enabled=False,
     )
     sess = cluster.connect()
     yield sess

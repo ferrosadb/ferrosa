@@ -1509,7 +1509,11 @@ async fn route_create_table(
             .collect(),
         params: TableParams::default(),
         flags: HashSet::new(),
-        extensions: std::collections::HashMap::new(),
+        extensions: s
+            .extensions
+            .as_ref()
+            .map(|pairs| pairs.iter().cloned().collect())
+            .unwrap_or_default(),
         is_system: false,
     };
 

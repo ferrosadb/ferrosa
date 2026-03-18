@@ -519,6 +519,7 @@ impl<'input> Parser<'input> {
         // WITH options
         let mut table_options: Vec<(String, String)> = vec![];
         let mut clustering_order: Vec<(String, ClusteringOrder)> = vec![];
+        let mut extensions: Option<Vec<(String, String)>> = None;
 
         if self.lexer.eat(&TokenKind::Keyword(Keyword::With))? {
             loop {
@@ -549,8 +550,13 @@ impl<'input> Parser<'input> {
                     // Generic option: name = value
                     let opt_name = self.parse_ident()?;
                     self.lexer.expect(&TokenKind::Eq)?;
-                    let opt_val = self.parse_option_value()?;
-                    table_options.push((opt_name, opt_val));
+                    if opt_name == "extensions" {
+                        // extensions takes a map literal: {'key': 'value', ...}
+                        extensions = Some(self.parse_string_map()?);
+                    } else {
+                        let opt_val = self.parse_option_value()?;
+                        table_options.push((opt_name, opt_val));
+                    }
                 }
                 if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
                     break;
@@ -577,6 +583,7 @@ impl<'input> Parser<'input> {
             clustering_key: final_clustering_key,
             if_not_exists,
             table_options,
+            extensions,
         })
     }
 
@@ -2296,6 +2303,61 @@ mod tests {
                 assert_eq!(ext[1], ("graph.label".into(), "Person".into()));
             }
             other => panic!("expected AlterTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_table_with_extensions_map() {
+        let stmt = parse(
+            "CREATE TABLE ks.t (id uuid PRIMARY KEY) WITH extensions = {'graph.type': 'vertex', 'graph.label': 'Person'}"
+        ).unwrap();
+        match stmt {
+            Statement::CreateTable(s) => {
+                assert_eq!(s.keyspace, Some("ks".into()));
+                assert_eq!(s.name, "t");
+                let ext = s.extensions.expect("extensions should be Some");
+                assert_eq!(ext.len(), 2);
+                assert_eq!(ext[0], ("graph.type".into(), "vertex".into()));
+                assert_eq!(ext[1], ("graph.label".into(), "Person".into()));
+                // table_options should not contain extensions
+                assert!(s.table_options.is_empty());
+            }
+            other => panic!("expected CreateTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_table_with_simple_option_still_works() {
+        let stmt =
+            parse("CREATE TABLE t (id int PRIMARY KEY, v text) WITH comment = 'hello'").unwrap();
+        match stmt {
+            Statement::CreateTable(s) => {
+                assert_eq!(s.name, "t");
+                assert_eq!(s.table_options, vec![("comment".into(), "hello".into())]);
+                assert!(s.extensions.is_none());
+            }
+            other => panic!("expected CreateTable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_create_table_with_extensions_and_other_options() {
+        let stmt = parse(
+            "CREATE TABLE ks.t (id uuid PRIMARY KEY) WITH gc_grace_seconds = 86400 AND extensions = {'graph.type': 'vertex'} AND comment = 'test'"
+        ).unwrap();
+        match stmt {
+            Statement::CreateTable(s) => {
+                let ext = s.extensions.expect("extensions should be Some");
+                assert_eq!(ext.len(), 1);
+                assert_eq!(ext[0], ("graph.type".into(), "vertex".into()));
+                assert_eq!(s.table_options.len(), 2);
+                assert_eq!(
+                    s.table_options[0],
+                    ("gc_grace_seconds".into(), "86400".into())
+                );
+                assert_eq!(s.table_options[1], ("comment".into(), "test".into()));
+            }
+            other => panic!("expected CreateTable, got {:?}", other),
         }
     }
 
