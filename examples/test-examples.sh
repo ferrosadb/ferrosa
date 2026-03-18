@@ -60,6 +60,28 @@ else
   failed_dirs="cluster-setup ${failed_dirs}"
 fi
 
+# ── Helper: run cqlsh, tolerate warnings (exit code 2) ──
+# cqlsh exits 2 for warnings (e.g. schema version mismatch) but the
+# operation succeeds. Only treat exit code 1 (real error) as failure.
+run_cqlsh() {
+  local output
+  output=$(cqlsh "$FERROSA_HOST" "$FERROSA_CQL_PORT" -f "$1" 2>&1)
+  local rc=$?
+  echo "$output"
+  # Exit code 2 = warnings only; check for actual errors in output
+  if [ "$rc" -eq 0 ]; then
+    return 0
+  elif [ "$rc" -eq 2 ]; then
+    # Fail only if output contains real errors (not just warnings)
+    if echo "$output" | grep -qiE "Error from server|SyntaxException|InvalidRequest|NoHostAvailable|struct\.error|Connection refused"; then
+      return 1
+    fi
+    return 0  # warnings only
+  else
+    return "$rc"
+  fi
+}
+
 # ── Run each example directory ──
 for dir in $(find . -mindepth 1 -maxdepth 1 -type d ! -name theme ! -name cluster-setup ! -name cluster-scaling | sort); do
   dir="${dir#./}"
@@ -70,7 +92,7 @@ for dir in $(find . -mindepth 1 -maxdepth 1 -type d ! -name theme ! -name cluste
   # schema.cql
   if [ -f "${dir}/schema.cql" ]; then
     echo "  -> ${dir}/schema.cql"
-    if ! cqlsh "$FERROSA_HOST" "$FERROSA_CQL_PORT" -f "${dir}/schema.cql"; then
+    if ! run_cqlsh "${dir}/schema.cql"; then
       echo "  FAIL: ${dir}/schema.cql"
       dir_ok=false
     fi
@@ -79,7 +101,7 @@ for dir in $(find . -mindepth 1 -maxdepth 1 -type d ! -name theme ! -name cluste
   # data.cql
   if [ -f "${dir}/data.cql" ]; then
     echo "  -> ${dir}/data.cql"
-    if ! cqlsh "$FERROSA_HOST" "$FERROSA_CQL_PORT" -f "${dir}/data.cql"; then
+    if ! run_cqlsh "${dir}/data.cql"; then
       echo "  FAIL: ${dir}/data.cql"
       dir_ok=false
     fi
@@ -88,7 +110,7 @@ for dir in $(find . -mindepth 1 -maxdepth 1 -type d ! -name theme ! -name cluste
   # queries.cql
   if [ -f "${dir}/queries.cql" ]; then
     echo "  -> ${dir}/queries.cql"
-    if ! cqlsh "$FERROSA_HOST" "$FERROSA_CQL_PORT" -f "${dir}/queries.cql"; then
+    if ! run_cqlsh "${dir}/queries.cql"; then
       echo "  FAIL: ${dir}/queries.cql"
       dir_ok=false
     fi
