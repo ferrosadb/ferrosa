@@ -441,6 +441,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = ferrosa_graph::http::AppState {
             engine: graph_engine.clone(),
             schema: schema_for_http,
+            auth_disabled,
         };
         tokio::spawn(async move {
             if let Err(e) = ferrosa_graph::http::start_graph_http(&http_config, state).await {

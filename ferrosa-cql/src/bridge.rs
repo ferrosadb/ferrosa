@@ -80,6 +80,49 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     .map_err(|e| CqlError::Invalid(format!("invalid inet address: {e}")))?;
                 Ok(CqlValue::Inet(addr))
             }
+            CqlType::Timestamp => {
+                // Parse ISO 8601 timestamp: "2024-01-15T10:30:00Z" or "2024-01-15 10:30:00+0000"
+                // Try common formats
+                let ms = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                    dt.timestamp_millis()
+                } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                {
+                    dt.and_utc().timestamp_millis()
+                } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+                {
+                    dt.and_utc().timestamp_millis()
+                } else if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                    d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis()
+                } else {
+                    return Err(CqlError::Invalid(format!(
+                        "cannot parse timestamp from string: {s}"
+                    )));
+                };
+                Ok(CqlValue::Timestamp(ms))
+            }
+            CqlType::Date => {
+                // Parse ISO date: "2024-01-15"
+                // CQL date is days since epoch (1970-01-01), stored as u32 with 2^31 offset
+                let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .map_err(|e| CqlError::Invalid(format!("cannot parse date: {e}")))?;
+                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                let days = (d - epoch).num_days();
+                // CQL date encoding: days since epoch + 2^31 (to make it unsigned/sortable)
+                let encoded = (days + (1i64 << 31)) as u32;
+                Ok(CqlValue::Date(encoded))
+            }
+            CqlType::Time => {
+                // Parse time: "10:30:00" or "10:30:00.123456789"
+                // CQL time is nanoseconds since midnight
+                let t = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+                    .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M:%S"))
+                    .map_err(|e| CqlError::Invalid(format!("cannot parse time: {e}")))?;
+                let nanos = t
+                    .signed_duration_since(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                    .num_nanoseconds()
+                    .unwrap_or(0);
+                Ok(CqlValue::Time(nanos))
+            }
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got string literal",
                 cql_type_name(target)
@@ -200,9 +243,25 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             "IN list not supported in this context".into(),
         )),
 
-        Term::FunctionCall { .. } => Err(CqlError::Invalid(
-            "function calls in values not yet implemented".into(),
-        )),
+        Term::FunctionCall { name, args, .. } => {
+            match name.to_lowercase().as_str() {
+                "uuid" if args.is_empty() => Ok(CqlValue::Uuid(uuid::Uuid::new_v4())),
+                "now" if args.is_empty() => {
+                    // timeuuid-like: use current timestamp
+                    Ok(CqlValue::Timestamp(chrono::Utc::now().timestamp_millis()))
+                }
+                "totimestamp" if args.len() == 1 => {
+                    // Convert argument to timestamp
+                    let inner = term_to_cql_value(&args[0], &CqlType::Timestamp)?;
+                    Ok(inner)
+                }
+                "todate" if args.len() == 1 => {
+                    let inner = term_to_cql_value(&args[0], &CqlType::Date)?;
+                    Ok(inner)
+                }
+                _ => Err(CqlError::Invalid(format!("unknown function: {name}"))),
+            }
+        }
     }
 }
 

@@ -250,6 +250,7 @@ fn build_app(schema: Arc<Schema>, storage: Arc<StorageEngine>) -> axum::Router {
     let state = AppState {
         engine,
         schema: Arc::clone(&schema),
+        auth_disabled: false,
     };
     build_router(state)
 }

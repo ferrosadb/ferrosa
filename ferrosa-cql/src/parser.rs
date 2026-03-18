@@ -1553,6 +1553,64 @@ impl<'input> Parser<'input> {
                 self.exit_nesting();
                 result
             }
+            // Identifiers and function calls
+            TokenKind::Ident(name) => {
+                let name = name.to_string();
+                if self.lexer.eat(&TokenKind::LParen)? {
+                    // Function call: name(args...)
+                    self.enter_nesting()?;
+                    let mut args = vec![];
+                    if self.lexer.peek()?.kind != TokenKind::RParen {
+                        args.push(self.parse_term()?);
+                        while self.lexer.eat(&TokenKind::Comma)? {
+                            args.push(self.parse_term()?);
+                        }
+                    }
+                    self.lexer.expect(&TokenKind::RParen)?;
+                    self.exit_nesting();
+                    Ok(Term::FunctionCall {
+                        keyspace: None,
+                        name,
+                        args,
+                    })
+                } else {
+                    // Bare identifier in term position (column reference)
+                    Ok(Term::FunctionCall {
+                        keyspace: None,
+                        name,
+                        args: vec![],
+                    })
+                }
+            }
+            // Keywords that can be used as function names (uuid, now, toDate, etc.)
+            TokenKind::Keyword(kw) => {
+                let name = Self::keyword_as_ident(kw);
+                if self.lexer.eat(&TokenKind::LParen)? {
+                    self.enter_nesting()?;
+                    let mut args = vec![];
+                    if self.lexer.peek()?.kind != TokenKind::RParen {
+                        args.push(self.parse_term()?);
+                        while self.lexer.eat(&TokenKind::Comma)? {
+                            args.push(self.parse_term()?);
+                        }
+                    }
+                    self.lexer.expect(&TokenKind::RParen)?;
+                    self.exit_nesting();
+                    Ok(Term::FunctionCall {
+                        keyspace: None,
+                        name,
+                        args,
+                    })
+                } else {
+                    // Keyword used as bare identifier — this is likely a syntax error
+                    // in most contexts, but we let the caller decide.
+                    Ok(Term::FunctionCall {
+                        keyspace: None,
+                        name,
+                        args: vec![],
+                    })
+                }
+            }
             _ => Err(CqlError::SyntaxError(format!(
                 "expected term, got {:?} at position {}",
                 tok.kind, tok.pos

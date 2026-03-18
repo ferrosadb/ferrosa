@@ -1394,6 +1394,15 @@ async fn route_drop_keyspace(
         &Resource::Keyspace(s.name.clone()),
     )?;
 
+    // IF EXISTS: silently succeed when keyspace doesn't exist
+    if s.if_exists && !state.schema.snapshot().keyspaces.contains_key(&s.name) {
+        return Ok(result::encode_schema_change(
+            "DROPPED",
+            "KEYSPACE",
+            &[&s.name],
+        ));
+    }
+
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
@@ -1635,6 +1644,21 @@ async fn route_drop_table(
         Permission::Drop,
         &Resource::Table(ks.to_string(), s.table.clone()),
     )?;
+
+    // IF EXISTS: silently succeed when table doesn't exist
+    if s.if_exists
+        && !state
+            .schema
+            .snapshot()
+            .tables
+            .contains_key(&(ks.to_string(), s.table.clone()))
+    {
+        return Ok(result::encode_schema_change(
+            "DROPPED",
+            "TABLE",
+            &[ks, &s.table],
+        ));
+    }
 
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
