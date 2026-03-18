@@ -218,8 +218,8 @@ fn create_social_graph_schema(schema: &Schema) {
     knows_ext.insert("graph.label".to_string(), "KNOWS".to_string());
     knows_ext.insert("graph.source".to_string(), "src_id".to_string());
     knows_ext.insert("graph.target".to_string(), "dst_id".to_string());
-    knows_ext.insert("graph.source_label".to_string(), "person_v".to_string());
-    knows_ext.insert("graph.target_label".to_string(), "person_v".to_string());
+    knows_ext.insert("graph.source_label".to_string(), "Person".to_string());
+    knows_ext.insert("graph.target_label".to_string(), "Person".to_string());
 
     schema
         .create_table(
