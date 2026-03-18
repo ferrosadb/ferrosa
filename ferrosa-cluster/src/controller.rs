@@ -35,7 +35,7 @@ use ferrosa_storage::CommitLogPosition;
 use crate::config::ClusterConfig;
 use crate::consistency::ConsistencyLevel;
 use crate::coordinator::ClusterCoordinator;
-use crate::ddl_path::DdlPath;
+use crate::ddl_path::{ClusterDdlForwardHandler, DdlPath};
 use crate::error::{ClusterError, Result};
 use crate::hints::delivery::HintDeliveryTask;
 use crate::hints::{HintConfig, HintStore};
@@ -675,6 +675,13 @@ impl ModeController {
         // Register self
         network_factory.register_node(local_node_id, self.local_host_id);
 
+        // Capture the node_map Arc before the factory is consumed by FerrosRaft::new.
+        // This shared map is used by DdlPath::Cluster to resolve leader NodeId → Uuid.
+        let node_map_for_ddl = network_factory.node_map();
+        // Clone peer_manager for DdlPath::Cluster forwarding (ClusterCoordinator
+        // will consume `peer_manager` below).
+        let peer_manager_for_ddl = peer_manager.clone();
+
         // 4. Build TokenRing with deterministic initial tokens
         let mut ring = TokenRing::new();
 
@@ -878,7 +885,19 @@ impl ModeController {
                         leader = lid,
                         "raft leader elected, swapping DDL path to Cluster"
                     );
-                    ddl_path.store(Arc::new(DdlPath::Cluster(raft_arc.clone())));
+                    // Register the cluster DDL forward handler so that when a
+                    // non-leader forwards a PairDdlForward to the leader, the
+                    // leader proposes it through Raft rather than applying
+                    // directly (which would bypass consensus).
+                    let cluster_ddl_handler =
+                        Arc::new(ClusterDdlForwardHandler::new(raft_arc.clone()));
+                    registry.register(MsgType::PairDdlForward, cluster_ddl_handler);
+
+                    ddl_path.store(Arc::new(DdlPath::Cluster {
+                        raft: raft_arc.clone(),
+                        peer_manager: peer_manager_for_ddl,
+                        node_map: node_map_for_ddl,
+                    }));
                 }
                 None => {
                     tracing::warn!(

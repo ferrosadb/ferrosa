@@ -71,6 +71,15 @@ impl FerrosRaftNetworkFactory {
         self.register_node(node_id, host_id);
     }
 
+    /// Return a clone of the `Arc` pointing to the node_id → host_id mapping.
+    ///
+    /// Callers such as [`crate::ddl_path::DdlPath::Cluster`] can hold this
+    /// reference to resolve a Raft leader `u64` NodeId to the `Uuid` needed by
+    /// [`ferrosa_net::peer::PeerManager`] without duplicating the map.
+    pub fn node_map(&self) -> Arc<std::sync::RwLock<std::collections::HashMap<u64, Uuid>>> {
+        Arc::clone(&self.node_map)
+    }
+
     /// Look up the host UUID for a given openraft node ID.
     fn resolve_host_id(&self, node_id: u64) -> Option<Uuid> {
         self.node_map

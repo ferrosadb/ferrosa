@@ -1300,7 +1300,7 @@ async fn route_create_keyspace(
             let op = DdlOperation::CreateKeyspace(ks_meta);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateKeyspace(ks_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1361,7 +1361,7 @@ async fn route_alter_keyspace(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::AlterKeyspace {
                 name: s.name.clone(),
                 updates,
@@ -1416,7 +1416,7 @@ async fn route_drop_keyspace(
             let op = DdlOperation::DropKeyspace(s.name.clone());
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropKeyspace(s.name.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1528,7 +1528,7 @@ async fn route_create_table(
             let op = DdlOperation::CreateTable(Box::new(table_meta));
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateTable(Box::new(table_meta));
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1596,7 +1596,7 @@ async fn route_alter_table(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::AlterTable {
                 keyspace: ks.to_string(),
                 table: s.table.clone(),
@@ -1647,7 +1647,7 @@ async fn route_drop_table(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropTable {
                 keyspace: ks.to_string(),
                 table: s.table.clone(),
@@ -1731,7 +1731,7 @@ async fn route_create_index(
             let op = DdlOperation::CreateIndex(index_meta);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateIndex(index_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1804,7 +1804,7 @@ async fn route_drop_index(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropIndex {
                 keyspace: ks.to_string(),
                 table: table_name.clone(),
@@ -1858,7 +1858,7 @@ async fn route_create_role(
             let op = DdlOperation::CreateRole(role);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateRole(role);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1902,7 +1902,7 @@ async fn route_alter_role(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::AlterRole {
                 name: s.name.clone(),
                 updates,
@@ -1939,7 +1939,7 @@ async fn route_drop_role(
             let op = DdlOperation::DropRole(s.name.clone());
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropRole(s.name.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1984,7 +1984,7 @@ async fn route_grant(
             });
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::Grant(GrantEntry {
                 role: s.role.clone(),
                 resource,
@@ -2035,7 +2035,7 @@ async fn route_revoke(
                 coordinator.coordinate_ddl(op).await?;
             }
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             // Same as Pair: one Raft proposal per permission for atomic replication.
             for perm in perms {
                 let op = DdlOperation::Revoke {
@@ -2394,7 +2394,7 @@ async fn route_create_type(
             let op = DdlOperation::CreateType(udt);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateType(udt);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -2502,7 +2502,7 @@ async fn route_drop_type(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropType {
                 keyspace: ks.clone(),
                 name: name.clone(),
@@ -2634,7 +2634,7 @@ async fn route_create_function(
             let op = DdlOperation::CreateFunction(func_meta);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateFunction(func_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -2751,7 +2751,7 @@ async fn route_drop_function(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropFunction {
                 keyspace: ks.clone(),
                 name: name.clone(),
@@ -2890,7 +2890,7 @@ async fn route_create_aggregate(
             let op = DdlOperation::CreateAggregate(agg_meta);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateAggregate(agg_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -3005,7 +3005,7 @@ async fn route_drop_aggregate(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropAggregate {
                 keyspace: ks.clone(),
                 name: name.clone(),
