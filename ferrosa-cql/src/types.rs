@@ -981,5 +981,53 @@ mod proptests {
             let decoded = decode_value(&cql_type, &encoded).unwrap();
             prop_assert_eq!(decoded, value);
         }
+
+        #[test]
+        fn roundtrip_list(items in proptest::collection::vec(any::<i32>(), 0..20)) {
+            let val = CqlValue::List(items.iter().map(|n| CqlValue::Int(*n)).collect());
+            let encoded = encode_value(&val);
+            let decoded = decode_value(&CqlType::List(Box::new(CqlType::Int)), &encoded).unwrap();
+            prop_assert_eq!(val, decoded);
+        }
+
+        #[test]
+        fn roundtrip_set(items in proptest::collection::vec(any::<i64>(), 0..20)) {
+            let val = CqlValue::Set(items.iter().map(|n| CqlValue::Bigint(*n)).collect());
+            let encoded = encode_value(&val);
+            let decoded = decode_value(&CqlType::Set(Box::new(CqlType::Bigint)), &encoded).unwrap();
+            prop_assert_eq!(val, decoded);
+        }
+
+        #[test]
+        fn roundtrip_map(entries in proptest::collection::vec(
+            (any::<i32>(), "\\PC{0,20}"), 0..10
+        )) {
+            let val = CqlValue::Map(
+                entries.iter().map(|(k, v)| (CqlValue::Int(*k), CqlValue::Text(v.clone()))).collect()
+            );
+            let encoded = encode_value(&val);
+            let decoded = decode_value(
+                &CqlType::Map(Box::new(CqlType::Int), Box::new(CqlType::Varchar)),
+                &encoded
+            ).unwrap();
+            prop_assert_eq!(val, decoded);
+        }
+
+        #[test]
+        fn roundtrip_nested_list_of_tuples(
+            items in proptest::collection::vec(
+                (any::<i32>(), "\\PC{0,20}"), 0..5
+            )
+        ) {
+            let tuple_type = CqlType::Tuple(vec![CqlType::Int, CqlType::Varchar]);
+            let list_type = CqlType::List(Box::new(tuple_type.clone()));
+            let tuples: Vec<CqlValue> = items.iter().map(|(n, s)| {
+                CqlValue::Tuple(vec![Some(CqlValue::Int(*n)), Some(CqlValue::Text(s.clone()))])
+            }).collect();
+            let val = CqlValue::List(tuples);
+            let encoded = encode_value(&val);
+            let decoded = decode_value(&list_type, &encoded).unwrap();
+            prop_assert_eq!(val, decoded);
+        }
     }
 }
