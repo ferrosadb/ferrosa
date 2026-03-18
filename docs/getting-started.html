@@ -527,6 +527,39 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
     </div>
   </div>
 
+  <!-- ── Operational Notes ── -->
+  <h2 id="operational-notes">Operational Notes</h2>
+
+  <h3>S3 Storage Resilience</h3>
+  <p>When S3 is configured as the durable backend, Ferrosa writes asynchronously to S3 via an
+    upload queue. If S3 becomes temporarily unreachable:</p>
+  <ul>
+    <li>Reads and writes continue against local disk and memtables.</li>
+    <li>Uploads are retried automatically when connectivity resumes.</li>
+    <li>Data written during the outage exists only on local disk until the next successful upload.</li>
+  </ul>
+  <div class="note">
+    <strong>Data loss window:</strong> If local disk is lost while S3 is unreachable, data written
+    since the last successful S3 upload may be lost. For production deployments, monitor the S3
+    upload queue depth and alert on sustained failures.
+  </div>
+
+  <h3>Multi-Node Cluster (Experimental)</h3>
+  <p>Three-node cluster mode (<code>FERROSA_CLUSTER_MODE=cluster</code>) uses Raft consensus for
+    metadata and tunable consistency for data. Current limitations:</p>
+  <ul>
+    <li>When one node in a three-node cluster goes down, reads and writes continue at reduced
+      availability depending on the configured consistency level.</li>
+    <li>Schema state on surviving nodes may temporarily diverge until the failed node rejoins and
+      the Raft log is replayed.</li>
+    <li>Automatic rebalancing after node loss is not yet implemented — use <code>ferrosa-ctl</code>
+      for manual recovery.</li>
+  </ul>
+  <div class="note">
+    <strong>Beta:</strong> Multi-node cluster mode is experimental. For production HA, two-node
+    pair mode with automatic failover is the recommended configuration.
+  </div>
+
   <p>
     For the full architecture spec, see the
     <a href="https://github.com/ferrosadb/ferrosadb">GitHub repository</a>.
