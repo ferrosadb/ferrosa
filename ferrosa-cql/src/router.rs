@@ -763,18 +763,30 @@ fn route_select_user_table(
             None => vec![],
         }
     } else {
-        // No PK — check for secondary indexes on WHERE columns
+        // No PK — check whether every WHERE column is covered by a secondary
+        // index on this table.  Cassandra requires ALLOW FILTERING whenever
+        // *any* WHERE column is not covered by an index (or the partition key),
+        // even if other WHERE columns are indexed.  Using `any` here was the
+        // original bug: it bypassed the check as soon as one indexed column was
+        // found, silently accepting queries that still needed ALLOW FILTERING
+        // for the remaining un-indexed columns.
         let where_columns: Vec<&str> = s.where_clauses.iter().map(|w| w.column.as_str()).collect();
-        let has_matching_index = snap.indexes.iter().any(|((idx_ks, idx_tbl, _), meta)| {
-            idx_ks == ks
-                && idx_tbl == &s.table
-                && meta
-                    .target_columns
-                    .iter()
-                    .any(|c| where_columns.contains(&c.as_str()))
-        });
 
-        if !has_matching_index && !s.allow_filtering {
+        // Build the set of columns that are covered by a secondary index on
+        // this table so we can check each WHERE column individually.
+        let indexed_columns: Vec<String> = snap
+            .indexes
+            .iter()
+            .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+            .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
+            .collect();
+
+        // A column is "covered" if it has a matching secondary index.
+        let all_where_columns_indexed = where_columns
+            .iter()
+            .all(|col| indexed_columns.iter().any(|ic| ic == col));
+
+        if !all_where_columns_indexed && !s.allow_filtering {
             return Err(CqlError::Invalid(
                 "Cannot execute this query as it might involve data filtering and \
                  thus may have unpredictable performance. If you want to execute \
@@ -787,8 +799,8 @@ fn route_select_user_table(
         // for index-accelerated lookups instead of full scan. For now, the
         // presence of a matching index allows the query without ALLOW FILTERING,
         // but execution still falls through to a full scan + post-filter.
-        if has_matching_index {
-            tracing::debug!(table = %s.table, "index exists for WHERE columns; full scan until index readers are wired");
+        if all_where_columns_indexed {
+            tracing::debug!(table = %s.table, "all WHERE columns indexed; full scan until index readers are wired");
         } else {
             tracing::warn!(table = %s.table, "executing full scan with ALLOW FILTERING");
         }
@@ -4293,6 +4305,168 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    // ── ALLOW FILTERING rejection: exact Cassandra semantics ─────────
+    //
+    // Cassandra requires ALLOW FILTERING when ANY WHERE column is not
+    // covered by the partition key or a secondary index.  The presence of
+    // an index on *some* WHERE columns does not exempt the remaining
+    // un-indexed columns from that requirement.
+    //
+    // The UAT test `single_allow_filtering_rejection` exposed a gap: when
+    // a table has an index on `email` and the query is
+    //   SELECT * WHERE email = 'x' AND name = 'Ada'   (no ALLOW FILTERING)
+    // Ferrosa was incorrectly accepting the query because `has_matching_index`
+    // was true for `email`, bypassing the check for the un-indexed `name`
+    // column.  Cassandra rejects this with "Cannot execute this query as it
+    // might involve data filtering…".
+
+    /// Non-indexed column in WHERE without ALLOW FILTERING must be rejected
+    /// even when another WHERE column IS indexed.  This was the gap caught by
+    /// the UAT run of 2026-03-17.
+    #[tokio::test]
+    async fn allow_filtering_required_for_non_indexed_where_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Setup: table with an index on `email` but NOT on `name`
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE af WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE af.users (id int PRIMARY KEY, name text, email text)",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Create an index on `email`
+        let stmt = crate::parser::parse("CREATE INDEX af_email_idx ON af.users (email)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert a row
+        let stmt = crate::parser::parse(
+            "INSERT INTO af.users (id, name, email) VALUES (1, 'Ada', 'ada@example.com')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Query: email is indexed but name is NOT — without ALLOW FILTERING
+        // this must be rejected because `name` requires a full-scan filter.
+        let stmt = crate::parser::parse(
+            "SELECT * FROM af.users WHERE email = 'ada@example.com' AND name = 'Ada'",
+        )
+        .unwrap();
+        match route(&state, &ctx, stmt).await {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("ALLOW FILTERING"),
+                    "error should mention ALLOW FILTERING, got: {msg}"
+                );
+            }
+            Ok(_) => panic!(
+                "WHERE on partially-indexed columns without ALLOW FILTERING should be rejected"
+            ),
+        }
+    }
+
+    /// Same query WITH ALLOW FILTERING must succeed and return the matching row.
+    #[tokio::test]
+    async fn allow_filtering_accepted_for_partially_indexed_where_with_flag() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE af2 WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE af2.users (id int PRIMARY KEY, name text, email text)",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE INDEX af2_email_idx ON af2.users (email)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO af2.users (id, name, email) VALUES (1, 'Ada', 'ada@example.com')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Same WHERE columns but WITH ALLOW FILTERING — must succeed.
+        let stmt = crate::parser::parse(
+            "SELECT * FROM af2.users WHERE email = 'ada@example.com' AND name = 'Ada' ALLOW FILTERING",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALLOW FILTERING should allow partially-indexed WHERE: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(count, 1, "should return the 1 matching row, got {count}");
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Querying on a fully-indexed column without ALLOW FILTERING must succeed.
+    /// This is the baseline: index present, no extra unindexed filter columns.
+    #[tokio::test]
+    async fn indexed_column_where_without_allow_filtering_succeeds() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE af3 WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE af3.users (id int PRIMARY KEY, name text, email text)",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE INDEX af3_email_idx ON af3.users (email)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO af3.users (id, name, email) VALUES (1, 'Ada', 'ada@example.com')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // All WHERE columns are indexed — no ALLOW FILTERING needed.
+        let stmt = crate::parser::parse("SELECT * FROM af3.users WHERE email = 'ada@example.com'")
+            .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "fully-indexed WHERE should not require ALLOW FILTERING: {:?}",
+            result.err()
+        );
     }
 
     // ── BUG-004: ORDER BY parsed but not executed ────────────────────
