@@ -571,27 +571,7 @@ impl ModeController {
                 }
 
                 // Send schema snapshot before mutation replay.
-                // SchemaSnapshot has HashMap<(String,String), _> which serde_json
-                // can't serialize (tuple keys aren't valid JSON keys). Use bincode-
-                // style workaround: serialize tables as a Vec of (key, value) pairs.
-                let snap = schema.snapshot();
-                let wire_snap = crate::pair::ddl::WireSchemaSnapshot::from_snapshot(&snap);
-                match serde_json::to_vec(&wire_snap) {
-                    Ok(json) => {
-                        match pm
-                            .send(
-                                peer_host_id,
-                                Message::PairSchemaSync(Bytes::from(json)),
-                                Lane::Bulk,
-                            )
-                            .await
-                        {
-                            Ok(_) => tracing::info!("schema snapshot sent to rejoined peer"),
-                            Err(e) => tracing::warn!(%e, "failed to send schema snapshot"),
-                        }
-                    }
-                    Err(e) => tracing::warn!(%e, "failed to serialize schema snapshot"),
-                }
+                send_schema_sync_to_peer(&pm, peer_host_id, &schema).await;
 
                 // Force sync commit log to disk before replay.
                 if let Err(e) = storage.force_commit_log_sync() {
@@ -622,6 +602,18 @@ impl ModeController {
                     Err(e) => tracing::warn!(%e, "catch-up replay_from failed"),
                 }
             });
+        } else if role == PairRole::Primary {
+            // Normal pair rejoin (no force-promote): primary sends schema snapshot so
+            // the secondary catches up on any schema changes made while it was offline.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let pm = peer_manager;
+                let schema = self.schema.clone();
+                handle.spawn(async move {
+                    // Wait for peer to complete its pair transition and register handlers.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    send_schema_sync_to_peer(&pm, peer_host_id, &schema).await;
+                });
+            }
         }
     }
 
@@ -1121,6 +1113,32 @@ impl InboundPeerCallback for ModeController {
                 self.trigger_cluster_join(host_id, addr);
             }
         }
+    }
+}
+
+/// Send the full schema snapshot to a peer over the bulk lane.
+///
+/// Used both after a force-promote rejoin (to sync schema + data replay) and
+/// after a normal pair reconnection (to catch up schema changes the secondary
+/// missed while it was offline).
+async fn send_schema_sync_to_peer(pm: &PeerManager, peer_host_id: Uuid, schema: &Schema) {
+    let snap = schema.snapshot();
+    let wire_snap = crate::pair::ddl::WireSchemaSnapshot::from_snapshot(&snap);
+    match serde_json::to_vec(&wire_snap) {
+        Ok(json) => {
+            match pm
+                .send(
+                    peer_host_id,
+                    Message::PairSchemaSync(Bytes::from(json)),
+                    Lane::Bulk,
+                )
+                .await
+            {
+                Ok(_) => tracing::info!("schema snapshot sent to rejoined peer"),
+                Err(e) => tracing::warn!(%e, "failed to send schema snapshot"),
+            }
+        }
+        Err(e) => tracing::warn!(%e, "failed to serialize schema snapshot"),
     }
 }
 
