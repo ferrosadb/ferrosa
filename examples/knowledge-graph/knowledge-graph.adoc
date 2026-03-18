@@ -1,0 +1,490 @@
+= Research Knowledge Graph
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+A research knowledge graph tracks the relationships between papers, authors, institutions, topics, and funding.
+These relationships are what make academic data valuable -- citation networks reveal influence, co-authorship reveals collaboration patterns, and funding links reveal the flow of resources through the research ecosystem.
+This tutorial builds a complete research knowledge graph in Ferrosa, querying it with both CQL and Cypher.
+
+NOTE: Complete the link:../cluster-setup.html[3-Node Cluster Setup] tutorial first.
+Your cluster must have `FERROSA_GRAPH_ENABLED=true` set (which our cluster-setup tutorial includes).
+
+== The Use Case
+
+University research offices, funding agencies, and academic publishers all need to answer relationship questions about scholarly output:
+
+* Which researchers collaborate across institutions?
+* What is the citation chain between two papers?
+* Which topics are covered by papers funded by a specific grant?
+* Who are the most influential researchers in a subfield, measured by transitive citation impact?
+* Which institutions share the most topic overlap?
+
+In a traditional Cassandra deployment, each of these questions requires multiple round trips and application-side join logic.
+A separate graph database (Neo4j, Neptune) adds ETL complexity and consistency headaches.
+Ferrosa eliminates both problems: the same CQL tables serve key-value lookups and graph traversals, with no data duplication.
+
+=== The data model
+
+Our knowledge graph has five entity types (vertices) and six relationship types (edges):
+
+[cols="1,2,2"]
+|===
+|Vertex |Description |Key properties
+
+|*Researcher*
+|An academic with publications and metrics
+|name, h_index, specializations (set), social_links (map)
+
+|*Institution*
+|A university or research lab
+|name, country, ranking, departments (set)
+
+|*Paper*
+|A published research paper
+|title, venue, year, citation_count, keywords (set), urls (map)
+
+|*Topic*
+|A research area or subfield
+|name, parent_topic, paper_count
+
+|*Grant*
+|A funding award
+|title, funder, amount (decimal), start_date, end_date
+|===
+
+[cols="1,2,2"]
+|===
+|Edge |Connects |Properties
+
+|*AUTHORED*
+|Researcher -> Paper
+|author_position, corresponding (boolean)
+
+|*CITES*
+|Paper -> Paper
+|context, section
+
+|*AFFILIATED_WITH*
+|Researcher -> Institution
+|department, role, start_year, end_year
+
+|*COVERS*
+|Paper -> Topic
+|relevance (float)
+
+|*FUNDED_BY*
+|Paper -> Grant
+|role
+
+|*COLLABORATES*
+|Researcher -> Researcher
+|paper_count, first_collab_year, last_collab_year
+|===
+
+== Schema Design
+
+Ferrosa's graph engine works on top of ordinary CQL tables.
+You annotate vertex tables with `graph.type: vertex` and edge tables with `graph.type: edge`, plus metadata that tells the engine how to resolve cross-table joins.
+
+=== Vertex tables
+
+Each vertex table has a single UUID primary key.
+The `graph.label` extension maps the CQL table to a Cypher label -- `MATCH (r:Researcher)` references the table with `graph.label = 'Researcher'`.
+
+This schema exercises several CQL data types: `uuid`, `text`, `int`, `float`, `decimal`, `date`, `timestamp`, `boolean`, `set<text>`, and `map<text, text>`.
+
+=== Edge tables
+
+Edge tables use a composite primary key of `(source_id, target_id)`.
+The `graph.source` and `graph.target` extensions tell the engine which columns hold the vertex UUIDs, and `graph.source_label` / `graph.target_label` resolve which vertex table each UUID belongs to.
+
+This design means CQL can efficiently answer "which papers did Alice author?" (partition key lookup on `source_id`), while the graph engine's reverse adjacency index also supports "who authored this paper?" without `ALLOW FILTERING`.
+
+=== Secondary indexes
+
+Secondary indexes on frequently queried columns (name, venue, year, country) enable CQL to filter without full table scans.
+Ferrosa's secondary indexes are backed by local token-range scans and the graph adjacency index, making them far more efficient than Cassandra's legacy secondary indexes.
+
+=== The full schema
+
+[source,sql]
+----
+include::schema.cql[]
+----
+
+== Loading Data
+
+Our sample dataset includes:
+
+* *10 researchers* across 4 institutions (MIT, Stanford, Oxford, ETH Zurich)
+* *4 institutions* with departments and metadata
+* *12 papers* with realistic titles in ML, distributed systems, NLP, computer vision, databases, and security
+* *6 topics* forming a hierarchy (NLP and Computer Vision are subtopics of Machine Learning)
+* *3 grants* from NSF, DARPA, and ERC
+* *30 authorship edges* (multiple authors per paper, with position and corresponding author flags)
+* *12 citation edges* (creating cycles and chains in the citation graph)
+* *11 affiliation edges* (including one cross-institutional: Alice was at Stanford before MIT)
+* *24 topic coverage edges* (with relevance scores)
+* *6 funding edges*
+* *11 collaboration edges*
+
+We use readable UUIDs with distinct prefixes so you can follow the data through queries:
+
+* Researchers: `11111111-0000-0000-0000-00000000000N`
+* Institutions: `22222222-0000-0000-0000-00000000000N`
+* Papers: `33333333-0000-0000-0000-00000000000N`
+* Topics: `44444444-0000-0000-0000-00000000000N`
+* Grants: `55555555-0000-0000-0000-00000000000N`
+
+In production you would use `uuid()` to generate them.
+
+[source,sql]
+----
+include::data.cql[]
+----
+
+== CQL Queries
+
+With the data loaded, CQL handles direct lookups and secondary index queries efficiently.
+This section exercises a broad range of CQL syntax: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `COUNT`, `LIMIT`, `ALLOW FILTERING`, `IF NOT EXISTS`, `USING TTL`, `USING TIMESTAMP`, collection operations on sets and maps, and multi-column `WHERE` clauses.
+
+=== What CQL handles well
+
+*Primary key lookups* are the fastest possible query -- single-partition, single-row:
+
+[source,sql]
+----
+SELECT name, h_index, specializations FROM researcher
+WHERE researcher_id = 11111111-0000-0000-0000-000000000001;
+----
+
+*Secondary index queries* scan the local token range efficiently:
+
+[source,sql]
+----
+SELECT title, year, citation_count FROM paper WHERE venue = 'NeurIPS';
+SELECT name, city, ranking FROM institution WHERE country = 'United States';
+----
+
+*Edge table lookups* use the partition key to find all relationships from a source:
+
+[source,sql]
+----
+SELECT target_id, author_position, corresponding FROM authored
+WHERE source_id = 11111111-0000-0000-0000-000000000001;
+----
+
+*Collection operations* let you add and remove elements from sets and maps in place:
+
+[source,sql]
+----
+UPDATE researcher SET specializations = specializations + {'Reinforcement Learning'}
+WHERE researcher_id = 11111111-0000-0000-0000-000000000001;
+
+UPDATE researcher SET social_links['linkedin'] = 'https://linkedin.com/in/alicechen'
+WHERE researcher_id = 11111111-0000-0000-0000-000000000001;
+----
+
+*Lightweight transactions* (LWT) provide conditional inserts:
+
+[source,sql]
+----
+INSERT INTO researcher (researcher_id, name, email, active)
+VALUES (11111111-0000-0000-0000-000000000099, 'New Researcher', 'new@test.com', true)
+IF NOT EXISTS;
+----
+
+=== Where CQL hits a wall
+
+These queries are impossible to express in a single CQL statement:
+
+* *Citation chains:* "What papers cite papers that cite this paper?" requires fetching each hop separately
+* *Cross-institution collaboration:* "Which researchers at MIT collaborate with researchers at Stanford?" requires joining three tables
+* *Topic overlap:* "Which topics are shared between two institutions?" requires a 4-hop traversal
+* *Path finding:* "What is the shortest collaboration chain from Alice to Jun?" is not expressible at all
+* *Mutual citations:* "Find papers that cite each other" requires a self-join on the cites table
+
+=== Full CQL query reference
+
+[source,sql]
+----
+include::queries.cql[]
+----
+
+== Cypher Graph Queries
+
+Ferrosa exposes a graph HTTP endpoint on port `7474`.
+The same data you inserted via CQL is immediately available for Cypher queries.
+No ETL. No sync delay. The graph index is updated asynchronously as CQL writes land.
+
+=== Basic node queries
+
+Find a researcher by name, returning scalar and collection properties:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (r:Researcher {name: \"Alice Chen\"}) RETURN r.name, r.h_index, r.specializations", "keyspace": "knowledge"}'
+----
+
+List all institutions ordered by ranking:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (i:Institution) RETURN i.name, i.country, i.ranking ORDER BY i.ranking", "keyspace": "knowledge"}'
+----
+
+=== Single-hop traversals
+
+Find all papers authored by a researcher:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (r:Researcher {name: \"Alice Chen\"})-[:AUTHORED]->(p:Paper) RETURN p.title, p.year, p.venue ORDER BY p.year DESC", "keyspace": "knowledge"}'
+----
+
+Find all researchers at MIT:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (r:Researcher)-[:AFFILIATED_WITH]->(i:Institution {name: \"MIT\"}) RETURN r.name, r.h_index, r.title ORDER BY r.h_index DESC", "keyspace": "knowledge"}'
+----
+
+=== Multi-hop traversals
+
+This is where the graph engine outperforms application-side joins.
+
+*Citation chains* -- trace influence through the literature, 2 hops deep:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (p1:Paper)-[:CITES]->(p2:Paper)-[:CITES]->(p3:Paper) RETURN p1.title AS citing, p2.title AS via, p3.title AS cited LIMIT 10", "keyspace": "knowledge"}'
+----
+
+*Researcher's topics via papers* -- traverse through authorship to topic coverage:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (r:Researcher {name: \"Alice Chen\"})-[:AUTHORED]->(p:Paper)-[:COVERS]->(t:Topic) RETURN DISTINCT t.name", "keyspace": "knowledge"}'
+----
+
+*Cross-institution collaborations* -- find researchers who collaborate across institutional boundaries:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (r1:Researcher)-[:AFFILIATED_WITH]->(i1:Institution), (r2:Researcher)-[:AFFILIATED_WITH]->(i2:Institution), (r1)-[:COLLABORATES]->(r2) WHERE i1.name <> i2.name RETURN r1.name, i1.name AS inst1, r2.name, i2.name AS inst2", "keyspace": "knowledge"}'
+----
+
+*Funding chain* -- trace the full path from funder through grant to paper to topic:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (p:Paper)-[:FUNDED_BY]->(g:Grant), (p)-[:COVERS]->(t:Topic) RETURN g.funder, g.title, p.title, t.name ORDER BY g.funder", "keyspace": "knowledge"}'
+----
+
+=== Path queries
+
+*Shortest path between researchers* -- find the shortest connection through any relationship type:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH path = shortestPath((a:Researcher {name: \"Alice Chen\"})-[*]-(b:Researcher {name: \"Eva Schmidt\"})) RETURN path", "keyspace": "knowledge"}'
+----
+
+*Shortest collaboration chain* -- restricted to COLLABORATES edges:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH path = shortestPath((a:Researcher {name: \"Alice Chen\"})-[:COLLABORATES*]-(b:Researcher {name: \"Jun Tanaka\"})) RETURN [n IN nodes(path) | n.name] AS chain", "keyspace": "knowledge"}'
+----
+
+*Citation depth traversal* -- follow citations up to 3 hops from a starting paper:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH path = (p:Paper)-[:CITES*1..3]->(end:Paper) WHERE p.title = \"Vision Transformers for Medical Image Segmentation\" RETURN [n IN nodes(path) | n.title] AS chain LIMIT 5", "keyspace": "knowledge"}'
+----
+
+=== Aggregation
+
+Cypher supports `COUNT`, `COLLECT`, `AVG`, `SUM`, and `SIZE` for graph-aware aggregations.
+
+*Papers per topic:*
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (p:Paper)-[:COVERS]->(t:Topic) RETURN t.name, COUNT(p) AS paper_count ORDER BY paper_count DESC", "keyspace": "knowledge"}'
+----
+
+*Institution publication count:*
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (r:Researcher)-[:AFFILIATED_WITH]->(i:Institution), (r)-[:AUTHORED]->(p:Paper) RETURN i.name, COUNT(DISTINCT p) AS papers ORDER BY papers DESC", "keyspace": "knowledge"}'
+----
+
+*Average citations per venue:*
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (p:Paper) RETURN p.venue, AVG(p.citation_count) AS avg_citations, COUNT(p) AS papers ORDER BY avg_citations DESC", "keyspace": "knowledge"}'
+----
+
+=== Run all queries as a test suite
+
+A bash script runs every Cypher query and verifies HTTP 200 responses:
+
+[source,bash]
+----
+include::cypher-queries.sh[]
+----
+
+== Advanced Analytics
+
+The real power of a knowledge graph emerges when you combine traversals with aggregation and filtering to answer complex analytical questions.
+
+=== Citation network analysis
+
+*Research influence* -- find all papers that cite papers authored by a specific researcher:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (r:Researcher {name: \"Alice Chen\"})-[:AUTHORED]->(p:Paper)<-[:CITES]-(citing:Paper) RETURN p.title AS original, citing.title AS cited_by", "keyspace": "knowledge"}'
+----
+
+*Mutual citations* -- detect papers that cite each other (potential self-citation rings):
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (a:Paper)-[:CITES]->(b:Paper)-[:CITES]->(a) RETURN a.title, b.title", "keyspace": "knowledge"}'
+----
+
+*Co-citation analysis* -- find papers frequently cited together, revealing hidden thematic links:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (p1:Paper)-[:CITES]->(common:Paper)<-[:CITES]-(p2:Paper) WHERE id(p1) < id(p2) RETURN p1.title, p2.title, common.title AS co_cited LIMIT 10", "keyspace": "knowledge"}'
+----
+
+=== Collaboration patterns
+
+*Collaboration network* -- list each researcher's collaborators:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (r:Researcher)-[:COLLABORATES]->(other:Researcher) RETURN r.name, COLLECT(other.name) AS collaborators ORDER BY SIZE(COLLECT(other.name)) DESC", "keyspace": "knowledge"}'
+----
+
+*Institution collaboration graph* -- aggregate individual collaborations into inter-institutional links:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (r1:Researcher)-[:AFFILIATED_WITH]->(i1:Institution), (r2:Researcher)-[:AFFILIATED_WITH]->(i2:Institution), (r1)-[:COLLABORATES]->(r2) WHERE i1.name < i2.name RETURN i1.name, i2.name, COUNT(*) AS collaboration_count", "keyspace": "knowledge"}'
+----
+
+*Topic-spanning researchers* -- find researchers who publish across multiple research areas:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (r:Researcher)-[:AUTHORED]->(p:Paper)-[:COVERS]->(t:Topic) WITH r, COLLECT(DISTINCT t.name) AS topics WHERE SIZE(topics) >= 2 RETURN r.name, topics ORDER BY SIZE(topics) DESC", "keyspace": "knowledge"}'
+----
+
+=== Topic clustering and overlap
+
+*Topic overlap between institutions* -- find shared research interests:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (i1:Institution {name: \"MIT\"})<-[:AFFILIATED_WITH]-(r1:Researcher)-[:AUTHORED]->(p1:Paper)-[:COVERS]->(t:Topic)<-[:COVERS]-(p2:Paper)<-[:AUTHORED]-(r2:Researcher)-[:AFFILIATED_WITH]->(i2:Institution {name: \"Stanford\"}) RETURN DISTINCT t.name AS shared_topic", "keyspace": "knowledge"}'
+----
+
+*Topic expertise by institution* -- break down each institution's publication focus:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (i:Institution)<-[:AFFILIATED_WITH]-(r:Researcher)-[:AUTHORED]->(p:Paper)-[:COVERS]->(t:Topic) RETURN i.name, t.name, COUNT(DISTINCT p) AS papers ORDER BY i.name, papers DESC", "keyspace": "knowledge"}'
+----
+
+=== Funding impact
+
+*Unfunded highly-cited papers* -- identify impactful research that was not grant-funded:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (p:Paper) WHERE p.citation_count > 50 AND NOT (p)-[:FUNDED_BY]->(:Grant) RETURN p.title, p.citation_count ORDER BY p.citation_count DESC", "keyspace": "knowledge"}'
+----
+
+*Research pipeline* -- trace the full funding-to-outcome pipeline using WITH chaining:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (g:Grant)<-[:FUNDED_BY]-(p:Paper)-[:COVERS]->(t:Topic) WITH g, COLLECT(DISTINCT t.name) AS topics, COUNT(DISTINCT p) AS papers RETURN g.title, g.funder, papers, topics", "keyspace": "knowledge"}'
+----
+
+== What You Learned
+
+In this tutorial you:
+
+. *Designed a research knowledge graph schema* with 5 vertex types and 6 edge types, using `WITH extensions` to annotate standard CQL tables for graph traversal.
+. *Loaded rich sample data* covering 10 researchers, 4 institutions, 12 papers, 6 topics, and 3 grants -- all with realistic relationships and properties spanning multiple CQL data types (uuid, text, int, float, decimal, date, timestamp, boolean, set, map).
+. *Queried with CQL* using primary key lookups, secondary indexes, collection operations, lightweight transactions, TTL, explicit timestamps, and `ALLOW FILTERING` -- and saw where CQL's single-table model breaks down for relationship queries.
+. *Queried with Cypher* using node matching, relationship traversals (1-hop, 2-hop, N-hop), `shortestPath`, variable-length patterns, `WHERE` predicates, `ORDER BY`, `LIMIT`, and aggregation functions (`COUNT`, `COLLECT`, `AVG`, `SIZE`).
+. *Analyzed citation networks* to detect influence chains, mutual citations, and co-citation patterns.
+. *Mapped collaboration patterns* across institutions, identifying topic-spanning researchers and inter-institutional research links.
+. *Traced funding impact* from grant to paper to topic, finding both funded and unfunded high-impact research.
+
+The core insight: *same data, two query paradigms.* CQL for speed and scale. Cypher for relationships and patterns. No data duplication. No separate database. No ETL.
+
+=== Next steps
+
+* Read the link:../cypher.html[Cypher Reference] for the full query language supported by Ferrosa's graph engine
+* Try the link:../graph-joins/graph-joins.html[Graph Joins & Traversals] tutorial for a social network variant with fraud detection
+* Explore link:../content-personalization/content-personalization.html[Content Personalization] to build a recommendation pipeline

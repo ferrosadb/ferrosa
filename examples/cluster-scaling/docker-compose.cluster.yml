@@ -1,0 +1,45 @@
+# docker-compose.cluster.yml — Phase 3: Add node3 in Raft cluster mode
+# Run with: docker compose -f docker-compose.yml -f docker-compose.pair.yml -f docker-compose.cluster.yml up -d
+#
+# Node1 and node2 stay as-is — they transition to cluster mode automatically
+# when node3 connects with cluster mode. This avoids recreating containers.
+
+services:
+
+  # ── Node 3 (Raft cluster mode) ──
+  node3:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      node1:
+        condition: service_healthy
+    ports:
+      - "9044:9042"    # CQL
+      - "9092:9090"    # Web console
+    environment:
+      FERROSA_HOST_ID: cc333333-3333-3333-3333-333333333333
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: 0.0.0.0:9042
+      FERROSA_WEB_BIND: 0.0.0.0:9090
+      FERROSA_CLUSTER_NAME: ferrosa-scaling-demo
+      FERROSA_CLUSTER_MODE: cluster
+      FERROSA_SEED: node1:7000
+      FERROSA_GRAPH_ENABLED: "true"
+
+      FERROSA_S3_ENDPOINT: http://rustfs:9000
+      FERROSA_S3_BUCKET: ferrosa
+      FERROSA_S3_REGION: us-east-1
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_PREFIX: node3
+    volumes:
+      - node3-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s

@@ -1,0 +1,250 @@
+= Real-Time Analytics
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Build a financial market data analytics platform.
+Ingest stock price ticks, compute aggregates, and power live dashboards -- all on your Ferrosa cluster.
+
+NOTE: Complete the <<cluster-setup.adoc#,3-Node Cluster Setup>> tutorial first, or have a running Ferrosa cluster accessible on `localhost:9042`.
+
+== The Use Case
+
+=== A financial market data platform
+
+You are building the backend for a financial data platform -- think a simplified Bloomberg terminal or a stock tracking application.
+The system needs to handle three things:
+
+* *Ingest raw price ticks.* Every time a stock trades on an exchange, you receive a tick containing the symbol, price, volume, and timestamp. During market hours, popular stocks like AAPL can generate hundreds of ticks per second. Across thousands of listed securities, you are looking at tens of thousands of writes per second.
+* *Serve historical data.* Traders and analysts need to view price history for any stock over any time window -- the last 5 minutes, the last hour, or the entire trading day.
+* *Power live dashboards.* Charting tools display OHLC candles (Open, High, Low, Close) at various intervals -- 1-minute, 5-minute, hourly. These aggregations need to be fast because charts refresh in real time.
+
+This workload is overwhelmingly write-heavy during market hours.
+A relational database with traditional indexes would fall behind on ingestion.
+And computing OHLC aggregates on the fly from raw ticks -- potentially millions of rows -- would make dashboard queries unacceptably slow.
+
+The solution is a two-table approach: store the raw ticks for history, and maintain pre-computed candle aggregations for dashboards.
+Ferrosa handles both write patterns effortlessly because every write is a fast append to the commit log.
+
+== Design the Schema
+
+=== Create the keyspace
+
+[source,sql]
+----
+include::schema.cql[lines=1..4]
+----
+
+We use `SimpleStrategy` with replication factor 3, just like the IoT tutorial.
+Every piece of market data is stored on all three nodes in your cluster.
+
+=== The raw ticks table
+
+This table stores every individual trade as it happens.
+It is the source of truth for price history.
+
+[source,sql]
+----
+include::schema.cql[lines=8..16]
+----
+
+There is something new here compared to the IoT tutorial: a *composite partition key*.
+Notice the double parentheses around `(symbol, trade_date)`.
+That means _both_ the symbol and the date together form the partition key.
+
+Why not just use `symbol` as the partition key?
+Because a single stock can generate millions of ticks per year.
+If all of AAPL's ticks went into one partition, that partition would grow without bound.
+By including `trade_date` in the partition key, each partition holds exactly one stock's ticks for one day.
+A busy stock might generate 50,000 ticks in a day -- a very manageable partition size.
+
+The tradeoff is that every query must specify both `symbol` and `trade_date`.
+For a financial application, this is natural -- you almost always look at one stock on one day.
+
+[cols="1,1,3"]
+|===
+| Column | Type | Purpose
+
+| `symbol` | `text` | Stock ticker (e.g., "AAPL", "GOOGL")
+| `trade_date` | `date` | Trading day -- part of partition key for bucketing
+| `trade_time` | `timestamp` | Exact time of the trade, down to the millisecond
+| `price` | `decimal` | Trade price (decimal avoids floating-point errors)
+| `volume` | `bigint` | Number of shares in this trade
+| `exchange` | `text` | Which exchange executed the trade (NYSE, NASDAQ)
+|===
+
+TIP: *Why `decimal` for prices?* Financial applications should never use `float` or `double` for money. Floating-point arithmetic can produce rounding errors -- for example, `0.1 + 0.2` equals `0.30000000000000004` in most languages. The `decimal` type stores exact values, just like your calculator would.
+
+=== The OHLC candles table
+
+OHLC stands for Open, High, Low, Close -- the four prices that define a candle on a stock chart.
+Each candle summarizes all the trades in a time interval (typically 1 minute, 5 minutes, or 1 hour).
+
+Computing these from raw ticks on every dashboard refresh would be far too slow.
+Instead, your application computes them as ticks arrive and writes the results to a pre-aggregated table:
+
+[source,sql]
+----
+include::schema.cql[lines=18..28]
+----
+
+This table uses the same composite partition key pattern as the ticks table: `(symbol, candle_date)`.
+A full trading day has 390 one-minute candles (6.5 hours of market time), so each partition is tiny -- just 390 rows.
+Dashboard queries return instantly.
+
+=== The daily summary table
+
+Let's also create a daily summary table for end-of-day reports:
+
+[source,sql]
+----
+include::schema.cql[lines=30..41]
+----
+
+The `vwap` column stands for Volume Weighted Average Price -- a common metric traders use to assess whether they got a good fill price.
+With `symbol` as the partition key and `trade_date` as the clustering key, you can query any stock's daily history across multiple days in a single read.
+
+== Insert Sample Data
+
+=== Insert raw ticks
+
+Let's simulate a morning of trading.
+We will insert ticks for three stocks: AAPL, GOOGL, and MSFT.
+In production, these would arrive from a market data feed at thousands per second.
+Here we will insert them manually to see the data shape.
+
+[source,sql]
+----
+include::data.cql[]
+----
+
+=== Insert OHLC candles
+
+In production, your application would compute these candles from the raw ticks in real time.
+Here, we will insert them directly.
+Each candle summarizes one minute of trading.
+
+=== Insert daily summaries
+
+The daily summaries provide end-of-day aggregate data for multi-day analysis.
+
+== Query Patterns
+
+=== Get the latest trades for a stock
+
+A trader wants to see what just happened with AAPL.
+This query returns the 10 most recent ticks for today:
+
+[source,sql]
+----
+SELECT trade_time, price, volume, exchange
+FROM ticks
+WHERE symbol = 'AAPL'
+  AND trade_date = '2024-06-15'
+LIMIT 10;
+----
+
+Because the partition key is `(symbol, trade_date)`, Ferrosa knows exactly which partition to read.
+And because we used `CLUSTERING ORDER BY (trade_time DESC)`, the newest ticks come first without any sorting overhead.
+
+=== Price history for a time window
+
+An analyst wants to see all AAPL trades during the first two minutes of trading:
+
+[source,sql]
+----
+SELECT trade_time, price, volume, exchange
+FROM ticks
+WHERE symbol = 'AAPL'
+  AND trade_date = '2024-06-15'
+  AND trade_time >= '2024-06-15 09:30:00'
+  AND trade_time <= '2024-06-15 09:32:00';
+----
+
+The clustering key (`trade_time`) supports range queries natively.
+Ferrosa seeks directly to the start of the range and reads forward.
+No index scan, no sort -- just a sequential read of the data that is already stored in order.
+
+=== OHLC candles for charting
+
+A charting library on the frontend needs 1-minute candle data to draw a candlestick chart.
+This is the query that powers the chart:
+
+[source,sql]
+----
+SELECT candle_time, open_price, high_price, low_price, close_price, volume
+FROM candles_1m
+WHERE symbol = 'AAPL'
+  AND candle_date = '2024-06-15';
+----
+
+This returns all candles for AAPL on June 15th, newest first.
+A full trading day has 390 candles -- small enough to send to the frontend in a single response.
+The chart renders instantly because the data is already aggregated.
+
+=== Compare candles across stocks
+
+Want to compare the first three minutes of AAPL and MSFT?
+Run the same candle query for each symbol.
+In your application, you would execute these in parallel:
+
+[source,sql]
+----
+-- AAPL candles
+SELECT candle_time, open_price, close_price, volume
+FROM candles_1m
+WHERE symbol = 'AAPL'
+  AND candle_date = '2024-06-15';
+
+-- MSFT candles
+SELECT candle_time, open_price, close_price, volume
+FROM candles_1m
+WHERE symbol = 'MSFT'
+  AND candle_date = '2024-06-15';
+----
+
+Each query hits a different partition, so they can run concurrently on different nodes.
+This is one of the strengths of the Cassandra data model -- queries that touch different partitions scale horizontally by nature.
+
+=== Volume analysis
+
+Which minutes had the most trading volume for MSFT?
+Query the candle data and sort by volume in your application, or simply look at the `volume` column:
+
+[source,sql]
+----
+SELECT candle_time, volume, trade_count
+FROM candles_1m
+WHERE symbol = 'MSFT'
+  AND candle_date = '2024-06-15';
+----
+
+The first minute of trading (09:30) typically has the highest volume as overnight orders fill -- and our sample data reflects that pattern with 73,300 shares traded.
+
+=== Multi-day price history
+
+For longer-term analysis, query the daily summary table.
+Because `symbol` is the partition key and `trade_date` is the clustering key, you can pull a stock's entire history in one query:
+
+[source,sql]
+----
+SELECT trade_date, open_price, close_price, total_volume, vwap
+FROM daily_summary
+WHERE symbol = 'AAPL';
+----
+
+This returns every daily summary for AAPL, newest first.
+Add a `LIMIT` clause if you only need the last few days.
+
+== What You Learned
+
+You have built a complete market data analytics backend.
+Here is what you practiced:
+
+* *Composite partition keys for bounded partitions.* Using `(symbol, trade_date)` as the partition key keeps each partition to one stock's ticks for one day. Partitions stay small and predictable, even as the total dataset grows to billions of rows.
+* *Pre-computed aggregations for fast dashboards.* Instead of computing OHLC candles from raw ticks on every query, you maintain a `candles_1m` table with pre-aggregated data. This is the "write more, read fast" philosophy of the Cassandra data model.
+* *Multiple tables for multiple access patterns.* Raw ticks for detailed history, 1-minute candles for charts, daily summaries for reports -- three tables serving three different query patterns, all from the same underlying data.
+* *Using `decimal` for financial data.* Floating-point types introduce rounding errors that are unacceptable in finance. The `decimal` type stores exact values.
+* *Descending clustering order for "latest first" queries.* By sorting newest trades first on disk, the most common query pattern -- "show me what just happened" -- reads the first few rows of the partition with zero sorting overhead.
+
+Next, try the <<ecommerce.adoc#,E-Commerce Platform>> tutorial to learn about collection types, denormalized query tables, and the update/delete patterns used in shopping cart and order workflows.

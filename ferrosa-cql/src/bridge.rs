@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use num_bigint::BigInt;
 
 use crate::ast::{CqlTypeName, Term};
 use crate::error::CqlError;
@@ -50,6 +51,14 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             }
             CqlType::Timestamp => Ok(CqlValue::Timestamp(*n)),
             CqlType::Counter => Ok(CqlValue::Counter(*n)),
+            CqlType::Varint => Ok(CqlValue::Varint(BigInt::from(*n))),
+            CqlType::Decimal => {
+                // Integer literal as decimal: scale 0, unscaled = the integer value
+                Ok(CqlValue::Decimal {
+                    scale: 0,
+                    unscaled: BigInt::from(*n),
+                })
+            }
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got integer literal",
                 cql_type_name(target)
@@ -65,6 +74,24 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 Ok(CqlValue::Float(f32_val.to_bits()))
             }
             CqlType::Double => Ok(CqlValue::Double(f.to_bits())),
+            CqlType::Decimal => {
+                // Convert float literal to decimal via string roundtrip to preserve
+                // user-visible precision (avoids binary floating-point artifacts).
+                let s = format!("{}", f);
+                let (unscaled, scale) = if let Some(dot_pos) = s.find('.') {
+                    let decimals = &s[dot_pos + 1..];
+                    let scale = decimals.len() as i32;
+                    let digits: String = s.chars().filter(|c| *c != '.').collect();
+                    let unscaled = digits
+                        .parse::<i128>()
+                        .map(BigInt::from)
+                        .unwrap_or_else(|_| BigInt::from(0));
+                    (unscaled, scale)
+                } else {
+                    (BigInt::from(*f as i64), 0)
+                };
+                Ok(CqlValue::Decimal { scale, unscaled })
+            }
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got float literal",
                 cql_type_name(target)
@@ -79,6 +106,61 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     .parse()
                     .map_err(|e| CqlError::Invalid(format!("invalid inet address: {e}")))?;
                 Ok(CqlValue::Inet(addr))
+            }
+            CqlType::Timestamp => {
+                // Parse timestamps in all common CQL/ISO formats
+                let ms = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                    dt.timestamp_millis()
+                } else if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z") {
+                    dt.timestamp_millis()
+                } else if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%z")
+                {
+                    dt.timestamp_millis()
+                } else if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                {
+                    dt.and_utc().timestamp_millis()
+                } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                {
+                    dt.and_utc().timestamp_millis()
+                } else if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+                {
+                    dt.and_utc().timestamp_millis()
+                } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+                {
+                    dt.and_utc().timestamp_millis()
+                } else if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                    d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis()
+                } else {
+                    return Err(CqlError::Invalid(format!(
+                        "cannot parse timestamp from string: {s}"
+                    )));
+                };
+                Ok(CqlValue::Timestamp(ms))
+            }
+            CqlType::Date => {
+                // Parse ISO date: "2024-01-15"
+                // CQL date is days since epoch (1970-01-01), stored as u32 with 2^31 offset
+                let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .map_err(|e| CqlError::Invalid(format!("cannot parse date: {e}")))?;
+                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                let days = (d - epoch).num_days();
+                // CQL date encoding: days since epoch + 2^31 (to make it unsigned/sortable)
+                let encoded = (days + (1i64 << 31)) as u32;
+                Ok(CqlValue::Date(encoded))
+            }
+            CqlType::Time => {
+                // Parse time: "10:30:00" or "10:30:00.123456789"
+                // CQL time is nanoseconds since midnight
+                let t = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+                    .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M:%S"))
+                    .map_err(|e| CqlError::Invalid(format!("cannot parse time: {e}")))?;
+                let nanos = t
+                    .signed_duration_since(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                    .num_nanoseconds()
+                    .unwrap_or(0);
+                Ok(CqlValue::Time(nanos))
             }
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got string literal",
@@ -200,9 +282,25 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             "IN list not supported in this context".into(),
         )),
 
-        Term::FunctionCall { .. } => Err(CqlError::Invalid(
-            "function calls in values not yet implemented".into(),
-        )),
+        Term::FunctionCall { name, args, .. } => {
+            match name.to_lowercase().as_str() {
+                "uuid" if args.is_empty() => Ok(CqlValue::Uuid(uuid::Uuid::new_v4())),
+                "now" if args.is_empty() => {
+                    // timeuuid-like: use current timestamp
+                    Ok(CqlValue::Timestamp(chrono::Utc::now().timestamp_millis()))
+                }
+                "totimestamp" if args.len() == 1 => {
+                    // Convert argument to timestamp
+                    let inner = term_to_cql_value(&args[0], &CqlType::Timestamp)?;
+                    Ok(inner)
+                }
+                "todate" if args.len() == 1 => {
+                    let inner = term_to_cql_value(&args[0], &CqlType::Date)?;
+                    Ok(inner)
+                }
+                _ => Err(CqlError::Invalid(format!("unknown function: {name}"))),
+            }
+        }
     }
 }
 

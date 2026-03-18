@@ -107,6 +107,33 @@ impl DdlOperation {
 }
 
 // ---------------------------------------------------------------------------
+// DdlEnvelope
+// ---------------------------------------------------------------------------
+
+/// Envelope carrying a DDL operation plus a primary-generated schema version.
+///
+/// The primary generates the UUID when applying DDL. The secondary receives
+/// the same UUID so both nodes converge on identical schema versions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DdlEnvelope {
+    pub op: DdlOperation,
+    pub schema_version: Uuid,
+}
+
+impl DdlEnvelope {
+    pub fn to_bytes(&self) -> Result<Bytes> {
+        serde_json::to_vec(self)
+            .map(Bytes::from)
+            .map_err(|e| ClusterError::Internal(format!("DdlEnvelope serialize: {e}")))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| ClusterError::Internal(format!("DdlEnvelope deserialize: {e}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DdlCoordinator
 // ---------------------------------------------------------------------------
 
@@ -117,7 +144,7 @@ impl DdlOperation {
 pub struct DdlCoordinator {
     role: Arc<ArcSwap<PairRole>>,
     peer_host_id: Uuid,
-    schema: Arc<Schema>,
+    pub(crate) schema: Arc<Schema>,
     engine: Arc<StorageEngine>,
     peer_manager: Arc<PeerManager>,
 }
@@ -140,11 +167,20 @@ impl DdlCoordinator {
     }
 
     /// Route a DDL operation based on current role.
+    ///
+    /// On the primary: applies DDL locally first, then best-effort
+    /// replicates to the secondary. If replication fails, the DDL
+    /// still succeeds — the secondary will catch up via schema sync
+    /// when it reconnects.
     pub async fn coordinate_ddl(&self, op: DdlOperation) -> Result<()> {
         match **self.role.load() {
             PairRole::Primary => {
                 self.apply_ddl_locally(&op)?;
-                self.replicate_ddl(&op).await?;
+                let version = Uuid::new_v4();
+                self.schema.set_schema_version(version);
+                if let Err(e) = self.replicate_ddl(&op, version).await {
+                    tracing::warn!("pair DDL replication failed (applied locally): {e}");
+                }
                 Ok(())
             }
             PairRole::Secondary => self.forward_ddl(&op).await,
@@ -299,8 +335,16 @@ impl DdlCoordinator {
 
     /// Send a DDL operation to the peer (as primary replicating to secondary)
     /// and wait for ACK.
-    pub(crate) async fn replicate_ddl(&self, op: &DdlOperation) -> Result<()> {
-        let body = op.to_bytes()?;
+    pub(crate) async fn replicate_ddl(
+        &self,
+        op: &DdlOperation,
+        schema_version: Uuid,
+    ) -> Result<()> {
+        let envelope = DdlEnvelope {
+            op: op.clone(),
+            schema_version,
+        };
+        let body = envelope.to_bytes()?;
         let resp = self
             .peer_manager
             .send(self.peer_host_id, Message::PairDdlForward(body), Lane::Data)
@@ -367,26 +411,41 @@ impl RpcHandler for PairDdlForwardHandler {
             _ => return None,
         };
 
-        let op = match DdlOperation::from_bytes(&body) {
-            Ok(op) => op,
-            Err(e) => {
-                tracing::error!("failed to decode PairDdlForward: {e}");
-                return None;
-            }
+        // Try DdlEnvelope first, fall back to bare DdlOperation.
+        let (op, schema_version) = match DdlEnvelope::from_bytes(&body) {
+            Ok(env) => (env.op, Some(env.schema_version)),
+            Err(_) => match DdlOperation::from_bytes(&body) {
+                Ok(op) => (op, None),
+                Err(e) => {
+                    tracing::error!("failed to decode PairDdlForward: {e}");
+                    return None;
+                }
+            },
         };
 
         let result = match **self.role.load() {
             PairRole::Primary => {
-                // Forwarded DDL from secondary: apply + replicate back
+                // Forwarded DDL from secondary: apply locally + best-effort replicate
                 if let Err(e) = self.coordinator.apply_ddl_locally(&op) {
                     tracing::error!("failed to apply forwarded DDL: {e}");
                     return None;
                 }
-                self.coordinator.replicate_ddl(&op).await
+                let version = Uuid::new_v4();
+                self.coordinator.schema.set_schema_version(version);
+                if let Err(e) = self.coordinator.replicate_ddl(&op, version).await {
+                    tracing::warn!("pair DDL replication-back failed (applied locally): {e}");
+                }
+                Ok(())
             }
             PairRole::Secondary => {
-                // Replicated DDL from primary: apply locally only
-                self.coordinator.apply_ddl_locally(&op)
+                // Replicated DDL from primary: apply + set version
+                let res = self.coordinator.apply_ddl_locally(&op);
+                if res.is_ok() {
+                    if let Some(v) = schema_version {
+                        self.coordinator.schema.set_schema_version(v);
+                    }
+                }
+                res
             }
         };
 

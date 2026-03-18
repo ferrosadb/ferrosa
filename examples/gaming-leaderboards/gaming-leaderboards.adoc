@@ -1,0 +1,162 @@
+= Gaming Leaderboards
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Build a multiplayer game backend.
+Track player stats, maintain real-time leaderboards, record match history, and manage in-game inventories.
+
+NOTE: This tutorial assumes you have a running 3-node Ferrosa cluster.
+If you haven't set one up yet, follow the link:../cluster-setup.html[3-Node Cluster Setup] guide first -- it only takes about 5 minutes.
+
+== Create the Keyspace
+
+Gaming backends need low latency above all else.
+When a player finishes a match, they want to see the leaderboard update immediately -- not wait for a cache refresh.
+Let's create a keyspace with full replication.
+
+With RF=3, player profiles and leaderboards survive any single node failure.
+Players stay in the game even during maintenance windows.
+
+== Design the Schema
+
+A multiplayer game backend needs to answer four questions fast: Who is this player?
+What happened in a match?
+How did this player do over time?
+Who is at the top of the leaderboard?
+One table for each.
+
+=== Players
+
+The player profile: identity, progression, and lifetime stats.
+This table gets read every time a player logs in or another player inspects their profile.
+
+=== Matches
+
+The global match log.
+We partition by `game_mode` and cluster by `started_at` descending so you can efficiently pull up the most recent matches in each mode.
+
+=== Player Matches
+
+Each player's personal match history with their individual performance stats.
+This is the "Match History" tab on a player's profile.
+
+=== Leaderboard
+
+The ranked leaderboard for each game mode.
+Pre-sorted by rank so the "Top 10" query is a simple range read with no sorting required.
+
+TIP: We denormalize the `username` into the leaderboard table.
+This means we can render the entire leaderboard in a single query without joining to the players table.
+If a player changes their display name, you update it in both places -- a small price for fast reads.
+
+Four tables, each tailored for a specific game screen.
+
+The full schema (keyspace and tables):
+
+[source,sql]
+----
+include::schema.cql[]
+----
+
+== Register Players
+
+Let's create five players at various skill levels.
+In a real game, these profiles would be created during account registration and updated after every match.
+
+PixelQueen is the veteran here -- level 55 with a 2.34 K/D ratio.
+Ironclad is still working their way up.
+A well-designed game backend makes every player's journey visible and motivating.
+
+== Record Matches
+
+Let's record ten matches across two game modes.
+The `players` list stores usernames for quick display, and `winner_id` records who took the victory.
+
+Ten matches -- five ranked, five casual.
+PixelQueen and StarBreaker are dominating tonight.
+Notice how the `list` type stores the player roster for each match.
+
+== Track Per-Player Match Stats
+
+Every player gets their own match history with individual performance stats.
+This is the data behind the "Match History" screen.
+
+Twenty player-match records across five players.
+PixelQueen's 28-kill game at 19:00 stands out -- that is the kind of performance that puts you at the top of the leaderboard.
+
+== Build the Leaderboard
+
+The leaderboard is a materialized view of player rankings.
+In production, a game server would recompute rankings after each match and update this table.
+For now, let's insert the current standings directly.
+
+PixelQueen leads ranked, but StarBreaker takes the top spot in casual.
+
+All data (players, matches, player match stats, and leaderboard):
+
+[source,sql]
+----
+include::data.cql[]
+----
+
+== Run Game Queries
+
+Here are the queries that power the different screens in your game client.
+
+=== Player Profile
+
+The first thing a player sees when they open the game.
+One partition read, sub-millisecond response.
+
+=== Match History
+
+A player's recent performance.
+The descending clustering order means the most recent matches appear first.
+
+=== Leaderboard Top 10
+
+The query everyone cares about.
+Because rank is the clustering key, this is a simple range read -- no sorting needed.
+
+=== Recent Matches by Game Mode
+
+Show what is happening in the game right now.
+Great for a "Live Matches" or "Recent Activity" feed.
+
+=== Player Stats Overview
+
+Calculate a quick win rate from the profile data.
+This is the kind of stat that appears on loading screens and profile cards.
+
+=== Update Stats After a Match
+
+After each match, the game server updates the player's profile.
+Here is what that looks like for a player who just won.
+
+IMPORTANT: In production, you would also update the leaderboard table whenever a player's score changes enough to affect rankings.
+Some games recompute the full leaderboard periodically (every few minutes), while others update it in real time after each match.
+The best approach depends on your game's scale and how competitive the ranking needs to feel.
+
+All queries (selects and updates):
+
+[source,sql]
+----
+include::queries.cql[]
+----
+
+== What You Learned
+
+You just built the data layer for a multiplayer game. Here is what you accomplished:
+
+* Designed a *player profile* table for sub-millisecond identity lookups
+* Built a *match history* table with per-player performance tracking using descending time order
+* Created a *pre-ranked leaderboard* partitioned by game mode for instant top-10 queries
+* Used *CQL collection types* (lists) to store variable-length player rosters in match records
+* Modeled *denormalized data* across tables to serve each game screen with a single partition read
+* Wrote *update queries* that a game server would run after each match to keep stats current
+
+This architecture is used by real game studios.
+The key principle is the same one that runs through every Ferrosa tutorial: design your tables around your queries, not the other way around.
+Each screen in the game client maps to exactly one table and one partition read.
+That is how you keep latency low even with millions of concurrent players.

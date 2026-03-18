@@ -165,16 +165,16 @@ fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
     buf.put_u16(cql_type.type_id());
     match cql_type {
         CqlType::List(elem) | CqlType::Set(elem) => {
-            buf.put_u16(elem.type_id());
+            encode_type(buf, elem);
         }
         CqlType::Map(key, val) => {
-            buf.put_u16(key.type_id());
-            buf.put_u16(val.type_id());
+            encode_type(buf, key);
+            encode_type(buf, val);
         }
         CqlType::Tuple(types) => {
             buf.put_u16(types.len() as u16);
             for t in types {
-                buf.put_u16(t.type_id());
+                encode_type(buf, t);
             }
         }
         // All simple types: type_id alone is sufficient.

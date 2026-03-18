@@ -257,10 +257,20 @@ impl Schema {
                 .or_insert_with(|| grants.clone());
         }
 
-        current.version = Uuid::new_v4();
         self.inner.store(Arc::new(current));
         tracing::info!("applied schema snapshot");
         Ok(())
+    }
+
+    /// Set the schema snapshot version to a specific UUID.
+    ///
+    /// Used by the Raft state machine to apply the leader-generated version
+    /// so all nodes converge on the same schema version.
+    pub fn set_schema_version(&self, version: Uuid) {
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        snap.version = version;
+        self.inner.store(Arc::new(snap));
     }
 
     /// Create a keyspace without auth checks. Idempotent — succeeds silently
@@ -273,7 +283,6 @@ impl Schema {
             return Ok(());
         }
         snap.keyspaces.insert(ks.name.clone(), ks);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -289,7 +298,6 @@ impl Schema {
             return Ok(());
         }
         snap.tables.insert(key, table);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -301,7 +309,6 @@ impl Schema {
         let mut snap = (**self.inner.load()).clone();
         snap.keyspaces.remove(name);
         snap.tables.retain(|(ks, _), _| ks != name);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -313,7 +320,6 @@ impl Schema {
         let mut snap = (**self.inner.load()).clone();
         snap.tables
             .remove(&(keyspace.to_string(), table.to_string()));
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -336,7 +342,6 @@ impl Schema {
         if let Some(durable_writes) = updates.durable_writes {
             ks.durable_writes = durable_writes;
         }
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -369,7 +374,6 @@ impl Schema {
                 tbl.extensions.insert(k, v);
             }
         }
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -383,7 +387,6 @@ impl Schema {
             return Ok(());
         }
         snap.roles.insert(role.name.clone(), role);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -412,7 +415,6 @@ impl Schema {
         if let Some(member_of) = updates.member_of {
             role.member_of = member_of;
         }
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -425,7 +427,6 @@ impl Schema {
         let mut snap = (**self.inner.load()).clone();
         snap.roles.remove(name);
         snap.grants.remove(name);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -444,7 +445,6 @@ impl Schema {
         } else {
             grants.push(entry);
         }
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -469,7 +469,6 @@ impl Schema {
                 snap.grants.remove(role);
             }
         }
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -549,7 +548,6 @@ impl Schema {
                 if let Some(r) = new_snap.roles.get_mut(username) {
                     if let Ok(new_hash) = self.hasher_config.hash_password(password) {
                         r.salted_hash = Some(new_hash);
-                        new_snap.version = Uuid::new_v4();
                         self.inner.store(Arc::new(new_snap));
                         self.emit_audit(AuditEventKind::PasswordChanged {
                             role: username.to_string(),
@@ -667,19 +665,27 @@ impl Schema {
                     // Validate source_label and target_label reference vertex tables
                     for label_key in &["graph.source_label", "graph.target_label"] {
                         let label = &extensions[*label_key];
-                        let ref_key = (ks.to_string(), label.clone());
-                        match snap.tables.get(&ref_key) {
+                        // Find table by graph.label extension, not by table name
+                        let ref_table = snap.tables.iter().find(|((k, _), meta)| {
+                            k == ks
+                                && meta
+                                    .extensions
+                                    .get("graph.label")
+                                    .map(|l| l.eq_ignore_ascii_case(label))
+                                    .unwrap_or(false)
+                        });
+                        match ref_table {
                             None => {
                                 return Err(SchemaError::InvalidSchema(format!(
-                                    "edge table {ks}.{table_name}: {label_key} references non-existent table '{label}'"
+                                    "edge table {ks}.{table_name}: {label_key} references non-existent vertex label '{label}'"
                                 )));
                             }
-                            Some(ref_table) => {
-                                if ref_table.extensions.get("graph.type")
+                            Some((_, ref_meta)) => {
+                                if ref_meta.extensions.get("graph.type")
                                     != Some(&"vertex".to_string())
                                 {
                                     return Err(SchemaError::InvalidSchema(format!(
-                                        "edge table {ks}.{table_name}: {label_key} references table '{label}' which is not a vertex table"
+                                        "edge table {ks}.{table_name}: {label_key} references label '{label}' which is not a vertex"
                                     )));
                                 }
                             }
@@ -988,7 +994,6 @@ impl Schema {
             index.name.clone(),
         );
         snap.indexes.entry(key).or_insert(index);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1007,7 +1012,6 @@ impl Schema {
         let mut snap = (*self.inner.load_full()).clone();
         snap.indexes
             .remove(&(keyspace.to_string(), table.to_string(), name.to_string()));
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1278,7 +1282,6 @@ impl Schema {
             return Err(SchemaError::KeyspaceNotFound(udt.keyspace.clone()));
         }
         snap.types.insert(key, udt.clone());
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1295,7 +1298,6 @@ impl Schema {
             ));
         }
         snap.types.remove(&key);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1390,7 +1392,6 @@ impl Schema {
             return Err(SchemaError::KeyspaceNotFound(func.keyspace.clone()));
         }
         snap.functions.insert(key, func.clone());
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1412,7 +1413,6 @@ impl Schema {
             ));
         }
         snap.functions.remove(&key);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1452,7 +1452,6 @@ impl Schema {
             return Err(SchemaError::KeyspaceNotFound(agg.keyspace.clone()));
         }
         snap.aggregates.insert(key, agg.clone());
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -1474,7 +1473,6 @@ impl Schema {
             ));
         }
         snap.aggregates.remove(&key);
-        snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -2229,6 +2227,9 @@ mod tests {
         vertex
             .extensions
             .insert("graph.type".to_string(), "vertex".to_string());
+        vertex
+            .extensions
+            .insert("graph.label".to_string(), "person".to_string());
         schema.create_table(vertex, &auth).unwrap();
 
         // Try to create an edge that references a non-existent vertex table
@@ -2245,7 +2246,7 @@ mod tests {
             .insert("graph.target_label".to_string(), "nonexistent".to_string());
         let result = schema.create_table(edge, &auth);
         assert!(
-            matches!(result, Err(SchemaError::InvalidSchema(ref msg)) if msg.contains("non-existent table"))
+            matches!(result, Err(SchemaError::InvalidSchema(ref msg)) if msg.contains("non-existent vertex label"))
         );
     }
 
@@ -2262,12 +2263,18 @@ mod tests {
         person
             .extensions
             .insert("graph.type".to_string(), "vertex".to_string());
+        person
+            .extensions
+            .insert("graph.label".to_string(), "person".to_string());
         schema.create_table(person, &auth).unwrap();
 
         let mut company = test_table("graph_ks3", "company");
         company
             .extensions
             .insert("graph.type".to_string(), "vertex".to_string());
+        company
+            .extensions
+            .insert("graph.label".to_string(), "company".to_string());
         schema.create_table(company, &auth).unwrap();
 
         // Create a valid edge table

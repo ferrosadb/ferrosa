@@ -1,0 +1,298 @@
+= Messaging & Chat
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Build a real-time messaging backend that stores billions of messages, retrieves conversation history instantly, and scales horizontally.
+
+NOTE: This tutorial assumes you have a running Ferrosa cluster. If you haven't set one up yet, follow the <<cluster-setup.adoc#,3-Node Cluster Setup>> guide first. You should be able to connect with `cqlsh` before continuing.
+
+== Create the Keyspace
+
+Every project in Ferrosa starts with a keyspace.
+Think of it as a namespace that groups your tables together and tells Ferrosa how many copies of your data to keep.
+
+Open your `cqlsh` session and run:
+
+[source,sql]
+----
+include::schema.cql[lines=1..2]
+----
+
+Setting `replication_factor` to 3 means every piece of data is stored on three nodes.
+If one node goes down, you still have two copies.
+That is what gives you durability without thinking about it.
+
+== Design the Schema
+
+A chat system has three core concepts: conversations, messages, and a per-user list of conversations.
+We will create one table for each.
+In Ferrosa, you model your tables around the queries you need to run -- not around abstract relationships.
+
+=== Conversations table
+
+This table stores metadata about each conversation: its name, when it was created, who is in it, and whether it is a group chat or a direct message.
+
+[source,sql]
+----
+include::schema.cql[lines=6..12]
+----
+
+Because the primary key is just `conversation_id`, each conversation lives on a single partition.
+Lookups by ID are lightning fast -- a single-partition read.
+
+=== Messages table
+
+This is where the actual chat messages live.
+The partition key is `conversation_id`, so all messages in a conversation are stored together.
+The clustering column `message_id` is a `timeuuid`, which keeps messages sorted by time automatically.
+
+[source,sql]
+----
+include::schema.cql[lines=14..21]
+----
+
+TIP: *Why DESC?* Chat apps almost always show the newest messages first. By clustering in descending order, Ferrosa returns the most recent messages without any extra sorting step.
+
+=== User conversations table
+
+This table powers the "inbox" view -- the list of conversations for a given user, sorted by the most recent message.
+Each user gets their own partition, and conversations within that partition are ordered by `last_message_at`.
+
+[source,sql]
+----
+include::schema.cql[lines=23..30]
+----
+
+Before we move on, here is a summary of how the tables relate to each other:
+
+[cols="1,1,1,2"]
+|===
+| Table | Partition Key | Clustering Key | Serves
+
+| `conversations` | `conversation_id` | -- | Metadata lookup by ID
+| `messages` | `conversation_id` | `message_id DESC` | Message history, newest first
+| `user_conversations` | `user_id` | `last_message_at DESC` | Inbox view, most active first
+|===
+
+Each table is designed around a specific screen in your app.
+That is the key insight of data modeling in Ferrosa: one table per query pattern.
+
+== Populate with Sample Data
+
+=== Create two conversations
+
+First, a direct message between Alice and Bob, and a group chat for a project team.
+
+=== Insert messages
+
+Let's add a realistic conversation between Alice and Bob, and team discussion in the Project Phoenix group chat.
+The data includes fixed timeuuids so the results are reproducible.
+
+[source,sql]
+----
+include::data.cql[]
+----
+
+== Query Your Data
+
+=== Fetch recent messages in a conversation
+
+The most common query in any chat app: "show me the last N messages."
+Because we used `CLUSTERING ORDER BY (message_id DESC)`, the newest messages come first automatically:
+
+[source,sql]
+----
+SELECT sender, body, message_type
+FROM messages
+WHERE conversation_id = 550e8400-e29b-41d4-a716-446655440001
+LIMIT 5;
+----
+
+This returns the five most recent messages in the Alice/Bob DM.
+Ferrosa reads them directly off a single partition -- no index scan, no join.
+Fast, every time.
+
+=== List a user's conversations
+
+To show Alice her inbox, sorted by most recent activity:
+
+[source,sql]
+----
+SELECT conversation_name, last_message_at, unread_count
+FROM user_conversations
+WHERE user_id = 'alice';
+----
+
+Because we partitioned on `user_id` and clustered by `last_message_at DESC`, this returns conversations with the freshest ones at the top -- exactly what you need for an inbox.
+
+=== Get conversation details
+
+When a user taps on a conversation, you need its metadata -- who is in it, when it was created:
+
+[source,sql]
+----
+SELECT name, created_at, participants, is_group
+FROM conversations
+WHERE conversation_id = 550e8400-e29b-41d4-a716-446655440002;
+----
+
+Single-partition read by primary key.
+This will return in under a millisecond on a healthy cluster.
+
+=== Paginate through older messages
+
+In a real chat app, users scroll up to load older messages.
+You can paginate with the `message_id` clustering key.
+After loading the first batch, use the last `message_id` you received as a cursor:
+
+[source,sql]
+----
+-- First page: the 5 newest messages
+SELECT message_id, sender, body
+FROM messages
+WHERE conversation_id = 550e8400-e29b-41d4-a716-446655440002
+LIMIT 5;
+
+-- Next page: messages older than the last one you received
+-- Replace the timeuuid below with the last message_id from your results
+SELECT message_id, sender, body
+FROM messages
+WHERE conversation_id = 550e8400-e29b-41d4-a716-446655440002
+  AND message_id < b4f4a940-e29b-11ef-8001-000000000004
+LIMIT 5;
+----
+
+This cursor-based pagination is efficient at any depth.
+Whether you are loading page 2 or page 200, Ferrosa seeks directly to the right position in the partition -- no offset scanning.
+
+=== Count messages in a conversation
+
+Need a quick count for a UI badge or analytics?
+Use `COUNT`:
+
+[source,sql]
+----
+SELECT COUNT(*)
+FROM messages
+WHERE conversation_id = 550e8400-e29b-41d4-a716-446655440001;
+----
+
+IMPORTANT: This scans the entire partition, so it works well for conversations with thousands of messages. For conversations with millions of messages, maintain a counter in your application layer instead.
+
+=== Update the unread count
+
+When Bob sends a new message, you need to bump Alice's unread count.
+In CQL, you delete the old row and insert a new one with the updated timestamp (since `last_message_at` is part of the primary key):
+
+[source,sql]
+----
+-- Remove the stale entry
+DELETE FROM user_conversations
+WHERE user_id = 'alice'
+  AND last_message_at = '2026-03-15 12:05:00+0000'
+  AND conversation_id = 550e8400-e29b-41d4-a716-446655440001;
+
+-- Insert the updated entry with the new timestamp
+INSERT INTO user_conversations (user_id, last_message_at, conversation_id, conversation_name, unread_count)
+VALUES ('alice', '2026-03-15 12:10:00+0000',
+    550e8400-e29b-41d4-a716-446655440001, 'Alice & Bob', 2);
+----
+
+NOTE: *Why delete then insert?* Since `last_message_at` is part of the clustering key, you cannot update it in place. The delete-then-insert pattern is standard for moving a row's position within a partition. Both operations go to the same partition, so it is fast.
+
+=== Mark a conversation as read
+
+When Alice opens the conversation, set unread_count to zero:
+
+[source,sql]
+----
+DELETE FROM user_conversations
+WHERE user_id = 'alice'
+  AND last_message_at = '2026-03-15 12:10:00+0000'
+  AND conversation_id = 550e8400-e29b-41d4-a716-446655440001;
+
+INSERT INTO user_conversations (user_id, last_message_at, conversation_id, conversation_name, unread_count)
+VALUES ('alice', '2026-03-15 12:10:00+0000',
+    550e8400-e29b-41d4-a716-446655440001, 'Alice & Bob', 0);
+----
+
+Let's verify it worked:
+
+[source,sql]
+----
+SELECT conversation_name, unread_count
+FROM user_conversations
+WHERE user_id = 'alice';
+----
+
+=== Send a new message
+
+Sending a message is just an INSERT.
+Use `now()` to auto-generate a timeuuid:
+
+[source,sql]
+----
+INSERT INTO messages (conversation_id, message_id, sender, body, message_type)
+VALUES (
+    550e8400-e29b-41d4-a716-446655440001,
+    now(),
+    'bob',
+    'On my way — grabbing coffee first.',
+    'text'
+);
+----
+
+The `now()` function creates a timeuuid based on the current time, so the message slots into the right chronological position automatically.
+
+=== List all group conversations
+
+If you need to find group conversations specifically, query the `conversations` table.
+Since `is_group` is not part of the primary key, you will need `ALLOW FILTERING` for small datasets, or a dedicated table in production:
+
+[source,sql]
+----
+SELECT conversation_id, name, participants
+FROM conversations
+WHERE is_group = true
+ALLOW FILTERING;
+----
+
+TIP: `ALLOW FILTERING` works fine when you have a handful of conversations in your tutorial dataset. In production with millions of conversations, you would create a separate `group_conversations` table. The golden rule in Ferrosa: if you query it often, give it its own table.
+
+=== Add a participant to a group
+
+Ferrosa's `set` type supports in-place additions.
+To add a new member to the Project Phoenix group:
+
+[source,sql]
+----
+UPDATE conversations
+SET participants = participants + {'eve'}
+WHERE conversation_id = 550e8400-e29b-41d4-a716-446655440002;
+----
+
+Verify that Eve was added:
+
+[source,sql]
+----
+SELECT name, participants
+FROM conversations
+WHERE conversation_id = 550e8400-e29b-41d4-a716-446655440002;
+----
+
+The `set` type automatically deduplicates -- if you add `'eve'` again, nothing changes.
+And because sets are stored sorted, they are efficient for both reads and writes.
+
+== What You Learned
+
+You just built the core data layer for a messaging app.
+Here is what you practiced:
+
+* *Partition design for conversations.* By partitioning messages on `conversation_id`, all messages in a conversation live together on the same nodes. Fetching a conversation is always a single-partition read, no matter how many conversations exist in the system.
+* *Clustering for time-ordered data.* Using `timeuuid` with `DESC` ordering means you get chronological sorting for free. No `ORDER BY`, no sorting step, no performance penalty.
+* *Denormalization for query performance.* The `user_conversations` table duplicates some data from `conversations`, but that duplication lets you serve the inbox view from a single read. In distributed databases, this trade-off is almost always worth it.
+* *The delete-then-insert pattern.* When a clustering key value needs to change, you remove the old row and write a new one. Both operations hit the same partition, keeping things fast.
+* *Collection types.* The `set<text>` type for participants gives you a built-in, deduplicated list of members with no extra tables needed.
+
+From here, you could extend this schema with message reactions (a `map<text, int>` column), read receipts (a separate table partitioned by `conversation_id`), or file attachments (store the URL and metadata as additional columns on `messages`).

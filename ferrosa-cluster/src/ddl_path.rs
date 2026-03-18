@@ -17,7 +17,7 @@ use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::{ClusterError, Result};
 use crate::pair::ddl::{DdlCoordinator, DdlOperation};
-use crate::raft::{FerrosRaft, RaftCommand};
+use crate::raft::{FerrosRaft, RaftCommand, RaftOp};
 
 /// The active DDL path. Swapped atomically via `ArcSwap` when
 /// the deployment mode changes (standalone → pair → cluster).
@@ -265,6 +265,7 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &StorageEngine) -> R
                 .map_err(|e| ClusterError::Internal(format!("drop_aggregate: {e}")))?;
         }
     }
+    schema.set_schema_version(Uuid::new_v4());
     Ok(())
 }
 
@@ -304,69 +305,74 @@ async fn forward_ddl_to_leader(
 // ---------------------------------------------------------------------------
 
 /// Convert a [`DdlOperation`] to the equivalent [`RaftCommand`].
+///
+/// The leader generates a fresh `schema_version` UUID here so that all
+/// followers replicate exactly the same version after applying the log entry.
 fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
-    match op {
-        DdlOperation::CreateKeyspace(ks) => RaftCommand::CreateKeyspace(ks),
-        DdlOperation::DropKeyspace(name) => RaftCommand::DropKeyspace(name),
-        DdlOperation::CreateTable(table) => RaftCommand::CreateTable(table),
-        DdlOperation::DropTable { keyspace, table } => RaftCommand::DropTable { keyspace, table },
-        DdlOperation::AlterKeyspace { name, updates } => {
-            RaftCommand::AlterKeyspace { name, updates }
-        }
+    let raft_op = match op {
+        DdlOperation::CreateKeyspace(ks) => RaftOp::CreateKeyspace(ks),
+        DdlOperation::DropKeyspace(name) => RaftOp::DropKeyspace(name),
+        DdlOperation::CreateTable(table) => RaftOp::CreateTable(table),
+        DdlOperation::DropTable { keyspace, table } => RaftOp::DropTable { keyspace, table },
+        DdlOperation::AlterKeyspace { name, updates } => RaftOp::AlterKeyspace { name, updates },
         DdlOperation::AlterTable {
             keyspace,
             table,
             updates,
-        } => RaftCommand::AlterTable {
+        } => RaftOp::AlterTable {
             keyspace,
             table,
             updates,
         },
-        DdlOperation::CreateRole(role) => RaftCommand::CreateRole(role),
-        DdlOperation::AlterRole { name, updates } => RaftCommand::AlterRole { name, updates },
-        DdlOperation::DropRole(name) => RaftCommand::DropRole(name),
-        DdlOperation::Grant(entry) => RaftCommand::Grant(entry),
+        DdlOperation::CreateRole(role) => RaftOp::CreateRole(role),
+        DdlOperation::AlterRole { name, updates } => RaftOp::AlterRole { name, updates },
+        DdlOperation::DropRole(name) => RaftOp::DropRole(name),
+        DdlOperation::Grant(entry) => RaftOp::Grant(entry),
         DdlOperation::Revoke {
             role,
             resource,
             permission,
-        } => RaftCommand::Revoke {
+        } => RaftOp::Revoke {
             role,
             resource,
             permission,
         },
-        DdlOperation::CreateIndex(idx) => RaftCommand::CreateIndex(idx),
+        DdlOperation::CreateIndex(idx) => RaftOp::CreateIndex(idx),
         DdlOperation::DropIndex {
             keyspace,
             table,
             index,
-        } => RaftCommand::DropIndex {
+        } => RaftOp::DropIndex {
             keyspace,
             table,
             index,
         },
-        DdlOperation::CreateType(udt) => RaftCommand::CreateType(udt),
-        DdlOperation::DropType { keyspace, name } => RaftCommand::DropType { keyspace, name },
-        DdlOperation::CreateFunction(func) => RaftCommand::CreateFunction(func),
+        DdlOperation::CreateType(udt) => RaftOp::CreateType(udt),
+        DdlOperation::DropType { keyspace, name } => RaftOp::DropType { keyspace, name },
+        DdlOperation::CreateFunction(func) => RaftOp::CreateFunction(func),
         DdlOperation::DropFunction {
             keyspace,
             name,
             arg_types,
-        } => RaftCommand::DropFunction {
+        } => RaftOp::DropFunction {
             keyspace,
             name,
             arg_types,
         },
-        DdlOperation::CreateAggregate(agg) => RaftCommand::CreateAggregate(agg),
+        DdlOperation::CreateAggregate(agg) => RaftOp::CreateAggregate(agg),
         DdlOperation::DropAggregate {
             keyspace,
             name,
             arg_types,
-        } => RaftCommand::DropAggregate {
+        } => RaftOp::DropAggregate {
             keyspace,
             name,
             arg_types,
         },
+    };
+    RaftCommand {
+        op: raft_op,
+        schema_version: Uuid::new_v4(),
     }
 }
 
@@ -633,8 +639,8 @@ mod tests {
         let ks = simple_keyspace("raft_ks");
         let op = DdlOperation::CreateKeyspace(ks);
         let cmd = ddl_op_to_raft_command(op);
-        match cmd {
-            RaftCommand::CreateKeyspace(ks) => assert_eq!(ks.name, "raft_ks"),
+        match cmd.op {
+            RaftOp::CreateKeyspace(ks) => assert_eq!(ks.name, "raft_ks"),
             other => panic!("expected CreateKeyspace, got {other:?}"),
         }
     }
@@ -644,8 +650,8 @@ mod tests {
         let table = simple_table("ks", "tbl");
         let op = DdlOperation::CreateTable(Box::new(table));
         let cmd = ddl_op_to_raft_command(op);
-        match cmd {
-            RaftCommand::CreateTable(t) => {
+        match cmd.op {
+            RaftOp::CreateTable(t) => {
                 assert_eq!(t.keyspace, "ks");
                 assert_eq!(t.name, "tbl");
             }
@@ -657,7 +663,7 @@ mod tests {
     fn ddl_op_to_raft_command_drop_keyspace() {
         let op = DdlOperation::DropKeyspace("bye_ks".into());
         let cmd = ddl_op_to_raft_command(op);
-        assert!(matches!(cmd, RaftCommand::DropKeyspace(ref n) if n == "bye_ks"));
+        assert!(matches!(cmd.op, RaftOp::DropKeyspace(ref n) if n == "bye_ks"));
     }
 
     #[test]
@@ -668,8 +674,8 @@ mod tests {
         };
         let cmd = ddl_op_to_raft_command(op);
         assert!(matches!(
-            cmd,
-            RaftCommand::DropTable {
+            cmd.op,
+            RaftOp::DropTable {
                 ref keyspace,
                 ref table
             } if keyspace == "ks" && table == "tbl"

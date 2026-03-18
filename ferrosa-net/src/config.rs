@@ -47,7 +47,7 @@ impl Default for NetConfig {
             psk: None,
             heartbeat_interval: Duration::from_millis(500),
             heartbeat_timeout: Duration::from_millis(1500),
-            max_connections: 100,
+            max_connections: 512,
             handshake_timeout: Duration::from_secs(5),
             max_frame_body_size: 256 * 1024 * 1024, // 256 MiB
             max_streams_per_lane: 128,
@@ -140,7 +140,7 @@ mod tests {
         assert_eq!(cfg.bind_addr, "0.0.0.0:7000".parse().unwrap());
         assert_eq!(cfg.cluster_name, "ferrosa");
         assert!(cfg.psk.is_none());
-        assert_eq!(cfg.max_connections, 100);
+        assert_eq!(cfg.max_connections, 512);
         assert_eq!(cfg.max_frame_body_size, 256 * 1024 * 1024);
         assert_eq!(cfg.max_streams_per_lane, 128);
         assert_eq!(cfg.heartbeat_interval, Duration::from_millis(500));

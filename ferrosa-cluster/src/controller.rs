@@ -49,7 +49,7 @@ use crate::raft::handlers::{
 use crate::raft::log_store::SledLogStore;
 use crate::raft::network::FerrosRaftNetworkFactory;
 use crate::raft::state_machine::FerrosStateMachine;
-use crate::raft::{uuid_to_node_id, FerrosRaft, NodeInfo, NodeState, RaftCommand};
+use crate::raft::{uuid_to_node_id, FerrosRaft, NodeInfo, NodeState, RaftCommand, RaftOp};
 use crate::ring::TokenRing;
 use crate::state::{PairClusterState, RaftClusterState};
 use crate::write_path::WritePath;
@@ -312,15 +312,21 @@ impl ModeController {
             state: NodeState::Normal,
         };
 
-        let join_cmd = RaftCommand::JoinNode(node_info);
+        let join_cmd = RaftCommand {
+            op: RaftOp::JoinNode(node_info),
+            schema_version: Uuid::new_v4(),
+        };
         raft.client_write(join_cmd)
             .await
             .map_err(|e| ClusterError::RaftError(format!("JoinNode proposal failed: {e}")))?;
 
         // Propose AssignTokens via Raft.
-        let assign_cmd = RaftCommand::AssignTokens {
-            node_id: peer_node_id,
-            tokens,
+        let assign_cmd = RaftCommand {
+            op: RaftOp::AssignTokens {
+                node_id: peer_node_id,
+                tokens,
+            },
+            schema_version: Uuid::new_v4(),
         };
         raft.client_write(assign_cmd)
             .await
@@ -353,7 +359,10 @@ impl ModeController {
 
         // 1. Propose LeaveNode via Raft — this removes the node from membership
         //    and cleans up its tokens in the state machine.
-        let leave_cmd = RaftCommand::LeaveNode { node_id };
+        let leave_cmd = RaftCommand {
+            op: RaftOp::LeaveNode { node_id },
+            schema_version: Uuid::new_v4(),
+        };
         raft.client_write(leave_cmd)
             .await
             .map_err(|e| ClusterError::RaftError(format!("LeaveNode proposal failed: {e}")))?;
@@ -436,8 +445,11 @@ impl ModeController {
         };
 
         // If this node was force-promoted, override UUID election — stay primary.
+        // If transitioning from standalone, this node is the authoritative source
+        // of data and must be primary regardless of UUID ordering.
         let was_promoted = self.force_promoted.swap(false, Ordering::AcqRel);
-        let role = if was_promoted {
+        let current_mode = **self.mode.load();
+        let role = if was_promoted || current_mode == DeploymentMode::Standalone {
             PairRole::Primary
         } else {
             PairRole::elect(self.local_host_id, peer_host_id)
@@ -654,7 +666,7 @@ impl ModeController {
         };
 
         // 2. Create state machine from current schema
-        let state_machine =
+        let mut state_machine =
             FerrosStateMachine::with_side_effects(self.schema.clone(), self.storage.clone());
 
         // 3. Create network factory
@@ -724,6 +736,26 @@ impl ModeController {
         }
 
         let ring_arc = Arc::new(ArcSwap::from_pointee(ring));
+
+        // Seed the state machine with the initial topology so that
+        // sync_ring() won't overwrite the ring with empty state.
+        {
+            let mut members = std::collections::BTreeMap::new();
+            let mut token_map = std::collections::BTreeMap::new();
+            let ring_snap = ring_arc.load();
+            for &nid in &all_node_ids {
+                if let Some(info) = ring_snap.get_node(nid) {
+                    members.insert(nid, info.clone());
+                }
+            }
+            for &nid in &all_node_ids {
+                for tok in ring_snap.tokens_for_node(nid) {
+                    token_map.insert(tok, nid);
+                }
+            }
+            state_machine.seed_topology(members, token_map);
+            state_machine.set_ring(ring_arc.clone());
+        }
 
         // Expose the live ring snapshot for observability (web API, CLI).
         // We capture a snapshot of the ring at this point; it will be updated
@@ -957,7 +989,10 @@ impl ModeController {
                 state: NodeState::Normal,
             };
 
-            let join_cmd = RaftCommand::JoinNode(node_info);
+            let join_cmd = RaftCommand {
+                op: RaftOp::JoinNode(node_info),
+                schema_version: Uuid::new_v4(),
+            };
             if let Err(e) = raft.client_write(join_cmd).await {
                 tracing::warn!(peer = %host_id, %e, "JoinNode proposal failed");
                 return;
@@ -969,9 +1004,12 @@ impl ModeController {
                 .map(|i| generate_deterministic_token(peer_node_id, i))
                 .collect();
 
-            let assign_cmd = RaftCommand::AssignTokens {
-                node_id: peer_node_id,
-                tokens,
+            let assign_cmd = RaftCommand {
+                op: RaftOp::AssignTokens {
+                    node_id: peer_node_id,
+                    tokens,
+                },
+                schema_version: Uuid::new_v4(),
             };
             if let Err(e) = raft.client_write(assign_cmd).await {
                 tracing::warn!(peer = %host_id, %e, "AssignTokens proposal failed");

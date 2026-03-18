@@ -14,6 +14,7 @@ use ferrosa_sstable::types::Row;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::{Mutation, TableId};
 
+use crate::consistency::ConsistencyLevel;
 use crate::coordinator::ClusterCoordinator;
 use crate::pair::coordinator::PairCoordinator;
 
@@ -57,12 +58,16 @@ impl WritePath {
     /// Write a row. In standalone mode this goes directly to storage.
     /// In pair mode this goes through the PairCoordinator which handles
     /// replication (primary) or forwarding (secondary).
+    /// In cluster mode the client's consistency level and keyspace RF are
+    /// forwarded to the coordinator for proper CL enforcement.
     pub async fn write(
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
         row: Row,
         timestamp: i64,
+        cl: ConsistencyLevel,
+        rf: usize,
     ) -> ferrosa_common::Result<()> {
         match self {
             Self::Direct(engine) => engine.write(table_id, key, row, timestamp),
@@ -83,7 +88,7 @@ impl WritePath {
                     .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}")))
             }
             Self::Cluster(coordinator) => coordinator
-                .coordinate_write(table_id, key, row, timestamp)
+                .coordinate_write_with(table_id, key, row, timestamp, cl, rf)
                 .await
                 .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
         }
@@ -146,7 +151,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
 
-        WritePath::write(&wp, &table_id, &key, row, 1000)
+        WritePath::write(&wp, &table_id, &key, row, 1000, ConsistencyLevel::One, 1)
             .await
             .unwrap();
 

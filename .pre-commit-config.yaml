@@ -98,7 +98,7 @@ repos:
     rev: v2.3.0
     hooks:
       - id: codespell
-        args: ["-L", "crate,ratatui,ser,trough,wit"]
+        args: ["-L", "crate,ratatui,rouge,ser,trough,wit"]
         exclude: '(node_modules/|package-lock\.json|\.lock$|cassandra/)'
 
   # ===========================================================================
@@ -136,16 +136,16 @@ repos:
         stages: [commit-msg]
 
   # ===========================================================================
-  # Pre-push: Rust tests + docs
+  # Pre-push: Smart tests (changed crates + dependents) + examples + docs
   # ===========================================================================
   - repo: local
     hooks:
-      - id: cargo-test-ferrosa
-        name: cargo test (ferrosa)
+      - id: pre-push-tests
+        name: cargo test (changed crates + dependents) + example tests
         stages: [pre-push]
-        entry: cargo test --all-features --workspace
+        entry: bash scripts/pre-push-tests.sh
         language: system
-        files: \.rs$
+        always_run: true
         pass_filenames: false
 
       - id: cargo-doc-ferrosa

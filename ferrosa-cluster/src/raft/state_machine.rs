@@ -32,7 +32,7 @@ use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
 use crate::config::ClusterConfig;
-use crate::raft::{FerrosRaftConfig, NodeInfo, RaftCommand, RaftResponse, Token};
+use crate::raft::{FerrosRaftConfig, NodeInfo, RaftCommand, RaftOp, RaftResponse, Token};
 use crate::ring::TokenRing;
 
 // ---------------------------------------------------------------------------
@@ -151,6 +151,21 @@ impl FerrosStateMachine {
         self.ring = Some(ring);
     }
 
+    /// Seed the state machine with initial cluster topology.
+    ///
+    /// Called during `transition_to_cluster` so that the state machine's
+    /// internal `members` and `token_map` match the initial `TokenRing`.
+    /// Without this, the first `sync_ring()` call would rebuild from empty
+    /// state, wiping the ring that the coordinator is using.
+    pub fn seed_topology(
+        &mut self,
+        members: BTreeMap<u64, NodeInfo>,
+        token_map: BTreeMap<Token, u64>,
+    ) {
+        self.state.members = members;
+        self.state.token_map = token_map;
+    }
+
     /// Read-only access to the current cluster state.
     pub fn state(&self) -> &RaftState {
         &self.state
@@ -181,9 +196,10 @@ impl FerrosStateMachine {
     /// Apply a single [`RaftCommand`] to `self.state`, updating BTreeMaps
     /// and optionally propagating side effects.
     fn apply_command(&mut self, cmd: RaftCommand) -> RaftResponse {
-        match cmd {
+        let RaftCommand { op, schema_version } = cmd;
+        match op {
             // ---- DDL: Keyspaces ----------------------------------------
-            RaftCommand::CreateKeyspace(ks) => {
+            RaftOp::CreateKeyspace(ks) => {
                 self.state
                     .keyspaces
                     .entry(ks.name.clone())
@@ -192,7 +208,7 @@ impl FerrosStateMachine {
                     let _ = schema.create_keyspace_internal(ks);
                 }
             }
-            RaftCommand::DropKeyspace(name) => {
+            RaftOp::DropKeyspace(name) => {
                 self.state.keyspaces.remove(&name);
                 // Collect tables to drop for engine unregistration.
                 let dropped_tables: Vec<(String, String)> = self
@@ -220,7 +236,7 @@ impl FerrosStateMachine {
                     }
                 }
             }
-            RaftCommand::AlterKeyspace { name, updates } => {
+            RaftOp::AlterKeyspace { name, updates } => {
                 if let Some(ks) = self.state.keyspaces.get_mut(&name) {
                     if let Some(replication) = &updates.replication {
                         ks.replication = replication.clone();
@@ -235,7 +251,7 @@ impl FerrosStateMachine {
             }
 
             // ---- DDL: Tables -------------------------------------------
-            RaftCommand::CreateTable(table) => {
+            RaftOp::CreateTable(table) => {
                 let key = (table.keyspace.clone(), table.name.clone());
                 self.state
                     .tables
@@ -248,7 +264,7 @@ impl FerrosStateMachine {
                     let _ = engine.register_table(table.to_storage_schema());
                 }
             }
-            RaftCommand::DropTable { keyspace, table } => {
+            RaftOp::DropTable { keyspace, table } => {
                 self.state.tables.remove(&(keyspace.clone(), table.clone()));
                 // Also drop indexes on this table.
                 self.state
@@ -262,7 +278,7 @@ impl FerrosStateMachine {
                     let _ = engine.unregister_table(&tid);
                 }
             }
-            RaftCommand::AlterTable {
+            RaftOp::AlterTable {
                 keyspace,
                 table,
                 updates,
@@ -293,7 +309,7 @@ impl FerrosStateMachine {
             }
 
             // ---- DDL: Indexes ------------------------------------------
-            RaftCommand::CreateIndex(index) => {
+            RaftOp::CreateIndex(index) => {
                 let key = (
                     index.keyspace.clone(),
                     index.table.clone(),
@@ -307,7 +323,7 @@ impl FerrosStateMachine {
                     let _ = schema.create_index_internal(index);
                 }
             }
-            RaftCommand::DropIndex {
+            RaftOp::DropIndex {
                 keyspace,
                 table,
                 index,
@@ -321,14 +337,14 @@ impl FerrosStateMachine {
             }
 
             // ---- DDL: User-Defined Types -------------------------------
-            RaftCommand::CreateType(udt) => {
+            RaftOp::CreateType(udt) => {
                 let key = (udt.keyspace.clone(), udt.name.clone());
                 self.state.types.entry(key).or_insert_with(|| udt.clone());
                 if let Some(schema) = &self.schema {
                     let _ = schema.create_type_internal(&udt);
                 }
             }
-            RaftCommand::DropType { keyspace, name } => {
+            RaftOp::DropType { keyspace, name } => {
                 self.state.types.remove(&(keyspace.clone(), name.clone()));
                 if let Some(schema) = &self.schema {
                     let _ = schema.drop_type_internal(&keyspace, &name);
@@ -336,7 +352,7 @@ impl FerrosStateMachine {
             }
 
             // ---- DDL: User-Defined Functions ---------------------------
-            RaftCommand::CreateFunction(func) => {
+            RaftOp::CreateFunction(func) => {
                 let key = (
                     func.keyspace.clone(),
                     func.name.clone(),
@@ -350,7 +366,7 @@ impl FerrosStateMachine {
                     let _ = schema.create_function_internal(&func);
                 }
             }
-            RaftCommand::DropFunction {
+            RaftOp::DropFunction {
                 keyspace,
                 name,
                 arg_types,
@@ -363,7 +379,7 @@ impl FerrosStateMachine {
             }
 
             // ---- DDL: User-Defined Aggregates --------------------------
-            RaftCommand::CreateAggregate(agg) => {
+            RaftOp::CreateAggregate(agg) => {
                 let key = (
                     agg.keyspace.clone(),
                     agg.name.clone(),
@@ -377,7 +393,7 @@ impl FerrosStateMachine {
                     let _ = schema.create_aggregate_internal(&agg);
                 }
             }
-            RaftCommand::DropAggregate {
+            RaftOp::DropAggregate {
                 keyspace,
                 name,
                 arg_types,
@@ -390,7 +406,7 @@ impl FerrosStateMachine {
             }
 
             // ---- DDL: Roles & Grants -----------------------------------
-            RaftCommand::CreateRole(role) => {
+            RaftOp::CreateRole(role) => {
                 self.state
                     .roles
                     .entry(role.name.clone())
@@ -399,7 +415,7 @@ impl FerrosStateMachine {
                     let _ = schema.create_role_internal(role);
                 }
             }
-            RaftCommand::AlterRole { name, updates } => {
+            RaftOp::AlterRole { name, updates } => {
                 if let Some(role) = self.state.roles.get_mut(&name) {
                     if let Some(is_superuser) = updates.is_superuser {
                         role.is_superuser = is_superuser;
@@ -418,14 +434,14 @@ impl FerrosStateMachine {
                     let _ = schema.alter_role_internal(&name, updates);
                 }
             }
-            RaftCommand::DropRole(name) => {
+            RaftOp::DropRole(name) => {
                 self.state.roles.remove(&name);
                 self.state.grants.remove(&name);
                 if let Some(schema) = &self.schema {
                     let _ = schema.drop_role_internal(&name);
                 }
             }
-            RaftCommand::Grant(entry) => {
+            RaftOp::Grant(entry) => {
                 let grants = self.state.grants.entry(entry.role.clone()).or_default();
                 if let Some(existing) = grants.iter_mut().find(|g| g.resource == entry.resource) {
                     existing
@@ -438,7 +454,7 @@ impl FerrosStateMachine {
                     let _ = schema.grant_internal(entry);
                 }
             }
-            RaftCommand::Revoke {
+            RaftOp::Revoke {
                 role,
                 resource,
                 permission,
@@ -458,17 +474,17 @@ impl FerrosStateMachine {
             }
 
             // ---- Topology ----------------------------------------------
-            RaftCommand::JoinNode(node_info) => {
+            RaftOp::JoinNode(node_info) => {
                 let node_id = super::uuid_to_node_id(node_info.host_id);
                 self.state.members.insert(node_id, node_info);
                 self.sync_ring();
             }
-            RaftCommand::LeaveNode { node_id } => {
+            RaftOp::LeaveNode { node_id } => {
                 self.state.members.remove(&node_id);
                 self.state.token_map.retain(|_, n| *n != node_id);
                 self.sync_ring();
             }
-            RaftCommand::AssignTokens { node_id, tokens } => {
+            RaftOp::AssignTokens { node_id, tokens } => {
                 for token in tokens {
                     self.state.token_map.insert(token, node_id);
                 }
@@ -476,18 +492,21 @@ impl FerrosStateMachine {
             }
 
             // ---- Config ------------------------------------------------
-            RaftCommand::UpdateConfig(config) => {
+            RaftOp::UpdateConfig(config) => {
                 self.state.config = config;
             }
 
             // ---- Node admission ----------------------------------------
-            RaftCommand::ApproveNode { host_id } => {
+            RaftOp::ApproveNode { host_id } => {
                 self.state.approved_nodes.insert(host_id);
             }
         }
 
-        // Bump schema version on every mutation for change detection.
-        self.state.schema_version = Uuid::new_v4();
+        // Use the leader-generated schema version so all nodes agree.
+        self.state.schema_version = schema_version;
+        if let Some(schema) = &self.schema {
+            schema.set_schema_version(schema_version);
+        }
         RaftResponse::Ok
     }
 }
@@ -719,7 +738,7 @@ mod tests {
     use ferrosa_schema::metadata::table::TableParams;
     use ferrosa_schema::{Permission, Resource, RoleMetadata};
 
-    use crate::raft::{NodeInfo, NodeState, RaftCommand, Token};
+    use crate::raft::{NodeInfo, NodeState, RaftCommand, RaftOp, Token};
 
     // -- helpers ----------------------------------------------------------
 
@@ -777,7 +796,11 @@ mod tests {
         }
     }
 
-    fn make_entry(term: u64, index: u64, cmd: RaftCommand) -> Entry<FerrosRaftConfig> {
+    fn make_entry(term: u64, index: u64, op: RaftOp) -> Entry<FerrosRaftConfig> {
+        let cmd = RaftCommand {
+            op,
+            schema_version: Uuid::new_v4(),
+        };
         Entry {
             log_id: LogId::new(CommittedLeaderId::new(term, 0), index),
             payload: EntryPayload::Normal(cmd),
@@ -790,7 +813,7 @@ mod tests {
     async fn apply_create_keyspace() {
         let mut sm = FerrosStateMachine::new();
         let ks = simple_keyspace("test_ks");
-        let entry = make_entry(1, 1, RaftCommand::CreateKeyspace(ks));
+        let entry = make_entry(1, 1, RaftOp::CreateKeyspace(ks));
 
         let results = sm.apply(vec![entry]).await.unwrap();
         assert_eq!(results.len(), 1);
@@ -806,8 +829,8 @@ mod tests {
         let table = simple_table("ks1", "users");
 
         let entries = vec![
-            make_entry(1, 1, RaftCommand::CreateKeyspace(ks)),
-            make_entry(1, 2, RaftCommand::CreateTable(Box::new(table))),
+            make_entry(1, 1, RaftOp::CreateKeyspace(ks)),
+            make_entry(1, 2, RaftOp::CreateTable(Box::new(table))),
         ];
 
         let results = sm.apply(entries).await.unwrap();
@@ -831,7 +854,7 @@ mod tests {
         };
         let node_id = super::super::uuid_to_node_id(host_id);
 
-        let entry = make_entry(1, 1, RaftCommand::JoinNode(node));
+        let entry = make_entry(1, 1, RaftOp::JoinNode(node));
         sm.apply(vec![entry]).await.unwrap();
 
         assert!(sm.state().members.contains_key(&node_id));
@@ -847,7 +870,7 @@ mod tests {
         let entry = make_entry(
             1,
             1,
-            RaftCommand::AssignTokens {
+            RaftOp::AssignTokens {
                 node_id,
                 tokens: tokens.clone(),
             },
@@ -868,16 +891,12 @@ mod tests {
         let other_t = simple_table("safe_ks", "t3");
 
         let entries = vec![
-            make_entry(1, 1, RaftCommand::CreateKeyspace(ks)),
-            make_entry(
-                1,
-                2,
-                RaftCommand::CreateKeyspace(simple_keyspace("safe_ks")),
-            ),
-            make_entry(1, 3, RaftCommand::CreateTable(Box::new(t1))),
-            make_entry(1, 4, RaftCommand::CreateTable(Box::new(t2))),
-            make_entry(1, 5, RaftCommand::CreateTable(Box::new(other_t))),
-            make_entry(1, 6, RaftCommand::DropKeyspace("doomed".to_string())),
+            make_entry(1, 1, RaftOp::CreateKeyspace(ks)),
+            make_entry(1, 2, RaftOp::CreateKeyspace(simple_keyspace("safe_ks"))),
+            make_entry(1, 3, RaftOp::CreateTable(Box::new(t1))),
+            make_entry(1, 4, RaftOp::CreateTable(Box::new(t2))),
+            make_entry(1, 5, RaftOp::CreateTable(Box::new(other_t))),
+            make_entry(1, 6, RaftOp::DropKeyspace("doomed".to_string())),
         ];
 
         sm.apply(entries).await.unwrap();
@@ -905,16 +924,16 @@ mod tests {
     async fn apply_is_deterministic() {
         // Apply the same sequence of commands to two independent state machines.
         let commands = [
-            RaftCommand::CreateKeyspace(simple_keyspace("ks1")),
-            RaftCommand::CreateTable(Box::new(simple_table("ks1", "t1"))),
-            RaftCommand::JoinNode(NodeInfo {
+            RaftOp::CreateKeyspace(simple_keyspace("ks1")),
+            RaftOp::CreateTable(Box::new(simple_table("ks1", "t1"))),
+            RaftOp::JoinNode(NodeInfo {
                 host_id: Uuid::nil(),
                 addr: "10.0.0.1:7000".to_string(),
                 data_center: "dc1".to_string(),
                 rack: "rack1".to_string(),
                 state: NodeState::Normal,
             }),
-            RaftCommand::AssignTokens {
+            RaftOp::AssignTokens {
                 node_id: super::super::uuid_to_node_id(Uuid::nil()),
                 tokens: vec![-100, 0, 100],
             },
@@ -956,16 +975,16 @@ mod tests {
 
         // Build up some state.
         let entries = vec![
-            make_entry(1, 1, RaftCommand::CreateKeyspace(simple_keyspace("ks1"))),
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("ks1"))),
             make_entry(
                 1,
                 2,
-                RaftCommand::CreateTable(Box::new(simple_table("ks1", "users"))),
+                RaftOp::CreateTable(Box::new(simple_table("ks1", "users"))),
             ),
             make_entry(
                 1,
                 3,
-                RaftCommand::JoinNode(NodeInfo {
+                RaftOp::JoinNode(NodeInfo {
                     host_id: Uuid::nil(),
                     addr: "10.0.0.1:7000".to_string(),
                     data_center: "dc1".to_string(),
@@ -1011,12 +1030,12 @@ mod tests {
             make_entry(
                 1,
                 1,
-                RaftCommand::AssignTokens {
+                RaftOp::AssignTokens {
                     node_id,
                     tokens: vec![-50, 0, 50],
                 },
             ),
-            make_entry(1, 2, RaftCommand::LeaveNode { node_id }),
+            make_entry(1, 2, RaftOp::LeaveNode { node_id }),
         ];
         sm.apply(entries).await.unwrap();
 
@@ -1037,8 +1056,8 @@ mod tests {
         };
 
         let entries = vec![
-            make_entry(1, 1, RaftCommand::CreateRole(role)),
-            make_entry(1, 2, RaftCommand::DropRole("analyst".to_string())),
+            make_entry(1, 1, RaftOp::CreateRole(role)),
+            make_entry(1, 2, RaftOp::DropRole("analyst".to_string())),
         ];
         sm.apply(entries).await.unwrap();
 
@@ -1056,11 +1075,11 @@ mod tests {
         };
 
         let entries = vec![
-            make_entry(1, 1, RaftCommand::Grant(grant)),
+            make_entry(1, 1, RaftOp::Grant(grant)),
             make_entry(
                 1,
                 2,
-                RaftCommand::Revoke {
+                RaftOp::Revoke {
                     role: "analyst".to_string(),
                     resource: Resource::Keyspace("ks1".to_string()),
                     permission: Permission::Select,
@@ -1083,7 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn get_current_snapshot_after_build() {
         let mut sm = FerrosStateMachine::new();
-        let entry = make_entry(1, 1, RaftCommand::CreateKeyspace(simple_keyspace("ks1")));
+        let entry = make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("ks1")));
         sm.apply(vec![entry]).await.unwrap();
 
         // Build snapshot.
@@ -1100,7 +1119,7 @@ mod tests {
         let (la, _) = sm.applied_state().await.unwrap();
         assert_eq!(la, None);
 
-        let entry = make_entry(1, 5, RaftCommand::CreateKeyspace(simple_keyspace("ks1")));
+        let entry = make_entry(1, 5, RaftOp::CreateKeyspace(simple_keyspace("ks1")));
         sm.apply(vec![entry]).await.unwrap();
 
         let (la, _) = sm.applied_state().await.unwrap();
@@ -1127,7 +1146,7 @@ mod tests {
             ..ClusterConfig::default()
         };
 
-        let entry = make_entry(1, 1, RaftCommand::UpdateConfig(config));
+        let entry = make_entry(1, 1, RaftOp::UpdateConfig(config));
         sm.apply(vec![entry]).await.unwrap();
 
         assert_eq!(sm.state().config.cluster_name, "my-cluster");
@@ -1138,7 +1157,7 @@ mod tests {
         let mut sm = FerrosStateMachine::new();
         let host_id = Uuid::new_v4();
 
-        let entry = make_entry(1, 1, RaftCommand::ApproveNode { host_id });
+        let entry = make_entry(1, 1, RaftOp::ApproveNode { host_id });
         sm.apply(vec![entry]).await.unwrap();
 
         assert!(sm.state().approved_nodes.contains(&host_id));
@@ -1149,7 +1168,7 @@ mod tests {
         let mut sm = FerrosStateMachine::new();
         let host_id = Uuid::new_v4();
 
-        let entry = make_entry(1, 1, RaftCommand::ApproveNode { host_id });
+        let entry = make_entry(1, 1, RaftOp::ApproveNode { host_id });
         sm.apply(vec![entry]).await.unwrap();
 
         // Build a snapshot.
@@ -1184,8 +1203,8 @@ mod tests {
         };
 
         let entries = vec![
-            make_entry(1, 1, RaftCommand::CreateKeyspace(ks)),
-            make_entry(1, 2, RaftCommand::CreateType(udt)),
+            make_entry(1, 1, RaftOp::CreateKeyspace(ks)),
+            make_entry(1, 2, RaftOp::CreateType(udt)),
         ];
         sm.apply(entries).await.unwrap();
 
@@ -1198,7 +1217,7 @@ mod tests {
         let entry = make_entry(
             1,
             3,
-            RaftCommand::DropType {
+            RaftOp::DropType {
                 keyspace: "ks".to_string(),
                 name: "address".to_string(),
             },
@@ -1224,8 +1243,8 @@ mod tests {
         };
 
         let entries = vec![
-            make_entry(1, 1, RaftCommand::CreateKeyspace(simple_keyspace("ks"))),
-            make_entry(1, 2, RaftCommand::CreateType(udt)),
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("ks"))),
+            make_entry(1, 2, RaftOp::CreateType(udt)),
         ];
         sm.apply(entries).await.unwrap();
 
@@ -1262,9 +1281,9 @@ mod tests {
         };
 
         let entries = vec![
-            make_entry(1, 1, RaftCommand::CreateKeyspace(simple_keyspace("doomed"))),
-            make_entry(1, 2, RaftCommand::CreateType(udt)),
-            make_entry(1, 3, RaftCommand::DropKeyspace("doomed".to_string())),
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("doomed"))),
+            make_entry(1, 2, RaftOp::CreateType(udt)),
+            make_entry(1, 3, RaftOp::DropKeyspace("doomed".to_string())),
         ];
         sm.apply(entries).await.unwrap();
 
@@ -1298,11 +1317,11 @@ mod tests {
         };
 
         let entries = vec![
-            make_entry(1, 1, RaftCommand::JoinNode(node)),
+            make_entry(1, 1, RaftOp::JoinNode(node)),
             make_entry(
                 1,
                 2,
-                RaftCommand::AssignTokens {
+                RaftOp::AssignTokens {
                     node_id,
                     tokens: vec![-100, 0, 100],
                 },
@@ -1344,16 +1363,16 @@ mod tests {
 
         // Join, assign tokens, then leave.
         let entries = vec![
-            make_entry(1, 1, RaftCommand::JoinNode(node)),
+            make_entry(1, 1, RaftOp::JoinNode(node)),
             make_entry(
                 1,
                 2,
-                RaftCommand::AssignTokens {
+                RaftOp::AssignTokens {
                     node_id,
                     tokens: vec![10, 20, 30],
                 },
             ),
-            make_entry(1, 3, RaftCommand::LeaveNode { node_id }),
+            make_entry(1, 3, RaftOp::LeaveNode { node_id }),
         ];
         sm.apply(entries).await.unwrap();
 

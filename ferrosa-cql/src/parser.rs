@@ -171,9 +171,44 @@ impl<'input> Parser<'input> {
             return Ok(vec![SelectColumn::Star]);
         }
 
-        let mut cols = vec![SelectColumn::Column(self.parse_ident()?)];
-        while self.lexer.eat(&TokenKind::Comma)? {
-            cols.push(SelectColumn::Column(self.parse_ident()?));
+        let mut cols = vec![];
+        loop {
+            // Check if this is a function call: ident(...)
+            let name = self.parse_ident()?;
+            if self.lexer.eat(&TokenKind::LParen)? {
+                // Function call: COUNT(*), WRITETIME(col), TTL(col), etc.
+                let mut args = vec![];
+                if self.lexer.eat(&TokenKind::Star)? {
+                    // COUNT(*) — represent * as a special term
+                    args.push(Term::StringLiteral("*".to_string()));
+                } else if !matches!(self.lexer.peek()?.kind, TokenKind::RParen) {
+                    args.push(self.parse_term()?);
+                    while self.lexer.eat(&TokenKind::Comma)? {
+                        args.push(self.parse_term()?);
+                    }
+                }
+                self.lexer.expect(&TokenKind::RParen)?;
+
+                // Optional AS alias
+                let alias = if self.lexer.eat(&TokenKind::Keyword(Keyword::As))? {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+
+                cols.push(SelectColumn::FunctionCall {
+                    keyspace: None,
+                    name,
+                    args,
+                    alias,
+                });
+            } else {
+                cols.push(SelectColumn::Column(name));
+            }
+
+            if !self.lexer.eat(&TokenKind::Comma)? {
+                break;
+            }
         }
         Ok(cols)
     }
@@ -279,13 +314,44 @@ impl<'input> Parser<'input> {
         })
     }
 
-    fn parse_assignments(&mut self) -> Result<Vec<(String, Term)>, CqlError> {
+    fn parse_assignments(&mut self) -> Result<Vec<Assignment>, CqlError> {
         let mut assignments = vec![];
         loop {
             let col = self.parse_ident()?;
-            self.lexer.expect(&TokenKind::Eq)?;
-            let val = self.parse_term()?;
-            assignments.push((col, val));
+
+            // Check for map/list element: col[key] = value
+            if self.lexer.eat(&TokenKind::LBracket)? {
+                let key = self.parse_term()?;
+                self.lexer.expect(&TokenKind::RBracket)?;
+                self.lexer.expect(&TokenKind::Eq)?;
+                let value = self.parse_term()?;
+                assignments.push(Assignment::Element {
+                    column: col,
+                    key,
+                    value,
+                });
+            } else {
+                self.lexer.expect(&TokenKind::Eq)?;
+                let value = self.parse_term()?;
+
+                // Check for: col = col + term  or  col = col - term
+                if self.lexer.eat(&TokenKind::Plus)? {
+                    let rhs = self.parse_term()?;
+                    assignments.push(Assignment::Add {
+                        column: col,
+                        value: rhs,
+                    });
+                } else if self.lexer.eat(&TokenKind::Minus)? {
+                    let rhs = self.parse_term()?;
+                    assignments.push(Assignment::Sub {
+                        column: col,
+                        value: rhs,
+                    });
+                } else {
+                    assignments.push(Assignment::Simple { column: col, value });
+                }
+            }
+
             if !self.lexer.eat(&TokenKind::Comma)? {
                 break;
             }
@@ -1491,6 +1557,14 @@ impl<'input> Parser<'input> {
             TokenKind::GtEq => Ok(ComparisonOp::Ge),
             TokenKind::NotEq => Ok(ComparisonOp::Ne),
             TokenKind::Keyword(Keyword::In) => Ok(ComparisonOp::In),
+            TokenKind::Keyword(Keyword::Contains) => {
+                // Check for CONTAINS KEY
+                if self.lexer.eat(&TokenKind::Keyword(Keyword::Key))? {
+                    Ok(ComparisonOp::ContainsKey)
+                } else {
+                    Ok(ComparisonOp::Contains)
+                }
+            }
             _ => Err(CqlError::SyntaxError(format!(
                 "expected comparison operator, got {:?} at position {}",
                 tok.kind, tok.pos
@@ -1552,6 +1626,64 @@ impl<'input> Parser<'input> {
                 let result = self.parse_tuple_literal();
                 self.exit_nesting();
                 result
+            }
+            // Identifiers and function calls
+            TokenKind::Ident(name) => {
+                let name = name.to_string();
+                if self.lexer.eat(&TokenKind::LParen)? {
+                    // Function call: name(args...)
+                    self.enter_nesting()?;
+                    let mut args = vec![];
+                    if self.lexer.peek()?.kind != TokenKind::RParen {
+                        args.push(self.parse_term()?);
+                        while self.lexer.eat(&TokenKind::Comma)? {
+                            args.push(self.parse_term()?);
+                        }
+                    }
+                    self.lexer.expect(&TokenKind::RParen)?;
+                    self.exit_nesting();
+                    Ok(Term::FunctionCall {
+                        keyspace: None,
+                        name,
+                        args,
+                    })
+                } else {
+                    // Bare identifier in term position (column reference)
+                    Ok(Term::FunctionCall {
+                        keyspace: None,
+                        name,
+                        args: vec![],
+                    })
+                }
+            }
+            // Keywords that can be used as function names (uuid, now, toDate, etc.)
+            TokenKind::Keyword(kw) => {
+                let name = Self::keyword_as_ident(kw);
+                if self.lexer.eat(&TokenKind::LParen)? {
+                    self.enter_nesting()?;
+                    let mut args = vec![];
+                    if self.lexer.peek()?.kind != TokenKind::RParen {
+                        args.push(self.parse_term()?);
+                        while self.lexer.eat(&TokenKind::Comma)? {
+                            args.push(self.parse_term()?);
+                        }
+                    }
+                    self.lexer.expect(&TokenKind::RParen)?;
+                    self.exit_nesting();
+                    Ok(Term::FunctionCall {
+                        keyspace: None,
+                        name,
+                        args,
+                    })
+                } else {
+                    // Keyword used as bare identifier — this is likely a syntax error
+                    // in most contexts, but we let the caller decide.
+                    Ok(Term::FunctionCall {
+                        keyspace: None,
+                        name,
+                        args: vec![],
+                    })
+                }
             }
             _ => Err(CqlError::SyntaxError(format!(
                 "expected term, got {:?} at position {}",
@@ -1942,6 +2074,7 @@ impl<'input> Parser<'input> {
             Keyword::Finalfunc => "finalfunc",
             Keyword::Initcond => "initcond",
             Keyword::As => "as",
+            Keyword::Contains => "contains",
         }
         .to_string()
     }
@@ -2111,7 +2244,10 @@ mod tests {
                 assert_eq!(s.table, "users");
                 assert_eq!(
                     s.assignments,
-                    vec![("name".into(), Term::StringLiteral("bob".into()))]
+                    vec![Assignment::Simple {
+                        column: "name".into(),
+                        value: Term::StringLiteral("bob".into()),
+                    }]
                 );
                 assert_eq!(s.where_clauses.len(), 1);
             }

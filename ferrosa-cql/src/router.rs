@@ -15,6 +15,7 @@ use arc_swap::ArcSwap;
 use bytes::BytesMut;
 use indexmap::IndexMap;
 
+use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::pair::ddl::DdlOperation;
 use ferrosa_cluster::{DdlPath, WritePath};
 use ferrosa_common::DataType;
@@ -60,10 +61,12 @@ pub struct SharedState {
     pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
 }
 
-/// Per-request context: authentication and current keyspace.
+/// Per-request context: authentication, current keyspace, and consistency level.
 pub struct RequestContext<'a> {
     pub auth: &'a AuthContext,
     pub current_keyspace: &'a Option<String>,
+    /// Client-requested consistency level parsed from the CQL protocol frame.
+    pub consistency: ConsistencyLevel,
 }
 
 /// Result of routing a statement.
@@ -867,6 +870,30 @@ fn route_select_user_table(
         rows
     };
 
+    // Check for aggregate functions (e.g. COUNT(*))
+    let is_aggregate = s.columns.iter().any(|c| {
+        matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+    });
+
+    if is_aggregate {
+        // Build a single result row with aggregate values
+        let mut agg_row: Vec<Option<CqlValue>> = Vec::new();
+        for sc in &s.columns {
+            match sc {
+                SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count") => {
+                    agg_row.push(Some(CqlValue::Bigint(rows.len() as i64)));
+                }
+                _ => {
+                    agg_row.push(None);
+                }
+            }
+        }
+        let agg_rows = vec![agg_row];
+        return Ok(result::encode_rows(
+            &col_names, &col_types, ks, &s.table, &agg_rows,
+        ));
+    }
+
     // Apply column selection if not Star
     let selected_rows = select_columns(&rows, &all_col_names, &col_names);
 
@@ -1036,11 +1063,19 @@ async fn route_insert(
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
     let table_id = TableId::new(ks, &s.table);
+    let rf = keyspace_rf(&state.schema, ks);
 
     state
         .write_path
         .load()
-        .write(&table_id, &decorated_key, row, timestamp)
+        .write(
+            &table_id,
+            &decorated_key,
+            row,
+            timestamp,
+            ctx.consistency,
+            rf,
+        )
         .await?;
     Ok(result::encode_void())
 }
@@ -1110,13 +1145,95 @@ async fn route_update(
 
     // Build cells from SET assignments
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
-    for (col_name, term) in &s.assignments {
-        let col_meta = table_meta
-            .columns
-            .get(col_name)
-            .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?;
-        let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
-        let value = bridge::term_to_cql_value(term, &cql_type)?;
+    for assignment in &s.assignments {
+        let (col_name, value) = match assignment {
+            Assignment::Simple { column, value } => {
+                let col_meta = table_meta
+                    .columns
+                    .get(column)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+                let val = bridge::term_to_cql_value(value, &cql_type)?;
+                (column.as_str(), val)
+            }
+            Assignment::Add { column, value } => {
+                let col_meta = table_meta
+                    .columns
+                    .get(column)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+
+                // For counters: increment. For collections: append.
+                match &cql_type {
+                    CqlType::Counter => {
+                        let increment = bridge::term_to_cql_value(value, &CqlType::Bigint)?;
+                        if let CqlValue::Bigint(n) = increment {
+                            (column.as_str(), CqlValue::Counter(n))
+                        } else {
+                            return Err(CqlError::Invalid(
+                                "counter increment must be an integer".into(),
+                            ));
+                        }
+                    }
+                    _ => {
+                        // Collection append: store the new value (simplified)
+                        let val = bridge::term_to_cql_value(value, &cql_type)?;
+                        (column.as_str(), val)
+                    }
+                }
+            }
+            Assignment::Sub { column, value } => {
+                let col_meta = table_meta
+                    .columns
+                    .get(column)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+
+                match &cql_type {
+                    CqlType::Counter => {
+                        let decrement = bridge::term_to_cql_value(value, &CqlType::Bigint)?;
+                        if let CqlValue::Bigint(n) = decrement {
+                            (column.as_str(), CqlValue::Counter(-n))
+                        } else {
+                            return Err(CqlError::Invalid(
+                                "counter decrement must be an integer".into(),
+                            ));
+                        }
+                    }
+                    CqlType::Map(key_type, _) => {
+                        // Map subtraction: RHS is a set of keys to remove.
+                        // Coerce the set literal to Set<K>, not Map<K,V>.
+                        let set_of_keys = CqlType::Set(key_type.clone());
+                        let val = bridge::term_to_cql_value(value, &set_of_keys)?;
+                        (column.as_str(), val)
+                    }
+                    _ => {
+                        // Set/list subtraction: RHS is the same collection type.
+                        let val = bridge::term_to_cql_value(value, &cql_type)?;
+                        (column.as_str(), val)
+                    }
+                }
+            }
+            Assignment::Element {
+                column,
+                key: _,
+                value,
+            } => {
+                // Map/list element set: coerce value to the element type, not the collection type
+                let col_meta = table_meta
+                    .columns
+                    .get(column)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+                let value_type = match &cql_type {
+                    CqlType::Map(_, v) => (**v).clone(),
+                    CqlType::List(v) => (**v).clone(),
+                    _ => cql_type.clone(),
+                };
+                let val = bridge::term_to_cql_value(value, &value_type)?;
+                (column.as_str(), val)
+            }
+        };
         let col_idx = table_meta
             .columns
             .get_index_of(col_name)
@@ -1128,11 +1245,19 @@ async fn route_update(
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
     let table_id = TableId::new(ks, &s.table);
+    let rf = keyspace_rf(&state.schema, ks);
 
     state
         .write_path
         .load()
-        .write(&table_id, &decorated_key, row, timestamp)
+        .write(
+            &table_id,
+            &decorated_key,
+            row,
+            timestamp,
+            ctx.consistency,
+            rf,
+        )
         .await?;
     Ok(result::encode_void())
 }
@@ -1216,11 +1341,19 @@ async fn route_delete(
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let row = bridge::build_delete_row(&delete_columns, &ck_values, timestamp);
     let table_id = TableId::new(ks, &s.table);
+    let rf = keyspace_rf(&state.schema, ks);
 
     state
         .write_path
         .load()
-        .write(&table_id, &decorated_key, row, timestamp)
+        .write(
+            &table_id,
+            &decorated_key,
+            row,
+            timestamp,
+            ctx.consistency,
+            rf,
+        )
         .await?;
     Ok(result::encode_void())
 }
@@ -1273,6 +1406,15 @@ async fn route_create_keyspace(
     state
         .schema
         .check_permission(ctx.auth, Permission::Create, &Resource::AllKeyspaces)?;
+
+    // IF NOT EXISTS: silently succeed when keyspace already exists
+    if s.if_not_exists && state.schema.snapshot().keyspaces.contains_key(&s.name) {
+        return Ok(result::encode_schema_change(
+            "CREATED",
+            "KEYSPACE",
+            &[&s.name],
+        ));
+    }
 
     let mut options = std::collections::HashMap::new();
     let mut strategy = String::new();
@@ -1394,6 +1536,15 @@ async fn route_drop_keyspace(
         &Resource::Keyspace(s.name.clone()),
     )?;
 
+    // IF EXISTS: silently succeed when keyspace doesn't exist
+    if s.if_exists && !state.schema.snapshot().keyspaces.contains_key(&s.name) {
+        return Ok(result::encode_schema_change(
+            "DROPPED",
+            "KEYSPACE",
+            &[&s.name],
+        ));
+    }
+
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
@@ -1449,6 +1600,21 @@ async fn route_create_table(
         Permission::Create,
         &Resource::Keyspace(ks.to_string()),
     )?;
+
+    // IF NOT EXISTS: silently succeed when table already exists
+    if s.if_not_exists
+        && state
+            .schema
+            .snapshot()
+            .tables
+            .contains_key(&(ks.to_string(), s.name.clone()))
+    {
+        return Ok(result::encode_schema_change(
+            "CREATED",
+            "TABLE",
+            &[ks, &s.name],
+        ));
+    }
 
     // Build column metadata
     let mut columns = IndexMap::new();
@@ -1635,6 +1801,21 @@ async fn route_drop_table(
         Permission::Drop,
         &Resource::Table(ks.to_string(), s.table.clone()),
     )?;
+
+    // IF EXISTS: silently succeed when table doesn't exist
+    if s.if_exists
+        && !state
+            .schema
+            .snapshot()
+            .tables
+            .contains_key(&(ks.to_string(), s.table.clone()))
+    {
+        return Ok(result::encode_schema_change(
+            "DROPPED",
+            "TABLE",
+            &[ks, &s.table],
+        ));
+    }
 
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
@@ -2099,6 +2280,18 @@ fn resolve_keyspace<'a>(
         .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))
 }
 
+/// Look up the replication factor for a keyspace from the schema.
+///
+/// Falls back to 1 if the keyspace is not found or the RF is not set.
+fn keyspace_rf(schema: &Schema, ks: &str) -> usize {
+    let snap = schema.snapshot();
+    snap.keyspaces
+        .get(ks)
+        .and_then(|km| km.replication.options.get("replication_factor"))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
 /// Build column names and types for a SELECT result.
 fn build_column_info(
     table_meta: &TableMetadata,
@@ -2134,10 +2327,19 @@ fn build_column_info(
                 names.push(name.clone());
                 types.push(resolve_col_type(&col.column_type, ks, schema)?);
             }
-            SelectColumn::FunctionCall { .. } => {
-                return Err(CqlError::Invalid(
-                    "function calls in SELECT not yet implemented".into(),
-                ));
+            SelectColumn::FunctionCall { name, alias, .. } => {
+                let display_name = alias.clone().unwrap_or_else(|| format!("system.{}", name));
+                let fn_lower = name.to_lowercase();
+                let cql_type = match fn_lower.as_str() {
+                    "count" => CqlType::Bigint,
+                    "writetime" => CqlType::Bigint,
+                    "ttl" => CqlType::Int,
+                    _ => {
+                        return Err(CqlError::Invalid(format!("unknown function: {}", name)));
+                    }
+                };
+                names.push(display_name);
+                types.push(cql_type);
             }
         }
     }
@@ -2212,6 +2414,11 @@ fn evaluate_where_predicates(
                 // IN comparison: check if actual is in the expected list.
                 // For now, treat as equality (single-value IN).
                 *actual == expected
+            }
+            ComparisonOp::Contains | ComparisonOp::ContainsKey => {
+                // CONTAINS / CONTAINS KEY: not yet implemented for filtering.
+                // Conservatively exclude the row so we don't return false positives.
+                false
             }
         };
         if !matches {
@@ -3145,6 +3352,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // CREATE KEYSPACE
@@ -3191,6 +3399,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("USE my_ks").unwrap();
         match route(&state, &ctx, stmt).await.unwrap() {
@@ -3208,6 +3417,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -3236,6 +3446,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -3288,6 +3499,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM users WHERE id = 1").unwrap();
         assert!(route(&state, &ctx, stmt).await.is_err());
@@ -3299,6 +3511,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         // Build a batch statement with > 500 entries programmatically
         let stmts: Vec<Statement> = (0..501)
@@ -3328,6 +3541,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.peers").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -3343,6 +3557,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system_schema.keyspaces").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -3402,6 +3617,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let _ = route(&state, &ctx, stmt).await;
@@ -3414,6 +3630,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace and table first
@@ -3498,6 +3715,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse("SELECT * FROM test_ks.test_vtable").unwrap();
@@ -3545,6 +3763,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace first
@@ -3583,6 +3802,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace + type
@@ -3619,6 +3839,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace + type
@@ -3648,6 +3869,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace
@@ -3669,6 +3891,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace + type
@@ -3697,6 +3920,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace + type
@@ -3726,6 +3950,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &ks,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace first (with explicit ks in statement)
@@ -3750,6 +3975,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // CREATE TYPE without keyspace and no session keyspace
@@ -3764,6 +3990,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace + type
@@ -3791,6 +4018,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Create keyspace but no type
@@ -3817,6 +4045,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -3847,6 +4076,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -3877,6 +4107,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -3908,6 +4139,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -3923,6 +4155,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -3946,6 +4179,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -3969,6 +4203,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -3992,6 +4227,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4070,6 +4306,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Setup: create keyspace and table
@@ -4133,6 +4370,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Setup
@@ -4211,6 +4449,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Setup
@@ -4276,6 +4515,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4335,6 +4575,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Setup: table with an index on `email` but NOT on `name`
@@ -4388,6 +4629,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4439,6 +4681,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         let stmt = crate::parser::parse(
@@ -4481,6 +4724,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
 
         // Setup: table with composite key (pk, ck) and a value column
@@ -4621,6 +4865,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt = crate::parser::parse("SELECT * FROM system_observability.connections").unwrap();
         let result = route(&state, &ctx, stmt).await;
@@ -4642,6 +4887,7 @@ mod tests {
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
         };
         let stmt =
             crate::parser::parse("SELECT * FROM system_observability.active_queries").unwrap();
@@ -4670,6 +4916,7 @@ mod tests {
             &RequestContext {
                 auth: &dev,
                 current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
             },
             use_stmt,
         )
@@ -4688,6 +4935,7 @@ mod tests {
             &RequestContext {
                 auth: &dev,
                 current_keyspace: &Some(new_ks),
+                consistency: ConsistencyLevel::One,
             },
             sel_stmt,
         )

@@ -1,0 +1,348 @@
+= E-Commerce Platform
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Model a complete e-commerce backend: product catalog, shopping carts, and order history.
+Handle Black Friday traffic without breaking a sweat.
+
+NOTE: Complete the <<cluster-setup.adoc#,3-Node Cluster Setup>> tutorial first, or have a running Ferrosa cluster accessible on `localhost:9042`.
+
+== The Use Case
+
+=== An online store that scales
+
+You are building the data layer for an online store.
+On a normal day, the site handles a steady stream of product browsing, cart updates, and order placements.
+But on Black Friday, traffic spikes 10x to 50x in the span of minutes.
+Your database needs to handle the surge without slowing down or going offline.
+
+The application has four core data needs:
+
+* *Product catalog.* Customers browse products by category and view product detail pages. Each product has structured data (name, price, stock status) and semi-structured data (tags, attributes that vary by product type).
+* *Shopping carts.* Every customer has a cart. Items are added, quantities are updated, and items are removed -- all in real time. The cart must be consistent and fast.
+* *Order history.* When a customer checks out, the cart becomes an order. Customers view their past orders, and the support team looks up orders by customer.
+* *Category browsing.* The homepage shows products grouped by category. This needs to be a fast, single-query lookup -- not a full-table scan with a filter.
+
+If you have worked with relational databases, your instinct might be to create a normalized schema with foreign keys.
+A `products` table, a `categories` table, an `order_items` table joining orders to products.
+That works well for a single-server database with low traffic.
+But at Black Friday scale, those JOIN operations become bottlenecks, and a single-server database becomes a single point of failure.
+
+In Ferrosa, we take a different approach: *model your tables around your queries*.
+If you need to browse products by category, create a table where the category is the partition key.
+If you need to look up a product by ID, create a table where the product ID is the partition key.
+Yes, this means some data is stored more than once.
+That is the tradeoff -- and it is the reason Ferrosa can serve reads in single-digit milliseconds at any scale.
+
+== Design the Schema
+
+=== Create the keyspace
+
+[source,sql]
+----
+include::schema.cql[lines=1..4]
+----
+
+=== The products table
+
+This table stores the full product record.
+You query it when a customer clicks on a product to see its detail page.
+
+[source,sql]
+----
+include::schema.cql[lines=8..19]
+----
+
+Two columns here deserve special attention:
+
+* `tags` is a *set* -- an unordered collection of unique text values. A product might have tags like `{'wireless', 'bluetooth', 'noise-cancelling'}`. Sets automatically prevent duplicates and let you add or remove individual tags without reading the whole row first.
+* `attributes` is a *map* -- a collection of key-value pairs. Different products have different attributes: a laptop has `{'ram': '16GB', 'storage': '512GB SSD'}`, while a shirt has `{'size': 'M', 'color': 'navy'}`. Maps let you store this semi-structured data without creating separate columns for every possible attribute.
+
+=== The products-by-category table
+
+When a customer clicks "Electronics" on the homepage, you need all products in that category.
+If you tried `SELECT * FROM products WHERE category = 'electronics'`, Ferrosa would reject the query -- `category` is not the partition key, so it would require a full cluster scan.
+
+Instead, we create a second table where `category` is the partition key:
+
+[source,sql]
+----
+include::schema.cql[lines=21..27]
+----
+
+This table duplicates some data from `products`, but it makes category browsing a single-partition read.
+The clustering key is `(name, product_id)` -- products within a category are sorted alphabetically by name, which is a natural sort order for a catalog page.
+We include `product_id` in the clustering key to ensure uniqueness (two products could have the same name).
+
+IMPORTANT: *This is denormalization.* In a relational database, you would have a single products table and use `WHERE category = ?` with an index. In Ferrosa, you maintain two copies of the data -- one organized by product ID, one organized by category. When you add a new product, your application writes to both tables. The payoff is that both query patterns are fast, simple, single-partition reads.
+
+=== The shopping cart table
+
+[source,sql]
+----
+include::schema.cql[lines=29..34]
+----
+
+Each user's cart is a single partition.
+The `product_id` clustering key means each product can appear only once per cart -- if the customer adds the same product again, your application updates the quantity rather than inserting a duplicate row.
+
+The partition key (`user_id`) groups all of a user's cart items together, so fetching the entire cart is one read.
+Adding, updating, or removing an item is one write.
+
+=== The orders table
+
+[source,sql]
+----
+include::schema.cql[lines=36..44]
+----
+
+Let's break down the interesting parts:
+
+* `order_id` is a *timeuuid* -- a UUID that embeds a timestamp. It serves double duty: it uniquely identifies each order and provides chronological ordering. With `CLUSTERING ORDER BY (order_id DESC)`, the newest orders appear first.
+* `items` is a *list* of *frozen tuples*. Each tuple contains `(product_id, product_name, quantity, unit_price)`. The `frozen` keyword means each tuple is stored as an indivisible blob -- you cannot update individual fields inside the tuple. This is fine for order items, which are immutable once the order is placed.
+* The partition key is `user_id`, so all of a customer's orders are in one partition. Fetching order history is one read.
+
+NOTE: *Why store product names in orders?* You might wonder why `items` includes the product name when you could look it up from the `products` table. This is intentional denormalization. If a product name changes after an order is placed, the order should still show the name the customer saw when they bought it. Storing it directly in the order freezes it in time.
+
+== Insert Sample Data
+
+=== Add products to the catalog
+
+Let's add five products across two categories.
+We will use hardcoded UUIDs so we can reference them consistently throughout the tutorial.
+In production, your application would generate UUIDs with `uuid()`.
+
+[source,sql]
+----
+include::data.cql[]
+----
+
+== Query Patterns
+
+=== Browse products by category
+
+A customer clicks "Electronics" on the homepage.
+This single query returns all electronics products, sorted alphabetically by name:
+
+[source,sql]
+----
+SELECT name, price, in_stock
+FROM products_by_category
+WHERE category = 'electronics';
+----
+
+Because `category` is the partition key, Ferrosa reads exactly one partition.
+The results come back sorted by `name` (the first clustering key), ready to display on the page.
+
+=== View a product detail page
+
+The customer clicks on the headphones.
+Your application fetches the full product record by ID:
+
+[source,sql]
+----
+SELECT * FROM products
+WHERE product_id = 11111111-1111-1111-1111-111111111111;
+----
+
+This is the simplest possible query -- a single-partition, single-row read by primary key.
+It returns in under a millisecond.
+
+=== View the shopping cart
+
+The customer clicks the cart icon.
+Fetch all items in their cart:
+
+[source,sql]
+----
+SELECT product_id, quantity, added_at
+FROM shopping_cart
+WHERE user_id = aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa;
+----
+
+This returns all cart items for the user.
+Your application would then look up product names and prices from the `products` table to render the cart page.
+In a production system, you might denormalize product names into the cart table to avoid the extra lookups.
+
+=== Update cart quantity
+
+The customer decides they want 3 USB-C hubs instead of 2:
+
+[source,sql]
+----
+UPDATE shopping_cart
+SET quantity = 3
+WHERE user_id = aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+  AND product_id = 44444444-4444-4444-4444-444444444444;
+----
+
+The `UPDATE` statement in CQL works like an upsert -- if the row exists, it updates the value.
+If it doesn't exist, it creates it.
+You must specify the full primary key (`user_id` and `product_id`), which tells Ferrosa exactly which row to modify.
+
+=== Remove an item from the cart
+
+The customer removes the keyboard:
+
+[source,sql]
+----
+DELETE FROM shopping_cart
+WHERE user_id = aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+  AND product_id = 22222222-2222-2222-2222-222222222222;
+----
+
+This deletes the single row for that product in the user's cart.
+The other cart items are untouched.
+
+=== View order history
+
+The customer clicks "My Orders" to see their past purchases:
+
+[source,sql]
+----
+SELECT order_id, status, total, items
+FROM orders
+WHERE user_id = aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+LIMIT 10;
+----
+
+Because we used `CLUSTERING ORDER BY (order_id DESC)`, the newest orders come first.
+The `LIMIT 10` ensures you only fetch the most recent page of orders.
+For pagination, your application can use the last `order_id` from the results to fetch the next page.
+
+=== Check if a product is in stock
+
+Before adding to cart, the frontend checks stock status:
+
+[source,sql]
+----
+SELECT in_stock FROM products
+WHERE product_id = 55555555-5555-5555-5555-555555555555;
+----
+
+This returns a single column from a single row -- the absolute minimum data transfer.
+Your application checks the boolean and shows "Add to Cart" or "Out of Stock" accordingly.
+
+== Working with Collections
+
+=== Understanding sets, lists, and maps
+
+Ferrosa supports three collection types that let you store multiple values in a single column.
+They are especially useful for semi-structured data that varies between rows.
+Let's explore each one using the products we already inserted.
+
+=== Working with sets (tags)
+
+A set is an unordered collection of unique values.
+Our products have a `tags` set.
+Let's see the tags for the headphones:
+
+[source,sql]
+----
+SELECT name, tags FROM products
+WHERE product_id = 11111111-1111-1111-1111-111111111111;
+----
+
+This returns `{'bluetooth', 'noise-cancelling', 'over-ear', 'wireless'}`.
+Notice the set is sorted alphabetically -- that is how Ferrosa stores sets internally.
+
+To add a new tag without replacing the existing ones, use the `+` operator:
+
+[source,sql]
+----
+UPDATE products
+SET tags = tags + {'premium', 'gift-idea'}
+WHERE product_id = 11111111-1111-1111-1111-111111111111;
+----
+
+This adds `'premium'` and `'gift-idea'` to the existing tags.
+You don't need to read the current tags first -- Ferrosa merges them for you.
+
+To remove a tag, use the `-` operator:
+
+[source,sql]
+----
+UPDATE products
+SET tags = tags - {'gift-idea'}
+WHERE product_id = 11111111-1111-1111-1111-111111111111;
+----
+
+=== Working with maps (attributes)
+
+A map stores key-value pairs.
+Our products use a map for attributes that vary by product type.
+Let's see the keyboard's attributes:
+
+[source,sql]
+----
+SELECT name, attributes FROM products
+WHERE product_id = 22222222-2222-2222-2222-222222222222;
+----
+
+This returns `{'brand': 'TypeMaster', 'connection': 'USB-C', 'layout': 'US ANSI', 'switch_type': 'Cherry MX Brown'}`.
+
+To add or update a specific key in the map:
+
+[source,sql]
+----
+UPDATE products
+SET attributes['warranty'] = '2 years'
+WHERE product_id = 22222222-2222-2222-2222-222222222222;
+----
+
+This adds a `'warranty'` key to the map (or updates it if it already exists).
+You can also add multiple entries at once:
+
+[source,sql]
+----
+UPDATE products
+SET attributes = attributes + {'backlight': 'RGB per-key', 'key_count': '104'}
+WHERE product_id = 22222222-2222-2222-2222-222222222222;
+----
+
+To remove a key from the map:
+
+[source,sql]
+----
+DELETE attributes['warranty'] FROM products
+WHERE product_id = 22222222-2222-2222-2222-222222222222;
+----
+
+=== Working with lists (order items)
+
+A list is an ordered collection that allows duplicates.
+We used it for order items.
+Let's look at an order:
+
+[source,sql]
+----
+SELECT order_id, items FROM orders
+WHERE user_id = aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+LIMIT 1;
+----
+
+Lists preserve insertion order and allow the same value to appear more than once -- which makes sense for orders (you could buy the same product twice in separate line items).
+
+TIP: *When to use which collection:* +
+*Set* -- when you need unique, unordered values. Perfect for tags, categories, permissions. +
+*Map* -- when you need key-value pairs. Perfect for flexible attributes, settings, metadata. +
+*List* -- when you need ordered values with duplicates. Perfect for order items, history logs, sequences.
+
+One important limitation: collections are designed for small to medium amounts of data (up to a few hundred elements).
+If you need to store thousands of values, use a separate table with clustering keys instead.
+
+== What You Learned
+
+You have built a complete e-commerce data layer that can handle traffic spikes gracefully.
+Here is what you practiced:
+
+* *Query-driven table design.* Instead of one normalized `products` table, you created two: one for ID lookups, one for category browsing. Each table is optimized for a specific query pattern.
+* *Denormalization as a feature.* Storing product data in multiple tables means your application writes more, but reads are always single-partition lookups. At Black Friday scale, this is the difference between a responsive site and a crashed one.
+* *Collection types for flexible data.* Sets for tags, maps for variable attributes, lists for ordered items -- collections let you store semi-structured data without rigid column definitions.
+* *Shopping cart as a partition.* Using `user_id` as the partition key and `product_id` as the clustering key gives you a natural cart model where adds, updates, and removes are all single-row operations.
+* *Timeuuid for chronological ordering.* The `timeuuid` type in the orders table provides both unique identification and time-based sorting, making "show me my latest orders" a simple partition scan.
+* *UPDATE and DELETE in CQL.* Unlike the previous tutorials that were insert-only, e-commerce requires mutations -- updating cart quantities and removing items. CQL handles these as targeted single-row operations.
+
+You now have hands-on experience with the three most common Ferrosa data modeling patterns: time-series (from the <<iot-sensor-data.adoc#,IoT tutorial>>), pre-computed aggregations (from the <<time-series-analytics.adoc#,Analytics tutorial>>), and query-driven denormalization (this tutorial).
+Together, these patterns cover the vast majority of real-world workloads.

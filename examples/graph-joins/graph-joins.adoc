@@ -1,0 +1,404 @@
+= Graph Joins & Traversals
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Traditional Cassandra warns against join-heavy workloads.
+Ferrosa doesn't -- it has a built-in graph engine with bidirectional traversals and secondary indexes.
+This tutorial shows relationship queries that are impossible in vanilla Cassandra.
+
+NOTE: Complete the link:../cluster-setup.html[3-Node Cluster Setup] tutorial first.
+Your cluster must have `FERROSA_GRAPH_ENABLED=true` set (which our cluster-setup tutorial includes).
+
+== Why Graph + CQL?
+
+Apache Cassandra is a proven choice for time-series data, IoT ingestion, and write-heavy workloads.
+Its partition-key design delivers single-digit-millisecond reads at any scale.
+But there is one thing the Cassandra community has always warned against: *relationship queries*.
+
+Need "find friends of friends"?
+"Which customers bought products that this customer also bought"?
+"What is the shortest path between two accounts"?
+In traditional Cassandra, these questions require multiple round trips from your application, client-side joins, and increasingly complex denormalized tables.
+Most teams end up running a second database -- Neo4j, JanusGraph, or Amazon Neptune -- just for graph queries.
+That means data duplication, ETL pipelines, and consistency headaches.
+
+Ferrosa eliminates that trade-off.
+Your data lives in ordinary CQL tables annotated with `graph.*` extensions.
+An async adjacency index maintains graph structure automatically in the background.
+You get the best of both worlds:
+
+* *CQL* for fast key-value operations, time-range scans, and high-throughput writes
+* *Cypher* (via Ferrosa's graph HTTP endpoint) for relationship traversals, pattern matching, and path queries
+
+Same data. Two query languages. No duplication, no ETL, no second database.
+
+== The Social Network Schema
+
+We will model a small social network with six entity and relationship types.
+The graph data model maps naturally to CQL tables.
+
+=== Vertex tables (entities)
+
+* *Person* -- a user with a name, age, city, and join date
+* *Company* -- an organization with an industry and founding year
+* *Post* -- a piece of content authored by a Person
+
+=== Edge tables (relationships)
+
+* *FOLLOWS* -- Person follows Person (directed)
+* *LIKES* -- Person likes Post
+* *WORKS_AT* -- Person works at Company
+
+Vertex tables use a single UUID primary key.
+Edge tables use a composite primary key of `(source_id, target_id)`, which lets CQL answer "who does X follow?" efficiently.
+Ferrosa's graph engine also maintains a reverse index so "who follows X?" is equally fast -- something vanilla Cassandra cannot do without a second denormalized table.
+
+== Create the Graph Tables
+
+Connect to your cluster with `cqlsh` and run the following DDL.
+Pay attention to the `WITH extensions` clauses -- these are what tell Ferrosa to treat ordinary CQL tables as graph vertices and edges.
+
+=== Understanding the extensions
+
+[cols="1,3"]
+|===
+|Extension key |Purpose
+
+|`graph.type`
+|Marks a table as `vertex` (entity) or `edge` (relationship). The graph engine ignores tables without this annotation.
+
+|`graph.label`
+|The name used in Cypher queries. `MATCH (p:Person)` references the table with `graph.label = 'Person'`.
+
+|`graph.source`
+|Column name holding the source vertex UUID. Only for edge tables.
+
+|`graph.target`
+|Column name holding the target vertex UUID. Only for edge tables.
+
+|`graph.source_label`
+|Which vertex label the source column references. Lets the engine resolve cross-table joins.
+
+|`graph.target_label`
+|Which vertex label the target column references.
+|===
+
+=== Secondary indexes for reverse lookups
+
+Create secondary indexes on columns you will filter by.
+Ferrosa's secondary indexes are backed by local token-range scans and the graph adjacency index, making them far more efficient than Cassandra's legacy secondary indexes.
+
+The full schema (keyspace, graph tables, and indexes):
+
+[source,sql]
+----
+include::schema.cql[]
+----
+
+== Load the Social Network
+
+Insert sample data.
+We use short, readable UUIDs so you can follow along easily.
+In production you would use `uuid()` to generate them.
+
+The data includes 8 people, 3 companies, 6 posts, follow relationships, likes, employment records, and transfer records for fraud detection.
+
+[source,sql]
+----
+include::data.cql[]
+----
+
+== CQL Queries with Secondary Indexes
+
+With secondary indexes in place, CQL can handle direct lookups efficiently.
+Let's see what it can do -- and where it hits its limits.
+
+=== What CQL handles well
+
+*Find people in a city* (secondary index scan):
+
+*Find who Alice follows* (partition key lookup -- fastest possible query):
+
+*Find posts by a specific author* (secondary index on `author_id`):
+
+*Find technology companies* (secondary index on `industry`):
+
+*Find who follows Alice* (reverse lookup -- uses `ALLOW FILTERING` in CQL, but Ferrosa's graph engine makes this a fast indexed lookup):
+
+[source,sql]
+----
+include::queries.cql[]
+----
+
+=== Where CQL hits a wall
+
+These queries are impossible to express in a single CQL statement.
+Each one would require multiple round trips and application-side join logic:
+
+* *Friends of friends:* "Find people followed by people that Alice follows" -- requires fetching Alice's follows, then fetching each of their follows, then deduplicating
+* *Mutual followers:* "Who follows people that Alice follows?" -- requires reverse lookups per target, then intersection
+* *Shortest path:* "What is the shortest follow chain from Alice to Hank?" -- not expressible at all; requires BFS in application code
+* *Pattern matching:* "Find triangles: A follows B, B follows C, C follows A" -- combinatorial explosion in application code
+
+This is exactly where Ferrosa's graph engine takes over.
+
+== Graph Queries with Cypher
+
+Ferrosa exposes a graph HTTP endpoint on port `7474`.
+The same data you just inserted via CQL is immediately available for Cypher queries.
+No ETL. No sync delay. The graph index is updated asynchronously as CQL writes land -- typically within milliseconds.
+
+=== Check graph health
+
+[source,bash]
+----
+curl http://localhost:7474/graph/health
+----
+
+=== View the graph schema
+
+[source,bash]
+----
+curl http://localhost:7474/graph/schema | python3 -m json.tool
+----
+
+=== Direct follows
+
+Find everyone Alice follows.
+This is equivalent to the CQL partition-key lookup, but expressed in graph terms:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (a:Person {name: \"Alice\"})-[:FOLLOWS]->(b:Person) RETURN b.name, b.city"}'
+----
+
+=== Friends of friends (2-hop traversal)
+
+Find people at distance 2 from Alice in the follow graph.
+This is the query that CQL cannot express in a single statement:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (a:Person {name: \"Alice\"})-[:FOLLOWS]->()-[:FOLLOWS]->(friend2:Person) WHERE friend2.name <> \"Alice\" RETURN DISTINCT friend2.name"}'
+----
+
+=== Reverse traversal: who follows Alice?
+
+Bidirectional traversal is where the graph engine truly shines.
+In vanilla Cassandra, this requires `ALLOW FILTERING` (full-table scan).
+In Ferrosa, the graph engine's reverse adjacency index makes it instant:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (follower:Person)-[:FOLLOWS]->(a:Person {name: \"Alice\"}) RETURN follower.name"}'
+----
+
+=== Coworkers: people at the same company
+
+Traverse through a Company vertex to find colleagues.
+This crosses two edge types and would require three CQL queries plus application logic:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (a:Person {name: \"Alice\"})-[:WORKS_AT]->(c:Company)<-[:WORKS_AT]-(coworker:Person) WHERE coworker.name <> \"Alice\" RETURN coworker.name, coworker.age, c.name AS company"}'
+----
+
+=== Posts liked by people Alice follows
+
+A 3-hop traversal across two different edge types.
+This combines social graph data with content interaction data in one query:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (a:Person {name: \"Alice\"})-[:FOLLOWS]->(friend:Person)-[:LIKES]->(p:Post) RETURN friend.name, p.content"}'
+----
+
+=== Shortest path between two people
+
+Find the shortest follow chain between Alice and Hank.
+This is entirely impossible in CQL -- it requires a breadth-first search that Cypher handles natively:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH path = shortestPath((a:Person {name: \"Alice\"})-[:FOLLOWS*..6]->(h:Person {name: \"Hank\"})) RETURN [n IN nodes(path) | n.name] AS chain"}'
+----
+
+IMPORTANT: Every Cypher query above reads from the same CQL tables you created earlier.
+There is no data duplication.
+A CQL `INSERT` into the `follows` table is immediately visible to Cypher.
+One database, two query paradigms.
+
+== Fraud Ring Detection
+
+Graph databases excel at detecting fraud rings -- circular patterns of transactions that hide money laundering or collusion.
+The `transfers` edge table in our schema lets us detect suspicious cycles.
+
+=== Detect circular money flows
+
+Alice sends money to David, David sends to Frank, Frank sends back to Alice.
+This forms a 3-node cycle -- a classic money laundering pattern.
+
+Find all cycles of length 2 to 4 in the transfer graph:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH path = (a:Person)-[:TRANSFERS*2..4]->(a) RETURN [n IN nodes(path) | n.name] AS ring, [r IN relationships(path) | r.amount] AS amounts"}'
+----
+
+One query. Three lines.
+In vanilla Cassandra, detecting this cycle would require a custom application with BFS/DFS logic, multiple CQL queries per hop, and manual cycle detection.
+With Ferrosa's graph engine, the database does the traversal for you.
+
+=== Enrich with context
+
+Once you have identified suspicious accounts, use Cypher to pull their full network context -- who they work with, who they follow, and how they are connected:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (suspect:Person)-[:TRANSFERS*2..4]->(suspect) WITH DISTINCT suspect MATCH (suspect)-[r]-(connected) RETURN suspect.name, type(r) AS relationship, connected.name ORDER BY suspect.name"}'
+----
+
+== Recommendation Engine
+
+Collaborative filtering is a natural fit for graph queries: "People who liked the posts you liked also liked these other posts."
+This pattern powers recommendation systems at Netflix, Spotify, and Amazon.
+
+=== Basic collaborative filtering
+
+Find posts that Alice has not liked but that were liked by people who share her taste (liked the same posts she did):
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (a:Person {name: \"Alice\"})-[:LIKES]->(p:Post)<-[:LIKES]-(other:Person)-[:LIKES]->(rec:Post) WHERE NOT (a)-[:LIKES]->(rec) RETURN rec.content, COUNT(other) AS score ORDER BY score DESC"}'
+----
+
+=== Follow recommendations
+
+"Suggest people that Alice's friends follow, but Alice does not yet follow" -- the classic "People You May Know" feature:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (a:Person {name: \"Alice\"})-[:FOLLOWS]->(friend)-[:FOLLOWS]->(suggestion:Person) WHERE NOT (a)-[:FOLLOWS]->(suggestion) AND suggestion.name <> \"Alice\" RETURN suggestion.name, suggestion.city, COUNT(friend) AS mutual_friends ORDER BY mutual_friends DESC"}'
+----
+
+=== Company network discovery
+
+Find companies where people in Alice's extended network work.
+This helps with B2B sales, recruiting, or professional networking:
+
+[source,bash]
+----
+curl -X POST http://localhost:7474/graph/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (a:Person {name: \"Alice\"})-[:FOLLOWS*1..2]->(connection:Person)-[:WORKS_AT]->(c:Company) WHERE c.name <> \"Acme Corp\" RETURN c.name, c.industry, COLLECT(DISTINCT connection.name) AS connections"}'
+----
+
+=== Run all Cypher queries as a test suite
+
+A bash script is provided that runs all Cypher queries and checks HTTP status codes:
+
+[source,bash]
+----
+include::cypher-queries.sh[]
+----
+
+== When to Use Graph vs. CQL
+
+Ferrosa gives you both CQL and Cypher against the same underlying data.
+Here is a practical guide for choosing between them:
+
+[cols="2,1,1"]
+|===
+|Query type |Use CQL |Use Cypher
+
+|Key-value lookup by ID
+|Yes -- fastest path
+|Overkill
+
+|Time-range scans
+|Yes -- clustering key
+|No
+
+|High-throughput writes
+|Yes -- CQL writes
+|No (read-only endpoint)
+
+|Single-hop lookups
+|Yes -- partition key
+|Either works
+
+|Reverse lookups
+|Possible with ALLOW FILTERING
+|Yes -- reverse adjacency index
+
+|Multi-hop traversals
+|No -- requires app-side joins
+|Yes -- native support
+
+|Path finding
+|No -- impossible in CQL
+|Yes -- shortestPath, allPaths
+
+|Cycle / pattern detection
+|No
+|Yes -- variable-length patterns
+
+|Aggregations across relationships
+|No
+|Yes -- COUNT, COLLECT, AVG
+
+|Recommendation / collaborative filtering
+|No
+|Yes -- native pattern
+
+|Fraud ring detection
+|No
+|Yes -- cycle detection
+|===
+
+TIP: Use CQL for all writes and simple reads.
+Use Cypher for complex relationship queries and analytics.
+Both hit the same data -- there is no penalty for mixing them in the same application.
+
+A typical application architecture uses CQL in the hot write path (e.g., recording a new follow, inserting a post, logging a transaction) and Cypher in the read path for features that involve relationships (e.g., "People You May Know", fraud alerts, recommendation feeds).
+Since both read from the same tables, your data is always consistent.
+
+== What You Learned
+
+In this tutorial you:
+
+. *Created graph-annotated CQL tables* using `WITH extensions` to mark vertex and edge tables. No schema migration -- just annotations on standard CQL DDL.
+. *Loaded data with ordinary CQL `INSERT` statements.* The graph engine builds its adjacency index asynchronously -- you don't interact with it directly.
+. *Queried relationships with CQL* and saw where it works well (direct lookups, secondary index scans) and where it breaks down (multi-hop traversals, reverse lookups, path finding).
+. *Queried the same data with Cypher* and saw how friends-of-friends, coworker discovery, and shortest-path queries become single, readable statements.
+. *Detected a fraud ring* with a 3-line Cypher query that would have required hundreds of lines of application code against vanilla Cassandra.
+. *Built a recommendation engine* using collaborative filtering -- a pattern that typically requires a separate graph database and ETL pipeline.
+
+The core insight: *same data, two query paradigms.* CQL for speed and scale. Cypher for relationships and patterns. No data duplication. No separate database. No ETL. This is unique to Ferrosa.
+
+=== Next steps
+
+* Read the link:../cypher.html[Cypher Reference] for the full query language supported by Ferrosa's graph engine
+* Try the link:fraud-detection.html[Fraud Detection] tutorial for a deeper dive into real-time transaction scoring
+* Explore link:content-personalization.html[Content Personalization] to build a full recommendation pipeline

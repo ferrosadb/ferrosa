@@ -1,0 +1,48 @@
+name: Generate Example Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'examples/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'examples/**'
+
+jobs:
+  generate:
+    name: AsciiDoc → HTML
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install asciidoctor
+        run: sudo gem install asciidoctor --no-document
+
+      - name: Generate HTML
+        run: make -C examples html
+
+      - name: Verify generated files
+        run: |
+          echo "Generated files:"
+          ls -la docs/examples/*.html
+          COUNT=$(ls docs/examples/*.html | wc -l)
+          echo "Total: $COUNT HTML files"
+          if [ "$COUNT" -lt 12 ]; then
+            echo "::error::Expected at least 12 HTML files, got $COUNT"
+            exit 1
+          fi
+
+      - name: Commit generated HTML (main only)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/examples/
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "docs: regenerate example HTML from AsciiDoc sources"
+            git push
+          fi

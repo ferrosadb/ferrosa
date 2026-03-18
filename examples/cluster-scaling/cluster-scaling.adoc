@@ -1,0 +1,230 @@
+= Cluster Scaling: Development to Production
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+:linkcss:
+:icons: font
+:source-highlighter: rouge
+
+Ferrosa scales from a single development node to a production cluster without downtime.
+Most databases force you to choose your deployment topology up front -- a single-node install that you later throw away and replace with a cluster, or a heavyweight multi-node setup that's overkill for development.
+Ferrosa eliminates that tradeoff: start with one node on your laptop, add a hot standby when you're ready for production, then grow into a full Raft consensus cluster when your traffic demands it.
+
+This tutorial walks through three stages of that journey: *standalone* (development), *pair mode* (low-volume production with a hot standby), and *Raft cluster* (full production with consensus).
+At each transition, writes and schema changes continue uninterrupted.
+The data you inserted on a single node is still there after you've scaled to three -- no migrations, no re-bootstrapping, no downtime windows.
+
+== Prerequisites
+
+* *Docker and Docker Compose* -- see the link:../cluster-setup/cluster-setup.html[Cluster Setup Guide] if you need to install Docker
+* *cqlsh* -- `pip install cqlsh`
+* About *4 GB of RAM* available for the three nodes plus the object store
+
+[[act-1]]
+== Act 1: Standalone -- Development
+
+A single Ferrosa node is all you need for development.
+It starts fast, uses minimal resources, and gives you a fully functional CQL endpoint.
+
+=== Start node1
+
+[source,bash]
+----
+docker compose up -d
+----
+
+This launches node1 in `standalone` mode along with a local S3-compatible object store (RustFS).
+Wait for node1 to report healthy:
+
+[source,bash]
+----
+docker compose ps
+----
+
+You should see `node1` with status "healthy" and `rustfs` running.
+
+=== Create the schema
+
+Connect to node1 and bootstrap the event analytics schema:
+
+[source,bash]
+----
+cqlsh localhost 9042
+----
+
+[source,sql]
+----
+include::01-standalone-schema.cql[]
+----
+
+This creates the `app` keyspace with `replication_factor: 1` -- appropriate for a single development node -- and an `events` table partitioned by tenant and date.
+
+=== Insert seed data
+
+[source,sql]
+----
+include::02-standalone-writes.cql[]
+----
+
+TIP: `replication_factor: 1` means every write lands on the only node that exists. No coordination overhead, no quorum delays -- ideal for rapid iteration during development.
+
+[[act-2]]
+== Act 2: Pair Mode -- Low-Volume Production
+
+Pair mode adds a hot standby that receives replicated writes in real time.
+If the primary fails, the secondary can serve reads immediately.
+Think of it like PostgreSQL streaming replication, but it also replicates DDL -- schema changes propagate automatically.
+
+=== Add node2
+
+Scale from standalone to pair mode by layering the pair override file:
+
+[source,bash]
+----
+docker compose -f docker-compose.yml -f docker-compose.pair.yml up -d
+----
+
+This does two things: it restarts node1 with `FERROSA_CLUSTER_MODE=pair`, and it launches node2 as the secondary.
+Node2 connects to node1, receives the current schema and data, and begins replicating writes.
+
+IMPORTANT: Writes continue uninterrupted during this transition. Node1 accepts CQL commands throughout the mode change. If you have a background writer running (like `run-demo.sh` provides), it will not see any errors.
+
+Watch the pair form:
+
+[source,bash]
+----
+docker compose logs -f node1 node2
+----
+
+You should see node2 complete its handshake and report "Pair mode established with node1".
+Press `Ctrl+C` to stop following logs.
+
+=== Write more data
+
+With both nodes running, insert additional events.
+These writes replicate to node2 in real time:
+
+[source,sql]
+----
+include::03-pair-writes.cql[]
+----
+
+=== Schema changes replicate too
+
+One of pair mode's key features is DDL replication.
+Add a new column and a secondary index -- the schema change propagates to node2 automatically:
+
+[source,sql]
+----
+include::04-pair-ddl.cql[]
+----
+
+Verify the schema arrived on node2 by connecting to port 9043:
+
+[source,bash]
+----
+cqlsh localhost 9043 -e "DESCRIBE TABLE app.events;"
+----
+
+You should see the new `user_id` column and `events_by_user` index on both nodes.
+
+NOTE: In traditional Cassandra, schema changes propagate via gossip and can temporarily disagree across nodes. In Ferrosa pair mode, DDL is replicated synchronously -- the secondary's schema is always consistent with the primary's.
+
+[[act-3]]
+== Act 3: Raft Cluster -- Full Production
+
+When your traffic outgrows a two-node pair, add a third node to form a Raft consensus cluster.
+Three nodes give you:
+
+* *Fault tolerance* -- the cluster continues operating if any single node fails
+* *Tunable consistency* -- choose between `ONE`, `QUORUM`, or `ALL` per query
+* *Consensus-backed metadata* -- schema changes and topology updates go through Raft, guaranteeing agreement
+
+=== Add node3
+
+Layer all three compose files to bring up the full cluster:
+
+[source,bash]
+----
+docker compose -f docker-compose.yml -f docker-compose.pair.yml -f docker-compose.cluster.yml up -d
+----
+
+This transitions all three nodes to `FERROSA_CLUSTER_MODE=cluster`.
+Node3 joins, a Raft leader election completes, and the cluster stabilizes.
+
+[source,bash]
+----
+docker compose logs -f node1 node2 node3
+----
+
+Watch for these log messages:
+
+. Node3 connects to node1 (the seed)
+. Raft leader election completes -- one of the three nodes becomes leader
+. All three nodes report "Cluster mode active, 3 nodes in ring"
+
+=== Write through the cluster
+
+Now writes are coordinated through Raft consensus.
+Insert more events -- these are acknowledged after a quorum (2 of 3 nodes) confirms:
+
+[source,sql]
+----
+include::05-cluster-writes.cql[]
+----
+
+=== DDL through Raft
+
+Schema changes now go through Raft consensus, guaranteeing that all nodes agree on the schema before the DDL statement returns:
+
+[source,sql]
+----
+include::06-cluster-ddl.cql[]
+----
+
+TIP: In cluster mode, DDL statements are linearizable. A `CREATE TABLE` that succeeds is guaranteed to be visible on every node immediately -- no schema agreement delays.
+
+[[verify]]
+== Verification
+
+Confirm that all data survived every transition and that the cluster is healthy.
+
+[source,sql]
+----
+include::07-verify.cql[]
+----
+
+Connect to each node and check:
+
+* *Row counts* -- the `app.events` table should contain all rows inserted across all three phases
+* *Schema agreement* -- `DESCRIBE TABLE app.events` should show identical output on all three nodes, including the columns and indexes added during pair mode and cluster mode
+* *Cluster health* -- query the web API on any node:
+
+[source,bash]
+----
+curl -s http://localhost:9090/api/cluster/status | python3 -m json.tool
+----
+
+All three nodes should show `"status": "UP"`.
+
+== Running the Demo
+
+The `run-demo.sh` script automates the entire sequence above -- starting each phase, running CQL scripts, maintaining a background writer to prove zero-downtime transitions, and asserting correctness at each stage.
+
+[source,bash]
+----
+bash run-demo.sh
+----
+
+The script prints progress for each act and exits with a non-zero status if any assertion fails.
+
+== Teardown
+
+Remove all containers and volumes:
+
+[source,bash]
+----
+docker compose -f docker-compose.yml -f docker-compose.pair.yml -f docker-compose.cluster.yml down -v
+----
+
+This deletes all data. The S3 bucket, node volumes, and container state are all removed.

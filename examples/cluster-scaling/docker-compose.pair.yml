@@ -1,0 +1,45 @@
+# docker-compose.pair.yml — Phase 2: Add node2 in pair mode
+# Run with: docker compose -f docker-compose.yml -f docker-compose.pair.yml up -d
+#
+# Node1 stays standalone — it transitions to pair mode automatically
+# when node2 connects. This avoids recreating node1 and losing state.
+
+services:
+
+  # ── Node 2 (pair mode) ──
+  node2:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      node1:
+        condition: service_healthy
+    ports:
+      - "9043:9042"    # CQL
+      - "9091:9090"    # Web console
+    environment:
+      FERROSA_HOST_ID: bb222222-2222-2222-2222-222222222222
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: 0.0.0.0:9042
+      FERROSA_WEB_BIND: 0.0.0.0:9090
+      FERROSA_CLUSTER_NAME: ferrosa-scaling-demo
+      FERROSA_CLUSTER_MODE: pair
+      FERROSA_SEED: node1:7000
+      FERROSA_GRAPH_ENABLED: "true"
+
+      FERROSA_S3_ENDPOINT: http://rustfs:9000
+      FERROSA_S3_BUCKET: ferrosa
+      FERROSA_S3_REGION: us-east-1
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_PREFIX: node2
+    volumes:
+      - node2-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s

@@ -662,6 +662,16 @@ async fn handle_query(
             return HandleResult::Reply(Opcode::Error, err.encode_body());
         }
     };
+    cursor.advance(query_len as usize);
+
+    // Parse consistency level from protocol frame: [short consistency]
+    let cl = if cursor.remaining() >= 2 {
+        let wire_cl = cursor.get_u16();
+        ferrosa_cluster::consistency::ConsistencyLevel::from_wire(wire_cl)
+            .unwrap_or(ferrosa_cluster::consistency::ConsistencyLevel::One)
+    } else {
+        ferrosa_cluster::consistency::ConsistencyLevel::One
+    };
 
     // Parse the CQL statement.
     let stmt = match parser::parse(query) {
@@ -672,7 +682,7 @@ async fn handle_query(
     };
 
     // Build an auth context for routing (use a default if auth was disabled).
-    let ctx = build_request_context(auth_context, current_keyspace);
+    let ctx = build_request_context(auth_context, current_keyspace, cl);
 
     match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
@@ -796,6 +806,17 @@ async fn handle_execute(
     }
     let mut id = [0u8; 16];
     id.copy_from_slice(&cursor[..16]);
+    cursor.advance(16);
+
+    // Parse consistency level from EXECUTE frame: after the prepared ID
+    // comes [short consistency][byte flags][...values...].
+    let cl = if cursor.remaining() >= 2 {
+        let wire_cl = cursor.get_u16();
+        ferrosa_cluster::consistency::ConsistencyLevel::from_wire(wire_cl)
+            .unwrap_or(ferrosa_cluster::consistency::ConsistencyLevel::One)
+    } else {
+        ferrosa_cluster::consistency::ConsistencyLevel::One
+    };
 
     // Look up the prepared plan.
     let plan = match state.prepared_cache.get(&id) {
@@ -807,7 +828,7 @@ async fn handle_execute(
     };
 
     // Re-route the stored statement (simplified: no bound value substitution).
-    let ctx = build_request_context(auth_context, current_keyspace);
+    let ctx = build_request_context(auth_context, current_keyspace, cl);
 
     match crate::router::route(state, &ctx, plan.statement.clone()).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
@@ -927,9 +948,18 @@ async fn handle_batch(
         statements.push(stmt);
     }
 
+    // Parse consistency level: [short consistency] after all statements.
+    let cl = if cursor.remaining() >= 2 {
+        let wire_cl = cursor.get_u16();
+        ferrosa_cluster::consistency::ConsistencyLevel::from_wire(wire_cl)
+            .unwrap_or(ferrosa_cluster::consistency::ConsistencyLevel::One)
+    } else {
+        ferrosa_cluster::consistency::ConsistencyLevel::One
+    };
+
     // Route each statement.
     for stmt in statements {
-        let ctx = build_request_context(auth_context, current_keyspace);
+        let ctx = build_request_context(auth_context, current_keyspace, cl);
         match crate::router::route(state, &ctx, stmt).await {
             Ok(RouteResult::SetKeyspace(ks, _)) => {
                 *current_keyspace = Some(ks);
@@ -958,6 +988,7 @@ fn handle_register() -> HandleResult {
 fn build_request_context<'a>(
     auth_context: &'a mut Option<AuthContext>,
     current_keyspace: &'a Option<String>,
+    consistency: ferrosa_cluster::consistency::ConsistencyLevel,
 ) -> RequestContext<'a> {
     // If auth was disabled, we need a default auth context.
     if auth_context.is_none() {
@@ -970,6 +1001,7 @@ fn build_request_context<'a>(
     RequestContext {
         auth: auth_context.as_ref().unwrap(),
         current_keyspace,
+        consistency,
     }
 }
 

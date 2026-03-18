@@ -1,0 +1,168 @@
+# docker-compose.yml — 3-node Ferrosa cluster with S3-compatible storage
+# Run with: docker compose up -d
+
+services:
+
+  # ── Volume permissions (RustFS runs as UID 10001) ──
+  volume-permissions:
+    image: alpine
+    volumes:
+      - rustfs-data:/data
+    command: >
+      sh -c "chown -R 10001:10001 /data && echo 'permissions fixed'"
+    restart: "no"
+
+  # ── S3-compatible object store (RustFS) ──
+  rustfs:
+    image: rustfs/rustfs:latest
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
+    environment:
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── Create the S3 bucket on first run ──
+  rustfs-init:
+    image: minio/mc
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+             mc mb local/ferrosa --ignore-existing &&
+             echo 'bucket ferrosa ready'"
+    restart: "no"
+
+  # ── Node 1 (seed node) ──
+  node1:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "9042:9042"    # CQL
+      - "9090:9090"    # Web console
+      - "7474:7474"    # Graph
+    environment:
+      FERROSA_HOST_ID: 11111111-1111-1111-1111-111111111111
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: 0.0.0.0:9042
+      FERROSA_WEB_BIND: 0.0.0.0:9090
+      FERROSA_CLUSTER_NAME: ferrosa-tutorial
+      FERROSA_CLUSTER_MODE: standalone
+      FERROSA_GRAPH_ENABLED: "true"
+      FERROSA_S3_ENDPOINT: http://rustfs:9000
+      FERROSA_S3_BUCKET: ferrosa
+      FERROSA_S3_REGION: us-east-1
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_PREFIX: node1
+    volumes:
+      - node1-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # ── Node 2 ──
+  node2:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      node1:
+        condition: service_healthy
+    ports:
+      - "9043:9042"    # CQL
+      - "9091:9090"    # Web console
+      - "7475:7474"    # Graph
+    environment:
+      FERROSA_HOST_ID: 22222222-2222-2222-2222-222222222222
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: 0.0.0.0:9042
+      FERROSA_WEB_BIND: 0.0.0.0:9090
+      FERROSA_CLUSTER_NAME: ferrosa-tutorial
+      FERROSA_CLUSTER_MODE: pair
+      FERROSA_SEED: node1:7000
+      FERROSA_GRAPH_ENABLED: "true"
+      FERROSA_S3_ENDPOINT: http://rustfs:9000
+      FERROSA_S3_BUCKET: ferrosa
+      FERROSA_S3_REGION: us-east-1
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_PREFIX: node2
+    volumes:
+      - node2-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # ── Node 3 ──
+  node3:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+    ports:
+      - "9044:9042"    # CQL
+      - "9092:9090"    # Web console
+      - "7476:7474"    # Graph
+    environment:
+      FERROSA_HOST_ID: 33333333-3333-3333-3333-333333333333
+      FERROSA_DATA_DIR: /var/lib/ferrosa
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: 0.0.0.0:9042
+      FERROSA_WEB_BIND: 0.0.0.0:9090
+      FERROSA_CLUSTER_NAME: ferrosa-tutorial
+      FERROSA_CLUSTER_MODE: cluster
+      FERROSA_SEED: node1:7000
+      FERROSA_GRAPH_ENABLED: "true"
+      FERROSA_S3_ENDPOINT: http://rustfs:9000
+      FERROSA_S3_BUCKET: ferrosa
+      FERROSA_S3_REGION: us-east-1
+      FERROSA_S3_ACCESS_KEY_ID: rustfsadmin
+      FERROSA_S3_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_PREFIX: node3
+    volumes:
+      - node3-data:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9042' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+volumes:
+  rustfs-data:
+  node1-data:
+  node2-data:
+  node3-data:

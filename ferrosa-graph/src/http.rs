@@ -61,6 +61,7 @@ impl Default for GraphHttpConfig {
 pub struct AppState {
     pub engine: Arc<GraphEngine>,
     pub schema: Arc<Schema>,
+    pub auth_disabled: bool,
 }
 
 /// Request body for query and explain endpoints.
@@ -116,6 +117,11 @@ async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    // Bypass authentication when disabled
+    if state.auth_disabled {
+        return next.run(req).await;
+    }
+
     let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -786,7 +792,11 @@ mod tests {
             std::time::Duration::from_secs(300),
         ));
 
-        let state = AppState { engine, schema };
+        let state = AppState {
+            engine,
+            schema,
+            auth_disabled: true,
+        };
 
         // build_router should succeed and include subscribe/unsubscribe routes.
         let _router = build_router(state);

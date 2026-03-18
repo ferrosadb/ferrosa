@@ -367,6 +367,11 @@ fn decode_vint(data: &[u8], offset: &mut usize) -> Result<i64, CqlError> {
 }
 
 /// Read the 4-byte element count from a collection header.
+///
+/// Validates that `count` does not exceed what the remaining buffer can
+/// possibly hold. Each collection element needs at least a 4-byte length
+/// prefix, so `count` cannot exceed `(remaining_bytes) / 4`. This prevents
+/// a corrupt or malicious count from triggering a multi-gigabyte allocation.
 fn read_collection_header(bytes: &[u8]) -> Result<(i32, usize), CqlError> {
     if bytes.len() < 4 {
         return Err(CqlError::Invalid("collection too short for count".into()));
@@ -374,6 +379,19 @@ fn read_collection_header(bytes: &[u8]) -> Result<(i32, usize), CqlError> {
     let count = i32::from_be_bytes(bytes[..4].try_into().unwrap());
     if count < 0 {
         return Err(CqlError::Invalid("negative collection count".into()));
+    }
+    let remaining = bytes.len() - 4;
+    if count as usize > remaining / 4 {
+        tracing::warn!(
+            count,
+            remaining,
+            first_bytes = ?&bytes[..std::cmp::min(16, bytes.len())],
+            "collection decode: count exceeds buffer — possible data corruption"
+        );
+        return Err(CqlError::Invalid(format!(
+            "collection count {} exceeds buffer capacity ({} bytes remaining)",
+            count, remaining
+        )));
     }
     Ok((count, 4))
 }
@@ -851,6 +869,32 @@ mod tests {
         assert_eq!(decoded, udt_val);
     }
 
+    // === OOM bounds-check tests for corrupt collection counts ===
+
+    #[test]
+    fn decode_list_with_corrupt_count_returns_error() {
+        let bytes = [0x7F, 0xFF, 0xFF, 0xFF];
+        let result = decode_value(&CqlType::List(Box::new(CqlType::Int)), &bytes);
+        assert!(result.is_err(), "corrupt count must not trigger allocation");
+    }
+
+    #[test]
+    fn decode_set_with_corrupt_count_returns_error() {
+        let bytes = [0x7F, 0xFF, 0xFF, 0xFF];
+        let result = decode_value(&CqlType::Set(Box::new(CqlType::Int)), &bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_map_with_corrupt_count_returns_error() {
+        let bytes = [0x7F, 0xFF, 0xFF, 0xFF];
+        let result = decode_value(
+            &CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Int)),
+            &bytes,
+        );
+        assert!(result.is_err());
+    }
+
     #[test]
     fn decode_udt_with_fewer_fields_than_definition() {
         // Cassandra allows shorter encodings — trailing fields become null
@@ -936,6 +980,54 @@ mod proptests {
             let encoded = encode_value(&value);
             let decoded = decode_value(&cql_type, &encoded).unwrap();
             prop_assert_eq!(decoded, value);
+        }
+
+        #[test]
+        fn roundtrip_list(items in proptest::collection::vec(any::<i32>(), 0..20)) {
+            let val = CqlValue::List(items.iter().map(|n| CqlValue::Int(*n)).collect());
+            let encoded = encode_value(&val);
+            let decoded = decode_value(&CqlType::List(Box::new(CqlType::Int)), &encoded).unwrap();
+            prop_assert_eq!(val, decoded);
+        }
+
+        #[test]
+        fn roundtrip_set(items in proptest::collection::vec(any::<i64>(), 0..20)) {
+            let val = CqlValue::Set(items.iter().map(|n| CqlValue::Bigint(*n)).collect());
+            let encoded = encode_value(&val);
+            let decoded = decode_value(&CqlType::Set(Box::new(CqlType::Bigint)), &encoded).unwrap();
+            prop_assert_eq!(val, decoded);
+        }
+
+        #[test]
+        fn roundtrip_map(entries in proptest::collection::vec(
+            (any::<i32>(), "\\PC{0,20}"), 0..10
+        )) {
+            let val = CqlValue::Map(
+                entries.iter().map(|(k, v)| (CqlValue::Int(*k), CqlValue::Text(v.clone()))).collect()
+            );
+            let encoded = encode_value(&val);
+            let decoded = decode_value(
+                &CqlType::Map(Box::new(CqlType::Int), Box::new(CqlType::Varchar)),
+                &encoded
+            ).unwrap();
+            prop_assert_eq!(val, decoded);
+        }
+
+        #[test]
+        fn roundtrip_nested_list_of_tuples(
+            items in proptest::collection::vec(
+                (any::<i32>(), "\\PC{0,20}"), 0..5
+            )
+        ) {
+            let tuple_type = CqlType::Tuple(vec![CqlType::Int, CqlType::Varchar]);
+            let list_type = CqlType::List(Box::new(tuple_type.clone()));
+            let tuples: Vec<CqlValue> = items.iter().map(|(n, s)| {
+                CqlValue::Tuple(vec![Some(CqlValue::Int(*n)), Some(CqlValue::Text(s.clone()))])
+            }).collect();
+            let val = CqlValue::List(tuples);
+            let encoded = encode_value(&val);
+            let decoded = decode_value(&list_type, &encoded).unwrap();
+            prop_assert_eq!(val, decoded);
         }
     }
 }

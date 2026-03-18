@@ -1,0 +1,238 @@
+= Fraud Detection
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Build a real-time fraud scoring system. Ingest financial transactions, detect suspicious patterns, and flag anomalies -- all with sub-millisecond lookups.
+
+NOTE: This tutorial assumes you have a running Ferrosa cluster. If you have not set one up yet, follow the Getting Started guide first. You should be able to connect with `cqlsh` before continuing.
+
+== Create the keyspace
+
+Fraud detection systems need strong durability guarantees -- you cannot afford to lose a transaction record. A replication factor of 3 means every transaction is stored on three separate nodes, so even if a node fails, your data is safe.
+
+[source,sql]
+----
+include::schema.cql[lines=4..7]
+----
+
+== Design the schema
+
+A fraud detection system revolves around three things: transactions (the raw financial events), account profiles (behavioral baselines for each customer), and alerts (flagged anomalies that need investigation). We will create a table for each.
+
+=== Transactions table
+
+This is your primary data table. Every card swipe, wire transfer, and online purchase lands here. Partitioning by `account_id` keeps all of a customer's transactions together, and clustering by `transaction_time DESC` puts the newest ones first.
+
+[source,sql]
+----
+include::schema.cql[lines=9..21]
+----
+
+NOTE: *Why include transaction_id in the key?* A customer could have two transactions at the exact same timestamp (think: a split-second double-tap on a payment terminal). Adding `transaction_id` as a tiebreaker guarantees uniqueness in the clustering order.
+
+=== Account profile table
+
+This stores each customer's risk baseline: their typical spending patterns, home country, and whether they have been flagged. Your fraud scoring engine reads this to decide if a transaction looks normal.
+
+[source,sql]
+----
+include::schema.cql[lines=23..32]
+----
+
+=== Alerts table
+
+When a transaction trips a fraud rule, an alert is created. We partition alerts by `alert_date` so you can efficiently pull all alerts for a given day -- the most common query for fraud analysts working through their queue.
+
+[source,sql]
+----
+include::schema.cql[lines=34..45]
+----
+
+Here is a quick reference for how these tables work together:
+
+[cols="1,1,1,2", options="header"]
+|===
+| Table | Partition Key | Clustering Key | Serves
+
+| transactions
+| `account_id`
+| `transaction_time DESC`
+| Per-account transaction history
+
+| account_profile
+| `account_id`
+| --
+| Behavioral baseline lookup
+
+| alerts
+| `alert_date`
+| `alert_time DESC`
+| Daily analyst queue
+|===
+
+Notice the pattern: each table is optimized for a specific workflow. The `transactions` table powers the investigation view, `account_profile` provides context, and `alerts` drives the analyst's daily queue.
+
+Your schema is in place. Let's load it with realistic transaction data.
+
+== Populate with sample data
+
+=== Create account profiles
+
+We will set up three customers with different spending patterns. Pay attention to the `avg_transaction` and `max_transaction` values -- they establish what "normal" looks like for each account.
+
+[source,sql]
+----
+include::data.cql[lines=6..25]
+----
+
+=== Insert normal transactions
+
+First, some everyday transactions that look completely normal for each account:
+
+[source,sql]
+----
+include::data.cql[lines=27..51]
+----
+
+=== Insert suspicious transactions
+
+Now the interesting part. Let's add some transactions that should trigger fraud rules -- large amounts, unusual countries, and rapid-fire purchases:
+
+[source,sql]
+----
+include::data.cql[lines=53..76]
+----
+
+=== Create alerts
+
+These alerts are what a fraud analyst sees in their dashboard. Each one links back to the transaction that triggered it:
+
+[source,sql]
+----
+include::data.cql[lines=78..106]
+----
+
+== Query your data
+
+=== View recent transactions for an account
+
+The first thing a fraud analyst does when reviewing an alert is pull up the customer's recent activity. This is a single-partition read -- fast and efficient:
+
+[source,sql]
+----
+include::queries.cql[lines=6..9]
+----
+
+You will see Sarah's transactions in reverse chronological order, with the two suspicious electronics purchases at the top.
+
+=== Find high-risk transactions
+
+Pull all transactions for a given account that have an elevated risk score. This helps the analyst focus on what matters:
+
+[source,sql]
+----
+include::queries.cql[lines=11..15]
+----
+
+This gives you all of Sarah's transactions from today. In your application code, you would filter for `risk_score > 70` after fetching the results.
+
+=== Review today's alerts
+
+Pull up the fraud analyst's daily queue -- every alert generated today, newest first:
+
+[source,sql]
+----
+include::queries.cql[lines=17..20]
+----
+
+Because we partitioned by `alert_date`, this reads a single partition. Even with millions of historical alerts, today's queue loads instantly.
+
+=== Find unresolved alerts only
+
+Analysts want to see what still needs attention. Pull today's alerts and filter for `resolved = false`:
+
+[source,sql]
+----
+include::queries.cql[lines=22..26]
+----
+
+IMPORTANT: *About ALLOW FILTERING:* In production, you would typically handle this filter in your application layer or create a separate table for unresolved alerts. We use `ALLOW FILTERING` here because the partition is small (one day of alerts). For large partitions, always prefer a dedicated table.
+
+=== Check an account's risk profile
+
+When investigating an alert, you need the customer's baseline. This is a single-row lookup by primary key:
+
+[source,sql]
+----
+include::queries.cql[lines=28..31]
+----
+
+You will see that Priya's average transaction is only 45 GBP, her home country is GB, and she is already flagged. The 850 USD transaction from New York is wildly out of pattern.
+
+=== Detect unusual country patterns
+
+To find all of Priya's transactions from outside her home country, query her partition and filter by country in your application:
+
+[source,sql]
+----
+include::queries.cql[lines=33..36]
+----
+
+Looking at the results, you can see the pattern: legitimate UK purchases followed by a burst of US transactions -- classic card-not-present fraud from a stolen card number.
+
+=== Review transactions in a specific time window
+
+To zoom in on the suspicious activity window for Sarah's account, use a time-range filter on the clustering key:
+
+[source,sql]
+----
+include::queries.cql[lines=38..42]
+----
+
+This narrows the results to just that one-hour window where the suspicious activity occurred. Both high-value transactions will appear, making the rapid-succession pattern obvious.
+
+=== Compare a transaction against the account baseline
+
+A core fraud detection operation is comparing a transaction amount against the customer's historical average. First, fetch the profile:
+
+[source,sql]
+----
+include::queries.cql[lines=44..47]
+----
+
+Sarah's average is $85.50 and her previous maximum was $450. That $2,899.99 electronics purchase is over 33 times her average and 6 times her previous max. In your application code, you would compute this ratio and assign the risk score accordingly.
+
+=== Resolve an alert
+
+After investigating, the analyst confirms the unusual-country alert for Marcus was actually him on a business trip. Mark it as resolved:
+
+TIP: In practice, you would capture the `alert_id` from your earlier query results. CQL requires all primary key columns in an `UPDATE` -- this ensures you are modifying exactly the right row.
+
+=== Update an account's risk level
+
+After investigating, the analyst decides to flag Sarah's account while the investigation is open:
+
+[source,sql]
+----
+include::queries.cql[lines=49..51]
+----
+
+Verify the update:
+
+[source,sql]
+----
+include::queries.cql[lines=53..56]
+----
+
+== What you learned
+
+You built the data layer for a real-time fraud detection system. Here is what you practiced:
+
+* *Time-series partitioning for transactions.* By partitioning on `account_id` and clustering on `transaction_time DESC`, you can pull any customer's recent activity in a single read. This pattern works at any scale -- whether a customer has 10 transactions or 10 million.
+* *Date-bucketed alert queues.* Partitioning alerts by `alert_date` keeps daily workloads bounded. An analyst's queue never touches historical data unless they explicitly query a different date.
+* *Composite clustering keys for uniqueness.* Adding `transaction_id` after `transaction_time` prevents collisions when two transactions happen at the same instant. This is a common pattern in high-throughput systems.
+* *Risk scoring at write time.* By computing the `risk_score` when the transaction is written, you avoid expensive recalculation on reads. The score is just another column -- no joins, no subqueries.
+* *Profile lookups for context.* The `account_profile` table gives O(1) access to behavioral baselines. Your fraud engine compares each transaction against these baselines to decide if it looks suspicious.
+
+From here, you could add a `merchant_risk` table to score merchants independently, a `device_fingerprints` table to track which devices are associated with each account, or a `blocked_cards` table for instant card-level blocks.
