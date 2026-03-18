@@ -3,39 +3,47 @@
 
 services:
 
+  # ── Volume permissions (RustFS runs as UID 10001) ──
+  volume-permissions:
+    image: alpine
+    volumes:
+      - rustfs-data:/data
+    command: >
+      sh -c "chown -R 10001:10001 /data && echo 'permissions fixed'"
+    restart: "no"
+
   # ── S3-compatible object store (RustFS) ──
   rustfs:
     image: rustfs/rustfs:latest
-    command: server
-    ports:
-      - "9000:9000"    # S3 API
-      - "9001:9001"    # Web console
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
     environment:
-      RUSTFS_VOLUMES: /data
-      RUSTFS_ADDRESS: :9000
-      RUSTFS_CONSOLE_ADDRESS: :9001
-      RUSTFS_CONSOLE_ENABLE: "on"
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
     volumes:
       - rustfs-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 10s
 
   # ── Create the S3 bucket on first run ──
   rustfs-init:
-    image: minio/mc:latest
+    image: minio/mc
     depends_on:
       rustfs:
         condition: service_healthy
     entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
-      mc mb local/ferrosa --ignore-existing
-      "
+      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+             mc mb local/ferrosa --ignore-existing &&
+             echo 'bucket ferrosa ready'"
     restart: "no"
 
   # ── Node 1 (seed node) ──
