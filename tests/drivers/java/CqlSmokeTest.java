@@ -1,13 +1,20 @@
 package ferrosa.test;
 
 import com.datastax.oss.driver.api.core.CqlSession;
+import com.datastax.oss.driver.api.core.cql.BatchStatement;
+import com.datastax.oss.driver.api.core.cql.DefaultBatchType;
 import com.datastax.oss.driver.api.core.cql.PreparedStatement;
 import com.datastax.oss.driver.api.core.cql.ResultSet;
 import com.datastax.oss.driver.api.core.cql.Row;
+import com.datastax.oss.driver.api.core.cql.SimpleStatement;
+import com.datastax.oss.driver.api.core.servererrors.InvalidQueryException;
+import com.datastax.oss.driver.api.core.servererrors.SyntaxError;
 
 import java.net.InetSocketAddress;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * CQL driver smoke tests using the DataStax Java driver 4.x.
@@ -220,6 +227,217 @@ public class CqlSmokeTest {
             Row row = rs.one();
             assertTrue(row != null, "expected 1 row");
             assertEqual(row.getString("name"), "JavaPrepared", "name");
+        });
+
+        // ---- Collections ----------------------------------------------------
+
+        test("CREATE TABLE collections", () -> {
+            session.execute(
+                    "CREATE TABLE IF NOT EXISTS " + KEYSPACE + ".collections (" +
+                            "id int PRIMARY KEY, " +
+                            "tags list<text>, " +
+                            "scores set<int>, " +
+                            "props map<text, text>" +
+                            ")");
+        });
+
+        test("INSERT collections", () -> {
+            session.execute(
+                    "INSERT INTO " + KEYSPACE + ".collections (id, tags, scores, props) " +
+                            "VALUES (1, ['tag1', 'tag2', 'tag3'], {10, 20, 30}, {'k1': 'v1', 'k2': 'v2'})");
+        });
+
+        test("SELECT list", () -> {
+            ResultSet rs = session.execute(
+                    "SELECT tags FROM " + KEYSPACE + ".collections WHERE id = 1");
+            Row row = rs.one();
+            assertTrue(row != null, "expected 1 row");
+            List<String> tags = row.getList("tags", String.class);
+            assertEqual(tags.size(), 3, "list size");
+            assertEqual(tags.get(0), "tag1", "tags[0]");
+            assertEqual(tags.get(1), "tag2", "tags[1]");
+            assertEqual(tags.get(2), "tag3", "tags[2]");
+        });
+
+        test("SELECT set", () -> {
+            ResultSet rs = session.execute(
+                    "SELECT scores FROM " + KEYSPACE + ".collections WHERE id = 1");
+            Row row = rs.one();
+            assertTrue(row != null, "expected 1 row");
+            Set<Integer> scores = row.getSet("scores", Integer.class);
+            assertEqual(scores.size(), 3, "set size");
+            assertTrue(scores.contains(10), "set should contain 10");
+            assertTrue(scores.contains(20), "set should contain 20");
+            assertTrue(scores.contains(30), "set should contain 30");
+        });
+
+        test("SELECT map", () -> {
+            ResultSet rs = session.execute(
+                    "SELECT props FROM " + KEYSPACE + ".collections WHERE id = 1");
+            Row row = rs.one();
+            assertTrue(row != null, "expected 1 row");
+            Map<String, String> props = row.getMap("props", String.class, String.class);
+            assertEqual(props.size(), 2, "map size");
+            assertEqual(props.get("k1"), "v1", "map[k1]");
+            assertEqual(props.get("k2"), "v2", "map[k2]");
+        });
+
+        // ---- ALTER / DELETE / UPDATE ----------------------------------------
+
+        test("ALTER TABLE add column", () -> {
+            session.execute(
+                    "ALTER TABLE " + KEYSPACE + ".users ADD phone text");
+        });
+
+        test("DELETE row", () -> {
+            session.execute(
+                    "INSERT INTO " + KEYSPACE + ".users (id, name) VALUES (900, 'ToDelete')");
+            session.execute(
+                    "DELETE FROM " + KEYSPACE + ".users WHERE id = 900");
+            ResultSet rs = session.execute(
+                    "SELECT * FROM " + KEYSPACE + ".users WHERE id = 900");
+            Row row = rs.one();
+            assertTrue(row == null, "row should be deleted");
+        });
+
+        test("UPDATE row", () -> {
+            session.execute(
+                    "INSERT INTO " + KEYSPACE + ".users (id, name, email) " +
+                            "VALUES (901, 'BeforeUpdate', 'old@test.com')");
+            session.execute(
+                    "UPDATE " + KEYSPACE + ".users SET email = 'new@test.com' WHERE id = 901");
+            ResultSet rs = session.execute(
+                    "SELECT email FROM " + KEYSPACE + ".users WHERE id = 901");
+            Row row = rs.one();
+            assertTrue(row != null, "expected 1 row");
+            assertEqual(row.getString("email"), "new@test.com", "updated email");
+        });
+
+        test("INSERT IF NOT EXISTS", () -> {
+            // First insert should succeed
+            session.execute(
+                    "INSERT INTO " + KEYSPACE + ".users (id, name) VALUES (902, 'LwtUser') IF NOT EXISTS");
+            // Second insert should not apply
+            ResultSet rs = session.execute(
+                    "INSERT INTO " + KEYSPACE + ".users (id, name) VALUES (902, 'LwtUserDup') IF NOT EXISTS");
+            assertTrue(!rs.wasApplied(), "[applied] should be false");
+        });
+
+        // ---- Batch ----------------------------------------------------------
+
+        test("batch INSERT", () -> {
+            BatchStatement batch = BatchStatement.builder(DefaultBatchType.LOGGED)
+                    .addStatement(SimpleStatement.newInstance(
+                            "INSERT INTO " + KEYSPACE + ".users (id, name) VALUES (801, 'BatchUser1')"))
+                    .addStatement(SimpleStatement.newInstance(
+                            "INSERT INTO " + KEYSPACE + ".users (id, name) VALUES (802, 'BatchUser2')"))
+                    .addStatement(SimpleStatement.newInstance(
+                            "INSERT INTO " + KEYSPACE + ".users (id, name) VALUES (803, 'BatchUser3')"))
+                    .build();
+            session.execute(batch);
+
+            // Verify all three rows
+            for (int id = 801; id <= 803; id++) {
+                ResultSet rs = session.execute(
+                        "SELECT name FROM " + KEYSPACE + ".users WHERE id = " + id);
+                Row row = rs.one();
+                assertTrue(row != null, "batch row " + id + " should exist");
+                assertEqual(row.getString("name"), "BatchUser" + (id - 800), "batch row " + id + " name");
+            }
+        });
+
+        // ---- TTL ------------------------------------------------------------
+
+        test("INSERT with TTL", () -> {
+            session.execute(
+                    "INSERT INTO " + KEYSPACE + ".users (id, name) VALUES (950, 'TtlUser') USING TTL 1");
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            ResultSet rs = session.execute(
+                    "SELECT * FROM " + KEYSPACE + ".users WHERE id = 950");
+            Row row = rs.one();
+            assertTrue(row == null, "row should have expired via TTL");
+        });
+
+        // ---- Counts & Limits ------------------------------------------------
+
+        test("SELECT COUNT(*)", () -> {
+            ResultSet rs = session.execute(
+                    "SELECT COUNT(*) FROM " + KEYSPACE + ".users");
+            Row row = rs.one();
+            assertTrue(row != null, "expected result row");
+            long count = row.getLong(0);
+            assertTrue(count > 0, "expected count > 0, got " + count);
+        });
+
+        test("SELECT LIMIT", () -> {
+            ResultSet rs = session.execute(
+                    "SELECT * FROM " + KEYSPACE + ".users LIMIT 2");
+            List<Row> rows = rs.all();
+            assertTrue(rows.size() <= 2, "expected at most 2 rows, got " + rows.size());
+        });
+
+        // ---- Error handling -------------------------------------------------
+
+        test("query nonexistent table", () -> {
+            boolean caught = false;
+            try {
+                session.execute("SELECT * FROM " + KEYSPACE + ".no_such_table");
+            } catch (InvalidQueryException e) {
+                caught = true;
+            }
+            assertTrue(caught, "expected InvalidQueryException for nonexistent table");
+        });
+
+        test("invalid CQL syntax", () -> {
+            boolean caught = false;
+            try {
+                session.execute("NOT VALID CQL AT ALL");
+            } catch (SyntaxError e) {
+                caught = true;
+            }
+            assertTrue(caught, "expected SyntaxError for invalid CQL syntax");
+        });
+
+        // ---- System schema --------------------------------------------------
+
+        test("system_schema.keyspaces", () -> {
+            ResultSet rs = session.execute(
+                    "SELECT keyspace_name FROM system_schema.keyspaces");
+            List<Row> rows = rs.all();
+            boolean found = false;
+            for (Row row : rows) {
+                if (KEYSPACE.equals(row.getString("keyspace_name"))) {
+                    found = true;
+                    break;
+                }
+            }
+            assertTrue(found, "expected " + KEYSPACE + " in system_schema.keyspaces");
+        });
+
+        // ---- NULL handling --------------------------------------------------
+
+        test("INSERT NULL", () -> {
+            session.execute(
+                    "INSERT INTO " + KEYSPACE + ".users (id, name) VALUES (960, null)");
+        });
+
+        test("SELECT NULL", () -> {
+            ResultSet rs = session.execute(
+                    "SELECT name FROM " + KEYSPACE + ".users WHERE id = 960");
+            Row row = rs.one();
+            assertTrue(row != null, "expected 1 row");
+            assertTrue(row.isNull("name"), "name should be null");
+        });
+
+        // ---- Index ----------------------------------------------------------
+
+        test("CREATE INDEX", () -> {
+            session.execute(
+                    "CREATE INDEX IF NOT EXISTS ON " + KEYSPACE + ".users (name)");
         });
 
         // ---- Cleanup --------------------------------------------------------

@@ -155,6 +155,34 @@ services:
       FERROSA_HOST: ferrosa
       FERROSA_CQL_PORT: "9042"
 
+  # -------------------------------------------------------------------------
+  # C# driver tests (CQL)
+  # -------------------------------------------------------------------------
+  csharp-tests:
+    build:
+      context: ./csharp
+      dockerfile: Dockerfile
+    depends_on:
+      ferrosa:
+        condition: service_healthy
+    environment:
+      FERROSA_HOST: ferrosa
+      FERROSA_CQL_PORT: "9042"
+
+  # -------------------------------------------------------------------------
+  # Rust driver tests (CQL)
+  # -------------------------------------------------------------------------
+  rust-tests:
+    build:
+      context: ./rust
+      dockerfile: Dockerfile
+    depends_on:
+      ferrosa:
+        condition: service_healthy
+    environment:
+      FERROSA_HOST: ferrosa
+      FERROSA_CQL_PORT: "9042"
+
 volumes:
   rustfs-data:
   ferrosa-data:
