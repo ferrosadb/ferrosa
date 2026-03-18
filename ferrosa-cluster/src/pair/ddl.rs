@@ -859,6 +859,127 @@ mod tests {
     }
 
     #[test]
+    fn ddl_operation_create_index_roundtrip() {
+        use ferrosa_index::IndexType;
+        use ferrosa_schema::metadata::index::IndexMetadata;
+        let op = DdlOperation::CreateIndex(IndexMetadata {
+            keyspace: "qa_pair".to_string(),
+            table: "kv".to_string(),
+            name: "qa_pair_v_idx".to_string(),
+            index_type: IndexType::Hash,
+            target_columns: vec!["v".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        });
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::CreateIndex(idx) => {
+                assert_eq!(idx.keyspace, "qa_pair");
+                assert_eq!(idx.table, "kv");
+                assert_eq!(idx.name, "qa_pair_v_idx");
+                assert!(matches!(idx.index_type, IndexType::Hash));
+                assert_eq!(idx.target_columns, vec!["v"]);
+                assert!(idx.filter_predicate.is_none());
+                assert!(idx.options.is_empty());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ddl_operation_drop_index_roundtrip() {
+        let op = DdlOperation::DropIndex {
+            keyspace: "qa_pair".to_string(),
+            table: "kv".to_string(),
+            index: "qa_pair_v_idx".to_string(),
+        };
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::DropIndex {
+                keyspace,
+                table,
+                index,
+            } => {
+                assert_eq!(keyspace, "qa_pair");
+                assert_eq!(table, "kv");
+                assert_eq!(index, "qa_pair_v_idx");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wire_schema_snapshot_roundtrip_with_tables() {
+        let mut tables = std::collections::HashMap::new();
+        tables.insert(
+            ("test_ks".to_string(), "test_tbl".to_string()),
+            test_table(),
+        );
+        let mut keyspaces = std::collections::HashMap::new();
+        keyspaces.insert("test_ks".to_string(), test_keyspace());
+
+        let snap = SchemaSnapshot {
+            version: Uuid::new_v4(),
+            keyspaces,
+            tables,
+            indexes: std::collections::HashMap::new(),
+            roles: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
+            types: std::collections::HashMap::new(),
+            functions: std::collections::HashMap::new(),
+            aggregates: std::collections::HashMap::new(),
+        };
+
+        let wire = WireSchemaSnapshot::from_snapshot(&snap);
+        assert_eq!(wire.tables.len(), 1, "should have one table entry");
+        assert_eq!(wire.keyspaces.len(), 1, "should have one keyspace");
+
+        let restored = wire.into_snapshot();
+        let key = ("test_ks".to_string(), "test_tbl".to_string());
+        let tbl = restored.tables.get(&key);
+        assert!(tbl.is_some(), "table should be present after roundtrip");
+        assert_eq!(tbl.unwrap().name, "test_tbl");
+        assert_eq!(tbl.unwrap().keyspace, "test_ks");
+    }
+
+    #[test]
+    fn wire_schema_snapshot_json_roundtrip() {
+        // Verifies the serde_json path used by send_schema_sync_to_peer.
+        let mut tables = std::collections::HashMap::new();
+        tables.insert(
+            ("test_ks".to_string(), "test_tbl".to_string()),
+            test_table(),
+        );
+
+        let snap = SchemaSnapshot {
+            version: Uuid::new_v4(),
+            keyspaces: std::collections::HashMap::new(),
+            tables,
+            indexes: std::collections::HashMap::new(),
+            roles: std::collections::HashMap::new(),
+            grants: std::collections::HashMap::new(),
+            types: std::collections::HashMap::new(),
+            functions: std::collections::HashMap::new(),
+            aggregates: std::collections::HashMap::new(),
+        };
+
+        let wire = WireSchemaSnapshot::from_snapshot(&snap);
+        let json = serde_json::to_vec(&wire).expect("serialization should succeed");
+        assert!(!json.is_empty(), "JSON bytes should not be empty");
+
+        let decoded: WireSchemaSnapshot =
+            serde_json::from_slice(&json).expect("deserialization should succeed");
+        let restored = decoded.into_snapshot();
+        let key = ("test_ks".to_string(), "test_tbl".to_string());
+        assert!(
+            restored.tables.contains_key(&key),
+            "table should survive JSON roundtrip"
+        );
+    }
+
+    #[test]
     fn wire_schema_snapshot_preserves_types() {
         use ferrosa_common::CqlType;
         let mut types = std::collections::HashMap::new();

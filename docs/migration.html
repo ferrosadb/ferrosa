@@ -408,6 +408,12 @@ cluster = Cluster([<span class="str">'ferrosa-node-1.prod'</span>])</pre>
   <p>Copy these files from your Cassandra data directory to Ferrosa's data directory, organized
     by keyspace and table. Ferrosa will pick them up on next read.</p>
 
+  <div class="note">
+    <strong>Note:</strong> SSTable import is currently a manual file-copy process. A dedicated
+    <code>ferrosa-import</code> CLI tool with validation and progress reporting is planned for a
+    future release.
+  </div>
+
   <h3>Compression support</h3>
   <p>Ferrosa supports LZ4 and Zstd compressed SSTables. No decompression step needed — compressed
     SSTables are read directly.</p>

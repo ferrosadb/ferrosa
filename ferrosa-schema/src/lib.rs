@@ -11,6 +11,7 @@ pub mod error;
 pub mod metadata;
 pub mod registry;
 pub mod secrets;
+pub mod serde_helpers;
 pub mod startup;
 pub mod system;
 pub mod validation;

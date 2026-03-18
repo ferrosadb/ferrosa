@@ -238,13 +238,13 @@ fn concurrent_writers_during_flush() {
         })
         .collect();
 
-    // Flush while writers are active.
+    // Flush while writers are active.  Wait long enough that at least some
+    // writes land first — 1 ms was too short on resource-constrained CI runners.
     let flusher = {
         let engine = Arc::clone(&engine);
         let tid = tid.clone();
         thread::spawn(move || {
-            // Small sleep to let some writes happen first.
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(50));
             engine.flush(&tid).unwrap();
         })
     };

@@ -35,7 +35,7 @@ use ferrosa_storage::CommitLogPosition;
 use crate::config::ClusterConfig;
 use crate::consistency::ConsistencyLevel;
 use crate::coordinator::ClusterCoordinator;
-use crate::ddl_path::DdlPath;
+use crate::ddl_path::{ClusterDdlForwardHandler, DdlPath};
 use crate::error::{ClusterError, Result};
 use crate::hints::delivery::HintDeliveryTask;
 use crate::hints::{HintConfig, HintStore};
@@ -402,16 +402,18 @@ impl ModeController {
     pub async fn switchover(&self) -> Result<()> {
         let (role_arc, peer_host_id) = {
             let ctx = self.pair_context.lock().unwrap();
-            let ctx = ctx
-                .as_ref()
-                .ok_or(ClusterError::Internal("not in pair mode".into()))?;
+            let ctx = ctx.as_ref().ok_or(ClusterError::ModeTransitionRejected(
+                "switchover requires pair mode; current node is standalone".into(),
+            ))?;
             (ctx.role.clone(), ctx.peer_host_id)
         };
 
         let peer_manager = match &**self.peer_manager.load() {
             Some(pm) => pm.clone(),
             None => {
-                return Err(ClusterError::Internal("peer_manager not set".into()));
+                return Err(ClusterError::ModeTransitionRejected(
+                    "peer manager not initialized; peer may be disconnected".into(),
+                ));
             }
         };
 
@@ -571,27 +573,7 @@ impl ModeController {
                 }
 
                 // Send schema snapshot before mutation replay.
-                // SchemaSnapshot has HashMap<(String,String), _> which serde_json
-                // can't serialize (tuple keys aren't valid JSON keys). Use bincode-
-                // style workaround: serialize tables as a Vec of (key, value) pairs.
-                let snap = schema.snapshot();
-                let wire_snap = crate::pair::ddl::WireSchemaSnapshot::from_snapshot(&snap);
-                match serde_json::to_vec(&wire_snap) {
-                    Ok(json) => {
-                        match pm
-                            .send(
-                                peer_host_id,
-                                Message::PairSchemaSync(Bytes::from(json)),
-                                Lane::Bulk,
-                            )
-                            .await
-                        {
-                            Ok(_) => tracing::info!("schema snapshot sent to rejoined peer"),
-                            Err(e) => tracing::warn!(%e, "failed to send schema snapshot"),
-                        }
-                    }
-                    Err(e) => tracing::warn!(%e, "failed to serialize schema snapshot"),
-                }
+                send_schema_sync_to_peer(&pm, peer_host_id, &schema).await;
 
                 // Force sync commit log to disk before replay.
                 if let Err(e) = storage.force_commit_log_sync() {
@@ -622,6 +604,18 @@ impl ModeController {
                     Err(e) => tracing::warn!(%e, "catch-up replay_from failed"),
                 }
             });
+        } else if role == PairRole::Primary {
+            // Normal pair rejoin (no force-promote): primary sends schema snapshot so
+            // the secondary catches up on any schema changes made while it was offline.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let pm = peer_manager;
+                let schema = self.schema.clone();
+                handle.spawn(async move {
+                    // Wait for peer to complete its pair transition and register handlers.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    send_schema_sync_to_peer(&pm, peer_host_id, &schema).await;
+                });
+            }
         }
     }
 
@@ -674,6 +668,13 @@ impl ModeController {
         }
         // Register self
         network_factory.register_node(local_node_id, self.local_host_id);
+
+        // Capture the node_map Arc before the factory is consumed by FerrosRaft::new.
+        // This shared map is used by DdlPath::Cluster to resolve leader NodeId → Uuid.
+        let node_map_for_ddl = network_factory.node_map();
+        // Clone peer_manager for DdlPath::Cluster forwarding (ClusterCoordinator
+        // will consume `peer_manager` below).
+        let peer_manager_for_ddl = peer_manager.clone();
 
         // 4. Build TokenRing with deterministic initial tokens
         let mut ring = TokenRing::new();
@@ -878,7 +879,19 @@ impl ModeController {
                         leader = lid,
                         "raft leader elected, swapping DDL path to Cluster"
                     );
-                    ddl_path.store(Arc::new(DdlPath::Cluster(raft_arc.clone())));
+                    // Register the cluster DDL forward handler so that when a
+                    // non-leader forwards a PairDdlForward to the leader, the
+                    // leader proposes it through Raft rather than applying
+                    // directly (which would bypass consensus).
+                    let cluster_ddl_handler =
+                        Arc::new(ClusterDdlForwardHandler::new(raft_arc.clone()));
+                    registry.register(MsgType::PairDdlForward, cluster_ddl_handler);
+
+                    ddl_path.store(Arc::new(DdlPath::Cluster {
+                        raft: raft_arc.clone(),
+                        peer_manager: peer_manager_for_ddl,
+                        node_map: node_map_for_ddl,
+                    }));
                 }
                 None => {
                     tracing::warn!(
@@ -1102,6 +1115,32 @@ impl InboundPeerCallback for ModeController {
                 self.trigger_cluster_join(host_id, addr);
             }
         }
+    }
+}
+
+/// Send the full schema snapshot to a peer over the bulk lane.
+///
+/// Used both after a force-promote rejoin (to sync schema + data replay) and
+/// after a normal pair reconnection (to catch up schema changes the secondary
+/// missed while it was offline).
+async fn send_schema_sync_to_peer(pm: &PeerManager, peer_host_id: Uuid, schema: &Schema) {
+    let snap = schema.snapshot();
+    let wire_snap = crate::pair::ddl::WireSchemaSnapshot::from_snapshot(&snap);
+    match serde_json::to_vec(&wire_snap) {
+        Ok(json) => {
+            match pm
+                .send(
+                    peer_host_id,
+                    Message::PairSchemaSync(Bytes::from(json)),
+                    Lane::Bulk,
+                )
+                .await
+            {
+                Ok(_) => tracing::info!("schema snapshot sent to rejoined peer"),
+                Err(e) => tracing::warn!(%e, "failed to send schema snapshot"),
+            }
+        }
+        Err(e) => tracing::warn!(%e, "failed to serialize schema snapshot"),
     }
 }
 

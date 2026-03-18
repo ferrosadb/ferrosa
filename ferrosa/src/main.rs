@@ -375,25 +375,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_sender: tokio::sync::broadcast::channel(64).0,
     });
     let auth_disabled = cql_config.auth_disabled;
-    let vt_connection_tracker = shared_state.connection_tracker.clone();
-    let vt_query_tracker = shared_state.query_tracker.clone();
-    let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state);
-    let cql_addr = cql_server.start_background().await?;
-    tracing::info!(%cql_addr, "CQL server listening");
 
-    // 9. Web observability console
-    let vt_registry = Arc::new(ferrosa_schema::VirtualTableRegistry::new());
-    vt_registry.register(Arc::new(
-        ferrosa_cql::virtual_tables::connections::ConnectionsTable::new(vt_connection_tracker),
+    // 9a. Register observability virtual tables into the schema's shared registry
+    //     so they are visible to both the CQL query router and the web console.
+    //     Previously a separate VirtualTableRegistry was created for the web
+    //     console only, which caused `SELECT * FROM system_observability.*`
+    //     queries to fail with "table not found".
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::connections::ConnectionsTable::new(
+            shared_state.connection_tracker.clone(),
+        ),
     ));
-    vt_registry.register(Arc::new(
-        ferrosa_cql::virtual_tables::active_queries::ActiveQueriesTable::new(vt_query_tracker),
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::active_queries::ActiveQueriesTable::new(
+            shared_state.query_tracker.clone(),
+        ),
     ));
     // TODO: Register StorageStatsTable once StorageEngine implements StorageStatsProvider.
     // Until then, GET /api/storage_stats will return [].
 
+    let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state);
+    let cql_addr = cql_server.start_background().await?;
+    tracing::info!(%cql_addr, "CQL server listening");
+
+    // 9b. Web observability console — reuse the same registry as the CQL router.
     let web_state = web::WebAppState {
-        registry: vt_registry,
+        registry: schema.virtual_tables_arc(),
         mode_controller: mode_controller.clone(),
         schema: schema.clone(),
         auth_disabled,

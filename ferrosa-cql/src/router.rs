@@ -606,9 +606,65 @@ fn route_select(
                 &rows,
             ))
         }
+        ("system_schema", "indexes") => {
+            let snap = state.schema.snapshot();
+            let col_names: Vec<String> = vec![
+                "keyspace_name".into(),
+                "table_name".into(),
+                "index_name".into(),
+                "kind".into(),
+                "options".into(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+            ];
+            let rows: Vec<Vec<Option<CqlValue>>> = snap
+                .indexes
+                .iter()
+                .map(|((ks, tbl, name), idx)| {
+                    let kind = match idx.index_type {
+                        IndexType::BTree => "COMPOSITES",
+                        IndexType::Hash => "CUSTOM",
+                        IndexType::Composite => "COMPOSITES",
+                        IndexType::Phonetic => "CUSTOM",
+                        IndexType::Filtered => "CUSTOM",
+                    };
+                    // Format options as a simple comma-separated key=value string
+                    // (avoiding a serde_json dependency in this crate).
+                    let options_json = if idx.options.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        let pairs: Vec<String> = idx
+                            .options
+                            .iter()
+                            .map(|(k, v)| format!("\"{k}\":\"{v}\""))
+                            .collect();
+                        format!("{{{}}}", pairs.join(","))
+                    };
+                    vec![
+                        Some(CqlValue::Text(ks.clone())),
+                        Some(CqlValue::Text(tbl.clone())),
+                        Some(CqlValue::Text(name.clone())),
+                        Some(CqlValue::Text(kind.to_string())),
+                        Some(CqlValue::Text(options_json)),
+                    ]
+                })
+                .collect();
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_schema",
+                "indexes",
+                &rows,
+            ))
+        }
         // cqlsh queries these system_schema tables during startup introspection.
         // Return empty results for tables we don't populate yet.
-        ("system_schema", "functions" | "aggregates" | "triggers" | "views" | "indexes") => {
+        ("system_schema", "functions" | "aggregates" | "triggers" | "views") => {
             Ok(result::encode_rows(
                 &["keyspace_name".into(), "type_name".into()],
                 &[CqlType::Varchar, CqlType::Varchar],
@@ -707,18 +763,30 @@ fn route_select_user_table(
             None => vec![],
         }
     } else {
-        // No PK — check for secondary indexes on WHERE columns
+        // No PK — check whether every WHERE column is covered by a secondary
+        // index on this table.  Cassandra requires ALLOW FILTERING whenever
+        // *any* WHERE column is not covered by an index (or the partition key),
+        // even if other WHERE columns are indexed.  Using `any` here was the
+        // original bug: it bypassed the check as soon as one indexed column was
+        // found, silently accepting queries that still needed ALLOW FILTERING
+        // for the remaining un-indexed columns.
         let where_columns: Vec<&str> = s.where_clauses.iter().map(|w| w.column.as_str()).collect();
-        let has_matching_index = snap.indexes.iter().any(|((idx_ks, idx_tbl, _), meta)| {
-            idx_ks == ks
-                && idx_tbl == &s.table
-                && meta
-                    .target_columns
-                    .iter()
-                    .any(|c| where_columns.contains(&c.as_str()))
-        });
 
-        if !has_matching_index && !s.allow_filtering {
+        // Build the set of columns that are covered by a secondary index on
+        // this table so we can check each WHERE column individually.
+        let indexed_columns: Vec<String> = snap
+            .indexes
+            .iter()
+            .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+            .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
+            .collect();
+
+        // A column is "covered" if it has a matching secondary index.
+        let all_where_columns_indexed = where_columns
+            .iter()
+            .all(|col| indexed_columns.iter().any(|ic| ic == col));
+
+        if !all_where_columns_indexed && !s.allow_filtering {
             return Err(CqlError::Invalid(
                 "Cannot execute this query as it might involve data filtering and \
                  thus may have unpredictable performance. If you want to execute \
@@ -731,8 +799,8 @@ fn route_select_user_table(
         // for index-accelerated lookups instead of full scan. For now, the
         // presence of a matching index allows the query without ALLOW FILTERING,
         // but execution still falls through to a full scan + post-filter.
-        if has_matching_index {
-            tracing::debug!(table = %s.table, "index exists for WHERE columns; full scan until index readers are wired");
+        if all_where_columns_indexed {
+            tracing::debug!(table = %s.table, "all WHERE columns indexed; full scan until index readers are wired");
         } else {
             tracing::warn!(table = %s.table, "executing full scan with ALLOW FILTERING");
         }
@@ -1232,7 +1300,7 @@ async fn route_create_keyspace(
             let op = DdlOperation::CreateKeyspace(ks_meta);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateKeyspace(ks_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1293,7 +1361,7 @@ async fn route_alter_keyspace(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::AlterKeyspace {
                 name: s.name.clone(),
                 updates,
@@ -1348,7 +1416,7 @@ async fn route_drop_keyspace(
             let op = DdlOperation::DropKeyspace(s.name.clone());
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropKeyspace(s.name.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1460,7 +1528,7 @@ async fn route_create_table(
             let op = DdlOperation::CreateTable(Box::new(table_meta));
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateTable(Box::new(table_meta));
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1528,7 +1596,7 @@ async fn route_alter_table(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::AlterTable {
                 keyspace: ks.to_string(),
                 table: s.table.clone(),
@@ -1579,7 +1647,7 @@ async fn route_drop_table(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropTable {
                 keyspace: ks.to_string(),
                 table: s.table.clone(),
@@ -1663,7 +1731,7 @@ async fn route_create_index(
             let op = DdlOperation::CreateIndex(index_meta);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateIndex(index_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1736,7 +1804,7 @@ async fn route_drop_index(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropIndex {
                 keyspace: ks.to_string(),
                 table: table_name.clone(),
@@ -1790,7 +1858,7 @@ async fn route_create_role(
             let op = DdlOperation::CreateRole(role);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateRole(role);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1834,7 +1902,7 @@ async fn route_alter_role(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::AlterRole {
                 name: s.name.clone(),
                 updates,
@@ -1871,7 +1939,7 @@ async fn route_drop_role(
             let op = DdlOperation::DropRole(s.name.clone());
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropRole(s.name.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -1916,7 +1984,7 @@ async fn route_grant(
             });
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::Grant(GrantEntry {
                 role: s.role.clone(),
                 resource,
@@ -1967,7 +2035,7 @@ async fn route_revoke(
                 coordinator.coordinate_ddl(op).await?;
             }
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             // Same as Pair: one Raft proposal per permission for atomic replication.
             for perm in perms {
                 let op = DdlOperation::Revoke {
@@ -2326,7 +2394,7 @@ async fn route_create_type(
             let op = DdlOperation::CreateType(udt);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateType(udt);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -2434,7 +2502,7 @@ async fn route_drop_type(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropType {
                 keyspace: ks.clone(),
                 name: name.clone(),
@@ -2566,7 +2634,7 @@ async fn route_create_function(
             let op = DdlOperation::CreateFunction(func_meta);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateFunction(func_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -2683,7 +2751,7 @@ async fn route_drop_function(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropFunction {
                 keyspace: ks.clone(),
                 name: name.clone(),
@@ -2822,7 +2890,7 @@ async fn route_create_aggregate(
             let op = DdlOperation::CreateAggregate(agg_meta);
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateAggregate(agg_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
@@ -2937,7 +3005,7 @@ async fn route_drop_aggregate(
             };
             coordinator.coordinate_ddl(op).await?;
         }
-        DdlPath::Cluster(_) => {
+        DdlPath::Cluster { .. } => {
             let op = DdlOperation::DropAggregate {
                 keyspace: ks.clone(),
                 name: name.clone(),
@@ -2979,6 +3047,8 @@ fn cql_value_to_common(val: &CqlValue) -> ferrosa_common::CqlValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::virtual_tables::active_queries::ActiveQueriesTable;
+    use crate::virtual_tables::connections::ConnectionsTable;
     use ferrosa_schema::{
         AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
         RateLimitConfig, SchemaConfig, TestAuditSink,
@@ -4237,6 +4307,168 @@ mod tests {
         }
     }
 
+    // ── ALLOW FILTERING rejection: exact Cassandra semantics ─────────
+    //
+    // Cassandra requires ALLOW FILTERING when ANY WHERE column is not
+    // covered by the partition key or a secondary index.  The presence of
+    // an index on *some* WHERE columns does not exempt the remaining
+    // un-indexed columns from that requirement.
+    //
+    // The UAT test `single_allow_filtering_rejection` exposed a gap: when
+    // a table has an index on `email` and the query is
+    //   SELECT * WHERE email = 'x' AND name = 'Ada'   (no ALLOW FILTERING)
+    // Ferrosa was incorrectly accepting the query because `has_matching_index`
+    // was true for `email`, bypassing the check for the un-indexed `name`
+    // column.  Cassandra rejects this with "Cannot execute this query as it
+    // might involve data filtering…".
+
+    /// Non-indexed column in WHERE without ALLOW FILTERING must be rejected
+    /// even when another WHERE column IS indexed.  This was the gap caught by
+    /// the UAT run of 2026-03-17.
+    #[tokio::test]
+    async fn allow_filtering_required_for_non_indexed_where_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        // Setup: table with an index on `email` but NOT on `name`
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE af WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE af.users (id int PRIMARY KEY, name text, email text)",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Create an index on `email`
+        let stmt = crate::parser::parse("CREATE INDEX af_email_idx ON af.users (email)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert a row
+        let stmt = crate::parser::parse(
+            "INSERT INTO af.users (id, name, email) VALUES (1, 'Ada', 'ada@example.com')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Query: email is indexed but name is NOT — without ALLOW FILTERING
+        // this must be rejected because `name` requires a full-scan filter.
+        let stmt = crate::parser::parse(
+            "SELECT * FROM af.users WHERE email = 'ada@example.com' AND name = 'Ada'",
+        )
+        .unwrap();
+        match route(&state, &ctx, stmt).await {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("ALLOW FILTERING"),
+                    "error should mention ALLOW FILTERING, got: {msg}"
+                );
+            }
+            Ok(_) => panic!(
+                "WHERE on partially-indexed columns without ALLOW FILTERING should be rejected"
+            ),
+        }
+    }
+
+    /// Same query WITH ALLOW FILTERING must succeed and return the matching row.
+    #[tokio::test]
+    async fn allow_filtering_accepted_for_partially_indexed_where_with_flag() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE af2 WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE af2.users (id int PRIMARY KEY, name text, email text)",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE INDEX af2_email_idx ON af2.users (email)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO af2.users (id, name, email) VALUES (1, 'Ada', 'ada@example.com')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Same WHERE columns but WITH ALLOW FILTERING — must succeed.
+        let stmt = crate::parser::parse(
+            "SELECT * FROM af2.users WHERE email = 'ada@example.com' AND name = 'Ada' ALLOW FILTERING",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALLOW FILTERING should allow partially-indexed WHERE: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(count, 1, "should return the 1 matching row, got {count}");
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Querying on a fully-indexed column without ALLOW FILTERING must succeed.
+    /// This is the baseline: index present, no extra unindexed filter columns.
+    #[tokio::test]
+    async fn indexed_column_where_without_allow_filtering_succeeds() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE af3 WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE af3.users (id int PRIMARY KEY, name text, email text)",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE INDEX af3_email_idx ON af3.users (email)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO af3.users (id, name, email) VALUES (1, 'Ada', 'ada@example.com')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // All WHERE columns are indexed — no ALLOW FILTERING needed.
+        let stmt = crate::parser::parse("SELECT * FROM af3.users WHERE email = 'ada@example.com'")
+            .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "fully-indexed WHERE should not require ALLOW FILTERING: {:?}",
+            result.err()
+        );
+    }
+
     // ── BUG-004: ORDER BY parsed but not executed ────────────────────
 
     #[tokio::test]
@@ -4354,5 +4586,114 @@ mod tests {
             }
         }
         values
+    }
+
+    // ── Observability virtual table tests ────────────────────────────────
+
+    /// Helper: register the standard observability virtual tables into the
+    /// schema's shared registry so CQL SELECT queries can resolve them.
+    fn setup_with_observability() -> (SharedState, TempDir) {
+        let (state, dir) = setup();
+        state
+            .schema
+            .virtual_tables()
+            .register(Arc::new(ConnectionsTable::new(
+                state.connection_tracker.clone(),
+            )));
+        state
+            .schema
+            .virtual_tables()
+            .register(Arc::new(ActiveQueriesTable::new(
+                state.query_tracker.clone(),
+            )));
+        (state, dir)
+    }
+
+    /// Regression: `SELECT * FROM system_observability.connections` must succeed
+    /// when the virtual table is registered in the schema's shared registry.
+    #[tokio::test]
+    async fn select_system_observability_connections() {
+        let (state, _dir) = setup_with_observability();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system_observability.connections").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                // Kind = Rows (0x0002)
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Regression: `SELECT * FROM system_observability.active_queries` must
+    /// succeed when the virtual table is registered in the schema's shared registry.
+    #[tokio::test]
+    async fn select_system_observability_active_queries() {
+        let (state, _dir) = setup_with_observability();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt =
+            crate::parser::parse("SELECT * FROM system_observability.active_queries").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                // Kind = Rows (0x0002)
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Regression: `USE system_observability` followed by `SELECT * FROM connections`
+    /// (unqualified, relying on current keyspace) must also succeed.
+    #[tokio::test]
+    async fn select_observability_with_use_keyspace() {
+        let (state, _dir) = setup_with_observability();
+        let dev = dev_auth();
+
+        // USE system_observability — no validation, just sets current keyspace.
+        let use_stmt = crate::parser::parse("USE system_observability").unwrap();
+        let use_result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &None,
+            },
+            use_stmt,
+        )
+        .await
+        .unwrap();
+        let new_ks = match use_result {
+            RouteResult::SetKeyspace(ks, _) => ks,
+            _ => panic!("expected SetKeyspace"),
+        };
+        assert_eq!(new_ks, "system_observability");
+
+        // SELECT * FROM connections (unqualified, using current_keyspace)
+        let sel_stmt = crate::parser::parse("SELECT * FROM connections").unwrap();
+        let result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &Some(new_ks),
+            },
+            sel_stmt,
+        )
+        .await;
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
     }
 }
