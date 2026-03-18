@@ -24,6 +24,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+ferrosa-index = { path = "../ferrosa-index" }
 indexmap = "2"
 proptest = "1"
 tempfile = "3"

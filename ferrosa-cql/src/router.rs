@@ -606,9 +606,65 @@ fn route_select(
                 &rows,
             ))
         }
+        ("system_schema", "indexes") => {
+            let snap = state.schema.snapshot();
+            let col_names: Vec<String> = vec![
+                "keyspace_name".into(),
+                "table_name".into(),
+                "index_name".into(),
+                "kind".into(),
+                "options".into(),
+            ];
+            let col_types = vec![
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+                CqlType::Varchar,
+            ];
+            let rows: Vec<Vec<Option<CqlValue>>> = snap
+                .indexes
+                .iter()
+                .map(|((ks, tbl, name), idx)| {
+                    let kind = match idx.index_type {
+                        IndexType::BTree => "COMPOSITES",
+                        IndexType::Hash => "CUSTOM",
+                        IndexType::Composite => "COMPOSITES",
+                        IndexType::Phonetic => "CUSTOM",
+                        IndexType::Filtered => "CUSTOM",
+                    };
+                    // Format options as a simple comma-separated key=value string
+                    // (avoiding a serde_json dependency in this crate).
+                    let options_json = if idx.options.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        let pairs: Vec<String> = idx
+                            .options
+                            .iter()
+                            .map(|(k, v)| format!("\"{k}\":\"{v}\""))
+                            .collect();
+                        format!("{{{}}}", pairs.join(","))
+                    };
+                    vec![
+                        Some(CqlValue::Text(ks.clone())),
+                        Some(CqlValue::Text(tbl.clone())),
+                        Some(CqlValue::Text(name.clone())),
+                        Some(CqlValue::Text(kind.to_string())),
+                        Some(CqlValue::Text(options_json)),
+                    ]
+                })
+                .collect();
+            Ok(result::encode_rows(
+                &col_names,
+                &col_types,
+                "system_schema",
+                "indexes",
+                &rows,
+            ))
+        }
         // cqlsh queries these system_schema tables during startup introspection.
         // Return empty results for tables we don't populate yet.
-        ("system_schema", "functions" | "aggregates" | "triggers" | "views" | "indexes") => {
+        ("system_schema", "functions" | "aggregates" | "triggers" | "views") => {
             Ok(result::encode_rows(
                 &["keyspace_name".into(), "type_name".into()],
                 &[CqlType::Varchar, CqlType::Varchar],

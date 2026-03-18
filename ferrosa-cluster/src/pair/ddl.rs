@@ -859,6 +859,58 @@ mod tests {
     }
 
     #[test]
+    fn ddl_operation_create_index_roundtrip() {
+        use ferrosa_index::IndexType;
+        use ferrosa_schema::metadata::index::IndexMetadata;
+        let op = DdlOperation::CreateIndex(IndexMetadata {
+            keyspace: "qa_pair".to_string(),
+            table: "kv".to_string(),
+            name: "qa_pair_v_idx".to_string(),
+            index_type: IndexType::Hash,
+            target_columns: vec!["v".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        });
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::CreateIndex(idx) => {
+                assert_eq!(idx.keyspace, "qa_pair");
+                assert_eq!(idx.table, "kv");
+                assert_eq!(idx.name, "qa_pair_v_idx");
+                assert!(matches!(idx.index_type, IndexType::Hash));
+                assert_eq!(idx.target_columns, vec!["v"]);
+                assert!(idx.filter_predicate.is_none());
+                assert!(idx.options.is_empty());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ddl_operation_drop_index_roundtrip() {
+        let op = DdlOperation::DropIndex {
+            keyspace: "qa_pair".to_string(),
+            table: "kv".to_string(),
+            index: "qa_pair_v_idx".to_string(),
+        };
+        let bytes = op.to_bytes().unwrap();
+        let decoded = DdlOperation::from_bytes(&bytes).unwrap();
+        match decoded {
+            DdlOperation::DropIndex {
+                keyspace,
+                table,
+                index,
+            } => {
+                assert_eq!(keyspace, "qa_pair");
+                assert_eq!(table, "kv");
+                assert_eq!(index, "qa_pair_v_idx");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn wire_schema_snapshot_preserves_types() {
         use ferrosa_common::CqlType;
         let mut types = std::collections::HashMap::new();
