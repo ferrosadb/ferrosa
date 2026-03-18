@@ -123,6 +123,7 @@ pub enum Keyword {
     Finalfunc,
     Initcond,
     As,
+    Contains,
 }
 
 /// Compile-time keyword map. Case-insensitive lookup is done by
@@ -236,6 +237,7 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "FINALFUNC" => Keyword::Finalfunc,
     "INITCOND" => Keyword::Initcond,
     "AS" => Keyword::As,
+    "CONTAINS" => Keyword::Contains,
 };
 
 /// Token kind produced by the lexer.

@@ -125,6 +125,8 @@ pub enum ComparisonOp {
     Ge,
     In,
     Ne,
+    Contains,
+    ContainsKey,
 }
 
 #[derive(Debug, Clone, PartialEq)]

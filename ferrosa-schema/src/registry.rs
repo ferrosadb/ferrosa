@@ -667,19 +667,27 @@ impl Schema {
                     // Validate source_label and target_label reference vertex tables
                     for label_key in &["graph.source_label", "graph.target_label"] {
                         let label = &extensions[*label_key];
-                        let ref_key = (ks.to_string(), label.clone());
-                        match snap.tables.get(&ref_key) {
+                        // Find table by graph.label extension, not by table name
+                        let ref_table = snap.tables.iter().find(|((k, _), meta)| {
+                            k == ks
+                                && meta
+                                    .extensions
+                                    .get("graph.label")
+                                    .map(|l| l.eq_ignore_ascii_case(label))
+                                    .unwrap_or(false)
+                        });
+                        match ref_table {
                             None => {
                                 return Err(SchemaError::InvalidSchema(format!(
-                                    "edge table {ks}.{table_name}: {label_key} references non-existent table '{label}'"
+                                    "edge table {ks}.{table_name}: {label_key} references non-existent vertex label '{label}'"
                                 )));
                             }
-                            Some(ref_table) => {
-                                if ref_table.extensions.get("graph.type")
+                            Some((_, ref_meta)) => {
+                                if ref_meta.extensions.get("graph.type")
                                     != Some(&"vertex".to_string())
                                 {
                                     return Err(SchemaError::InvalidSchema(format!(
-                                        "edge table {ks}.{table_name}: {label_key} references table '{label}' which is not a vertex table"
+                                        "edge table {ks}.{table_name}: {label_key} references label '{label}' which is not a vertex"
                                     )));
                                 }
                             }

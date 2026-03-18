@@ -867,6 +867,30 @@ fn route_select_user_table(
         rows
     };
 
+    // Check for aggregate functions (e.g. COUNT(*))
+    let is_aggregate = s.columns.iter().any(|c| {
+        matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+    });
+
+    if is_aggregate {
+        // Build a single result row with aggregate values
+        let mut agg_row: Vec<Option<CqlValue>> = Vec::new();
+        for sc in &s.columns {
+            match sc {
+                SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count") => {
+                    agg_row.push(Some(CqlValue::Bigint(rows.len() as i64)));
+                }
+                _ => {
+                    agg_row.push(None);
+                }
+            }
+        }
+        let agg_rows = vec![agg_row];
+        return Ok(result::encode_rows(
+            &col_names, &col_types, ks, &s.table, &agg_rows,
+        ));
+    }
+
     // Apply column selection if not Star
     let selected_rows = select_columns(&rows, &all_col_names, &col_names);
 
@@ -2257,10 +2281,19 @@ fn build_column_info(
                 names.push(name.clone());
                 types.push(resolve_col_type(&col.column_type, ks, schema)?);
             }
-            SelectColumn::FunctionCall { .. } => {
-                return Err(CqlError::Invalid(
-                    "function calls in SELECT not yet implemented".into(),
-                ));
+            SelectColumn::FunctionCall { name, alias, .. } => {
+                let display_name = alias.clone().unwrap_or_else(|| format!("system.{}", name));
+                let fn_lower = name.to_lowercase();
+                let cql_type = match fn_lower.as_str() {
+                    "count" => CqlType::Bigint,
+                    "writetime" => CqlType::Bigint,
+                    "ttl" => CqlType::Int,
+                    _ => {
+                        return Err(CqlError::Invalid(format!("unknown function: {}", name)));
+                    }
+                };
+                names.push(display_name);
+                types.push(cql_type);
             }
         }
     }
@@ -2335,6 +2368,11 @@ fn evaluate_where_predicates(
                 // IN comparison: check if actual is in the expected list.
                 // For now, treat as equality (single-value IN).
                 *actual == expected
+            }
+            ComparisonOp::Contains | ComparisonOp::ContainsKey => {
+                // CONTAINS / CONTAINS KEY: not yet implemented for filtering.
+                // Conservatively exclude the row so we don't return false positives.
+                false
             }
         };
         if !matches {

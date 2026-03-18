@@ -171,9 +171,44 @@ impl<'input> Parser<'input> {
             return Ok(vec![SelectColumn::Star]);
         }
 
-        let mut cols = vec![SelectColumn::Column(self.parse_ident()?)];
-        while self.lexer.eat(&TokenKind::Comma)? {
-            cols.push(SelectColumn::Column(self.parse_ident()?));
+        let mut cols = vec![];
+        loop {
+            // Check if this is a function call: ident(...)
+            let name = self.parse_ident()?;
+            if self.lexer.eat(&TokenKind::LParen)? {
+                // Function call: COUNT(*), WRITETIME(col), TTL(col), etc.
+                let mut args = vec![];
+                if self.lexer.eat(&TokenKind::Star)? {
+                    // COUNT(*) — represent * as a special term
+                    args.push(Term::StringLiteral("*".to_string()));
+                } else if !matches!(self.lexer.peek()?.kind, TokenKind::RParen) {
+                    args.push(self.parse_term()?);
+                    while self.lexer.eat(&TokenKind::Comma)? {
+                        args.push(self.parse_term()?);
+                    }
+                }
+                self.lexer.expect(&TokenKind::RParen)?;
+
+                // Optional AS alias
+                let alias = if self.lexer.eat(&TokenKind::Keyword(Keyword::As))? {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+
+                cols.push(SelectColumn::FunctionCall {
+                    keyspace: None,
+                    name,
+                    args,
+                    alias,
+                });
+            } else {
+                cols.push(SelectColumn::Column(name));
+            }
+
+            if !self.lexer.eat(&TokenKind::Comma)? {
+                break;
+            }
         }
         Ok(cols)
     }
@@ -1522,6 +1557,14 @@ impl<'input> Parser<'input> {
             TokenKind::GtEq => Ok(ComparisonOp::Ge),
             TokenKind::NotEq => Ok(ComparisonOp::Ne),
             TokenKind::Keyword(Keyword::In) => Ok(ComparisonOp::In),
+            TokenKind::Keyword(Keyword::Contains) => {
+                // Check for CONTAINS KEY
+                if self.lexer.eat(&TokenKind::Keyword(Keyword::Key))? {
+                    Ok(ComparisonOp::ContainsKey)
+                } else {
+                    Ok(ComparisonOp::Contains)
+                }
+            }
             _ => Err(CqlError::SyntaxError(format!(
                 "expected comparison operator, got {:?} at position {}",
                 tok.kind, tok.pos
@@ -2031,6 +2074,7 @@ impl<'input> Parser<'input> {
             Keyword::Finalfunc => "finalfunc",
             Keyword::Initcond => "initcond",
             Keyword::As => "as",
+            Keyword::Contains => "contains",
         }
         .to_string()
     }
