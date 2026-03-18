@@ -51,6 +51,24 @@ wait_cql() {
   echo "  CQL ready on port $port (${elapsed}s)"
 }
 
+wait_writes_ready() {
+  local port=${1:-$PORT}
+  local elapsed=0
+  local timeout=60
+  echo "  Waiting for write path to stabilize on port $port..."
+  while ! cqlsh "$HOST" "$port" -e "INSERT INTO app.events (tenant_id, event_date, event_id, event_type, payload) VALUES ('_probe', '1970-01-01', 0, 'probe', 'test');" >/dev/null 2>&1; do
+    sleep 2
+    elapsed=$((elapsed + 2))
+    if [ "$elapsed" -ge "$timeout" ]; then
+      echo "  WARNING: write path not ready after ${timeout}s, continuing anyway"
+      return
+    fi
+  done
+  # Clean up probe row
+  cqlsh "$HOST" "$port" -e "DELETE FROM app.events WHERE tenant_id = '_probe' AND event_date = '1970-01-01';" >/dev/null 2>&1 || true
+  echo "  Write path ready (${elapsed}s)"
+}
+
 run_cql() {
   local file=$1
   local port=${2:-$PORT}
@@ -146,9 +164,7 @@ echo "Adding node2 in pair mode..."
 docker compose $PAIR up -d
 
 wait_cql 9043
-
-echo "  Letting background writes accumulate (3s)..."
-sleep 3
+wait_writes_ready
 
 run_cql 03-pair-writes.cql
 run_cql 04-pair-ddl.cql
@@ -172,9 +188,7 @@ echo "Adding node3 in Raft cluster mode..."
 docker compose $CLUSTER up -d
 
 wait_cql 9044
-
-echo "  Letting background writes accumulate (3s)..."
-sleep 3
+wait_writes_ready
 
 run_cql 05-cluster-writes.cql
 run_cql 06-cluster-ddl.cql

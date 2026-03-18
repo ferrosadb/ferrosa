@@ -40,11 +40,18 @@ impl PairCoordinator {
     }
 
     /// Route a write based on current role.
+    ///
+    /// On the primary: writes locally first (always succeeds), then
+    /// best-effort replicates to the secondary. If replication fails
+    /// (peer down, lanes reconnecting), the write still succeeds —
+    /// the secondary will catch up when it reconnects.
     pub async fn coordinate_write(&self, mutation: &Mutation) -> Result<()> {
         match **self.role.load() {
             PairRole::Primary => {
                 self.apply_locally(mutation)?;
-                self.replicate_to_peer(mutation).await?;
+                if let Err(e) = self.replicate_to_peer(mutation).await {
+                    tracing::warn!("pair replication failed (write succeeded locally): {e}");
+                }
                 Ok(())
             }
             PairRole::Secondary => self.forward_to_primary(mutation).await,

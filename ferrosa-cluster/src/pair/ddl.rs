@@ -167,13 +167,20 @@ impl DdlCoordinator {
     }
 
     /// Route a DDL operation based on current role.
+    ///
+    /// On the primary: applies DDL locally first, then best-effort
+    /// replicates to the secondary. If replication fails, the DDL
+    /// still succeeds — the secondary will catch up via schema sync
+    /// when it reconnects.
     pub async fn coordinate_ddl(&self, op: DdlOperation) -> Result<()> {
         match **self.role.load() {
             PairRole::Primary => {
                 self.apply_ddl_locally(&op)?;
                 let version = Uuid::new_v4();
                 self.schema.set_schema_version(version);
-                self.replicate_ddl(&op, version).await?;
+                if let Err(e) = self.replicate_ddl(&op, version).await {
+                    tracing::warn!("pair DDL replication failed (applied locally): {e}");
+                }
                 Ok(())
             }
             PairRole::Secondary => self.forward_ddl(&op).await,
@@ -418,14 +425,17 @@ impl RpcHandler for PairDdlForwardHandler {
 
         let result = match **self.role.load() {
             PairRole::Primary => {
-                // Forwarded DDL from secondary: apply + replicate back
+                // Forwarded DDL from secondary: apply locally + best-effort replicate
                 if let Err(e) = self.coordinator.apply_ddl_locally(&op) {
                     tracing::error!("failed to apply forwarded DDL: {e}");
                     return None;
                 }
                 let version = Uuid::new_v4();
                 self.coordinator.schema.set_schema_version(version);
-                self.coordinator.replicate_ddl(&op, version).await
+                if let Err(e) = self.coordinator.replicate_ddl(&op, version).await {
+                    tracing::warn!("pair DDL replication-back failed (applied locally): {e}");
+                }
+                Ok(())
             }
             PairRole::Secondary => {
                 // Replicated DDL from primary: apply + set version
