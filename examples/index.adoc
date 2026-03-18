@@ -54,3 +54,11 @@ Player stats, rankings, and match history.
 
 link:graph-joins.html[*Graph Joins & Traversals*]::
 Relationship queries that traditional Cassandra can't do -- using Ferrosa's built-in graph engine.
+
+link:knowledge-graph.html[*Research Knowledge Graph*]::
+Academic papers, citations, authors, institutions, and funding -- a full knowledge graph with 42 Cypher queries.
+
+== Compatibility & Reference
+
+link:cql-comprehensive.html[*CQL Comprehensive Compatibility*]::
+Systematic test of every CQL feature: all data types, collections, UDTs, tuples, counters, static columns, LWT, batch, TTL, TIMESTAMP, secondary indexes, and more.

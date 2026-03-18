@@ -1,0 +1,424 @@
+= CQL Comprehensive Compatibility
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+A systematic compatibility test for every CQL feature that Ferrosa supports.
+Run `schema.cql`, `data.cql`, and `queries.cql` in order against a Ferrosa cluster to verify full CQL coverage.
+
+NOTE: Complete the <<cluster-setup.adoc#,3-Node Cluster Setup>> tutorial first, or have a running Ferrosa cluster accessible on `localhost:9042`.
+
+== Purpose
+
+This example exists to exercise every CQL statement and data type in a single, reproducible sequence.
+It is not a tutorial -- it is a compatibility verification suite disguised as an example.
+
+The three CQL files are designed to run in order:
+
+. *schema.cql* -- DDL: keyspace, tables, types, indexes, alter statements
+. *data.cql* -- DML writes: inserts, updates, batches, counters, TTL, LWT
+. *queries.cql* -- DML reads: selects, aggregations, token scans, cleanup
+
+If all three files execute without error, the cluster under test supports the full CQL surface area covered here.
+
+== Data Types
+
+CQL defines a rich set of scalar types.
+The `all_types` table creates one column for each.
+
+[source,sql]
+----
+include::schema.cql[lines=10..30]
+----
+
+The following types are tested:
+
+[cols="1,2"]
+|===
+| Type | Notes
+
+| `int`, `bigint`, `smallint`, `tinyint` | Signed integers at 32, 64, 16, and 8 bits
+| `float`, `double` | IEEE 754 single and double precision
+| `decimal` | Arbitrary-precision decimal
+| `varint` | Arbitrary-precision integer
+| `boolean` | `true` / `false`
+| `text`, `ascii` | UTF-8 and ASCII-only strings
+| `blob` | Arbitrary bytes (hex literal `0xdeadbeef`)
+| `uuid`, `timeuuid` | Version 4 random UUID and version 1 time-based UUID
+| `timestamp`, `date`, `time` | Millisecond timestamp, calendar date, nanosecond time-of-day
+| `inet` | IPv4 or IPv6 address
+|===
+
+The data file inserts positive boundary values, negative boundary values, zeros, nulls, and empty strings to exercise edge cases.
+
+[source,sql]
+----
+include::data.cql[lines=6..12]
+----
+
+== Collections
+
+CQL supports three collection types, each of which can be nested inside a `frozen<>` wrapper.
+
+[source,sql]
+----
+include::schema.cql[lines=35..42]
+----
+
+* `list<text>` -- ordered, allows duplicates
+* `set<int>` -- unordered, unique elements
+* `map<text, text>` -- key-value pairs
+* `list<frozen<list<int>>>` -- nested frozen list
+* `map<text, frozen<map<text, int>>>` -- nested frozen map
+
+Collection mutation operations are tested in the data file: append, remove, element access for each type.
+
+[source,sql]
+----
+include::data.cql[lines=141..150]
+----
+
+== Primary Keys
+
+=== Simple primary key
+
+The `all_types` table uses a single-column primary key (`id int PRIMARY KEY`).
+
+=== Composite partition key
+
+The `composite_pk` table uses a multi-column partition key with clustering columns and explicit ordering.
+
+[source,sql]
+----
+include::schema.cql[lines=47..54]
+----
+
+The partition key `(tenant, region)` means all events for one tenant in one region are co-located.
+The clustering columns `event_time DESC, event_id ASC` sort rows within each partition.
+
+Queries exercise full partition reads, ordering, and `LIMIT`:
+
+[source,sql]
+----
+include::queries.cql[lines=38..44]
+----
+
+=== Clustering order
+
+`CLUSTERING ORDER BY` controls the physical sort order of rows on disk.
+`DESC` on `event_time` means the most recent events are read first, which avoids reversing results at query time.
+
+== Static Columns
+
+A `STATIC` column is shared across all rows in a partition.
+It is set once and applies to every clustering row.
+
+[source,sql]
+----
+include::schema.cql[lines=59..65]
+----
+
+When `group_name` is set for `group_id = 1`, all items in that group see the same name.
+The `DISTINCT` keyword retrieves only the partition key and static columns, without scanning clustering rows.
+
+[source,sql]
+----
+include::queries.cql[lines=49..52]
+----
+
+== Write Operations
+
+=== INSERT
+
+Standard inserts with all scalar types, null values, empty strings, and function calls (`uuid()`).
+
+[source,sql]
+----
+include::data.cql[lines=6..12]
+----
+
+=== UPDATE
+
+Column updates, arithmetic increments, and collection mutations.
+
+[source,sql]
+----
+include::data.cql[lines=133..150]
+----
+
+=== TTL and TIMESTAMP
+
+`USING TTL` sets a per-row expiration in seconds.
+`USING TIMESTAMP` sets an explicit write timestamp for last-write-wins conflict resolution.
+
+[source,sql]
+----
+include::data.cql[lines=82..89]
+----
+
+=== BATCH
+
+Logged batches guarantee atomicity across multiple statements.
+Unlogged batches skip the batch log for better performance when atomicity is not required.
+
+[source,sql]
+----
+include::data.cql[lines=100..112]
+----
+
+=== Counter updates
+
+Counter columns only support increment and decrement operations.
+They cannot be set to an absolute value or mixed with non-counter columns in the same table.
+
+[source,sql]
+----
+include::data.cql[lines=117..119]
+----
+
+=== DELETE
+
+Row deletes target a specific clustering row.
+Partition deletes remove all rows in a partition.
+
+[source,sql]
+----
+include::queries.cql[lines=86..91]
+----
+
+== Lightweight Transactions
+
+LWT provides linearizable consistency for conditional mutations.
+
+=== INSERT IF NOT EXISTS
+
+The first insert succeeds and returns `[applied] = true`.
+The second insert for the same primary key is a no-op and returns `[applied] = false`.
+
+[source,sql]
+----
+include::data.cql[lines=94..95]
+----
+
+=== UPDATE ... IF condition
+
+A conditional update that only applies if the current value matches the condition.
+
+[source,sql]
+----
+include::queries.cql[lines=119..120]
+----
+
+=== DELETE ... IF EXISTS
+
+A conditional delete that only applies if the row exists.
+
+[source,sql]
+----
+include::queries.cql[lines=125..126]
+----
+
+== Read Operations
+
+=== SELECT
+
+Basic reads with `*`, column subsets, and `WHERE` clauses on partition keys.
+
+[source,sql]
+----
+include::queries.cql[lines=6..7]
+----
+
+=== LIMIT and ORDER BY
+
+`LIMIT` restricts the number of rows returned.
+`ORDER BY` on clustering columns controls the sort order (must match or reverse the `CLUSTERING ORDER BY`).
+
+[source,sql]
+----
+include::queries.cql[lines=41..44]
+----
+
+=== COUNT and aggregation
+
+`COUNT(*)` returns the number of rows matching the query.
+
+[source,sql]
+----
+include::queries.cql[lines=96..97]
+----
+
+=== DISTINCT
+
+Returns only unique partition key values, optionally with static columns.
+
+[source,sql]
+----
+include::queries.cql[lines=52..52]
+----
+
+=== Token function
+
+`token()` exposes the partition token, enabling range scans across the token ring.
+
+[source,sql]
+----
+include::queries.cql[lines=131..131]
+----
+
+=== WRITETIME function
+
+`WRITETIME()` returns the microsecond timestamp of the last write to a column.
+
+[source,sql]
+----
+include::queries.cql[lines=136..136]
+----
+
+=== TTL function
+
+`TTL()` returns the remaining time-to-live in seconds for a column, or null if no TTL is set.
+
+[source,sql]
+----
+include::queries.cql[lines=151..151]
+----
+
+=== IN clause
+
+`IN` on the partition key retrieves rows from multiple partitions in a single query.
+
+[source,sql]
+----
+include::queries.cql[lines=141..141]
+----
+
+=== ALLOW FILTERING
+
+`ALLOW FILTERING` permits queries that would otherwise require a full table scan.
+It signals that the query is intentionally unindexed.
+
+[source,sql]
+----
+include::queries.cql[lines=146..146]
+----
+
+== Secondary Indexes
+
+Secondary indexes allow queries on non-primary-key columns without `ALLOW FILTERING`.
+
+[source,sql]
+----
+include::schema.cql[lines=150..152]
+----
+
+Queries using secondary indexes:
+
+[source,sql]
+----
+include::queries.cql[lines=102..103]
+----
+
+== User-Defined Types
+
+UDTs let you define named structs that can be used as column types.
+They must be wrapped in `frozen<>` when used in a table.
+
+[source,sql]
+----
+include::schema.cql[lines=114..126]
+----
+
+[source,sql]
+----
+include::schema.cql[lines=131..136]
+----
+
+Inserting UDT values uses brace-literal syntax:
+
+[source,sql]
+----
+include::data.cql[lines=155..161]
+----
+
+== Tuples
+
+Tuples are anonymous fixed-length structures.
+They must be `frozen<>` and are written with parenthesized syntax.
+
+[source,sql]
+----
+include::schema.cql[lines=141..145]
+----
+
+[source,sql]
+----
+include::data.cql[lines=166..169]
+----
+
+== Counters
+
+Counter tables have a special structure: the primary key columns plus one or more `counter` columns.
+Non-counter columns (other than the primary key) are not allowed.
+
+[source,sql]
+----
+include::schema.cql[lines=95..99]
+----
+
+Counters are updated with increment/decrement syntax, not absolute assignment:
+
+[source,sql]
+----
+include::data.cql[lines=117..119]
+----
+
+== What This Covers
+
+This example exercises the following CQL features:
+
+*DDL:*
+
+* `CREATE KEYSPACE` with `SimpleStrategy`
+* `CREATE TABLE` with simple and composite primary keys
+* `CLUSTERING ORDER BY` (ascending and descending)
+* `STATIC` columns
+* `CREATE TYPE` (user-defined types)
+* `CREATE INDEX` (secondary indexes)
+* `ALTER TABLE ADD`
+* `DROP INDEX`, `DROP TABLE`, `DROP TYPE`, `DROP KEYSPACE`
+* `IF NOT EXISTS` / `IF EXISTS` guards on DDL
+
+*Data types:*
+
+* All 18 CQL scalar types
+* `list`, `set`, `map` collections
+* Nested `frozen<>` collections
+* `frozen<>` UDTs and tuples
+* `counter` type
+
+*DML writes:*
+
+* `INSERT` with literal values, `null`, empty string, function calls (`uuid()`)
+* `INSERT ... USING TTL` and `USING TIMESTAMP`
+* `INSERT ... IF NOT EXISTS` (LWT)
+* `UPDATE` with column assignment, arithmetic, collection mutation
+* `UPDATE ... IF condition` (LWT)
+* `DELETE` (row, partition)
+* `DELETE ... IF EXISTS` (LWT)
+* `BEGIN BATCH` / `APPLY BATCH` (logged and unlogged)
+* Counter `UPDATE` with increment
+
+*DML reads:*
+
+* `SELECT *` and column subsets
+* `WHERE` on partition key, composite partition key, clustering columns
+* `ORDER BY` on clustering columns
+* `LIMIT`
+* `DISTINCT`
+* `COUNT(*)`
+* `IN` clause on partition key
+* `ALLOW FILTERING`
+* `token()` function
+* `WRITETIME()` and `TTL()` functions
+* Secondary index lookups
