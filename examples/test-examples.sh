@@ -61,7 +61,7 @@ else
 fi
 
 # ── Run each example directory ──
-for dir in $(find . -mindepth 1 -maxdepth 1 -type d ! -name theme ! -name cluster-setup | sort); do
+for dir in $(find . -mindepth 1 -maxdepth 1 -type d ! -name theme ! -name cluster-setup ! -name cluster-scaling | sort); do
   dir="${dir#./}"
   echo ""
   echo "=== Running example: ${dir} ==="
@@ -118,6 +118,20 @@ for dir in $(find . -mindepth 1 -maxdepth 1 -type d ! -name theme ! -name cluste
     failed_dirs="${dir} ${failed_dirs}"
   fi
 done
+
+# ── Self-managed examples (manage their own Docker lifecycle) ──
+if [ -x "cluster-scaling/run-demo.sh" ]; then
+  echo ""
+  echo "=== Running cluster-scaling demo (self-managed) ==="
+  if (cd cluster-scaling && bash run-demo.sh); then
+    echo "PASS: cluster-scaling"
+    passed=$((passed + 1))
+  else
+    echo "FAIL: cluster-scaling"
+    failed=$((failed + 1))
+    failed_dirs="cluster-scaling ${failed_dirs}"
+  fi
+fi
 
 # ── Summary ──
 echo ""

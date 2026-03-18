@@ -15,6 +15,9 @@ NOTE: *Before you begin:* Every tutorial in this collection uses the same 3-node
 link:cluster-setup.html[*3-Node Cluster Setup*]::
 Install Docker and launch a production-like Ferrosa cluster in 5 minutes.
 
+link:cluster-scaling.html[*Cluster Scaling: Development to Production*] _New!_::
+Watch Ferrosa scale from a single development node to a 3-node production cluster with zero downtime. Writes and schema changes continue uninterrupted during each transition.
+
 == Data-Intensive Workloads
 
 link:iot-sensor-data.html[*IoT Sensor Data*]::
