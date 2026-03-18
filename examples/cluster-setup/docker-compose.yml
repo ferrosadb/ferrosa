@@ -77,10 +77,11 @@ services:
     volumes:
       - node1-data:/var/lib/ferrosa
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "9042"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9042 || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 30
+      start_period: 15s
 
   # ── Node 2 ──
   node2:
@@ -114,10 +115,11 @@ services:
     volumes:
       - node2-data:/var/lib/ferrosa
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "9042"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9042 || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 30
+      start_period: 15s
 
   # ── Node 3 ──
   node3:
@@ -153,10 +155,11 @@ services:
     volumes:
       - node3-data:/var/lib/ferrosa
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "9042"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9042 || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 30
+      start_period: 15s
 
 volumes:
   rustfs-data:
