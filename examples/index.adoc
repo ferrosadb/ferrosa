@@ -3,6 +3,7 @@
 :linkcss:
 :icons: font
 :source-highlighter: rouge
+:docinfo: shared
 :nofooter:
 
 Step-by-step tutorials that take you from zero to a running workload on a 3-node Ferrosa cluster. Each guide starts from `docker compose up` and ends with live queries.

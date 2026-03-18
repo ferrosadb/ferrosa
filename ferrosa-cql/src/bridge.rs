@@ -108,11 +108,23 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 Ok(CqlValue::Inet(addr))
             }
             CqlType::Timestamp => {
-                // Parse ISO 8601 timestamp: "2024-01-15T10:30:00Z" or "2024-01-15 10:30:00+0000"
-                // Try common formats
+                // Parse timestamps in all common CQL/ISO formats
                 let ms = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
                     dt.timestamp_millis()
+                } else if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z") {
+                    dt.timestamp_millis()
+                } else if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%z")
+                {
+                    dt.timestamp_millis()
+                } else if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                {
+                    dt.and_utc().timestamp_millis()
                 } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                {
+                    dt.and_utc().timestamp_millis()
+                } else if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
                 {
                     dt.and_utc().timestamp_millis()
                 } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")

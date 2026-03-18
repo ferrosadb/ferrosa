@@ -5,15 +5,20 @@ OUTDIR := ../docs/examples
 
 .PHONY: html clean test
 
-html: $(ADOC) $(THEME)
+html: $(ADOC) $(THEME) index.adoc
 	@mkdir -p $(OUTDIR)
 	@for f in $(ADOC); do \
 		name=$$(basename $$f .adoc); \
 		dir=$$(dirname $$f); \
 		echo "Converting $$f -> $(OUTDIR)/$$name.html"; \
 		asciidoctor -a stylesheet=$(THEME) -a linkcss -a stylesdir=. \
+			-a docinfo=shared -a docinfodir=$$PWD \
 			-D $(OUTDIR) -o $$name.html $$f; \
 	done
+	@echo "Converting index.adoc -> $(OUTDIR)/index.html"
+	@asciidoctor -a stylesheet=$(THEME) -a linkcss -a stylesdir=. \
+		-a docinfo=shared -a docinfodir=$$PWD \
+		-D $(OUTDIR) -o index.html index.adoc
 	@cp $(THEME) $(OUTDIR)/ferrosa.css
 
 clean:

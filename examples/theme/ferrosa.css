@@ -80,12 +80,13 @@ h1 {
 }
 
 h2 {
-  font-size: 1.5rem;
-  margin-top: 3rem;
-  margin-bottom: 1rem;
-  padding-bottom: 0.5rem;
-  border-bottom: 1px solid var(--border);
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
   color: var(--accent);
+  margin-top: 4rem;
+  margin-bottom: 1.5rem;
 }
 
 h3 {
@@ -276,7 +277,6 @@ table.tableblock thead th {
   letter-spacing: 0.08em;
   color: var(--text-muted);
   font-weight: 600;
-  background: var(--bg-card);
 }
 
 table.tableblock td {
