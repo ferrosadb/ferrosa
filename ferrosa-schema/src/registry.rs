@@ -2227,6 +2227,9 @@ mod tests {
         vertex
             .extensions
             .insert("graph.type".to_string(), "vertex".to_string());
+        vertex
+            .extensions
+            .insert("graph.label".to_string(), "person".to_string());
         schema.create_table(vertex, &auth).unwrap();
 
         // Try to create an edge that references a non-existent vertex table
@@ -2243,7 +2246,7 @@ mod tests {
             .insert("graph.target_label".to_string(), "nonexistent".to_string());
         let result = schema.create_table(edge, &auth);
         assert!(
-            matches!(result, Err(SchemaError::InvalidSchema(ref msg)) if msg.contains("non-existent table"))
+            matches!(result, Err(SchemaError::InvalidSchema(ref msg)) if msg.contains("non-existent vertex label"))
         );
     }
 
@@ -2260,12 +2263,18 @@ mod tests {
         person
             .extensions
             .insert("graph.type".to_string(), "vertex".to_string());
+        person
+            .extensions
+            .insert("graph.label".to_string(), "person".to_string());
         schema.create_table(person, &auth).unwrap();
 
         let mut company = test_table("graph_ks3", "company");
         company
             .extensions
             .insert("graph.type".to_string(), "vertex".to_string());
+        company
+            .extensions
+            .insert("graph.label".to_string(), "company".to_string());
         schema.create_table(company, &auth).unwrap();
 
         // Create a valid edge table
