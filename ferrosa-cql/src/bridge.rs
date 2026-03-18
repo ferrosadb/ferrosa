@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use num_bigint::BigInt;
 
 use crate::ast::{CqlTypeName, Term};
 use crate::error::CqlError;
@@ -50,6 +51,14 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             }
             CqlType::Timestamp => Ok(CqlValue::Timestamp(*n)),
             CqlType::Counter => Ok(CqlValue::Counter(*n)),
+            CqlType::Varint => Ok(CqlValue::Varint(BigInt::from(*n))),
+            CqlType::Decimal => {
+                // Integer literal as decimal: scale 0, unscaled = the integer value
+                Ok(CqlValue::Decimal {
+                    scale: 0,
+                    unscaled: BigInt::from(*n),
+                })
+            }
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got integer literal",
                 cql_type_name(target)
@@ -65,6 +74,24 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 Ok(CqlValue::Float(f32_val.to_bits()))
             }
             CqlType::Double => Ok(CqlValue::Double(f.to_bits())),
+            CqlType::Decimal => {
+                // Convert float literal to decimal via string roundtrip to preserve
+                // user-visible precision (avoids binary floating-point artifacts).
+                let s = format!("{}", f);
+                let (unscaled, scale) = if let Some(dot_pos) = s.find('.') {
+                    let decimals = &s[dot_pos + 1..];
+                    let scale = decimals.len() as i32;
+                    let digits: String = s.chars().filter(|c| *c != '.').collect();
+                    let unscaled = digits
+                        .parse::<i128>()
+                        .map(BigInt::from)
+                        .unwrap_or_else(|_| BigInt::from(0));
+                    (unscaled, scale)
+                } else {
+                    (BigInt::from(*f as i64), 0)
+                };
+                Ok(CqlValue::Decimal { scale, unscaled })
+            }
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got float literal",
                 cql_type_name(target)

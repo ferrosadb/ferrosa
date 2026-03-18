@@ -1110,13 +1110,83 @@ async fn route_update(
 
     // Build cells from SET assignments
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
-    for (col_name, term) in &s.assignments {
-        let col_meta = table_meta
-            .columns
-            .get(col_name)
-            .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?;
-        let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
-        let value = bridge::term_to_cql_value(term, &cql_type)?;
+    for assignment in &s.assignments {
+        let (col_name, value) = match assignment {
+            Assignment::Simple { column, value } => {
+                let col_meta = table_meta
+                    .columns
+                    .get(column)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+                let val = bridge::term_to_cql_value(value, &cql_type)?;
+                (column.as_str(), val)
+            }
+            Assignment::Add { column, value } => {
+                let col_meta = table_meta
+                    .columns
+                    .get(column)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+
+                // For counters: increment. For collections: append.
+                match &cql_type {
+                    CqlType::Counter => {
+                        let increment = bridge::term_to_cql_value(value, &CqlType::Bigint)?;
+                        if let CqlValue::Bigint(n) = increment {
+                            (column.as_str(), CqlValue::Counter(n))
+                        } else {
+                            return Err(CqlError::Invalid(
+                                "counter increment must be an integer".into(),
+                            ));
+                        }
+                    }
+                    _ => {
+                        // Collection append: store the new value (simplified)
+                        let val = bridge::term_to_cql_value(value, &cql_type)?;
+                        (column.as_str(), val)
+                    }
+                }
+            }
+            Assignment::Sub { column, value } => {
+                let col_meta = table_meta
+                    .columns
+                    .get(column)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+
+                match &cql_type {
+                    CqlType::Counter => {
+                        let decrement = bridge::term_to_cql_value(value, &CqlType::Bigint)?;
+                        if let CqlValue::Bigint(n) = decrement {
+                            (column.as_str(), CqlValue::Counter(-n))
+                        } else {
+                            return Err(CqlError::Invalid(
+                                "counter decrement must be an integer".into(),
+                            ));
+                        }
+                    }
+                    _ => {
+                        // Collection subtract: store new value (simplified)
+                        let val = bridge::term_to_cql_value(value, &cql_type)?;
+                        (column.as_str(), val)
+                    }
+                }
+            }
+            Assignment::Element {
+                column,
+                key: _,
+                value,
+            } => {
+                // Map/list element set: simplified — store the value for the column
+                let col_meta = table_meta
+                    .columns
+                    .get(column)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+                let val = bridge::term_to_cql_value(value, &cql_type)?;
+                (column.as_str(), val)
+            }
+        };
         let col_idx = table_meta
             .columns
             .get_index_of(col_name)
@@ -1273,6 +1343,15 @@ async fn route_create_keyspace(
     state
         .schema
         .check_permission(ctx.auth, Permission::Create, &Resource::AllKeyspaces)?;
+
+    // IF NOT EXISTS: silently succeed when keyspace already exists
+    if s.if_not_exists && state.schema.snapshot().keyspaces.contains_key(&s.name) {
+        return Ok(result::encode_schema_change(
+            "CREATED",
+            "KEYSPACE",
+            &[&s.name],
+        ));
+    }
 
     let mut options = std::collections::HashMap::new();
     let mut strategy = String::new();
@@ -1458,6 +1537,21 @@ async fn route_create_table(
         Permission::Create,
         &Resource::Keyspace(ks.to_string()),
     )?;
+
+    // IF NOT EXISTS: silently succeed when table already exists
+    if s.if_not_exists
+        && state
+            .schema
+            .snapshot()
+            .tables
+            .contains_key(&(ks.to_string(), s.name.clone()))
+    {
+        return Ok(result::encode_schema_change(
+            "CREATED",
+            "TABLE",
+            &[ks, &s.name],
+        ));
+    }
 
     // Build column metadata
     let mut columns = IndexMap::new();

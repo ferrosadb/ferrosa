@@ -279,13 +279,44 @@ impl<'input> Parser<'input> {
         })
     }
 
-    fn parse_assignments(&mut self) -> Result<Vec<(String, Term)>, CqlError> {
+    fn parse_assignments(&mut self) -> Result<Vec<Assignment>, CqlError> {
         let mut assignments = vec![];
         loop {
             let col = self.parse_ident()?;
-            self.lexer.expect(&TokenKind::Eq)?;
-            let val = self.parse_term()?;
-            assignments.push((col, val));
+
+            // Check for map/list element: col[key] = value
+            if self.lexer.eat(&TokenKind::LBracket)? {
+                let key = self.parse_term()?;
+                self.lexer.expect(&TokenKind::RBracket)?;
+                self.lexer.expect(&TokenKind::Eq)?;
+                let value = self.parse_term()?;
+                assignments.push(Assignment::Element {
+                    column: col,
+                    key,
+                    value,
+                });
+            } else {
+                self.lexer.expect(&TokenKind::Eq)?;
+                let value = self.parse_term()?;
+
+                // Check for: col = col + term  or  col = col - term
+                if self.lexer.eat(&TokenKind::Plus)? {
+                    let rhs = self.parse_term()?;
+                    assignments.push(Assignment::Add {
+                        column: col,
+                        value: rhs,
+                    });
+                } else if self.lexer.eat(&TokenKind::Minus)? {
+                    let rhs = self.parse_term()?;
+                    assignments.push(Assignment::Sub {
+                        column: col,
+                        value: rhs,
+                    });
+                } else {
+                    assignments.push(Assignment::Simple { column: col, value });
+                }
+            }
+
             if !self.lexer.eat(&TokenKind::Comma)? {
                 break;
             }
@@ -2169,7 +2200,10 @@ mod tests {
                 assert_eq!(s.table, "users");
                 assert_eq!(
                     s.assignments,
-                    vec![("name".into(), Term::StringLiteral("bob".into()))]
+                    vec![Assignment::Simple {
+                        column: "name".into(),
+                        value: Term::StringLiteral("bob".into()),
+                    }]
                 );
                 assert_eq!(s.where_clauses.len(), 1);
             }

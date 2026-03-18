@@ -174,11 +174,28 @@ pub struct InsertStatement {
     pub using_ttl: Option<i32>,
 }
 
+/// An assignment in an UPDATE SET clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Assignment {
+    /// Simple: `col = term`
+    Simple { column: String, value: Term },
+    /// Addition: `col = col + term` (counter increment or collection append)
+    Add { column: String, value: Term },
+    /// Subtraction: `col = col - term` (counter decrement or collection subtract)
+    Sub { column: String, value: Term },
+    /// Map/list element: `col[key] = term`
+    Element {
+        column: String,
+        key: Term,
+        value: Term,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStatement {
     pub keyspace: Option<String>,
     pub table: String,
-    pub assignments: Vec<(String, Term)>,
+    pub assignments: Vec<Assignment>,
     pub where_clauses: Vec<WhereClause>,
     pub if_exists: bool,
     pub using_timestamp: Option<i64>,
