@@ -404,7 +404,7 @@ async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<()> {
 /// Handles [`Message::PairDdlForward`] on the Raft **leader** node.
 ///
 /// Non-leader cluster nodes forward DDL to the leader via
-/// [`forward_ddl_to_leader`].  The leader must have this handler registered
+/// `forward_ddl_to_leader`.  The leader must have this handler registered
 /// (instead of the pair-mode [`crate::pair::ddl::PairDdlForwardHandler`]) so
 /// that it proposes the operation through Raft rather than applying it
 /// directly.

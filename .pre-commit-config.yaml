@@ -136,7 +136,7 @@ repos:
         stages: [commit-msg]
 
   # ===========================================================================
-  # Pre-push: Rust tests
+  # Pre-push: Rust tests + docs
   # ===========================================================================
   - repo: local
     hooks:
@@ -144,6 +144,14 @@ repos:
         name: cargo test (ferrosa)
         stages: [pre-push]
         entry: cargo test
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+      - id: cargo-doc-ferrosa
+        name: cargo doc (ferrosa)
+        stages: [pre-push]
+        entry: bash -c 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace'
         language: system
         files: \.rs$
         pass_filenames: false
