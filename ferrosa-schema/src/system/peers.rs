@@ -55,8 +55,8 @@ pub fn query_peers(schema: &Schema, cluster: &dyn ClusterState) -> Vec<PeerInfo>
     let snap = schema.snapshot();
     let mut peers = cluster.peers();
     for peer in &mut peers {
-        // TODO: In multi-node mode, peers should report their own schema_version.
-        // This stamp is a single-node placeholder.
+        // All nodes apply the same leader-generated schema_version from
+        // Raft, so the local snapshot version matches what peers report.
         peer.schema_version = snap.version;
     }
     peers
