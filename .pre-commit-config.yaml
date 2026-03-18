@@ -143,7 +143,7 @@ repos:
       - id: cargo-test-ferrosa
         name: cargo test (ferrosa)
         stages: [pre-push]
-        entry: cargo test
+        entry: cargo test --all-features --workspace
         language: system
         files: \.rs$
         pass_filenames: false
