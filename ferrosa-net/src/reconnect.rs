@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rand::Rng;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -9,10 +10,11 @@ use crate::codec::Lane;
 use crate::config::NetConfig;
 use crate::rpc::client::RpcClient;
 
-/// Exponential backoff with a configurable initial delay and maximum cap.
+/// Exponential backoff with randomized jitter to prevent thundering herd.
 ///
-/// Each call to [`Self::next_delay`] returns the current delay and doubles it for
-/// the next call, capped at `max`.  Call [`Self::reset`] to restart from `initial`.
+/// Each call to [`Self::next_delay`] returns the current delay plus random
+/// jitter (up to 25% of the delay), then doubles the base for the next call,
+/// capped at `max`.  Call [`Self::reset`] to restart from `initial`.
 pub struct ExponentialBackoff {
     initial: Duration,
     max: Duration,
@@ -28,11 +30,18 @@ impl ExponentialBackoff {
         }
     }
 
-    /// Returns the current delay, then doubles it (capped at `max`).
+    /// Returns the current delay with jitter, then doubles the base (capped at `max`).
     pub fn next_delay(&mut self) -> Duration {
-        let delay = self.current;
+        let base = self.current;
         self.current = self.current.saturating_mul(2).min(self.max);
-        delay
+        // Add 0-25% random jitter to prevent synchronized retries
+        let jitter_range = base.as_millis() as u64 / 4;
+        if jitter_range > 0 {
+            let jitter = rand::thread_rng().gen_range(0..=jitter_range);
+            base.saturating_add(Duration::from_millis(jitter))
+        } else {
+            base
+        }
     }
 
     /// Resets the backoff to `initial`.
@@ -133,18 +142,28 @@ pub(crate) async fn connect_with_retry(
 mod tests {
     use super::*;
 
+    /// Assert delay is within [base, base + 25%] range (accounting for jitter).
+    fn assert_in_range(actual: Duration, base_ms: u64) {
+        let min = Duration::from_millis(base_ms);
+        let max = Duration::from_millis(base_ms + base_ms / 4);
+        assert!(
+            actual >= min && actual <= max,
+            "expected {actual:?} in [{min:?}, {max:?}]"
+        );
+    }
+
     #[test]
     fn backoff_sequence_caps_at_10s() {
         let mut b = ExponentialBackoff::new(Duration::from_millis(100), Duration::from_secs(10));
-        assert_eq!(b.next_delay(), Duration::from_millis(100));
-        assert_eq!(b.next_delay(), Duration::from_millis(200));
-        assert_eq!(b.next_delay(), Duration::from_millis(400));
-        assert_eq!(b.next_delay(), Duration::from_millis(800));
-        assert_eq!(b.next_delay(), Duration::from_millis(1600));
-        assert_eq!(b.next_delay(), Duration::from_millis(3200));
-        assert_eq!(b.next_delay(), Duration::from_millis(6400));
-        assert_eq!(b.next_delay(), Duration::from_secs(10)); // capped
-        assert_eq!(b.next_delay(), Duration::from_secs(10)); // stays capped
+        assert_in_range(b.next_delay(), 100);
+        assert_in_range(b.next_delay(), 200);
+        assert_in_range(b.next_delay(), 400);
+        assert_in_range(b.next_delay(), 800);
+        assert_in_range(b.next_delay(), 1600);
+        assert_in_range(b.next_delay(), 3200);
+        assert_in_range(b.next_delay(), 6400);
+        assert_in_range(b.next_delay(), 10000); // capped
+        assert_in_range(b.next_delay(), 10000); // stays capped
     }
 
     #[test]
@@ -153,7 +172,7 @@ mod tests {
         b.next_delay();
         b.next_delay();
         b.reset();
-        assert_eq!(b.next_delay(), Duration::from_millis(100));
+        assert_in_range(b.next_delay(), 100);
     }
 
     #[test]
