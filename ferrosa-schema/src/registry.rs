@@ -493,6 +493,15 @@ impl Schema {
         &self.virtual_table_registry
     }
 
+    /// Return a cloned `Arc` to the virtual table registry.
+    ///
+    /// Use this when you need to share the registry across subsystems (e.g.
+    /// to give the web console and the CQL router access to the same instance
+    /// without registering tables twice).
+    pub fn virtual_tables_arc(&self) -> Arc<VirtualTableRegistry> {
+        Arc::clone(&self.virtual_table_registry)
+    }
+
     /// Authenticate a user with username and password.
     ///
     /// Checks the rate limiter, verifies the password, optionally upgrades

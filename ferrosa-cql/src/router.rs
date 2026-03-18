@@ -2979,6 +2979,8 @@ fn cql_value_to_common(val: &CqlValue) -> ferrosa_common::CqlValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::virtual_tables::active_queries::ActiveQueriesTable;
+    use crate::virtual_tables::connections::ConnectionsTable;
     use ferrosa_schema::{
         AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
         RateLimitConfig, SchemaConfig, TestAuditSink,
@@ -4354,5 +4356,114 @@ mod tests {
             }
         }
         values
+    }
+
+    // ── Observability virtual table tests ────────────────────────────────
+
+    /// Helper: register the standard observability virtual tables into the
+    /// schema's shared registry so CQL SELECT queries can resolve them.
+    fn setup_with_observability() -> (SharedState, TempDir) {
+        let (state, dir) = setup();
+        state
+            .schema
+            .virtual_tables()
+            .register(Arc::new(ConnectionsTable::new(
+                state.connection_tracker.clone(),
+            )));
+        state
+            .schema
+            .virtual_tables()
+            .register(Arc::new(ActiveQueriesTable::new(
+                state.query_tracker.clone(),
+            )));
+        (state, dir)
+    }
+
+    /// Regression: `SELECT * FROM system_observability.connections` must succeed
+    /// when the virtual table is registered in the schema's shared registry.
+    #[tokio::test]
+    async fn select_system_observability_connections() {
+        let (state, _dir) = setup_with_observability();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system_observability.connections").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                // Kind = Rows (0x0002)
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Regression: `SELECT * FROM system_observability.active_queries` must
+    /// succeed when the virtual table is registered in the schema's shared registry.
+    #[tokio::test]
+    async fn select_system_observability_active_queries() {
+        let (state, _dir) = setup_with_observability();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+        };
+        let stmt =
+            crate::parser::parse("SELECT * FROM system_observability.active_queries").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                // Kind = Rows (0x0002)
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Regression: `USE system_observability` followed by `SELECT * FROM connections`
+    /// (unqualified, relying on current keyspace) must also succeed.
+    #[tokio::test]
+    async fn select_observability_with_use_keyspace() {
+        let (state, _dir) = setup_with_observability();
+        let dev = dev_auth();
+
+        // USE system_observability — no validation, just sets current keyspace.
+        let use_stmt = crate::parser::parse("USE system_observability").unwrap();
+        let use_result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &None,
+            },
+            use_stmt,
+        )
+        .await
+        .unwrap();
+        let new_ks = match use_result {
+            RouteResult::SetKeyspace(ks, _) => ks,
+            _ => panic!("expected SetKeyspace"),
+        };
+        assert_eq!(new_ks, "system_observability");
+
+        // SELECT * FROM connections (unqualified, using current_keyspace)
+        let sel_stmt = crate::parser::parse("SELECT * FROM connections").unwrap();
+        let result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &Some(new_ks),
+            },
+            sel_stmt,
+        )
+        .await;
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
     }
 }
