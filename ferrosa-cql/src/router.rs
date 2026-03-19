@@ -35,6 +35,7 @@ use ferrosa_udf::UdfExecutor;
 use crate::ast::*;
 use crate::bridge;
 use crate::error::CqlError;
+use crate::planner::{self, ScanPlan};
 use crate::prepared::PreparedCache;
 use crate::result;
 use crate::types::{CqlType, CqlValue};
@@ -766,75 +767,157 @@ fn route_select_user_table(
             None => vec![],
         }
     } else {
-        // No PK — check whether every WHERE column is covered by a secondary
-        // index on this table.  Cassandra requires ALLOW FILTERING whenever
-        // *any* WHERE column is not covered by an index (or the partition key),
-        // even if other WHERE columns are indexed.  Using `any` here was the
-        // original bug: it bypassed the check as soon as one indexed column was
-        // found, silently accepting queries that still needed ALLOW FILTERING
-        // for the remaining un-indexed columns.
-        let where_columns: Vec<&str> = s.where_clauses.iter().map(|w| w.column.as_str()).collect();
-
-        // Build the set of columns that are covered by a secondary index on
-        // this table so we can check each WHERE column individually.
-        let indexed_columns: Vec<String> = snap
+        // No PK — use the query planner to decide the access path.
+        let planner_indexes: Vec<(String, Vec<String>)> = snap
             .indexes
             .iter()
             .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
-            .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
+            .map(|((_, _, _), meta)| (meta.name.clone(), meta.target_columns.clone()))
             .collect();
 
-        // A column is "covered" if it has a matching secondary index.
-        let all_where_columns_indexed = where_columns
-            .iter()
-            .all(|col| indexed_columns.iter().any(|ic| ic == col));
+        let scan_plan = planner::plan(
+            &s.where_clauses,
+            &table_meta.partition_key,
+            &planner_indexes,
+        );
 
-        if !all_where_columns_indexed && !s.allow_filtering {
-            return Err(CqlError::Invalid(
-                "Cannot execute this query as it might involve data filtering and \
-                 thus may have unpredictable performance. If you want to execute \
-                 this query despite the performance unpredictability, use ALLOW FILTERING"
-                    .into(),
-            ));
-        }
+        match scan_plan {
+            ScanPlan::PartitionKeyLookup => {
+                unreachable!("PK lookup should have been handled above");
+            }
 
-        // TODO: When IndexReader is available on StorageEngine, use it here
-        // for index-accelerated lookups instead of full scan. For now, the
-        // presence of a matching index allows the query without ALLOW FILTERING,
-        // but execution still falls through to a full scan + post-filter.
-        if all_where_columns_indexed {
-            tracing::debug!(table = %s.table, "all WHERE columns indexed; full scan until index readers are wired");
-        } else {
-            tracing::warn!(table = %s.table, "executing full scan with ALLOW FILTERING");
-        }
+            ScanPlan::SingleIndex {
+                ref index_name,
+                ref index_column,
+            }
+            | ScanPlan::IndexScanWithFilter {
+                ref index_name,
+                ref index_column,
+                ..
+            } => {
+                // IndexScanWithFilter means some WHERE columns are not covered
+                // by any index — Cassandra requires ALLOW FILTERING in this case.
+                if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) && !s.allow_filtering {
+                    return Err(CqlError::Invalid(
+                        "Cannot execute this query as it might involve data filtering and \
+                         thus may have unpredictable performance. If you want to execute \
+                         this query despite the performance unpredictability, use ALLOW FILTERING"
+                            .into(),
+                    ));
+                }
 
-        // Use a large scan window — LIMIT is applied *after* filtering,
-        // not before, to avoid cutting off matching rows (FRSA-BUG-003).
-        let scan_limit = 10_000;
-        let partitions = state.engine.read_range(&table_id, None, None, scan_limit)?;
-        let mut all_rows = Vec::new();
-        for partition in &partitions {
-            let mut prows = bridge::partition_to_rows(
-                partition,
-                &all_col_names,
-                &all_col_types,
-                &pk_indices,
-                &ck_indices,
-            );
-            all_rows.append(&mut prows);
+                // Find the WHERE clause for the indexed column.
+                let index_wc = s
+                    .where_clauses
+                    .iter()
+                    .find(|wc| wc.column == *index_column && wc.op == ComparisonOp::Eq)
+                    .ok_or_else(|| {
+                        CqlError::Invalid(
+                            "planner selected index but no matching WHERE clause found".into(),
+                        )
+                    })?;
+
+                let index_key = term_to_index_key(
+                    &index_wc.value,
+                    index_column,
+                    table_meta,
+                    ks,
+                    &state.schema,
+                )?;
+
+                let partitions = state
+                    .engine
+                    .read_by_index(&table_id, index_name, &index_key)?;
+
+                // Fallback: if the index read returns empty, the memtable index
+                // may not be wired yet (Sprint I-3). Fall back to full scan so
+                // queries still return correct results.
+                let partitions = if partitions.is_empty() {
+                    let scan_limit = 10_000;
+                    state.engine.read_range(&table_id, None, None, scan_limit)?
+                } else {
+                    partitions
+                };
+
+                let mut all_rows = Vec::new();
+                for partition in &partitions {
+                    let mut prows = bridge::partition_to_rows(
+                        partition,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                    );
+                    all_rows.append(&mut prows);
+                }
+
+                // Always apply post-filter as defensive measure.
+                // SingleIndex: redundant but safe; IndexScanWithFilter: necessary.
+                all_rows.retain(|row| {
+                    evaluate_where_predicates(
+                        row,
+                        &s.where_clauses,
+                        &all_col_names,
+                        table_meta,
+                        ks,
+                        &state.schema,
+                    )
+                });
+
+                all_rows
+            }
+
+            ScanPlan::FullScan => {
+                // Check ALLOW FILTERING requirement.
+                let indexed_columns: Vec<String> = snap
+                    .indexes
+                    .iter()
+                    .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+                    .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
+                    .collect();
+
+                let all_where_columns_indexed = s
+                    .where_clauses
+                    .iter()
+                    .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
+
+                if !s.where_clauses.is_empty() && !all_where_columns_indexed && !s.allow_filtering {
+                    return Err(CqlError::Invalid(
+                        "Cannot execute this query as it might involve data filtering and \
+                         thus may have unpredictable performance. If you want to execute \
+                         this query despite the performance unpredictability, use ALLOW FILTERING"
+                            .into(),
+                    ));
+                }
+
+                // Use a large scan window — LIMIT is applied *after* filtering,
+                // not before, to avoid cutting off matching rows (FRSA-BUG-003).
+                let scan_limit = 10_000;
+                let partitions = state.engine.read_range(&table_id, None, None, scan_limit)?;
+                let mut all_rows = Vec::new();
+                for partition in &partitions {
+                    let mut prows = bridge::partition_to_rows(
+                        partition,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                    );
+                    all_rows.append(&mut prows);
+                }
+                all_rows.retain(|row| {
+                    evaluate_where_predicates(
+                        row,
+                        &s.where_clauses,
+                        &all_col_names,
+                        table_meta,
+                        ks,
+                        &state.schema,
+                    )
+                });
+                all_rows
+            }
         }
-        // Apply WHERE predicates as post-filter
-        all_rows.retain(|row| {
-            evaluate_where_predicates(
-                row,
-                &s.where_clauses,
-                &all_col_names,
-                table_meta,
-                ks,
-                &state.schema,
-            )
-        });
-        all_rows
     };
 
     // Apply ORDER BY sorting (FRSA-BUG-004)
@@ -2371,6 +2454,25 @@ fn extract_pk_values(
         values.push(val);
     }
     Ok(values)
+}
+
+/// Convert a WHERE clause `Term` for a given column into an `IndexKey` for
+/// secondary index lookup.
+fn term_to_index_key(
+    term: &Term,
+    column: &str,
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+) -> Result<ferrosa_index::IndexKey, CqlError> {
+    let col_meta = table_meta
+        .columns
+        .get(column)
+        .ok_or_else(|| CqlError::Invalid(format!("column '{column}' not found")))?;
+    let cql_type = resolve_col_type(&col_meta.column_type, ks, schema)?;
+    let cql_value = bridge::term_to_cql_value(term, &cql_type)?;
+    let bytes = crate::types::encode_value(&cql_value);
+    Ok(ferrosa_index::IndexKey(bytes))
 }
 
 /// Evaluate WHERE predicates against a row for ALLOW FILTERING post-filter.
