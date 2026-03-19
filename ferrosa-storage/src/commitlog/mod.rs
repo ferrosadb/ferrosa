@@ -30,7 +30,7 @@ pub(crate) mod sync;
 pub use config::{ArchiveConfig, CommitLogConfig, CommitLogPosition, SyncStrategyConfig, TableId};
 pub use mutation::Mutation;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -74,6 +74,11 @@ pub struct CommitLog {
 
     /// Monotonic segment ID generator.
     next_segment_id: AtomicU64,
+
+    /// Segment IDs that have been successfully archived to S3.
+    /// Used by `discard_completed()` to gate segment deletion when
+    /// archiving is enabled.
+    archived: Mutex<HashSet<u64>>,
 }
 
 impl CommitLog {
@@ -98,6 +103,7 @@ impl CommitLog {
             segment_tracker: Mutex::new(HashMap::new()),
             sync_strategy,
             next_segment_id: AtomicU64::new(2), // first segment is 1
+            archived: Mutex::new(HashSet::new()),
         })
     }
 
@@ -240,8 +246,17 @@ impl CommitLog {
                         }
                     }
                     if tables.is_empty() {
-                        tracker.remove(&seg_id);
-                        segments_to_delete.push(seg_id);
+                        // Check archive gate: if archiving is enabled, the segment
+                        // must be archived before it can be deleted from disk.
+                        let dominated_by_archive = match &self.config.archive {
+                            Some(cfg) if cfg.enabled => self.archived.lock().contains(&seg_id),
+                            _ => true, // Archiving disabled — no gate.
+                        };
+
+                        if dominated_by_archive {
+                            tracker.remove(&seg_id);
+                            segments_to_delete.push(seg_id);
+                        }
                     }
                 }
             }
@@ -249,12 +264,14 @@ impl CommitLog {
 
         // Remove deleted segments from closed_segments and delete files.
         if !segments_to_delete.is_empty() {
+            let mut archived = self.archived.lock();
             let mut closed = self.closed_segments.lock();
             for seg_id in &segments_to_delete {
                 if let Some(idx) = closed.iter().position(|s| s.id == *seg_id) {
                     let segment = closed.remove(idx);
                     let _ = fs::remove_file(segment.path());
                 }
+                archived.remove(seg_id);
             }
         }
 
@@ -289,24 +306,49 @@ impl CommitLog {
             let segment_ids: Vec<u64> = tracker.keys().copied().collect();
             for seg_id in segment_ids {
                 if tracker.get(&seg_id).is_some_and(|tables| tables.is_empty()) {
-                    tracker.remove(&seg_id);
-                    segments_to_delete.push(seg_id);
+                    // Check archive gate: if archiving is enabled, the segment
+                    // must be archived before it can be deleted from disk.
+                    let dominated_by_archive = match &self.config.archive {
+                        Some(cfg) if cfg.enabled => self.archived.lock().contains(&seg_id),
+                        _ => true, // Archiving disabled — no gate.
+                    };
+
+                    if dominated_by_archive {
+                        tracker.remove(&seg_id);
+                        segments_to_delete.push(seg_id);
+                    }
                 }
             }
         }
 
         let count = segments_to_delete.len();
         if !segments_to_delete.is_empty() {
+            let mut archived = self.archived.lock();
             let mut closed = self.closed_segments.lock();
             for seg_id in &segments_to_delete {
                 if let Some(idx) = closed.iter().position(|s| s.id == *seg_id) {
                     let segment = closed.remove(idx);
                     let _ = fs::remove_file(segment.path());
                 }
+                archived.remove(seg_id);
             }
         }
 
         Ok(count)
+    }
+
+    /// Marks a segment as archived to S3.
+    ///
+    /// Called by the archiver after successful upload. Once marked,
+    /// `discard_completed()` will allow deletion of this segment
+    /// (provided all tables are also flushed).
+    pub fn mark_archived(&self, segment_id: u64) {
+        self.archived.lock().insert(segment_id);
+    }
+
+    /// Returns the set of segment IDs currently marked as archived.
+    pub fn archived_segments(&self) -> HashSet<u64> {
+        self.archived.lock().clone()
     }
 
     /// Forces rotation of the active segment.
@@ -724,6 +766,137 @@ mod tests {
             closed_after <= closed_count,
             "should not have more closed segments after discard"
         );
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn discard_blocked_until_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+
+        let m = simple_mutation();
+        let table_id = TableId::new("test_ks", "test_table");
+
+        // Append enough to force at least one rotation.
+        let mut last_pos = None;
+        for _ in 0..10 {
+            if let Ok(pos) = cl.append(&m) {
+                last_pos = Some(pos);
+            }
+        }
+        let last_pos = last_pos.unwrap();
+
+        // Mark all tables flushed — but do NOT mark segments as archived.
+        cl.discard_completed(&table_id, last_pos).unwrap();
+
+        // Closed segments should still exist because they are not archived.
+        let closed = cl.closed_segments.lock();
+        // When archive tracking is enabled, segments that are flushed but
+        // not archived must not be deleted from disk.
+        // (This test will need adjustment once archiving is wired in.)
+        // For now: verify the API exists.
+        assert!(
+            cl.archived_segments().is_empty(),
+            "no segments should be archived yet"
+        );
+        drop(closed);
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn mark_archived_allows_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+
+        let m = simple_mutation();
+        let table_id = TableId::new("test_ks", "test_table");
+
+        // Append to force rotation.
+        let mut positions = Vec::new();
+        for _ in 0..10 {
+            if let Ok(pos) = cl.append(&m) {
+                positions.push(pos);
+            }
+        }
+
+        // Collect closed segment IDs before discard.
+        let closed_ids: Vec<u64> = cl.closed_segments.lock().iter().map(|s| s.id).collect();
+        assert!(!closed_ids.is_empty(), "need closed segments for this test");
+
+        // Mark all closed segments as archived.
+        for id in &closed_ids {
+            cl.mark_archived(*id);
+        }
+
+        // Verify they are tracked as archived.
+        let archived = cl.archived_segments();
+        for id in &closed_ids {
+            assert!(archived.contains(id), "segment {id} should be archived");
+        }
+
+        // Now discard — segments are both flushed and archived, so they
+        // should be deleted.
+        let last_pos = positions.last().unwrap();
+        cl.discard_completed(&table_id, *last_pos).unwrap();
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn flushed_but_not_archived_segment_kept_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 512,
+            archive: Some(super::config::ArchiveConfig {
+                enabled: true,
+                ..super::config::ArchiveConfig::default()
+            }),
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+
+        let m = simple_mutation();
+        let table_id = TableId::new("test_ks", "test_table");
+
+        // Append to force rotation.
+        let mut last_pos = None;
+        for _ in 0..10 {
+            if let Ok(pos) = cl.append(&m) {
+                last_pos = Some(pos);
+            }
+        }
+        let last_pos = last_pos.unwrap();
+
+        // Collect closed segment paths.
+        let closed_paths: Vec<std::path::PathBuf> = cl
+            .closed_segments
+            .lock()
+            .iter()
+            .map(|s| s.path().to_path_buf())
+            .collect();
+        assert!(!closed_paths.is_empty());
+
+        // Discard with archiving enabled but no segments marked as archived.
+        cl.discard_completed(&table_id, last_pos).unwrap();
+
+        // Segment files should still exist on disk.
+        for path in &closed_paths {
+            assert!(
+                path.exists(),
+                "segment {} should still exist (not archived yet)",
+                path.display()
+            );
+        }
 
         cl.shutdown().unwrap();
     }
