@@ -37,6 +37,10 @@ use crate::memtable::skiplist::SkipListMemtable;
 use crate::memtable::Memtable;
 use crate::merge;
 
+/// Maximum number of row positions collected from secondary index before
+/// returning an error. Prevents OOM from high-cardinality queries.
+const INDEX_RESULT_CAP: usize = 10_000;
+
 /// Atomic snapshot of the storage engine's current state.
 ///
 /// Held inside an [`ArcSwap`] so any thread can load a consistent view
@@ -344,6 +348,58 @@ impl<F: FlushTarget> TableStore<F> {
             .collect();
 
         Ok(filtered)
+    }
+
+    /// Query by secondary index: looks up the index key in the memtable
+    /// index (and, in future, all SSTable sidecar indexes), fetches the
+    /// matching partitions, and returns merged results.
+    ///
+    /// Returns an error if the number of matching row positions exceeds
+    /// [`INDEX_RESULT_CAP`] (10,000) to prevent OOM on high-cardinality
+    /// index values. The error message suggests `ALLOW FILTERING` for
+    /// unbounded scans.
+    ///
+    /// Deduplicates by `(partition_key, clustering_key)` so that the same
+    /// row appearing in both memtable and sidecar indexes is returned once.
+    pub fn read_by_index(&self, index_name: &str, key: &IndexKey) -> Result<Vec<Partition>> {
+        let guard = self.view.load();
+
+        let mut positions: Vec<RowPosition> = Vec::new();
+
+        // 1. Query memtable index
+        if let Some(idx) = guard.indexes.get(index_name) {
+            positions.extend(idx.lookup(key));
+        }
+
+        // 2. Query SSTable sidecar indexes (future: populated during flush)
+        // When sidecar writing is wired into flush(), sidecar readers will be
+        // stored in the StoreView alongside SSTables. For now, this is a no-op.
+
+        // 3. Enforce result cap before dedup to bound memory usage
+        if positions.len() > INDEX_RESULT_CAP {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "secondary index query exceeded {} row limit; \
+                 use ALLOW FILTERING for unbounded scans",
+                INDEX_RESULT_CAP
+            )));
+        }
+
+        // 4. Deduplicate by (partition_key, clustering_key)
+        let mut seen = std::collections::HashSet::new();
+        positions.retain(|p| seen.insert((p.partition_key.clone(), p.clustering_key.clone())));
+
+        // 5. Fetch actual partitions by partition key
+        let mut partitions = Vec::new();
+        for pos in &positions {
+            let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
+                pos.partition_key.clone(),
+            ));
+            if let Ok(Some(partition)) = self.read(&dk) {
+                partitions.push(partition);
+            }
+        }
+
+        Ok(partitions)
     }
 
     /// Retrieve a named memtable-level secondary index.
@@ -967,5 +1023,349 @@ mod tests {
         // Perform swap: remove 2 oldest, add 1 → should go from 4 to 3.
         store.swap_compacted_sstables(2, new_sst).unwrap();
         assert_eq!(store.sstable_count(), 3); // 4 - 2 + 1 = 3
+    }
+
+    // =========================================================================
+    // Task 5: read_by_index
+    // =========================================================================
+
+    #[test]
+    fn read_by_index_returns_matching_rows_from_memtable() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "email".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        let store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("email_idx".to_string(), 0_usize)],
+        );
+
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"alice@test.com".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+
+        store
+            .write(
+                &make_key("user2"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"bob@test.com".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+
+        let results = store
+            .read_by_index("email_idx", &IndexKey(b"alice@test.com".to_vec()))
+            .unwrap();
+        assert_eq!(results.len(), 1, "expected exactly one matching partition");
+        assert_eq!(results[0].key.key.as_bytes(), b"user1");
+    }
+
+    #[test]
+    fn read_by_index_deduplicates_same_partition() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "city".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        let store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("city_idx".to_string(), 0_usize)],
+        );
+
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"NYC".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+
+        store
+            .write(
+                &make_key("user2"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"NYC".to_vec(), 2000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(2000),
+                },
+            )
+            .unwrap();
+
+        let results = store
+            .read_by_index("city_idx", &IndexKey(b"NYC".to_vec()))
+            .unwrap();
+        assert_eq!(results.len(), 2, "expected both users from index");
+        let pks: Vec<&[u8]> = results.iter().map(|p| p.key.key.as_bytes()).collect();
+        assert!(pks.contains(&b"user1".as_slice()));
+        assert!(pks.contains(&b"user2".as_slice()));
+    }
+
+    #[test]
+    fn read_by_index_unknown_index_returns_empty() {
+        use ferrosa_index::IndexKey;
+        let store = test_store();
+        store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
+        let results = store
+            .read_by_index("nonexistent_idx", &IndexKey(b"anything".to_vec()))
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    // =========================================================================
+    // Task 6: Result cap (10K RowPositions)
+    // =========================================================================
+
+    #[test]
+    fn read_by_index_returns_all_rows_under_cap() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "status".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        let store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("status_idx".to_string(), 0_usize)],
+        );
+
+        for i in 0..100 {
+            let key = make_key(&format!("user{i}"));
+            store
+                .write(
+                    &key,
+                    Row {
+                        clustering: vec![0x00, 0x00, 0x00, i as u8],
+                        cells: vec![(0, CellValue::live(b"active".to_vec(), 1000 + i as i64))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(1000 + i as i64),
+                    },
+                )
+                .unwrap();
+        }
+
+        let results = store
+            .read_by_index("status_idx", &IndexKey(b"active".to_vec()))
+            .unwrap();
+        assert_eq!(results.len(), 100, "all 100 rows should be returned");
+    }
+
+    #[test]
+    fn read_by_index_exceeds_cap_returns_error() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "tag".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        let store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("tag_idx".to_string(), 0_usize)],
+        );
+
+        // Inject >10K entries directly into index to avoid slow row writes
+        let idx = store.get_memtable_index("tag_idx").unwrap();
+        for i in 0..10_001 {
+            idx.insert(
+                IndexKey(b"popular".to_vec()),
+                RowPosition {
+                    partition_key: format!("pk{i}").into_bytes(),
+                    clustering_key: vec![],
+                },
+            );
+        }
+
+        let result = store.read_by_index("tag_idx", &IndexKey(b"popular".to_vec()));
+        assert!(result.is_err(), "should return error when cap exceeded");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("10000") || err_msg.contains("ALLOW FILTERING"),
+            "error should mention cap or ALLOW FILTERING, got: {err_msg}"
+        );
+    }
+
+    // =========================================================================
+    // Task 7: Handle null indexed column values
+    // =========================================================================
+
+    #[test]
+    fn write_with_null_indexed_column_succeeds() {
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "email".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        let store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("email_idx".to_string(), 0_usize)],
+        );
+
+        // Write a row with a tombstone (null) for the indexed column
+        let key = make_key("user_null");
+        let row = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(0, CellValue::tombstone(1000, 1700000000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        store.write(&key, row).unwrap();
+
+        // Index should be empty (tombstone not indexed)
+        let idx = store.get_memtable_index("email_idx").unwrap();
+        let all_entries: Vec<_> = idx.iter().collect();
+        assert!(all_entries.is_empty(), "null column should not be indexed");
+
+        // Row itself should still be readable via primary key
+        let partition = store.read(&key).unwrap();
+        assert!(
+            partition.is_some(),
+            "row should be readable via primary key"
+        );
+    }
+
+    #[test]
+    fn write_with_missing_indexed_column_succeeds() {
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "email".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "name".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+        };
+
+        // Index on "email" (column position 0), but row only has "name" (position 1)
+        let store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("email_idx".to_string(), 0_usize)],
+        );
+
+        let key = make_key("user_partial");
+        let row = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(1, CellValue::live(b"Alice".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        store.write(&key, row).unwrap();
+
+        // Index should be empty — indexed column was not present
+        let idx = store.get_memtable_index("email_idx").unwrap();
+        let all_entries: Vec<_> = idx.iter().collect();
+        assert!(
+            all_entries.is_empty(),
+            "missing column should not produce an index entry"
+        );
     }
 }

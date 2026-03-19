@@ -556,6 +556,24 @@ impl StorageEngine {
         }
     }
 
+    /// Query by secondary index across memtable and SSTable sidecar indexes.
+    ///
+    /// Delegates to [`TableStore::read_by_index`] which merges results from
+    /// the memtable index and (future) sidecar indexes. Returns an empty vec
+    /// if the table is not registered.
+    pub fn read_by_index(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.read_by_index(index_name, key),
+            None => Ok(vec![]),
+        }
+    }
+
     /// Truncates a table: clears the memtable and drops all SSTable references.
     ///
     /// Subsequent reads for this table will return empty results. Existing
