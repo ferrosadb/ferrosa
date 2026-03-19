@@ -761,6 +761,27 @@ impl StorageEngine {
             .await
     }
 
+    /// Lists all snapshots from S3 using an injected store (for testing).
+    pub async fn list_snapshots_with_store(
+        &self,
+        store: std::sync::Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+    ) -> ferrosa_common::Result<Vec<crate::snapshot::metadata::SnapshotMetadata>> {
+        let manager = crate::snapshot::SnapshotManager::new(store, prefix.to_string());
+        manager.list_snapshots().await
+    }
+
+    /// Deletes a snapshot from S3 using an injected store (for testing).
+    pub async fn delete_snapshot_with_store(
+        &self,
+        name: &str,
+        store: std::sync::Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+    ) -> ferrosa_common::Result<()> {
+        let manager = crate::snapshot::SnapshotManager::new(store, prefix.to_string());
+        manager.delete_snapshot(name).await
+    }
+
     /// Force-syncs the commit log to disk.
     ///
     /// Ensures all buffered mutations are written to disk before reading
@@ -1959,6 +1980,87 @@ mod tests {
                 "{prefix}/snapshots/test-snap/metadata.json"
             ));
             assert!(store.get(&meta_path).await.is_ok());
+
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn list_and_delete_snapshots_via_engine() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: std::sync::Arc<dyn object_store::ObjectStore> =
+                std::sync::Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-node";
+
+            // Save manifest + schema so create_snapshot works.
+            let manifest = crate::manifest::Manifest::new();
+            manifest
+                .save_with_retry(store.as_ref(), prefix)
+                .await
+                .unwrap();
+            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+                .await
+                .unwrap();
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(dir.path()),
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+            let engine = StorageEngine::new(config, None).unwrap();
+
+            // Create two snapshots.
+            engine
+                .create_snapshot_with_store(
+                    "snap-a",
+                    "n1",
+                    None,
+                    false,
+                    std::sync::Arc::clone(&store),
+                    prefix,
+                )
+                .await
+                .unwrap();
+            engine
+                .create_snapshot_with_store(
+                    "snap-b",
+                    "n1",
+                    None,
+                    false,
+                    std::sync::Arc::clone(&store),
+                    prefix,
+                )
+                .await
+                .unwrap();
+
+            // List — should see both.
+            let snaps = engine
+                .list_snapshots_with_store(std::sync::Arc::clone(&store), prefix)
+                .await
+                .unwrap();
+            assert_eq!(snaps.len(), 2);
+            let names: Vec<&str> = snaps.iter().map(|s| s.name.as_str()).collect();
+            assert!(names.contains(&"snap-a"));
+            assert!(names.contains(&"snap-b"));
+
+            // Delete one.
+            engine
+                .delete_snapshot_with_store("snap-a", std::sync::Arc::clone(&store), prefix)
+                .await
+                .unwrap();
+
+            // List — should see only one.
+            let snaps = engine
+                .list_snapshots_with_store(std::sync::Arc::clone(&store), prefix)
+                .await
+                .unwrap();
+            assert_eq!(snaps.len(), 1);
+            assert_eq!(snaps[0].name, "snap-b");
 
             engine.shutdown().unwrap();
         });
