@@ -215,6 +215,41 @@ impl SnapshotManager {
         Ok(ids)
     }
 
+    /// Returns the set of SSTable IDs that are safe to delete from S3.
+    ///
+    /// An SSTable is safe to delete only when it appears in neither the
+    /// live manifest nor any snapshot manifest. This prevents data loss
+    /// when compaction replaces SSTables that are still referenced by
+    /// snapshots.
+    ///
+    /// # Arguments
+    /// * `candidates` — SSTable IDs that the caller wants to delete (e.g., compaction inputs)
+    /// * `live_manifest` — the current live manifest
+    pub async fn sstable_ids_safe_to_delete(
+        &self,
+        candidates: &[String],
+        live_manifest: &Manifest,
+    ) -> ferrosa_common::Result<Vec<String>> {
+        // Collect all SSTable IDs from the live manifest.
+        let live_ids: HashSet<String> = live_manifest
+            .sstables
+            .values()
+            .flat_map(|entries| entries.iter().map(|e| e.id.clone()))
+            .collect();
+
+        // Collect all SSTable IDs from all snapshot manifests.
+        let snapshot_ids = self.all_referenced_sstable_ids().await?;
+
+        // A candidate is safe to delete only if it is in neither set.
+        let safe: Vec<String> = candidates
+            .iter()
+            .filter(|id| !live_ids.contains(id.as_str()) && !snapshot_ids.contains(id.as_str()))
+            .cloned()
+            .collect();
+
+        Ok(safe)
+    }
+
     /// Returns the minimum commit-log position across all live snapshots, or
     /// `None` if no snapshots exist.
     ///
@@ -752,5 +787,94 @@ mod tests {
         assert!(ids.contains("sst-001"));
         assert!(ids.contains("sst-002"));
         assert!(ids.contains("sst-003"));
+    }
+
+    // ── Test 9 ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sstable_gc_safety_protects_snapshot_references() {
+        let store = make_store();
+        let mgr = make_manager(store);
+
+        // Create a snapshot that references sst1 and sst2.
+        let mut snap_manifest = Manifest::new();
+        snap_manifest.add_sstable(
+            "ks.t",
+            ManifestEntry {
+                id: "sst1".into(),
+                size: 100,
+                min_token: 0,
+                max_token: 0,
+                min_timestamp: 0,
+                max_timestamp: 0,
+            },
+        );
+        snap_manifest.add_sstable(
+            "ks.t",
+            ManifestEntry {
+                id: "sst2".into(),
+                size: 100,
+                min_token: 0,
+                max_token: 0,
+                min_timestamp: 0,
+                max_timestamp: 0,
+            },
+        );
+        let pos = CommitLogPosition {
+            segment_id: 1,
+            offset: 0,
+        };
+        mgr.create_snapshot("snap1", &snap_manifest, &[], pos, "n", None, false)
+            .await
+            .unwrap();
+
+        // Live manifest has sst2 and sst3 (sst1 was compacted away from live).
+        let mut live_manifest = Manifest::new();
+        live_manifest.add_sstable(
+            "ks.t",
+            ManifestEntry {
+                id: "sst2".into(),
+                size: 200,
+                min_token: 0,
+                max_token: 0,
+                min_timestamp: 0,
+                max_timestamp: 0,
+            },
+        );
+        live_manifest.add_sstable(
+            "ks.t",
+            ManifestEntry {
+                id: "sst3".into(),
+                size: 300,
+                min_token: 0,
+                max_token: 0,
+                min_timestamp: 0,
+                max_timestamp: 0,
+            },
+        );
+
+        // Try to delete sst1, sst2, sst3.
+        let safe = mgr
+            .sstable_ids_safe_to_delete(
+                &["sst1".into(), "sst2".into(), "sst3".into()],
+                &live_manifest,
+            )
+            .await
+            .unwrap();
+
+        // sst1: in snapshot → NOT safe
+        // sst2: in both live + snapshot → NOT safe
+        // sst3: in live → NOT safe
+        assert!(
+            safe.is_empty(),
+            "no SSTables should be safe to delete: {safe:?}"
+        );
+
+        // sst4 is in neither live nor any snapshot → safe to delete.
+        let safe = mgr
+            .sstable_ids_safe_to_delete(&["sst4".into()], &live_manifest)
+            .await
+            .unwrap();
+        assert_eq!(safe, vec!["sst4".to_string()]);
     }
 }
