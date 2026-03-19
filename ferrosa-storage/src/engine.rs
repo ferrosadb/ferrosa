@@ -1048,7 +1048,11 @@ impl StorageEngine {
             // Swap: remove input SSTables, insert output.
             let tables = self.tables.read();
             if let Some(state) = tables.get(table_id) {
-                if let Err(e) = state.store.swap_compacted_sstables(input_count, reader) {
+                if let Err(e) = state.store.swap_compacted_sstables(
+                    input_count,
+                    reader,
+                    std::collections::HashMap::new(),
+                ) {
                     eprintln!("[compaction] swap failed: {e}");
                 }
             }

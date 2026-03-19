@@ -185,6 +185,15 @@ impl SidecarReader {
         Ok(results)
     }
 
+    /// Returns all `(IndexKey, RowPosition)` pairs in this sidecar, in sorted
+    /// key order. Used to collect entries for merging during compaction.
+    pub fn all_entries(&self) -> Vec<(IndexKey, RowPosition)> {
+        self.entries
+            .iter()
+            .map(|e| (IndexKey(e.key.clone()), e.position.clone()))
+            .collect()
+    }
+
     /// Range query: returns all `RowPosition`s for keys in `[start, end]`
     /// inclusive.
     pub fn range(&self, start: &IndexKey, end: &IndexKey) -> IndexResult<Vec<RowPosition>> {

@@ -552,6 +552,7 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         input_count: usize,
         add: Arc<SSTableReader<F::Reader>>,
+        output_sidecars: HashMap<String, SidecarReader>,
     ) -> Result<()> {
         let _guard = self.flush_guard.lock();
         let current = self.view.load();
@@ -564,7 +565,7 @@ impl<F: FlushTarget> TableStore<F> {
             .collect();
         new_sstables.insert(0, add);
 
-        // Mirror the sidecar list: drop the oldest `input_count`, prepend empty for output
+        // Mirror the sidecar list: drop the oldest `input_count`, prepend merged output sidecar.
         let slen = current.sidecar_indexes.len();
         let mut new_sidecars: Vec<Arc<HashMap<String, SidecarReader>>> = current
             .sidecar_indexes
@@ -572,7 +573,7 @@ impl<F: FlushTarget> TableStore<F> {
             .take(slen.saturating_sub(input_count))
             .cloned()
             .collect();
-        new_sidecars.insert(0, Arc::new(HashMap::new()));
+        new_sidecars.insert(0, Arc::new(output_sidecars));
 
         self.view.store(Arc::new(StoreView {
             active: Arc::clone(&current.active),
@@ -582,6 +583,26 @@ impl<F: FlushTarget> TableStore<F> {
             sidecar_indexes: Arc::new(new_sidecars),
         }));
         Ok(())
+    }
+
+    /// Collects sidecar entries from the oldest `input_count` SSTables for merging.
+    pub fn collect_compaction_sidecar_entries(
+        &self,
+        input_count: usize,
+    ) -> HashMap<String, Vec<(IndexKey, RowPosition)>> {
+        let guard = self.view.load();
+        let slen = guard.sidecar_indexes.len();
+        let start = slen.saturating_sub(input_count);
+        let mut merged: HashMap<String, Vec<(IndexKey, RowPosition)>> = HashMap::new();
+        for sidecar_map in &guard.sidecar_indexes[start..] {
+            for (index_name, reader) in sidecar_map.as_ref() {
+                merged
+                    .entry(index_name.clone())
+                    .or_default()
+                    .extend(reader.all_entries());
+            }
+        }
+        merged
     }
 
     /// Collect metadata for all current SSTables.
@@ -1133,7 +1154,9 @@ mod tests {
         drop(view);
 
         // Perform swap: remove 2 oldest, add 1 → should go from 4 to 3.
-        store.swap_compacted_sstables(2, new_sst).unwrap();
+        store
+            .swap_compacted_sstables(2, new_sst, HashMap::new())
+            .unwrap();
         assert_eq!(store.sstable_count(), 3); // 4 - 2 + 1 = 3
     }
 
