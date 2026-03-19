@@ -215,41 +215,6 @@ impl SnapshotManager {
         Ok(ids)
     }
 
-    /// Returns the set of SSTable IDs that are safe to delete from S3.
-    ///
-    /// An SSTable is safe to delete only when it appears in neither the
-    /// live manifest nor any snapshot manifest. This prevents data loss
-    /// when compaction replaces SSTables that are still referenced by
-    /// snapshots.
-    ///
-    /// # Arguments
-    /// * `candidates` — SSTable IDs that the caller wants to delete (e.g., compaction inputs)
-    /// * `live_manifest` — the current live manifest
-    pub async fn sstable_ids_safe_to_delete(
-        &self,
-        candidates: &[String],
-        live_manifest: &Manifest,
-    ) -> ferrosa_common::Result<Vec<String>> {
-        // Collect all SSTable IDs from the live manifest.
-        let live_ids: HashSet<String> = live_manifest
-            .sstables
-            .values()
-            .flat_map(|entries| entries.iter().map(|e| e.id.clone()))
-            .collect();
-
-        // Collect all SSTable IDs from all snapshot manifests.
-        let snapshot_ids = self.all_referenced_sstable_ids().await?;
-
-        // A candidate is safe to delete only if it is in neither set.
-        let safe: Vec<String> = candidates
-            .iter()
-            .filter(|id| !live_ids.contains(id.as_str()) && !snapshot_ids.contains(id.as_str()))
-            .cloned()
-            .collect();
-
-        Ok(safe)
-    }
-
     /// Returns the minimum commit-log position across all live snapshots, or
     /// `None` if no snapshots exist.
     ///
@@ -260,6 +225,35 @@ impl SnapshotManager {
         let snapshots = self.list_snapshots().await?;
         let min = snapshots.iter().map(|m| m.commit_log_position).min(); // CommitLogPosition implements Ord
         Ok(min)
+    }
+
+    /// Returns segment IDs that are safe to delete from S3 archive.
+    ///
+    /// A segment is safe to delete only if its ID is:
+    /// 1. Below the retention cutoff (based on age)
+    /// 2. Below the oldest snapshot's commit log position segment_id
+    ///
+    /// This prevents deleting segments that a snapshot's PITR restore
+    /// would need for replay.
+    pub async fn segments_safe_to_delete(
+        &self,
+        candidate_segment_ids: &[u64],
+        retention_cutoff_segment_id: u64,
+    ) -> ferrosa_common::Result<Vec<u64>> {
+        let oldest_snapshot_pos = self.oldest_snapshot_position().await?;
+
+        let effective_cutoff = match oldest_snapshot_pos {
+            Some(pos) => retention_cutoff_segment_id.min(pos.segment_id),
+            None => retention_cutoff_segment_id,
+        };
+
+        let safe: Vec<u64> = candidate_segment_ids
+            .iter()
+            .filter(|&&id| id < effective_cutoff)
+            .copied()
+            .collect();
+
+        Ok(safe)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
@@ -792,89 +786,142 @@ mod tests {
     // ── Test 9 ────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn sstable_gc_safety_protects_snapshot_references() {
-        let store = make_store();
-        let mgr = make_manager(store);
+    async fn snapshot_captures_consistent_manifest_state() {
+        // Verify that a snapshot captures a self-consistent manifest.
+        // Even if the live manifest is updated between our read and the
+        // snapshot write, the snapshot's copy is internally consistent.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = "node1";
+        let mgr = SnapshotManager::new(Arc::clone(&store), prefix.to_string());
 
-        // Create a snapshot that references sst1 and sst2.
-        let mut snap_manifest = Manifest::new();
-        snap_manifest.add_sstable(
+        // Create a manifest with 2 SSTables
+        let mut manifest = Manifest::new();
+        manifest.add_sstable(
             "ks.t",
             ManifestEntry {
                 id: "sst1".into(),
                 size: 100,
                 min_token: 0,
-                max_token: 0,
-                min_timestamp: 0,
-                max_timestamp: 0,
+                max_token: 50,
+                min_timestamp: 1000,
+                max_timestamp: 2000,
             },
         );
-        snap_manifest.add_sstable(
-            "ks.t",
-            ManifestEntry {
-                id: "sst2".into(),
-                size: 100,
-                min_token: 0,
-                max_token: 0,
-                min_timestamp: 0,
-                max_timestamp: 0,
-            },
-        );
-        let pos = CommitLogPosition {
-            segment_id: 1,
-            offset: 0,
-        };
-        mgr.create_snapshot("snap1", &snap_manifest, &[], pos, "n", None, false)
-            .await
-            .unwrap();
-
-        // Live manifest has sst2 and sst3 (sst1 was compacted away from live).
-        let mut live_manifest = Manifest::new();
-        live_manifest.add_sstable(
+        manifest.add_sstable(
             "ks.t",
             ManifestEntry {
                 id: "sst2".into(),
                 size: 200,
-                min_token: 0,
-                max_token: 0,
-                min_timestamp: 0,
-                max_timestamp: 0,
+                min_token: 51,
+                max_token: 100,
+                min_timestamp: 2000,
+                max_timestamp: 3000,
             },
         );
-        live_manifest.add_sstable(
+
+        let pos = CommitLogPosition {
+            segment_id: 5,
+            offset: 512,
+        };
+        mgr.create_snapshot("pre-compaction", &manifest, b"{}", pos, "n1", None, false)
+            .await
+            .unwrap();
+
+        // Simulate compaction: replace sst1+sst2 with sst3
+        let mut compacted = Manifest::new();
+        compacted.add_sstable(
             "ks.t",
             ManifestEntry {
                 id: "sst3".into(),
-                size: 300,
+                size: 250,
                 min_token: 0,
-                max_token: 0,
-                min_timestamp: 0,
-                max_timestamp: 0,
+                max_token: 100,
+                min_timestamp: 1000,
+                max_timestamp: 3000,
             },
         );
 
-        // Try to delete sst1, sst2, sst3.
-        let safe = mgr
-            .sstable_ids_safe_to_delete(
-                &["sst1".into(), "sst2".into(), "sst3".into()],
-                &live_manifest,
-            )
+        let pos2 = CommitLogPosition {
+            segment_id: 6,
+            offset: 0,
+        };
+        mgr.create_snapshot(
+            "post-compaction",
+            &compacted,
+            b"{}",
+            pos2,
+            "n1",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Pre-compaction snapshot references sst1, sst2
+        let pre = mgr.load_snapshot_manifest("pre-compaction").await.unwrap();
+        let pre_ids: Vec<&str> = pre.sstables["ks.t"].iter().map(|e| e.id.as_str()).collect();
+        assert!(pre_ids.contains(&"sst1"));
+        assert!(pre_ids.contains(&"sst2"));
+        assert!(!pre_ids.contains(&"sst3"));
+
+        // Post-compaction snapshot references sst3
+        let post = mgr.load_snapshot_manifest("post-compaction").await.unwrap();
+        let post_ids: Vec<&str> = post.sstables["ks.t"]
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert!(post_ids.contains(&"sst3"));
+        assert!(!post_ids.contains(&"sst1"));
+
+        // Both snapshots are self-consistent
+        assert_eq!(pre.sstables["ks.t"].len(), 2);
+        assert_eq!(post.sstables["ks.t"].len(), 1);
+    }
+
+    // ── Test 10 ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn archive_retention_respects_snapshot_position() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = "node1";
+        let mgr = SnapshotManager::new(Arc::clone(&store), prefix.to_string());
+
+        // Create snapshot at segment 10
+        let manifest = Manifest::new();
+        let pos = CommitLogPosition {
+            segment_id: 10,
+            offset: 0,
+        };
+        mgr.create_snapshot("snap1", &manifest, b"{}", pos, "n1", None, false)
             .await
             .unwrap();
 
-        // sst1: in snapshot → NOT safe
-        // sst2: in both live + snapshot → NOT safe
-        // sst3: in live → NOT safe
-        assert!(
-            safe.is_empty(),
-            "no SSTables should be safe to delete: {safe:?}"
-        );
-
-        // sst4 is in neither live nor any snapshot → safe to delete.
+        // Retention says delete segments below 15
+        // But snapshot needs segments >= 10 for PITR replay
+        // So effective cutoff = min(15, 10) = 10
         let safe = mgr
-            .sstable_ids_safe_to_delete(&["sst4".into()], &live_manifest)
+            .segments_safe_to_delete(&[5, 8, 10, 12, 14], 15)
             .await
             .unwrap();
-        assert_eq!(safe, vec!["sst4".to_string()]);
+
+        // Only segments strictly below 10 are safe
+        assert_eq!(safe, vec![5, 8]);
+    }
+
+    // ── Test 11 ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn archive_retention_no_snapshots_uses_retention_cutoff() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = "node1";
+        let mgr = SnapshotManager::new(Arc::clone(&store), prefix.to_string());
+
+        // No snapshots — use retention cutoff directly
+        let safe = mgr
+            .segments_safe_to_delete(&[5, 8, 10, 12, 14], 10)
+            .await
+            .unwrap();
+
+        assert_eq!(safe, vec![5, 8]);
     }
 }
