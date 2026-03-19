@@ -16,6 +16,8 @@
 //!   topology     Ring topology / token assignments
 //!   peers        Peer node list
 //!   monitor      Interactive TUI dashboard (T24)
+//!   snapshot     Manage node snapshots (create / list / delete)
+//!   restore      Restore from a snapshot, optionally to a point in time
 //! ```
 
 use std::net::SocketAddr;
@@ -99,6 +101,49 @@ enum Commands {
 
     /// Rebalance token distribution across the cluster.
     Rebalance,
+
+    /// Manage node snapshots (create, list, delete).
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotAction,
+    },
+
+    /// Restore from a snapshot, optionally to a point in time.
+    Restore {
+        /// Name of the snapshot to restore from.
+        snapshot_name: String,
+
+        /// Restore to this point in time (RFC 3339 timestamp, e.g. 2026-03-18T12:00:00Z).
+        #[arg(long)]
+        point_in_time: Option<String>,
+
+        /// Skip confirmation prompt and proceed even if data will be overwritten.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// Snapshot sub-actions.
+#[derive(Debug, Subcommand)]
+enum SnapshotAction {
+    /// Create a new snapshot.
+    Create {
+        /// Name for the new snapshot.
+        name: String,
+
+        /// Time-to-live in hours before the snapshot is automatically removed.
+        #[arg(long)]
+        ttl_hours: Option<u64>,
+    },
+
+    /// List existing snapshots.
+    List,
+
+    /// Delete a snapshot.
+    Delete {
+        /// Name of the snapshot to delete.
+        name: String,
+    },
 }
 
 /// Unified error type used by `main` so all match arms have the same type.
@@ -138,6 +183,29 @@ async fn main() {
         }
         Commands::Ring => commands::ring(&web_host, web_port).await,
         Commands::Rebalance => commands::rebalance(&web_host, web_port).await,
+        Commands::Snapshot { action } => match action {
+            SnapshotAction::Create { name, ttl_hours } => {
+                commands::snapshot_create(&web_host, web_port, &name, ttl_hours).await
+            }
+            SnapshotAction::List => commands::snapshot_list(&web_host, web_port).await,
+            SnapshotAction::Delete { name } => {
+                commands::snapshot_delete(&web_host, web_port, &name).await
+            }
+        },
+        Commands::Restore {
+            snapshot_name,
+            point_in_time,
+            force,
+        } => {
+            commands::restore(
+                &web_host,
+                web_port,
+                &snapshot_name,
+                point_in_time.as_deref(),
+                force,
+            )
+            .await
+        }
     };
 
     if let Err(e) = result {
@@ -298,5 +366,137 @@ mod tests {
     fn subcommand_rebalance_parses() {
         let cli = Cli::try_parse_from(["ferrosa-ctl", "rebalance"]).unwrap();
         assert!(matches!(cli.command, Commands::Rebalance));
+    }
+
+    // ── Snapshot / Restore argument-parsing tests ─────────────────────────────
+
+    #[test]
+    fn parse_snapshot_create_minimal() {
+        let cli =
+            Cli::try_parse_from(["ferrosa-ctl", "snapshot", "create", "daily-backup"]).unwrap();
+        match cli.command {
+            Commands::Snapshot {
+                action: SnapshotAction::Create { name, ttl_hours },
+            } => {
+                assert_eq!(name, "daily-backup");
+                assert!(ttl_hours.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_snapshot_create_with_ttl() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "snapshot",
+            "create",
+            "weekly",
+            "--ttl-hours",
+            "168",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Snapshot {
+                action: SnapshotAction::Create { name, ttl_hours },
+            } => {
+                assert_eq!(name, "weekly");
+                assert_eq!(ttl_hours, Some(168));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_snapshot_list() {
+        let cli = Cli::try_parse_from(["ferrosa-ctl", "snapshot", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Snapshot {
+                action: SnapshotAction::List,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_snapshot_delete() {
+        let cli =
+            Cli::try_parse_from(["ferrosa-ctl", "snapshot", "delete", "daily-backup"]).unwrap();
+        match cli.command {
+            Commands::Snapshot {
+                action: SnapshotAction::Delete { name },
+            } => assert_eq!(name, "daily-backup"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_minimal() {
+        let cli = Cli::try_parse_from(["ferrosa-ctl", "restore", "my-snapshot"]).unwrap();
+        match cli.command {
+            Commands::Restore {
+                snapshot_name,
+                point_in_time,
+                force,
+            } => {
+                assert_eq!(snapshot_name, "my-snapshot");
+                assert!(point_in_time.is_none());
+                assert!(!force);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_with_force() {
+        let cli =
+            Cli::try_parse_from(["ferrosa-ctl", "restore", "my-snapshot", "--force"]).unwrap();
+        match cli.command {
+            Commands::Restore { force, .. } => assert!(force),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_with_point_in_time() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "restore",
+            "my-snapshot",
+            "--point-in-time",
+            "2026-03-18T12:00:00Z",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Restore { point_in_time, .. } => {
+                assert_eq!(point_in_time.as_deref(), Some("2026-03-18T12:00:00Z"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore_all_flags() {
+        let cli = Cli::try_parse_from([
+            "ferrosa-ctl",
+            "restore",
+            "backup-2026",
+            "--point-in-time",
+            "2026-03-01T00:00:00Z",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Restore {
+                snapshot_name,
+                point_in_time,
+                force,
+            } => {
+                assert_eq!(snapshot_name, "backup-2026");
+                assert_eq!(point_in_time.as_deref(), Some("2026-03-01T00:00:00Z"));
+                assert!(force);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }
