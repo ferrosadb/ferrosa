@@ -102,6 +102,22 @@ fn new_indexes(indexed_columns: &[(String, usize)]) -> Arc<HashMap<String, Arc<M
     Arc::new(map)
 }
 
+/// Filters sidecar entries to remove references to deleted partitions.
+///
+/// After compaction merges partitions, some entries in the collected
+/// sidecar map may reference partition keys that were removed (tombstoned).
+/// This function removes those stale entries and drops any index whose
+/// entry list becomes empty as a result.
+pub fn filter_tombstoned_sidecar_entries(
+    entries: &mut HashMap<String, Vec<(IndexKey, RowPosition)>>,
+    live_partition_keys: &std::collections::HashSet<Vec<u8>>,
+) {
+    for positions in entries.values_mut() {
+        positions.retain(|(_key, pos)| live_partition_keys.contains(&pos.partition_key));
+    }
+    entries.retain(|_, positions| !positions.is_empty());
+}
+
 impl<F: FlushTarget> TableStore<F> {
     /// Create a new `TableStore` with an empty memtable and no SSTables.
     pub fn new(schema: TableSchema, flush_target: F, options: WriteOptions) -> Self {
