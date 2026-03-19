@@ -844,6 +844,18 @@
           from S3 in seconds instead of streaming for hours.
         </p>
         <p style="margin-top: 0.75rem;">
+          NVMe is a bounded cache layer, S3 is the unbounded durable store. Data that doesn't
+          fit on NVMe lives in S3 and gets pulled through on demand. The
+          <code style="font-size: 0.875rem;">local_cache_max_bytes</code> config controls how much
+          NVMe is used. Size your local disks for your working set, not your total dataset.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          Point-in-time recovery retention is managed through standard S3 Lifecycle rules —
+          set a retention policy on your commit log archive bucket and S3 handles expiry
+          automatically. No custom GC, no cron jobs. Node retirement is just as simple:
+          decommission a node and its S3 objects are tagged for cleanup.
+        </p>
+        <p style="margin-top: 0.75rem;">
           Works with AWS S3, MinIO, Cloudflare R2, or any S3-compatible endpoint.
           No vendor lock-in.
         </p>
