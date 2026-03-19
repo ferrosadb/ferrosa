@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Ordered first by segment_id, then by offset. Used to track how
 /// far each table has been flushed so old segments can be deleted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CommitLogPosition {
     pub segment_id: u64,
     pub offset: u64,
