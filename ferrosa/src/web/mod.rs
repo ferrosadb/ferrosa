@@ -14,9 +14,16 @@
 //!   `POST /api/cluster/decommission`→ initiate graceful removal of a node
 //!   `GET /api/cluster/ring`         → token ring topology
 //!   `POST /api/cluster/rebalance`   → rebalance token distribution
+//!   `GET /api/snapshots`            → list PITR snapshots
+//!   `POST /api/snapshots`           → create a PITR snapshot
+//!   `DELETE /api/snapshots/:name`   → delete a PITR snapshot
+//!   `GET /api/archive_status`       → commit-log archive health
+//!   `POST /api/restore/preflight`   → validate a restore without applying it
+//!   `POST /api/restore`             → trigger a PITR restore
 
 pub mod api;
 pub mod auth;
+pub mod snapshots;
 pub mod static_files;
 pub mod ws;
 
@@ -27,6 +34,7 @@ use axum::routing::get;
 use axum::Router;
 use ferrosa_cluster::ModeController;
 use ferrosa_schema::{Schema, VirtualTableRegistry};
+use ferrosa_storage::StorageEngine;
 
 /// Configuration for the web observability server.
 #[derive(Debug, Clone)]
@@ -61,6 +69,10 @@ pub struct WebAppState {
     pub registry: Arc<VirtualTableRegistry>,
     pub mode_controller: Arc<ModeController>,
     pub schema: Arc<Schema>,
+    /// Storage engine — used by snapshot and restore endpoints.
+    pub storage: Arc<StorageEngine>,
+    /// Host UUID — used as the `node_id` when creating snapshots.
+    pub host_id: uuid::Uuid,
     pub auth_disabled: bool,
 }
 
@@ -84,6 +96,7 @@ impl FromRef<WebAppState> for Arc<ModeController> {
 pub fn build_router(state: WebAppState) -> Router {
     let api = Router::new()
         .nest("/api", api::routes())
+        .nest("/api", snapshots::snapshot_routes())
         .nest("/api/cluster", api::cluster_routes())
         .route("/api/ws", get(ws::ws_handler))
         .layer(axum::middleware::from_fn_with_state(
