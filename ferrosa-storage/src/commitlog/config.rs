@@ -74,6 +74,68 @@ impl Default for SyncStrategyConfig {
     }
 }
 
+/// Default archive poll interval: 5 seconds.
+pub const DEFAULT_ARCHIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Default archive retention: 7 days.
+pub const DEFAULT_ARCHIVE_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Configuration for commit log archiving to S3.
+///
+/// When enabled, closed commit log segments are uploaded to S3 for
+/// point-in-time recovery. Disabled by default.
+#[derive(Debug, Clone)]
+pub struct ArchiveConfig {
+    /// Whether archiving is enabled.
+    pub enabled: bool,
+    /// How often the archiver polls for new closed segments.
+    pub poll_interval: Duration,
+    /// How long archived segments are retained in S3.
+    pub retention: Duration,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval: DEFAULT_ARCHIVE_POLL_INTERVAL,
+            retention: DEFAULT_ARCHIVE_RETENTION,
+        }
+    }
+}
+
+impl ArchiveConfig {
+    /// Reads archive configuration from `FERROSA_ARCHIVE_*` environment variables.
+    ///
+    /// - `FERROSA_ARCHIVE_ENABLED` — `true` to enable (default: `false`)
+    /// - `FERROSA_ARCHIVE_POLL_INTERVAL_SECS` — seconds (default: 5)
+    /// - `FERROSA_ARCHIVE_RETENTION_DAYS` — days (default: 7)
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("FERROSA_ARCHIVE_ENABLED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false);
+
+        let poll_interval = std::env::var("FERROSA_ARCHIVE_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_ARCHIVE_POLL_INTERVAL);
+
+        let retention = std::env::var("FERROSA_ARCHIVE_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|days| Duration::from_secs(days * 24 * 3600))
+            .unwrap_or(DEFAULT_ARCHIVE_RETENTION);
+
+        Self {
+            enabled,
+            poll_interval,
+            retention,
+        }
+    }
+}
+
 /// Default segment size: 32 MB.
 pub const DEFAULT_SEGMENT_SIZE: usize = 32 * 1024 * 1024;
 
@@ -97,6 +159,8 @@ pub struct CommitLogConfig {
     pub log_dir: PathBuf,
     /// Directory for checkpoint file (may be same as log_dir).
     pub checkpoint_dir: PathBuf,
+    /// Optional commit log archiving configuration.
+    pub archive: Option<ArchiveConfig>,
 }
 
 impl CommitLogConfig {
@@ -109,6 +173,7 @@ impl CommitLogConfig {
             sync_strategy: SyncStrategyConfig::Batch, // immediate fsync for deterministic tests
             log_dir: dir.to_path_buf(),
             checkpoint_dir: dir.to_path_buf(),
+            archive: None,
         }
     }
 }
@@ -121,6 +186,7 @@ impl Default for CommitLogConfig {
             sync_strategy: SyncStrategyConfig::default(),
             log_dir: PathBuf::from("/var/lib/ferrosa/commitlog"),
             checkpoint_dir: PathBuf::from("/var/lib/ferrosa/commitlog"),
+            archive: None,
         }
     }
 }
@@ -178,5 +244,32 @@ mod tests {
     fn sync_strategy_default_is_periodic() {
         let strategy = SyncStrategyConfig::default();
         assert!(matches!(strategy, SyncStrategyConfig::Periodic { .. }));
+    }
+
+    #[test]
+    fn archive_config_defaults() {
+        let config = ArchiveConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.poll_interval, Duration::from_secs(5));
+        assert_eq!(config.retention, Duration::from_secs(7 * 24 * 3600));
+    }
+
+    #[test]
+    fn commit_log_config_archive_none_by_default() {
+        let config = CommitLogConfig::default();
+        assert!(config.archive.is_none());
+    }
+
+    #[test]
+    fn archive_config_from_env_defaults() {
+        // No env vars set — should return default (disabled).
+        // Clear any stale env to be safe.
+        std::env::remove_var("FERROSA_ARCHIVE_ENABLED");
+        std::env::remove_var("FERROSA_ARCHIVE_POLL_INTERVAL_SECS");
+        std::env::remove_var("FERROSA_ARCHIVE_RETENTION_DAYS");
+        let config = ArchiveConfig::from_env();
+        assert!(!config.enabled);
+        assert_eq!(config.poll_interval, Duration::from_secs(5));
+        assert_eq!(config.retention, Duration::from_secs(7 * 24 * 3600));
     }
 }

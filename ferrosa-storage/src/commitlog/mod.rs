@@ -27,7 +27,7 @@ pub(crate) mod reader;
 pub(crate) mod segment;
 pub(crate) mod sync;
 
-pub use config::{CommitLogConfig, CommitLogPosition, SyncStrategyConfig, TableId};
+pub use config::{ArchiveConfig, CommitLogConfig, CommitLogPosition, SyncStrategyConfig, TableId};
 pub use mutation::Mutation;
 
 use std::collections::HashMap;
