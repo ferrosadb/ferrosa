@@ -7,6 +7,7 @@
 //! `CompactionExecutor`.
 
 pub mod scheduler;
+pub mod sidecar;
 pub mod tracker;
 pub mod virtual_table;
 

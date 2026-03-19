@@ -29,6 +29,7 @@ use ferrosa_sstable::writer::SSTableWriter;
 use ferrosa_sstable::WriteOptions;
 
 use crate::flush::{self, FlushTarget};
+use crate::index::sidecar::SidecarReader;
 use crate::memtable::index::MemtableIndex;
 #[cfg(not(feature = "skiplist-memtable"))]
 use crate::memtable::sharded::ShardedBTreeMemtable;
@@ -57,6 +58,9 @@ struct StoreView<R: ReadAt + Send + Sync + 'static> {
     /// Per-index MemtableIndex companions for the active memtable, keyed by
     /// index name. Swapped atomically alongside the active memtable during flush.
     indexes: Arc<HashMap<String, Arc<MemtableIndex>>>,
+    /// Per-SSTable sidecar index readers, parallel to `sstables`.
+    /// Each entry maps index_name -> SidecarReader for that SSTable.
+    sidecar_indexes: Arc<Vec<Arc<HashMap<String, SidecarReader>>>>,
 }
 
 /// Single-table storage engine: lock-free reads, serialized flushes.
@@ -122,6 +126,7 @@ impl<F: FlushTarget> TableStore<F> {
             flushing: None,
             sstables: Arc::new(vec![]),
             indexes,
+            sidecar_indexes: Arc::new(vec![]),
         };
         Self {
             schema,
@@ -145,11 +150,17 @@ impl<F: FlushTarget> TableStore<F> {
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
         let indexes = new_indexes(&[]);
+        let sidecar_count = initial_sstables.len();
         let initial_view = StoreView {
             active,
             flushing: None,
             sstables: Arc::new(initial_sstables),
             indexes,
+            sidecar_indexes: Arc::new(
+                (0..sidecar_count)
+                    .map(|_| Arc::new(HashMap::new()))
+                    .collect(),
+            ),
         };
         Self {
             schema,
@@ -249,7 +260,9 @@ impl<F: FlushTarget> TableStore<F> {
         let fresh_indexes = new_indexes(&self.indexed_columns);
         let old_view = self.view.load();
         let old_active = Arc::clone(&old_view.active);
+        let old_indexes = Arc::clone(&old_view.indexes);
         let current_sstables = Arc::clone(&old_view.sstables);
+        let current_sidecars = Arc::clone(&old_view.sidecar_indexes);
         // Drop the guard before storing (ArcSwap does not require it, but
         // dropping early avoids holding a pinned epoch longer than needed).
         drop(old_view);
@@ -259,6 +272,7 @@ impl<F: FlushTarget> TableStore<F> {
             flushing: Some(Arc::clone(&old_active)),
             sstables: Arc::clone(&current_sstables),
             indexes: fresh_indexes,
+            sidecar_indexes: Arc::clone(&current_sidecars),
         }));
 
         // Step 2: Snapshot the flushing memtable.
@@ -275,6 +289,7 @@ impl<F: FlushTarget> TableStore<F> {
                 flushing: None,
                 sstables: Arc::clone(&live.sstables),
                 indexes: Arc::clone(&live.indexes),
+                sidecar_indexes: Arc::clone(&live.sidecar_indexes),
             }));
             return Ok(());
         }
@@ -297,16 +312,39 @@ impl<F: FlushTarget> TableStore<F> {
         let reader = self.flush_target.flush(output)?;
         let new_reader = Arc::new(reader);
 
-        // Step 6: Prepend new SSTable, clear flushing.
+        // Step 5b: Build sidecar readers from the old memtable indexes.
+        let mut sidecar_map: HashMap<String, SidecarReader> = HashMap::new();
+        for (index_name, memtable_idx) in old_indexes.iter() {
+            let entries: Vec<(IndexKey, Vec<RowPosition>)> = memtable_idx.iter().collect();
+            // Flatten: each (key, positions) pair becomes multiple (key, pos) entries
+            let flat_entries: Vec<(IndexKey, RowPosition)> = entries
+                .into_iter()
+                .flat_map(|(key, positions)| {
+                    positions.into_iter().map(move |pos| (key.clone(), pos))
+                })
+                .collect();
+            if !flat_entries.is_empty() {
+                sidecar_map.insert(
+                    index_name.clone(),
+                    SidecarReader::from_entries(flat_entries),
+                );
+            }
+        }
+
+        // Step 6: Prepend new SSTable and sidecar, clear flushing.
         let current_view = self.view.load();
         let mut new_sstables = vec![new_reader];
         new_sstables.extend(current_view.sstables.iter().cloned());
+
+        let mut new_sidecars = vec![Arc::new(sidecar_map)];
+        new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
 
         self.view.store(Arc::new(StoreView {
             active: Arc::clone(&current_view.active),
             flushing: None,
             sstables: Arc::new(new_sstables),
             indexes: Arc::clone(&current_view.indexes),
+            sidecar_indexes: Arc::new(new_sidecars),
         }));
 
         Ok(())
@@ -371,9 +409,14 @@ impl<F: FlushTarget> TableStore<F> {
             positions.extend(idx.lookup(key));
         }
 
-        // 2. Query SSTable sidecar indexes (future: populated during flush)
-        // When sidecar writing is wired into flush(), sidecar readers will be
-        // stored in the StoreView alongside SSTables. For now, this is a no-op.
+        // 2. Query SSTable sidecar indexes
+        for sidecar in guard.sidecar_indexes.iter() {
+            if let Some(reader) = sidecar.get(index_name) {
+                if let Ok(results) = reader.lookup(key) {
+                    positions.extend(results);
+                }
+            }
+        }
 
         // 3. Enforce result cap before dedup to bound memory usage
         if positions.len() > INDEX_RESULT_CAP {
@@ -440,6 +483,7 @@ impl<F: FlushTarget> TableStore<F> {
             flushing: None,
             sstables: Arc::new(vec![]),
             indexes: new_indexes(&self.indexed_columns),
+            sidecar_indexes: Arc::new(vec![]),
         }));
     }
 
@@ -463,11 +507,22 @@ impl<F: FlushTarget> TableStore<F> {
             .collect();
         new_sstables.insert(0, add);
 
+        // Mirror the sidecar list: drop the oldest `input_count`, prepend empty for output
+        let slen = current.sidecar_indexes.len();
+        let mut new_sidecars: Vec<Arc<HashMap<String, SidecarReader>>> = current
+            .sidecar_indexes
+            .iter()
+            .take(slen.saturating_sub(input_count))
+            .cloned()
+            .collect();
+        new_sidecars.insert(0, Arc::new(HashMap::new()));
+
         self.view.store(Arc::new(StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
             sstables: Arc::new(new_sstables),
             indexes: Arc::clone(&current.indexes),
+            sidecar_indexes: Arc::new(new_sidecars),
         }));
         Ok(())
     }
@@ -1367,5 +1422,141 @@ mod tests {
             all_entries.is_empty(),
             "missing column should not produce an index entry"
         );
+    }
+
+    // =========================================================================
+    // Sidecar index integration (flush + read_by_index)
+    // =========================================================================
+
+    #[test]
+    fn read_by_index_after_flush_queries_sidecar() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "city".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        let store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("city_idx".to_string(), 0_usize)],
+        );
+
+        // Write a row and flush it to SSTable + sidecar
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"NYC".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+        store.flush().unwrap();
+
+        // The memtable index should be empty after flush
+        let idx = store.get_memtable_index("city_idx").unwrap();
+        assert!(
+            idx.lookup(&IndexKey(b"NYC".to_vec())).is_empty(),
+            "memtable index should be reset after flush"
+        );
+
+        // But read_by_index should still find it via the sidecar
+        let results = store
+            .read_by_index("city_idx", &IndexKey(b"NYC".to_vec()))
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "read_by_index should find the flushed row via sidecar"
+        );
+        assert_eq!(results[0].key.key.as_bytes(), b"user1");
+    }
+
+    #[test]
+    fn read_by_index_merges_memtable_and_sidecar() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "city".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        let store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("city_idx".to_string(), 0_usize)],
+        );
+
+        // Write and flush one row
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"NYC".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+        store.flush().unwrap();
+
+        // Write another row with same index value (stays in memtable)
+        store
+            .write(
+                &make_key("user2"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"NYC".to_vec(), 2000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(2000),
+                },
+            )
+            .unwrap();
+
+        // Query should find BOTH: user1 from sidecar, user2 from memtable
+        let results = store
+            .read_by_index("city_idx", &IndexKey(b"NYC".to_vec()))
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "should find user1 (sidecar) + user2 (memtable)"
+        );
+        let pks: Vec<&[u8]> = results.iter().map(|p| p.key.key.as_bytes()).collect();
+        assert!(pks.contains(&b"user1".as_slice()));
+        assert!(pks.contains(&b"user2".as_slice()));
     }
 }
