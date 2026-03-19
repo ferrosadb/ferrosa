@@ -23,6 +23,7 @@ pub mod manifest;
 pub mod memtable;
 pub mod merge;
 pub mod observer;
+pub mod restore;
 pub mod snapshot;
 pub mod store;
 pub mod subscription_observer;
