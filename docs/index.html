@@ -1394,6 +1394,22 @@ user = session.execute(stmt, [user_id])
           <td>~$250K/mo</td>
         </tr>
         <tr>
+          <td>PITR Cost (PB, 30d)</td>
+          <td class="ferrosa-col">~$2/mo (commit log only)</td>
+          <td>~$150K/mo (EBS snapshots)</td>
+          <td>~$150K/mo (EBS snapshots)</td>
+          <td>~$250K/mo (on-demand)</td>
+          <td>~$250K/mo (on-demand)</td>
+        </tr>
+        <tr>
+          <td>PITR Cost (PB, 1yr)</td>
+          <td class="ferrosa-col">~$45/mo (Glacier tiered)</td>
+          <td>~$500K+/mo</td>
+          <td>~$500K+/mo</td>
+          <td>N/A (35 days max)</td>
+          <td>N/A (35 days max)</td>
+        </tr>
+        <tr>
           <td>Vendor Lock-In</td>
           <td class="ferrosa-col">None</td>
           <td>None</td>
