@@ -22,6 +22,7 @@ pub mod index;
 pub mod manifest;
 pub mod memtable;
 pub mod merge;
+pub mod metrics;
 pub mod observer;
 pub mod restore;
 pub mod snapshot;

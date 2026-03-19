@@ -868,6 +868,66 @@ fn route_select_user_table(
                 all_rows
             }
 
+            ScanPlan::IndexIntersection { ref indexes } => {
+                // Use first index for fetch, post-filter all WHERE predicates.
+                // Full set intersection across indexes is a future optimization.
+                let (ref first_idx_name, ref first_idx_col) = indexes[0];
+                let index_wc = s
+                    .where_clauses
+                    .iter()
+                    .find(|wc| wc.column == *first_idx_col && wc.op == ComparisonOp::Eq)
+                    .ok_or_else(|| {
+                        CqlError::Invalid(
+                            "planner selected index but no matching WHERE clause found".into(),
+                        )
+                    })?;
+
+                let index_key = term_to_index_key(
+                    &index_wc.value,
+                    first_idx_col,
+                    table_meta,
+                    ks,
+                    &state.schema,
+                )?;
+
+                let partitions =
+                    state
+                        .engine
+                        .read_by_index(&table_id, first_idx_name, &index_key)?;
+
+                let partitions = if partitions.is_empty() {
+                    let scan_limit = 10_000;
+                    state.engine.read_range(&table_id, None, None, scan_limit)?
+                } else {
+                    partitions
+                };
+
+                let mut all_rows = Vec::new();
+                for partition in &partitions {
+                    let mut prows = bridge::partition_to_rows(
+                        partition,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                    );
+                    all_rows.append(&mut prows);
+                }
+
+                all_rows.retain(|row| {
+                    evaluate_where_predicates(
+                        row,
+                        &s.where_clauses,
+                        &all_col_names,
+                        table_meta,
+                        ks,
+                        &state.schema,
+                    )
+                });
+
+                all_rows
+            }
+
             ScanPlan::FullScan => {
                 // Check ALLOW FILTERING requirement.
                 let indexed_columns: Vec<String> = snap
