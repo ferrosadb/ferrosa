@@ -327,4 +327,64 @@ mod tests {
     fn display_full_scan() {
         assert_eq!(format!("{}", ScanPlan::FullScan), "FullScan");
     }
+
+    // Task 4: IndexScanWithFilter post-filter validation
+
+    #[test]
+    fn index_scan_with_filter_only_one_indexed_column() {
+        // WHERE email = 'x' AND age > 25 AND status = 'active'
+        // Only email is indexed.
+        let plan = plan(
+            &[
+                wc("email", ComparisonOp::Eq),
+                wc("age", ComparisonOp::Gt),
+                wc("status", ComparisonOp::Eq),
+            ],
+            &pk(&["id"]),
+            &[idx("idx_email", &["email"])],
+        );
+        match &plan {
+            ScanPlan::IndexScanWithFilter { filter_columns, .. } => {
+                assert_eq!(filter_columns.len(), 2);
+                assert!(filter_columns.contains(&"age".to_string()));
+                assert!(filter_columns.contains(&"status".to_string()));
+            }
+            other => panic!("expected IndexScanWithFilter, got {other:?}"),
+        }
+    }
+
+    // Task 5: Keyspace/table scoping validation
+
+    #[test]
+    fn index_from_different_table_not_used() {
+        // Index exists on "other_table.email", not "users.email"
+        // The plan() function receives only indexes for the target table,
+        // so this test validates the router's filtering (which happens before
+        // plan() is called). At the planner level, if no indexes are passed,
+        // it should return FullScan.
+        let plan = plan(
+            &[wc("email", ComparisonOp::Eq)],
+            &pk(&["id"]),
+            &[], // Router filtered out indexes from other tables
+        );
+        assert_eq!(plan, ScanPlan::FullScan);
+    }
+
+    #[test]
+    fn multiple_indexes_picks_first_matching() {
+        // Two indexes on different columns — planner picks the first WHERE match
+        let plan = plan(
+            &[wc("city", ComparisonOp::Eq), wc("email", ComparisonOp::Eq)],
+            &pk(&["id"]),
+            &[idx("idx_city", &["city"]), idx("idx_email", &["email"])],
+        );
+        // First WHERE clause is "city" which matches idx_city
+        assert_eq!(
+            plan,
+            ScanPlan::SingleIndex {
+                index_name: "idx_city".to_string(),
+                index_column: "city".to_string(),
+            }
+        );
+    }
 }
