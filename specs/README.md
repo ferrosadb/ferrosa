@@ -42,6 +42,10 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [Graph Gap Project Plan](graph-gap-project-plan.md) | 3-sprint plan: eval+agg, varpath+subscribe, Bolt | Draft |
 | [Threat Model — Net/Cluster](threat-model-net-cluster.md) | STRIDE for internode protocol, Raft, pair mode, coordinator | Draft |
 | [Threat Model — Schema Replication](threat-model-schema-replication.md) | STRIDE for schema snapshot sync, DDL forwarding (T21-T28) | Draft |
+| [PITR](pitr.md) | Point-in-time restoration: S3-native snapshots, commit log archiving, restore | Draft |
+| [Threat Model — PITR](threat-model-pitr.md) | STRIDE for backup/restore: archive integrity, snapshot tampering, restore safety | Draft |
+| [PITR FMEA](pitr-fmea.md) | Failure modes for PITR (16 modes, 21 test cases) | Draft |
+| [PITR Project Plan](pitr-project-plan.md) | 4-sprint plan: archiving, snapshots, restore, tooling | Draft |
 | [Cluster Phase 2 Design](../superpowers/specs/2026-03-14-cluster-phase2-design.md) | Raft consensus, token ring, coordinator pattern | Implemented |
 
 ## Architecture Decision Records
@@ -58,6 +62,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [008](decisions/008-audit-first-schema.md) | Audit-first schema design — audit logging baked into registry from day one | Accepted |
 | [009](decisions/009-pluggable-secrets-provider.md) | Pluggable secrets provider — env default, AWS SM/Vault/file backends | Accepted |
 | [010](decisions/010-production-mode.md) | Production mode — mandatory encryption at all layers, fail-closed startup | Accepted |
+| [011](decisions/011-s3-native-pitr.md) | S3-native PITR — metadata snapshots + built-in commit log archiving | Draft |
 
 ## Related Documents
 
