@@ -25,6 +25,7 @@ pub mod event;
 pub mod frame;
 pub mod lexer;
 pub mod parser;
+pub mod planner;
 pub mod prepared;
 pub mod prometheus;
 pub mod result;
