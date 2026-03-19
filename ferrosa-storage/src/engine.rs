@@ -413,6 +413,28 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Registers a secondary index on a table.
+    ///
+    /// Called when `CREATE INDEX` is processed. Updates the `TableStore`'s
+    /// `indexed_columns` so future writes are indexed in the memtable.
+    /// The write lock on `self.tables` guarantees exclusive access to the
+    /// `TableStore`, so `TableStore::add_index` can take `&mut self`.
+    pub fn add_index(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        column_position: usize,
+    ) -> ferrosa_common::Result<()> {
+        let mut tables = self.tables.write();
+        let state = tables.get_mut(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state
+            .store
+            .add_index(index_name.to_string(), column_position);
+        Ok(())
+    }
+
     /// Scans a table directory for existing SSTable files and opens them.
     ///
     /// Returns readers ordered newest-first (by generation number descending).
@@ -2064,5 +2086,78 @@ mod tests {
 
             engine.shutdown().unwrap();
         });
+    }
+
+    // =========================================================================
+    // Task 3.5: StorageEngine::add_index
+    // =========================================================================
+
+    fn test_schema_with_email() -> TableSchema {
+        TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "email".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn engine_add_index_enables_memtable_indexing() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema_with_email()).unwrap();
+
+        let tid = table_id();
+
+        // Add the index via engine
+        engine.add_index(&tid, "email_idx", 0).unwrap();
+
+        // Write a row with the indexed column
+        let key = make_key("user1");
+        let row = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(
+                0,
+                ferrosa_common::cell::CellValue::live(b"alice@example.com".to_vec(), 1000),
+            )],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key, row, 1000).unwrap();
+
+        // Read by index — should find the row
+        let results = engine
+            .read_by_index(&tid, "email_idx", &IndexKey(b"alice@example.com".to_vec()))
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "indexed write should be findable via engine.read_by_index"
+        );
+        assert_eq!(results[0].key.key.as_bytes(), b"user1");
+    }
+
+    #[test]
+    fn engine_add_index_on_unregistered_table_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let result = engine.add_index(&TableId::new("no", "such"), "idx", 0);
+        assert!(
+            result.is_err(),
+            "add_index on unregistered table should fail"
+        );
     }
 }

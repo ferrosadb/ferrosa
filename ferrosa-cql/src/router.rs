@@ -2053,6 +2053,41 @@ async fn route_create_index(
         }
     }
 
+    // Notify the storage engine about the new index so future memtable writes
+    // are indexed. We look up the column position from the post-DDL schema
+    // snapshot. Only the first target column is wired (composite index support
+    // is deferred). If the table is not yet registered with the engine (e.g.,
+    // schema-only mode), a warning is logged but the operation does not fail.
+    if let Some(target_col) = s.columns.first() {
+        let snap = state.schema.snapshot();
+        let table_id = TableId::new(ks, &s.table);
+        let col_pos = snap
+            .tables
+            .get(&(ks.to_string(), s.table.clone()))
+            .and_then(|tbl| {
+                // Collect regular columns sorted by position to determine the ordinal.
+                let mut regulars: Vec<_> = tbl
+                    .columns
+                    .values()
+                    .filter(|c| c.kind == ColumnKind::Regular)
+                    .collect();
+                regulars.sort_by_key(|c| c.position);
+                regulars.iter().position(|c| &c.name == target_col)
+            });
+
+        if let Some(pos) = col_pos {
+            if let Err(e) = state.engine.add_index(&table_id, &index_name, pos) {
+                // Log warning but don't fail — index is persisted in schema;
+                // it will be populated once the table is registered (e.g., on restart).
+                eprintln!(
+                    "[router] CREATE INDEX: failed to wire index '{index_name}' to \
+                     storage engine for table '{ks}.{}': {e}",
+                    s.table
+                );
+            }
+        }
+    }
+
     Ok(result::encode_schema_change(
         "CREATED",
         "INDEX",
@@ -5090,6 +5125,69 @@ mod tests {
         match result.unwrap() {
             RouteResult::Result(b) => {
                 assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    // =========================================================================
+    // Task 3.5: CREATE INDEX wires through to StorageEngine indexed_columns
+    // =========================================================================
+
+    /// `CREATE INDEX` followed by `INSERT` then `SELECT WHERE indexed_col = ?`
+    /// must return the inserted row via the memtable index.  This verifies the
+    /// full wire-up: router calls engine.add_index(), the TableStore's
+    /// indexed_columns is updated, and the next write is indexed.
+    #[tokio::test]
+    async fn create_index_wires_memtable_indexing_end_to_end() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+        };
+
+        // Create keyspace and table
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE idx_wire WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE idx_wire.users (id int PRIMARY KEY, email text)")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Create index on `email` — this must wire engine.add_index()
+        let stmt =
+            crate::parser::parse("CREATE INDEX wire_email_idx ON idx_wire.users (email)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert a row AFTER the index was created
+        let stmt = crate::parser::parse(
+            "INSERT INTO idx_wire.users (id, email) VALUES (42, 'bob@example.com')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Query by indexed column — must find the row
+        let stmt = crate::parser::parse(
+            "SELECT id, email FROM idx_wire.users WHERE email = 'bob@example.com'",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "SELECT on indexed column should succeed: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "should find exactly 1 row via memtable index, got {count}"
+                );
             }
             _ => panic!("expected Result"),
         }

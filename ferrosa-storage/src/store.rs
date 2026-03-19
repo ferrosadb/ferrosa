@@ -455,6 +455,31 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(partitions)
     }
 
+    /// Dynamically adds a secondary index. Future writes will be indexed.
+    ///
+    /// Records the new `(index_name, column_position)` pair in `indexed_columns`
+    /// and atomically installs a fresh `MemtableIndex` into the current view.
+    /// Existing data in the active memtable is NOT retroactively indexed —
+    /// only writes after this call will appear in the index.
+    ///
+    /// Called by `StorageEngine::add_index` while holding a write lock on the
+    /// table map, so `&mut self` is safe.
+    pub fn add_index(&mut self, index_name: String, column_position: usize) {
+        self.indexed_columns
+            .push((index_name.clone(), column_position));
+        // Atomically install a fresh MemtableIndex into the current view.
+        let current = self.view.load();
+        let mut new_indexes = (*current.indexes).clone();
+        new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
+        self.view.store(Arc::new(StoreView {
+            active: Arc::clone(&current.active),
+            flushing: current.flushing.clone(),
+            sstables: Arc::clone(&current.sstables),
+            indexes: Arc::new(new_indexes),
+            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
+        }));
+    }
+
     /// Retrieve a named memtable-level secondary index.
     ///
     /// Returns `None` if no index with the given name was declared at
@@ -1772,5 +1797,152 @@ mod tests {
         let city_results = city_reader.lookup(&IndexKey(b"NYC".to_vec())).unwrap();
         assert_eq!(city_results.len(), 1);
         assert_eq!(city_results[0].partition_key, b"user1");
+    }
+
+    // =========================================================================
+    // Task 3.5: add_index — dynamically wire a new secondary index
+    // =========================================================================
+
+    /// After `add_index`, future writes to the indexed column appear in the
+    /// memtable index.
+    #[test]
+    fn add_index_enables_memtable_indexing() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "email".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        // Create store WITHOUT any indexes
+        let mut store = TableStore::new(
+            schema,
+            InMemoryFlushTarget,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+
+        // Before add_index: no index exists
+        assert!(
+            store.get_memtable_index("email_idx").is_none(),
+            "index should not exist before add_index"
+        );
+
+        // Dynamically add the index
+        store.add_index("email_idx".to_string(), 0);
+
+        // Now the index exists
+        assert!(
+            store.get_memtable_index("email_idx").is_some(),
+            "index should exist after add_index"
+        );
+
+        // Write a row with the indexed column
+        let key = make_key("user1");
+        let row = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(0, CellValue::live(b"alice@example.com".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        store.write(&key, row).unwrap();
+
+        // The memtable index should contain the entry
+        let index = store
+            .get_memtable_index("email_idx")
+            .expect("index must exist after add_index");
+        let results = index.lookup(&IndexKey(b"alice@example.com".to_vec()));
+        assert_eq!(
+            results.len(),
+            1,
+            "indexed write should appear in memtable index"
+        );
+        assert_eq!(results[0].partition_key, b"user1");
+    }
+
+    /// Writes that occurred before `add_index` are NOT retroactively indexed.
+    /// Only writes after `add_index` are indexed in the new memtable index.
+    #[test]
+    fn add_index_on_existing_data_indexes_future_writes_only() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "email".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        let mut store = TableStore::new(
+            schema,
+            InMemoryFlushTarget,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+
+        // Write data BEFORE creating the index
+        let pre_key = make_key("pre_user");
+        let pre_row = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(0, CellValue::live(b"pre@example.com".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        store.write(&pre_key, pre_row).unwrap();
+
+        // Now add the index
+        store.add_index("email_idx".to_string(), 0);
+
+        // Write data AFTER creating the index
+        let post_key = make_key("post_user");
+        let post_row = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(0, CellValue::live(b"post@example.com".to_vec(), 2000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(2000),
+        };
+        store.write(&post_key, post_row).unwrap();
+
+        let index = store
+            .get_memtable_index("email_idx")
+            .expect("index must exist after add_index");
+
+        // Pre-existing data should NOT be in the index
+        let pre_results = index.lookup(&IndexKey(b"pre@example.com".to_vec()));
+        assert!(
+            pre_results.is_empty(),
+            "data written before add_index should not be retroactively indexed"
+        );
+
+        // Post-index data SHOULD be in the index
+        let post_results = index.lookup(&IndexKey(b"post@example.com".to_vec()));
+        assert_eq!(
+            post_results.len(),
+            1,
+            "data written after add_index should be indexed"
+        );
+        assert_eq!(post_results[0].partition_key, b"post_user");
     }
 }
