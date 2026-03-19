@@ -793,17 +793,36 @@
 <div class="problem">
   <section>
     <p class="section-label">The Problem</p>
-    <h2 class="section-title">Running Cassandra in the cloud<br>shouldn't feel like this</h2>
+    <h2 class="section-title">Most of your database bill<br>isn't serving a single query</h2>
     <p class="section-subtitle">
-      You chose Cassandra for its proven distributed architecture. But the JVM overhead,
-      operational burden, and storage costs keep growing.
+      Pull up your cloud bill. Look past the compute, past the live storage.
+      The largest line items are EBS snapshots, cross-region replicas, and backup retention
+      — copies of data that nobody reads, nobody queries, and nobody thinks about until
+      something goes wrong. It's the most expensive insurance policy in your infrastructure,
+      and it scales with every gigabyte you store.
     </p>
 
     <div class="pain-points">
       <div class="pain-card">
         <div class="pain-icon">💸</div>
-        <h3>Backups Cost More Than Storage</h3>
-        <p>Point-in-time recovery requires EBS snapshots — a second copy of your entire dataset. 10 TB with 30-day retention? That's $2,250/month just for backups. A full year costs $15,000/month. And you're still paying for the live EBS volumes underneath.</p>
+        <h3>Your Backups Cost More Than Your Database</h3>
+        <p>
+          Point-in-time recovery requires EBS snapshots — a full second copy of your dataset
+          that exists only for "just in case." 10 TB with 30-day retention costs $2,250/month
+          in snapshots alone — on top of the $3,000–7,500/month you're already paying for the
+          live EBS volumes. A year of retention? $15,000/month. That's $180,000/year for data
+          you hope you never need to read.
+        </p>
+      </div>
+      <div class="pain-card">
+        <div class="pain-icon">📀</div>
+        <h3>You Pay for Every Byte Three Times</h3>
+        <p>
+          Once on the live EBS volume. Once in EBS snapshots for recovery. Once more if you
+          replicate across regions. At petabyte scale with RF=3, you're storing 3 PB on EBS
+          ($300K/month), snapshotting 3 PB ($150K/month), and none of that snapshot storage
+          serves a single read.
+        </p>
       </div>
       <div class="pain-card">
         <div class="pain-icon">⏱</div>
@@ -814,11 +833,6 @@
         <div class="pain-icon">⏳</div>
         <h3>Hours to Replace a Node</h3>
         <p>When a node dies, streaming hundreds of gigabytes from replicas takes hours. Your cluster runs degraded the entire time.</p>
-      </div>
-      <div class="pain-card">
-        <div class="pain-icon">📀</div>
-        <h3>Storage Costs Scale Linearly</h3>
-        <p>Every replica needs its own EBS volumes. At petabyte scale, you're paying $0.10–0.25/GB/month for attached storage across every node.</p>
       </div>
       <div class="pain-card">
         <div class="pain-icon">🔧</div>
@@ -842,13 +856,13 @@
     <div class="feature-card highlight">
       <div>
         <div class="feature-icon s3">☁</div>
-        <h3>Point-in-Time Recovery at 1/1000th the Cost</h3>
+        <h3>Eliminate Your Backup Bill Entirely</h3>
         <p>
-          Traditional databases store data on EBS, then pay again to snapshot it for backups.
-          30-day point-in-time recovery for 10 TB on Cassandra costs ~$2,250/month in EBS
-          snapshots alone. Ferrosa's data is already durable in S3 — there is no "backup"
-          step. Point-in-time recovery is just commit log retention:
-          <strong>$2.30/month</strong> for the same 10 TB.
+          That $2,250/month you're spending on EBS snapshots for 10 TB? That $180,000/year
+          insurance policy? Ferrosa makes it $2.30/month. Not because we compress better or
+          found cheaper storage — because the backup step doesn't exist. Your data is already
+          durable in S3. Point-in-time recovery is just keeping commit log segments longer,
+          and S3 Lifecycle rules tier them to Glacier automatically.
         </p>
         <p style="margin-top: 0.75rem;">
           One command sets your retention policy:
