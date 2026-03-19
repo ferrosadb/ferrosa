@@ -14,13 +14,13 @@ use crate::commitlog::mutation::Mutation;
 ///
 /// Returns `Ok(())` if `node_id == expected`, otherwise returns an error
 /// describing the mismatch. Used during restore to confirm archive segments
-/// originated from the intended node.
-pub fn validate_node_id(node_id: &str, expected: &str) -> ferrosa_common::Result<()> {
-    if node_id == expected {
+/// originated from the intended node. If `force` is true, mismatches are allowed.
+pub fn validate_node_id(node_id: &str, expected: &str, force: bool) -> ferrosa_common::Result<()> {
+    if node_id == expected || force {
         Ok(())
     } else {
         Err(ferrosa_common::Error::InvalidFormat(format!(
-            "node ID mismatch: expected {expected:?}, got {node_id:?}"
+            "node ID mismatch: expected {expected:?}, got {node_id:?}; use force=true to override"
         )))
     }
 }
@@ -129,12 +129,12 @@ mod tests {
 
     #[test]
     fn node_id_match_passes() {
-        assert!(validate_node_id("node-1", "node-1").is_ok());
+        assert!(validate_node_id("node-1", "node-1", false).is_ok());
     }
 
     #[test]
     fn node_id_mismatch_fails() {
-        let err = validate_node_id("node-2", "node-1").unwrap_err();
+        let err = validate_node_id("node-2", "node-1", false).unwrap_err();
         assert!(
             format!("{err}").contains("node-1"),
             "error should mention expected node id"
@@ -143,6 +143,11 @@ mod tests {
             format!("{err}").contains("node-2"),
             "error should mention actual node id"
         );
+    }
+
+    #[test]
+    fn node_id_mismatch_with_force_passes() {
+        assert!(validate_node_id("node-2", "node-1", true).is_ok());
     }
 
     // ---------------------------------------------------------------------------

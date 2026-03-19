@@ -734,6 +734,60 @@ impl StorageEngine {
         self.commit_log.current_position()
     }
 
+    /// Opens a StorageEngine by restoring from a named snapshot.
+    ///
+    /// 1. Loads and validates the snapshot manifest (SHA-256 integrity check).
+    /// 2. Validates the node ID (cross-node restore requires `force = true`).
+    /// 3. Downloads SSTables from the snapshot manifest to local disk.
+    /// 4. Downloads archived commit log segments from S3.
+    /// 5. Validates segment continuity from the snapshot's commit-log position.
+    /// 6. Opens the engine normally (SSTables are loaded from disk).
+    ///
+    /// Mutation replay from the downloaded segments is deferred — this
+    /// constructor restores the engine to the state at the snapshot boundary.
+    pub async fn open_from_snapshot_with_store(
+        config: StorageEngineConfig,
+        snapshot_name: &str,
+        _point_in_time: Option<i64>,
+        node_id: &str,
+        force: bool,
+        store: std::sync::Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+    ) -> ferrosa_common::Result<Self> {
+        let restore_mgr =
+            crate::restore::RestoreManager::new(std::sync::Arc::clone(&store), prefix.to_string());
+        let (metadata, manifest) = restore_mgr
+            .load_and_validate_snapshot(snapshot_name)
+            .await?;
+
+        crate::restore::validation::validate_node_id(&metadata.node_id, node_id, force)?;
+
+        let sstable_dir = config.data_dir.join("sstables");
+        std::fs::create_dir_all(&sstable_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("failed to create sstable dir: {e}"))
+        })?;
+        let _sst_count = restore_mgr
+            .download_sstables(&manifest, &sstable_dir)
+            .await?;
+
+        let segment_dir = config.commit_log.log_dir.clone();
+        std::fs::create_dir_all(&segment_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("failed to create segment dir: {e}"))
+        })?;
+        let segment_ids = restore_mgr
+            .download_segments(metadata.commit_log_position.segment_id, &segment_dir)
+            .await?;
+
+        crate::restore::validation::validate_segment_continuity(
+            &segment_ids,
+            metadata.commit_log_position.segment_id,
+        )?;
+
+        // TODO(PITR): full mutation replay from downloaded segment files
+        let engine = StorageEngine::new(config, None)?;
+        Ok(engine)
+    }
+
     /// Creates a snapshot using an injected object store (for testing).
     ///
     /// 1. Flushes all memtables to SSTables.
@@ -2159,5 +2213,121 @@ mod tests {
             result.is_err(),
             "add_index on unregistered table should fail"
         );
+    }
+
+    #[test]
+    fn open_from_snapshot_downloads_and_validates() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: std::sync::Arc<dyn object_store::ObjectStore> =
+                std::sync::Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-node";
+
+            let manifest = crate::manifest::Manifest::new();
+            manifest
+                .save_with_retry(store.as_ref(), prefix)
+                .await
+                .unwrap();
+            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+                .await
+                .unwrap();
+
+            let snap_mgr = crate::snapshot::SnapshotManager::new(
+                std::sync::Arc::clone(&store),
+                prefix.to_string(),
+            );
+            let pos = CommitLogPosition {
+                segment_id: 1,
+                offset: 0,
+            };
+            snap_mgr
+                .create_snapshot("test-snap", &manifest, b"{}", pos, "node-1", None, false)
+                .await
+                .unwrap();
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(dir.path()),
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let engine = StorageEngine::open_from_snapshot_with_store(
+                config,
+                "test-snap",
+                None,
+                "node-1",
+                false,
+                std::sync::Arc::clone(&store),
+                prefix,
+            )
+            .await
+            .unwrap();
+
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn open_from_snapshot_rejects_cross_node_without_force() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: std::sync::Arc<dyn object_store::ObjectStore> =
+                std::sync::Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-node";
+
+            let manifest = crate::manifest::Manifest::new();
+            manifest
+                .save_with_retry(store.as_ref(), prefix)
+                .await
+                .unwrap();
+            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+                .await
+                .unwrap();
+
+            let snap_mgr = crate::snapshot::SnapshotManager::new(
+                std::sync::Arc::clone(&store),
+                prefix.to_string(),
+            );
+            let pos = CommitLogPosition {
+                segment_id: 1,
+                offset: 0,
+            };
+            snap_mgr
+                .create_snapshot("test-snap", &manifest, b"{}", pos, "node-1", None, false)
+                .await
+                .unwrap();
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(dir.path()),
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let result = StorageEngine::open_from_snapshot_with_store(
+                config,
+                "test-snap",
+                None,
+                "node-2",
+                false,
+                std::sync::Arc::clone(&store),
+                prefix,
+            )
+            .await;
+
+            assert!(
+                result.is_err(),
+                "cross-node restore should fail without force"
+            );
+            let err = result.err().unwrap();
+            assert!(format!("{err}").contains("force"));
+        });
     }
 }

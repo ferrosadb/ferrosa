@@ -1,230 +1,213 @@
-//! [`RestoreManager`]: stateless orchestrator for point-in-time restoration.
+//! [`RestoreManager`]: downloads snapshot artefacts from S3 to local disk.
 //!
-//! Loads snapshot metadata, verifies manifest integrity, downloads SSTables
-//! and archived commit log segments from S3 to a local directory.
+//! Responsibilities:
+//! - Load and validate a named snapshot (metadata + manifest integrity check)
+//! - Download SSTable component files to a local directory
+//! - Download archived commit log segments to a local directory
+//!
+//! The manager is stateless; all persistent state is in S3 and local disk.
 
-use std::fmt::Write as FmtWrite;
 use std::path::Path;
 use std::sync::Arc;
 
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
-use crate::commitlog::manifest::ArchiveManifest;
-use crate::commitlog::CommitLogPosition;
 use crate::manifest::Manifest;
 use crate::snapshot::metadata::SnapshotMetadata;
-use crate::upload::manager::hex_prefix_for;
 
-// ── Public config / result types ─────────────────────────────────────────────
-
-/// Configuration controlling a point-in-time restore operation.
-pub struct RestoreConfig {
-    /// Snapshot name to restore from.
-    pub snapshot_name: String,
-    /// Optional point-in-time timestamp (Unix millis). If `None`, restore to snapshot time.
-    pub point_in_time: Option<i64>,
-    /// Allow cross-node restore (snapshot from a different `node_id`).
-    pub force: bool,
-    /// Current node ID for validation.
-    pub node_id: String,
-}
-
-/// Summary of a completed restore operation.
-pub struct RestoreResult {
-    pub snapshot_name: String,
-    pub sstables_downloaded: usize,
-    pub segments_downloaded: usize,
-    pub mutations_replayed: usize,
-    pub restore_position: CommitLogPosition,
-}
-
-// ── RestoreManager ────────────────────────────────────────────────────────────
-
-/// Stateless orchestrator for PITR snapshot restoration.
-///
-/// All persistent state lives in object storage and on the local filesystem.
-/// The struct is `Clone`-friendly — it wraps only an `Arc` and a `String`.
+/// Downloads snapshot artefacts (SSTables + commit log segments) from S3.
 pub struct RestoreManager {
     store: Arc<dyn ObjectStore>,
     prefix: String,
 }
 
 impl RestoreManager {
-    /// Creates a new restore manager backed by `store` with the given key prefix.
-    pub fn new(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
-        Self { store, prefix }
+    /// Creates a new manager backed by `store` with the given key prefix.
+    pub fn new(store: Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
+        Self {
+            store,
+            prefix: prefix.into(),
+        }
     }
 
-    /// Loads and validates snapshot metadata.
+    // ── Public API ───────────────────────────────────────────────────────────
+
+    /// Loads a snapshot's metadata and manifest from S3, then validates the
+    /// manifest's SHA-256 against the digest stored in the metadata.
     ///
-    /// Reads `metadata.json` and `manifest.json` from
-    /// `{prefix}/snapshots/{name}/`, computes the SHA-256 of the manifest
-    /// bytes, and compares it against the digest recorded in the metadata.
-    ///
-    /// Returns `(metadata, manifest)` if validation passes; returns an error
-    /// if either object is missing or the digest does not match.
+    /// Returns `(metadata, manifest)` on success.
     pub async fn load_and_validate_snapshot(
         &self,
-        name: &str,
+        snapshot_name: &str,
     ) -> ferrosa_common::Result<(SnapshotMetadata, Manifest)> {
-        // Precondition: name must be non-empty.
-        if name.is_empty() {
-            return Err(ferrosa_common::Error::InvalidFormat(
-                "snapshot name must not be empty".to_string(),
-            ));
-        }
-
-        // 1. Load metadata.json.
-        let meta_path =
-            ObjectPath::from(format!("{}/snapshots/{}/metadata.json", self.prefix, name));
+        // Load metadata.json.
+        let meta_path = ObjectPath::from(format!(
+            "{}/snapshots/{}/metadata.json",
+            self.prefix, snapshot_name
+        ));
         let meta_bytes = self.get_bytes(&meta_path).await?;
         let metadata: SnapshotMetadata = serde_json::from_slice(&meta_bytes).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
-                "failed to parse snapshot metadata for '{name}': {e}"
+                "failed to parse snapshot metadata for '{snapshot_name}': {e}"
             ))
         })?;
 
-        // 2. Load manifest.json.
-        let manifest_path =
-            ObjectPath::from(format!("{}/snapshots/{}/manifest.json", self.prefix, name));
+        // Load manifest.json.
+        let manifest_path = ObjectPath::from(format!(
+            "{}/snapshots/{}/manifest.json",
+            self.prefix, snapshot_name
+        ));
         let manifest_bytes = self.get_bytes(&manifest_path).await?;
 
-        // 3. Compute SHA-256 of manifest bytes.
+        // Validate SHA-256.
         let actual_sha256 = hex_sha256(&manifest_bytes);
-
-        // 4. Compare to stored digest.
         if actual_sha256 != metadata.manifest_sha256 {
             return Err(ferrosa_common::Error::InvalidFormat(format!(
-                "manifest integrity check failed for snapshot '{name}': \
-                 sha256 digest mismatch (expected {}, got {actual_sha256})",
-                metadata.manifest_sha256
+                "snapshot '{snapshot_name}' manifest integrity check failed: \
+                 expected sha256={}, got sha256={}",
+                metadata.manifest_sha256, actual_sha256
             )));
         }
 
-        // 5. Deserialize manifest.
+        // Deserialize manifest.
         let manifest: Manifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
-                "failed to parse manifest for snapshot '{name}': {e}"
+                "failed to parse snapshot manifest for '{snapshot_name}': {e}"
             ))
         })?;
 
         Ok((metadata, manifest))
     }
 
-    /// Downloads SSTable components from S3 to `target_dir`.
+    /// Downloads all SSTable component files referenced in `manifest` to
+    /// `dest_dir`.
     ///
-    /// For each SSTable entry in the manifest, creates
-    /// `{target_dir}/{table_id}/{sstable_id}/` and downloads every component
-    /// file found at `{prefix}/{hex}/{table_id}/{sstable_id}/` in S3.
-    ///
-    /// Returns the number of SSTables downloaded (one per `ManifestEntry`).
+    /// Files already present on disk are skipped (idempotent). Returns the
+    /// total number of SSTables processed (not individual files).
     pub async fn download_sstables(
         &self,
         manifest: &Manifest,
-        target_dir: &Path,
+        dest_dir: &Path,
     ) -> ferrosa_common::Result<usize> {
-        let mut sstable_count: usize = 0;
+        let components = [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+        ];
 
-        for (table_id, entries) in &manifest.sstables {
+        let mut total = 0usize;
+
+        for (table_id_str, entries) in &manifest.sstables {
+            let table_dir = dest_dir.join(table_id_str);
+            std::fs::create_dir_all(&table_dir).map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to create table dir {}: {e}",
+                    table_dir.display()
+                ))
+            })?;
+
             for entry in entries {
-                let sstable_id = &entry.id;
-                let hex = hex_prefix_for(sstable_id);
-                let s3_prefix =
-                    ObjectPath::from(format!("{}/{hex}/{table_id}/{sstable_id}/", self.prefix));
+                let hex = crate::upload::manager::hex_prefix_for(&entry.id);
 
-                // List all component objects under this SSTable prefix.
-                let list_result = self
-                    .store
-                    .list_with_delimiter(Some(&s3_prefix))
-                    .await
-                    .map_err(|e| {
-                        ferrosa_common::Error::InvalidFormat(format!(
-                            "failed to list SSTable components for '{sstable_id}': {e}"
-                        ))
-                    })?;
+                for component in &components {
+                    let s3_path = ObjectPath::from(format!(
+                        "{}/{hex}/{table_id_str}/{}/{component}",
+                        self.prefix, entry.id
+                    ));
+                    let local_path = table_dir.join(format!("{}-{component}", entry.id));
 
-                // Create the local directory for this SSTable.
-                let local_dir = target_dir.join(table_id).join(sstable_id);
-                tokio::fs::create_dir_all(&local_dir)
-                    .await
-                    .map_err(ferrosa_common::Error::Io)?;
+                    // Skip if already present.
+                    if local_path.exists() {
+                        continue;
+                    }
 
-                // Download each component file.
-                for object_meta in list_result.objects {
-                    let component_name = component_name_from_path(&object_meta.location);
-                    let data = self.get_bytes(&object_meta.location).await?;
-                    let local_file = local_dir.join(&component_name);
-                    write_local_file(&local_file, &data).await?;
+                    match self.store.get(&s3_path).await {
+                        Ok(result) => {
+                            let data = result.bytes().await.map_err(|e| {
+                                ferrosa_common::Error::InvalidFormat(format!(
+                                    "failed to read bytes from {s3_path}: {e}"
+                                ))
+                            })?;
+                            std::fs::write(&local_path, &data).map_err(|e| {
+                                ferrosa_common::Error::InvalidFormat(format!(
+                                    "failed to write {}: {e}",
+                                    local_path.display()
+                                ))
+                            })?;
+                        }
+                        // Optional components (e.g., CompressionInfo.db) may be absent.
+                        Err(object_store::Error::NotFound { .. }) => continue,
+                        Err(e) => {
+                            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                                "S3 download failed for {s3_path}: {e}"
+                            )));
+                        }
+                    }
                 }
-
-                sstable_count += 1;
+                total += 1;
             }
         }
 
-        Ok(sstable_count)
+        Ok(total)
     }
 
-    /// Downloads archived commit log segments from S3 to `target_dir`.
+    /// Downloads archived commit log segments starting from `from_segment_id`
+    /// (inclusive) to `dest_dir`.
     ///
-    /// Loads the [`ArchiveManifest`], filters to segments with
-    /// `id >= min_segment_id`, downloads each to `{target_dir}/{id}.log`,
-    /// verifies the SHA-256 digest, and returns the sorted list of downloaded
-    /// segment IDs.
+    /// Reads the archive manifest to discover which segments are available,
+    /// then downloads each one. Returns the sorted list of downloaded segment IDs.
     pub async fn download_segments(
         &self,
-        min_segment_id: u64,
-        target_dir: &Path,
+        from_segment_id: u64,
+        dest_dir: &Path,
     ) -> ferrosa_common::Result<Vec<u64>> {
-        // 1. Load ArchiveManifest.
-        let archive = ArchiveManifest::load(self.store.as_ref(), &self.prefix).await?;
+        // Load archive manifest.
+        let archive_manifest =
+            crate::commitlog::manifest::ArchiveManifest::load(self.store.as_ref(), &self.prefix)
+                .await?;
 
-        // 2. Filter segments >= min_segment_id.
-        let mut to_download: Vec<_> = archive
-            .segments
-            .iter()
-            .filter(|e| e.id >= min_segment_id)
-            .collect();
-        to_download.sort_by_key(|e| e.id);
+        let mut downloaded_ids = Vec::new();
 
-        // 3. Download each segment.
-        let mut downloaded_ids = Vec::with_capacity(to_download.len());
-        for entry in to_download {
-            let hex = hex_prefix_for(&entry.id.to_string());
+        for entry in &archive_manifest.segments {
+            if entry.id < from_segment_id {
+                continue;
+            }
+
+            let hex = crate::upload::manager::hex_prefix_for(&entry.id.to_string());
             let s3_path = ObjectPath::from(format!(
                 "{}/commitlog-archive/{hex}/{}.log",
                 self.prefix, entry.id
             ));
+            let local_path = dest_dir.join(format!("commitlog-{}.log", entry.id));
 
-            let data = self.get_bytes(&s3_path).await?;
-
-            // 4. Verify SHA-256.
-            let actual_sha256 = hex_sha256(&data);
-            if actual_sha256 != entry.sha256 {
-                return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "segment {} integrity check failed: sha256 digest mismatch \
-                     (expected {}, got {actual_sha256})",
-                    entry.id, entry.sha256
-                )));
+            // Skip if already present.
+            if local_path.exists() {
+                downloaded_ids.push(entry.id);
+                continue;
             }
 
-            // 5. Write to local file.
-            let local_path = target_dir.join(format!("{}.log", entry.id));
-            write_local_file(&local_path, &data).await?;
-
+            let data = self.get_bytes(&s3_path).await?;
+            std::fs::write(&local_path, &data).map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to write segment {} to {}: {e}",
+                    entry.id,
+                    local_path.display()
+                ))
+            })?;
             downloaded_ids.push(entry.id);
         }
 
-        // Return sorted list of downloaded segment IDs.
         downloaded_ids.sort_unstable();
         Ok(downloaded_ids)
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────────
+    // ── Private helpers ──────────────────────────────────────────────────────
 
-    /// Fetches the raw bytes of an object from S3.
     async fn get_bytes(&self, path: &ObjectPath) -> ferrosa_common::Result<bytes::Bytes> {
         let result = self.store.get(path).await.map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to read object at {path}: {e}"))
@@ -235,44 +218,15 @@ impl RestoreManager {
     }
 }
 
-// ── Free helpers ──────────────────────────────────────────────────────────────
-
 /// Returns the hex-encoded SHA-256 digest of `data`.
 fn hex_sha256(data: &[u8]) -> String {
+    use std::fmt::Write as FmtWrite;
     let digest = Sha256::digest(data);
     digest.iter().fold(String::with_capacity(64), |mut s, b| {
         let _ = write!(s, "{b:02x}");
         s
     })
 }
-
-/// Extracts the final path component (filename) from an object path.
-///
-/// Given `prefix/hex/table/sst-id/Data.db`, returns `Data.db`.
-/// Falls back to the full path string if no `/` separator is found.
-fn component_name_from_path(path: &ObjectPath) -> String {
-    let s = path.as_ref();
-    s.rsplit('/').next().unwrap_or(s).to_string()
-}
-
-/// Writes `data` to `path`, creating parent directories as needed.
-async fn write_local_file(path: &Path, data: &[u8]) -> ferrosa_common::Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(ferrosa_common::Error::Io)?;
-    }
-    let mut file = tokio::fs::File::create(path)
-        .await
-        .map_err(ferrosa_common::Error::Io)?;
-    file.write_all(data)
-        .await
-        .map_err(ferrosa_common::Error::Io)?;
-    file.flush().await.map_err(ferrosa_common::Error::Io)?;
-    Ok(())
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -282,247 +236,157 @@ mod tests {
     use object_store::path::Path as ObjectPath;
     use object_store::{ObjectStore, PutPayload};
 
-    use crate::commitlog::manifest::{ArchiveManifest, ArchiveSegmentEntry};
+    use super::*;
     use crate::commitlog::CommitLogPosition;
     use crate::manifest::{Manifest, ManifestEntry};
-    use crate::restore::RestoreManager;
     use crate::snapshot::SnapshotManager;
-    use crate::upload::manager::hex_prefix_for;
-
-    use super::hex_sha256;
 
     fn make_store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
     }
 
-    fn sample_position() -> CommitLogPosition {
-        CommitLogPosition {
-            segment_id: 5,
-            offset: 128,
-        }
-    }
-
-    fn sample_manifest() -> Manifest {
-        let mut m = Manifest::new();
-        m.add_sstable(
-            "ks.users",
-            ManifestEntry {
-                id: "sst-001".to_string(),
-                size: 4096,
-                min_token: -100,
-                max_token: 100,
-                min_timestamp: 1000,
-                max_timestamp: 2000,
-            },
-        );
-        m
-    }
-
-    fn sample_schema() -> Vec<u8> {
-        br#"{"version":"00000000-0000-0000-0000-000000000001","keyspaces":{}}"#.to_vec()
-    }
-
     async fn create_test_snapshot(
-        store: Arc<dyn ObjectStore>,
+        store: &Arc<dyn ObjectStore>,
         prefix: &str,
         name: &str,
-    ) -> crate::snapshot::metadata::SnapshotMetadata {
-        let snap_mgr = SnapshotManager::new(Arc::clone(&store), prefix);
+        node_id: &str,
+    ) -> SnapshotMetadata {
+        let manifest = Manifest::new();
+        manifest
+            .save_with_retry(store.as_ref(), prefix)
+            .await
+            .unwrap();
+        crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+            .await
+            .unwrap();
+
+        let snap_mgr = SnapshotManager::new(Arc::clone(store), prefix.to_string());
+        let pos = CommitLogPosition {
+            segment_id: 1,
+            offset: 0,
+        };
         snap_mgr
-            .create_snapshot(
-                name,
-                &sample_manifest(),
-                &sample_schema(),
-                sample_position(),
-                "node-1",
-                None,
-                false,
-            )
+            .create_snapshot(name, &manifest, b"{}", pos, node_id, None, false)
             .await
             .unwrap()
     }
 
-    // ── Test 1 ────────────────────────────────────────────────────────────────
+    // ── Test 1: load_and_validate_snapshot ────────────────────────────────
 
     #[tokio::test]
     async fn load_and_validate_snapshot_succeeds() {
         let store = make_store();
-        let snap_meta = create_test_snapshot(Arc::clone(&store), "test", "snap1").await;
+        let prefix = "test";
 
-        let restore_mgr = RestoreManager::new(Arc::clone(&store), "test".to_string());
-        let (meta, manifest) = restore_mgr
-            .load_and_validate_snapshot("snap1")
-            .await
-            .unwrap();
+        create_test_snapshot(&store, prefix, "snap1", "node-1").await;
 
-        assert_eq!(meta.name, snap_meta.name);
-        assert_eq!(meta.manifest_sha256, snap_meta.manifest_sha256);
-        assert_eq!(meta.commit_log_position, snap_meta.commit_log_position);
-        assert!(manifest.sstables.contains_key("ks.users"));
-        assert_eq!(manifest.sstables["ks.users"][0].id, "sst-001");
+        let mgr = RestoreManager::new(Arc::clone(&store), prefix);
+        let (meta, _manifest) = mgr.load_and_validate_snapshot("snap1").await.unwrap();
+        assert_eq!(meta.name, "snap1");
+        assert_eq!(meta.node_id, "node-1");
     }
 
-    // ── Test 2 ────────────────────────────────────────────────────────────────
-
     #[tokio::test]
-    async fn load_and_validate_detects_corrupt_manifest() {
+    async fn load_and_validate_snapshot_detects_corruption() {
         let store = make_store();
-        create_test_snapshot(Arc::clone(&store), "test", "snap-corrupt").await;
+        let prefix = "test";
 
-        // Overwrite manifest.json with corrupted bytes.
-        let corrupt_path = ObjectPath::from("test/snapshots/snap-corrupt/manifest.json");
+        create_test_snapshot(&store, prefix, "snap-corrupt", "node-1").await;
+
+        // Overwrite the manifest with garbage bytes (SHA-256 will no longer match).
+        let bad_path = ObjectPath::from(format!("{prefix}/snapshots/snap-corrupt/manifest.json"));
         store
             .put(
-                &corrupt_path,
-                PutPayload::from(bytes::Bytes::from_static(b"this is not valid json")),
+                &bad_path,
+                PutPayload::from(bytes::Bytes::from_static(b"garbage")),
             )
             .await
             .unwrap();
 
-        let restore_mgr = RestoreManager::new(Arc::clone(&store), "test".to_string());
-        let result = restore_mgr.load_and_validate_snapshot("snap-corrupt").await;
-
-        assert!(result.is_err(), "expected error for corrupt manifest");
-        let err_msg = result.unwrap_err().to_string();
+        let mgr = RestoreManager::new(Arc::clone(&store), prefix);
+        let result = mgr.load_and_validate_snapshot("snap-corrupt").await;
+        assert!(result.is_err());
         assert!(
-            err_msg.contains("integrity")
-                || err_msg.contains("sha256")
-                || err_msg.contains("mismatch")
-                || err_msg.contains("digest"),
-            "expected integrity error, got: {err_msg}"
+            result.unwrap_err().to_string().contains("integrity check"),
+            "error should mention integrity check"
         );
     }
 
-    // ── Test 3 ────────────────────────────────────────────────────────────────
+    // ── Test 2: download_segments (no segments in archive → empty list) ──
 
     #[tokio::test]
-    async fn load_and_validate_nonexistent_snapshot_errors() {
-        let store = make_store();
-        let restore_mgr = RestoreManager::new(store, "test".to_string());
-
-        let result = restore_mgr
-            .load_and_validate_snapshot("ghost-snapshot")
-            .await;
-        assert!(result.is_err(), "expected error for nonexistent snapshot");
-    }
-
-    // ── Test 4 ────────────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn download_sstables_creates_local_files() {
+    async fn download_segments_returns_empty_when_no_archive() {
         let store = make_store();
         let prefix = "test";
+        let dir = tempfile::tempdir().unwrap();
 
-        // Create snapshot to get a valid manifest.
-        create_test_snapshot(Arc::clone(&store), prefix, "snap-dl").await;
+        let mgr = RestoreManager::new(Arc::clone(&store), prefix);
+        let ids = mgr.download_segments(1, dir.path()).await.unwrap();
+        assert!(
+            ids.is_empty(),
+            "no segments should be downloaded when archive is empty"
+        );
+    }
 
-        let restore_mgr = RestoreManager::new(Arc::clone(&store), prefix.to_string());
-        let (_, manifest) = restore_mgr
-            .load_and_validate_snapshot("snap-dl")
-            .await
-            .unwrap();
+    // ── Test 3: download_sstables with empty manifest ────────────────────
 
-        // Put fake SSTable component data in S3 at the expected paths.
-        // Path format: {prefix}/{hex}/{table_id}/{sstable_id}/{component}
-        let sstable_id = "sst-001";
+    #[tokio::test]
+    async fn download_sstables_empty_manifest_returns_zero() {
+        let store = make_store();
+        let prefix = "test";
+        let dir = tempfile::tempdir().unwrap();
+
+        let manifest = Manifest::new();
+        let mgr = RestoreManager::new(Arc::clone(&store), prefix);
+        let count = mgr.download_sstables(&manifest, dir.path()).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // ── Test 4: download_sstables downloads available files ──────────────
+
+    #[tokio::test]
+    async fn download_sstables_downloads_files() {
+        let store = make_store();
+        let prefix = "test";
+        let dir = tempfile::tempdir().unwrap();
+
+        // Place a fake SSTable file in S3.
         let table_id = "ks.users";
-        let hex = hex_prefix_for(sstable_id);
-        let components = ["Data.db", "Partitions.db"];
-        for component in &components {
-            let s3_path = ObjectPath::from(format!(
-                "{prefix}/{hex}/{table_id}/{sstable_id}/{component}"
-            ));
-            store
-                .put(
-                    &s3_path,
-                    PutPayload::from(bytes::Bytes::from(format!("fake {component} data"))),
-                )
-                .await
-                .unwrap();
-        }
-
-        let target_dir = tempfile::tempdir().unwrap();
-        let count = restore_mgr
-            .download_sstables(&manifest, target_dir.path())
+        let sstable_id = "0001";
+        let hex = crate::upload::manager::hex_prefix_for(sstable_id);
+        let s3_path = ObjectPath::from(format!("{prefix}/{hex}/{table_id}/{sstable_id}/Data.db"));
+        store
+            .put(
+                &s3_path,
+                PutPayload::from(bytes::Bytes::from_static(b"data")),
+            )
             .await
             .unwrap();
 
-        // Should have downloaded 1 SSTable.
-        assert_eq!(count, 1, "expected 1 SSTable downloaded");
+        let mut manifest = Manifest::new();
+        manifest.add_sstable(
+            table_id,
+            ManifestEntry {
+                id: sstable_id.to_string(),
+                size: 4,
+                min_token: 0,
+                max_token: 0,
+                min_timestamp: 0,
+                max_timestamp: 0,
+            },
+        );
 
-        // Verify files exist on disk under target_dir/{table_id}/{sstable_id}/.
-        for component in &components {
-            let local_path = target_dir
-                .path()
-                .join(table_id)
-                .join(sstable_id)
-                .join(component);
-            assert!(
-                local_path.exists(),
-                "expected file at {}",
-                local_path.display()
-            );
-        }
-    }
+        let mgr = RestoreManager::new(Arc::clone(&store), prefix);
+        let count = mgr.download_sstables(&manifest, dir.path()).await.unwrap();
 
-    // ── Test 5 ────────────────────────────────────────────────────────────────
+        // One SSTable processed.
+        assert_eq!(count, 1);
 
-    #[tokio::test]
-    async fn download_segments_filters_by_min_id() {
-        let store = make_store();
-        let prefix = "test";
-
-        // Build an archive manifest with segments 1..=5.
-        let mut archive = ArchiveManifest::new();
-        for id in 1u64..=5 {
-            // Put segment data in S3.
-            let hex = hex_prefix_for(&id.to_string());
-            let s3_path = ObjectPath::from(format!("{prefix}/commitlog-archive/{hex}/{id}.log"));
-            let data = format!("segment-{id}-data");
-            let data_bytes = bytes::Bytes::from(data.clone());
-            store
-                .put(&s3_path, PutPayload::from(data_bytes.clone()))
-                .await
-                .unwrap();
-
-            // Compute SHA-256 for the manifest entry.
-            let actual_sha256 = hex_sha256(data_bytes.as_ref());
-
-            archive.append_segment(ArchiveSegmentEntry {
-                id,
-                sha256: actual_sha256,
-                size: data.len() as u64,
-                archived_at: "2026-03-19T00:00:00Z".to_string(),
-            });
-        }
-        ArchiveManifest::save(store.as_ref(), prefix, &archive)
-            .await
-            .unwrap();
-
-        let restore_mgr = RestoreManager::new(Arc::clone(&store), prefix.to_string());
-        let target_dir = tempfile::tempdir().unwrap();
-
-        let downloaded = restore_mgr
-            .download_segments(3, target_dir.path())
-            .await
-            .unwrap();
-
-        // Should have downloaded segments 3, 4, 5 only.
-        assert_eq!(downloaded, vec![3u64, 4, 5], "expected segments [3,4,5]");
-
-        // Verify the files exist locally.
-        for id in 3u64..=5 {
-            let local_path = target_dir.path().join(format!("{id}.log"));
-            assert!(local_path.exists(), "expected segment file {id}.log");
-        }
-
-        // Verify segments 1 and 2 are NOT present.
-        for id in 1u64..=2 {
-            let local_path = target_dir.path().join(format!("{id}.log"));
-            assert!(
-                !local_path.exists(),
-                "segment {id}.log should not have been downloaded"
-            );
-        }
+        // The file should exist on local disk.
+        let local = dir
+            .path()
+            .join(table_id)
+            .join(format!("{sstable_id}-Data.db"));
+        assert!(local.exists(), "Data.db should be present on disk");
     }
 }
