@@ -35,6 +35,7 @@ fn test_config(dir: &Path) -> CommitLogConfig {
         sync_strategy: SyncStrategyConfig::Batch,
         log_dir: dir.to_path_buf(),
         checkpoint_dir: dir.to_path_buf(),
+        archive: None,
     }
 }
 

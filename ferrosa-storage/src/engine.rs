@@ -118,6 +118,8 @@ pub struct StorageEngine {
     /// Optional index build scheduler — wiring to flush/compaction is deferred.
     #[allow(dead_code)]
     index_scheduler: Option<crate::index::IndexBuildScheduler>,
+    /// Background archiver task handle, if archiving is enabled.
+    archiver_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Per-table state: schema + store.
@@ -180,6 +182,109 @@ impl StorageEngine {
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler: None,
+            archiver_handle: None,
+        })
+    }
+
+    /// Creates a storage engine with an explicit archive object store.
+    ///
+    /// Used by tests to inject an InMemory store instead of real S3.
+    /// When `archive_store` is `Some` and `config.commit_log.archive` is
+    /// enabled, spawns a background archiver task on the provided runtime.
+    pub fn new_with_archive_store(
+        config: StorageEngineConfig,
+        runtime: Option<&tokio::runtime::Handle>,
+        archive_store: Option<Arc<dyn object_store::ObjectStore>>,
+        archive_prefix: String,
+    ) -> ferrosa_common::Result<Self> {
+        std::fs::create_dir_all(&config.data_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("failed to create data dir: {e}"))
+        })?;
+        std::fs::create_dir_all(&config.commit_log.log_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
+        })?;
+
+        let mut commit_log = CommitLog::new(config.commit_log.clone())?;
+        let compaction_executor = CompactionExecutor::new();
+
+        let upload_manager = match (&config.object_store, runtime) {
+            (Some(os_config), Some(rt)) => {
+                let store = os_config.build_object_store()?;
+                Some(UploadManager::new(
+                    Arc::from(store),
+                    os_config.prefix.clone(),
+                    os_config.upload_queue_depth,
+                    rt,
+                ))
+            }
+            _ => None,
+        };
+
+        let local_cache =
+            LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
+
+        // Set up archiver if enabled.
+        let archiver_handle = match (&config.commit_log.archive, archive_store, runtime) {
+            (Some(archive_cfg), Some(store), Some(rt)) if archive_cfg.enabled => {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(64);
+                commit_log.set_archive_channel(tx);
+
+                let archiver = crate::commitlog::archiver::CommitLogArchiver::new(
+                    store,
+                    archive_prefix,
+                    config.commit_log.log_dir.clone(),
+                );
+
+                // Spawn background archiver task.
+                let handle = rt.spawn(async move {
+                    while let Some(segment_id) = rx.recv().await {
+                        match archiver.archive_segment(segment_id).await {
+                            Ok(result) => {
+                                // Update manifest.
+                                let entry = crate::commitlog::manifest::ArchiveSegmentEntry {
+                                    id: result.segment_id,
+                                    sha256: result.sha256,
+                                    size: result.size,
+                                    archived_at: result.archived_at,
+                                };
+                                if let Err(e) =
+                                    crate::commitlog::manifest::ArchiveManifest::append_and_save(
+                                        archiver.store(),
+                                        archiver.prefix(),
+                                        entry,
+                                    )
+                                    .await
+                                {
+                                    eprintln!(
+                                        "[commitlog-archiver] manifest update failed for segment {segment_id}: {e}"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[commitlog-archiver] failed to archive segment {segment_id}: {e}"
+                                );
+                            }
+                        }
+                    }
+                });
+                Some(handle)
+            }
+            _ => None,
+        };
+
+        Ok(Self {
+            config,
+            tables: RwLock::new(HashMap::new()),
+            commit_log,
+            compaction_executor,
+            upload_manager,
+            local_cache,
+            observers: RwLock::new(Vec::new()),
+            async_observers: RwLock::new(Vec::new()),
+            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            index_scheduler: None,
+            archiver_handle,
         })
     }
 
@@ -232,6 +337,7 @@ impl StorageEngine {
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler: None,
+            archiver_handle: None,
         };
 
         Ok((engine, pending_mutations))
@@ -556,6 +662,24 @@ impl StorageEngine {
         }
     }
 
+    /// Query by secondary index across memtable and SSTable sidecar indexes.
+    ///
+    /// Delegates to [`TableStore::read_by_index`] which merges results from
+    /// the memtable index and (future) sidecar indexes. Returns an empty vec
+    /// if the table is not registered.
+    pub fn read_by_index(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.read_by_index(index_name, key),
+            None => Ok(vec![]),
+        }
+    }
+
     /// Truncates a table: clears the memtable and drops all SSTable references.
     ///
     /// Subsequent reads for this table will return empty results. Existing
@@ -578,6 +702,63 @@ impl StorageEngine {
         position: CommitLogPosition,
     ) -> ferrosa_common::Result<Vec<Mutation>> {
         self.commit_log.replay_from(position)
+    }
+
+    /// Returns the current commit log write position.
+    ///
+    /// Used by snapshot creation to record which commit log position
+    /// the snapshot covers.
+    pub fn commit_log_position(&self) -> CommitLogPosition {
+        self.commit_log.current_position()
+    }
+
+    /// Creates a snapshot using an injected object store (for testing).
+    ///
+    /// 1. Flushes all memtables to SSTables.
+    /// 2. Records the commit log position.
+    /// 3. Loads the live manifest and schema from S3.
+    /// 4. Delegates to SnapshotManager to write snapshot objects.
+    pub async fn create_snapshot_with_store(
+        &self,
+        name: &str,
+        node_id: &str,
+        expires_at: Option<String>,
+        ephemeral: bool,
+        store: std::sync::Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+    ) -> ferrosa_common::Result<crate::snapshot::metadata::SnapshotMetadata> {
+        // Step 1: Flush all tables.
+        let table_ids: Vec<_> = self.tables.read().keys().cloned().collect();
+        for table_id in &table_ids {
+            self.flush(table_id)?;
+        }
+
+        // Step 2: Record commit log position.
+        let position = self.commit_log_position();
+
+        // Step 3: Load live manifest and schema from S3.
+        let (manifest, _version) = crate::manifest::Manifest::load(store.as_ref(), prefix).await?;
+        let schema_json = crate::manifest::load_schema_snapshot(store.as_ref(), prefix)
+            .await?
+            .unwrap_or_default();
+
+        // Step 4: Create snapshot via manager.
+        let manager = crate::snapshot::SnapshotManager::new(
+            std::sync::Arc::clone(&store),
+            prefix.to_string(),
+        );
+
+        manager
+            .create_snapshot(
+                name,
+                &manifest,
+                &schema_json,
+                position,
+                node_id,
+                expires_at,
+                ephemeral,
+            )
+            .await
     }
 
     /// Force-syncs the commit log to disk.
@@ -720,6 +901,11 @@ impl StorageEngine {
 
         // Stop compaction.
         self.compaction_executor.shutdown();
+
+        // Stop archiver.
+        if let Some(handle) = &self.archiver_handle {
+            handle.abort();
+        }
 
         // Commit log shutdown.
         self.commit_log.shutdown()?;
@@ -1616,5 +1802,165 @@ mod tests {
         engine.poll_compactions();
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn commit_log_position_exposed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let before = engine.commit_log_position();
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .unwrap();
+        let after = engine.commit_log_position();
+
+        assert!(
+            after > before,
+            "commit_log_position should advance after write"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn archiver_uploads_closed_segment_on_rotate() {
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjectPath;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let prefix = "test-node";
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig {
+                    segment_size: 512, // small to force rotation
+                    archive: Some(crate::commitlog::config::ArchiveConfig {
+                        enabled: true,
+                        poll_interval: std::time::Duration::from_millis(50),
+                        ..crate::commitlog::config::ArchiveConfig::default()
+                    }),
+                    ..CommitLogConfig::test_config(dir.path())
+                },
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let engine = StorageEngine::new_with_archive_store(
+                config,
+                Some(&tokio::runtime::Handle::current()),
+                Some(Arc::clone(&store)),
+                prefix.to_string(),
+            )
+            .unwrap();
+
+            engine.register_table(test_schema()).unwrap();
+
+            let tid = table_id();
+            let key = make_key("k1");
+            let row = make_row(b"value", 1000);
+
+            // Write enough to trigger rotation.
+            for i in 0..20 {
+                let _ = engine.write(&tid, &key, row.clone(), i);
+            }
+
+            // Give the archiver time to process.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            // Verify at least one segment was uploaded to S3.
+            let manifest =
+                crate::commitlog::manifest::ArchiveManifest::load(store.as_ref(), prefix)
+                    .await
+                    .unwrap();
+            assert!(
+                !manifest.segments.is_empty(),
+                "archiver should have uploaded at least one segment"
+            );
+
+            // Verify the segment data is in S3.
+            let seg = &manifest.segments[0];
+            let hex = crate::upload::manager::hex_prefix_for(&seg.id.to_string());
+            let s3_path =
+                ObjectPath::from(format!("{prefix}/commitlog-archive/{hex}/{}.log", seg.id));
+            let result = store.get(&s3_path).await;
+            assert!(result.is_ok(), "segment file should exist in S3");
+
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn create_snapshot_flushes_and_writes_to_s3() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: std::sync::Arc<dyn object_store::ObjectStore> =
+                std::sync::Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-node";
+
+            // Save a manifest and schema so snapshot can load them.
+            let manifest = crate::manifest::Manifest::new();
+            manifest
+                .save_with_retry(store.as_ref(), prefix)
+                .await
+                .unwrap();
+            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+                .await
+                .unwrap();
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(dir.path()),
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let engine = StorageEngine::new(config, None).unwrap();
+
+            // Register a table and write some data.
+            engine.register_table(test_schema()).unwrap();
+            let tid = table_id();
+            let key = make_key("k1");
+            engine
+                .write(&tid, &key, make_row(b"value", 1000), 1000)
+                .unwrap();
+
+            // Create snapshot via injected store.
+            let metadata = engine
+                .create_snapshot_with_store(
+                    "test-snap",
+                    "node-1",
+                    None,
+                    false,
+                    std::sync::Arc::clone(&store),
+                    prefix,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(metadata.name, "test-snap");
+            assert_eq!(metadata.node_id, "node-1");
+            assert!(!metadata.manifest_sha256.is_empty());
+            assert!(!metadata.ephemeral);
+
+            // Verify snapshot objects exist in S3.
+            let meta_path = object_store::path::Path::from(format!(
+                "{prefix}/snapshots/test-snap/metadata.json"
+            ));
+            assert!(store.get(&meta_path).await.is_ok());
+
+            engine.shutdown().unwrap();
+        });
     }
 }

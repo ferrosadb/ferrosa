@@ -439,6 +439,7 @@ mod tests {
             commit_log: CommitLogConfig {
                 log_dir: dir.path().join("commitlog"),
                 checkpoint_dir: dir.path().join("commitlog"),
+                archive: None,
                 ..CommitLogConfig::default()
             },
             compaction: CompactionConfig::from_env(dir.path().join("compaction")),
@@ -894,6 +895,7 @@ mod tests {
                 commit_log: ferrosa_storage::commitlog::CommitLogConfig {
                     log_dir: dir.path().join("commitlog"),
                     checkpoint_dir: dir.path().join("commitlog"),
+                    archive: None,
                     ..ferrosa_storage::commitlog::CommitLogConfig::default()
                 },
                 compaction: ferrosa_storage::compaction::CompactionConfig::from_env(

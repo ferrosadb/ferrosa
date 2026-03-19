@@ -43,6 +43,7 @@ fn setup() -> (Arc<Schema>, Arc<StorageEngine>, TempDir) {
             sync_strategy: SyncStrategyConfig::Batch,
             log_dir: dir.path().join("commitlog"),
             checkpoint_dir: dir.path().join("commitlog"),
+            archive: None,
         },
         compaction: CompactionConfig::from_env(dir.path().join("compaction")),
         object_store: None,

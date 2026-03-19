@@ -40,6 +40,7 @@ fn test_engine_config(dir: &Path) -> StorageEngineConfig {
             sync_strategy: SyncStrategyConfig::Batch,
             log_dir: dir.join("commitlog"),
             checkpoint_dir: dir.join("commitlog"),
+            archive: None,
         },
         compaction: CompactionConfig::from_env(dir.join("compaction")),
         object_store: None,

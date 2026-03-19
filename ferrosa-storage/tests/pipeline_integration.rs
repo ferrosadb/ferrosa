@@ -39,6 +39,7 @@ fn make_engine(dir: &std::path::Path) -> StorageEngine {
             sync_strategy: SyncStrategyConfig::Batch,
             log_dir: dir.join("commitlog"),
             checkpoint_dir: dir.join("commitlog"),
+            archive: None,
         },
         compaction: CompactionConfig::from_env(dir.join("compaction")),
         object_store: None,
@@ -200,6 +201,7 @@ fn wal_replay_after_crash() {
         sync_strategy: SyncStrategyConfig::Batch,
         log_dir: dir.path().join("commitlog"),
         checkpoint_dir: dir.path().join("commitlog"),
+        archive: None,
     };
     let (commit_log, mutations) = CommitLog::open_and_replay(replay_config).unwrap();
 

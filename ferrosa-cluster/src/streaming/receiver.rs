@@ -236,6 +236,7 @@ mod tests {
             commit_log: CommitLogConfig {
                 log_dir: dir.to_path_buf(),
                 checkpoint_dir: dir.to_path_buf(),
+                archive: None,
                 ..CommitLogConfig::default()
             },
             compaction: CompactionConfig::from_env(dir.join("compaction")),

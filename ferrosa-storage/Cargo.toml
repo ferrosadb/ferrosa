@@ -19,6 +19,7 @@ serde_json = "1"
 object_store = { version = "0.11", features = ["aws"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 bytes = "1"
+sha2 = "0.10"
 crossbeam-skiplist = { version = "0.1", optional = true }
 
 [features]
@@ -27,5 +28,6 @@ skiplist-memtable = ["crossbeam-skiplist"]
 
 [dev-dependencies]
 ferrosa-common = { path = "../ferrosa-common", features = ["test-generators"] }
+hex = "0.4"
 proptest = "1"
 tempfile = "3"

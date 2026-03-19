@@ -313,6 +313,7 @@ mod tests {
             sync_strategy: SyncStrategyConfig::Batch,
             log_dir: dir.path().join("commitlog"),
             checkpoint_dir: dir.path().join("commitlog"),
+            archive: None,
         };
         let compaction = CompactionConfig::from_env(dir.path().join("compaction"));
         let engine_config = StorageEngineConfig {
