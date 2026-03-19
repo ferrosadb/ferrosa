@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="generator" content="Asciidoctor 2.0.26">
+<title>Cluster Scaling: Development to Production</title>
+<link rel="stylesheet" href="./theme/ferrosa.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+<link rel="stylesheet" href="./rouge-github.css">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+</head>
+<body class="article toc2 toc-left">
+<div id="header">
+<h1>Cluster Scaling: Development to Production</h1>
+<div id="toc" class="toc2">
+<div id="toctitle">Table of Contents</div>
+<ul class="sectlevel1">
+<li><a href="#_prerequisites">Prerequisites</a></li>
+<li><a href="#act-1">Act 1: Standalone&#8201;&#8212;&#8201;Development</a>
+<ul class="sectlevel2">
+<li><a href="#_start_node1">Start node1</a></li>
+<li><a href="#_create_the_schema">Create the schema</a></li>
+<li><a href="#_insert_seed_data">Insert seed data</a></li>
+</ul>
+</li>
+<li><a href="#act-2">Act 2: Pair Mode&#8201;&#8212;&#8201;Low-Volume Production</a>
+<ul class="sectlevel2">
+<li><a href="#_add_node2">Add node2</a></li>
+<li><a href="#_write_more_data">Write more data</a></li>
+<li><a href="#_schema_changes_replicate_too">Schema changes replicate too</a></li>
+</ul>
+</li>
+<li><a href="#act-3">Act 3: Raft Cluster&#8201;&#8212;&#8201;Full Production</a>
+<ul class="sectlevel2">
+<li><a href="#_add_node3">Add node3</a></li>
+<li><a href="#_write_through_the_cluster">Write through the cluster</a></li>
+<li><a href="#_ddl_through_raft">DDL through Raft</a></li>
+</ul>
+</li>
+<li><a href="#verify">Verification</a></li>
+<li><a href="#_running_the_demo">Running the Demo</a></li>
+<li><a href="#_teardown">Teardown</a></li>
+</ul>
+</div>
+</div>
+<div id="content">
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>Ferrosa scales from a single development node to a production cluster without downtime.
+Most databases force you to choose your deployment topology up front&#8201;&#8212;&#8201;a single-node install that you later throw away and replace with a cluster, or a heavyweight multi-node setup that&#8217;s overkill for development.
+Ferrosa eliminates that tradeoff: start with one node on your laptop, add a hot standby when you&#8217;re ready for production, then grow into a full Raft consensus cluster when your traffic demands it.</p>
+</div>
+<div class="paragraph">
+<p>This tutorial walks through three stages of that journey: <strong>standalone</strong> (development), <strong>pair mode</strong> (low-volume production with a hot standby), and <strong>Raft cluster</strong> (full production with consensus).
+At each transition, writes and schema changes continue uninterrupted.
+The data you inserted on a single node is still there after you&#8217;ve scaled to three&#8201;&#8212;&#8201;no migrations, no re-bootstrapping, no downtime windows.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_prerequisites">Prerequisites</h2>
+<div class="sectionbody">
+<div class="ulist">
+<ul>
+<li>
+<p><strong>Docker and Docker Compose</strong>&#8201;&#8212;&#8201;see the <a href="../cluster-setup/cluster-setup.html">Cluster Setup Guide</a> if you need to install Docker</p>
+</li>
+<li>
+<p><strong>cqlsh</strong>&#8201;&#8212;&#8201;<code>pip install cqlsh</code></p>
+</li>
+<li>
+<p>About <strong>4 GB of RAM</strong> available for the three nodes plus the object store</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="act-1">Act 1: Standalone&#8201;&#8212;&#8201;Development</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>A single Ferrosa node is all you need for development.
+It starts fast, uses minimal resources, and gives you a fully functional CQL endpoint.</p>
+</div>
+<div class="sect2">
+<h3 id="_start_node1">Start node1</h3>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="bash">docker compose up <span class="nt">-d</span></code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This launches node1 in <code>standalone</code> mode along with a local S3-compatible object store (RustFS).
+Wait for node1 to report healthy:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="bash">docker compose ps</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>You should see <code>node1</code> with status "healthy" and <code>rustfs</code> running.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_create_the_schema">Create the schema</h3>
+<div class="paragraph">
+<p>Connect to node1 and bootstrap the event analytics schema:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="bash">cqlsh localhost 9042</code></pre>
+</div>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Act 1: Development / Standalone Mode</span>
+<span class="c1">-- Create the application keyspace and core table.</span>
+<span class="c1">-- RF=1 is appropriate for single-node development.</span>
+
+<span class="k">CREATE</span> <span class="n">KEYSPACE</span> <span class="n">IF</span> <span class="k">NOT</span> <span class="k">EXISTS</span> <span class="n">app</span>
+    <span class="k">WITH</span> <span class="n">replication</span> <span class="o">=</span> <span class="p">{</span><span class="s1">'class'</span><span class="p">:</span> <span class="s1">'SimpleStrategy'</span><span class="p">,</span> <span class="s1">'replication_factor'</span><span class="p">:</span> <span class="mi">1</span><span class="p">};</span>
+
+<span class="k">CREATE</span> <span class="k">TABLE</span> <span class="n">IF</span> <span class="k">NOT</span> <span class="k">EXISTS</span> <span class="n">app</span><span class="p">.</span><span class="n">events</span> <span class="p">(</span>
+    <span class="n">tenant_id</span>  <span class="nb">text</span><span class="p">,</span>
+    <span class="n">event_date</span> <span class="nb">text</span><span class="p">,</span>
+    <span class="n">event_id</span>   <span class="nb">int</span><span class="p">,</span>
+    <span class="n">event_type</span> <span class="nb">text</span><span class="p">,</span>
+    <span class="n">payload</span>    <span class="nb">text</span><span class="p">,</span>
+    <span class="k">PRIMARY</span> <span class="k">KEY</span> <span class="p">((</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">),</span> <span class="n">event_id</span><span class="p">)</span>
+<span class="p">)</span> <span class="k">WITH</span> <span class="n">CLUSTERING</span> <span class="k">ORDER</span> <span class="k">BY</span> <span class="p">(</span><span class="n">event_id</span> <span class="k">ASC</span><span class="p">);</span></code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This creates the <code>app</code> keyspace with <code>replication_factor: 1</code>&#8201;&#8212;&#8201;appropriate for a single development node&#8201;&#8212;&#8201;and an <code>events</code> table partitioned by tenant and date.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_insert_seed_data">Insert seed data</h3>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Act 1: Standalone — seed initial event data</span>
+<span class="c1">-- 5 events for acme, 5 for globex (10 total)</span>
+
+<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+
+<span class="c1">-- acme events (IDs 1-5)</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/home"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="s1">'click'</span><span class="p">,</span> <span class="s1">'{"button": "signup"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="s1">'signup'</span><span class="p">,</span> <span class="s1">'{"plan": "free"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/dashboard"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="s1">'purchase'</span><span class="p">,</span> <span class="s1">'{"item": "pro_plan", "amount": 29.99}'</span><span class="p">);</span>
+
+<span class="c1">-- globex events (IDs 1-5)</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/products"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="s1">'click'</span><span class="p">,</span> <span class="s1">'{"button": "add_to_cart"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="s1">'purchase'</span><span class="p">,</span> <span class="s1">'{"item": "widget", "amount": 9.99}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/checkout"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="s1">'signup'</span><span class="p">,</span> <span class="s1">'{"plan": "enterprise"}'</span><span class="p">);</span>
+
+<span class="c1">-- Verify counts</span>
+<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="c1">-- Expected: 5</span>
+<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="c1">-- Expected: 5</span></code></pre>
+</div>
+</div>
+<div class="admonitionblock tip">
+<table>
+<tr>
+<td class="icon">
+<i class="fa icon-tip" title="Tip"></i>
+</td>
+<td class="content">
+<code>replication_factor: 1</code> means every write lands on the only node that exists. No coordination overhead, no quorum delays&#8201;&#8212;&#8201;ideal for rapid iteration during development.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="act-2">Act 2: Pair Mode&#8201;&#8212;&#8201;Low-Volume Production</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Pair mode adds a hot standby that receives replicated writes in real time.
+If the primary fails, the secondary can serve reads immediately.
+Think of it like PostgreSQL streaming replication, but it also replicates DDL&#8201;&#8212;&#8201;schema changes propagate automatically.</p>
+</div>
+<div class="sect2">
+<h3 id="_add_node2">Add node2</h3>
+<div class="paragraph">
+<p>Scale from standalone to pair mode by layering the pair override file:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="bash">docker compose <span class="nt">-f</span> docker-compose.yml <span class="nt">-f</span> docker-compose.pair.yml up <span class="nt">-d</span></code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This does two things: it restarts node1 with <code>FERROSA_CLUSTER_MODE=pair</code>, and it launches node2 as the secondary.
+Node2 connects to node1, receives the current schema and data, and begins replicating writes.</p>
+</div>
+<div class="admonitionblock important">
+<table>
+<tr>
+<td class="icon">
+<i class="fa icon-important" title="Important"></i>
+</td>
+<td class="content">
+Writes continue uninterrupted during this transition. Node1 accepts CQL commands throughout the mode change. If you have a background writer running (like <code>run-demo.sh</code> provides), it will not see any errors.
+</td>
+</tr>
+</table>
+</div>
+<div class="paragraph">
+<p>Watch the pair form:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="bash">docker compose logs <span class="nt">-f</span> node1 node2</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>You should see node2 complete its handshake and report "Pair mode established with node1".
+Press <code>Ctrl+C</code> to stop following logs.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_write_more_data">Write more data</h3>
+<div class="paragraph">
+<p>With both nodes running, insert additional events.
+These writes replicate to node2 in real time:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Act 2: Pair mode — writes replicated to second node</span>
+<span class="c1">-- 3 more for acme (total 8), 2 more for globex (total 7)</span>
+
+<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+
+<span class="c1">-- acme events (IDs 6-8)</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="s1">'click'</span><span class="p">,</span> <span class="s1">'{"button": "export_csv"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">7</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/reports"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="s1">'purchase'</span><span class="p">,</span> <span class="s1">'{"item": "addon_analytics", "amount": 14.99}'</span><span class="p">);</span>
+
+<span class="c1">-- globex events (IDs 6-7)</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/settings"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">7</span><span class="p">,</span> <span class="s1">'click'</span><span class="p">,</span> <span class="s1">'{"button": "invite_team"}'</span><span class="p">);</span>
+
+<span class="c1">-- Verify counts after pair writes</span>
+<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="c1">-- Expected: 8</span>
+<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="c1">-- Expected: 7</span></code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_schema_changes_replicate_too">Schema changes replicate too</h3>
+<div class="paragraph">
+<p>One of pair mode&#8217;s key features is DDL replication.
+Add a new column and a secondary index&#8201;&#8212;&#8201;the schema change propagates to node2 automatically:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Phase 2: Pair mode — DDL replication test</span>
+<span class="c1">-- Create a counter table and populate it with daily summaries</span>
+
+<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+
+<span class="k">CREATE</span> <span class="k">TABLE</span> <span class="n">IF</span> <span class="k">NOT</span> <span class="k">EXISTS</span> <span class="n">daily_summary</span> <span class="p">(</span>
+    <span class="n">tenant_id</span>  <span class="nb">text</span><span class="p">,</span>
+    <span class="n">event_date</span> <span class="nb">date</span><span class="p">,</span>
+    <span class="n">event_type</span> <span class="nb">text</span><span class="p">,</span>
+    <span class="n">event_count</span> <span class="n">counter</span><span class="p">,</span>
+    <span class="k">PRIMARY</span> <span class="k">KEY</span> <span class="p">((</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">),</span> <span class="n">event_type</span><span class="p">)</span>
+<span class="p">);</span>
+
+<span class="c1">-- acme summaries for 2026-03-18</span>
+<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">3</span>
+    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'page_view'</span><span class="p">;</span>
+<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">2</span>
+    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'click'</span><span class="p">;</span>
+<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">1</span>
+    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'signup'</span><span class="p">;</span>
+<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">2</span>
+    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'purchase'</span><span class="p">;</span>
+
+<span class="c1">-- globex summaries for 2026-03-18</span>
+<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">3</span>
+    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'page_view'</span><span class="p">;</span>
+<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">2</span>
+    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'click'</span><span class="p">;</span>
+<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">1</span>
+    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'signup'</span><span class="p">;</span>
+<span class="k">UPDATE</span> <span class="n">daily_summary</span> <span class="k">SET</span> <span class="n">event_count</span> <span class="o">=</span> <span class="n">event_count</span> <span class="o">+</span> <span class="mi">1</span>
+    <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span> <span class="k">AND</span> <span class="n">event_type</span> <span class="o">=</span> <span class="s1">'purchase'</span><span class="p">;</span>
+
+<span class="c1">-- Verify counter table</span>
+<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">daily_summary</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">daily_summary</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span></code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Verify the schema arrived on node2 by connecting to port 9043:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="bash">cqlsh localhost 9043 <span class="nt">-e</span> <span class="s2">"DESCRIBE TABLE app.events;"</span></code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>You should see the new <code>user_id</code> column and <code>events_by_user</code> index on both nodes.</p>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<i class="fa icon-note" title="Note"></i>
+</td>
+<td class="content">
+In traditional Cassandra, schema changes propagate via gossip and can temporarily disagree across nodes. In Ferrosa pair mode, DDL is replicated synchronously&#8201;&#8212;&#8201;the secondary&#8217;s schema is always consistent with the primary&#8217;s.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="act-3">Act 3: Raft Cluster&#8201;&#8212;&#8201;Full Production</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>When your traffic outgrows a two-node pair, add a third node to form a Raft consensus cluster.
+Three nodes give you:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><strong>Fault tolerance</strong>&#8201;&#8212;&#8201;the cluster continues operating if any single node fails</p>
+</li>
+<li>
+<p><strong>Tunable consistency</strong>&#8201;&#8212;&#8201;choose between <code>ONE</code>, <code>QUORUM</code>, or <code>ALL</code> per query</p>
+</li>
+<li>
+<p><strong>Consensus-backed metadata</strong>&#8201;&#8212;&#8201;schema changes and topology updates go through Raft, guaranteeing agreement</p>
+</li>
+</ul>
+</div>
+<div class="sect2">
+<h3 id="_add_node3">Add node3</h3>
+<div class="paragraph">
+<p>Layer all three compose files to bring up the full cluster:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="bash">docker compose <span class="nt">-f</span> docker-compose.yml <span class="nt">-f</span> docker-compose.pair.yml <span class="nt">-f</span> docker-compose.cluster.yml up <span class="nt">-d</span></code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This transitions all three nodes to <code>FERROSA_CLUSTER_MODE=cluster</code>.
+Node3 joins, a Raft leader election completes, and the cluster stabilizes.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="bash">docker compose logs <span class="nt">-f</span> node1 node2 node3</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Watch for these log messages:</p>
+</div>
+<div class="olist arabic">
+<ol class="arabic">
+<li>
+<p>Node3 connects to node1 (the seed)</p>
+</li>
+<li>
+<p>Raft leader election completes&#8201;&#8212;&#8201;one of the three nodes becomes leader</p>
+</li>
+<li>
+<p>All three nodes report "Cluster mode active, 3 nodes in ring"</p>
+</li>
+</ol>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_write_through_the_cluster">Write through the cluster</h3>
+<div class="paragraph">
+<p>Now writes are coordinated through Raft consensus.
+Insert more events&#8201;&#8212;&#8201;these are acknowledged after a quorum (2 of 3 nodes) confirms:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Act 3: Raft cluster — writes across a 3-node cluster</span>
+<span class="c1">-- 2 more for acme (total 10), 3 for new tenant initech (total 3)</span>
+
+<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+
+<span class="c1">-- acme events (IDs 9-10)</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">9</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/billing"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">10</span><span class="p">,</span> <span class="s1">'click'</span><span class="p">,</span> <span class="s1">'{"button": "upgrade_plan"}'</span><span class="p">);</span>
+
+<span class="c1">-- initech events (IDs 1-3, new tenant)</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'initech'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/home"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'initech'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="s1">'signup'</span><span class="p">,</span> <span class="s1">'{"plan": "trial"}'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">events</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">event_date</span><span class="p">,</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">event_type</span><span class="p">,</span> <span class="n">payload</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'initech'</span><span class="p">,</span> <span class="s1">'2026-03-18'</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="s1">'page_view'</span><span class="p">,</span> <span class="s1">'{"url": "/onboarding"}'</span><span class="p">);</span>
+
+<span class="c1">-- Verify counts across all tenants</span>
+<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="c1">-- Expected: 10</span>
+<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="c1">-- Expected: 7</span>
+<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'initech'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="c1">-- Expected: 3</span></code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_ddl_through_raft">DDL through Raft</h3>
+<div class="paragraph">
+<p>Schema changes now go through Raft consensus, guaranteeing that all nodes agree on the schema before the DDL statement returns:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Phase 3: Raft cluster — DDL through consensus</span>
+<span class="c1">-- Create a tenants table and register all known tenants</span>
+
+<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+
+<span class="k">CREATE</span> <span class="k">TABLE</span> <span class="n">IF</span> <span class="k">NOT</span> <span class="k">EXISTS</span> <span class="n">tenants</span> <span class="p">(</span>
+    <span class="n">tenant_id</span>   <span class="nb">text</span> <span class="k">PRIMARY</span> <span class="k">KEY</span><span class="p">,</span>
+    <span class="n">name</span>        <span class="nb">text</span><span class="p">,</span>
+    <span class="n">plan</span>        <span class="nb">text</span><span class="p">,</span>
+    <span class="n">created_at</span>  <span class="nb">timestamp</span><span class="p">,</span>
+    <span class="n">contact</span>     <span class="nb">text</span>
+<span class="p">);</span>
+
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">tenants</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">plan</span><span class="p">,</span> <span class="n">created_at</span><span class="p">,</span> <span class="n">contact</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'acme'</span><span class="p">,</span> <span class="s1">'Acme Corporation'</span><span class="p">,</span> <span class="s1">'pro'</span><span class="p">,</span> <span class="s1">'2026-01-15T09:00:00Z'</span><span class="p">,</span> <span class="s1">'admin@acme.example'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">tenants</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">plan</span><span class="p">,</span> <span class="n">created_at</span><span class="p">,</span> <span class="n">contact</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'globex'</span><span class="p">,</span> <span class="s1">'Globex Corporation'</span><span class="p">,</span> <span class="s1">'enterprise'</span><span class="p">,</span> <span class="s1">'2026-02-01T14:30:00Z'</span><span class="p">,</span> <span class="s1">'ops@globex.example'</span><span class="p">);</span>
+<span class="k">INSERT</span> <span class="k">INTO</span> <span class="n">tenants</span> <span class="p">(</span><span class="n">tenant_id</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">plan</span><span class="p">,</span> <span class="n">created_at</span><span class="p">,</span> <span class="n">contact</span><span class="p">)</span>
+    <span class="k">VALUES</span> <span class="p">(</span><span class="s1">'initech'</span><span class="p">,</span> <span class="s1">'Initech'</span><span class="p">,</span> <span class="s1">'trial'</span><span class="p">,</span> <span class="s1">'2026-03-18T10:00:00Z'</span><span class="p">,</span> <span class="s1">'peter@initech.example'</span><span class="p">);</span>
+
+<span class="c1">-- Verify tenant records</span>
+<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">tenants</span><span class="p">;</span></code></pre>
+</div>
+</div>
+<div class="admonitionblock tip">
+<table>
+<tr>
+<td class="icon">
+<i class="fa icon-tip" title="Tip"></i>
+</td>
+<td class="content">
+In cluster mode, DDL statements are linearizable. A <code>CREATE TABLE</code> that succeeds is guaranteed to be visible on every node immediately&#8201;&#8212;&#8201;no schema agreement delays.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="verify">Verification</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Confirm that all data survived every transition and that the cluster is healthy.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="sql"><span class="c1">-- Final verification: confirm all data across the scaled cluster</span>
+
+<span class="n">USE</span> <span class="n">app</span><span class="p">;</span>
+
+<span class="c1">-- Event counts per tenant</span>
+<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="c1">-- Expected: 10</span>
+<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="c1">-- Expected: 7</span>
+<span class="k">SELECT</span> <span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span> <span class="k">FROM</span> <span class="n">events</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'initech'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="c1">-- Expected: 3</span>
+
+<span class="c1">-- Daily summaries</span>
+<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">daily_summary</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'acme'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">daily_summary</span> <span class="k">WHERE</span> <span class="n">tenant_id</span> <span class="o">=</span> <span class="s1">'globex'</span> <span class="k">AND</span> <span class="n">event_date</span> <span class="o">=</span> <span class="s1">'2026-03-18'</span><span class="p">;</span>
+
+<span class="c1">-- Tenant registry</span>
+<span class="k">SELECT</span> <span class="o">*</span> <span class="k">FROM</span> <span class="n">tenants</span><span class="p">;</span>
+
+<span class="c1">-- Cluster health</span>
+<span class="k">SELECT</span> <span class="n">cluster_name</span><span class="p">,</span> <span class="n">listen_address</span><span class="p">,</span> <span class="n">data_center</span><span class="p">,</span> <span class="n">rack</span> <span class="k">FROM</span> <span class="k">system</span><span class="p">.</span><span class="k">local</span><span class="p">;</span>
+<span class="k">SELECT</span> <span class="n">peer</span><span class="p">,</span> <span class="n">data_center</span> <span class="k">FROM</span> <span class="k">system</span><span class="p">.</span><span class="n">peers</span><span class="p">;</span></code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Connect to each node and check:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><strong>Row counts</strong>&#8201;&#8212;&#8201;the <code>app.events</code> table should contain all rows inserted across all three phases</p>
+</li>
+<li>
+<p><strong>Schema agreement</strong>&#8201;&#8212;&#8201;<code>DESCRIBE TABLE app.events</code> should show identical output on all three nodes, including the columns and indexes added during pair mode and cluster mode</p>
+</li>
+<li>
+<p><strong>Cluster health</strong>&#8201;&#8212;&#8201;query the web API on any node:</p>
+</li>
+</ul>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="bash">curl <span class="nt">-s</span> http://localhost:9090/api/cluster/status | python3 <span class="nt">-m</span> json.tool</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>All three nodes should show <code>"status": "UP"</code>.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_running_the_demo">Running the Demo</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The <code>run-demo.sh</code> script automates the entire sequence above&#8201;&#8212;&#8201;starting each phase, running CQL scripts, maintaining a background writer to prove zero-downtime transitions, and asserting correctness at each stage.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="bash">bash run-demo.sh</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The script prints progress for each act and exits with a non-zero status if any assertion fails.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_teardown">Teardown</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Remove all containers and volumes:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="rouge highlight"><code data-lang="bash">docker compose <span class="nt">-f</span> docker-compose.yml <span class="nt">-f</span> docker-compose.pair.yml <span class="nt">-f</span> docker-compose.cluster.yml down <span class="nt">-v</span></code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This deletes all data. The S3 bucket, node volumes, and container state are all removed.</p>
+</div>
+</div>
+</div>
+</div>
+<div id="footer">
+<div id="footer-text">
+Last updated 2026-03-18 22:08:59 UTC
+</div>
+</div>
+</body>
+</html>
