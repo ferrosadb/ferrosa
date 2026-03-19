@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="generator" content="Asciidoctor 2.0.26">
+<title>Cybersecurity Monitoring</title>
+<link rel="stylesheet" href="./theme/ferrosa.css">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+</head>
+<body class="article toc2 toc-left">
+<div id="header">
+<h1>Cybersecurity Monitoring</h1>
+<div id="toc" class="toc2">
+<div id="toctitle">Table of Contents</div>
+<ul class="sectlevel1">
+<li><a href="#_create_the_keyspace">Create the keyspace</a></li>
+<li><a href="#_design_the_schema">Design the schema</a>
+<ul class="sectlevel2">
+<li><a href="#_events_table">Events table</a></li>
+<li><a href="#_events_by_source_ip">Events by source IP</a></li>
+<li><a href="#_threat_intelligence_table">Threat intelligence table</a></li>
+<li><a href="#_incidents_table">Incidents table</a></li>
+</ul>
+</li>
+<li><a href="#_populate_with_sample_data">Populate with sample data</a>
+<ul class="sectlevel2">
+<li><a href="#_insert_normal_network_traffic">Insert normal network traffic</a></li>
+<li><a href="#_insert_ssh_brute_force_attack">Insert SSH brute force attack</a></li>
+<li><a href="#_insert_port_scan_activity">Insert port scan activity</a></li>
+<li><a href="#_insert_malware_beacon">Insert malware beacon</a></li>
+<li><a href="#_populate_events_by_source_for_investigation">Populate events_by_source for investigation</a></li>
+<li><a href="#_add_threat_intelligence">Add threat intelligence</a></li>
+<li><a href="#_create_an_incident">Create an incident</a></li>
+</ul>
+</li>
+<li><a href="#_query_your_data">Query your data</a>
+<ul class="sectlevel2">
+<li><a href="#_view_events_in_a_time_window">View events in a time window</a></li>
+<li><a href="#_investigate_a_suspicious_source_ip">Investigate a suspicious source IP</a></li>
+<li><a href="#_find_high_severity_events">Find high-severity events</a></li>
+<li><a href="#_check_all_activity_from_the_compromised_host">Check all activity from the compromised host</a></li>
+<li><a href="#_look_up_threat_intelligence">Look up threat intelligence</a></li>
+<li><a href="#_review_the_incident">Review the incident</a></li>
+<li><a href="#_correlate_find_all_events_targeting_the_same_destination_as_a_known_threat">Correlate: find all events targeting the same destination as a known threat</a></li>
+<li><a href="#_search_threat_intel_by_type">Search threat intel by type</a></li>
+<li><a href="#_look_up_domain_based_threats">Look up domain-based threats</a></li>
+<li><a href="#_update_the_incident_with_correlation_findings">Update the incident with correlation findings</a></li>
+</ul>
+</li>
+<li><a href="#_what_you_learned">What you learned</a></li>
+</ul>
+</div>
+</div>
+<div id="content">
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>Build a SIEM-style security event platform. Ingest network logs, detect threats, and investigate incidents with fast time-range queries.</p>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+This tutorial assumes you have a running Ferrosa cluster. If you have not set one up yet, follow the Getting Started guide first. You should be able to connect with <code>cqlsh</code> before continuing.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_create_the_keyspace">Create the keyspace</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Security event data is write-heavy and time-sensitive. You are going to be ingesting thousands of events per second and querying them by time range. A replication factor of 3 ensures no event is lost, even during node failures.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE KEYSPACE IF NOT EXISTS security
+  WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};
+
+USE security;</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_design_the_schema">Design the schema</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>A security monitoring platform needs four core tables: a primary event log (partitioned by date for time-range queries), a secondary view by source IP (for investigating specific hosts), a threat intelligence lookup table, and an incident tracker. Let&#8217;s build them one at a time.</p>
+</div>
+<div class="sect2">
+<h3 id="_events_table">Events table</h3>
+<div class="paragraph">
+<p>This is your primary log. Every firewall event, IDS alert, and authentication attempt lands here. Partitioning by <code>event_date</code> means each day&#8217;s events live in their own partition, which keeps time-range queries fast and gives you a natural data lifecycle&#8201;&#8212;&#8201;old partitions can be archived or dropped.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE IF NOT EXISTS events (
+    event_date   date,
+    event_time   timestamp,
+    event_id     uuid,
+    source_ip    text,
+    dest_ip      text,
+    source_port  int,
+    dest_port    int,
+    protocol     text,
+    event_type   text,
+    severity     text,
+    rule_id      text,
+    description  text,
+    raw_payload  blob,
+    PRIMARY KEY ((event_date), event_time, event_id)
+) WITH CLUSTERING ORDER BY (event_time DESC);</code></pre>
+</div>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+<strong>Why partition by date?</strong> Security analysts work in time windows&#8201;&#8212;&#8201;"show me everything from the last hour" or "what happened yesterday between 2am and 4am." Date partitioning makes these queries hit a single partition (or at most two, if the window spans midnight).
+</td>
+</tr>
+</table>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_events_by_source_ip">Events by source IP</h3>
+<div class="paragraph">
+<p>When investigating a specific host, you need to pull all events from that IP quickly. This table uses a compound partition key of <code>(source_ip, event_date)</code> to keep per-IP, per-day data together:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">    source_ip   text,
+    event_date  date,
+    event_time  timestamp,
+    event_id    uuid,
+    event_type  text,
+    severity    text,
+    dest_ip     text,
+    dest_port   int,
+    PRIMARY KEY ((source_ip, event_date), event_time, event_id)
+) WITH CLUSTERING ORDER BY (event_time DESC);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This is denormalization in action&#8201;&#8212;&#8201;the same event data appears in both tables, optimized for different query patterns. You write to both tables when an event arrives.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_threat_intelligence_table">Threat intelligence table</h3>
+<div class="paragraph">
+<p>This stores known indicators of compromise (IOCs): malicious IP addresses, domain names, file hashes. Your detection engine checks incoming events against this table to flag known threats.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">    indicator_type  text,
+    indicator_value text,
+    threat_name     text,
+    severity        text,
+    source          text,
+    first_seen      timestamp,
+    last_seen       timestamp,
+    tags            set&lt;text&gt;,
+    PRIMARY KEY (indicator_type, indicator_value)
+);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Partitioning by <code>indicator_type</code> (like "ip", "domain", or "hash") groups similar indicators together. Lookups by type and value are O(1).</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_incidents_table">Incidents table</h3>
+<div class="paragraph">
+<p>When events are correlated into a confirmed security incident, the details go here. Each incident tracks its lifecycle from creation through investigation to resolution.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">    incident_id    uuid PRIMARY KEY,
+    title          text,
+    severity       text,
+    status         text,
+    created_at     timestamp,
+    updated_at     timestamp,
+    assigned_to    text,
+    related_events list&lt;uuid&gt;,
+    notes          text
+);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The <code>related_events</code> column uses a list to store references to the event UUIDs that make up this incident.</p>
+</div>
+<div class="paragraph">
+<p>Here is how the tables relate to each other:</p>
+</div>
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 20%;">
+<col style="width: 20%;">
+<col style="width: 20%;">
+<col style="width: 40%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Table</th>
+<th class="tableblock halign-left valign-top">Partition Key</th>
+<th class="tableblock halign-left valign-top">Clustering Key</th>
+<th class="tableblock halign-left valign-top">Serves</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">events</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>event_date</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>event_time DESC</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Time-range event queries</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">events_by_source</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>(source_ip, event_date)</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>event_time DESC</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Per-IP investigation</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">threat_intel</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>indicator_type</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>indicator_value</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">IOC lookups</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">incidents</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>incident_id</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">&#8201;&#8212;&#8201;</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Incident lifecycle tracking</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>Two tables for the same events (with different partition keys) is a deliberate choice. In Ferrosa, you optimize for the read path by duplicating writes. The cost of writing twice is trivial compared to the cost of a slow investigation query during an active breach.</p>
+</div>
+<div class="paragraph">
+<p>Your schema is ready&#8201;&#8212;&#8201;let&#8217;s fill it with security events.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_populate_with_sample_data">Populate with sample data</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_insert_normal_network_traffic">Insert normal network traffic</h3>
+<div class="paragraph">
+<p>First, some baseline activity that looks completely routine&#8201;&#8212;&#8201;web browsing, DNS queries, and internal service communication:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- ── Normal Network Traffic ──
+
+-- Normal web traffic
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 08:01:00+0000', e1000000-0000-0000-0000-000000000001, '10.0.1.50', '93.184.216.34', 52431, 443, 'TCP', 'connection', 'info', 'NET-001', 'HTTPS connection to example.com');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 08:01:05+0000', e1000000-0000-0000-0000-000000000002, '10.0.1.50', '10.0.0.2', 49152, 53, 'UDP', 'dns_query', 'info', 'DNS-001', 'DNS lookup for internal.corp.local');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 08:05:00+0000', e1000000-0000-0000-0000-000000000003, '10.0.2.10', '10.0.3.20', 55000, 5432, 'TCP', 'connection', 'info', 'NET-001', 'Internal database connection from app server');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 08:10:00+0000', e1000000-0000-0000-0000-000000000004, '10.0.1.100', '10.0.0.1', 60123, 389, 'TCP', 'authentication', 'info', 'AUTH-001', 'Successful LDAP authentication for user jdoe');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 09:00:00+0000', e1000000-0000-0000-0000-000000000005, '10.0.1.75', '172.217.14.206', 51888, 443, 'TCP', 'connection', 'info', 'NET-001', 'HTTPS connection to google.com');</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_insert_ssh_brute_force_attack">Insert SSH brute force attack</h3>
+<div class="paragraph">
+<p>Now let&#8217;s simulate an attacker trying to brute-force SSH credentials. Notice the rapid succession of failed login attempts from the same source IP:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- ── SSH Brute Force Attack ──
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 10:15:01+0000', e2000000-0000-0000-0000-000000000001, '203.0.113.42', '10.0.1.5', 44001, 22, 'TCP', 'auth_failure', 'medium', 'SSH-001', 'Failed SSH login attempt: user root');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 10:15:03+0000', e2000000-0000-0000-0000-000000000002, '203.0.113.42', '10.0.1.5', 44002, 22, 'TCP', 'auth_failure', 'medium', 'SSH-001', 'Failed SSH login attempt: user admin');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 10:15:05+0000', e2000000-0000-0000-0000-000000000003, '203.0.113.42', '10.0.1.5', 44003, 22, 'TCP', 'auth_failure', 'medium', 'SSH-001', 'Failed SSH login attempt: user ubuntu');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 10:15:07+0000', e2000000-0000-0000-0000-000000000004, '203.0.113.42', '10.0.1.5', 44004, 22, 'TCP', 'auth_failure', 'high', 'SSH-002', 'SSH brute force detected: 4 failures in 6 seconds from 203.0.113.42');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 10:15:08+0000', e2000000-0000-0000-0000-000000000005, '203.0.113.42', '10.0.1.5', 44005, 22, 'TCP', 'auth_failure', 'medium', 'SSH-001', 'Failed SSH login attempt: user deploy');
+
+-- ── Port Scan Activity ──</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_insert_port_scan_activity">Insert port scan activity</h3>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">VALUES ('2026-03-17', '2026-03-17 11:30:00+0000', e3000000-0000-0000-0000-000000000001, '198.51.100.77', '10.0.1.5', 33000, 21, 'TCP', 'port_scan', 'medium', 'SCAN-001', 'SYN scan detected on port 21 (FTP)');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 11:30:01+0000', e3000000-0000-0000-0000-000000000002, '198.51.100.77', '10.0.1.5', 33001, 23, 'TCP', 'port_scan', 'medium', 'SCAN-001', 'SYN scan detected on port 23 (Telnet)');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 11:30:02+0000', e3000000-0000-0000-0000-000000000003, '198.51.100.77', '10.0.1.5', 33002, 80, 'TCP', 'port_scan', 'low', 'SCAN-001', 'SYN scan detected on port 80 (HTTP)');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 11:30:03+0000', e3000000-0000-0000-0000-000000000004, '198.51.100.77', '10.0.1.5', 33003, 3389, 'TCP', 'port_scan', 'high', 'SCAN-002', 'SYN scan on port 3389 (RDP) -- high-value target port');
+
+-- ── Malware Beacon and Lateral Movement ──
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 13:00:00+0000', e4000000-0000-0000-0000-000000000001, '10.0.1.200', '45.33.32.156', 49200, 443, 'TCP', 'c2_beacon', 'critical', 'MAL-001', 'Outbound connection to known C2 server (Cobalt Strike)');</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_insert_malware_beacon">Insert malware beacon</h3>
+<div class="paragraph">
+<p>This is the most dangerous pattern&#8201;&#8212;&#8201;an internal host communicating with a known command-and-control server at regular intervals:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 13:05:00+0000', e4000000-0000-0000-0000-000000000002, '10.0.1.200', '45.33.32.156', 49201, 443, 'TCP', 'c2_beacon', 'critical', 'MAL-001', 'Repeated beacon to C2 server -- 5 minute interval detected');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 13:10:00+0000', e4000000-0000-0000-0000-000000000003, '10.0.1.200', '45.33.32.156', 49202, 443, 'TCP', 'c2_beacon', 'critical', 'MAL-001', 'Third C2 beacon in 10 minutes -- confirmed periodic callback');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 13:12:00+0000', e4000000-0000-0000-0000-000000000004, '10.0.1.200', '10.0.2.10', 49300, 445, 'TCP', 'lateral_movement', 'critical', 'LAT-001', 'SMB connection from compromised host to internal app server');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 13:14:00+0000', e4000000-0000-0000-0000-000000000005, '10.0.1.200', '10.0.3.20', 49301, 445, 'TCP', 'lateral_movement', 'critical', 'LAT-001', 'SMB connection from compromised host to database server');
+
+INSERT INTO events (event_date, event_time, event_id, source_ip, dest_ip, source_port, dest_port, protocol, event_type, severity, rule_id, description)
+VALUES ('2026-03-17', '2026-03-17 14:00:00+0000', e4000000-0000-0000-0000-000000000006, '10.0.1.200', '45.33.32.156', 49203, 443, 'TCP', 'data_exfiltration', 'critical', 'EXFIL-001', 'Large outbound data transfer (450MB) to C2 server');
+
+-- ── Events by Source (denormalized for IP investigation) ──
+
+-- SSH brute force attacker
+INSERT INTO events_by_source (source_ip, event_date, event_time, event_id, event_type, severity, dest_ip, dest_port)
+VALUES ('203.0.113.42', '2026-03-17', '2026-03-17 10:15:01+0000', e2000000-0000-0000-0000-000000000001, 'auth_failure', 'medium', '10.0.1.5', 22);</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_populate_events_by_source_for_investigation">Populate events_by_source for investigation</h3>
+<div class="paragraph">
+<p>In a production system, your ingestion pipeline would write to both tables simultaneously. For this tutorial, let&#8217;s insert the key attack events into the source-IP view:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">VALUES ('203.0.113.42', '2026-03-17', '2026-03-17 10:15:03+0000', e2000000-0000-0000-0000-000000000002, 'auth_failure', 'medium', '10.0.1.5', 22);
+
+INSERT INTO events_by_source (source_ip, event_date, event_time, event_id, event_type, severity, dest_ip, dest_port)
+VALUES ('203.0.113.42', '2026-03-17', '2026-03-17 10:15:05+0000', e2000000-0000-0000-0000-000000000003, 'auth_failure', 'medium', '10.0.1.5', 22);
+
+INSERT INTO events_by_source (source_ip, event_date, event_time, event_id, event_type, severity, dest_ip, dest_port)
+VALUES ('203.0.113.42', '2026-03-17', '2026-03-17 10:15:07+0000', e2000000-0000-0000-0000-000000000004, 'auth_failure', 'high', '10.0.1.5', 22);
+
+-- Compromised internal host
+INSERT INTO events_by_source (source_ip, event_date, event_time, event_id, event_type, severity, dest_ip, dest_port)
+VALUES ('10.0.1.200', '2026-03-17', '2026-03-17 13:00:00+0000', e4000000-0000-0000-0000-000000000001, 'c2_beacon', 'critical', '45.33.32.156', 443);
+
+INSERT INTO events_by_source (source_ip, event_date, event_time, event_id, event_type, severity, dest_ip, dest_port)
+VALUES ('10.0.1.200', '2026-03-17', '2026-03-17 13:12:00+0000', e4000000-0000-0000-0000-000000000004, 'lateral_movement', 'critical', '10.0.2.10', 445);
+
+INSERT INTO events_by_source (source_ip, event_date, event_time, event_id, event_type, severity, dest_ip, dest_port)
+VALUES ('10.0.1.200', '2026-03-17', '2026-03-17 14:00:00+0000', e4000000-0000-0000-0000-000000000006, 'data_exfiltration', 'critical', '45.33.32.156', 443);
+
+-- ── Threat Intelligence ──
+
+INSERT INTO threat_intel (indicator_type, indicator_value, threat_name, severity, source, first_seen, last_seen, tags)
+VALUES ('ip', '45.33.32.156', 'Cobalt Strike C2', 'critical', 'AlienVault OTX',
+    '2026-01-15 00:00:00+0000', '2026-03-17 13:00:00+0000',
+    {'cobalt-strike', 'c2', 'apt', 'beacon'});</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_add_threat_intelligence">Add threat intelligence</h3>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">VALUES ('ip', '203.0.113.42', 'SSH Brute Force Botnet', 'medium', 'AbuseIPDB',
+    '2026-02-20 00:00:00+0000', '2026-03-17 10:15:00+0000',
+    {'brute-force', 'ssh', 'botnet'});
+
+INSERT INTO threat_intel (indicator_type, indicator_value, threat_name, severity, source, first_seen, last_seen, tags)
+VALUES ('ip', '198.51.100.77', 'Reconnaissance Scanner', 'low', 'Shodan',
+    '2026-03-10 00:00:00+0000', '2026-03-17 11:30:00+0000',
+    {'scanner', 'recon', 'port-scan'});
+
+INSERT INTO threat_intel (indicator_type, indicator_value, threat_name, severity, source, first_seen, last_seen, tags)
+VALUES ('domain', 'evil-payload.example.net', 'Malware Distribution', 'high', 'VirusTotal',
+    '2026-03-01 00:00:00+0000', '2026-03-16 00:00:00+0000',
+    {'malware', 'dropper', 'phishing'});
+
+-- ── Incidents ──</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_create_an_incident">Create an incident</h3>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">INSERT INTO incidents (incident_id, title, severity, status, created_at, updated_at, assigned_to, related_events, notes)
+VALUES (
+    f5a10000-0000-0000-0000-000000000001,
+    'Active C2 Communication from Workstation 10.0.1.200',
+    'critical',
+    'investigating',
+    '2026-03-17 13:05:30+0000',
+    '2026-03-17 14:10:00+0000',
+    'analyst-rivera',
+    [e4000000-0000-0000-0000-000000000001,
+     e4000000-0000-0000-0000-000000000002,
+     e4000000-0000-0000-0000-000000000003,
+     e4000000-0000-0000-0000-000000000004,
+     e4000000-0000-0000-0000-000000000005,
+     e4000000-0000-0000-0000-000000000006],
+    'Workstation 10.0.1.200 is communicating with known Cobalt Strike C2 at 45.33.32.156 on a 5-minute interval. Lateral movement to app server and DB server observed. 450MB data exfiltration detected. Immediate containment required.'
+);</code></pre>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_query_your_data">Query your data</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_view_events_in_a_time_window">View events in a time window</h3>
+<div class="paragraph">
+<p>The most common SIEM query: "show me everything that happened in the last hour." Because we partition by date and cluster by time, this is a fast range scan:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- View events in a time window
+SELECT event_time, source_ip, dest_ip, event_type, severity, description
+FROM events
+WHERE event_date = '2026-03-17'
+  AND event_time &gt;= '2026-03-17 13:00:00+0000'</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This returns only the events within that hour, in reverse chronological order. You will see the C2 beacons, lateral movement, and data exfiltration&#8201;&#8212;&#8201;a clear attack timeline.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_investigate_a_suspicious_source_ip">Investigate a suspicious source IP</h3>
+<div class="paragraph">
+<p>When an alert fires on a specific IP, you need all its activity fast. The <code>events_by_source</code> table makes this a single-partition read:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Investigate the SSH brute force source IP
+SELECT event_time, event_type, severity, dest_ip, dest_port
+FROM events_by_source</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The results clearly show a pattern: four SSH login failures in rapid succession against the same target, all on port 22. Textbook brute force.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_find_high_severity_events">Find high-severity events</h3>
+<div class="paragraph">
+<p>During an active incident, analysts need to focus on the most critical events. Pull today&#8217;s events and filter for high and critical severity:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">  AND event_date = '2026-03-17';
+
+-- Find high-severity events (pull today's events, filter in application)
+SELECT event_time, source_ip, dest_ip, event_type, severity, description</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>In your application layer, filter for <code>severity IN ('high', 'critical')</code>. You will see the SSH brute force detection event, the port scan on RDP, all three C2 beacons, the lateral movement, and the data exfiltration&#8201;&#8212;&#8201;a clear escalation from reconnaissance to compromise to data theft.</p>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+<strong>Why filter in the application?</strong> The <code>severity</code> column is not part of the primary key, so filtering on it in CQL would require <code>ALLOW FILTERING</code>. For a day&#8217;s worth of events that easily fits in memory, application-side filtering is cleaner. For very high-volume environments, consider a separate <code>events_by_severity</code> table.
+</td>
+</tr>
+</table>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_check_all_activity_from_the_compromised_host">Check all activity from the compromised host</h3>
+<div class="paragraph">
+<p>Now the critical investigation&#8201;&#8212;&#8201;what has 10.0.1.200 been doing?</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">WHERE event_date = '2026-03-17'
+LIMIT 50;
+
+-- Check all activity from the compromised host</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The timeline tells the whole story: C2 beacons at regular intervals, lateral movement to internal servers, and a large data exfiltration. This host is compromised and actively being used by an attacker.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_look_up_threat_intelligence">Look up threat intelligence</h3>
+<div class="paragraph">
+<p>Cross-reference the C2 server&#8217;s IP against your threat intel database:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">FROM events_by_source
+WHERE source_ip = '10.0.1.200'
+  AND event_date = '2026-03-17';</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This confirms the IP is a known Cobalt Strike C2 server, first seen in January, reported by AlienVault OTX. The tags tell you exactly what you are dealing with.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_review_the_incident">Review the incident</h3>
+<div class="paragraph">
+<p>Pull up the full incident record to see the investigation status and all related events:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT threat_name, severity, source, first_seen, last_seen, tags
+FROM threat_intel
+WHERE indicator_type = 'ip'
+  AND indicator_value = '45.33.32.156';</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The <code>related_events</code> list gives you direct references back to the individual events in the <code>events</code> table. In your application, you would loop through these UUIDs to build a complete attack timeline.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_correlate_find_all_events_targeting_the_same_destination_as_a_known_threat">Correlate: find all events targeting the same destination as a known threat</h3>
+<div class="paragraph">
+<p>Let&#8217;s see if the SSH brute force attacker (203.0.113.42) was also targeting other hosts. First, confirm what we know about them:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Review the incident
+SELECT title, severity, status, assigned_to, related_events, notes
+FROM incidents
+WHERE incident_id = f5a10000-0000-0000-0000-000000000001;</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The result confirms this IP is part of a known SSH brute force botnet. This is valuable context&#8201;&#8212;&#8201;it tells you the attack is automated, not targeted, which changes your response posture.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_search_threat_intel_by_type">Search threat intel by type</h3>
+<div class="paragraph">
+<p>To see all known malicious IPs in your threat database:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Look up threat intel for the SSH brute force IP
+SELECT threat_name, severity, tags
+FROM threat_intel</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This returns all IP-based indicators, sorted by the indicator value. You could feed these into your firewall rules or use them to enrich incoming events in real time.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_look_up_domain_based_threats">Look up domain-based threats</h3>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">  AND indicator_value = '203.0.113.42';
+
+-- Search all IP-based threat intel
+SELECT indicator_value, threat_name, severity, tags</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Your detection engine can check every outbound DNS query against this table. If a host resolves <code>evil-payload.example.net</code>, you know immediately that it is trying to reach a known malware distribution site.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_update_the_incident_with_correlation_findings">Update the incident with correlation findings</h3>
+<div class="paragraph">
+<p>Good investigations connect the dots. Let&#8217;s update the incident to document what we found:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">WHERE indicator_type = 'ip';
+
+-- Look up domain-based threats
+SELECT indicator_value, threat_name, severity, source, tags
+FROM threat_intel
+WHERE indicator_type = 'domain';</code></pre>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_what_you_learned">What you learned</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>You built a complete security event monitoring platform. Here is what you practiced:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><strong>Date-partitioned event logs.</strong> By partitioning on <code>event_date</code>, time-range queries stay fast regardless of how much historical data you have. Each day is its own partition, which also makes data retention easy&#8201;&#8212;&#8201;drop old partitions when they expire.</p>
+</li>
+<li>
+<p><strong>Dual-write denormalization.</strong> The <code>events</code> and <code>events_by_source</code> tables store the same events optimized for different access patterns. One serves time-range queries, the other serves IP-based investigations. In Ferrosa, you model for the query, not the entity.</p>
+</li>
+<li>
+<p><strong>Compound partition keys.</strong> The <code>(source_ip, event_date)</code> partition key on <code>events_by_source</code> prevents any single IP from creating an unbounded partition. Even if one IP generates millions of events over its lifetime, each day&#8217;s data is bounded.</p>
+</li>
+<li>
+<p><strong>Threat intel as a lookup table.</strong> Partitioning by <code>indicator_type</code> and clustering by <code>indicator_value</code> gives you O(1) lookups for any IOC. Your detection engine can check every incoming event against this table with minimal latency.</p>
+</li>
+<li>
+<p><strong>Collection types for relationships.</strong> The <code>list&lt;uuid&gt;</code> on incidents and <code>set&lt;text&gt;</code> on threat intel let you store structured relationships without separate join tables. This keeps your read path simple&#8201;&#8212;&#8201;one query gets the full incident with all its related event IDs.</p>
+</li>
+<li>
+<p><strong>Incident lifecycle tracking.</strong> Using <code>UPDATE</code> to modify incident status and notes shows how Ferrosa handles mutable state alongside append-only event data. The incident evolves while the underlying events are immutable.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>From here, you could add a <code>blocked_ips</code> table for automated response, a <code>user_activity</code> table to track authentication patterns per user, or an <code>asset_inventory</code> table to enrich events with context about which hosts are critical.</p>
+</div>
+</div>
+</div>
+</div>
+<div id="footer">
+<div id="footer-text">
+Last updated 2026-03-18 22:08:59 UTC
+</div>
+</div>
+</body>
+</html>

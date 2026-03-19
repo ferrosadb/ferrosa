@@ -1,0 +1,915 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="generator" content="Asciidoctor 2.0.26">
+<title>CQL Comprehensive Compatibility</title>
+<link rel="stylesheet" href="./theme/ferrosa.css">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+</head>
+<body class="article toc2 toc-left">
+<div id="header">
+<h1>CQL Comprehensive Compatibility</h1>
+<div id="toc" class="toc2">
+<div id="toctitle">Table of Contents</div>
+<ul class="sectlevel1">
+<li><a href="#_purpose">Purpose</a></li>
+<li><a href="#_data_types">Data Types</a></li>
+<li><a href="#_collections">Collections</a></li>
+<li><a href="#_primary_keys">Primary Keys</a>
+<ul class="sectlevel2">
+<li><a href="#_simple_primary_key">Simple primary key</a></li>
+<li><a href="#_composite_partition_key">Composite partition key</a></li>
+<li><a href="#_clustering_order">Clustering order</a></li>
+</ul>
+</li>
+<li><a href="#_static_columns">Static Columns</a></li>
+<li><a href="#_write_operations">Write Operations</a>
+<ul class="sectlevel2">
+<li><a href="#_insert">INSERT</a></li>
+<li><a href="#_update">UPDATE</a></li>
+<li><a href="#_ttl_and_timestamp">TTL and TIMESTAMP</a></li>
+<li><a href="#_batch">BATCH</a></li>
+<li><a href="#_counter_updates">Counter updates</a></li>
+<li><a href="#_delete">DELETE</a></li>
+</ul>
+</li>
+<li><a href="#_lightweight_transactions">Lightweight Transactions</a>
+<ul class="sectlevel2">
+<li><a href="#_insert_if_not_exists">INSERT IF NOT EXISTS</a></li>
+<li><a href="#_update_if_condition">UPDATE &#8230;&#8203; IF condition</a></li>
+<li><a href="#_delete_if_exists">DELETE &#8230;&#8203; IF EXISTS</a></li>
+</ul>
+</li>
+<li><a href="#_read_operations">Read Operations</a>
+<ul class="sectlevel2">
+<li><a href="#_select">SELECT</a></li>
+<li><a href="#_limit_and_order_by">LIMIT and ORDER BY</a></li>
+<li><a href="#_count_and_aggregation">COUNT and aggregation</a></li>
+<li><a href="#_distinct">DISTINCT</a></li>
+<li><a href="#_token_function">Token function</a></li>
+<li><a href="#_writetime_function">WRITETIME function</a></li>
+<li><a href="#_ttl_function">TTL function</a></li>
+<li><a href="#_in_clause">IN clause</a></li>
+<li><a href="#_allow_filtering">ALLOW FILTERING</a></li>
+</ul>
+</li>
+<li><a href="#_secondary_indexes">Secondary Indexes</a></li>
+<li><a href="#_user_defined_types">User-Defined Types</a></li>
+<li><a href="#_tuples">Tuples</a></li>
+<li><a href="#_counters">Counters</a></li>
+<li><a href="#_what_this_covers">What This Covers</a></li>
+</ul>
+</div>
+</div>
+<div id="content">
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>A systematic compatibility test for every CQL feature that Ferrosa supports.
+Run <code>schema.cql</code>, <code>data.cql</code>, and <code>queries.cql</code> in order against a Ferrosa cluster to verify full CQL coverage.</p>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+Complete the <a href="cluster-setup.html">3-Node Cluster Setup</a> tutorial first, or have a running Ferrosa cluster accessible on <code>localhost:9042</code>.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_purpose">Purpose</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>This example exists to exercise every CQL statement and data type in a single, reproducible sequence.
+It is not a tutorial&#8201;&#8212;&#8201;it is a compatibility verification suite disguised as an example.</p>
+</div>
+<div class="paragraph">
+<p>The three CQL files are designed to run in order:</p>
+</div>
+<div class="olist arabic">
+<ol class="arabic">
+<li>
+<p><strong>schema.cql</strong>&#8201;&#8212;&#8201;DDL: keyspace, tables, types, indexes, alter statements</p>
+</li>
+<li>
+<p><strong>data.cql</strong>&#8201;&#8212;&#8201;DML writes: inserts, updates, batches, counters, TTL, LWT</p>
+</li>
+<li>
+<p><strong>queries.cql</strong>&#8201;&#8212;&#8201;DML reads: selects, aggregations, token scans, cleanup</p>
+</li>
+</ol>
+</div>
+<div class="paragraph">
+<p>If all three files execute without error, the cluster under test supports the full CQL surface area covered here.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_data_types">Data Types</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>CQL defines a rich set of scalar types.
+The <code>all_types</code> table creates one column for each.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE IF NOT EXISTS all_types (
+    id           int PRIMARY KEY,
+    col_text     text,
+    col_ascii    ascii,
+    col_bigint   bigint,
+    col_int      int,
+    col_smallint smallint,
+    col_tinyint  tinyint,
+    col_boolean  boolean,
+    col_float    float,
+    col_double   double,
+    col_decimal  decimal,
+    col_blob     blob,
+    col_uuid     uuid,
+    col_timeuuid timeuuid,
+    col_timestamp timestamp,
+    col_date     date,
+    col_time     time,
+    col_inet     inet,
+    col_varint   varint
+);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The following types are tested:</p>
+</div>
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 33.3333%;">
+<col style="width: 66.6667%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Type</th>
+<th class="tableblock halign-left valign-top">Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>int</code>, <code>bigint</code>, <code>smallint</code>, <code>tinyint</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Signed integers at 32, 64, 16, and 8 bits</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>float</code>, <code>double</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">IEEE 754 single and double precision</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>decimal</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Arbitrary-precision decimal</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>varint</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Arbitrary-precision integer</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>boolean</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>true</code> / <code>false</code></p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>text</code>, <code>ascii</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">UTF-8 and ASCII-only strings</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>blob</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Arbitrary bytes (hex literal <code>0xdeadbeef</code>)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>uuid</code>, <code>timeuuid</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Version 4 random UUID and version 1 time-based UUID</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>timestamp</code>, <code>date</code>, <code>time</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Millisecond timestamp, calendar date, nanosecond time-of-day</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>inet</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">IPv4 or IPv6 address</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>The data file inserts positive boundary values, negative boundary values, zeros, nulls, and empty strings to exercise edge cases.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">INSERT INTO all_types (id, col_text, col_ascii, col_bigint, col_int, col_smallint, col_tinyint,
+    col_boolean, col_float, col_double, col_decimal, col_blob, col_uuid, col_timestamp,
+    col_date, col_time, col_inet)
+VALUES (1, 'hello', 'ascii_val', 9223372036854775807, 42, 32767, 127,
+    true, 3.14, 2.718281828459045, 99.99, 0xdeadbeef,
+    550e8400-e29b-41d4-a716-446655440000, '2024-06-15T10:30:00Z',
+    '2024-06-15', '10:30:00', '192.168.1.1');</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_collections">Collections</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>CQL supports three collection types, each of which can be nested inside a <code>frozen&lt;&gt;</code> wrapper.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE IF NOT EXISTS collection_types (
+    id         int PRIMARY KEY,
+    tags       list&lt;text&gt;,
+    scores     set&lt;int&gt;,
+    props      map&lt;text, text&gt;,
+    nested_list list&lt;frozen&lt;list&lt;int&gt;&gt;&gt;,
+    nested_map  map&lt;text, frozen&lt;map&lt;text, int&gt;&gt;&gt;
+);</code></pre>
+</div>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>list&lt;text&gt;</code>&#8201;&#8212;&#8201;ordered, allows duplicates</p>
+</li>
+<li>
+<p><code>set&lt;int&gt;</code>&#8201;&#8212;&#8201;unordered, unique elements</p>
+</li>
+<li>
+<p><code>map&lt;text, text&gt;</code>&#8201;&#8212;&#8201;key-value pairs</p>
+</li>
+<li>
+<p><code>list&lt;frozen&lt;list&lt;int&gt;&gt;&gt;</code>&#8201;&#8212;&#8201;nested frozen list</p>
+</li>
+<li>
+<p><code>map&lt;text, frozen&lt;map&lt;text, int&gt;&gt;&gt;</code>&#8201;&#8212;&#8201;nested frozen map</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Collection mutation operations are tested in the data file: append, remove, element access for each type.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- List append and remove
+UPDATE collection_types SET tags = tags + ['delta'] WHERE id = 1;
+UPDATE collection_types SET tags = tags - ['alpha'] WHERE id = 1;
+
+-- Set add and remove
+UPDATE collection_types SET scores = scores + {40, 50} WHERE id = 1;
+UPDATE collection_types SET scores = scores - {10} WHERE id = 1;
+
+-- Map put and remove</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_primary_keys">Primary Keys</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_simple_primary_key">Simple primary key</h3>
+<div class="paragraph">
+<p>The <code>all_types</code> table uses a single-column primary key (<code>id int PRIMARY KEY</code>).</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_composite_partition_key">Composite partition key</h3>
+<div class="paragraph">
+<p>The <code>composite_pk</code> table uses a multi-column partition key with clustering columns and explicit ordering.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE IF NOT EXISTS composite_pk (
+    tenant     text,
+    region     text,
+    event_id   uuid,
+    event_time timestamp,
+    data       text,
+    PRIMARY KEY ((tenant, region), event_time, event_id)
+) WITH CLUSTERING ORDER BY (event_time DESC, event_id ASC);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The partition key <code>(tenant, region)</code> means all events for one tenant in one region are co-located.
+The clustering columns <code>event_time DESC, event_id ASC</code> sort rows within each partition.</p>
+</div>
+<div class="paragraph">
+<p>Queries exercise full partition reads, ordering, and <code>LIMIT</code>:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM composite_pk WHERE tenant = 'acme' AND region = 'us-east';
+
+-- ORDER BY with clustering column
+SELECT * FROM composite_pk WHERE tenant = 'acme' AND region = 'us-east' ORDER BY event_time DESC;
+
+-- LIMIT
+SELECT * FROM composite_pk WHERE tenant = 'acme' AND region = 'us-east' LIMIT 1;</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_clustering_order">Clustering order</h3>
+<div class="paragraph">
+<p><code>CLUSTERING ORDER BY</code> controls the physical sort order of rows on disk.
+<code>DESC</code> on <code>event_time</code> means the most recent events are read first, which avoids reversing results at query time.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_static_columns">Static Columns</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>A <code>STATIC</code> column is shared across all rows in a partition.
+It is set once and applies to every clustering row.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE IF NOT EXISTS static_cols (
+    group_id   int,
+    item_id    int,
+    group_name text STATIC,
+    item_name  text,
+    PRIMARY KEY (group_id, item_id)
+);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>When <code>group_name</code> is set for <code>group_id = 1</code>, all items in that group see the same name.
+The <code>DISTINCT</code> keyword retrieves only the partition key and static columns, without scanning clustering rows.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM static_cols WHERE group_id = 1;
+
+-- DISTINCT on partition key with static column
+SELECT DISTINCT group_id, group_name FROM static_cols;</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_write_operations">Write Operations</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_insert">INSERT</h3>
+<div class="paragraph">
+<p>Standard inserts with all scalar types, null values, empty strings, and function calls (<code>uuid()</code>).</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">INSERT INTO all_types (id, col_text, col_ascii, col_bigint, col_int, col_smallint, col_tinyint,
+    col_boolean, col_float, col_double, col_decimal, col_blob, col_uuid, col_timestamp,
+    col_date, col_time, col_inet)
+VALUES (1, 'hello', 'ascii_val', 9223372036854775807, 42, 32767, 127,
+    true, 3.14, 2.718281828459045, 99.99, 0xdeadbeef,
+    550e8400-e29b-41d4-a716-446655440000, '2024-06-15T10:30:00Z',
+    '2024-06-15', '10:30:00', '192.168.1.1');</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_update">UPDATE</h3>
+<div class="paragraph">
+<p>Column updates, arithmetic increments, and collection mutations.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- UPDATE — simple column updates
+-- ============================================================
+UPDATE all_types SET col_text = 'updated', extra_col = 'added' WHERE id = 1;
+UPDATE all_types SET col_int = col_int + 1 WHERE id = 1;
+
+-- ============================================================
+-- Collection updates — append, remove, element access
+-- ============================================================
+
+-- List append and remove
+UPDATE collection_types SET tags = tags + ['delta'] WHERE id = 1;
+UPDATE collection_types SET tags = tags - ['alpha'] WHERE id = 1;
+
+-- Set add and remove
+UPDATE collection_types SET scores = scores + {40, 50} WHERE id = 1;
+UPDATE collection_types SET scores = scores - {10} WHERE id = 1;
+
+-- Map put and remove</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_ttl_and_timestamp">TTL and TIMESTAMP</h3>
+<div class="paragraph">
+<p><code>USING TTL</code> sets a per-row expiration in seconds.
+<code>USING TIMESTAMP</code> sets an explicit write timestamp for last-write-wins conflict resolution.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- TTL — permanent and expiring rows
+-- ============================================================
+INSERT INTO ttl_test (id, val) VALUES (1, 'permanent');
+INSERT INTO ttl_test (id, val) VALUES (2, 'expires_soon') USING TTL 1;
+
+-- ============================================================
+-- USING TIMESTAMP — explicit write timestamps
+-- ============================================================</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_batch">BATCH</h3>
+<div class="paragraph">
+<p>Logged batches guarantee atomicity across multiple statements.
+Unlogged batches skip the batch log for better performance when atomicity is not required.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Logged batch
+-- ============================================================
+BEGIN BATCH
+    INSERT INTO batch_test (id, val) VALUES (1, 'batch_1');
+    INSERT INTO batch_test (id, val) VALUES (2, 'batch_2');
+    INSERT INTO batch_test (id, val) VALUES (3, 'batch_3');
+APPLY BATCH;
+
+-- ============================================================
+-- Unlogged batch
+-- ============================================================
+BEGIN UNLOGGED BATCH
+    INSERT INTO batch_test (id, val) VALUES (4, 'unlogged_1');</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_counter_updates">Counter updates</h3>
+<div class="paragraph">
+<p>Counter columns only support increment and decrement operations.
+They cannot be set to an absolute value or mixed with non-counter columns in the same table.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Counter updates — increment operations
+-- ============================================================
+UPDATE counters SET page_views = page_views + 100, unique_visitors = unique_visitors + 42 WHERE id = 'homepage';</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_delete">DELETE</h3>
+<div class="paragraph">
+<p>Row deletes target a specific clustering row.
+Partition deletes remove all rows in a partition.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">DELETE FROM delete_test WHERE pk = 1 AND ck = 2;
+SELECT * FROM delete_test WHERE pk = 1;
+
+-- Partition delete — remove all rows in a partition
+DELETE FROM delete_test WHERE pk = 2;
+SELECT * FROM delete_test WHERE pk = 2;</code></pre>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_lightweight_transactions">Lightweight Transactions</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>LWT provides linearizable consistency for conditional mutations.</p>
+</div>
+<div class="sect2">
+<h3 id="_insert_if_not_exists">INSERT IF NOT EXISTS</h3>
+<div class="paragraph">
+<p>The first insert succeeds and returns <code>[applied] = true</code>.
+The second insert for the same primary key is a no-op and returns <code>[applied] = false</code>.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- LWT: INSERT IF NOT EXISTS — first succeeds, second is a no-op
+-- ============================================================</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_update_if_condition">UPDATE &#8230;&#8203; IF condition</h3>
+<div class="paragraph">
+<p>A conditional update that only applies if the current value matches the condition.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">UPDATE lwt_test SET data = 'modified' WHERE id = 1 IF version = 1;
+SELECT * FROM lwt_test WHERE id = 1;</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_delete_if_exists">DELETE &#8230;&#8203; IF EXISTS</h3>
+<div class="paragraph">
+<p>A conditional delete that only applies if the row exists.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">DELETE FROM lwt_test WHERE id = 1 IF EXISTS;
+SELECT * FROM lwt_test WHERE id = 1;</code></pre>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_read_operations">Read Operations</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_select">SELECT</h3>
+<div class="paragraph">
+<p>Basic reads with <code>*</code>, column subsets, and <code>WHERE</code> clauses on partition keys.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM all_types WHERE id = 1;
+SELECT col_text, col_int, col_bigint FROM all_types WHERE id = 1;</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_limit_and_order_by">LIMIT and ORDER BY</h3>
+<div class="paragraph">
+<p><code>LIMIT</code> restricts the number of rows returned.
+<code>ORDER BY</code> on clustering columns controls the sort order (must match or reverse the <code>CLUSTERING ORDER BY</code>).</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM composite_pk WHERE tenant = 'acme' AND region = 'us-east' ORDER BY event_time DESC;
+
+-- LIMIT
+SELECT * FROM composite_pk WHERE tenant = 'acme' AND region = 'us-east' LIMIT 1;</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_count_and_aggregation">COUNT and aggregation</h3>
+<div class="paragraph">
+<p><code>COUNT(*)</code> returns the number of rows matching the query.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT COUNT(*) FROM all_types;
+SELECT COUNT(*) FROM batch_test;</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_distinct">DISTINCT</h3>
+<div class="paragraph">
+<p>Returns only unique partition key values, optionally with static columns.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT DISTINCT group_id, group_name FROM static_cols;</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_token_function">Token function</h3>
+<div class="paragraph">
+<p><code>token()</code> exposes the partition token, enabling range scans across the token ring.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM all_types WHERE token(id) &gt; token(3);</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_writetime_function">WRITETIME function</h3>
+<div class="paragraph">
+<p><code>WRITETIME()</code> returns the microsecond timestamp of the last write to a column.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT col_text, WRITETIME(col_text) FROM all_types WHERE id = 1;</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_ttl_function">TTL function</h3>
+<div class="paragraph">
+<p><code>TTL()</code> returns the remaining time-to-live in seconds for a column, or null if no TTL is set.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT val, TTL(val) FROM ttl_test WHERE id = 1;</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_in_clause">IN clause</h3>
+<div class="paragraph">
+<p><code>IN</code> on the partition key retrieves rows from multiple partitions in a single query.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM all_types WHERE id IN (1, 2, 3);</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_allow_filtering">ALLOW FILTERING</h3>
+<div class="paragraph">
+<p><code>ALLOW FILTERING</code> permits queries that would otherwise require a full table scan.
+It signals that the query is intentionally unindexed.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM all_types WHERE col_boolean = true ALLOW FILTERING;</code></pre>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_secondary_indexes">Secondary Indexes</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Secondary indexes allow queries on non-primary-key columns without <code>ALLOW FILTERING</code>.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE INDEX IF NOT EXISTS ON all_types (col_text);
+CREATE INDEX IF NOT EXISTS ON all_types (col_int);
+CREATE INDEX IF NOT EXISTS ON composite_pk (data);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Queries using secondary indexes:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT * FROM all_types WHERE col_text = 'updated';
+SELECT * FROM all_types WHERE col_int = 43;</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_user_defined_types">User-Defined Types</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>UDTs let you define named structs that can be used as column types.
+They must be wrapped in <code>frozen&lt;&gt;</code> when used in a table.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TYPE IF NOT EXISTS address (
+    street  text,
+    city    text,
+    state   text,
+    zip     text,
+    country text
+);
+
+CREATE TYPE IF NOT EXISTS phone_number (
+    country_code int,
+    number       text,
+    phone_type   text
+);</code></pre>
+</div>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE IF NOT EXISTS udt_test (
+    id           int PRIMARY KEY,
+    home_address frozen&lt;address&gt;,
+    phones       list&lt;frozen&lt;phone_number&gt;&gt;,
+    work_address frozen&lt;address&gt;
+);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Inserting UDT values uses brace-literal syntax:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- UDT insert — nested user-defined type values
+-- ============================================================
+INSERT INTO udt_test (id, home_address, phones, work_address)
+VALUES (1,
+    {street: '123 Main St', city: 'Springfield', state: 'IL', zip: '62704', country: 'US'},
+    [{country_code: 1, number: '555-0100', phone_type: 'mobile'},
+     {country_code: 1, number: '555-0200', phone_type: 'work'}],</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_tuples">Tuples</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Tuples are anonymous fixed-length structures.
+They must be <code>frozen&lt;&gt;</code> and are written with parenthesized syntax.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE IF NOT EXISTS tuple_test (
+    id      int PRIMARY KEY,
+    coords  frozen&lt;tuple&lt;double, double&gt;&gt;,
+    labeled frozen&lt;tuple&lt;text, int, boolean&gt;&gt;
+);</code></pre>
+</div>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Tuple insert
+-- ============================================================
+INSERT INTO tuple_test (id, coords, labeled)
+VALUES (1, (37.7749, -122.4194), ('active', 42, true));</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_counters">Counters</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Counter tables have a special structure: the primary key columns plus one or more <code>counter</code> columns.
+Non-counter columns (other than the primary key) are not allowed.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE IF NOT EXISTS counters (
+    id              text PRIMARY KEY,
+    page_views      counter,
+    unique_visitors counter
+);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Counters are updated with increment/decrement syntax, not absolute assignment:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Counter updates — increment operations
+-- ============================================================
+UPDATE counters SET page_views = page_views + 100, unique_visitors = unique_visitors + 42 WHERE id = 'homepage';</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_what_this_covers">What This Covers</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>This example exercises the following CQL features:</p>
+</div>
+<div class="paragraph">
+<p><strong>DDL:</strong></p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>CREATE KEYSPACE</code> with <code>SimpleStrategy</code></p>
+</li>
+<li>
+<p><code>CREATE TABLE</code> with simple and composite primary keys</p>
+</li>
+<li>
+<p><code>CLUSTERING ORDER BY</code> (ascending and descending)</p>
+</li>
+<li>
+<p><code>STATIC</code> columns</p>
+</li>
+<li>
+<p><code>CREATE TYPE</code> (user-defined types)</p>
+</li>
+<li>
+<p><code>CREATE INDEX</code> (secondary indexes)</p>
+</li>
+<li>
+<p><code>ALTER TABLE ADD</code></p>
+</li>
+<li>
+<p><code>DROP INDEX</code>, <code>DROP TABLE</code>, <code>DROP TYPE</code>, <code>DROP KEYSPACE</code></p>
+</li>
+<li>
+<p><code>IF NOT EXISTS</code> / <code>IF EXISTS</code> guards on DDL</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p><strong>Data types:</strong></p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>All 18 CQL scalar types</p>
+</li>
+<li>
+<p><code>list</code>, <code>set</code>, <code>map</code> collections</p>
+</li>
+<li>
+<p>Nested <code>frozen&lt;&gt;</code> collections</p>
+</li>
+<li>
+<p><code>frozen&lt;&gt;</code> UDTs and tuples</p>
+</li>
+<li>
+<p><code>counter</code> type</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p><strong>DML writes:</strong></p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>INSERT</code> with literal values, <code>null</code>, empty string, function calls (<code>uuid()</code>)</p>
+</li>
+<li>
+<p><code>INSERT &#8230;&#8203; USING TTL</code> and <code>USING TIMESTAMP</code></p>
+</li>
+<li>
+<p><code>INSERT &#8230;&#8203; IF NOT EXISTS</code> (LWT)</p>
+</li>
+<li>
+<p><code>UPDATE</code> with column assignment, arithmetic, collection mutation</p>
+</li>
+<li>
+<p><code>UPDATE &#8230;&#8203; IF condition</code> (LWT)</p>
+</li>
+<li>
+<p><code>DELETE</code> (row, partition)</p>
+</li>
+<li>
+<p><code>DELETE &#8230;&#8203; IF EXISTS</code> (LWT)</p>
+</li>
+<li>
+<p><code>BEGIN BATCH</code> / <code>APPLY BATCH</code> (logged and unlogged)</p>
+</li>
+<li>
+<p>Counter <code>UPDATE</code> with increment</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p><strong>DML reads:</strong></p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>SELECT *</code> and column subsets</p>
+</li>
+<li>
+<p><code>WHERE</code> on partition key, composite partition key, clustering columns</p>
+</li>
+<li>
+<p><code>ORDER BY</code> on clustering columns</p>
+</li>
+<li>
+<p><code>LIMIT</code></p>
+</li>
+<li>
+<p><code>DISTINCT</code></p>
+</li>
+<li>
+<p><code>COUNT(*)</code></p>
+</li>
+<li>
+<p><code>IN</code> clause on partition key</p>
+</li>
+<li>
+<p><code>ALLOW FILTERING</code></p>
+</li>
+<li>
+<p><code>token()</code> function</p>
+</li>
+<li>
+<p><code>WRITETIME()</code> and <code>TTL()</code> functions</p>
+</li>
+<li>
+<p>Secondary index lookups</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+</div>
+<div id="footer">
+<div id="footer-text">
+Last updated 2026-03-18 22:08:59 UTC
+</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="generator" content="Asciidoctor 2.0.26">
+<title>Real-Time Analytics</title>
+<link rel="stylesheet" href="./theme/ferrosa.css">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+</head>
+<body class="article toc2 toc-left">
+<div id="header">
+<h1>Real-Time Analytics</h1>
+<div id="toc" class="toc2">
+<div id="toctitle">Table of Contents</div>
+<ul class="sectlevel1">
+<li><a href="#_the_use_case">The Use Case</a>
+<ul class="sectlevel2">
+<li><a href="#_a_financial_market_data_platform">A financial market data platform</a></li>
+</ul>
+</li>
+<li><a href="#_design_the_schema">Design the Schema</a>
+<ul class="sectlevel2">
+<li><a href="#_create_the_keyspace">Create the keyspace</a></li>
+<li><a href="#_the_raw_ticks_table">The raw ticks table</a></li>
+<li><a href="#_the_ohlc_candles_table">The OHLC candles table</a></li>
+<li><a href="#_the_daily_summary_table">The daily summary table</a></li>
+</ul>
+</li>
+<li><a href="#_insert_sample_data">Insert Sample Data</a>
+<ul class="sectlevel2">
+<li><a href="#_insert_raw_ticks">Insert raw ticks</a></li>
+<li><a href="#_insert_ohlc_candles">Insert OHLC candles</a></li>
+<li><a href="#_insert_daily_summaries">Insert daily summaries</a></li>
+</ul>
+</li>
+<li><a href="#_query_patterns">Query Patterns</a>
+<ul class="sectlevel2">
+<li><a href="#_get_the_latest_trades_for_a_stock">Get the latest trades for a stock</a></li>
+<li><a href="#_price_history_for_a_time_window">Price history for a time window</a></li>
+<li><a href="#_ohlc_candles_for_charting">OHLC candles for charting</a></li>
+<li><a href="#_compare_candles_across_stocks">Compare candles across stocks</a></li>
+<li><a href="#_volume_analysis">Volume analysis</a></li>
+<li><a href="#_multi_day_price_history">Multi-day price history</a></li>
+</ul>
+</li>
+<li><a href="#_what_you_learned">What You Learned</a></li>
+</ul>
+</div>
+</div>
+<div id="content">
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>Build a financial market data analytics platform.
+Ingest stock price ticks, compute aggregates, and power live dashboards&#8201;&#8212;&#8201;all on your Ferrosa cluster.</p>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+Complete the <a href="cluster-setup.html">3-Node Cluster Setup</a> tutorial first, or have a running Ferrosa cluster accessible on <code>localhost:9042</code>.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_the_use_case">The Use Case</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_a_financial_market_data_platform">A financial market data platform</h3>
+<div class="paragraph">
+<p>You are building the backend for a financial data platform&#8201;&#8212;&#8201;think a simplified Bloomberg terminal or a stock tracking application.
+The system needs to handle three things:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><strong>Ingest raw price ticks.</strong> Every time a stock trades on an exchange, you receive a tick containing the symbol, price, volume, and timestamp. During market hours, popular stocks like AAPL can generate hundreds of ticks per second. Across thousands of listed securities, you are looking at tens of thousands of writes per second.</p>
+</li>
+<li>
+<p><strong>Serve historical data.</strong> Traders and analysts need to view price history for any stock over any time window&#8201;&#8212;&#8201;the last 5 minutes, the last hour, or the entire trading day.</p>
+</li>
+<li>
+<p><strong>Power live dashboards.</strong> Charting tools display OHLC candles (Open, High, Low, Close) at various intervals&#8201;&#8212;&#8201;1-minute, 5-minute, hourly. These aggregations need to be fast because charts refresh in real time.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>This workload is overwhelmingly write-heavy during market hours.
+A relational database with traditional indexes would fall behind on ingestion.
+And computing OHLC aggregates on the fly from raw ticks&#8201;&#8212;&#8201;potentially millions of rows&#8201;&#8212;&#8201;would make dashboard queries unacceptably slow.</p>
+</div>
+<div class="paragraph">
+<p>The solution is a two-table approach: store the raw ticks for history, and maintain pre-computed candle aggregations for dashboards.
+Ferrosa handles both write patterns effortlessly because every write is a fast append to the commit log.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_design_the_schema">Design the Schema</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_create_the_keyspace">Create the keyspace</h3>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE KEYSPACE IF NOT EXISTS market_data WITH replication = {
+    'class': 'SimpleStrategy', 'replication_factor': 3
+};</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>We use <code>SimpleStrategy</code> with replication factor 3, just like the IoT tutorial.
+Every piece of market data is stored on all three nodes in your cluster.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_the_raw_ticks_table">The raw ticks table</h3>
+<div class="paragraph">
+<p>This table stores every individual trade as it happens.
+It is the source of truth for price history.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">    symbol     text,
+    trade_date date,
+    trade_time timestamp,
+    price      decimal,
+    volume     bigint,
+    exchange   text,
+    PRIMARY KEY ((symbol, trade_date), trade_time)
+) WITH CLUSTERING ORDER BY (trade_time DESC);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>There is something new here compared to the IoT tutorial: a <strong>composite partition key</strong>.
+Notice the double parentheses around <code>(symbol, trade_date)</code>.
+That means <em>both</em> the symbol and the date together form the partition key.</p>
+</div>
+<div class="paragraph">
+<p>Why not just use <code>symbol</code> as the partition key?
+Because a single stock can generate millions of ticks per year.
+If all of AAPL&#8217;s ticks went into one partition, that partition would grow without bound.
+By including <code>trade_date</code> in the partition key, each partition holds exactly one stock&#8217;s ticks for one day.
+A busy stock might generate 50,000 ticks in a day&#8201;&#8212;&#8201;a very manageable partition size.</p>
+</div>
+<div class="paragraph">
+<p>The tradeoff is that every query must specify both <code>symbol</code> and <code>trade_date</code>.
+For a financial application, this is natural&#8201;&#8212;&#8201;you almost always look at one stock on one day.</p>
+</div>
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 20%;">
+<col style="width: 20%;">
+<col style="width: 60%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Column</th>
+<th class="tableblock halign-left valign-top">Type</th>
+<th class="tableblock halign-left valign-top">Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>symbol</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>text</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Stock ticker (e.g., "AAPL", "GOOGL")</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>trade_date</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>date</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Trading day&#8201;&#8212;&#8201;part of partition key for bucketing</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>trade_time</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>timestamp</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Exact time of the trade, down to the millisecond</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>price</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>decimal</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Trade price (decimal avoids floating-point errors)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>volume</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>bigint</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Number of shares in this trade</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>exchange</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>text</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Which exchange executed the trade (NYSE, NASDAQ)</p></td>
+</tr>
+</tbody>
+</table>
+<div class="admonitionblock tip">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Tip</div>
+</td>
+<td class="content">
+<strong>Why <code>decimal</code> for prices?</strong> Financial applications should never use <code>float</code> or <code>double</code> for money. Floating-point arithmetic can produce rounding errors&#8201;&#8212;&#8201;for example, <code>0.1 + 0.2</code> equals <code>0.30000000000000004</code> in most languages. The <code>decimal</code> type stores exact values, just like your calculator would.
+</td>
+</tr>
+</table>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_the_ohlc_candles_table">The OHLC candles table</h3>
+<div class="paragraph">
+<p>OHLC stands for Open, High, Low, Close&#8201;&#8212;&#8201;the four prices that define a candle on a stock chart.
+Each candle summarizes all the trades in a time interval (typically 1 minute, 5 minutes, or 1 hour).</p>
+</div>
+<div class="paragraph">
+<p>Computing these from raw ticks on every dashboard refresh would be far too slow.
+Instead, your application computes them as ticks arrive and writes the results to a pre-aggregated table:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">    symbol      text,
+    candle_date date,
+    candle_time timestamp,
+    open_price  decimal,
+    high_price  decimal,
+    low_price   decimal,
+    close_price decimal,
+    volume      bigint,
+    trade_count int,
+    PRIMARY KEY ((symbol, candle_date), candle_time)
+) WITH CLUSTERING ORDER BY (candle_time DESC);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This table uses the same composite partition key pattern as the ticks table: <code>(symbol, candle_date)</code>.
+A full trading day has 390 one-minute candles (6.5 hours of market time), so each partition is tiny&#8201;&#8212;&#8201;just 390 rows.
+Dashboard queries return instantly.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_the_daily_summary_table">The daily summary table</h3>
+<div class="paragraph">
+<p>Let&#8217;s also create a daily summary table for end-of-day reports:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">CREATE TABLE IF NOT EXISTS daily_summary (
+    symbol       text,
+    trade_date   date,
+    open_price   decimal,
+    high_price   decimal,
+    low_price    decimal,
+    close_price  decimal,
+    total_volume bigint,
+    trade_count  int,
+    vwap         decimal,
+    PRIMARY KEY (symbol, trade_date)
+) WITH CLUSTERING ORDER BY (trade_date DESC);</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The <code>vwap</code> column stands for Volume Weighted Average Price&#8201;&#8212;&#8201;a common metric traders use to assess whether they got a good fill price.
+With <code>symbol</code> as the partition key and <code>trade_date</code> as the clustering key, you can query any stock&#8217;s daily history across multiple days in a single read.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_insert_sample_data">Insert Sample Data</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_insert_raw_ticks">Insert raw ticks</h3>
+<div class="paragraph">
+<p>Let&#8217;s simulate a morning of trading.
+We will insert ticks for three stocks: AAPL, GOOGL, and MSFT.
+In production, these would arrive from a market data feed at thousands per second.
+Here we will insert them manually to see the data shape.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">USE market_data;
+
+-- AAPL ticks
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:30:00.000', 195.25, 15000, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:30:15.230', 195.30, 8500, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:30:32.100', 195.18, 12000, 'NYSE');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:30:45.500', 195.42, 20000, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:31:02.800', 195.50, 9200, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:31:18.450', 195.38, 11000, 'NYSE');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:31:33.920', 195.55, 7800, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:31:50.100', 195.60, 14500, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:32:05.330', 195.48, 6300, 'NYSE');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:32:22.750', 195.65, 18000, 'NASDAQ');
+
+-- GOOGL ticks
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('GOOGL', '2024-06-15', '2024-06-15 09:30:00.000', 178.90, 22000, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('GOOGL', '2024-06-15', '2024-06-15 09:30:20.400', 178.85, 13500, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('GOOGL', '2024-06-15', '2024-06-15 09:30:41.800', 179.10, 9800, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('GOOGL', '2024-06-15', '2024-06-15 09:31:05.200', 179.25, 17000, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('GOOGL', '2024-06-15', '2024-06-15 09:31:28.600', 179.05, 11200, 'NYSE');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('GOOGL', '2024-06-15', '2024-06-15 09:31:50.900', 179.30, 8400, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('GOOGL', '2024-06-15', '2024-06-15 09:32:10.350', 179.45, 15600, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('GOOGL', '2024-06-15', '2024-06-15 09:32:35.100', 179.50, 19000, 'NASDAQ');
+
+-- MSFT ticks
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:30:00.000', 442.10, 25000, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:30:18.700', 442.25, 12000, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:30:35.400', 442.00, 16500, 'NYSE');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:30:52.100', 442.50, 19800, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:31:10.600', 442.75, 8900, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:31:30.200', 442.60, 14200, 'NYSE');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:31:48.800', 442.80, 21000, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:32:05.500', 443.00, 17500, 'NASDAQ');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:32:22.300', 442.90, 10600, 'NYSE');
+
+INSERT INTO ticks (symbol, trade_date, trade_time, price, volume, exchange)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:32:40.900', 443.15, 23000, 'NASDAQ');
+
+-- AAPL 1-minute candles
+INSERT INTO candles_1m (symbol, candle_date, candle_time, open_price, high_price, low_price, close_price, volume, trade_count)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:30:00', 195.25, 195.42, 195.18, 195.42, 55500, 4);
+
+INSERT INTO candles_1m (symbol, candle_date, candle_time, open_price, high_price, low_price, close_price, volume, trade_count)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:31:00', 195.50, 195.60, 195.38, 195.60, 33500, 3);
+
+INSERT INTO candles_1m (symbol, candle_date, candle_time, open_price, high_price, low_price, close_price, volume, trade_count)
+VALUES ('AAPL', '2024-06-15', '2024-06-15 09:32:00', 195.48, 195.65, 195.48, 195.65, 24300, 2);
+
+-- GOOGL 1-minute candles
+INSERT INTO candles_1m (symbol, candle_date, candle_time, open_price, high_price, low_price, close_price, volume, trade_count)
+VALUES ('GOOGL', '2024-06-15', '2024-06-15 09:30:00', 178.90, 179.10, 178.85, 179.10, 45300, 3);
+
+INSERT INTO candles_1m (symbol, candle_date, candle_time, open_price, high_price, low_price, close_price, volume, trade_count)
+VALUES ('GOOGL', '2024-06-15', '2024-06-15 09:31:00', 179.25, 179.30, 179.05, 179.30, 36600, 3);
+
+INSERT INTO candles_1m (symbol, candle_date, candle_time, open_price, high_price, low_price, close_price, volume, trade_count)
+VALUES ('GOOGL', '2024-06-15', '2024-06-15 09:32:00', 179.45, 179.50, 179.45, 179.50, 34600, 2);
+
+-- MSFT 1-minute candles
+INSERT INTO candles_1m (symbol, candle_date, candle_time, open_price, high_price, low_price, close_price, volume, trade_count)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:30:00', 442.10, 442.50, 442.00, 442.50, 73300, 4);
+
+INSERT INTO candles_1m (symbol, candle_date, candle_time, open_price, high_price, low_price, close_price, volume, trade_count)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:31:00', 442.75, 442.80, 442.60, 442.80, 44100, 3);
+
+INSERT INTO candles_1m (symbol, candle_date, candle_time, open_price, high_price, low_price, close_price, volume, trade_count)
+VALUES ('MSFT', '2024-06-15', '2024-06-15 09:32:00', 443.00, 443.15, 442.90, 443.15, 51100, 3);
+
+-- Daily summaries
+INSERT INTO daily_summary (symbol, trade_date, open_price, high_price, low_price, close_price, total_volume, trade_count, vwap)
+VALUES ('AAPL', '2024-06-14', 194.50, 196.20, 194.10, 195.80, 45200000, 128500, 195.42);
+
+INSERT INTO daily_summary (symbol, trade_date, open_price, high_price, low_price, close_price, total_volume, trade_count, vwap)
+VALUES ('AAPL', '2024-06-13', 193.80, 195.00, 193.20, 194.50, 38700000, 112000, 194.15);
+
+INSERT INTO daily_summary (symbol, trade_date, open_price, high_price, low_price, close_price, total_volume, trade_count, vwap)
+VALUES ('GOOGL', '2024-06-14', 177.50, 179.30, 177.10, 178.90, 28400000, 95200, 178.35);
+
+INSERT INTO daily_summary (symbol, trade_date, open_price, high_price, low_price, close_price, total_volume, trade_count, vwap)
+VALUES ('MSFT', '2024-06-14', 440.00, 443.50, 439.80, 442.10, 32100000, 108000, 441.85);</code></pre>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_insert_ohlc_candles">Insert OHLC candles</h3>
+<div class="paragraph">
+<p>In production, your application would compute these candles from the raw ticks in real time.
+Here, we will insert them directly.
+Each candle summarizes one minute of trading.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_insert_daily_summaries">Insert daily summaries</h3>
+<div class="paragraph">
+<p>The daily summaries provide end-of-day aggregate data for multi-day analysis.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_query_patterns">Query Patterns</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_get_the_latest_trades_for_a_stock">Get the latest trades for a stock</h3>
+<div class="paragraph">
+<p>A trader wants to see what just happened with AAPL.
+This query returns the 10 most recent ticks for today:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT trade_time, price, volume, exchange
+FROM ticks
+WHERE symbol = 'AAPL'
+  AND trade_date = '2024-06-15'
+LIMIT 10;</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Because the partition key is <code>(symbol, trade_date)</code>, Ferrosa knows exactly which partition to read.
+And because we used <code>CLUSTERING ORDER BY (trade_time DESC)</code>, the newest ticks come first without any sorting overhead.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_price_history_for_a_time_window">Price history for a time window</h3>
+<div class="paragraph">
+<p>An analyst wants to see all AAPL trades during the first two minutes of trading:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT trade_time, price, volume, exchange
+FROM ticks
+WHERE symbol = 'AAPL'
+  AND trade_date = '2024-06-15'
+  AND trade_time &gt;= '2024-06-15 09:30:00'
+  AND trade_time &lt;= '2024-06-15 09:32:00';</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The clustering key (<code>trade_time</code>) supports range queries natively.
+Ferrosa seeks directly to the start of the range and reads forward.
+No index scan, no sort&#8201;&#8212;&#8201;just a sequential read of the data that is already stored in order.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_ohlc_candles_for_charting">OHLC candles for charting</h3>
+<div class="paragraph">
+<p>A charting library on the frontend needs 1-minute candle data to draw a candlestick chart.
+This is the query that powers the chart:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT candle_time, open_price, high_price, low_price, close_price, volume
+FROM candles_1m
+WHERE symbol = 'AAPL'
+  AND candle_date = '2024-06-15';</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This returns all candles for AAPL on June 15th, newest first.
+A full trading day has 390 candles&#8201;&#8212;&#8201;small enough to send to the frontend in a single response.
+The chart renders instantly because the data is already aggregated.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_compare_candles_across_stocks">Compare candles across stocks</h3>
+<div class="paragraph">
+<p>Want to compare the first three minutes of AAPL and MSFT?
+Run the same candle query for each symbol.
+In your application, you would execute these in parallel:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- AAPL candles
+SELECT candle_time, open_price, close_price, volume
+FROM candles_1m
+WHERE symbol = 'AAPL'
+  AND candle_date = '2024-06-15';
+
+-- MSFT candles
+SELECT candle_time, open_price, close_price, volume
+FROM candles_1m
+WHERE symbol = 'MSFT'
+  AND candle_date = '2024-06-15';</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Each query hits a different partition, so they can run concurrently on different nodes.
+This is one of the strengths of the Cassandra data model&#8201;&#8212;&#8201;queries that touch different partitions scale horizontally by nature.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_volume_analysis">Volume analysis</h3>
+<div class="paragraph">
+<p>Which minutes had the most trading volume for MSFT?
+Query the candle data and sort by volume in your application, or simply look at the <code>volume</code> column:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT candle_time, volume, trade_count
+FROM candles_1m
+WHERE symbol = 'MSFT'
+  AND candle_date = '2024-06-15';</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The first minute of trading (09:30) typically has the highest volume as overnight orders fill&#8201;&#8212;&#8201;and our sample data reflects that pattern with 73,300 shares traded.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_multi_day_price_history">Multi-day price history</h3>
+<div class="paragraph">
+<p>For longer-term analysis, query the daily summary table.
+Because <code>symbol</code> is the partition key and <code>trade_date</code> is the clustering key, you can pull a stock&#8217;s entire history in one query:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">SELECT trade_date, open_price, close_price, total_volume, vwap
+FROM daily_summary
+WHERE symbol = 'AAPL';</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>This returns every daily summary for AAPL, newest first.
+Add a <code>LIMIT</code> clause if you only need the last few days.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_what_you_learned">What You Learned</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>You have built a complete market data analytics backend.
+Here is what you practiced:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><strong>Composite partition keys for bounded partitions.</strong> Using <code>(symbol, trade_date)</code> as the partition key keeps each partition to one stock&#8217;s ticks for one day. Partitions stay small and predictable, even as the total dataset grows to billions of rows.</p>
+</li>
+<li>
+<p><strong>Pre-computed aggregations for fast dashboards.</strong> Instead of computing OHLC candles from raw ticks on every query, you maintain a <code>candles_1m</code> table with pre-aggregated data. This is the "write more, read fast" philosophy of the Cassandra data model.</p>
+</li>
+<li>
+<p><strong>Multiple tables for multiple access patterns.</strong> Raw ticks for detailed history, 1-minute candles for charts, daily summaries for reports&#8201;&#8212;&#8201;three tables serving three different query patterns, all from the same underlying data.</p>
+</li>
+<li>
+<p><strong>Using <code>decimal</code> for financial data.</strong> Floating-point types introduce rounding errors that are unacceptable in finance. The <code>decimal</code> type stores exact values.</p>
+</li>
+<li>
+<p><strong>Descending clustering order for "latest first" queries.</strong> By sorting newest trades first on disk, the most common query pattern&#8201;&#8212;&#8201;"show me what just happened"&#8201;&#8212;&#8201;reads the first few rows of the partition with zero sorting overhead.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Next, try the <a href="ecommerce.html">E-Commerce Platform</a> tutorial to learn about collection types, denormalized query tables, and the update/delete patterns used in shopping cart and order workflows.</p>
+</div>
+</div>
+</div>
+</div>
+<div id="footer">
+<div id="footer-text">
+Last updated 2026-03-18 22:08:59 UTC
+</div>
+</div>
+</body>
+</html>
