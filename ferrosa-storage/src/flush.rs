@@ -8,8 +8,11 @@
 //! minimum timestamp, local deletion time, and TTL across all cells, then
 //! builds a [`SerializationHeader`] compatible with the SSTable writer.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use ferrosa_index::{IndexKey, RowPosition};
 
 use ferrosa_common::schema::TableSchema;
 use ferrosa_common::{Result, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
@@ -108,20 +111,29 @@ pub trait FlushTarget {
     /// Write SSTable component bytes to the target and open a reader.
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<Self::Reader>>;
 
-    /// Base directory for sidecar files, if this target writes to disk.
+    /// Returns the generation number of the most recently flushed SSTable.
     ///
-    /// Returns `None` for in-memory targets. File-based targets return
-    /// the directory where `{gen}-{index_name}.sidecar` files are written.
-    fn base_dir(&self) -> Option<&std::path::Path> {
-        None
+    /// Used by [`TableStore`] to determine which generation number to use
+    /// when writing per-SSTable sidecar index files alongside the SSTable.
+    /// Returns 0 for in-memory targets where no generation tracking occurs.
+    fn last_generation(&self) -> u64 {
+        0
     }
 
-    /// Generation number of the most recently flushed SSTable.
+    /// Write per-index sidecar files alongside the flushed SSTable.
     ///
-    /// Returns 0 if no flush has occurred or if this is an in-memory target.
-    /// After [`flush`] returns, this reflects the generation just written.
-    fn current_generation(&self) -> u64 {
-        0
+    /// Called after [`flush`] with the same generation number. For each
+    /// `(index_name, entries)` pair, writes a `{gen}-{index_name}.sidecar`
+    /// file so that sidecar indexes survive process restarts.
+    ///
+    /// The default implementation is a no-op (in-memory targets do not
+    /// persist sidecar files).
+    fn write_sidecars(
+        &self,
+        _generation: u64,
+        _sidecars: &HashMap<String, Vec<(IndexKey, RowPosition)>>,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -212,14 +224,6 @@ impl FileFlushTarget {
 impl FlushTarget for FileFlushTarget {
     type Reader = FileReadAt;
 
-    fn base_dir(&self) -> Option<&std::path::Path> {
-        Some(&self.base_dir)
-    }
-
-    fn current_generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
-    }
-
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<FileReadAt>> {
         let gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let base = &self.base_dir;
@@ -278,6 +282,38 @@ impl FlushTarget for FileFlushTarget {
             compression_info,
             statistics,
         })
+    }
+
+    fn last_generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Write per-index sidecar files as `{gen}-{index_name}.sidecar`.
+    ///
+    /// Skips empty entry lists (no-ops for indexes with no data).
+    /// Files that fail to write are logged but do not abort the flush —
+    /// a missing sidecar degrades to a full-scan on that index, which is
+    /// recoverable. This matches the `load_existing_sstables` "skip corrupt"
+    /// policy.
+    fn write_sidecars(
+        &self,
+        generation: u64,
+        sidecars: &HashMap<String, Vec<(IndexKey, RowPosition)>>,
+    ) -> Result<()> {
+        use crate::index::sidecar::SidecarWriter;
+
+        for (index_name, entries) in sidecars {
+            if entries.is_empty() {
+                continue;
+            }
+            let path = self
+                .base_dir
+                .join(format!("{generation}-{index_name}.sidecar"));
+            if let Err(e) = SidecarWriter::write(&path, entries) {
+                eprintln!("[flush] failed to write sidecar {}: {e}", path.display());
+            }
+        }
+        Ok(())
     }
 }
 

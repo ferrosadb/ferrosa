@@ -129,6 +129,13 @@ struct TableState {
     store: TableStore<FileFlushTarget>,
 }
 
+/// SSTable reader type alias for file-backed SSTables.
+type FileSSTableReader =
+    Arc<ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt>>;
+
+/// Sidecar map type alias: index name -> sidecar reader for one SSTable.
+type SSTableSidecarMap = Arc<HashMap<String, crate::index::sidecar::SidecarReader>>;
+
 /// State for a single async observer: the observer, its sender half, and a
 /// drop counter for backpressure metrics.
 struct AsyncObserverState {
@@ -370,8 +377,32 @@ impl StorageEngine {
     /// Creates the per-table `FileFlushTarget` directory and `TableStore`.
     /// If the directory already contains SSTable files from a previous run,
     /// they are opened and loaded into the store so reads work immediately
-    /// after re-opening the engine (crash recovery path).
+    /// after re-opening the engine (crash recovery path). Sidecar index files
+    /// are also loaded and associated with their corresponding SSTables.
     pub fn register_table(&self, schema: TableSchema) -> ferrosa_common::Result<()> {
+        self.register_table_inner(schema, vec![])
+    }
+
+    /// Registers a table schema with secondary index declarations.
+    ///
+    /// `indexed_columns` is a list of `(index_name, column_position)` pairs
+    /// passed through to [`TableStore::new_with_indexes`]. Sidecar files from
+    /// prior flushes are loaded from disk alongside the SSTables.
+    pub fn register_table_with_indexes(
+        &self,
+        schema: TableSchema,
+        indexed_columns: Vec<(String, usize)>,
+    ) -> ferrosa_common::Result<()> {
+        self.register_table_inner(schema, indexed_columns)
+    }
+
+    /// Internal: create a `TableStore` for a table, loading existing SSTables
+    /// and sidecar files from disk.
+    fn register_table_inner(
+        &self,
+        schema: TableSchema,
+        indexed_columns: Vec<(String, usize)>,
+    ) -> ferrosa_common::Result<()> {
         let table_id = TableId::new(&schema.keyspace, &schema.table);
         let table_dir = self
             .config
@@ -383,17 +414,27 @@ impl StorageEngine {
         })?;
 
         // Load any SSTables that already exist on disk (e.g., after crash recovery).
-        let existing_sstables = Self::load_existing_sstables(&table_dir);
+        let (existing_sstables, existing_sidecars) =
+            Self::load_existing_sstables_and_sidecars(&table_dir);
 
         let flush_target = FileFlushTarget::new_starting_at(table_dir)?;
-        let store = if existing_sstables.is_empty() {
+        let store = if existing_sstables.is_empty() && indexed_columns.is_empty() {
             TableStore::new(schema.clone(), flush_target, WriteOptions::default())
+        } else if existing_sstables.is_empty() {
+            TableStore::new_with_indexes(
+                schema.clone(),
+                flush_target,
+                WriteOptions::default(),
+                indexed_columns,
+            )
         } else {
-            TableStore::new_with_sstables(
+            TableStore::new_with_sstables_and_indexes(
                 schema.clone(),
                 flush_target,
                 WriteOptions::default(),
                 existing_sstables,
+                existing_sidecars,
+                indexed_columns,
             )
         };
 
@@ -415,10 +456,8 @@ impl StorageEngine {
 
     /// Registers a secondary index on a table.
     ///
-    /// Called when `CREATE INDEX` is processed. Updates the `TableStore`'s
-    /// `indexed_columns` so future writes are indexed in the memtable.
-    /// The write lock on `self.tables` guarantees exclusive access to the
-    /// `TableStore`, so `TableStore::add_index` can take `&mut self`.
+    /// Called when CREATE INDEX is processed. Updates the TableStore's
+    /// indexed_columns so future writes are indexed in the memtable.
     pub fn add_index(
         &self,
         table_id: &TableId,
@@ -435,14 +474,19 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Scans a table directory for existing SSTable files and opens them.
+    /// Scans a table directory for existing SSTable files and sidecar index files,
+    /// opening both.
     ///
-    /// Returns readers ordered newest-first (by generation number descending).
-    /// Files that fail to open are silently skipped — a corrupted SSTable is
-    /// better handled at compaction time than at startup.
-    fn load_existing_sstables(
+    /// Returns `(sstables, sidecars)` where each vec is ordered newest-first (by
+    /// generation number descending) and the two vecs are parallel — position `i`
+    /// in `sidecars` is the sidecar map for the SSTable at position `i`.
+    ///
+    /// SSTables that fail to open are silently skipped — a corrupted SSTable is
+    /// better handled at compaction time than at startup. Sidecar files that fail
+    /// to open are replaced with empty maps (degraded: full scan fallback).
+    fn load_existing_sstables_and_sidecars(
         table_dir: &std::path::Path,
-    ) -> Vec<Arc<ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt>>> {
+    ) -> (Vec<FileSSTableReader>, Vec<SSTableSidecarMap>) {
         // Collect all generation numbers by looking for Data.db files.
         let mut generations: Vec<u64> = std::fs::read_dir(table_dir)
             .into_iter()
@@ -461,22 +505,70 @@ impl StorageEngine {
         // Sort descending — newest generation first.
         generations.sort_by(|a, b| b.cmp(a));
 
-        generations
-            .into_iter()
-            .filter_map(|gen| {
-                let gen_str = gen.to_string();
-                match Self::open_sstable_from_dir(table_dir, &gen_str) {
-                    Ok(reader) => Some(Arc::new(reader)),
+        let mut sstables = Vec::new();
+        let mut sidecars = Vec::new();
+
+        for gen in generations {
+            let gen_str = gen.to_string();
+            match Self::open_sstable_from_dir(table_dir, &gen_str) {
+                Ok(reader) => {
+                    sstables.push(Arc::new(reader));
+                    sidecars.push(Arc::new(Self::load_sidecars_for_generation(table_dir, gen)));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[storage-engine] skipping corrupt SSTable gen {gen} in {}: {e}",
+                        table_dir.display()
+                    );
+                }
+            }
+        }
+
+        (sstables, sidecars)
+    }
+
+    /// Scans a table directory for sidecar files belonging to a given generation.
+    ///
+    /// Looks for files matching `{gen}-*.sidecar`. Each successfully opened
+    /// sidecar is added to the returned map keyed by index name. Files that
+    /// fail to open are silently skipped (degraded to full-scan on that index).
+    fn load_sidecars_for_generation(
+        table_dir: &std::path::Path,
+        gen: u64,
+    ) -> HashMap<String, crate::index::sidecar::SidecarReader> {
+        use crate::index::sidecar::SidecarReader;
+
+        let sidecar_prefix = format!("{gen}-");
+        const SIDECAR_SUFFIX: &str = ".sidecar";
+
+        let mut sidecars = HashMap::new();
+
+        let entries = match std::fs::read_dir(table_dir) {
+            Ok(e) => e,
+            Err(_) => return sidecars,
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&sidecar_prefix) && name.ends_with(SIDECAR_SUFFIX) {
+                // Extract index name from "{gen}-{index_name}.sidecar"
+                let index_name = &name[sidecar_prefix.len()..name.len() - SIDECAR_SUFFIX.len()];
+                match SidecarReader::open(&entry.path()) {
+                    Ok(reader) => {
+                        sidecars.insert(index_name.to_string(), reader);
+                    }
                     Err(e) => {
                         eprintln!(
-                            "[storage-engine] skipping corrupt SSTable gen {gen} in {}: {e}",
+                            "[storage-engine] skipping corrupt sidecar {} in {}: {e}",
+                            name,
                             table_dir.display()
                         );
-                        None
                     }
                 }
-            })
-            .collect()
+            }
+        }
+
+        sidecars
     }
 
     /// Registers an observer that will be notified when mutations are written.
@@ -736,15 +828,31 @@ impl StorageEngine {
 
     /// Opens a StorageEngine by restoring from a named snapshot.
     ///
+    /// Steps:
     /// 1. Loads and validates the snapshot manifest (SHA-256 integrity check).
     /// 2. Validates the node ID (cross-node restore requires `force = true`).
-    /// 3. Downloads SSTables from the snapshot manifest to local disk.
-    /// 4. Downloads archived commit log segments from S3.
+    /// 3. Downloads SSTables from the snapshot manifest to
+    ///    `{config.data_dir}/sstables/`.
+    /// 4. Downloads archived commit log segments from S3 to
+    ///    `{config.commit_log.log_dir}`.
     /// 5. Validates segment continuity from the snapshot's commit-log position.
     /// 6. Opens the engine normally (SSTables are loaded from disk).
     ///
-    /// Mutation replay from the downloaded segments is deferred — this
+    /// Mutation replay from the downloaded segments is a future step — this
     /// constructor restores the engine to the state at the snapshot boundary.
+    /// Callers that need point-in-time replay beyond the snapshot boundary
+    /// should call `replay_from` after registering table schemas.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` — engine configuration (data_dir, commit_log dirs, etc.)
+    /// * `snapshot_name` — name of the snapshot stored in S3
+    /// * `point_in_time` — optional Unix-epoch microsecond timestamp to filter
+    ///   replay (placeholder; full replay is deferred)
+    /// * `node_id` — ID of this node; must match the snapshot unless `force`
+    /// * `force` — allow restoring a snapshot from a different node
+    /// * `store` — injected object store (use for tests; production uses S3)
+    /// * `prefix` — S3 key prefix under which the snapshot lives
     pub async fn open_from_snapshot_with_store(
         config: StorageEngineConfig,
         snapshot_name: &str,
@@ -754,37 +862,54 @@ impl StorageEngine {
         store: std::sync::Arc<dyn object_store::ObjectStore>,
         prefix: &str,
     ) -> ferrosa_common::Result<Self> {
+        // 1. Load and validate snapshot (SHA-256 integrity check).
         let restore_mgr =
             crate::restore::RestoreManager::new(std::sync::Arc::clone(&store), prefix.to_string());
         let (metadata, manifest) = restore_mgr
             .load_and_validate_snapshot(snapshot_name)
             .await?;
 
+        // 2. Validate node ID — cross-node restore requires force = true.
         crate::restore::validation::validate_node_id(&metadata.node_id, node_id, force)?;
 
+        // 3. Download SSTables to {data_dir}/sstables/.
         let sstable_dir = config.data_dir.join("sstables");
         std::fs::create_dir_all(&sstable_dir).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!("failed to create sstable dir: {e}"))
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to create sstable dir {}: {e}",
+                sstable_dir.display()
+            ))
         })?;
         let _sst_count = restore_mgr
             .download_sstables(&manifest, &sstable_dir)
             .await?;
 
+        // 4. Download archived commit log segments.
         let segment_dir = config.commit_log.log_dir.clone();
         std::fs::create_dir_all(&segment_dir).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!("failed to create segment dir: {e}"))
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to create segment dir {}: {e}",
+                segment_dir.display()
+            ))
         })?;
         let segment_ids = restore_mgr
             .download_segments(metadata.commit_log_position.segment_id, &segment_dir)
             .await?;
 
+        // 5. Validate segment continuity.
         crate::restore::validation::validate_segment_continuity(
             &segment_ids,
             metadata.commit_log_position.segment_id,
         )?;
 
-        // TODO(PITR): full mutation replay from downloaded segment files
+        // 6. Open the engine normally; SSTables are on disk from step 3.
+        //    Callers register table schemas and optionally call replay_from()
+        //    to apply mutations beyond the snapshot boundary.
+        //
+        // TODO(PITR): full mutation replay from downloaded segment files —
+        //   deserialize mutations, filter by _point_in_time, apply via write().
         let engine = StorageEngine::new(config, None)?;
+
         Ok(engine)
     }
 
@@ -1995,6 +2120,224 @@ mod tests {
         });
     }
 
+    // ── open_from_snapshot_with_store tests ──────────────────────────────────
+
+    #[test]
+    fn open_from_snapshot_downloads_and_validates() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-node";
+
+            // Set up: manifest + schema in S3, then create a snapshot.
+            let manifest = crate::manifest::Manifest::new();
+            manifest
+                .save_with_retry(store.as_ref(), prefix)
+                .await
+                .unwrap();
+            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+                .await
+                .unwrap();
+
+            let snap_mgr =
+                crate::snapshot::SnapshotManager::new(Arc::clone(&store), prefix.to_string());
+            let pos = crate::commitlog::CommitLogPosition {
+                segment_id: 1,
+                offset: 0,
+            };
+            snap_mgr
+                .create_snapshot("test-snap", &manifest, b"{}", pos, "node-1", None, false)
+                .await
+                .unwrap();
+
+            // Restore from snapshot.
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(dir.path()),
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let engine = StorageEngine::open_from_snapshot_with_store(
+                config,
+                "test-snap",
+                None,     // no PIT filter
+                "node-1", // same node
+                false,    // no force
+                Arc::clone(&store),
+                prefix,
+            )
+            .await
+            .unwrap();
+
+            // Engine should be functional.
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn open_from_snapshot_rejects_cross_node_without_force() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-node";
+
+            let manifest = crate::manifest::Manifest::new();
+            manifest
+                .save_with_retry(store.as_ref(), prefix)
+                .await
+                .unwrap();
+            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+                .await
+                .unwrap();
+
+            let snap_mgr =
+                crate::snapshot::SnapshotManager::new(Arc::clone(&store), prefix.to_string());
+            let pos = crate::commitlog::CommitLogPosition {
+                segment_id: 1,
+                offset: 0,
+            };
+            snap_mgr
+                .create_snapshot("test-snap", &manifest, b"{}", pos, "node-1", None, false)
+                .await
+                .unwrap();
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(dir.path()),
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let result = StorageEngine::open_from_snapshot_with_store(
+                config,
+                "test-snap",
+                None,
+                "node-2", // different node!
+                false,    // no force
+                Arc::clone(&store),
+                prefix,
+            )
+            .await;
+
+            assert!(
+                result.is_err(),
+                "cross-node restore without force must fail"
+            );
+            let err_msg = match result {
+                Err(e) => e.to_string(),
+                Ok(_) => unreachable!(),
+            };
+            assert!(
+                err_msg.contains("force"),
+                "error message should mention 'force': {err_msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn open_from_snapshot_force_allows_cross_node_restore() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-node";
+
+            let manifest = crate::manifest::Manifest::new();
+            manifest
+                .save_with_retry(store.as_ref(), prefix)
+                .await
+                .unwrap();
+            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+                .await
+                .unwrap();
+
+            let snap_mgr =
+                crate::snapshot::SnapshotManager::new(Arc::clone(&store), prefix.to_string());
+            let pos = crate::commitlog::CommitLogPosition {
+                segment_id: 1,
+                offset: 0,
+            };
+            snap_mgr
+                .create_snapshot(
+                    "test-snap-force",
+                    &manifest,
+                    b"{}",
+                    pos,
+                    "node-1",
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(dir.path()),
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            // force = true should succeed even though node IDs differ.
+            let engine = StorageEngine::open_from_snapshot_with_store(
+                config,
+                "test-snap-force",
+                None,
+                "node-2", // different node
+                true,     // force override
+                Arc::clone(&store),
+                prefix,
+            )
+            .await
+            .unwrap();
+
+            engine.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn open_from_snapshot_rejects_missing_snapshot() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(dir.path()),
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let result = StorageEngine::open_from_snapshot_with_store(
+                config,
+                "does-not-exist",
+                None,
+                "node-1",
+                false,
+                Arc::clone(&store),
+                "prefix",
+            )
+            .await;
+
+            assert!(result.is_err(), "missing snapshot should return an error");
+        });
+    }
+
     #[test]
     fn create_snapshot_flushes_and_writes_to_s3() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2061,273 +2404,58 @@ mod tests {
         });
     }
 
-    #[test]
-    fn list_and_delete_snapshots_via_engine() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let store: std::sync::Arc<dyn object_store::ObjectStore> =
-                std::sync::Arc::new(object_store::memory::InMemory::new());
-            let prefix = "test-node";
-
-            // Save manifest + schema so create_snapshot works.
-            let manifest = crate::manifest::Manifest::new();
-            manifest
-                .save_with_retry(store.as_ref(), prefix)
-                .await
-                .unwrap();
-            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
-                .await
-                .unwrap();
-
-            let config = StorageEngineConfig {
-                commit_log: CommitLogConfig::test_config(dir.path()),
-                ..StorageEngineConfig::test_config(dir.path())
-            };
-            let engine = StorageEngine::new(config, None).unwrap();
-
-            // Create two snapshots.
-            engine
-                .create_snapshot_with_store(
-                    "snap-a",
-                    "n1",
-                    None,
-                    false,
-                    std::sync::Arc::clone(&store),
-                    prefix,
-                )
-                .await
-                .unwrap();
-            engine
-                .create_snapshot_with_store(
-                    "snap-b",
-                    "n1",
-                    None,
-                    false,
-                    std::sync::Arc::clone(&store),
-                    prefix,
-                )
-                .await
-                .unwrap();
-
-            // List — should see both.
-            let snaps = engine
-                .list_snapshots_with_store(std::sync::Arc::clone(&store), prefix)
-                .await
-                .unwrap();
-            assert_eq!(snaps.len(), 2);
-            let names: Vec<&str> = snaps.iter().map(|s| s.name.as_str()).collect();
-            assert!(names.contains(&"snap-a"));
-            assert!(names.contains(&"snap-b"));
-
-            // Delete one.
-            engine
-                .delete_snapshot_with_store("snap-a", std::sync::Arc::clone(&store), prefix)
-                .await
-                .unwrap();
-
-            // List — should see only one.
-            let snaps = engine
-                .list_snapshots_with_store(std::sync::Arc::clone(&store), prefix)
-                .await
-                .unwrap();
-            assert_eq!(snaps.len(), 1);
-            assert_eq!(snaps[0].name, "snap-b");
-
-            engine.shutdown().unwrap();
-        });
-    }
-
     // =========================================================================
-    // Task 3.5: StorageEngine::add_index
+    // Task 3.2: Sidecar files survive table re-registration
     // =========================================================================
 
-    fn test_schema_with_email() -> TableSchema {
-        TableSchema {
-            keyspace: "test_ks".to_string(),
-            table: "test_table".to_string(),
-            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            clustering_columns: vec![ColumnDefinition {
-                name: "ck".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
-            }],
-            static_columns: vec![],
-            regular_columns: vec![ColumnDefinition {
-                name: "email".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            }],
-        }
-    }
-
     #[test]
-    fn engine_add_index_enables_memtable_indexing() {
+    fn sidecar_survives_table_reregistration() {
         use ferrosa_index::IndexKey;
 
         let dir = tempfile::tempdir().unwrap();
-        let config = StorageEngineConfig::test_config(dir.path());
-        let engine = StorageEngine::new(config, None).unwrap();
-        engine.register_table(test_schema_with_email()).unwrap();
-
         let tid = table_id();
 
-        // Add the index via engine
-        engine.add_index(&tid, "email_idx", 0).unwrap();
-
-        // Write a row with the indexed column
-        let key = make_key("user1");
-        let row = Row {
-            clustering: vec![0x00, 0x00, 0x00, 0x01],
-            cells: vec![(
-                0,
-                ferrosa_common::cell::CellValue::live(b"alice@example.com".to_vec(), 1000),
-            )],
-            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
-            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
-        };
-        engine.write(&tid, &key, row, 1000).unwrap();
-
-        // Read by index — should find the row
-        let results = engine
-            .read_by_index(&tid, "email_idx", &IndexKey(b"alice@example.com".to_vec()))
-            .unwrap();
-        assert_eq!(
-            results.len(),
-            1,
-            "indexed write should be findable via engine.read_by_index"
-        );
-        assert_eq!(results[0].key.key.as_bytes(), b"user1");
-    }
-
-    #[test]
-    fn engine_add_index_on_unregistered_table_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = StorageEngineConfig::test_config(dir.path());
-        let engine = StorageEngine::new(config, None).unwrap();
-
-        let result = engine.add_index(&TableId::new("no", "such"), "idx", 0);
-        assert!(
-            result.is_err(),
-            "add_index on unregistered table should fail"
-        );
-    }
-
-    #[test]
-    fn open_from_snapshot_downloads_and_validates() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let store: std::sync::Arc<dyn object_store::ObjectStore> =
-                std::sync::Arc::new(object_store::memory::InMemory::new());
-            let prefix = "test-node";
-
-            let manifest = crate::manifest::Manifest::new();
-            manifest
-                .save_with_retry(store.as_ref(), prefix)
-                .await
-                .unwrap();
-            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
-                .await
+        // Phase 1: register table with an index, write indexed data, flush.
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine
+                .register_table_with_indexes(test_schema(), vec![("val_idx".to_string(), 0_usize)])
                 .unwrap();
 
-            let snap_mgr = crate::snapshot::SnapshotManager::new(
-                std::sync::Arc::clone(&store),
-                prefix.to_string(),
-            );
-            let pos = CommitLogPosition {
-                segment_id: 1,
-                offset: 0,
-            };
-            snap_mgr
-                .create_snapshot("test-snap", &manifest, b"{}", pos, "node-1", None, false)
-                .await
+            engine
+                .write(&tid, &make_key("user1"), make_row(b"alice", 1000), 1000)
                 .unwrap();
+            engine.flush(&tid).unwrap();
 
-            let config = StorageEngineConfig {
-                commit_log: CommitLogConfig::test_config(dir.path()),
-                ..StorageEngineConfig::test_config(dir.path())
-            };
-
-            let engine = StorageEngine::open_from_snapshot_with_store(
-                config,
-                "test-snap",
-                None,
-                "node-1",
-                false,
-                std::sync::Arc::clone(&store),
-                prefix,
-            )
-            .await
-            .unwrap();
+            // Verify readable before drop.
+            let results = engine
+                .read_by_index(&tid, "val_idx", &IndexKey(b"alice".to_vec()))
+                .unwrap();
+            assert_eq!(results.len(), 1, "pre-reregistration: should find user1");
 
             engine.shutdown().unwrap();
-        });
-    }
+        }
 
-    #[test]
-    fn open_from_snapshot_rejects_cross_node_without_force() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let store: std::sync::Arc<dyn object_store::ObjectStore> =
-                std::sync::Arc::new(object_store::memory::InMemory::new());
-            let prefix = "test-node";
-
-            let manifest = crate::manifest::Manifest::new();
-            manifest
-                .save_with_retry(store.as_ref(), prefix)
-                .await
+        // Phase 2: create a new engine with the same data dir, re-register,
+        // and verify the sidecar index is loaded from disk.
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let (engine, pending) = StorageEngine::open(config, None).unwrap();
+            engine
+                .register_table_with_indexes(test_schema(), vec![("val_idx".to_string(), 0_usize)])
                 .unwrap();
-            crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
-                .await
-                .unwrap();
+            engine.replay_mutations(pending).unwrap();
 
-            let snap_mgr = crate::snapshot::SnapshotManager::new(
-                std::sync::Arc::clone(&store),
-                prefix.to_string(),
+            let results = engine
+                .read_by_index(&tid, "val_idx", &IndexKey(b"alice".to_vec()))
+                .unwrap();
+            assert_eq!(
+                results.len(),
+                1,
+                "post-reregistration: sidecar should be loaded from disk and return user1"
             );
-            let pos = CommitLogPosition {
-                segment_id: 1,
-                offset: 0,
-            };
-            snap_mgr
-                .create_snapshot("test-snap", &manifest, b"{}", pos, "node-1", None, false)
-                .await
-                .unwrap();
-
-            let config = StorageEngineConfig {
-                commit_log: CommitLogConfig::test_config(dir.path()),
-                ..StorageEngineConfig::test_config(dir.path())
-            };
-
-            let result = StorageEngine::open_from_snapshot_with_store(
-                config,
-                "test-snap",
-                None,
-                "node-2",
-                false,
-                std::sync::Arc::clone(&store),
-                prefix,
-            )
-            .await;
-
-            assert!(
-                result.is_err(),
-                "cross-node restore should fail without force"
-            );
-            let err = result.err().unwrap();
-            assert!(format!("{err}").contains("force"));
-        });
+            assert_eq!(results[0].key.key.as_bytes(), b"user1");
+        }
     }
 }

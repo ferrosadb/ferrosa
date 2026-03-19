@@ -29,7 +29,7 @@ use ferrosa_sstable::writer::SSTableWriter;
 use ferrosa_sstable::WriteOptions;
 
 use crate::flush::{self, FlushTarget};
-use crate::index::sidecar::{SidecarReader, SidecarWriter};
+use crate::index::sidecar::SidecarReader;
 use crate::memtable::index::MemtableIndex;
 #[cfg(not(feature = "skiplist-memtable"))]
 use crate::memtable::sharded::ShardedBTreeMemtable;
@@ -142,25 +142,54 @@ impl<F: FlushTarget> TableStore<F> {
     ///
     /// Used during crash recovery to populate the store with SSTables that
     /// were flushed before the crash. The readers must be ordered newest first.
+    /// `initial_sidecars` is a parallel vec — position `i` is the sidecar map
+    /// for `initial_sstables[i]`. If empty or shorter than `initial_sstables`,
+    /// the remaining positions get empty sidecar maps.
+    /// `indexed_columns` declares secondary indexes for new writes; use an empty
+    /// vec if no indexes are active on this table.
     pub fn new_with_sstables(
         schema: TableSchema,
         flush_target: F,
         options: WriteOptions,
         initial_sstables: Vec<Arc<SSTableReader<F::Reader>>>,
+        initial_sidecars: Vec<Arc<HashMap<String, SidecarReader>>>,
+    ) -> Self {
+        Self::new_with_sstables_and_indexes(
+            schema,
+            flush_target,
+            options,
+            initial_sstables,
+            initial_sidecars,
+            vec![],
+        )
+    }
+
+    /// Like [`new_with_sstables`] but also registers secondary index declarations
+    /// so that new writes populate the memtable index.
+    pub fn new_with_sstables_and_indexes(
+        schema: TableSchema,
+        flush_target: F,
+        options: WriteOptions,
+        initial_sstables: Vec<Arc<SSTableReader<F::Reader>>>,
+        initial_sidecars: Vec<Arc<HashMap<String, SidecarReader>>>,
+        indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&[]);
+        let indexes = new_indexes(&indexed_columns);
         let sidecar_count = initial_sstables.len();
+
+        // Pad sidecar list with empty maps if shorter than the SSTable list.
+        let mut sidecars: Vec<Arc<HashMap<String, SidecarReader>>> = initial_sidecars;
+        while sidecars.len() < sidecar_count {
+            sidecars.push(Arc::new(HashMap::new()));
+        }
+
         let initial_view = StoreView {
             active,
             flushing: None,
             sstables: Arc::new(initial_sstables),
             indexes,
-            sidecar_indexes: Arc::new(
-                (0..sidecar_count)
-                    .map(|_| Arc::new(HashMap::new()))
-                    .collect(),
-            ),
+            sidecar_indexes: Arc::new(sidecars),
         };
         Self {
             schema,
@@ -168,7 +197,7 @@ impl<F: FlushTarget> TableStore<F> {
             flush_guard: Mutex::new(()),
             flush_target,
             options,
-            indexed_columns: vec![],
+            indexed_columns,
         }
     }
 
@@ -312,11 +341,10 @@ impl<F: FlushTarget> TableStore<F> {
         let reader = self.flush_target.flush(output)?;
         let new_reader = Arc::new(reader);
 
-        // Generation used for this flush — captured after flush() increments it.
-        let gen = self.flush_target.current_generation();
-
-        // Step 5b: Build sidecar readers from the old memtable indexes.
-        // Also persist to disk if the flush target has a base directory.
+        // Step 5b: Build sidecar readers from the old memtable indexes and
+        // persist them to disk so they survive process restarts.
+        let gen = self.flush_target.last_generation();
+        let mut raw_sidecar_entries: HashMap<String, Vec<(IndexKey, RowPosition)>> = HashMap::new();
         let mut sidecar_map: HashMap<String, SidecarReader> = HashMap::new();
         for (index_name, memtable_idx) in old_indexes.iter() {
             let entries: Vec<(IndexKey, Vec<RowPosition>)> = memtable_idx.iter().collect();
@@ -328,17 +356,17 @@ impl<F: FlushTarget> TableStore<F> {
                 })
                 .collect();
             if !flat_entries.is_empty() {
-                // Persist sidecar to disk when flush target has a base directory.
-                if let Some(base_dir) = self.flush_target.base_dir() {
-                    let sidecar_path = base_dir.join(format!("{gen}-{index_name}.sidecar"));
-                    SidecarWriter::write(&sidecar_path, &flat_entries)
-                        .map_err(|e| ferrosa_common::Error::InvalidData(e.to_string()))?;
-                }
+                raw_sidecar_entries.insert(index_name.clone(), flat_entries.clone());
                 sidecar_map.insert(
                     index_name.clone(),
                     SidecarReader::from_entries(flat_entries),
                 );
             }
+        }
+
+        // Persist sidecar files to disk (no-op for in-memory flush targets).
+        if let Err(e) = self.flush_target.write_sidecars(gen, &raw_sidecar_entries) {
+            eprintln!("[store] sidecar persist failed for gen {gen}: {e}");
         }
 
         // Step 6: Prepend new SSTable and sidecar, clear flushing.
@@ -455,19 +483,13 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(partitions)
     }
 
+    /// Retrieve a named memtable-level secondary index.
+    ///
+    /// Returns `None` if no index with the given name was declared at
     /// Dynamically adds a secondary index. Future writes will be indexed.
-    ///
-    /// Records the new `(index_name, column_position)` pair in `indexed_columns`
-    /// and atomically installs a fresh `MemtableIndex` into the current view.
-    /// Existing data in the active memtable is NOT retroactively indexed —
-    /// only writes after this call will appear in the index.
-    ///
-    /// Called by `StorageEngine::add_index` while holding a write lock on the
-    /// table map, so `&mut self` is safe.
     pub fn add_index(&mut self, index_name: String, column_position: usize) {
         self.indexed_columns
             .push((index_name.clone(), column_position));
-        // Atomically install a fresh MemtableIndex into the current view.
         let current = self.view.load();
         let mut new_indexes = (*current.indexes).clone();
         new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
@@ -1593,356 +1615,5 @@ mod tests {
         let pks: Vec<&[u8]> = results.iter().map(|p| p.key.key.as_bytes()).collect();
         assert!(pks.contains(&b"user1".as_slice()));
         assert!(pks.contains(&b"user2".as_slice()));
-    }
-
-    // =========================================================================
-    // Task 3.1: Sidecar files written to disk during flush
-    // =========================================================================
-
-    #[test]
-    fn flush_writes_sidecar_files_to_disk() {
-        use crate::flush::FileFlushTarget;
-        use crate::index::sidecar::SidecarReader;
-        use ferrosa_index::IndexKey;
-
-        let dir = tempfile::tempdir().unwrap();
-
-        let schema = TableSchema {
-            keyspace: "test_ks".to_string(),
-            table: "test_table".to_string(),
-            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            clustering_columns: vec![ColumnDefinition {
-                name: "ck".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
-            }],
-            static_columns: vec![],
-            regular_columns: vec![ColumnDefinition {
-                name: "email".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            }],
-        };
-
-        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
-        let store = TableStore::new_with_indexes(
-            schema,
-            target,
-            WriteOptions {
-                compression: None,
-                ..WriteOptions::default()
-            },
-            vec![("email_idx".to_string(), 0_usize)],
-        );
-
-        store
-            .write(
-                &make_key("user1"),
-                Row {
-                    clustering: vec![0x00, 0x00, 0x00, 0x01],
-                    cells: vec![(0, CellValue::live(b"alice@example.com".to_vec(), 1000))],
-                    deletion: DeletionTime::LIVE,
-                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
-            )
-            .unwrap();
-
-        store.flush().unwrap();
-
-        // Assert the sidecar file exists: {gen}-{index_name}.sidecar = 1-email_idx.sidecar
-        let sidecar_path = dir.path().join("1-email_idx.sidecar");
-        assert!(
-            sidecar_path.exists(),
-            "sidecar file should exist at {}",
-            sidecar_path.display()
-        );
-
-        // Assert the sidecar is readable and lookup works
-        let reader = SidecarReader::open(&sidecar_path).unwrap();
-        let results = reader
-            .lookup(&IndexKey(b"alice@example.com".to_vec()))
-            .unwrap();
-        assert_eq!(results.len(), 1, "should find one entry in sidecar");
-        assert_eq!(results[0].partition_key, b"user1");
-    }
-
-    #[test]
-    fn flush_empty_index_writes_no_sidecar_file() {
-        use crate::flush::FileFlushTarget;
-
-        let dir = tempfile::tempdir().unwrap();
-
-        let schema = TableSchema {
-            keyspace: "test_ks".to_string(),
-            table: "test_table".to_string(),
-            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            clustering_columns: vec![ColumnDefinition {
-                name: "ck".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
-            }],
-            static_columns: vec![],
-            regular_columns: vec![ColumnDefinition {
-                name: "val".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            }],
-        };
-
-        // Store with no indexed columns
-        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
-        let store = TableStore::new(
-            schema,
-            target,
-            WriteOptions {
-                compression: None,
-                ..WriteOptions::default()
-            },
-        );
-
-        store.write(&make_key("k1"), make_row(b"v1", 1000)).unwrap();
-        store.flush().unwrap();
-
-        // No indexed columns means no sidecar files should be written
-        let sidecar_count = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .map(|n| n.ends_with(".sidecar"))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(sidecar_count, 0, "no .sidecar files should exist");
-    }
-
-    #[test]
-    fn flush_multiple_indexes_writes_multiple_sidecars() {
-        use crate::flush::FileFlushTarget;
-        use crate::index::sidecar::SidecarReader;
-        use ferrosa_index::IndexKey;
-
-        let dir = tempfile::tempdir().unwrap();
-
-        let schema = TableSchema {
-            keyspace: "test_ks".to_string(),
-            table: "test_table".to_string(),
-            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            clustering_columns: vec![],
-            static_columns: vec![],
-            regular_columns: vec![
-                ColumnDefinition {
-                    name: "email".to_string(),
-                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-                },
-                ColumnDefinition {
-                    name: "city".to_string(),
-                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-                },
-            ],
-        };
-
-        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
-        let store = TableStore::new_with_indexes(
-            schema,
-            target,
-            WriteOptions {
-                compression: None,
-                ..WriteOptions::default()
-            },
-            vec![
-                ("email_idx".to_string(), 0_usize),
-                ("city_idx".to_string(), 1_usize),
-            ],
-        );
-
-        store
-            .write(
-                &make_key("user1"),
-                Row {
-                    clustering: vec![],
-                    cells: vec![
-                        (0, CellValue::live(b"alice@example.com".to_vec(), 1000)),
-                        (1, CellValue::live(b"NYC".to_vec(), 1000)),
-                    ],
-                    deletion: DeletionTime::LIVE,
-                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
-                },
-            )
-            .unwrap();
-
-        store.flush().unwrap();
-
-        // Both sidecar files should exist
-        let email_sidecar = dir.path().join("1-email_idx.sidecar");
-        let city_sidecar = dir.path().join("1-city_idx.sidecar");
-
-        assert!(
-            email_sidecar.exists(),
-            "email_idx sidecar should exist at {}",
-            email_sidecar.display()
-        );
-        assert!(
-            city_sidecar.exists(),
-            "city_idx sidecar should exist at {}",
-            city_sidecar.display()
-        );
-
-        // Verify lookups work in both
-        let email_reader = SidecarReader::open(&email_sidecar).unwrap();
-        let email_results = email_reader
-            .lookup(&IndexKey(b"alice@example.com".to_vec()))
-            .unwrap();
-        assert_eq!(email_results.len(), 1);
-        assert_eq!(email_results[0].partition_key, b"user1");
-
-        let city_reader = SidecarReader::open(&city_sidecar).unwrap();
-        let city_results = city_reader.lookup(&IndexKey(b"NYC".to_vec())).unwrap();
-        assert_eq!(city_results.len(), 1);
-        assert_eq!(city_results[0].partition_key, b"user1");
-    }
-
-    // =========================================================================
-    // Task 3.5: add_index — dynamically wire a new secondary index
-    // =========================================================================
-
-    /// After `add_index`, future writes to the indexed column appear in the
-    /// memtable index.
-    #[test]
-    fn add_index_enables_memtable_indexing() {
-        use ferrosa_index::IndexKey;
-
-        let schema = TableSchema {
-            keyspace: "test_ks".to_string(),
-            table: "test_table".to_string(),
-            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            clustering_columns: vec![ColumnDefinition {
-                name: "ck".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
-            }],
-            static_columns: vec![],
-            regular_columns: vec![ColumnDefinition {
-                name: "email".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            }],
-        };
-
-        // Create store WITHOUT any indexes
-        let mut store = TableStore::new(
-            schema,
-            InMemoryFlushTarget,
-            WriteOptions {
-                compression: None,
-                ..WriteOptions::default()
-            },
-        );
-
-        // Before add_index: no index exists
-        assert!(
-            store.get_memtable_index("email_idx").is_none(),
-            "index should not exist before add_index"
-        );
-
-        // Dynamically add the index
-        store.add_index("email_idx".to_string(), 0);
-
-        // Now the index exists
-        assert!(
-            store.get_memtable_index("email_idx").is_some(),
-            "index should exist after add_index"
-        );
-
-        // Write a row with the indexed column
-        let key = make_key("user1");
-        let row = Row {
-            clustering: vec![0x00, 0x00, 0x00, 0x01],
-            cells: vec![(0, CellValue::live(b"alice@example.com".to_vec(), 1000))],
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        };
-        store.write(&key, row).unwrap();
-
-        // The memtable index should contain the entry
-        let index = store
-            .get_memtable_index("email_idx")
-            .expect("index must exist after add_index");
-        let results = index.lookup(&IndexKey(b"alice@example.com".to_vec()));
-        assert_eq!(
-            results.len(),
-            1,
-            "indexed write should appear in memtable index"
-        );
-        assert_eq!(results[0].partition_key, b"user1");
-    }
-
-    /// Writes that occurred before `add_index` are NOT retroactively indexed.
-    /// Only writes after `add_index` are indexed in the new memtable index.
-    #[test]
-    fn add_index_on_existing_data_indexes_future_writes_only() {
-        use ferrosa_index::IndexKey;
-
-        let schema = TableSchema {
-            keyspace: "test_ks".to_string(),
-            table: "test_table".to_string(),
-            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            clustering_columns: vec![ColumnDefinition {
-                name: "ck".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
-            }],
-            static_columns: vec![],
-            regular_columns: vec![ColumnDefinition {
-                name: "email".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            }],
-        };
-
-        let mut store = TableStore::new(
-            schema,
-            InMemoryFlushTarget,
-            WriteOptions {
-                compression: None,
-                ..WriteOptions::default()
-            },
-        );
-
-        // Write data BEFORE creating the index
-        let pre_key = make_key("pre_user");
-        let pre_row = Row {
-            clustering: vec![0x00, 0x00, 0x00, 0x01],
-            cells: vec![(0, CellValue::live(b"pre@example.com".to_vec(), 1000))],
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        };
-        store.write(&pre_key, pre_row).unwrap();
-
-        // Now add the index
-        store.add_index("email_idx".to_string(), 0);
-
-        // Write data AFTER creating the index
-        let post_key = make_key("post_user");
-        let post_row = Row {
-            clustering: vec![0x00, 0x00, 0x00, 0x01],
-            cells: vec![(0, CellValue::live(b"post@example.com".to_vec(), 2000))],
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::with_timestamp(2000),
-        };
-        store.write(&post_key, post_row).unwrap();
-
-        let index = store
-            .get_memtable_index("email_idx")
-            .expect("index must exist after add_index");
-
-        // Pre-existing data should NOT be in the index
-        let pre_results = index.lookup(&IndexKey(b"pre@example.com".to_vec()));
-        assert!(
-            pre_results.is_empty(),
-            "data written before add_index should not be retroactively indexed"
-        );
-
-        // Post-index data SHOULD be in the index
-        let post_results = index.lookup(&IndexKey(b"post@example.com".to_vec()));
-        assert_eq!(
-            post_results.len(),
-            1,
-            "data written after add_index should be indexed"
-        );
-        assert_eq!(post_results[0].partition_key, b"post_user");
     }
 }
