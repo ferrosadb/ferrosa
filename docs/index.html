@@ -850,11 +850,13 @@
           NVMe is used. Size your local disks for your working set, not your total dataset.
         </p>
         <p style="margin-top: 0.75rem;">
-          Point-in-time recovery retention is managed through standard S3 Lifecycle rules —
-          set a retention policy and S3 handles the rest. Keep 7 days in Standard for
-          instant recovery, or tier through Glacier for a full year of PITR at
-          pennies per GB. Cold SSTables automatically transition to cheaper storage classes
-          while staying instantly readable through the block cache.
+          Point-in-time recovery retention is one command:
+          <code style="font-size: 0.875rem;">ferrosa-ctl storage retention set --years 1</code>.
+          Ferrosa configures S3 Lifecycle rules that tier your commit log archives through
+          Standard, Infrequent Access, and Glacier automatically. A full year of PITR costs
+          ~$45/TB — cheaper than 3 months without tiering. Cold SSTables transition to
+          cheaper storage classes automatically while staying instantly readable through
+          the block cache — 66% savings on storage with zero performance impact.
           Node retirement is just as simple: decommission a node and its S3 objects are
           tagged for cleanup.
         </p>
@@ -862,7 +864,7 @@
           Works with AWS S3, MinIO, Cloudflare R2, or any S3-compatible endpoint.
           No vendor lock-in.
         </p>
-        <span class="metric">S3: ~$0.023/GB/mo vs EBS: ~$0.10–0.25/GB/mo</span>
+        <span class="metric">S3: ~$0.023/GB/mo · 1yr PITR: ~$45/TB · SSTable tiering: 66% savings</span>
       </div>
       <div class="arch-diagram" style="margin-top: 0; border: none; background: var(--bg-primary);">
         <div class="arch-layers">
@@ -1385,7 +1387,7 @@ user = session.execute(stmt, [user_id])
         </tr>
         <tr>
           <td>Storage Cost (PB)</td>
-          <td class="ferrosa-col">~$23K/mo</td>
+          <td class="ferrosa-col">~$23K/mo (tiered: ~$8K)</td>
           <td>~$100–250K/mo</td>
           <td>~$100–250K/mo</td>
           <td>~$250K/mo</td>
