@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - 'examples/**'
+      - '.github/workflows/test-examples.yml'
   pull_request:
     branches: [main]
     paths:
       - 'examples/**'
+      - '.github/workflows/test-examples.yml'
   schedule:
     # Nightly at 03:00 UTC
     - cron: '0 3 * * *'
