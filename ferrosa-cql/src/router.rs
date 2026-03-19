@@ -270,6 +270,7 @@ pub async fn route(
         } => route_drop_aggregate(state, ctx, keyspace, name, arg_types, if_exists)
             .await
             .map(RouteResult::Result),
+        Statement::Explain(s) => route_explain(state, ctx, *s).map(RouteResult::Result),
     }
 }
 
@@ -1074,6 +1075,48 @@ fn encode_virtual_rows(
 
     Ok(result::encode_rows(
         &col_names, &col_types, keyspace, table, &cql_rows,
+    ))
+}
+
+// ── EXPLAIN ──────────────────────────────────────────────────────────────
+
+fn route_explain(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: SelectStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = s
+        .keyspace
+        .as_deref()
+        .or(ctx.current_keyspace.as_deref())
+        .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), s.table.clone()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+
+    let planner_indexes: Vec<(String, Vec<String>)> = snap
+        .indexes
+        .iter()
+        .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+        .map(|(_, meta)| (meta.name.clone(), meta.target_columns.clone()))
+        .collect();
+
+    let scan_plan = planner::plan(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        &planner_indexes,
+    );
+
+    let plan_text = format!("{scan_plan}");
+
+    let col_names = vec!["plan".to_string()];
+    let col_types = vec![CqlType::Varchar];
+    let rows = vec![vec![Some(CqlValue::Text(plan_text))]];
+    Ok(result::encode_rows(
+        &col_names, &col_types, ks, &s.table, &rows,
     ))
 }
 

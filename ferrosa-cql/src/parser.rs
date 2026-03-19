@@ -90,6 +90,7 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke().map(Statement::Revoke),
             TokenKind::Keyword(Keyword::Subscribe) => self.parse_subscribe(),
             TokenKind::Keyword(Keyword::Unsubscribe) => self.parse_unsubscribe(),
+            TokenKind::Keyword(Keyword::Explain) => self.parse_explain(),
             TokenKind::Eof => Err(CqlError::SyntaxError("empty query".to_string())),
             _ => Err(CqlError::SyntaxError(format!(
                 "unexpected token {:?} at position {}",
@@ -1481,6 +1482,20 @@ impl<'input> Parser<'input> {
         Ok(Statement::Unsubscribe { stream_id })
     }
 
+    fn parse_explain(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Explain))?;
+
+        // EXPLAIN requires a SELECT statement
+        let tok = self.lexer.peek()?;
+        if !matches!(tok.kind, TokenKind::Keyword(Keyword::Select)) {
+            return Err(CqlError::SyntaxError(
+                "EXPLAIN requires a SELECT statement".to_string(),
+            ));
+        }
+        let select = self.parse_select()?;
+        Ok(Statement::Explain(Box::new(select)))
+    }
+
     /// Parse a duration string like `5s`, `500ms`, `1m`.
     ///
     /// The lexer produces these as a single `Ident` token (e.g. `"5s"`)
@@ -2075,6 +2090,7 @@ impl<'input> Parser<'input> {
             Keyword::Initcond => "initcond",
             Keyword::As => "as",
             Keyword::Contains => "contains",
+            Keyword::Explain => "explain",
         }
         .to_string()
     }
@@ -3335,6 +3351,37 @@ mod tests {
             }
             _ => panic!("expected CreateFunction"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // EXPLAIN tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_explain_select() {
+        let stmt = parse("EXPLAIN SELECT * FROM ks.users WHERE email = 'alice'").unwrap();
+        match stmt {
+            Statement::Explain(s) => {
+                assert_eq!(s.keyspace.as_deref(), Some("ks"));
+                assert_eq!(s.table, "users");
+                assert_eq!(s.where_clauses.len(), 1);
+            }
+            other => panic!("expected Explain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_explain_select_with_allow_filtering() {
+        let stmt = parse("EXPLAIN SELECT * FROM t WHERE x = 1 ALLOW FILTERING").unwrap();
+        match stmt {
+            Statement::Explain(s) => assert!(s.allow_filtering),
+            other => panic!("expected Explain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_explain_rejects_non_select() {
+        assert!(parse("EXPLAIN INSERT INTO t (a) VALUES (1)").is_err());
     }
 }
 
