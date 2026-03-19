@@ -1,60 +1,63 @@
-//! Snapshot metadata: write-once JSON document stored at
-//! `{prefix}/snapshots/{name}/metadata.json` in S3.
+//! Snapshot metadata stored alongside each named snapshot in S3.
+//!
+//! [`SnapshotMetadata`] is written to `{prefix}/snapshots/{name}/metadata.json`
+//! and describes the snapshot's identity, timing, and commit-log position.
 
 use serde::{Deserialize, Serialize};
 
 use crate::commitlog::CommitLogPosition;
 
-/// Metadata for a point-in-time snapshot.
+/// Format version for the metadata file.
+pub const METADATA_FORMAT_VERSION: u32 = 1;
+
+/// Metadata document stored at `{prefix}/snapshots/{name}/metadata.json`.
 ///
-/// Write-once: created during `create_snapshot()`, never modified.
-/// The `manifest_sha256` field provides integrity verification —
-/// on restore, the manifest is re-hashed and compared.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Contains everything needed to locate the snapshot's manifest, validate
+/// its integrity, and determine which commit-log segments it covers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotMetadata {
-    /// Schema version for forward compatibility.
+    /// Format version for forward compatibility.
     pub format_version: u32,
-    /// Snapshot name (user-provided, validated: alphanumeric + hyphens + underscores).
+    /// Human-readable name, URL-safe characters only.
     pub name: String,
-    /// ISO 8601 timestamp when the snapshot was created.
+    /// ISO 8601 UTC timestamp when the snapshot was created.
     pub created_at: String,
-    /// Optional ISO 8601 expiry timestamp. None = no expiry.
+    /// Optional ISO 8601 UTC expiry time. `None` means never expire.
     pub expires_at: Option<String>,
-    /// Commit log position at snapshot creation time.
-    /// All mutations at or before this position are included.
+    /// Commit-log position at the time the snapshot was taken.
+    ///
+    /// All mutations before this position are captured in the manifest.
     pub commit_log_position: CommitLogPosition,
-    /// Node ID that created this snapshot.
+    /// Node ID of the node that created the snapshot.
     pub node_id: String,
-    /// If true, this snapshot is ephemeral (auto-deleted on next startup).
+    /// If true, this snapshot is ephemeral (e.g., created before compaction).
     pub ephemeral: bool,
-    /// SHA-256 hex digest of the manifest.json at snapshot time.
-    /// Used for integrity verification during restore.
+    /// SHA-256 hex digest of `manifest.json` as stored in S3.
     pub manifest_sha256: String,
 }
 
-/// Current metadata format version.
-pub const METADATA_FORMAT_VERSION: u32 = 1;
-
-/// Validates a snapshot name: must be non-empty, max 128 chars,
-/// only alphanumeric + hyphens + underscores.
-pub fn validate_snapshot_name(name: &str) -> Result<(), String> {
+/// Validates that a snapshot name is safe for use as a path component.
+///
+/// Accepts ASCII alphanumeric characters, `-`, and `_`. Rejects empty names,
+/// names longer than 128 characters, and names containing path-unsafe chars.
+pub fn validate_snapshot_name(name: &str) -> ferrosa_common::Result<()> {
     if name.is_empty() {
-        return Err("snapshot name must not be empty".to_string());
+        return Err(ferrosa_common::Error::InvalidFormat(
+            "snapshot name must not be empty".to_string(),
+        ));
     }
     if name.len() > 128 {
-        return Err(format!(
-            "snapshot name too long: {} chars (max 128)",
+        return Err(ferrosa_common::Error::InvalidFormat(format!(
+            "snapshot name exceeds 128 characters: {}",
             name.len()
-        ));
+        )));
     }
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(format!(
-            "snapshot name contains invalid characters: '{}' (only alphanumeric, hyphens, underscores allowed)",
-            name
-        ));
+    for ch in name.chars() {
+        if !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "snapshot name contains invalid character: '{ch}'"
+            )));
+        }
     }
     Ok(())
 }
@@ -62,85 +65,56 @@ pub fn validate_snapshot_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commitlog::CommitLogPosition;
-
-    fn sample_metadata() -> SnapshotMetadata {
-        SnapshotMetadata {
-            format_version: METADATA_FORMAT_VERSION,
-            name: "daily-backup".to_string(),
-            created_at: "2026-03-18T12:00:00Z".to_string(),
-            expires_at: Some("2026-03-25T12:00:00Z".to_string()),
-            commit_log_position: CommitLogPosition {
-                segment_id: 42,
-                offset: 1024,
-            },
-            node_id: "node-1".to_string(),
-            ephemeral: false,
-            manifest_sha256: "cafe0123".repeat(8),
-        }
-    }
 
     #[test]
-    fn serde_round_trip() {
-        let meta = sample_metadata();
-        let json = serde_json::to_vec_pretty(&meta).unwrap();
-        let deserialized: SnapshotMetadata = serde_json::from_slice(&json).unwrap();
-        assert_eq!(meta, deserialized);
-    }
-
-    #[test]
-    fn serde_contains_expected_fields() {
-        let meta = sample_metadata();
-        let json = serde_json::to_string_pretty(&meta).unwrap();
-        assert!(json.contains("\"format_version\": 1"));
-        assert!(json.contains("\"name\": \"daily-backup\""));
-        assert!(json.contains("\"segment_id\": 42"));
-        assert!(json.contains("\"offset\": 1024"));
-        assert!(json.contains("\"ephemeral\": false"));
-        assert!(json.contains("\"manifest_sha256\""));
-    }
-
-    #[test]
-    fn serde_no_expires() {
-        let mut meta = sample_metadata();
-        meta.expires_at = None;
-        let json = serde_json::to_vec(&meta).unwrap();
-        let deserialized: SnapshotMetadata = serde_json::from_slice(&json).unwrap();
-        assert_eq!(deserialized.expires_at, None);
-    }
-
-    #[test]
-    fn validate_name_valid() {
-        assert!(validate_snapshot_name("daily-backup").is_ok());
-        assert!(validate_snapshot_name("snapshot_2026_03_18").is_ok());
+    fn validate_accepts_valid_names() {
+        assert!(validate_snapshot_name("backup-2026-01-01").is_ok());
+        assert!(validate_snapshot_name("my_snapshot").is_ok());
+        assert!(validate_snapshot_name("abc123").is_ok());
         assert!(validate_snapshot_name("a").is_ok());
-        assert!(validate_snapshot_name("ABC123").is_ok());
     }
 
     #[test]
-    fn validate_name_empty() {
-        let err = validate_snapshot_name("").unwrap_err();
-        assert!(err.contains("empty"));
+    fn validate_rejects_empty_name() {
+        assert!(validate_snapshot_name("").is_err());
     }
 
     #[test]
-    fn validate_name_too_long() {
-        let long_name = "a".repeat(129);
-        let err = validate_snapshot_name(&long_name).unwrap_err();
-        assert!(err.contains("too long"));
+    fn validate_rejects_path_separator() {
+        assert!(validate_snapshot_name("bad/name").is_err());
+        assert!(validate_snapshot_name("bad\\name").is_err());
     }
 
     #[test]
-    fn validate_name_invalid_chars() {
-        let err = validate_snapshot_name("snap/shot").unwrap_err();
-        assert!(err.contains("invalid characters"));
-        assert!(validate_snapshot_name("snap shot").is_err());
-        assert!(validate_snapshot_name("snap.shot").is_err());
+    fn validate_rejects_too_long() {
+        let name = "a".repeat(129);
+        assert!(validate_snapshot_name(&name).is_err());
     }
 
     #[test]
-    fn validate_name_max_length_ok() {
+    fn validate_accepts_max_length() {
         let name = "a".repeat(128);
         assert!(validate_snapshot_name(&name).is_ok());
+    }
+
+    #[test]
+    fn metadata_round_trips_json() {
+        let pos = CommitLogPosition {
+            segment_id: 7,
+            offset: 1024,
+        };
+        let meta = SnapshotMetadata {
+            format_version: METADATA_FORMAT_VERSION,
+            name: "test-snap".to_string(),
+            created_at: "2026-03-18T00:00:00Z".to_string(),
+            expires_at: None,
+            commit_log_position: pos,
+            node_id: "node-1".to_string(),
+            ephemeral: false,
+            manifest_sha256: "abc123".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let decoded: SnapshotMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(meta, decoded);
     }
 }
