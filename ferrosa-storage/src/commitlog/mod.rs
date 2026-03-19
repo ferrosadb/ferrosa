@@ -23,6 +23,7 @@ pub mod cdc;
 pub(crate) mod checkpoint;
 pub(crate) mod config;
 pub(crate) mod descriptor;
+pub mod manifest;
 pub(crate) mod mutation;
 pub(crate) mod reader;
 pub(crate) mod segment;
