@@ -3996,6 +3996,129 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn resolve_index_type_hash() {
+        let result = resolve_index_type(Some("hash"), &["user_id".to_string()], &HashMap::new());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), IndexType::Hash);
+    }
+
+    #[test]
+    fn resolve_index_type_btree_explicit() {
+        let result = resolve_index_type(Some("btree"), &["col".to_string()], &HashMap::new());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), IndexType::BTree);
+    }
+
+    #[test]
+    fn resolve_index_type_composite() {
+        let result = resolve_index_type(
+            Some("composite"),
+            &["a".to_string(), "b".to_string()],
+            &HashMap::new(),
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), IndexType::Composite);
+    }
+
+    #[tokio::test]
+    async fn create_hash_index_stores_correct_type_in_schema() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+        };
+
+        // Create keyspace
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE hashks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Create table
+        let stmt =
+            crate::parser::parse("CREATE TABLE hashks.users (id int PRIMARY KEY, email text)")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // CREATE INDEX USING 'hash'
+        let stmt = crate::parser::parse(
+            "CREATE INDEX idx_email_hash ON hashks.users (email) USING 'hash'",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "CREATE INDEX USING 'hash' should succeed, got: {:?}",
+            result.err()
+        );
+
+        // Verify the index is stored with IndexType::Hash
+        let snap = state.schema.snapshot();
+        let key = (
+            "hashks".to_string(),
+            "users".to_string(),
+            "idx_email_hash".to_string(),
+        );
+        let idx = snap.indexes.get(&key);
+        assert!(idx.is_some(), "index should be registered in schema");
+        let idx = idx.unwrap();
+        assert!(
+            matches!(idx.index_type, IndexType::Hash),
+            "expected IndexType::Hash, got {:?}",
+            idx.index_type
+        );
+        assert_eq!(idx.target_columns, vec!["email"]);
+    }
+
+    #[tokio::test]
+    async fn hash_index_eq_predicate_uses_single_index_plan() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+        };
+
+        // Create keyspace + table + hash index
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE hashplan WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE hashplan.users (id int PRIMARY KEY, email text)")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE INDEX idx_hp_email ON hashplan.users (email) USING 'hash'",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // INSERT a row
+        let stmt = crate::parser::parse(
+            "INSERT INTO hashplan.users (id, email) VALUES (1, 'alice@example.com')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // SELECT WHERE email = ? — hash index Eq lookup must succeed (not require ALLOW FILTERING)
+        let stmt =
+            crate::parser::parse("SELECT * FROM hashplan.users WHERE email = 'alice@example.com'")
+                .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "SELECT WHERE indexed_col = ? should succeed with hash index, got: {:?}",
+            result.err()
+        );
+    }
+
     // ── UDT DDL routing tests ──────────────────────────────────────────
 
     #[tokio::test]

@@ -308,6 +308,41 @@ mod tests {
         assert_eq!(plan, ScanPlan::FullScan);
     }
 
+    // Hash indexes support POINT_LOOKUP only. The planner is index-type-agnostic:
+    // it matches any registered single-column index for an Eq predicate.
+    // These tests confirm hash index columns produce SingleIndex plans and that
+    // non-Eq predicates against hash-indexed columns fall through to FullScan.
+
+    #[test]
+    fn hash_index_eq_predicate_produces_single_index() {
+        // A hash index registered on `user_id` matches an Eq predicate.
+        let plan = plan(
+            &[wc("user_id", ComparisonOp::Eq)],
+            &pk(&["pk"]),
+            &[idx("idx_user_id_hash", &["user_id"])],
+        );
+        assert_eq!(
+            plan,
+            ScanPlan::SingleIndex {
+                index_name: "idx_user_id_hash".to_string(),
+                index_column: "user_id".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn hash_index_range_predicate_falls_to_full_scan() {
+        // Hash indexes don't support range scans. The planner rejects non-Eq
+        // predicates for all index types, so a Gt on a hash-indexed column
+        // must produce FullScan rather than an index plan.
+        let plan = plan(
+            &[wc("user_id", ComparisonOp::Gt)],
+            &pk(&["pk"]),
+            &[idx("idx_user_id_hash", &["user_id"])],
+        );
+        assert_eq!(plan, ScanPlan::FullScan);
+    }
+
     #[test]
     fn display_partition_key_lookup() {
         assert_eq!(
