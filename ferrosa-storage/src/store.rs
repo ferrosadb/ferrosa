@@ -29,7 +29,7 @@ use ferrosa_sstable::writer::SSTableWriter;
 use ferrosa_sstable::WriteOptions;
 
 use crate::flush::{self, FlushTarget};
-use crate::index::sidecar::SidecarReader;
+use crate::index::sidecar::{SidecarReader, SidecarWriter};
 use crate::memtable::index::MemtableIndex;
 #[cfg(not(feature = "skiplist-memtable"))]
 use crate::memtable::sharded::ShardedBTreeMemtable;
@@ -312,7 +312,11 @@ impl<F: FlushTarget> TableStore<F> {
         let reader = self.flush_target.flush(output)?;
         let new_reader = Arc::new(reader);
 
+        // Generation used for this flush — captured after flush() increments it.
+        let gen = self.flush_target.current_generation();
+
         // Step 5b: Build sidecar readers from the old memtable indexes.
+        // Also persist to disk if the flush target has a base directory.
         let mut sidecar_map: HashMap<String, SidecarReader> = HashMap::new();
         for (index_name, memtable_idx) in old_indexes.iter() {
             let entries: Vec<(IndexKey, Vec<RowPosition>)> = memtable_idx.iter().collect();
@@ -324,6 +328,12 @@ impl<F: FlushTarget> TableStore<F> {
                 })
                 .collect();
             if !flat_entries.is_empty() {
+                // Persist sidecar to disk when flush target has a base directory.
+                if let Some(base_dir) = self.flush_target.base_dir() {
+                    let sidecar_path = base_dir.join(format!("{gen}-{index_name}.sidecar"));
+                    SidecarWriter::write(&sidecar_path, &flat_entries)
+                        .map_err(|e| ferrosa_common::Error::InvalidData(e.to_string()))?;
+                }
                 sidecar_map.insert(
                     index_name.clone(),
                     SidecarReader::from_entries(flat_entries),
@@ -1558,5 +1568,209 @@ mod tests {
         let pks: Vec<&[u8]> = results.iter().map(|p| p.key.key.as_bytes()).collect();
         assert!(pks.contains(&b"user1".as_slice()));
         assert!(pks.contains(&b"user2".as_slice()));
+    }
+
+    // =========================================================================
+    // Task 3.1: Sidecar files written to disk during flush
+    // =========================================================================
+
+    #[test]
+    fn flush_writes_sidecar_files_to_disk() {
+        use crate::flush::FileFlushTarget;
+        use crate::index::sidecar::SidecarReader;
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "email".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let store = TableStore::new_with_indexes(
+            schema,
+            target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("email_idx".to_string(), 0_usize)],
+        );
+
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"alice@example.com".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+
+        store.flush().unwrap();
+
+        // Assert the sidecar file exists: {gen}-{index_name}.sidecar = 1-email_idx.sidecar
+        let sidecar_path = dir.path().join("1-email_idx.sidecar");
+        assert!(
+            sidecar_path.exists(),
+            "sidecar file should exist at {}",
+            sidecar_path.display()
+        );
+
+        // Assert the sidecar is readable and lookup works
+        let reader = SidecarReader::open(&sidecar_path).unwrap();
+        let results = reader
+            .lookup(&IndexKey(b"alice@example.com".to_vec()))
+            .unwrap();
+        assert_eq!(results.len(), 1, "should find one entry in sidecar");
+        assert_eq!(results[0].partition_key, b"user1");
+    }
+
+    #[test]
+    fn flush_empty_index_writes_no_sidecar_file() {
+        use crate::flush::FileFlushTarget;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        // Store with no indexed columns
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let store = TableStore::new(
+            schema,
+            target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+
+        store.write(&make_key("k1"), make_row(b"v1", 1000)).unwrap();
+        store.flush().unwrap();
+
+        // No indexed columns means no sidecar files should be written
+        let sidecar_count = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.ends_with(".sidecar"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(sidecar_count, 0, "no .sidecar files should exist");
+    }
+
+    #[test]
+    fn flush_multiple_indexes_writes_multiple_sidecars() {
+        use crate::flush::FileFlushTarget;
+        use crate::index::sidecar::SidecarReader;
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "email".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "city".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+        };
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let store = TableStore::new_with_indexes(
+            schema,
+            target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![
+                ("email_idx".to_string(), 0_usize),
+                ("city_idx".to_string(), 1_usize),
+            ],
+        );
+
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![],
+                    cells: vec![
+                        (0, CellValue::live(b"alice@example.com".to_vec(), 1000)),
+                        (1, CellValue::live(b"NYC".to_vec(), 1000)),
+                    ],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+
+        store.flush().unwrap();
+
+        // Both sidecar files should exist
+        let email_sidecar = dir.path().join("1-email_idx.sidecar");
+        let city_sidecar = dir.path().join("1-city_idx.sidecar");
+
+        assert!(
+            email_sidecar.exists(),
+            "email_idx sidecar should exist at {}",
+            email_sidecar.display()
+        );
+        assert!(
+            city_sidecar.exists(),
+            "city_idx sidecar should exist at {}",
+            city_sidecar.display()
+        );
+
+        // Verify lookups work in both
+        let email_reader = SidecarReader::open(&email_sidecar).unwrap();
+        let email_results = email_reader
+            .lookup(&IndexKey(b"alice@example.com".to_vec()))
+            .unwrap();
+        assert_eq!(email_results.len(), 1);
+        assert_eq!(email_results[0].partition_key, b"user1");
+
+        let city_reader = SidecarReader::open(&city_sidecar).unwrap();
+        let city_results = city_reader.lookup(&IndexKey(b"NYC".to_vec())).unwrap();
+        assert_eq!(city_results.len(), 1);
+        assert_eq!(city_results[0].partition_key, b"user1");
     }
 }

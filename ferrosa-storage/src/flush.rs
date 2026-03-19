@@ -107,6 +107,22 @@ pub trait FlushTarget {
 
     /// Write SSTable component bytes to the target and open a reader.
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<Self::Reader>>;
+
+    /// Base directory for sidecar files, if this target writes to disk.
+    ///
+    /// Returns `None` for in-memory targets. File-based targets return
+    /// the directory where `{gen}-{index_name}.sidecar` files are written.
+    fn base_dir(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    /// Generation number of the most recently flushed SSTable.
+    ///
+    /// Returns 0 if no flush has occurred or if this is an in-memory target.
+    /// After [`flush`] returns, this reflects the generation just written.
+    fn current_generation(&self) -> u64 {
+        0
+    }
 }
 
 /// In-memory flush target for testing — wraps output as `SSTableComponents<Vec<u8>>`.
@@ -195,6 +211,14 @@ impl FileFlushTarget {
 
 impl FlushTarget for FileFlushTarget {
     type Reader = FileReadAt;
+
+    fn base_dir(&self) -> Option<&std::path::Path> {
+        Some(&self.base_dir)
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
 
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<FileReadAt>> {
         let gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
