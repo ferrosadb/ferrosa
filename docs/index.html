@@ -851,9 +851,12 @@
         </p>
         <p style="margin-top: 0.75rem;">
           Point-in-time recovery retention is managed through standard S3 Lifecycle rules —
-          set a retention policy on your commit log archive bucket and S3 handles expiry
-          automatically. No custom GC, no cron jobs. Node retirement is just as simple:
-          decommission a node and its S3 objects are tagged for cleanup.
+          set a retention policy and S3 handles the rest. Keep 7 days in Standard for
+          instant recovery, or tier through Glacier for a full year of PITR at
+          pennies per GB. Cold SSTables automatically transition to cheaper storage classes
+          while staying instantly readable through the block cache.
+          Node retirement is just as simple: decommission a node and its S3 objects are
+          tagged for cleanup.
         </p>
         <p style="margin-top: 0.75rem;">
           Works with AWS S3, MinIO, Cloudflare R2, or any S3-compatible endpoint.
