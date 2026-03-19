@@ -110,8 +110,9 @@ impl UploadManager {
                         data,
                         sha256: _,
                     } => {
+                        let hex = hex_prefix_for(&segment_id.to_string());
                         let path = ObjectPath::from(format!(
-                            "{prefix}/commitlog-archive/{segment_id}.log"
+                            "{prefix}/commitlog-archive/{hex}/{segment_id}.log"
                         ));
                         if let Err(e) = Self::put_with_retry(&store, &path, data.clone(), 5).await {
                             tracing_or_eprintln(format!(
@@ -328,8 +329,9 @@ mod tests {
 
             manager.shutdown().await;
 
-            // Verify the segment is in the store at the correct path.
-            let path = ObjectPath::from("node1/commitlog-archive/42.log");
+            // Verify the segment is in the store at the correct hex-prefixed path.
+            let hex = hex_prefix_for("42");
+            let path = ObjectPath::from(format!("node1/commitlog-archive/{hex}/42.log"));
             let result = store.get(&path).await.unwrap();
             let bytes = result.bytes().await.unwrap();
             assert_eq!(bytes.as_ref(), b"commit-log-segment-bytes");

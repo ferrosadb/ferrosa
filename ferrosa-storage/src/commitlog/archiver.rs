@@ -74,7 +74,8 @@ impl CommitLogArchiver {
     /// Archives a single closed segment to S3.
     ///
     /// Reads the segment file from disk, computes its SHA-256, uploads
-    /// to `{prefix}/commitlog-archive/{segment_id}.log`, and returns
+    /// to `{prefix}/commitlog-archive/{hex}/{segment_id}.log` (where `hex`
+    /// is a 2-char prefix from `hex_prefix_for`), and returns
     /// the archive metadata.
     ///
     /// Retries transient S3 errors with exponential backoff (5 attempts:
@@ -97,8 +98,10 @@ impl CommitLogArchiver {
         let size = data.len() as u64;
 
         // Upload to S3 with retry.
+        // Distribute across 256 hex-prefixed buckets (same pattern as SSTable uploads).
+        let hex = crate::upload::manager::hex_prefix_for(&segment_id.to_string());
         let s3_path = ObjectPath::from(format!(
-            "{}/commitlog-archive/{segment_id}.log",
+            "{}/commitlog-archive/{hex}/{segment_id}.log",
             self.prefix
         ));
         let bytes = Bytes::from(data);
@@ -243,8 +246,9 @@ mod tests {
 
             let result = archiver.archive_segment(42).await.unwrap();
 
-            // Verify segment was uploaded to correct S3 path.
-            let s3_path = ObjectPath::from(format!("{prefix}/commitlog-archive/42.log"));
+            // Verify segment was uploaded to correct S3 path (hex-prefixed).
+            let hex = crate::upload::manager::hex_prefix_for("42");
+            let s3_path = ObjectPath::from(format!("{prefix}/commitlog-archive/{hex}/42.log"));
             let get_result = store.get(&s3_path).await.unwrap();
             let bytes = get_result.bytes().await.unwrap();
             assert_eq!(bytes.as_ref(), segment_data);

@@ -1839,7 +1839,9 @@ mod tests {
 
             // Verify the segment data is in S3.
             let seg = &manifest.segments[0];
-            let s3_path = ObjectPath::from(format!("{prefix}/commitlog-archive/{}.log", seg.id));
+            let hex = crate::upload::manager::hex_prefix_for(&seg.id.to_string());
+            let s3_path =
+                ObjectPath::from(format!("{prefix}/commitlog-archive/{hex}/{}.log", seg.id));
             let result = store.get(&s3_path).await;
             assert!(result.is_ok(), "segment file should exist in S3");
 
