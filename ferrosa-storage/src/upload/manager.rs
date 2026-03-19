@@ -30,6 +30,15 @@ pub enum UploadTask {
         /// Index component files: (component_name, data).
         files: Vec<(String, Bytes)>,
     },
+    /// Upload a commit log segment for PITR archiving.
+    CommitLogSegment {
+        /// Segment ID (used for the S3 key).
+        segment_id: u64,
+        /// Raw segment file bytes.
+        data: Bytes,
+        /// Pre-computed SHA-256 hex digest (stored in manifest, not validated here).
+        sha256: String,
+    },
     /// Shutdown signal.
     Shutdown,
 }
@@ -94,6 +103,20 @@ impl UploadManager {
                             {
                                 tracing_or_eprintln(format!("index upload failed for {path}: {e}"));
                             }
+                        }
+                    }
+                    UploadTask::CommitLogSegment {
+                        segment_id,
+                        data,
+                        sha256: _,
+                    } => {
+                        let path = ObjectPath::from(format!(
+                            "{prefix}/commitlog-archive/{segment_id}.log"
+                        ));
+                        if let Err(e) = Self::put_with_retry(&store, &path, data.clone(), 5).await {
+                            tracing_or_eprintln(format!(
+                                "commitlog segment upload failed for {path}: {e}"
+                            ));
                         }
                     }
                     UploadTask::Shutdown => break,
@@ -278,6 +301,38 @@ mod tests {
                 let result = store.get(&path).await.unwrap();
                 assert!(!result.bytes().await.unwrap().is_empty());
             }
+        });
+    }
+
+    #[test]
+    fn upload_commit_log_segment() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let store = Arc::new(InMemory::new());
+            let manager = UploadManager::new(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                "node1".into(),
+                16,
+                &tokio::runtime::Handle::current(),
+            );
+
+            let segment_data = Bytes::from_static(b"commit-log-segment-bytes");
+            manager
+                .submit(UploadTask::CommitLogSegment {
+                    segment_id: 42,
+                    data: segment_data.clone(),
+                    sha256: "abc123def456".into(), // pragma: allowlist secret
+                })
+                .await
+                .unwrap();
+
+            manager.shutdown().await;
+
+            // Verify the segment is in the store at the correct path.
+            let path = ObjectPath::from("node1/commitlog-archive/42.log");
+            let result = store.get(&path).await.unwrap();
+            let bytes = result.bytes().await.unwrap();
+            assert_eq!(bytes.as_ref(), b"commit-log-segment-bytes");
         });
     }
 }

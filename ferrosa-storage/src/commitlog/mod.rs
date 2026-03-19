@@ -81,6 +81,10 @@ pub struct CommitLog {
     /// Used by `discard_completed()` to gate segment deletion when
     /// archiving is enabled.
     archived: Mutex<HashSet<u64>>,
+
+    /// Channel sender for notifying the archiver of closed segments.
+    /// None when archiving is disabled.
+    archive_tx: Option<tokio::sync::mpsc::Sender<u64>>,
 }
 
 impl CommitLog {
@@ -106,6 +110,7 @@ impl CommitLog {
             sync_strategy,
             next_segment_id: AtomicU64::new(2), // first segment is 1
             archived: Mutex::new(HashSet::new()),
+            archive_tx: None,
         })
     }
 
@@ -353,6 +358,26 @@ impl CommitLog {
         self.archived.lock().clone()
     }
 
+    /// Sets the channel sender for archive notifications.
+    ///
+    /// Called by StorageEngine during initialization when archiving is enabled.
+    pub fn set_archive_channel(&mut self, tx: tokio::sync::mpsc::Sender<u64>) {
+        self.archive_tx = Some(tx);
+    }
+
+    /// Returns the current write position in the active segment.
+    ///
+    /// This is the position of the next byte that will be written. Used
+    /// by snapshot creation (PITR Sprint P-2) to record the commit log
+    /// position at the time of the snapshot.
+    pub fn current_position(&self) -> CommitLogPosition {
+        let segment = self.active.load();
+        CommitLogPosition {
+            segment_id: segment.id,
+            offset: segment.current_position(),
+        }
+    }
+
     /// Forces rotation of the active segment.
     ///
     /// Allocates a new segment, atomically swaps it in via `ArcSwap`, and moves
@@ -376,8 +401,15 @@ impl CommitLog {
         old_segment.flush_to_disk()?;
 
         // Move old segment to closed list.
+        let old_id = old_segment.id;
         let mut closed = self.closed_segments.lock();
         closed.push(old_segment);
+        drop(closed);
+
+        // Notify archiver of the closed segment (non-blocking).
+        if let Some(tx) = &self.archive_tx {
+            let _ = tx.try_send(old_id);
+        }
 
         Ok(())
     }
@@ -911,5 +943,66 @@ mod tests {
         assert_eq!(parse_segment_id("other-file.txt"), None);
         assert_eq!(parse_segment_id("commitlog-.log"), None);
         assert_eq!(parse_segment_id("commitlog-abc.log"), None);
+    }
+
+    #[test]
+    fn current_position_returns_active_segment_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config).unwrap();
+
+        let pos = cl.current_position();
+        assert_eq!(pos.segment_id, 1, "first segment should have id 1");
+        // Initial position is after header (17 bytes) + sync marker (8 bytes) = 25.
+        assert_eq!(pos.offset, 25, "initial offset should be 25");
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn current_position_advances_after_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config).unwrap();
+
+        let before = cl.current_position();
+        let m = simple_mutation();
+        cl.append(&m).unwrap();
+        let after = cl.current_position();
+
+        assert_eq!(before.segment_id, after.segment_id);
+        assert!(
+            after.offset > before.offset,
+            "position should advance after append: before={}, after={}",
+            before.offset,
+            after.offset
+        );
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn current_position_reflects_new_segment_after_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+
+        let m = simple_mutation();
+        // Write enough to force rotation.
+        for _ in 0..10 {
+            let _ = cl.append(&m);
+        }
+
+        let pos = cl.current_position();
+        assert!(
+            pos.segment_id > 1,
+            "should have rotated to a new segment, got id={}",
+            pos.segment_id
+        );
+
+        cl.shutdown().unwrap();
     }
 }

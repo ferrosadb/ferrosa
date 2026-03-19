@@ -61,6 +61,16 @@ impl CommitLogArchiver {
         }
     }
 
+    /// Returns a reference to the object store.
+    pub fn store(&self) -> &dyn ObjectStore {
+        self.store.as_ref()
+    }
+
+    /// Returns the S3 prefix.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     /// Archives a single closed segment to S3.
     ///
     /// Reads the segment file from disk, computes its SHA-256, uploads

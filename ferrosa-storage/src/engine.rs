@@ -118,6 +118,8 @@ pub struct StorageEngine {
     /// Optional index build scheduler — wiring to flush/compaction is deferred.
     #[allow(dead_code)]
     index_scheduler: Option<crate::index::IndexBuildScheduler>,
+    /// Background archiver task handle, if archiving is enabled.
+    archiver_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Per-table state: schema + store.
@@ -180,6 +182,109 @@ impl StorageEngine {
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler: None,
+            archiver_handle: None,
+        })
+    }
+
+    /// Creates a storage engine with an explicit archive object store.
+    ///
+    /// Used by tests to inject an InMemory store instead of real S3.
+    /// When `archive_store` is `Some` and `config.commit_log.archive` is
+    /// enabled, spawns a background archiver task on the provided runtime.
+    pub fn new_with_archive_store(
+        config: StorageEngineConfig,
+        runtime: Option<&tokio::runtime::Handle>,
+        archive_store: Option<Arc<dyn object_store::ObjectStore>>,
+        archive_prefix: String,
+    ) -> ferrosa_common::Result<Self> {
+        std::fs::create_dir_all(&config.data_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("failed to create data dir: {e}"))
+        })?;
+        std::fs::create_dir_all(&config.commit_log.log_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
+        })?;
+
+        let mut commit_log = CommitLog::new(config.commit_log.clone())?;
+        let compaction_executor = CompactionExecutor::new();
+
+        let upload_manager = match (&config.object_store, runtime) {
+            (Some(os_config), Some(rt)) => {
+                let store = os_config.build_object_store()?;
+                Some(UploadManager::new(
+                    Arc::from(store),
+                    os_config.prefix.clone(),
+                    os_config.upload_queue_depth,
+                    rt,
+                ))
+            }
+            _ => None,
+        };
+
+        let local_cache =
+            LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
+
+        // Set up archiver if enabled.
+        let archiver_handle = match (&config.commit_log.archive, archive_store, runtime) {
+            (Some(archive_cfg), Some(store), Some(rt)) if archive_cfg.enabled => {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(64);
+                commit_log.set_archive_channel(tx);
+
+                let archiver = crate::commitlog::archiver::CommitLogArchiver::new(
+                    store,
+                    archive_prefix,
+                    config.commit_log.log_dir.clone(),
+                );
+
+                // Spawn background archiver task.
+                let handle = rt.spawn(async move {
+                    while let Some(segment_id) = rx.recv().await {
+                        match archiver.archive_segment(segment_id).await {
+                            Ok(result) => {
+                                // Update manifest.
+                                let entry = crate::commitlog::manifest::ArchiveSegmentEntry {
+                                    id: result.segment_id,
+                                    sha256: result.sha256,
+                                    size: result.size,
+                                    archived_at: result.archived_at,
+                                };
+                                if let Err(e) =
+                                    crate::commitlog::manifest::ArchiveManifest::append_and_save(
+                                        archiver.store(),
+                                        archiver.prefix(),
+                                        entry,
+                                    )
+                                    .await
+                                {
+                                    eprintln!(
+                                        "[commitlog-archiver] manifest update failed for segment {segment_id}: {e}"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[commitlog-archiver] failed to archive segment {segment_id}: {e}"
+                                );
+                            }
+                        }
+                    }
+                });
+                Some(handle)
+            }
+            _ => None,
+        };
+
+        Ok(Self {
+            config,
+            tables: RwLock::new(HashMap::new()),
+            commit_log,
+            compaction_executor,
+            upload_manager,
+            local_cache,
+            observers: RwLock::new(Vec::new()),
+            async_observers: RwLock::new(Vec::new()),
+            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            index_scheduler: None,
+            archiver_handle,
         })
     }
 
@@ -232,6 +337,7 @@ impl StorageEngine {
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler: None,
+            archiver_handle: None,
         };
 
         Ok((engine, pending_mutations))
@@ -598,6 +704,14 @@ impl StorageEngine {
         self.commit_log.replay_from(position)
     }
 
+    /// Returns the current commit log write position.
+    ///
+    /// Used by snapshot creation to record which commit log position
+    /// the snapshot covers.
+    pub fn commit_log_position(&self) -> CommitLogPosition {
+        self.commit_log.current_position()
+    }
+
     /// Force-syncs the commit log to disk.
     ///
     /// Ensures all buffered mutations are written to disk before reading
@@ -738,6 +852,11 @@ impl StorageEngine {
 
         // Stop compaction.
         self.compaction_executor.shutdown();
+
+        // Stop archiver.
+        if let Some(handle) = &self.archiver_handle {
+            handle.abort();
+        }
 
         // Commit log shutdown.
         self.commit_log.shutdown()?;
@@ -1634,5 +1753,97 @@ mod tests {
         engine.poll_compactions();
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn commit_log_position_exposed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let before = engine.commit_log_position();
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000)
+            .unwrap();
+        let after = engine.commit_log_position();
+
+        assert!(
+            after > before,
+            "commit_log_position should advance after write"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn archiver_uploads_closed_segment_on_rotate() {
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjectPath;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let prefix = "test-node";
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig {
+                    segment_size: 512, // small to force rotation
+                    archive: Some(crate::commitlog::config::ArchiveConfig {
+                        enabled: true,
+                        poll_interval: std::time::Duration::from_millis(50),
+                        ..crate::commitlog::config::ArchiveConfig::default()
+                    }),
+                    ..CommitLogConfig::test_config(dir.path())
+                },
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let engine = StorageEngine::new_with_archive_store(
+                config,
+                Some(&tokio::runtime::Handle::current()),
+                Some(Arc::clone(&store)),
+                prefix.to_string(),
+            )
+            .unwrap();
+
+            engine.register_table(test_schema()).unwrap();
+
+            let tid = table_id();
+            let key = make_key("k1");
+            let row = make_row(b"value", 1000);
+
+            // Write enough to trigger rotation.
+            for i in 0..20 {
+                let _ = engine.write(&tid, &key, row.clone(), i);
+            }
+
+            // Give the archiver time to process.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            // Verify at least one segment was uploaded to S3.
+            let manifest =
+                crate::commitlog::manifest::ArchiveManifest::load(store.as_ref(), prefix)
+                    .await
+                    .unwrap();
+            assert!(
+                !manifest.segments.is_empty(),
+                "archiver should have uploaded at least one segment"
+            );
+
+            // Verify the segment data is in S3.
+            let seg = &manifest.segments[0];
+            let s3_path = ObjectPath::from(format!("{prefix}/commitlog-archive/{}.log", seg.id));
+            let result = store.get(&s3_path).await;
+            assert!(result.is_ok(), "segment file should exist in S3");
+
+            engine.shutdown().unwrap();
+        });
     }
 }
