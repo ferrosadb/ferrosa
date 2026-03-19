@@ -215,6 +215,22 @@ impl SnapshotManager {
         Ok(ids)
     }
 
+    /// Deletes all snapshots whose `expires_at` is before `now_iso`.
+    /// Returns the names of deleted snapshots.
+    pub async fn cleanup_expired(&self, now_iso: &str) -> ferrosa_common::Result<Vec<String>> {
+        let snapshots = self.list_snapshots().await?;
+        let mut deleted = Vec::new();
+        for snap in snapshots {
+            if let Some(ref expires) = snap.expires_at {
+                if expires.as_str() < now_iso {
+                    self.delete_snapshot(&snap.name).await?;
+                    deleted.push(snap.name.clone());
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Returns the minimum commit-log position across all live snapshots, or
     /// `None` if no snapshots exist.
     ///
@@ -225,35 +241,6 @@ impl SnapshotManager {
         let snapshots = self.list_snapshots().await?;
         let min = snapshots.iter().map(|m| m.commit_log_position).min(); // CommitLogPosition implements Ord
         Ok(min)
-    }
-
-    /// Returns segment IDs that are safe to delete from S3 archive.
-    ///
-    /// A segment is safe to delete only if its ID is:
-    /// 1. Below the retention cutoff (based on age)
-    /// 2. Below the oldest snapshot's commit log position segment_id
-    ///
-    /// This prevents deleting segments that a snapshot's PITR restore
-    /// would need for replay.
-    pub async fn segments_safe_to_delete(
-        &self,
-        candidate_segment_ids: &[u64],
-        retention_cutoff_segment_id: u64,
-    ) -> ferrosa_common::Result<Vec<u64>> {
-        let oldest_snapshot_pos = self.oldest_snapshot_position().await?;
-
-        let effective_cutoff = match oldest_snapshot_pos {
-            Some(pos) => retention_cutoff_segment_id.min(pos.segment_id),
-            None => retention_cutoff_segment_id,
-        };
-
-        let safe: Vec<u64> = candidate_segment_ids
-            .iter()
-            .filter(|&&id| id < effective_cutoff)
-            .copied()
-            .collect();
-
-        Ok(safe)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
@@ -786,142 +773,61 @@ mod tests {
     // ── Test 9 ────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn snapshot_captures_consistent_manifest_state() {
-        // Verify that a snapshot captures a self-consistent manifest.
-        // Even if the live manifest is updated between our read and the
-        // snapshot write, the snapshot's copy is internally consistent.
+    async fn cleanup_expired_deletes_past_snapshots() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let prefix = "node1";
-        let mgr = SnapshotManager::new(Arc::clone(&store), prefix.to_string());
-
-        // Create a manifest with 2 SSTables
-        let mut manifest = Manifest::new();
-        manifest.add_sstable(
-            "ks.t",
-            ManifestEntry {
-                id: "sst1".into(),
-                size: 100,
-                min_token: 0,
-                max_token: 50,
-                min_timestamp: 1000,
-                max_timestamp: 2000,
-            },
-        );
-        manifest.add_sstable(
-            "ks.t",
-            ManifestEntry {
-                id: "sst2".into(),
-                size: 200,
-                min_token: 51,
-                max_token: 100,
-                min_timestamp: 2000,
-                max_timestamp: 3000,
-            },
-        );
-
+        let mgr = SnapshotManager::new(Arc::clone(&store), "pfx".to_string());
+        let manifest = Manifest::new();
         let pos = CommitLogPosition {
-            segment_id: 5,
-            offset: 512,
-        };
-        mgr.create_snapshot("pre-compaction", &manifest, b"{}", pos, "n1", None, false)
-            .await
-            .unwrap();
-
-        // Simulate compaction: replace sst1+sst2 with sst3
-        let mut compacted = Manifest::new();
-        compacted.add_sstable(
-            "ks.t",
-            ManifestEntry {
-                id: "sst3".into(),
-                size: 250,
-                min_token: 0,
-                max_token: 100,
-                min_timestamp: 1000,
-                max_timestamp: 3000,
-            },
-        );
-
-        let pos2 = CommitLogPosition {
-            segment_id: 6,
+            segment_id: 1,
             offset: 0,
         };
+
+        // Snapshot with expiry in the past.
         mgr.create_snapshot(
-            "post-compaction",
-            &compacted,
+            "old-snap",
+            &manifest,
             b"{}",
-            pos2,
+            pos,
             "n1",
-            None,
+            Some("2026-01-01T00:00:00Z".to_string()),
             false,
         )
         .await
         .unwrap();
+        // Snapshot with expiry in the future.
+        mgr.create_snapshot(
+            "new-snap",
+            &manifest,
+            b"{}",
+            pos,
+            "n1",
+            Some("2099-12-31T00:00:00Z".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+        // Snapshot with no expiry.
+        mgr.create_snapshot("perm-snap", &manifest, b"{}", pos, "n1", None, false)
+            .await
+            .unwrap();
 
-        // Pre-compaction snapshot references sst1, sst2
-        let pre = mgr.load_snapshot_manifest("pre-compaction").await.unwrap();
-        let pre_ids: Vec<&str> = pre.sstables["ks.t"].iter().map(|e| e.id.as_str()).collect();
-        assert!(pre_ids.contains(&"sst1"));
-        assert!(pre_ids.contains(&"sst2"));
-        assert!(!pre_ids.contains(&"sst3"));
+        let deleted = mgr.cleanup_expired("2026-03-19T00:00:00Z").await.unwrap();
+        assert_eq!(deleted, vec!["old-snap"]);
 
-        // Post-compaction snapshot references sst3
-        let post = mgr.load_snapshot_manifest("post-compaction").await.unwrap();
-        let post_ids: Vec<&str> = post.sstables["ks.t"]
-            .iter()
-            .map(|e| e.id.as_str())
-            .collect();
-        assert!(post_ids.contains(&"sst3"));
-        assert!(!post_ids.contains(&"sst1"));
-
-        // Both snapshots are self-consistent
-        assert_eq!(pre.sstables["ks.t"].len(), 2);
-        assert_eq!(post.sstables["ks.t"].len(), 1);
+        let remaining = mgr.list_snapshots().await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        let names: Vec<&str> = remaining.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"new-snap"));
+        assert!(names.contains(&"perm-snap"));
     }
 
     // ── Test 10 ───────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn archive_retention_respects_snapshot_position() {
+    async fn cleanup_expired_no_expired_snapshots() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let prefix = "node1";
-        let mgr = SnapshotManager::new(Arc::clone(&store), prefix.to_string());
-
-        // Create snapshot at segment 10
-        let manifest = Manifest::new();
-        let pos = CommitLogPosition {
-            segment_id: 10,
-            offset: 0,
-        };
-        mgr.create_snapshot("snap1", &manifest, b"{}", pos, "n1", None, false)
-            .await
-            .unwrap();
-
-        // Retention says delete segments below 15
-        // But snapshot needs segments >= 10 for PITR replay
-        // So effective cutoff = min(15, 10) = 10
-        let safe = mgr
-            .segments_safe_to_delete(&[5, 8, 10, 12, 14], 15)
-            .await
-            .unwrap();
-
-        // Only segments strictly below 10 are safe
-        assert_eq!(safe, vec![5, 8]);
-    }
-
-    // ── Test 11 ───────────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn archive_retention_no_snapshots_uses_retention_cutoff() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let prefix = "node1";
-        let mgr = SnapshotManager::new(Arc::clone(&store), prefix.to_string());
-
-        // No snapshots — use retention cutoff directly
-        let safe = mgr
-            .segments_safe_to_delete(&[5, 8, 10, 12, 14], 10)
-            .await
-            .unwrap();
-
-        assert_eq!(safe, vec![5, 8]);
+        let mgr = SnapshotManager::new(Arc::clone(&store), "pfx".to_string());
+        let deleted = mgr.cleanup_expired("2026-03-19T00:00:00Z").await.unwrap();
+        assert!(deleted.is_empty());
     }
 }

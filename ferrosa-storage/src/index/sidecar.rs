@@ -167,6 +167,14 @@ impl SidecarReader {
         self.entry_count
     }
 
+    /// Returns all entries as `(IndexKey, RowPosition)` pairs.
+    pub fn all_entries(&self) -> Vec<(IndexKey, RowPosition)> {
+        self.entries
+            .iter()
+            .map(|e| (IndexKey(e.key.clone()), e.position.clone()))
+            .collect()
+    }
+
     /// Point lookup: returns all `RowPosition`s whose key exactly matches.
     pub fn lookup(&self, key: &IndexKey) -> IndexResult<Vec<RowPosition>> {
         let key_bytes = &key.0;
@@ -183,15 +191,6 @@ impl SidecarReader {
             }
         }
         Ok(results)
-    }
-
-    /// Returns all `(IndexKey, RowPosition)` pairs in this sidecar, in sorted
-    /// key order. Used to collect entries for merging during compaction.
-    pub fn all_entries(&self) -> Vec<(IndexKey, RowPosition)> {
-        self.entries
-            .iter()
-            .map(|e| (IndexKey(e.key.clone()), e.position.clone()))
-            .collect()
     }
 
     /// Range query: returns all `RowPosition`s for keys in `[start, end]`
@@ -563,6 +562,27 @@ mod tests {
             .range(&IndexKey(b"aaa".to_vec()), &IndexKey(b"zzz".to_vec()))
             .unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    // ── Task 4.4: CRC32 validation tests ─────────────────────────────────────
+
+    #[test]
+    fn single_bit_flip_in_header_detected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bitflip.sidecar");
+        SidecarWriter::write(&path, &sample_entries()).unwrap();
+        let mut data = std::fs::read(&path).unwrap();
+        data[7] ^= 0x01; // flip one bit in entry_count
+        std::fs::write(&path, &data).unwrap();
+        assert!(SidecarReader::open(&path).is_err());
+    }
+
+    #[test]
+    fn valid_sidecar_opens_without_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("valid.sidecar");
+        SidecarWriter::write(&path, &sample_entries()).unwrap();
+        assert!(SidecarReader::open(&path).is_ok());
     }
 
     #[test]

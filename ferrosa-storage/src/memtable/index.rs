@@ -489,4 +489,59 @@ mod concurrent_tests {
             }
         }
     }
+
+    // ── Task 4.5: Concurrent stress test ─────────────────────────────────────
+
+    #[test]
+    fn concurrent_stress_10_writers_10_readers() {
+        let index = Arc::new(MemtableIndex::new());
+        let barrier = Arc::new(std::sync::Barrier::new(20));
+
+        let writers: Vec<_> = (0..10)
+            .map(|t| {
+                let idx = Arc::clone(&index);
+                let bar = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    bar.wait();
+                    for i in 0..1000 {
+                        let key = IndexKey(format!("t{t}-k{i}").into_bytes());
+                        let pos = RowPosition {
+                            partition_key: format!("pk-{t}-{i}").into_bytes(),
+                            clustering_key: vec![],
+                        };
+                        idx.insert(key, pos);
+                    }
+                })
+            })
+            .collect();
+
+        let readers: Vec<_> = (0..10)
+            .map(|_| {
+                let idx = Arc::clone(&index);
+                let bar = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    bar.wait();
+                    for _ in 0..2000 {
+                        let _ = idx.lookup(&IndexKey(b"t0-k0".to_vec()));
+                        let _ = idx.range(&IndexKey(b"a".to_vec()), &IndexKey(b"z".to_vec()));
+                    }
+                })
+            })
+            .collect();
+
+        for h in writers {
+            h.join().unwrap();
+        }
+        for h in readers {
+            h.join().unwrap();
+        }
+
+        // Verify all entries present
+        for t in 0..10 {
+            for i in 0..1000 {
+                let key = IndexKey(format!("t{t}-k{i}").into_bytes());
+                assert_eq!(index.lookup(&key).len(), 1, "missing t{t}-k{i}");
+            }
+        }
+    }
 }
