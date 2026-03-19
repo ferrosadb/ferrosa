@@ -355,7 +355,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// matching partitions, and returns merged results.
     ///
     /// Returns an error if the number of matching row positions exceeds
-    /// [`INDEX_RESULT_CAP`] (10,000) to prevent OOM on high-cardinality
+    /// `INDEX_RESULT_CAP` (10,000) to prevent OOM on high-cardinality
     /// index values. The error message suggests `ALLOW FILTERING` for
     /// unbounded scans.
     ///
