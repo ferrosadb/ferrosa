@@ -272,6 +272,7 @@ mod tests {
                 sync_strategy: SyncStrategyConfig::Batch,
                 log_dir: dir.to_path_buf(),
                 checkpoint_dir: dir.to_path_buf(),
+                archive: None,
             },
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
