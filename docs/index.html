@@ -759,10 +759,10 @@
   </h1>
   <p>
     Drop-in CQL compatibility. No GC pauses. Ephemeral nodes that recover in seconds.
-    Start on a single node in development, promote to a pair for HA, then scale to
-    a full production cluster with Raft consensus, tunable consistency, and hinted handoff
-    — same binary, same config, no migration.
-    Production-quality code in active development.
+    Your data lives in S3 — no EBS snapshots, no backup jobs. Point-in-time recovery
+    for 10 TB costs $2/month, not $2,250. Start on a single node, scale to a full
+    production cluster — same binary, same config, no migration.
+    Cheap, fast, easy — pick all three.
   </p>
   <div class="hero-actions">
     <a href="#get-started" class="btn-primary">Get Started</a>
@@ -779,8 +779,8 @@
       <div class="stat-label">Node Recovery</div>
     </div>
     <div class="stat">
-      <div class="stat-value">10<span class="unit">x</span></div>
-      <div class="stat-label">Lower Storage Cost</div>
+      <div class="stat-value">1000<span class="unit">x</span></div>
+      <div class="stat-label">Cheaper Point-in-Time Recovery</div>
     </div>
     <div class="stat">
       <div class="stat-value">1→N</div>
@@ -801,6 +801,11 @@
 
     <div class="pain-points">
       <div class="pain-card">
+        <div class="pain-icon">💸</div>
+        <h3>Backups Cost More Than Storage</h3>
+        <p>Point-in-time recovery requires EBS snapshots — a second copy of your entire dataset. 10 TB with 30-day retention? That's $2,250/month just for backups. A full year costs $15,000/month. And you're still paying for the live EBS volumes underneath.</p>
+      </div>
+      <div class="pain-card">
         <div class="pain-icon">⏱</div>
         <h3>GC Pauses Kill Your P99</h3>
         <p>Java's garbage collector causes unpredictable tail latency spikes. No amount of JVM tuning eliminates the problem — it just moves it.</p>
@@ -811,7 +816,7 @@
         <p>When a node dies, streaming hundreds of gigabytes from replicas takes hours. Your cluster runs degraded the entire time.</p>
       </div>
       <div class="pain-card">
-        <div class="pain-icon">💸</div>
+        <div class="pain-icon">📀</div>
         <h3>Storage Costs Scale Linearly</h3>
         <p>Every replica needs its own EBS volumes. At petabyte scale, you're paying $0.10–0.25/GB/month for attached storage across every node.</p>
       </div>
@@ -833,6 +838,67 @@
   </p>
 
   <div class="features-grid">
+    <!-- Point-in-Time Recovery — full width highlight, lead feature -->
+    <div class="feature-card highlight">
+      <div>
+        <div class="feature-icon s3">☁</div>
+        <h3>Point-in-Time Recovery at 1/1000th the Cost</h3>
+        <p>
+          Traditional databases store data on EBS, then pay again to snapshot it for backups.
+          30-day point-in-time recovery for 10 TB on Cassandra costs ~$2,250/month in EBS
+          snapshots alone. Ferrosa's data is already durable in S3 — there is no "backup"
+          step. Point-in-time recovery is just commit log retention:
+          <strong>$2.30/month</strong> for the same 10 TB.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          One command sets your retention policy:
+          <code style="font-size: 0.875rem;">ferrosa-ctl storage retention set --years 1</code>.
+          Ferrosa configures S3 Lifecycle rules that tier your archives through Standard,
+          Infrequent Access, and Glacier automatically. A full year of point-in-time recovery
+          costs ~$45/TB — actually cheaper than 3 months without tiering, because data
+          spends most of its life in Deep Archive at $0.00099/GB.
+        </p>
+        <span class="metric">30d recovery: $2.30 vs $2,250 · 1yr: $45/TB · DynamoDB max: 35 days</span>
+      </div>
+      <div style="padding: 1.5rem;">
+        <table style="width: 100%; font-size: 0.8125rem; font-family: var(--font-mono); border-collapse: collapse;">
+          <thead>
+            <tr style="border-bottom: 1px solid var(--border);">
+              <th style="text-align: left; padding: 0.5rem; color: var(--text-muted); font-weight: 600;">10 TB Recovery</th>
+              <th style="text-align: right; padding: 0.5rem; color: var(--text-muted); font-weight: 600;">Cassandra</th>
+              <th style="text-align: right; padding: 0.5rem; color: var(--accent); font-weight: 600;">Ferrosa</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="border-bottom: 1px solid var(--border);">
+              <td style="padding: 0.5rem; color: var(--text-secondary);">7 days</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$525/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$0.55/mo</td>
+            </tr>
+            <tr style="border-bottom: 1px solid var(--border);">
+              <td style="padding: 0.5rem; color: var(--text-secondary);">30 days</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$2,250/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$2.30/mo</td>
+            </tr>
+            <tr style="border-bottom: 1px solid var(--border);">
+              <td style="padding: 0.5rem; color: var(--text-secondary);">1 year</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$15,000/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$3.75/mo</td>
+            </tr>
+            <tr>
+              <td style="padding: 0.5rem; color: var(--text-secondary);">3 years</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--text-secondary);">$30,000/mo</td>
+              <td style="text-align: right; padding: 0.5rem; color: var(--accent-green); font-weight: 600;">$5.20/mo</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.75rem; text-align: center;">
+          Cassandra: EBS snapshots at $0.05/GB, 5% daily change rate, RF=3.
+          Ferrosa: S3 Lifecycle tiered commit log retention.
+        </p>
+      </div>
+    </div>
+
     <!-- S3 Storage — full width highlight -->
     <div class="feature-card highlight">
       <div>
@@ -853,8 +919,8 @@
           Point-in-time recovery retention is one command:
           <code style="font-size: 0.875rem;">ferrosa-ctl storage retention set --years 1</code>.
           Ferrosa configures S3 Lifecycle rules that tier your commit log archives through
-          Standard, Infrequent Access, and Glacier automatically. A full year of PITR costs
-          ~$45/TB — cheaper than 3 months without tiering. Cold SSTables transition to
+          Standard, Infrequent Access, and Glacier automatically. A full year of point-in-time
+          recovery costs ~$45/TB — cheaper than 3 months without tiering. Cold SSTables transition to
           cheaper storage classes automatically while staying instantly readable through
           the block cache — 66% savings on storage with zero performance impact.
           Node retirement is just as simple: decommission a node and its S3 objects are
@@ -864,7 +930,7 @@
           Works with AWS S3, MinIO, Cloudflare R2, or any S3-compatible endpoint.
           No vendor lock-in.
         </p>
-        <span class="metric">S3: ~$0.023/GB/mo · 1yr PITR: ~$45/TB · SSTable tiering: 66% savings</span>
+        <span class="metric">S3: ~$0.023/GB/mo · 1yr recovery: ~$45/TB · SSTable tiering: 66% savings</span>
       </div>
       <div class="arch-diagram" style="margin-top: 0; border: none; background: var(--bg-primary);">
         <div class="arch-layers">
@@ -1394,7 +1460,7 @@ user = session.execute(stmt, [user_id])
           <td>~$250K/mo</td>
         </tr>
         <tr>
-          <td>PITR Cost (PB, 30d)</td>
+          <td>Recovery Cost (PB, 30d)</td>
           <td class="ferrosa-col">~$2/mo (commit log only)</td>
           <td>~$150K/mo (EBS snapshots)</td>
           <td>~$150K/mo (EBS snapshots)</td>
@@ -1402,7 +1468,7 @@ user = session.execute(stmt, [user_id])
           <td>~$250K/mo (on-demand)</td>
         </tr>
         <tr>
-          <td>PITR Cost (PB, 1yr)</td>
+          <td>Recovery Cost (PB, 1yr)</td>
           <td class="ferrosa-col">~$45/mo (Glacier tiered)</td>
           <td>~$500K+/mo</td>
           <td>~$500K+/mo</td>
