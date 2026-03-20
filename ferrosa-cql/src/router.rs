@@ -711,6 +711,17 @@ fn route_select_user_table(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
+    // Reject ALLOW FILTERING — Ferrosa requires queries to use indexed columns
+    // or partition keys rather than full-table scans.
+    if s.allow_filtering {
+        return Err(CqlError::Invalid(
+            "ALLOW FILTERING is not supported. Ferrosa requires queries to use \
+             indexed columns or partition keys. Create an index on the filtered \
+             column or restructure your query."
+                .into(),
+        ));
+    }
+
     // Build column info for result
     let (col_names, col_types) = build_column_info(table_meta, &s.columns, ks, &state.schema)?;
 
@@ -797,12 +808,12 @@ fn route_select_user_table(
                 ..
             } => {
                 // IndexScanWithFilter means some WHERE columns are not covered
-                // by any index — Cassandra requires ALLOW FILTERING in this case.
-                if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) && !s.allow_filtering {
+                // by any index — reject these queries.
+                if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) {
                     return Err(CqlError::Invalid(
-                        "Cannot execute this query as it might involve data filtering and \
-                         thus may have unpredictable performance. If you want to execute \
-                         this query despite the performance unpredictability, use ALLOW FILTERING"
+                        "Cannot execute this query as it requires filtering on non-indexed \
+                         columns. Create a secondary index on the filtered columns or \
+                         restructure your query to use partition keys."
                             .into(),
                     ));
                 }
@@ -942,11 +953,11 @@ fn route_select_user_table(
                     .iter()
                     .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
 
-                if !s.where_clauses.is_empty() && !all_where_columns_indexed && !s.allow_filtering {
+                if !s.where_clauses.is_empty() && !all_where_columns_indexed {
                     return Err(CqlError::Invalid(
-                        "Cannot execute this query as it might involve data filtering and \
-                         thus may have unpredictable performance. If you want to execute \
-                         this query despite the performance unpredictability, use ALLOW FILTERING"
+                        "Cannot execute this query as it requires filtering on non-indexed \
+                         columns. Create a secondary index on the filtered columns or \
+                         restructure your query to use partition keys."
                             .into(),
                     ));
                 }
@@ -4714,7 +4725,7 @@ mod tests {
         }
 
         // Full scan should also return 0 rows
-        let stmt = crate::parser::parse("SELECT * FROM ks.t ALLOW FILTERING").unwrap();
+        let stmt = crate::parser::parse("SELECT * FROM ks.t").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => assert_eq!(
@@ -4726,10 +4737,13 @@ mod tests {
         }
     }
 
-    // ── BUG-002: ALLOW FILTERING range predicates ────────────────────
+    // ── ALLOW FILTERING is always rejected ────────────────────────
+    //
+    // Ferrosa policy: ALLOW FILTERING is not supported.  Queries must use
+    // partition keys or secondary indexes.
 
     #[tokio::test]
-    async fn allow_filtering_range_predicates() {
+    async fn allow_filtering_rejected() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -4747,68 +4761,22 @@ mod tests {
             crate::parser::parse("CREATE TABLE ks.t (id int PRIMARY KEY, score int)").unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
-        // Insert rows with varying scores: 10, 20, 30, 40, 50
-        for (id, score) in [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)] {
-            let stmt = crate::parser::parse(&format!(
-                "INSERT INTO ks.t (id, score) VALUES ({id}, {score})"
-            ))
-            .unwrap();
-            route(&state, &ctx, stmt).await.unwrap();
-        }
-
-        // SELECT with score > 25 ALLOW FILTERING => should return rows with score 30, 40, 50
         let stmt =
             crate::parser::parse("SELECT * FROM ks.t WHERE score > 25 ALLOW FILTERING").unwrap();
-        let result = route(&state, &ctx, stmt).await.unwrap();
-        match &result {
-            RouteResult::Result(b) => {
-                let count = extract_row_count(b);
-                assert_eq!(count, 3, "score > 25 should match 3 rows, got {count}");
+        match route(&state, &ctx, stmt).await {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("ALLOW FILTERING"),
+                    "error should mention ALLOW FILTERING: {msg}"
+                );
             }
-            _ => panic!("expected Result"),
-        }
-
-        // SELECT with score < 25 ALLOW FILTERING => should return rows with score 10, 20
-        let stmt =
-            crate::parser::parse("SELECT * FROM ks.t WHERE score < 25 ALLOW FILTERING").unwrap();
-        let result = route(&state, &ctx, stmt).await.unwrap();
-        match &result {
-            RouteResult::Result(b) => {
-                let count = extract_row_count(b);
-                assert_eq!(count, 2, "score < 25 should match 2 rows, got {count}");
-            }
-            _ => panic!("expected Result"),
-        }
-
-        // SELECT with score >= 30 ALLOW FILTERING => should return rows with score 30, 40, 50
-        let stmt =
-            crate::parser::parse("SELECT * FROM ks.t WHERE score >= 30 ALLOW FILTERING").unwrap();
-        let result = route(&state, &ctx, stmt).await.unwrap();
-        match &result {
-            RouteResult::Result(b) => {
-                let count = extract_row_count(b);
-                assert_eq!(count, 3, "score >= 30 should match 3 rows, got {count}");
-            }
-            _ => panic!("expected Result"),
-        }
-
-        // SELECT with score <= 20 ALLOW FILTERING => should return rows with score 10, 20
-        let stmt =
-            crate::parser::parse("SELECT * FROM ks.t WHERE score <= 20 ALLOW FILTERING").unwrap();
-        let result = route(&state, &ctx, stmt).await.unwrap();
-        match &result {
-            RouteResult::Result(b) => {
-                let count = extract_row_count(b);
-                assert_eq!(count, 2, "score <= 20 should match 2 rows, got {count}");
-            }
-            _ => panic!("expected Result"),
+            Ok(_) => panic!("ALLOW FILTERING should be rejected"),
         }
     }
 
-    // ── BUG-003: LIMIT applied before post-filtering ─────────────────
-
     #[tokio::test]
-    async fn limit_applied_after_filtering() {
+    async fn allow_filtering_with_limit_also_rejected() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -4816,103 +4784,23 @@ mod tests {
             consistency: ConsistencyLevel::One,
         };
 
-        // Setup
         let stmt = crate::parser::parse(
-            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE KEYSPACE afl WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
         ).unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
         let stmt =
-            crate::parser::parse("CREATE TABLE ks.t (id int PRIMARY KEY, flag int)").unwrap();
+            crate::parser::parse("CREATE TABLE afl.t (id int PRIMARY KEY, flag int)").unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
-        // Insert 10 rows, only 3 have flag = 1
-        for id in 1..=10 {
-            let flag = if id <= 3 { 1 } else { 0 };
-            let stmt = crate::parser::parse(&format!(
-                "INSERT INTO ks.t (id, flag) VALUES ({id}, {flag})"
-            ))
-            .unwrap();
-            route(&state, &ctx, stmt).await.unwrap();
-        }
-
-        // SELECT with flag = 1 LIMIT 2 ALLOW FILTERING
-        // Should return exactly 2 rows (out of the 3 that match)
         let stmt =
-            crate::parser::parse("SELECT * FROM ks.t WHERE flag = 1 LIMIT 2 ALLOW FILTERING")
+            crate::parser::parse("SELECT * FROM afl.t WHERE flag = 1 LIMIT 2 ALLOW FILTERING")
                 .unwrap();
-        let result = route(&state, &ctx, stmt).await.unwrap();
-        match &result {
-            RouteResult::Result(b) => {
-                let count = extract_row_count(b);
-                assert_eq!(
-                    count, 2,
-                    "LIMIT 2 after filtering should return 2 matching rows, got {count}"
-                );
-            }
-            _ => panic!("expected Result"),
-        }
-
-        // Also verify without LIMIT we get all 3
-        let stmt =
-            crate::parser::parse("SELECT * FROM ks.t WHERE flag = 1 ALLOW FILTERING").unwrap();
-        let result = route(&state, &ctx, stmt).await.unwrap();
-        match &result {
-            RouteResult::Result(b) => {
-                let count = extract_row_count(b);
-                assert_eq!(
-                    count, 3,
-                    "without LIMIT should return all 3 matching rows, got {count}"
-                );
-            }
-            _ => panic!("expected Result"),
-        }
-    }
-
-    // ── BUG-018: ALLOW FILTERING rejected at runtime ────────────────
-
-    #[tokio::test]
-    async fn allow_filtering_select_star_with_non_pk_predicate() {
-        // Reproduces the exact pattern from the bug report:
-        // SELECT * FROM bbqa.t WHERE v > 20 ALLOW FILTERING
-        let (state, _dir) = setup();
-        let ctx = RequestContext {
-            auth: &dev_auth(),
-            current_keyspace: &None,
-            consistency: ConsistencyLevel::One,
-        };
-
-        let stmt = crate::parser::parse(
-            "CREATE KEYSPACE bbqa WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
-        ).unwrap();
-        route(&state, &ctx, stmt).await.unwrap();
-
-        let stmt = crate::parser::parse("CREATE TABLE bbqa.t (k int PRIMARY KEY, v int)").unwrap();
-        route(&state, &ctx, stmt).await.unwrap();
-
-        for (k, v) in [(1, 10), (2, 20), (3, 30)] {
-            let stmt =
-                crate::parser::parse(&format!("INSERT INTO bbqa.t (k, v) VALUES ({k}, {v})"))
-                    .unwrap();
-            route(&state, &ctx, stmt).await.unwrap();
-        }
-
-        // This is the exact query from the bug report.
-        let stmt =
-            crate::parser::parse("SELECT * FROM bbqa.t WHERE v > 20 ALLOW FILTERING").unwrap();
         let result = route(&state, &ctx, stmt).await;
         assert!(
-            result.is_ok(),
-            "ALLOW FILTERING should not be rejected: {:?}",
-            result.err()
+            result.is_err(),
+            "ALLOW FILTERING with LIMIT should also be rejected"
         );
-        match result.unwrap() {
-            RouteResult::Result(b) => {
-                let count = extract_row_count(&b);
-                assert_eq!(count, 1, "v > 20 should match 1 row (v=30), got {count}");
-            }
-            _ => panic!("expected Result"),
-        }
     }
 
     // ── ALLOW FILTERING rejection: exact Cassandra semantics ─────────
@@ -4976,8 +4864,8 @@ mod tests {
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
-                    msg.contains("ALLOW FILTERING"),
-                    "error should mention ALLOW FILTERING, got: {msg}"
+                    msg.contains("non-indexed"),
+                    "error should mention non-indexed columns, got: {msg}"
                 );
             }
             Ok(_) => panic!(
@@ -4986,9 +4874,9 @@ mod tests {
         }
     }
 
-    /// Same query WITH ALLOW FILTERING must succeed and return the matching row.
+    /// Even with an index on some columns, ALLOW FILTERING is rejected.
     #[tokio::test]
-    async fn allow_filtering_accepted_for_partially_indexed_where_with_flag() {
+    async fn allow_filtering_rejected_even_with_partial_index() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -5012,29 +4900,11 @@ mod tests {
         route(&state, &ctx, stmt).await.unwrap();
 
         let stmt = crate::parser::parse(
-            "INSERT INTO af2.users (id, name, email) VALUES (1, 'Ada', 'ada@example.com')",
-        )
-        .unwrap();
-        route(&state, &ctx, stmt).await.unwrap();
-
-        // Same WHERE columns but WITH ALLOW FILTERING — must succeed.
-        let stmt = crate::parser::parse(
             "SELECT * FROM af2.users WHERE email = 'ada@example.com' AND name = 'Ada' ALLOW FILTERING",
         )
         .unwrap();
         let result = route(&state, &ctx, stmt).await;
-        assert!(
-            result.is_ok(),
-            "ALLOW FILTERING should allow partially-indexed WHERE: {:?}",
-            result.err()
-        );
-        match result.unwrap() {
-            RouteResult::Result(b) => {
-                let count = extract_row_count(&b);
-                assert_eq!(count, 1, "should return the 1 matching row, got {count}");
-            }
-            _ => panic!("expected Result"),
-        }
+        assert!(result.is_err(), "ALLOW FILTERING should be rejected");
     }
 
     /// Querying on a fully-indexed column without ALLOW FILTERING must succeed.
