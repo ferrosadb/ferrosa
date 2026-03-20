@@ -113,7 +113,7 @@ pub trait FlushTarget {
 
     /// Returns the generation number of the most recently flushed SSTable.
     ///
-    /// Used by [`TableStore`] to determine which generation number to use
+    /// Used by `TableStore` to determine which generation number to use
     /// when writing per-SSTable sidecar index files alongside the SSTable.
     /// Returns 0 for in-memory targets where no generation tracking occurs.
     fn last_generation(&self) -> u64 {
@@ -122,7 +122,7 @@ pub trait FlushTarget {
 
     /// Write per-index sidecar files alongside the flushed SSTable.
     ///
-    /// Called after [`flush`] with the same generation number. For each
+    /// Called after [`FlushTarget::flush`] with the same generation number. For each
     /// `(index_name, entries)` pair, writes a `{gen}-{index_name}.sidecar`
     /// file so that sidecar indexes survive process restarts.
     ///

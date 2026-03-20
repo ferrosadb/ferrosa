@@ -180,7 +180,7 @@ impl<F: FlushTarget> TableStore<F> {
         )
     }
 
-    /// Like [`new_with_sstables`] but also registers secondary index declarations
+    /// Like [`Self::new_with_sstables`] but also registers secondary index declarations
     /// so that new writes populate the memtable index.
     pub fn new_with_sstables_and_indexes(
         schema: TableSchema,
