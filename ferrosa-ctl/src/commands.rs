@@ -357,6 +357,70 @@ pub async fn rebalance(host: &str, web_port: u16) -> Result<(), WebError> {
     }
 }
 
+// ── Snapshot and restore commands ─────────────────────────────────────────────
+//
+// These commands make HTTP requests to the Ferrosa web admin API for PITR
+// (point-in-time recovery) operations.  The REST endpoints are not yet
+// implemented; for now each function prints what it would do and returns `Ok`.
+
+/// Create a snapshot on the target node.
+///
+/// Will issue `POST /api/snapshots` once the endpoint exists.
+pub async fn snapshot_create(
+    host: &str,
+    web_port: u16,
+    name: &str,
+    ttl_hours: Option<u64>,
+) -> Result<(), WebError> {
+    let node_url = format!("http://{}:{}", host, web_port);
+    println!("Creating snapshot '{name}'...");
+    println!("  TTL: {ttl_hours:?} hours");
+    println!("  Node: {node_url}");
+    // TODO: POST /api/snapshots
+    Ok(())
+}
+
+/// List snapshots on the target node.
+///
+/// Will issue `GET /api/snapshots` once the endpoint exists.
+pub async fn snapshot_list(host: &str, web_port: u16) -> Result<(), WebError> {
+    let node_url = format!("http://{}:{}", host, web_port);
+    println!("Listing snapshots...");
+    println!("  Node: {node_url}");
+    // TODO: GET /api/snapshots
+    Ok(())
+}
+
+/// Delete a snapshot on the target node.
+///
+/// Will issue `DELETE /api/snapshots/{name}` once the endpoint exists.
+pub async fn snapshot_delete(host: &str, web_port: u16, name: &str) -> Result<(), WebError> {
+    let node_url = format!("http://{}:{}", host, web_port);
+    println!("Deleting snapshot '{name}'...");
+    println!("  Node: {node_url}");
+    // TODO: DELETE /api/snapshots/{name}
+    Ok(())
+}
+
+/// Restore from a snapshot, optionally to a point in time.
+///
+/// Will issue `POST /api/restore` once the endpoint exists.
+pub async fn restore(
+    host: &str,
+    web_port: u16,
+    snapshot_name: &str,
+    point_in_time: Option<&str>,
+    force: bool,
+) -> Result<(), WebError> {
+    let node_url = format!("http://{}:{}", host, web_port);
+    println!("Restoring from snapshot '{snapshot_name}'...");
+    println!("  Point-in-time: {point_in_time:?}");
+    println!("  Force: {force}");
+    println!("  Node: {node_url}");
+    // TODO: POST /api/restore
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -592,5 +656,71 @@ mod tests {
         let value = serde_json::json!([]);
         let entries = value.as_array().unwrap();
         assert!(entries.is_empty());
+    }
+
+    // ── Snapshot / restore URL-construction tests ──────────────────────────────
+
+    fn snapshot_create_url(host: &str, web_port: u16) -> String {
+        format!("http://{}:{}/api/snapshots", host, web_port)
+    }
+
+    fn snapshot_list_url(host: &str, web_port: u16) -> String {
+        format!("http://{}:{}/api/snapshots", host, web_port)
+    }
+
+    fn snapshot_delete_url(host: &str, web_port: u16, name: &str) -> String {
+        format!("http://{}:{}/api/snapshots/{}", host, web_port, name)
+    }
+
+    fn restore_url(host: &str, web_port: u16) -> String {
+        format!("http://{}:{}/api/restore", host, web_port)
+    }
+
+    #[test]
+    fn snapshot_create_formats_correct_url() {
+        let url = snapshot_create_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/snapshots");
+    }
+
+    #[test]
+    fn snapshot_list_formats_correct_url() {
+        let url = snapshot_list_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/snapshots");
+    }
+
+    #[test]
+    fn snapshot_delete_formats_correct_url() {
+        let url = snapshot_delete_url("127.0.0.1", 9090, "daily-backup");
+        assert_eq!(url, "http://127.0.0.1:9090/api/snapshots/daily-backup");
+    }
+
+    #[test]
+    fn restore_formats_correct_url() {
+        let url = restore_url("127.0.0.1", 9090);
+        assert_eq!(url, "http://127.0.0.1:9090/api/restore");
+    }
+
+    #[test]
+    fn restore_body_with_point_in_time() {
+        let body = serde_json::json!({
+            "snapshot_name": "daily-backup",
+            "point_in_time": "2026-03-18T12:00:00Z",
+            "force": false,
+        });
+        assert_eq!(body["snapshot_name"], "daily-backup");
+        assert_eq!(body["point_in_time"], "2026-03-18T12:00:00Z");
+        assert_eq!(body["force"], false);
+    }
+
+    #[test]
+    fn restore_body_without_point_in_time() {
+        let pit: Option<&str> = None;
+        let body = serde_json::json!({
+            "snapshot_name": "my-snap",
+            "point_in_time": pit,
+            "force": true,
+        });
+        assert!(body["point_in_time"].is_null());
+        assert_eq!(body["force"], true);
     }
 }

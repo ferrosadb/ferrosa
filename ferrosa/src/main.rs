@@ -403,6 +403,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         registry: schema.virtual_tables_arc(),
         mode_controller: mode_controller.clone(),
         schema: schema.clone(),
+        storage: storage.clone(),
+        host_id,
         auth_disabled,
     };
     let web_config = web::WebConfig::from_env();

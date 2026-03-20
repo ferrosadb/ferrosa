@@ -66,6 +66,22 @@
     #status-pill.ok   { background: rgba(63,185,80,0.15);  color: var(--green); }
     #status-pill.err  { background: rgba(248,81,73,0.15);  color: var(--red); }
 
+    /* ── Archive lag pill (Task 5.8) ─────────────────────── */
+    #archive-lag-pill {
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+      background: var(--border);
+      color: var(--muted);
+      transition: background 0.3s, color 0.3s;
+      display: none;
+    }
+
+    #archive-lag-pill.lag-green  { background: rgba(63,185,80,0.15);  color: var(--green);  display: inline-block; }
+    #archive-lag-pill.lag-yellow { background: rgba(210,153,34,0.15); color: var(--yellow); display: inline-block; }
+    #archive-lag-pill.lag-red    { background: rgba(248,81,73,0.15);  color: var(--red);    display: inline-block; }
+
     #refresh-countdown {
       font-size: 12px;
       color: var(--muted);
@@ -219,6 +235,209 @@
 
     /* Full-width cards span all columns */
     .card.full-width { grid-column: 1 / -1; }
+
+    /* ── Backup & Restore card (Task 5.7) ────────────────── */
+    .snapshot-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+
+    .snapshot-toolbar input[type="text"] {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 13px;
+      padding: 6px 10px;
+      outline: none;
+    }
+
+    .snapshot-toolbar input[type="text"]:focus {
+      border-color: var(--accent);
+    }
+
+    .snapshot-toolbar input[type="text"]::placeholder {
+      color: var(--muted);
+    }
+
+    .btn {
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      transition: background 0.15s, border-color 0.15s;
+      white-space: nowrap;
+    }
+
+    .btn:hover { background: rgba(255,255,255,0.06); }
+
+    .btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      background: rgba(88,166,255,0.12);
+      border-color: rgba(88,166,255,0.4);
+      color: var(--accent);
+    }
+
+    .btn-primary:hover:not(:disabled) { background: rgba(88,166,255,0.2); }
+
+    .btn-danger {
+      background: transparent;
+      border-color: var(--border);
+      color: var(--red);
+      padding: 4px 10px;
+      font-size: 11px;
+    }
+
+    .btn-danger:hover:not(:disabled) { background: rgba(248,81,73,0.08); }
+
+    .btn-restore {
+      background: transparent;
+      border-color: var(--border);
+      color: var(--accent);
+      padding: 4px 10px;
+      font-size: 11px;
+    }
+
+    .btn-restore:hover:not(:disabled) { background: rgba(88,166,255,0.08); }
+
+    /* Archive lag indicator row inside the snapshot card (Task 5.7) */
+    .archive-status-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 18px;
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .archive-lag-badge {
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .archive-lag-badge.green  { background: rgba(63,185,80,0.15);  color: var(--green); }
+    .archive-lag-badge.yellow { background: rgba(210,153,34,0.15); color: var(--yellow); }
+    .archive-lag-badge.red    { background: rgba(248,81,73,0.15);  color: var(--red); }
+
+    /* ── Restore confirmation modal (Task 5.10) ──────────── */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .modal-overlay.open { display: flex; }
+
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      width: min(520px, calc(100vw - 48px));
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .modal-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .modal-body {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.7;
+    }
+
+    .modal-preflight {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 14px;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      gap: 4px 12px;
+    }
+
+    .modal-preflight dt { color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; font-size: 11px; }
+    .modal-preflight dd { color: var(--text); }
+
+    .modal-preflight-error {
+      background: var(--bg);
+      border: 1px solid rgba(248,81,73,0.4);
+      border-radius: 6px;
+      padding: 12px 14px;
+      font-size: 12px;
+      color: var(--red);
+    }
+
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .pitr-input-row {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .pitr-input-row label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+
+    .pitr-input-row input[type="datetime-local"] {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 13px;
+      padding: 6px 10px;
+      outline: none;
+      width: 100%;
+    }
+
+    .pitr-input-row input[type="datetime-local"]:focus {
+      border-color: var(--accent);
+    }
+
+    .modal-warning {
+      background: rgba(248,81,73,0.08);
+      border: 1px solid rgba(248,81,73,0.3);
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-size: 12px;
+      color: var(--red);
+    }
   </style>
 </head>
 <body>
@@ -226,6 +445,8 @@
 <header>
   <div class="logo">ferrosa <span>operations console</span></div>
   <span id="refresh-countdown">Refreshing in 5s</span>
+  <!-- Task 5.8: archive health pill -->
+  <span id="archive-lag-pill" title="Commit-log archive health">Archive: &#8212;</span>
   <span id="status-pill">Connecting&#8230;</span>
 </header>
 
@@ -275,7 +496,56 @@
     </div>
   </div>
 
+  <!-- Backup & Restore (Tasks 5.7, 5.8) -->
+  <div class="card full-width" id="card-snapshots">
+    <div class="card-header">
+      <span class="card-title">Backup &amp; Restore</span>
+      <span class="card-badge" id="badge-snapshots">&#8212;</span>
+    </div>
+    <!-- Create snapshot toolbar -->
+    <div class="snapshot-toolbar">
+      <input type="text" id="snapshot-name-input" placeholder="Snapshot name (e.g. pre-deploy-20260319)" maxlength="128">
+      <input type="number" id="snapshot-ttl-input" placeholder="TTL (hours, 0=forever)" min="0" max="8760"
+             style="width:180px; background:var(--surface); border:1px solid var(--border); border-radius:6px;
+                    color:var(--text); font-size:13px; padding:6px 10px; outline:none;">
+      <button class="btn btn-primary" id="btn-create-snapshot" onclick="createSnapshot()">Create Snapshot</button>
+    </div>
+    <!-- Snapshot table -->
+    <div class="card-body" id="body-snapshots">
+      <div class="placeholder loading">Loading snapshots&#8230;</div>
+    </div>
+    <!-- Archive lag indicator (Task 5.7 inline) -->
+    <div class="archive-status-row" id="archive-status-row">
+      <span>Archive lag:</span>
+      <span class="archive-lag-badge" id="archive-lag-badge-inline">&#8212;</span>
+      <span id="archive-lag-detail" style="color:var(--muted)"></span>
+    </div>
+  </div>
+
 </main>
+
+<!-- Restore confirmation modal (Task 5.10) -->
+<div class="modal-overlay" id="restore-modal" role="dialog" aria-modal="true" aria-labelledby="restore-modal-title">
+  <div class="modal">
+    <div class="modal-title" id="restore-modal-title">Confirm Restore</div>
+    <div class="modal-body" id="restore-modal-body">Running preflight checks&#8230;</div>
+    <div id="restore-modal-preflight"></div>
+    <div class="pitr-input-row">
+      <label for="restore-pit-input">Point-in-time cutoff (optional)</label>
+      <input type="datetime-local" id="restore-pit-input">
+    </div>
+    <div class="modal-warning">
+      Restoring will overwrite all current data on the next node restart.
+      This action cannot be undone.
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="btn-modal-cancel" onclick="closeRestoreModal()">Cancel</button>
+      <button class="btn btn-danger" id="btn-modal-confirm" onclick="confirmRestore()" disabled>
+        Restore
+      </button>
+    </div>
+  </div>
+</div>
 
 <script>
 "use strict";
@@ -432,6 +702,279 @@ function placeholderErr(msg) {
   return '<div class="placeholder" style="color:var(--red)">' + escHtml(msg) + "</div>";
 }
 
+// ── Task 5.8: Archive lag pill (header) ───────────────────
+// Also updates the inline badge in the Backup & Restore card.
+//
+// Task 5.9: The WebSocket handler in ws.rs dispatches subscriptions via the
+// VirtualTableRegistry.  archive_status is served by a dedicated REST handler
+// (GET /api/archive_status) and is not registered as a virtual table, so
+// WebSocket subscription is not available.  We poll on the same REFRESH_INTERVAL_MS
+// cadence instead.
+// TODO(5.9): register archive_status as a virtual table or add a direct WS
+//            event type to ws.rs so it can be pushed rather than polled.
+
+function updateArchiveLagPill(unarchived) {
+  var pill    = document.getElementById("archive-lag-pill");
+  var inline  = document.getElementById("archive-lag-badge-inline");
+  var detail  = document.getElementById("archive-lag-detail");
+
+  var cls, label;
+  if (unarchived === 0) {
+    cls   = "green";
+    label = "Healthy";
+  } else if (unarchived <= 5) {
+    cls   = "yellow";
+    label = unarchived + " unarchived";
+  } else {
+    cls   = "red";
+    label = unarchived + " unarchived";
+  }
+
+  // Header pill (Task 5.8)
+  pill.className = "lag-" + cls;
+  pill.textContent = "Archive: " + label;
+
+  // Inline badge (Task 5.7)
+  inline.className = "archive-lag-badge " + cls;
+  inline.textContent = label;
+  detail.textContent = unarchived === 0
+    ? "All commit-log segments archived"
+    : unarchived + " segment(s) pending archive";
+}
+
+function refreshArchiveStatus() {
+  fetchJSON("/api/archive_status").then(function(data) {
+    var unarchived = Number(data.unarchived_segments) || 0;
+    updateArchiveLagPill(unarchived);
+  }).catch(function() {
+    var pill = document.getElementById("archive-lag-pill");
+    pill.className = "lag-red";
+    pill.textContent = "Archive: Error";
+  });
+}
+
+// ── Task 5.7: Snapshot table renderer ────────────────────
+function renderSnapshotTable(snapshots) {
+  if (!Array.isArray(snapshots) || snapshots.length === 0) {
+    return '<div class="placeholder">No snapshots. Create one above.</div>';
+  }
+
+  var rows = snapshots.map(function(snap) {
+    var name       = escHtml(snap.name || "");
+    var createdAt  = escHtml(snap.created_at || "\u2014");
+    var expiresAt  = snap.expires_at ? escHtml(snap.expires_at) : '<span style="color:var(--muted)">never</span>';
+    var sizeCells  = '<td style="color:var(--muted)">&#8212;</td>'; // size not yet in API response
+
+    return (
+      "<tr>" +
+      "<td>" + name + "</td>" +
+      "<td>" + createdAt + "</td>" +
+      "<td>" + expiresAt + "</td>" +
+      sizeCells +
+      '<td>' +
+        '<button class="btn btn-restore" onclick="openRestoreModal(' + JSON.stringify(snap.name) + ')" title="Restore from ' + name + '">Restore</button>' +
+        ' <button class="btn btn-danger" onclick="deleteSnapshot(' + JSON.stringify(snap.name) + ')" title="Delete ' + name + '">Delete</button>' +
+      '</td>' +
+      "</tr>"
+    );
+  }).join("");
+
+  return (
+    "<table>" +
+    "<thead><tr>" +
+    "<th>Name</th>" +
+    "<th>Created</th>" +
+    "<th>Expires</th>" +
+    "<th>Size</th>" +
+    "<th>Actions</th>" +
+    "</tr></thead>" +
+    "<tbody>" + rows + "</tbody>" +
+    "</table>"
+  );
+}
+
+function refreshSnapshots() {
+  fetchJSON("/api/snapshots").then(function(data) {
+    var snaps = Array.isArray(data) ? data : [];
+    setBody("body-snapshots", renderSnapshotTable(snaps));
+    setBadge("badge-snapshots", snaps.length);
+  }).catch(function(err) {
+    setBody("body-snapshots", placeholderErr(err.message || "Fetch failed"));
+    setBadge("badge-snapshots", null);
+  });
+}
+
+// ── Create snapshot ───────────────────────────────────────
+function createSnapshot() {
+  var nameInput = document.getElementById("snapshot-name-input");
+  var ttlInput  = document.getElementById("snapshot-ttl-input");
+  var btn       = document.getElementById("btn-create-snapshot");
+
+  var name = nameInput.value.trim();
+  if (!name) {
+    nameInput.focus();
+    return;
+  }
+
+  var ttlHours = parseInt(ttlInput.value, 10);
+  var body = { name: name };
+  if (!isNaN(ttlHours) && ttlHours > 0) {
+    body.ttl_hours = ttlHours;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "Creating\u2026";
+
+  fetch("/api/snapshots", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(function(res) {
+    if (!res.ok) {
+      return res.json().then(function(data) {
+        throw new Error(data.error || "HTTP " + res.status);
+      });
+    }
+    nameInput.value = "";
+    ttlInput.value  = "";
+    refreshSnapshots();
+  }).catch(function(err) {
+    setBody("body-snapshots", placeholderErr("Create failed: " + (err.message || String(err))));
+  }).finally(function() {
+    btn.disabled = false;
+    btn.textContent = "Create Snapshot";
+  });
+}
+
+// ── Delete snapshot ───────────────────────────────────────
+function deleteSnapshot(name) {
+  if (!confirm("Delete snapshot \"" + name + "\"? This cannot be undone.")) {
+    return;
+  }
+  fetch("/api/snapshots/" + encodeURIComponent(name), { method: "DELETE" })
+    .then(function(res) {
+      if (!res.ok && res.status !== 204) {
+        return res.json().then(function(data) {
+          throw new Error(data.error || "HTTP " + res.status);
+        });
+      }
+      refreshSnapshots();
+    }).catch(function(err) {
+      setBody("body-snapshots", placeholderErr("Delete failed: " + (err.message || String(err))));
+    });
+}
+
+// ── Task 5.10: Restore confirmation modal ────────────────
+var pendingRestoreSnapshot = null;
+
+function openRestoreModal(snapshotName) {
+  pendingRestoreSnapshot = snapshotName;
+
+  document.getElementById("restore-modal-title").textContent = "Restore from \"" + snapshotName + "\"";
+  document.getElementById("restore-modal-body").textContent = "Running preflight checks\u2026";
+  document.getElementById("restore-modal-preflight").innerHTML = "";
+  document.getElementById("restore-pit-input").value = "";
+  document.getElementById("btn-modal-confirm").disabled = true;
+  document.getElementById("restore-modal").classList.add("open");
+
+  // Run preflight to populate modal details.
+  fetch("/api/restore/preflight", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ snapshot: snapshotName }),
+  }).then(function(res) {
+    return res.json().then(function(data) {
+      return { ok: res.ok, status: res.status, data: data };
+    });
+  }).then(function(result) {
+    var data = result.data;
+    if (!result.ok) {
+      document.getElementById("restore-modal-body").textContent =
+        "Preflight failed \u2014 snapshot may be corrupt or missing.";
+      document.getElementById("restore-modal-preflight").innerHTML =
+        '<div class="modal-preflight-error">' + escHtml(data.error || "Unknown error") + "</div>";
+      return;
+    }
+
+    document.getElementById("restore-modal-body").textContent =
+      "Preflight passed. Review the details below before confirming.";
+
+    var clPos = data.commit_log_position || {};
+    document.getElementById("restore-modal-preflight").innerHTML =
+      '<dl class="modal-preflight">' +
+      "<dt>Snapshot</dt><dd>" + escHtml(data.snapshot || "\u2014") + "</dd>" +
+      "<dt>Created</dt><dd>" + escHtml(data.created_at || "\u2014") + "</dd>" +
+      "<dt>Node ID</dt><dd>" + escHtml(data.node_id || "\u2014") + "</dd>" +
+      "<dt>SSTables</dt><dd>" + escHtml(String(data.sstable_count || 0)) + "</dd>" +
+      "<dt>Commit log</dt><dd>segment " +
+        escHtml(String(clPos.segment_id || 0)) +
+        " offset " +
+        escHtml(String(clPos.offset || 0)) +
+      "</dd>" +
+      "</dl>";
+
+    document.getElementById("btn-modal-confirm").disabled = false;
+  }).catch(function(err) {
+    document.getElementById("restore-modal-body").textContent = "Preflight request failed.";
+    document.getElementById("restore-modal-preflight").innerHTML =
+      '<div class="modal-preflight-error">' + escHtml(err.message || String(err)) + "</div>";
+  });
+}
+
+function closeRestoreModal() {
+  pendingRestoreSnapshot = null;
+  document.getElementById("restore-modal").classList.remove("open");
+}
+
+function confirmRestore() {
+  if (!pendingRestoreSnapshot) { return; }
+
+  var pitValue = document.getElementById("restore-pit-input").value;
+  var body = { snapshot: pendingRestoreSnapshot };
+  if (pitValue) {
+    // Convert local datetime string to ISO 8601 UTC string.
+    body.point_in_time = new Date(pitValue).toISOString();
+  }
+
+  document.getElementById("btn-modal-confirm").disabled = true;
+  document.getElementById("btn-modal-confirm").textContent = "Submitting\u2026";
+
+  fetch("/api/restore", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(function(res) {
+    return res.json().then(function(data) {
+      return { ok: res.ok, status: res.status, data: data };
+    });
+  }).then(function(result) {
+    if (result.ok) {
+      closeRestoreModal();
+      alert("Restore accepted. Restart the node to complete the restore.");
+    } else {
+      document.getElementById("restore-modal-body").textContent =
+        "Restore failed: " + (result.data.error || "HTTP " + result.status);
+      document.getElementById("btn-modal-confirm").disabled = false;
+      document.getElementById("btn-modal-confirm").textContent = "Restore";
+    }
+  }).catch(function(err) {
+    document.getElementById("restore-modal-body").textContent =
+      "Restore request failed: " + (err.message || String(err));
+    document.getElementById("btn-modal-confirm").disabled = false;
+    document.getElementById("btn-modal-confirm").textContent = "Restore";
+  });
+}
+
+// Close modal on overlay click.
+document.getElementById("restore-modal").addEventListener("click", function(evt) {
+  if (evt.target === this) { closeRestoreModal(); }
+});
+
+// Close modal on Escape key.
+document.addEventListener("keydown", function(evt) {
+  if (evt.key === "Escape") { closeRestoreModal(); }
+});
+
 // ── Main refresh ──────────────────────────────────────────
 function refreshAll() {
   var anyError = false;
@@ -440,6 +983,11 @@ function refreshAll() {
   var connectionsPromise = fetchJSON("/api/connections");
   var storagePromise     = fetchJSON("/api/storage_stats");
   var queriesPromise     = fetchJSON("/api/active_queries");
+
+  // Task 5.9: archive_status is polled here rather than via WebSocket.
+  // See TODO(5.9) comment above for details.
+  refreshArchiveStatus();
+  refreshSnapshots();
 
   Promise.allSettled([tablesPromise, connectionsPromise, storagePromise, queriesPromise])
     .then(function(results) {

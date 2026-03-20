@@ -1,6 +1,6 @@
 # Ferrosa Development Status
 
-> Last updated: 2026-03-17
+> Last updated: 2026-03-20
 > Status: Living document
 
 ## Overview
@@ -9,13 +9,12 @@ Ferrosa is a **distributed CQL-compatible database** with graph
 query support, built-in observability, and S3-backed storage. The production cluster
 sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff,
 node lifecycle (join/decommission/rebalance), reconnection, and integration tests.
-Hardening and observability wiring sprints are also complete. UDT/UDF with WASM
-sandboxing is complete (parser, schema, DDL replication, Wasmtime compilation, router
-wiring). Secondary and vector indexes consolidated into the main branch. Graph engine
-is fully complete: Cypher parser, expression evaluator, aggregation framework,
-variable-length paths with BFS, SUBSCRIBE/UNSUBSCRIBE with SSE streaming,
-leapfrog triejoin for worst-case optimal joins, Bolt v5 wire protocol with TCP
-server, and full adjacency reconciliation.
+UDT/UDF with WASM sandboxing is complete. Secondary and vector indexes are consolidated
+with a full query planner pipeline (MemtableIndex, sidecar files, EXPLAIN,
+IndexIntersection, VectorMemtableIndex). Point-in-time recovery is fully implemented:
+commit log archiving to S3, snapshot management, point-in-time restoration with
+timestamp filtering, CLI tooling, and web console integration with Backup & Restore
+dashboard. The graph engine is fully complete.
 
 | Metric | Value |
 |--------|-------|
@@ -86,6 +85,15 @@ cluster        ██████   ██████  █████░   █
   - [x] ~~S3 upload wiring~~ (flush → UploadManager → manifest update)
   - [x] ~~S3 cold restart bootstrap~~ (schema.json + manifest → download SSTables)
   - [x] ~~Graceful shutdown flush + S3 sync~~
+  - [x] ~~Commit log archiving to S3~~ (PITR Sprint P-1)
+  - [x] ~~SnapshotManager (create/list/delete)~~ (PITR Sprint P-2)
+  - [x] ~~SSTable GC safety (snapshot manifest scanning)~~ (PITR Sprint P-2)
+  - [x] ~~RestoreManager (segment continuity, timestamp filtering, node-id validation)~~ (PITR Sprint P-3)
+  - [x] ~~StorageEngine::open_from_snapshot~~ (PITR Sprint P-3)
+  - [x] ~~archive_status and snapshots virtual tables~~ (PITR Sprint P-4)
+  - [x] ~~Snapshot TTL cleanup~~ (PITR Sprint P-4)
+  - [x] ~~Sidecar index file persistence (flush, load, merge, tombstone-aware)~~ (Index Sprints I-1/I-3)
+  - [x] ~~VectorMemtableIndex for ANN queries~~ (Index Sprint I-4)
   - [ ] LCS and TWCS compaction strategies
   - [ ] Disk backpressure
   - [ ] `io_uring` I/O backend
@@ -105,6 +113,7 @@ cluster        ██████   ██████  █████░   █
 - **Remaining (Chunks B-F):**
   - [x] ~~DDL validation rules~~ (table name, PK, RF constraints)
   - [x] ~~UDT (user-defined type) support~~ — `UserTypeMetadata`, `system_schema.types` virtual table, schema registry integration
+  - [x] ~~BACKUP permission for snapshot operations~~ (PITR Sprint P-4)
   - [ ] System table persistence to SSTable
   - [ ] Role hierarchy with inheritance
   - [ ] Audit sink composition
@@ -123,11 +132,12 @@ cluster        ██████   ██████  █████░   █
   metrics via `system_views.secondary_indexes`, CQL-compatible DDL with
   `CREATE INDEX ... USING 'type'` syntax.
 - **Remaining:**
-  - [x] ~~Query path integration~~ (index check in SELECT path, falls through to scan until IndexReader wired)
+  - [x] ~~Query path integration~~ (planner + route_select, Index Sprint I-2)
+  - [x] ~~IndexIntersection (multi-index WHERE)~~ (Index Sprint I-4)
+  - [x] ~~Sidecar index persistence (flush/compaction/recovery)~~ (Index Sprint I-3)
   - [ ] `SOUNDS LIKE` / `ANN OF` CQL syntax
   - [ ] Clustered indexes
   - [ ] GPU offloading for vector operations
-  - [ ] Binary serialization for index persistence
   - [ ] Compaction-triggered index rebuild
   - [ ] Distributed index coordination in cluster mode
 - **Spec:** [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md)
@@ -185,6 +195,8 @@ cluster        ██████   ██████  █████░   █
   - [x] ~~UDF DDL parsing~~ — CREATE/DROP FUNCTION AST and parser support
   - [x] ~~UDT wire encoding~~ — protocol type 0x0030, type resolution in bridge
   - [x] ~~UDF execution wiring~~ (CREATE/DROP FUNCTION/AGGREGATE routed through DdlPath)
+  - [x] ~~EXPLAIN statement~~ (Index Sprint I-2)
+  - [x] ~~Query planner (ScanPlan: PrimaryKey/SingleIndex/IndexIntersection/FullScan)~~ (Index Sprint I-2)
   - [ ] Logged batch atomicity
   - [ ] Query tracing
 
@@ -227,6 +239,8 @@ cluster        ██████   ██████  █████░   █
   `ring`, `rebalance`.
 - **Remaining:**
   - [x] ~~Integration tests~~ (11 tests covering connections, queries, system tables)
+  - [x] ~~Snapshot create/list/delete CLI commands~~ (PITR Sprint P-4)
+  - [x] ~~Restore CLI command~~ (PITR Sprint P-4)
 
 ### ferrosa (binary) — Complete (cluster-mode)
 
@@ -250,6 +264,9 @@ cluster        ██████   ██████  █████░   █
   - [x] ~~Configuration file support~~ (TOML with env var override)
   - [x] ~~Flush + S3 sync on graceful shutdown~~ (zero data loss on SIGTERM)
   - [x] ~~Configurable flush interval~~ (FERROSA_FLUSH_INTERVAL_SECS)
+  - [x] ~~Snapshot/restore REST API endpoints~~ (PITR Sprint P-5)
+  - [x] ~~Backup & Restore web dashboard card~~ (PITR Sprint P-5)
+  - [x] ~~Archive lag indicator~~ (PITR Sprint P-5)
 
 ### ferrosa-net — Phase 1 + Reconnection Complete
 
@@ -341,7 +358,9 @@ cluster        ██████   ██████  █████░   █
 | ~~Production cluster (Phase 3)~~ | — | Merged (PR #57) |
 | ~~Beta release v1.0.0-beta.1~~ | — | Released (PR #58, #59) |
 | ~~Beta release v1.0.0-beta.3~~ | — | Released |
-| Beta release v1.0.0-beta.4 | — | In progress |
+| ~~Secondary index pipeline (Sprints I-1 to I-4)~~ | — | Done (feature branch) |
+| ~~PITR (Sprints P-1 to P-5)~~ | — | Done (feature branch) |
+| Beta release v1.0.0-beta.4 | — | Sprints complete |
 | NetworkTopologyStrategy (multi-DC) | — | Planned |
 
 ## Path to Distributed Operation

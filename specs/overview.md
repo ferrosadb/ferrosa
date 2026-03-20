@@ -1,6 +1,6 @@
 # System Overview
 
-> Last updated: 2026-03-14
+> Last updated: 2026-03-20
 > Status: Approved
 
 ## Overview
@@ -15,14 +15,17 @@ graph TB
         D1[CQL Drivers]
         D2[cqlsh]
         D3[ferrosa-ctl<br/>CLI + TUI Monitor]
+        D4[Graph Clients<br/>Bolt / HTTP]
     end
 
     subgraph "Ferrosa Node"
         CQL[ferrosa-cql<br/>CQL Protocol v5]
-        Schema[ferrosa-schema<br/>DDL, System KS]
+        Graph[ferrosa-graph<br/>Cypher + Bolt v5]
+        Schema[ferrosa-schema<br/>DDL, Auth, Audit]
         Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
-        Index[ferrosa-index<br/>Secondary Indexes]
-        Storage[ferrosa-storage<br/>Memtable, Cache, Compaction]
+        Index[ferrosa-index<br/>Secondary + Vector Indexes]
+        UDF[ferrosa-udf<br/>WASM Sandbox]
+        Storage[ferrosa-storage<br/>Memtable, Cache, Compaction, PITR]
         SST[ferrosa-sstable<br/>BTI Read + Write]
         Net[ferrosa-net<br/>Internode Protocol]
         Web[Web Console<br/>Port 9090]
@@ -40,10 +43,14 @@ graph TB
 
     D1 & D2 -->|CQL Native Protocol v5| CQL
     D3 -->|CQL + HTTP| CQL & Web
+    D4 -->|Bolt v5 / HTTP| Graph
     CQL --> Schema
     CQL --> Storage
     CQL --> Cluster
     CQL --> Index
+    CQL --> UDF
+    Graph --> Schema
+    Graph --> Storage
     Cluster --> Storage
     Index --> Storage
     Cluster --> Net
@@ -51,7 +58,7 @@ graph TB
     SST --> NVMe
     SST -.->|async upload| S3
     Storage --> NVMe
-    Storage -.->|write-behind| S3
+    Storage -.->|write-behind + PITR archive| S3
     Net <-->|Internode| N2 & N3
     Cluster -.->|Raft consensus| N2 & N3
 ```
@@ -96,7 +103,7 @@ graph LR
 
 Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable.
 
-**Current progress**: All 11 crates are implemented. `ferrosa-common`, `ferrosa-sstable`, `ferrosa-storage`, `ferrosa-schema`, and `ferrosa-cql` (Parts A-D + observability) are complete. `ferrosa-graph` Phase 1 is complete (Cypher parser, planner, executor, adjacency index, HTTP endpoint with auth/TLS). The observability system is complete: virtual tables in `system_observability`, Prometheus metrics, web dashboard, SUBSCRIBE/UNSUBSCRIBE CQL extensions, and the `ferrosa-ctl` CLI admin tool with TUI monitor. `ferrosa-net` Phase 1 is complete (24 message types, PSK handshake, priority-lane RPC, peer manager). `ferrosa-cluster` Phase 2 is complete: Raft consensus (openraft + sled-backed log), token ring with O(log n) replica lookup, `ClusterCoordinator` with write/read fan-out and tunable consistency level enforcement. Phase 1 (pair mode) provides two-node synchronous replication with write forwarding, DDL replication, failover (force-promote + switchover), schema snapshot catch-up, and commit log data replay. `ferrosa-index` provides 8 pluggable secondary index types (B-tree, hash, composite, phonetic, filtered, vector HNSW, vector IVFFlat) with storage-attached async builds and staleness tracking. All 11 DDL operations replicate in pair mode. The `ferrosa` binary composes everything into a pair-mode database with background maintenance (auto-flush, compaction polling, commit log GC), graceful shutdown, per-connection backpressure, and exponential backoff reconnection. Available as a `.deb` package via GitHub Releases. Next up: Phase 3 — end-to-end cluster wiring in binary, hinted handoff, repair, and node lifecycle management.
+**Current progress**: All 12 crates are implemented and functional. The production cluster sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff, node lifecycle (join/decommission/rebalance), reconnection, and integration tests. The graph engine is fully complete: Cypher parser, expression evaluator, aggregation framework, variable-length paths, SUBSCRIBE/UNSUBSCRIBE with SSE streaming, leapfrog triejoin, and Bolt v5 wire protocol. UDF/UDA with WASM sandboxing is complete (parser, schema, DDL replication, Wasmtime compilation). Secondary and vector indexes are consolidated with a full query planner pipeline (MemtableIndex, sidecar files, EXPLAIN, IndexIntersection). Point-in-time recovery is implemented: commit log archiving to S3, snapshot management, point-in-time restoration, CLI tooling, and web console integration. The `ferrosa` binary composes everything into a cluster-mode database with background maintenance, graceful shutdown, per-connection backpressure, PITR archiving, and exponential backoff reconnection. Available as a `.deb` package via GitHub Releases.
 
 ## Key Architectural Decisions
 

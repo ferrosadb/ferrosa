@@ -226,11 +226,12 @@ mod tests {
         let storage = Arc::new(StorageEngine::new(storage_config, None).expect("storage engine"));
 
         let registry = Arc::new(HandlerRegistry::new());
+        let host_id = uuid::Uuid::new_v4();
         let (mode_controller, _handles) = ModeController::new(
             Arc::new(ferrosa_cluster::ClusterConfig::default()),
             Arc::new(ferrosa_net::config::NetConfig::default()),
-            uuid::Uuid::new_v4(),
-            storage,
+            host_id,
+            storage.clone(),
             schema.clone(),
             registry,
         );
@@ -239,6 +240,8 @@ mod tests {
             registry: Arc::new(VirtualTableRegistry::new()),
             mode_controller,
             schema: schema.clone(),
+            storage,
+            host_id,
             auth_disabled,
         };
 

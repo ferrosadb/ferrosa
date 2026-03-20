@@ -1,6 +1,6 @@
 # Data Flow
 
-> Last updated: 2026-03-14
+> Last updated: 2026-03-20
 > Status: Approved
 
 ## Overview
@@ -71,6 +71,34 @@ sequenceDiagram
 
     Coord->>C: Result
 ```
+
+## Index-Accelerated Read Path
+
+When a secondary index exists for the queried column, the planner bypasses full table scan:
+
+```mermaid
+sequenceDiagram
+    participant C as CQL Client
+    participant P as Planner
+    participant MI as MemtableIndex
+    participant SC as Sidecar Files
+    participant Store as TableStore
+
+    C->>P: SELECT * FROM t WHERE val = 'x'
+    P->>P: plan() → SingleIndex(idx_val)
+
+    par Merge index sources
+        P->>MI: lookup("x") → Vec<RowPosition>
+        P->>SC: lookup("x") per SSTable → Vec<RowPosition>
+    end
+
+    P->>Store: Fetch rows by RowPosition
+    Store->>C: Result rows
+```
+
+**Sidecar files** are per-SSTable companion files written during flush. They contain sorted `(indexed_value, RowPosition)` entries with a CRC32-checksummed header. Missing sidecars trigger a fallback to full scan for that SSTable, with startup rebuild.
+
+**IndexIntersection**: When multiple indexed columns appear in WHERE, the planner collects RowPositions from each index and intersects them before row fetch, reducing I/O.
 
 ## SSTable Lifecycle in S3
 
@@ -161,17 +189,19 @@ All multi-byte integers are big-endian. Each entry is fully self-describing — 
 
 Segments are configurable-size files (default 32 MB, `DEFAULT_SEGMENT_SIZE`). A segment is closed and a new one opened when it reaches capacity or max age (default 5 minutes, `DEFAULT_MAX_SEGMENT_AGE`). Segment space is allocated via compare-and-swap (CAS) on an `AtomicUsize` offset, enabling concurrent appends without holding a lock during serialization.
 
-### S3 Shipping (Follow-on)
+### Commit Log Archiving (PITR)
 
-Commit log S3 shipping is not yet implemented. The design:
+Commit log archiving is implemented as part of the PITR system. When `FERROSA_ARCHIVE_ENABLED=true`:
 
-Closed segments are uploaded to S3 immediately. The active (not yet full) segment is uploaded on a configurable timer (`commitlog_ship_interval`, candidate values: 1-10 seconds, trading durability window for upload overhead) as a partial segment. The `checkpoint.json` per node tracks:
+1. The `CommitLogArchiver` (tokio task) monitors closed segments
+2. Closed segments are uploaded to `{prefix}/commitlog-archive/` in S3 with hex-prefix paths for throughput
+3. Each segment is checksummed (SHA-256) and recorded in `archive-manifest.json` with CAS update
+4. The `archived` flag on the segment tracker prevents premature local deletion
+5. Retention policy respects snapshot boundaries: segments newer than the oldest snapshot's commit log position are never deleted
 
-- The latest segment ID and offset confirmed durable in S3
-- The latest SSTable generation confirmed durable in S3
-- A mapping of segment IDs to their S3 object keys
+The active (not yet full) segment is not archived — only closed segments. The archiver uses exponential backoff retry (5 attempts) on S3 upload failure.
 
-**What is implemented**: The commit log checkpoint system (`ferrosa-storage/src/commitlog/checkpoint.rs`) tracks per-table flush positions as `CommitLogPosition { segment_id, offset }`. The checkpoint is serialized as JSON and persisted to local disk. S3 upload of segments and checkpoint is follow-on work.
+**Implementation**: The `CommitLogArchiver` (`ferrosa-storage/src/archiver.rs`) runs as a tokio background task. The commit log checkpoint system (`ferrosa-storage/src/commitlog/checkpoint.rs`) tracks per-table flush positions as `CommitLogPosition { segment_id, offset }`. Checkpoints are serialized as JSON and persisted to local disk. The archive manifest (`archive-manifest.json`) in S3 tracks archived segments with checksums and uses etag-based CAS for consistency.
 
 ### Replay Protocol
 
@@ -187,6 +217,57 @@ Commit log replay is implemented (merged PR #38). At startup, the storage engine
 ### Commit Log Cleanup
 
 Segments are deleted once the data they contain has been flushed to SSTables. The checkpoint tracks per-table flush boundaries. Currently, local segment cleanup is based on the checkpoint; S3 segment cleanup is follow-on work.
+
+## PITR: Snapshot & Restore
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant Engine as StorageEngine
+    participant SM as SnapshotManager
+    participant S3 as S3
+
+    Note over Op,S3: Snapshot Creation
+    Op->>Engine: create_snapshot("daily")
+    Engine->>Engine: Flush all memtables
+    Engine->>SM: create(name, commit_log_position)
+    SM->>S3: Copy manifest.json → snapshots/daily/
+    SM->>S3: Copy schema.json → snapshots/daily/
+    SM->>S3: Write metadata.json (name, node_id, position, SHA-256)
+    SM->>Engine: SnapshotMetadata
+
+    Note over Op,S3: Point-in-Time Restore
+    Op->>Engine: open_from_snapshot("daily", restore_point)
+    Engine->>S3: Load snapshot metadata.json
+    Engine->>Engine: Validate node_id matches (or --force)
+    Engine->>S3: Download SSTables from snapshot manifest
+    Engine->>S3: Download archived segments [snapshot_pos..latest]
+    Engine->>Engine: Validate segment continuity (no gaps)
+    Engine->>Engine: Replay segments with timestamp <= restore_point
+    Engine->>Engine: Open normally
+```
+
+### Snapshot Lifecycle
+
+Snapshots are metadata-only references to existing SSTables — they do not duplicate data:
+
+- **Create**: Flush memtables, copy manifest + schema to snapshot prefix, write `metadata.json` with SHA-256 of manifest and commit log position
+- **SSTable GC safety**: Before deleting any SSTable, GC scans all snapshot manifests. An SSTable is deleted only when zero references exist across the live manifest and all snapshots
+- **TTL cleanup**: Background task expires snapshots past their `expires_at` (configurable, default 1 hour interval)
+- **Archive retention**: Retention cleanup never deletes segments newer than the oldest snapshot's commit log position
+
+### S3 Layout (PITR)
+
+```text
+s3://ferrosa-data/{cluster_id}/
+  commitlog-archive/
+    {hex_prefix}/{node_id}/{segment_id}.log
+  snapshots/
+    {snapshot_name}/
+      manifest.json
+      schema.json
+      metadata.json
+```
 
 ## S3 Upload Backpressure
 

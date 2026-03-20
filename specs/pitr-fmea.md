@@ -1,7 +1,7 @@
 # FMEA — Point-in-Time Restoration
 
-> Last updated: 2026-03-18
-> Status: Draft
+> Last updated: 2026-03-20
+> Status: Implemented
 
 ## Scoring Criteria
 
@@ -50,6 +50,29 @@ RPN = Severity x Occurrence x Detection. **Action required for RPN >= 50.**
 | 8 | FM6 | 63 | S3 PUT fails during snapshot creation |
 | 9 | FM3 | 60 | Archive manifest CAS conflict |
 | 10 | FM12 | 56 | Schema mismatch between snapshot and segments |
+
+## Implementation Status
+
+> Updated: 2026-03-20
+
+| ID | RPN | Mitigation Status | Sprint | Evidence |
+|----|-----|-------------------|--------|----------|
+| FM1 | 96 | **Implemented** — Exponential backoff retry (5 attempts), local segment retained until confirmed | P-1 | `6dd71e5` |
+| FM2 | 105 | **Implemented** — archive_status virtual table monitors unarchived segments, lag metrics | P-4 | `faf52e6` |
+| FM3 | 60 | **Implemented** — Archive manifest CAS retry, hex-prefix paths for throughput | P-1 | `6dd71e5` |
+| FM4 | 36 | **Implemented** — `archived` flag on segment tracker prevents premature deletion | P-1 | `1e73f66` |
+| FM5 | 48 | **Implemented** — Snapshot creation atomic: all flushes succeed or fail | P-2 | `bf0afdb` |
+| FM6 | 63 | **Implemented** — Atomic snapshot write with cleanup on error | P-2 | `ed0df9d` |
+| FM7 | 90 | **Implemented** — Snapshot copies manifest atomically; concurrent compaction safe | P-2 | `31ad2a4` |
+| FM8 | 9 | Low RPN — SHA-256 verify on download planned for full restore path | — | Deferred |
+| FM9 | 36 | **Implemented** — Segment continuity validation before replay | P-3 | `abf30dc` |
+| FM10 | 108 | **Implemented** — Inclusive `<=` boundary, timestamp filtering during replay | P-3 | `abf30dc` |
+| FM11 | 72 | **Implemented** — Node-id validation, `--force` required for cross-node restore | P-3 | `9c549ee` |
+| FM12 | 56 | **Implemented** — Schema loaded from snapshot, unknown table mutations skipped with warning | P-3 | `abf30dc` |
+| FM13 | 150 | **Implemented** — GC scans all snapshot manifests before SSTable deletion | P-2 | `a0160de` |
+| FM14 | 81 | **Implemented** — Retention respects snapshot boundaries | P-2 | `1e73f66` |
+| FM15 | 30 | Low RPN — Atomic S3 PUT prevents partial upload visibility | — | By design |
+| FM16 | 42 | Low RPN — Idempotent restore with retry planned | — | Deferred |
 
 ## Test Plan
 

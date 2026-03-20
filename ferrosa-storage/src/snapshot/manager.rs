@@ -215,6 +215,22 @@ impl SnapshotManager {
         Ok(ids)
     }
 
+    /// Deletes all snapshots whose `expires_at` is before `now_iso`.
+    /// Returns the names of deleted snapshots.
+    pub async fn cleanup_expired(&self, now_iso: &str) -> ferrosa_common::Result<Vec<String>> {
+        let snapshots = self.list_snapshots().await?;
+        let mut deleted = Vec::new();
+        for snap in snapshots {
+            if let Some(ref expires) = snap.expires_at {
+                if expires.as_str() < now_iso {
+                    self.delete_snapshot(&snap.name).await?;
+                    deleted.push(snap.name.clone());
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Returns the minimum commit-log position across all live snapshots, or
     /// `None` if no snapshots exist.
     ///
@@ -752,5 +768,66 @@ mod tests {
         assert!(ids.contains("sst-001"));
         assert!(ids.contains("sst-002"));
         assert!(ids.contains("sst-003"));
+    }
+
+    // ── Test 9 ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cleanup_expired_deletes_past_snapshots() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mgr = SnapshotManager::new(Arc::clone(&store), "pfx".to_string());
+        let manifest = Manifest::new();
+        let pos = CommitLogPosition {
+            segment_id: 1,
+            offset: 0,
+        };
+
+        // Snapshot with expiry in the past.
+        mgr.create_snapshot(
+            "old-snap",
+            &manifest,
+            b"{}",
+            pos,
+            "n1",
+            Some("2026-01-01T00:00:00Z".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+        // Snapshot with expiry in the future.
+        mgr.create_snapshot(
+            "new-snap",
+            &manifest,
+            b"{}",
+            pos,
+            "n1",
+            Some("2099-12-31T00:00:00Z".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+        // Snapshot with no expiry.
+        mgr.create_snapshot("perm-snap", &manifest, b"{}", pos, "n1", None, false)
+            .await
+            .unwrap();
+
+        let deleted = mgr.cleanup_expired("2026-03-19T00:00:00Z").await.unwrap();
+        assert_eq!(deleted, vec!["old-snap"]);
+
+        let remaining = mgr.list_snapshots().await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        let names: Vec<&str> = remaining.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"new-snap"));
+        assert!(names.contains(&"perm-snap"));
+    }
+
+    // ── Test 10 ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cleanup_expired_no_expired_snapshots() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mgr = SnapshotManager::new(Arc::clone(&store), "pfx".to_string());
+        let deleted = mgr.cleanup_expired("2026-03-19T00:00:00Z").await.unwrap();
+        assert!(deleted.is_empty());
     }
 }

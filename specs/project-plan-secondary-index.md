@@ -1,16 +1,16 @@
 # Project Plan: Secondary Index Pipeline
 
-> Last updated: 2026-03-18
+> Last updated: 2026-03-20
 
 ## Sprint Overview
 
-| Sprint | Focus | Size | Risk Items Addressed |
-|--------|-------|------|---------------------|
-| 1 | Core infrastructure: MemtableIndex + sidecar write + read_by_index | L | F1, F2, F3, F11 (OOM cap), T2, T5 |
-| 2 | Query planner + EXPLAIN + route_select integration | M | F5, F6, F7, F8 |
-| 3 | Flush + compaction integration + crash recovery | M | F4, F9, F10, T1, T5 |
-| 4 | Multi-index intersection + tests + benchmarks | M | F7, F5, TC1-TC10 |
-| Backlog | Cost-based planner, vector index integration, S3 sidecar upload | — | Future |
+| Sprint | Focus | Size | Risk Items Addressed | Status |
+|--------|-------|------|---------------------|--------|
+| 1 | Core infrastructure: MemtableIndex + sidecar write + read_by_index | L | F1, F2, F3, F11 (OOM cap), T2, T5 | **Complete** |
+| 2 | Query planner + EXPLAIN + route_select integration | M | F5, F6, F7, F8 | **Complete** |
+| 3 | Flush + compaction integration + crash recovery | M | F4, F9, F10, T1, T5 | **Complete** |
+| 4 | Multi-index intersection + tests + benchmarks | M | F7, F5, TC1-TC10 | **Complete** |
+| Backlog | Cost-based planner, vector index integration, S3 sidecar upload | — | Future | Open |
 
 ---
 

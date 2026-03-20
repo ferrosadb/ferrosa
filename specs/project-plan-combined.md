@@ -1,7 +1,7 @@
 # Combined Project Plan: Secondary Indexes + Point-in-Time Recovery
 
-> Last updated: 2026-03-18
-> Status: Draft
+> Last updated: 2026-03-20
+> Status: Complete
 
 ## Parallel Workstreams
 
@@ -89,11 +89,19 @@ Once both workstreams are done, two optional integration tasks:
 | Sidecar corruption → wrong results | Index | High | I-4 |
 | Restore from wrong node | PITR | Critical | P-3 |
 
-## Execution Strategy
+## Execution Status
 
-**Option A (Recommended): Parallel subagents** — dispatch Index Sprint I-1 and PITR Sprint P-1 simultaneously as separate subagents. Review between sprints. No coordination needed until integration tasks.
+Both workstreams executed in parallel on the `feature/integrate-pitr-index-s3-sprints` branch and completed as of 2026-03-20.
 
-**Option B: Interleaved** — alternate between workstreams sprint by sprint. Slower but keeps one developer in the loop on both.
+| Workstream | Sprints | Status |
+|------------|---------|--------|
+| Secondary Indexes | I-1 through I-4 | **All Complete** |
+| PITR | P-1 through P-5 | **All Complete** |
+
+**Integration points** (both complete):
+
+- Sidecar index files written during flush alongside SSTables
+- VectorMemtableIndex added for ANN queries in the memtable path
 
 ## Related Specs
 

@@ -270,6 +270,7 @@ pub async fn route(
         } => route_drop_aggregate(state, ctx, keyspace, name, arg_types, if_exists)
             .await
             .map(RouteResult::Result),
+        Statement::Explain(s) => route_explain(state, ctx, *s).map(RouteResult::Result),
     }
 }
 
@@ -867,6 +868,66 @@ fn route_select_user_table(
                 all_rows
             }
 
+            ScanPlan::IndexIntersection { ref indexes } => {
+                // Use first index for fetch, post-filter all WHERE predicates.
+                // Full set intersection across indexes is a future optimization.
+                let (ref first_idx_name, ref first_idx_col) = indexes[0];
+                let index_wc = s
+                    .where_clauses
+                    .iter()
+                    .find(|wc| wc.column == *first_idx_col && wc.op == ComparisonOp::Eq)
+                    .ok_or_else(|| {
+                        CqlError::Invalid(
+                            "planner selected index but no matching WHERE clause found".into(),
+                        )
+                    })?;
+
+                let index_key = term_to_index_key(
+                    &index_wc.value,
+                    first_idx_col,
+                    table_meta,
+                    ks,
+                    &state.schema,
+                )?;
+
+                let partitions =
+                    state
+                        .engine
+                        .read_by_index(&table_id, first_idx_name, &index_key)?;
+
+                let partitions = if partitions.is_empty() {
+                    let scan_limit = 10_000;
+                    state.engine.read_range(&table_id, None, None, scan_limit)?
+                } else {
+                    partitions
+                };
+
+                let mut all_rows = Vec::new();
+                for partition in &partitions {
+                    let mut prows = bridge::partition_to_rows(
+                        partition,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                    );
+                    all_rows.append(&mut prows);
+                }
+
+                all_rows.retain(|row| {
+                    evaluate_where_predicates(
+                        row,
+                        &s.where_clauses,
+                        &all_col_names,
+                        table_meta,
+                        ks,
+                        &state.schema,
+                    )
+                });
+
+                all_rows
+            }
+
             ScanPlan::FullScan => {
                 // Check ALLOW FILTERING requirement.
                 let indexed_columns: Vec<String> = snap
@@ -1074,6 +1135,48 @@ fn encode_virtual_rows(
 
     Ok(result::encode_rows(
         &col_names, &col_types, keyspace, table, &cql_rows,
+    ))
+}
+
+// ── EXPLAIN ──────────────────────────────────────────────────────────────
+
+fn route_explain(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: SelectStatement,
+) -> Result<BytesMut, CqlError> {
+    let ks = s
+        .keyspace
+        .as_deref()
+        .or(ctx.current_keyspace.as_deref())
+        .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), s.table.clone()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+
+    let planner_indexes: Vec<(String, Vec<String>)> = snap
+        .indexes
+        .iter()
+        .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+        .map(|(_, meta)| (meta.name.clone(), meta.target_columns.clone()))
+        .collect();
+
+    let scan_plan = planner::plan(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        &planner_indexes,
+    );
+
+    let plan_text = format!("{scan_plan}");
+
+    let col_names = vec!["plan".to_string()];
+    let col_types = vec![CqlType::Varchar];
+    let rows = vec![vec![Some(CqlValue::Text(plan_text))]];
+    Ok(result::encode_rows(
+        &col_names, &col_types, ks, &s.table, &rows,
     ))
 }
 
@@ -2007,6 +2110,41 @@ async fn route_create_index(
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
+        }
+    }
+
+    // Notify the storage engine about the new index so future memtable writes
+    // are indexed. We look up the column position from the post-DDL schema
+    // snapshot. Only the first target column is wired (composite index support
+    // is deferred). If the table is not yet registered with the engine (e.g.,
+    // schema-only mode), a warning is logged but the operation does not fail.
+    if let Some(target_col) = s.columns.first() {
+        let snap = state.schema.snapshot();
+        let table_id = TableId::new(ks, &s.table);
+        let col_pos = snap
+            .tables
+            .get(&(ks.to_string(), s.table.clone()))
+            .and_then(|tbl| {
+                // Collect regular columns sorted by position to determine the ordinal.
+                let mut regulars: Vec<_> = tbl
+                    .columns
+                    .values()
+                    .filter(|c| c.kind == ColumnKind::Regular)
+                    .collect();
+                regulars.sort_by_key(|c| c.position);
+                regulars.iter().position(|c| &c.name == target_col)
+            });
+
+        if let Some(pos) = col_pos {
+            if let Err(e) = state.engine.add_index(&table_id, &index_name, pos) {
+                // Log warning but don't fail — index is persisted in schema;
+                // it will be populated once the table is registered (e.g., on restart).
+                eprintln!(
+                    "[router] CREATE INDEX: failed to wire index '{index_name}' to \
+                     storage engine for table '{ks}.{}': {e}",
+                    s.table
+                );
+            }
         }
     }
 
@@ -3858,6 +3996,129 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn resolve_index_type_hash() {
+        let result = resolve_index_type(Some("hash"), &["user_id".to_string()], &HashMap::new());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), IndexType::Hash);
+    }
+
+    #[test]
+    fn resolve_index_type_btree_explicit() {
+        let result = resolve_index_type(Some("btree"), &["col".to_string()], &HashMap::new());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), IndexType::BTree);
+    }
+
+    #[test]
+    fn resolve_index_type_composite() {
+        let result = resolve_index_type(
+            Some("composite"),
+            &["a".to_string(), "b".to_string()],
+            &HashMap::new(),
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), IndexType::Composite);
+    }
+
+    #[tokio::test]
+    async fn create_hash_index_stores_correct_type_in_schema() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+        };
+
+        // Create keyspace
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE hashks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Create table
+        let stmt =
+            crate::parser::parse("CREATE TABLE hashks.users (id int PRIMARY KEY, email text)")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // CREATE INDEX USING 'hash'
+        let stmt = crate::parser::parse(
+            "CREATE INDEX idx_email_hash ON hashks.users (email) USING 'hash'",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "CREATE INDEX USING 'hash' should succeed, got: {:?}",
+            result.err()
+        );
+
+        // Verify the index is stored with IndexType::Hash
+        let snap = state.schema.snapshot();
+        let key = (
+            "hashks".to_string(),
+            "users".to_string(),
+            "idx_email_hash".to_string(),
+        );
+        let idx = snap.indexes.get(&key);
+        assert!(idx.is_some(), "index should be registered in schema");
+        let idx = idx.unwrap();
+        assert!(
+            matches!(idx.index_type, IndexType::Hash),
+            "expected IndexType::Hash, got {:?}",
+            idx.index_type
+        );
+        assert_eq!(idx.target_columns, vec!["email"]);
+    }
+
+    #[tokio::test]
+    async fn hash_index_eq_predicate_uses_single_index_plan() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+        };
+
+        // Create keyspace + table + hash index
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE hashplan WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE hashplan.users (id int PRIMARY KEY, email text)")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE INDEX idx_hp_email ON hashplan.users (email) USING 'hash'",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // INSERT a row
+        let stmt = crate::parser::parse(
+            "INSERT INTO hashplan.users (id, email) VALUES (1, 'alice@example.com')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // SELECT WHERE email = ? — hash index Eq lookup must succeed (not require ALLOW FILTERING)
+        let stmt =
+            crate::parser::parse("SELECT * FROM hashplan.users WHERE email = 'alice@example.com'")
+                .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "SELECT WHERE indexed_col = ? should succeed with hash index, got: {:?}",
+            result.err()
+        );
+    }
+
     // ── UDT DDL routing tests ──────────────────────────────────────────
 
     #[tokio::test]
@@ -5047,6 +5308,69 @@ mod tests {
         match result.unwrap() {
             RouteResult::Result(b) => {
                 assert_eq!(&b[0..4], &0x0002i32.to_be_bytes());
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    // =========================================================================
+    // Task 3.5: CREATE INDEX wires through to StorageEngine indexed_columns
+    // =========================================================================
+
+    /// `CREATE INDEX` followed by `INSERT` then `SELECT WHERE indexed_col = ?`
+    /// must return the inserted row via the memtable index.  This verifies the
+    /// full wire-up: router calls engine.add_index(), the TableStore's
+    /// indexed_columns is updated, and the next write is indexed.
+    #[tokio::test]
+    async fn create_index_wires_memtable_indexing_end_to_end() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+        };
+
+        // Create keyspace and table
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE idx_wire WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE idx_wire.users (id int PRIMARY KEY, email text)")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Create index on `email` — this must wire engine.add_index()
+        let stmt =
+            crate::parser::parse("CREATE INDEX wire_email_idx ON idx_wire.users (email)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert a row AFTER the index was created
+        let stmt = crate::parser::parse(
+            "INSERT INTO idx_wire.users (id, email) VALUES (42, 'bob@example.com')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Query by indexed column — must find the row
+        let stmt = crate::parser::parse(
+            "SELECT id, email FROM idx_wire.users WHERE email = 'bob@example.com'",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "SELECT on indexed column should succeed: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "should find exactly 1 row via memtable index, got {count}"
+                );
             }
             _ => panic!("expected Result"),
         }

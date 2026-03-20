@@ -40,3 +40,4 @@ pub trait Memtable: Send + Sync {
     /// Number of partitions stored. Wait-free (`AtomicUsize`).
     fn partition_count(&self) -> usize;
 }
+pub mod vector_index;
