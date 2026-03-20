@@ -145,16 +145,12 @@ format. Ferrosa clusters are standalone — they do not join existing Cassandra 
 
 ## Testing
 
-Ferrosa uses [Hunter](https://github.com/datastax-labs/hunter) (DataStax) for automated
-performance regression detection via change point analysis on benchmark time-series data.
-
-Test infrastructure runs on [Sprites](https://docs.sprites.dev/) (Firecracker VMs) and
-[fly.io](https://fly.io/) for fast, ephemeral multi-node clusters:
-
-- **Data integrity** — write/read verification, node kill/recovery, S3 cold start
-- **Performance** — YCSB workloads against Cassandra baseline (the floor to beat)
-- **Chaos** — node crash, network partition, S3 outage, disk full
-- **CQL compatibility** — driver matrix, protocol conformance
+```bash
+cargo test                        # All crates
+cargo test -p ferrosa-storage     # Single crate
+cargo clippy --all-targets        # Lint
+cargo fmt --check                 # Format check
+```
 
 ## Project Status
 
@@ -165,4 +161,4 @@ complete and Phase 3 (production cluster wiring) is next. See the
 
 ## License
 
-[Apache License 2.0](LICENSE)
+All rights reserved.
