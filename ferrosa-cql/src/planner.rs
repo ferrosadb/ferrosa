@@ -28,6 +28,12 @@ pub enum ScanPlan {
         filter_columns: Vec<String>,
     },
 
+    /// Two or more WHERE columns each match a different index with `=`.
+    /// Fetch from each index, intersect RowPosition sets, fetch only intersection.
+    IndexIntersection {
+        indexes: Vec<(String, String)>, // (index_name, index_column) pairs
+    },
+
     /// No indexes match. Requires ALLOW FILTERING.
     FullScan,
 }
@@ -51,6 +57,11 @@ impl fmt::Display for ScanPlan {
                     "IndexScanWithFilter({index_name} on {index_column}, filter: [{cols}])"
                 )
             }
+            ScanPlan::IndexIntersection { indexes } => {
+                let pairs: Vec<String> =
+                    indexes.iter().map(|(n, c)| format!("{n} on {c}")).collect();
+                write!(f, "IndexIntersection({})", pairs.join(", "))
+            }
             ScanPlan::FullScan => write!(f, "FullScan"),
         }
     }
@@ -66,9 +77,11 @@ impl fmt::Display for ScanPlan {
 /// # Decision order
 /// 1. All PK columns have `Eq` predicates → `PartitionKeyLookup`
 /// 2. No WHERE clauses → `FullScan`
-/// 3. First WHERE column with `Eq` that matches a single-column index:
-///    - All other WHERE columns also indexed → `SingleIndex`
-///    - Some WHERE columns not indexed → `IndexScanWithFilter`
+/// 3. Collect all WHERE columns with `Eq` that match a single-column index:
+///    - 0 matches → `FullScan`
+///    - 1 match and no unindexed WHERE columns → `SingleIndex`
+///    - 1 match with unindexed WHERE columns → `IndexScanWithFilter`
+///    - 2+ matches → `IndexIntersection` (all matched indexes)
 /// 4. No usable index → `FullScan`
 pub fn plan(
     where_clauses: &[WhereClause],
@@ -83,45 +96,47 @@ pub fn plan(
         return ScanPlan::FullScan;
     }
 
-    // Find the first WHERE column with Eq that has a matching single-column index.
-    let best = where_clauses.iter().find_map(|wc| {
-        if wc.op != ComparisonOp::Eq {
-            return None;
-        }
-        indexes
-            .iter()
-            .find(|(_, cols)| cols.len() == 1 && cols[0] == wc.column)
-            .map(|(name, _)| (name.clone(), wc.column.clone()))
-    });
-
-    let (index_name, index_column) = match best {
-        None => return ScanPlan::FullScan,
-        Some(pair) => pair,
-    };
-
-    // Collect WHERE columns that are not covered by any index.
-    let filter_columns: Vec<String> = where_clauses
+    // Collect all WHERE columns with Eq that have a matching single-column index.
+    let matched: Vec<(String, String)> = where_clauses
         .iter()
-        .filter(|wc| wc.column != index_column)
-        .filter(|wc| {
-            !indexes
+        .filter(|wc| wc.op == ComparisonOp::Eq)
+        .filter_map(|wc| {
+            indexes
                 .iter()
-                .any(|(_, cols)| cols.len() == 1 && cols[0] == wc.column)
+                .find(|(_, cols)| cols.len() == 1 && cols[0] == wc.column)
+                .map(|(name, _)| (name.clone(), wc.column.clone()))
         })
-        .map(|wc| wc.column.clone())
         .collect();
 
-    if filter_columns.is_empty() {
-        ScanPlan::SingleIndex {
-            index_name,
-            index_column,
+    match matched.len() {
+        0 => ScanPlan::FullScan,
+        1 => {
+            let (index_name, index_column) = matched.into_iter().next().unwrap();
+            // Collect WHERE columns not covered by any index.
+            let filter_columns: Vec<String> = where_clauses
+                .iter()
+                .filter(|wc| wc.column != index_column)
+                .filter(|wc| {
+                    !indexes
+                        .iter()
+                        .any(|(_, cols)| cols.len() == 1 && cols[0] == wc.column)
+                })
+                .map(|wc| wc.column.clone())
+                .collect();
+            if filter_columns.is_empty() {
+                ScanPlan::SingleIndex {
+                    index_name,
+                    index_column,
+                }
+            } else {
+                ScanPlan::IndexScanWithFilter {
+                    index_name,
+                    index_column,
+                    filter_columns,
+                }
+            }
         }
-    } else {
-        ScanPlan::IndexScanWithFilter {
-            index_name,
-            index_column,
-            filter_columns,
-        }
+        _ => ScanPlan::IndexIntersection { indexes: matched },
     }
 }
 
@@ -203,18 +218,18 @@ mod tests {
 
     #[test]
     fn single_index_all_where_columns_indexed() {
+        // Both email and city are indexed with Eq — planner should use IndexIntersection.
         let plan = plan(
             &[wc("email", ComparisonOp::Eq), wc("city", ComparisonOp::Eq)],
             &pk(&["id"]),
             &[idx("idx_email", &["email"]), idx("idx_city", &["city"])],
         );
-        assert_eq!(
-            plan,
-            ScanPlan::SingleIndex {
-                index_name: "idx_email".to_string(),
-                index_column: "email".to_string(),
+        match &plan {
+            ScanPlan::IndexIntersection { indexes } => {
+                assert_eq!(indexes.len(), 2);
             }
-        );
+            other => panic!("expected IndexIntersection, got {other:?}"),
+        }
     }
 
     #[test]
@@ -293,6 +308,41 @@ mod tests {
         assert_eq!(plan, ScanPlan::FullScan);
     }
 
+    // Hash indexes support POINT_LOOKUP only. The planner is index-type-agnostic:
+    // it matches any registered single-column index for an Eq predicate.
+    // These tests confirm hash index columns produce SingleIndex plans and that
+    // non-Eq predicates against hash-indexed columns fall through to FullScan.
+
+    #[test]
+    fn hash_index_eq_predicate_produces_single_index() {
+        // A hash index registered on `user_id` matches an Eq predicate.
+        let plan = plan(
+            &[wc("user_id", ComparisonOp::Eq)],
+            &pk(&["pk"]),
+            &[idx("idx_user_id_hash", &["user_id"])],
+        );
+        assert_eq!(
+            plan,
+            ScanPlan::SingleIndex {
+                index_name: "idx_user_id_hash".to_string(),
+                index_column: "user_id".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn hash_index_range_predicate_falls_to_full_scan() {
+        // Hash indexes don't support range scans. The planner rejects non-Eq
+        // predicates for all index types, so a Gt on a hash-indexed column
+        // must produce FullScan rather than an index plan.
+        let plan = plan(
+            &[wc("user_id", ComparisonOp::Gt)],
+            &pk(&["pk"]),
+            &[idx("idx_user_id_hash", &["user_id"])],
+        );
+        assert_eq!(plan, ScanPlan::FullScan);
+    }
+
     #[test]
     fn display_partition_key_lookup() {
         assert_eq!(
@@ -326,5 +376,52 @@ mod tests {
     #[test]
     fn display_full_scan() {
         assert_eq!(format!("{}", ScanPlan::FullScan), "FullScan");
+    }
+
+    #[test]
+    fn index_intersection_two_indexes() {
+        let plan = plan(
+            &[wc("email", ComparisonOp::Eq), wc("city", ComparisonOp::Eq)],
+            &pk(&["id"]),
+            &[idx("idx_email", &["email"]), idx("idx_city", &["city"])],
+        );
+        match &plan {
+            ScanPlan::IndexIntersection { indexes } => {
+                assert_eq!(indexes.len(), 2);
+            }
+            other => panic!("expected IndexIntersection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_intersection_three_indexes() {
+        let plan = plan(
+            &[
+                wc("a", ComparisonOp::Eq),
+                wc("b", ComparisonOp::Eq),
+                wc("c", ComparisonOp::Eq),
+            ],
+            &pk(&["id"]),
+            &[
+                idx("idx_a", &["a"]),
+                idx("idx_b", &["b"]),
+                idx("idx_c", &["c"]),
+            ],
+        );
+        match &plan {
+            ScanPlan::IndexIntersection { indexes } => assert_eq!(indexes.len(), 3),
+            other => panic!("expected IndexIntersection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_index_intersection() {
+        let plan = ScanPlan::IndexIntersection {
+            indexes: vec![("idx_a".into(), "a".into()), ("idx_b".into(), "b".into())],
+        };
+        assert_eq!(
+            format!("{plan}"),
+            "IndexIntersection(idx_a on a, idx_b on b)"
+        );
     }
 }

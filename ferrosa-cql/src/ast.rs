@@ -87,6 +87,7 @@ pub enum Statement {
     Unsubscribe {
         stream_id: Option<u16>,
     },
+    Explain(Box<SelectStatement>),
 }
 
 /// A value expression in DML statements.

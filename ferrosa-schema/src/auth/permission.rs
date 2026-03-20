@@ -28,6 +28,8 @@ pub enum Permission {
     Describe,
     /// Permission to execute functions/aggregates.
     Execute,
+    /// Permission for snapshot and restore operations.
+    Backup,
 }
 
 impl fmt::Display for Permission {
@@ -41,6 +43,7 @@ impl fmt::Display for Permission {
             Self::Authorize => write!(f, "AUTHORIZE"),
             Self::Describe => write!(f, "DESCRIBE"),
             Self::Execute => write!(f, "EXECUTE"),
+            Self::Backup => write!(f, "BACKUP"),
         }
     }
 }
@@ -193,10 +196,11 @@ mod tests {
             Permission::Authorize,
             Permission::Describe,
             Permission::Execute,
+            Permission::Backup,
         ];
 
         let set: HashSet<Permission> = perms.iter().copied().collect();
-        assert_eq!(set.len(), 8, "all permission variants must be distinct");
+        assert_eq!(set.len(), 9, "all permission variants must be distinct");
     }
 
     #[test]
@@ -275,6 +279,7 @@ mod tests {
         assert_eq!(Permission::Authorize.to_string(), "AUTHORIZE");
         assert_eq!(Permission::Describe.to_string(), "DESCRIBE");
         assert_eq!(Permission::Execute.to_string(), "EXECUTE");
+        assert_eq!(Permission::Backup.to_string(), "BACKUP");
     }
 
     // ---- Task 19: Permission checking tests ----
@@ -488,5 +493,18 @@ mod tests {
             &Resource::Table("any_ks".into(), "any_table".into()),
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn backup_permission_display() {
+        assert_eq!(format!("{}", Permission::Backup), "BACKUP");
+    }
+
+    #[test]
+    fn backup_permission_serde_roundtrip() {
+        let perm = Permission::Backup;
+        let json = serde_json::to_string(&perm).unwrap();
+        let deserialized: Permission = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, perm);
     }
 }

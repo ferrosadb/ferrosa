@@ -102,6 +102,22 @@ fn new_indexes(indexed_columns: &[(String, usize)]) -> Arc<HashMap<String, Arc<M
     Arc::new(map)
 }
 
+/// Filters sidecar entries to remove references to deleted partitions.
+///
+/// After compaction merges partitions, some entries in the collected
+/// sidecar map may reference partition keys that were removed (tombstoned).
+/// This function removes those stale entries and drops any index whose
+/// entry list becomes empty as a result.
+pub fn filter_tombstoned_sidecar_entries(
+    entries: &mut HashMap<String, Vec<(IndexKey, RowPosition)>>,
+    live_partition_keys: &std::collections::HashSet<Vec<u8>>,
+) {
+    for positions in entries.values_mut() {
+        positions.retain(|(_key, pos)| live_partition_keys.contains(&pos.partition_key));
+    }
+    entries.retain(|_, positions| !positions.is_empty());
+}
+
 impl<F: FlushTarget> TableStore<F> {
     /// Create a new `TableStore` with an empty memtable and no SSTables.
     pub fn new(schema: TableSchema, flush_target: F, options: WriteOptions) -> Self {
@@ -142,25 +158,54 @@ impl<F: FlushTarget> TableStore<F> {
     ///
     /// Used during crash recovery to populate the store with SSTables that
     /// were flushed before the crash. The readers must be ordered newest first.
+    /// `initial_sidecars` is a parallel vec — position `i` is the sidecar map
+    /// for `initial_sstables[i]`. If empty or shorter than `initial_sstables`,
+    /// the remaining positions get empty sidecar maps.
+    /// `indexed_columns` declares secondary indexes for new writes; use an empty
+    /// vec if no indexes are active on this table.
     pub fn new_with_sstables(
         schema: TableSchema,
         flush_target: F,
         options: WriteOptions,
         initial_sstables: Vec<Arc<SSTableReader<F::Reader>>>,
+        initial_sidecars: Vec<Arc<HashMap<String, SidecarReader>>>,
+    ) -> Self {
+        Self::new_with_sstables_and_indexes(
+            schema,
+            flush_target,
+            options,
+            initial_sstables,
+            initial_sidecars,
+            vec![],
+        )
+    }
+
+    /// Like [`new_with_sstables`] but also registers secondary index declarations
+    /// so that new writes populate the memtable index.
+    pub fn new_with_sstables_and_indexes(
+        schema: TableSchema,
+        flush_target: F,
+        options: WriteOptions,
+        initial_sstables: Vec<Arc<SSTableReader<F::Reader>>>,
+        initial_sidecars: Vec<Arc<HashMap<String, SidecarReader>>>,
+        indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&[]);
+        let indexes = new_indexes(&indexed_columns);
         let sidecar_count = initial_sstables.len();
+
+        // Pad sidecar list with empty maps if shorter than the SSTable list.
+        let mut sidecars: Vec<Arc<HashMap<String, SidecarReader>>> = initial_sidecars;
+        while sidecars.len() < sidecar_count {
+            sidecars.push(Arc::new(HashMap::new()));
+        }
+
         let initial_view = StoreView {
             active,
             flushing: None,
             sstables: Arc::new(initial_sstables),
             indexes,
-            sidecar_indexes: Arc::new(
-                (0..sidecar_count)
-                    .map(|_| Arc::new(HashMap::new()))
-                    .collect(),
-            ),
+            sidecar_indexes: Arc::new(sidecars),
         };
         Self {
             schema,
@@ -168,7 +213,7 @@ impl<F: FlushTarget> TableStore<F> {
             flush_guard: Mutex::new(()),
             flush_target,
             options,
-            indexed_columns: vec![],
+            indexed_columns,
         }
     }
 
@@ -312,7 +357,10 @@ impl<F: FlushTarget> TableStore<F> {
         let reader = self.flush_target.flush(output)?;
         let new_reader = Arc::new(reader);
 
-        // Step 5b: Build sidecar readers from the old memtable indexes.
+        // Step 5b: Build sidecar readers from the old memtable indexes and
+        // persist them to disk so they survive process restarts.
+        let gen = self.flush_target.last_generation();
+        let mut raw_sidecar_entries: HashMap<String, Vec<(IndexKey, RowPosition)>> = HashMap::new();
         let mut sidecar_map: HashMap<String, SidecarReader> = HashMap::new();
         for (index_name, memtable_idx) in old_indexes.iter() {
             let entries: Vec<(IndexKey, Vec<RowPosition>)> = memtable_idx.iter().collect();
@@ -324,11 +372,17 @@ impl<F: FlushTarget> TableStore<F> {
                 })
                 .collect();
             if !flat_entries.is_empty() {
+                raw_sidecar_entries.insert(index_name.clone(), flat_entries.clone());
                 sidecar_map.insert(
                     index_name.clone(),
                     SidecarReader::from_entries(flat_entries),
                 );
             }
+        }
+
+        // Persist sidecar files to disk (no-op for in-memory flush targets).
+        if let Err(e) = self.flush_target.write_sidecars(gen, &raw_sidecar_entries) {
+            eprintln!("[store] sidecar persist failed for gen {gen}: {e}");
         }
 
         // Step 6: Prepend new SSTable and sidecar, clear flushing.
@@ -448,6 +502,25 @@ impl<F: FlushTarget> TableStore<F> {
     /// Retrieve a named memtable-level secondary index.
     ///
     /// Returns `None` if no index with the given name was declared at
+    /// Dynamically adds a secondary index. Future writes will be indexed.
+    pub fn add_index(&mut self, index_name: String, column_position: usize) {
+        self.indexed_columns
+            .push((index_name.clone(), column_position));
+        let current = self.view.load();
+        let mut new_indexes = (*current.indexes).clone();
+        new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
+        self.view.store(Arc::new(StoreView {
+            active: Arc::clone(&current.active),
+            flushing: current.flushing.clone(),
+            sstables: Arc::clone(&current.sstables),
+            indexes: Arc::new(new_indexes),
+            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
+        }));
+    }
+
+    /// Retrieve a named memtable-level secondary index.
+    ///
+    /// Returns `None` if no index with the given name was declared at
     /// construction time. The returned `Arc` is a snapshot — it remains
     /// valid even after a flush swaps in fresh indexes.
     pub fn get_memtable_index(&self, name: &str) -> Option<Arc<MemtableIndex>> {
@@ -495,6 +568,7 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         input_count: usize,
         add: Arc<SSTableReader<F::Reader>>,
+        output_sidecars: HashMap<String, SidecarReader>,
     ) -> Result<()> {
         let _guard = self.flush_guard.lock();
         let current = self.view.load();
@@ -507,7 +581,7 @@ impl<F: FlushTarget> TableStore<F> {
             .collect();
         new_sstables.insert(0, add);
 
-        // Mirror the sidecar list: drop the oldest `input_count`, prepend empty for output
+        // Mirror the sidecar list: drop the oldest `input_count`, prepend merged output sidecar.
         let slen = current.sidecar_indexes.len();
         let mut new_sidecars: Vec<Arc<HashMap<String, SidecarReader>>> = current
             .sidecar_indexes
@@ -515,7 +589,7 @@ impl<F: FlushTarget> TableStore<F> {
             .take(slen.saturating_sub(input_count))
             .cloned()
             .collect();
-        new_sidecars.insert(0, Arc::new(HashMap::new()));
+        new_sidecars.insert(0, Arc::new(output_sidecars));
 
         self.view.store(Arc::new(StoreView {
             active: Arc::clone(&current.active),
@@ -525,6 +599,26 @@ impl<F: FlushTarget> TableStore<F> {
             sidecar_indexes: Arc::new(new_sidecars),
         }));
         Ok(())
+    }
+
+    /// Collects sidecar entries from the oldest `input_count` SSTables for merging.
+    pub fn collect_compaction_sidecar_entries(
+        &self,
+        input_count: usize,
+    ) -> HashMap<String, Vec<(IndexKey, RowPosition)>> {
+        let guard = self.view.load();
+        let slen = guard.sidecar_indexes.len();
+        let start = slen.saturating_sub(input_count);
+        let mut merged: HashMap<String, Vec<(IndexKey, RowPosition)>> = HashMap::new();
+        for sidecar_map in &guard.sidecar_indexes[start..] {
+            for (index_name, reader) in sidecar_map.as_ref() {
+                merged
+                    .entry(index_name.clone())
+                    .or_default()
+                    .extend(reader.all_entries());
+            }
+        }
+        merged
     }
 
     /// Collect metadata for all current SSTables.
@@ -1076,7 +1170,9 @@ mod tests {
         drop(view);
 
         // Perform swap: remove 2 oldest, add 1 → should go from 4 to 3.
-        store.swap_compacted_sstables(2, new_sst).unwrap();
+        store
+            .swap_compacted_sstables(2, new_sst, HashMap::new())
+            .unwrap();
         assert_eq!(store.sstable_count(), 3); // 4 - 2 + 1 = 3
     }
 

@@ -463,11 +463,12 @@ mod tests {
             })
             .expect("test schema"),
         );
+        let host_id = uuid::Uuid::new_v4();
         let (mc, _handles) = ModeController::new(
             Arc::new(ferrosa_cluster::ClusterConfig::default()),
             Arc::new(ferrosa_net::config::NetConfig::default()),
-            uuid::Uuid::new_v4(),
-            storage,
+            host_id,
+            storage.clone(),
             schema.clone(),
             registry,
         );
@@ -475,6 +476,8 @@ mod tests {
             registry: Arc::new(VirtualTableRegistry::new()),
             mode_controller: mc,
             schema,
+            storage,
+            host_id,
             auth_disabled: true,
         }
     }
