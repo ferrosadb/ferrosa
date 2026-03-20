@@ -1681,29 +1681,14 @@ user = session.execute(stmt, [user_id])
 <!-- ═══════════════════ Download ═══════════════════ -->
 <section id="download" style="padding-bottom: 2rem;">
   <p class="section-label centered">Download</p>
-  <h2 class="section-title centered">Install in under a minute</h2>
+  <h2 class="section-title centered">Coming Soon</h2>
   <p class="section-subtitle centered" style="margin-bottom: 3rem;">
-    The .deb package includes the ferrosa server, ferrosa-ctl admin tool, systemd service unit, and smoke tests.
+    Ferrosa is under active development. Sign up below to be notified when the first release is available.
   </p>
 
   <div style="max-width: 700px; margin: 0 auto;">
-    <div class="code-demo">
-      <pre class="code-block active" style="display: block;"><span class="cm"># Download the latest release</span>
-<span class="kw">wget</span> https://github.com/ferrosadb/ferrosadb/releases/latest/download/ferrosa_1.0.0-beta.4_amd64.deb
-
-<span class="cm"># Install</span>
-<span class="kw">sudo</span> dpkg -i ferrosa_1.0.0-beta.4_amd64.deb
-
-<span class="cm"># Start the service</span>
-<span class="kw">sudo</span> systemctl start ferrosa
-
-<span class="cm"># Connect with any CQL client</span>
-<span class="kw">cqlsh</span> localhost 9042</pre>
-    </div>
-
     <p style="text-align: center; margin-top: 1.5rem; font-size: 0.9375rem; color: var(--text-secondary);">
-      See the <a href="getting-started.html" style="color: var(--accent);">getting started guide</a> for configuration and driver setup.
-      All releases available on <a href="https://github.com/ferrosadb/ferrosadb/releases/latest" style="color: var(--accent);">GitHub Releases</a>.
+      See the <a href="getting-started.html" style="color: var(--accent);">getting started guide</a> for architecture and design details.
     </p>
 
     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.25rem; max-width: 700px; margin: 2.5rem auto 0;">

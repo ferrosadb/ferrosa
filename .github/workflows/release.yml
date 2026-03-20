@@ -1,6 +1,5 @@
 name: Release
 
-# Triggered by pushing a version tag (e.g., v0.1.0, v0.2.0)
 on:
   push:
     tags:
@@ -9,54 +8,66 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
-  build-and-release:
-    name: Build & Publish Release
+  # ── Linux x86_64 (glibc + musl) ──────────────────────────────────────
+  build-linux:
+    name: Build Linux x86_64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
+
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      # ── Run tests before releasing ────────────────────────────────
       - name: Run tests
         run: cargo test --workspace
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      # ── Build release binaries ────────────────────────────────────
-      - name: Build release binaries
-        run: cargo build --release -p ferrosa -p ferrosa-ctl
+      # glibc binary (standard Linux)
+      - name: Build x86_64 glibc binaries
+        run: |
+          cargo build --release -p ferrosa -p ferrosa-ctl
+          strip target/release/ferrosa
+          strip target/release/ferrosa-ctl
 
-      # ── Build static musl binaries ──────────────────────────────
-      - name: Build musl static binaries
+      # musl static binary (Alpine, containers, anywhere)
+      - name: Build x86_64 musl static binaries
         run: |
           cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl
           strip target/x86_64-unknown-linux-musl/release/ferrosa
           strip target/x86_64-unknown-linux-musl/release/ferrosa-ctl
           file target/x86_64-unknown-linux-musl/release/ferrosa | grep -q "statically linked"
+
+      - name: Package tarballs
+        id: package
+        run: |
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist
+
+          tar czf "dist/ferrosa-${VERSION}-x86_64-linux-gnu.tar.gz" \
+            -C target/release ferrosa ferrosa-ctl
           tar czf "dist/ferrosa-${VERSION}-x86_64-linux-musl.tar.gz" \
             -C target/x86_64-unknown-linux-musl/release ferrosa ferrosa-ctl
-          echo "musl_tarball=dist/ferrosa-${VERSION}-x86_64-linux-musl.tar.gz" >> "$GITHUB_OUTPUT"
-        id: musl
 
-      # ── Build .deb package ────────────────────────────────────────
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
       - name: Build Debian package
+        id: deb
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           ARCH="amd64"
           PKG_DIR="dist/ferrosa_${VERSION}_${ARCH}"
           DEB_FILE="dist/ferrosa_${VERSION}_${ARCH}.deb"
 
-          # Debian control
           mkdir -p "${PKG_DIR}/DEBIAN"
           cat > "${PKG_DIR}/DEBIAN/control" <<CTRL
           Package: ferrosa
@@ -72,10 +83,8 @@ jobs:
            storage, pluggable secondary indexes, built-in graph queries, and
            pair-mode high availability with automatic failover.
           CTRL
-          # Fix indentation (heredoc adds leading spaces)
           sed -i 's/^          //' "${PKG_DIR}/DEBIAN/control"
 
-          # Post-install script
           cat > "${PKG_DIR}/DEBIAN/postinst" <<'POSTINST'
           #!/bin/sh
           set -e
@@ -88,26 +97,12 @@ jobs:
           sed -i 's/^          //' "${PKG_DIR}/DEBIAN/postinst"
           chmod 755 "${PKG_DIR}/DEBIAN/postinst"
 
-          # Binaries
           mkdir -p "${PKG_DIR}/usr/bin"
           cp target/release/ferrosa "${PKG_DIR}/usr/bin/"
           cp target/release/ferrosa-ctl "${PKG_DIR}/usr/bin/"
           strip "${PKG_DIR}/usr/bin/ferrosa"
           strip "${PKG_DIR}/usr/bin/ferrosa-ctl"
 
-          # Marketing docs
-          mkdir -p "${PKG_DIR}/usr/share/ferrosa/docs"
-          cp -r docs/*.html docs/*.svg "${PKG_DIR}/usr/share/ferrosa/docs/" 2>/dev/null || true
-          cp docs/CNAME "${PKG_DIR}/usr/share/ferrosa/docs/" 2>/dev/null || true
-
-          # Smoke tests
-          mkdir -p "${PKG_DIR}/usr/share/ferrosa/tests"
-          cp tests/docker-smoke.sh "${PKG_DIR}/usr/share/ferrosa/tests/" 2>/dev/null || true
-          cp tests/cqlsh_smoke_test.sh "${PKG_DIR}/usr/share/ferrosa/tests/" 2>/dev/null || true
-          cp docker-compose.yml "${PKG_DIR}/usr/share/ferrosa/tests/" 2>/dev/null || true
-          cp Dockerfile "${PKG_DIR}/usr/share/ferrosa/tests/" 2>/dev/null || true
-
-          # Systemd service
           mkdir -p "${PKG_DIR}/lib/systemd/system"
           cat > "${PKG_DIR}/lib/systemd/system/ferrosa.service" <<SERVICE
           [Unit]
@@ -134,94 +129,126 @@ jobs:
           SERVICE
           sed -i 's/^          //' "${PKG_DIR}/lib/systemd/system/ferrosa.service"
 
-          # Empty dirs
           mkdir -p "${PKG_DIR}/etc/ferrosa"
           mkdir -p "${PKG_DIR}/var/lib/ferrosa"
-
-          # Copyright
           mkdir -p "${PKG_DIR}/usr/share/doc/ferrosa"
           echo "Copyright 2026 Ferrosa Contributors. All rights reserved." \
               > "${PKG_DIR}/usr/share/doc/ferrosa/copyright"
 
-          # Build .deb
           dpkg-deb --build --root-owner-group "$PKG_DIR" "$DEB_FILE"
           echo "deb_file=${DEB_FILE}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-        id: package
 
-      # ── Upload as workflow artifact ───────────────────────────────
-      - name: Upload .deb artifact
+      - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ferrosa-deb
-          path: ${{ steps.package.outputs.deb_file }}
+          name: linux-x86_64
+          path: dist/ferrosa-*
           retention-days: 90
 
-      # ── Publish to public repo (ferrosadb/ferrosadb) ──────────────
-      - name: Clone public repo and update
-        env:
-          GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+  # ── macOS Apple Silicon (aarch64) ─────────────────────────────────────
+  build-macos:
+    name: Build macOS Apple Silicon
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build aarch64-apple-darwin binaries
         run: |
-          VERSION="${{ steps.package.outputs.version }}"
-          DEB_FILE="${{ steps.package.outputs.deb_file }}"
+          cargo build --release --target aarch64-apple-darwin -p ferrosa -p ferrosa-ctl
+          strip target/aarch64-apple-darwin/release/ferrosa
+          strip target/aarch64-apple-darwin/release/ferrosa-ctl
 
-          # Clone the public repo
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/ferrosadb/ferrosadb.git" /tmp/public-repo
-          cd /tmp/public-repo
-
-          git config user.name "Ferrosa Release Bot"
-          git config user.email "releases@ferrosadb.com"
-
-          # Copy marketing docs from private repo (HTML, SVG only — no specs/plans)
-          cp "${GITHUB_WORKSPACE}/docs/"*.html . 2>/dev/null || true
-          cp "${GITHUB_WORKSPACE}/docs/"*.svg . 2>/dev/null || true
-          cp "${GITHUB_WORKSPACE}/docs/CNAME" . 2>/dev/null || true
-
-          # Update version badge in README
-          sed -i "s|ferrosa_[0-9a-zA-Z._-]*_amd64\.deb|ferrosa_${VERSION}_amd64.deb|g" README.md
-
-          # Commit and push if there are changes
-          git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "release: update to v${VERSION}"
-            git push origin main
-          fi
-
-          cd "${GITHUB_WORKSPACE}"
-
-      - name: Create release on public repo
-        env:
-          GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+      - name: Package tarball
         run: |
-          VERSION="${{ steps.package.outputs.version }}"
-          DEB_FILE="${{ steps.package.outputs.deb_file }}"
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          tar czf "dist/ferrosa-${VERSION}-aarch64-apple-darwin.tar.gz" \
+            -C target/aarch64-apple-darwin/release ferrosa ferrosa-ctl
 
-          NOTES=$(cat <<NOTES
-          ## Ferrosa v${VERSION}
+      - name: Package Homebrew bottle (tar.gz)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BOTTLE_DIR="dist/ferrosa/${VERSION}"
+          mkdir -p "${BOTTLE_DIR}/bin"
+          cp target/aarch64-apple-darwin/release/ferrosa "${BOTTLE_DIR}/bin/"
+          cp target/aarch64-apple-darwin/release/ferrosa-ctl "${BOTTLE_DIR}/bin/"
 
-          CQL-compatible distributed database with S3-backed storage, built in Rust.
+          # Homebrew bottle is a tar.gz rooted at ferrosa/<version>/
+          tar czf "dist/ferrosa-${VERSION}.arm64_sonoma.bottle.tar.gz" \
+            -C dist ferrosa/${VERSION}
+          rm -rf "dist/ferrosa"
 
-          ### Installation (Debian/Ubuntu)
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: dist/ferrosa-*
+          retention-days: 90
 
-          \`\`\`bash
-          wget https://github.com/ferrosadb/ferrosadb/releases/download/v${VERSION}/ferrosa_${VERSION}_amd64.deb
-          sudo dpkg -i ferrosa_${VERSION}_amd64.deb
-          sudo systemctl start ferrosa
-          cqlsh localhost 9042
-          \`\`\`
+  # ── Create GitHub Release (private repo) ──────────────────────────────
+  release:
+    name: Create Release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-          ### What's Included
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/
 
-          - \`/usr/bin/ferrosa\` — database server
-          - \`/usr/bin/ferrosa-ctl\` — CLI admin tool
-          - \`/lib/systemd/system/ferrosa.service\` — systemd unit
-          - \`/usr/share/ferrosa/docs/\` — documentation
-          - \`/usr/share/ferrosa/tests/\` — smoke tests
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-aarch64
+          path: dist/
+
+      - name: List release artifacts
+        run: ls -lh dist/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          NOTES=$(cat <<'NOTES'
+          ## What's Included
+
+          | Artifact | Platform | Description |
+          |----------|----------|-------------|
+          | `ferrosa-VERSION-x86_64-linux-gnu.tar.gz` | Linux x86_64 (glibc) | Standard Linux binary |
+          | `ferrosa-VERSION-x86_64-linux-musl.tar.gz` | Linux x86_64 (musl) | Statically linked, works on Alpine/containers |
+          | `ferrosa-VERSION_amd64.deb` | Debian/Ubuntu x86_64 | Package with systemd service |
+          | `ferrosa-VERSION-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | Native ARM64 binary |
+          | `ferrosa-VERSION.arm64_sonoma.bottle.tar.gz` | macOS (Homebrew) | Homebrew bottle for tap install |
+
+          ### Quick Start (Linux)
+
+          ```bash
+          tar xzf ferrosa-VERSION-x86_64-linux-gnu.tar.gz
+          ./ferrosa
+          ```
+
+          ### Quick Start (macOS)
+
+          ```bash
+          tar xzf ferrosa-VERSION-aarch64-apple-darwin.tar.gz
+          ./ferrosa
+          ```
           NOTES
           )
 
-          MUSL_TARBALL="${{ steps.musl.outputs.musl_tarball }}"
-          gh release create "v${VERSION}" "$DEB_FILE" "$MUSL_TARBALL" \
-            --repo ferrosadb/ferrosadb \
+          # Replace VERSION placeholder in notes
+          NOTES="${NOTES//VERSION/${VERSION}}"
+
+          gh release create "v${VERSION}" dist/* \
             --title "Ferrosa v${VERSION}" \
-            --notes "$NOTES"
+            --notes "$NOTES" \
+            --draft
