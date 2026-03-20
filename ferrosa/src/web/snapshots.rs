@@ -372,7 +372,7 @@ async fn trigger_restore(
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Converts a [`SnapshotMetadata`] to a JSON [`Value`].
+/// Converts a [`ferrosa_storage::snapshot::SnapshotMetadata`] to a JSON [`Value`].
 fn snapshot_metadata_to_json(meta: ferrosa_storage::snapshot::SnapshotMetadata) -> Value {
     json!({
         "name": meta.name,
