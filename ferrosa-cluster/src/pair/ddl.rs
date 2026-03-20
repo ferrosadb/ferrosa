@@ -5,6 +5,7 @@
 //! schema sync.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -30,6 +31,9 @@ use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::{ClusterError, Result};
 use crate::pair::PairRole;
+
+/// Timeout for peer-to-peer DDL RPC calls.
+const DDL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // DdlOperation
@@ -183,7 +187,18 @@ impl DdlCoordinator {
                 }
                 Ok(())
             }
-            PairRole::Secondary => self.forward_ddl(&op).await,
+            PairRole::Secondary => {
+                // Forward to primary for authority, but always apply locally
+                // so the DDL is available immediately on this node.
+                let forward_result = self.forward_ddl(&op).await;
+                self.apply_ddl_locally(&op)?;
+                let version = Uuid::new_v4();
+                self.schema.set_schema_version(version);
+                if let Err(e) = forward_result {
+                    tracing::warn!("DDL forward to primary failed ({e}), applied locally only");
+                }
+                Ok(())
+            }
         }
     }
 
@@ -334,7 +349,7 @@ impl DdlCoordinator {
     }
 
     /// Send a DDL operation to the peer (as primary replicating to secondary)
-    /// and wait for ACK.
+    /// and wait for ACK with timeout.
     pub(crate) async fn replicate_ddl(
         &self,
         op: &DdlOperation,
@@ -345,11 +360,14 @@ impl DdlCoordinator {
             schema_version,
         };
         let body = envelope.to_bytes()?;
-        let resp = self
-            .peer_manager
-            .send(self.peer_host_id, Message::PairDdlForward(body), Lane::Data)
-            .await
-            .map_err(ClusterError::Net)?;
+        let resp = tokio::time::timeout(
+            DDL_RPC_TIMEOUT,
+            self.peer_manager
+                .send(self.peer_host_id, Message::PairDdlForward(body), Lane::Data),
+        )
+        .await
+        .map_err(|_| ClusterError::Internal("DDL replication timed out".into()))?
+        .map_err(ClusterError::Net)?;
 
         match resp {
             Message::PairDdlAck(_) => Ok(()),
@@ -360,14 +378,18 @@ impl DdlCoordinator {
         }
     }
 
-    /// Forward a DDL operation to the primary (as secondary) and wait for ACK.
+    /// Forward a DDL operation to the primary (as secondary) and wait for ACK
+    /// with timeout.
     async fn forward_ddl(&self, op: &DdlOperation) -> Result<()> {
         let body = op.to_bytes()?;
-        let resp = self
-            .peer_manager
-            .send(self.peer_host_id, Message::PairDdlForward(body), Lane::Data)
-            .await
-            .map_err(ClusterError::Net)?;
+        let resp = tokio::time::timeout(
+            DDL_RPC_TIMEOUT,
+            self.peer_manager
+                .send(self.peer_host_id, Message::PairDdlForward(body), Lane::Data),
+        )
+        .await
+        .map_err(|_| ClusterError::Internal("DDL forward to primary timed out".into()))?
+        .map_err(ClusterError::Net)?;
 
         match resp {
             Message::PairDdlAck(_) => Ok(()),
@@ -425,16 +447,25 @@ impl RpcHandler for PairDdlForwardHandler {
 
         let result = match **self.role.load() {
             PairRole::Primary => {
-                // Forwarded DDL from secondary: apply locally + best-effort replicate
+                // Forwarded DDL from secondary: apply locally, ACK immediately.
+                // Replicate back to secondary in background to avoid deadlock
+                // (calling replicate_ddl inside the RPC handler would block
+                // the dispatch loop, creating a circular wait).
                 if let Err(e) = self.coordinator.apply_ddl_locally(&op) {
                     tracing::error!("failed to apply forwarded DDL: {e}");
                     return None;
                 }
                 let version = Uuid::new_v4();
                 self.coordinator.schema.set_schema_version(version);
-                if let Err(e) = self.coordinator.replicate_ddl(&op, version).await {
-                    tracing::warn!("pair DDL replication-back failed (applied locally): {e}");
-                }
+
+                let coord = Arc::clone(&self.coordinator);
+                let op_clone = op.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = coord.replicate_ddl(&op_clone, version).await {
+                        tracing::warn!("pair DDL replication-back failed: {e}");
+                    }
+                });
+
                 Ok(())
             }
             PairRole::Secondary => {

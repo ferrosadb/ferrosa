@@ -110,14 +110,10 @@ pub fn spawn_subscription_poll(
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
-        // SUBSCRIBE implies full table scan — set allow_filtering on the inner SELECT.
-        let inner = match inner {
-            Statement::Select(mut s) => {
-                s.allow_filtering = true;
-                Statement::Select(s)
-            }
-            other => other,
-        };
+        // SUBSCRIBE no longer sets allow_filtering — queries must use
+        // partition keys or indexes, consistent with the ALLOW FILTERING
+        // rejection policy.
+        let inner = inner;
 
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await; // Skip the immediate first tick — first result at t+interval.

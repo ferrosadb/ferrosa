@@ -91,12 +91,36 @@ async fn bootstrap_from_s3(
     let (os_config, store) = storage.object_store_and_config()?;
     let prefix = &os_config.prefix;
 
-    // Load schema snapshot
-    let snapshot_data = ferrosa_storage::load_schema_snapshot(store.as_ref(), prefix).await?;
+    // Load schema snapshot (retry up to 5 times — the S3-compatible store may
+    // not be ready immediately after a container restart).
+    let snapshot_data = {
+        let mut loaded = None;
+        for attempt in 1..=5u32 {
+            match ferrosa_storage::load_schema_snapshot(store.as_ref(), prefix).await {
+                Ok(Some(data)) => {
+                    loaded = Some(data);
+                    break;
+                }
+                Ok(None) if attempt < 5 => {
+                    tracing::info!(attempt, "no schema snapshot in S3 yet, retrying in 2s…");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Ok(None) => {}
+                Err(e) if attempt < 5 => {
+                    tracing::warn!(attempt, "S3 schema load failed: {e}, retrying in 2s…");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(e) => {
+                    tracing::warn!("S3 schema load failed after 5 attempts: {e}");
+                }
+            }
+        }
+        loaded
+    };
     let snapshot_data = match snapshot_data {
         Some(data) => data,
         None => {
-            tracing::info!("no schema snapshot in S3 — starting fresh");
+            tracing::info!("no schema snapshot in S3 after retries — starting fresh");
             return Ok(());
         }
     };

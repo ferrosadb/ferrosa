@@ -117,10 +117,8 @@ async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // Bypass authentication when disabled
-    if state.auth_disabled {
-        return next.run(req).await;
-    }
+    // Graph HTTP endpoints always require auth -- FERROSA_AUTH_DISABLED applies
+    // to CQL protocol auth only, not graph HTTP endpoints.
 
     let auth_header = req
         .headers()
@@ -201,15 +199,15 @@ async fn auth_middleware(
 
 /// POST /graph/query — execute a graph query with audit emission (T10).
 async fn handle_query(State(state): State<AppState>, req: Request<Body>) -> Response {
-    let auth = req
-        .extensions()
-        .get::<AuthContext>()
-        .cloned()
-        .unwrap_or(AuthContext {
-            role: "anonymous".to_string(),
-            is_superuser: false,
-            must_change_password: false,
-        });
+    let Some(auth) = req.extensions().get::<AuthContext>().cloned() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "authentication required".to_string(),
+            }),
+        )
+            .into_response();
+    };
 
     // Extract JSON body
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1_048_576).await {
@@ -281,15 +279,15 @@ async fn handle_query(State(state): State<AppState>, req: Request<Body>) -> Resp
 
 /// POST /graph/explain — return query plan without executing.
 async fn handle_explain(State(state): State<AppState>, req: Request<Body>) -> Response {
-    let auth = req
-        .extensions()
-        .get::<AuthContext>()
-        .cloned()
-        .unwrap_or(AuthContext {
-            role: "anonymous".to_string(),
-            is_superuser: false,
-            must_change_password: false,
-        });
+    let Some(auth) = req.extensions().get::<AuthContext>().cloned() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "authentication required".to_string(),
+            }),
+        )
+            .into_response();
+    };
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1_048_576).await {
         Ok(b) => b,
@@ -354,15 +352,15 @@ pub struct UnsubscribeRequest {
 /// are sent at the configured interval. In delta mode, only changed/new rows
 /// are sent after the initial snapshot.
 async fn handle_subscribe(State(state): State<AppState>, req: Request<Body>) -> Response {
-    let auth = req
-        .extensions()
-        .get::<AuthContext>()
-        .cloned()
-        .unwrap_or(AuthContext {
-            role: "anonymous".to_string(),
-            is_superuser: false,
-            must_change_password: false,
-        });
+    let Some(auth) = req.extensions().get::<AuthContext>().cloned() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "authentication required".to_string(),
+            }),
+        )
+            .into_response();
+    };
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1_048_576).await {
         Ok(b) => b,

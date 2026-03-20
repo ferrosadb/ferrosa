@@ -185,6 +185,10 @@ pub async fn save_schema_snapshot(
     snapshot_json: &[u8],
 ) -> ferrosa_common::Result<()> {
     let path = schema_path(prefix);
+    eprintln!(
+        "saving schema snapshot to S3 at {path} ({} bytes)",
+        snapshot_json.len()
+    );
     store
         .put(
             &path,
@@ -195,7 +199,7 @@ pub async fn save_schema_snapshot(
             ferrosa_common::Error::InvalidFormat(format!("failed to save schema snapshot: {e}"))
         })?;
     eprintln!(
-        "schema snapshot saved to S3 ({} bytes)",
+        "schema snapshot saved to S3 at {path} ({} bytes)",
         snapshot_json.len()
     );
     Ok(())
@@ -207,17 +211,24 @@ pub async fn load_schema_snapshot(
     prefix: &str,
 ) -> ferrosa_common::Result<Option<Vec<u8>>> {
     let path = schema_path(prefix);
+    eprintln!("loading schema snapshot from S3 at {path}");
     match store.get(&path).await {
         Ok(result) => {
             let data = result.bytes().await.map_err(|e| {
                 ferrosa_common::Error::InvalidFormat(format!("failed to read schema snapshot: {e}"))
             })?;
-            eprintln!("schema snapshot loaded from S3 ({} bytes)", data.len());
+            eprintln!(
+                "schema snapshot loaded from S3 at {path} ({} bytes)",
+                data.len()
+            );
             Ok(Some(data.to_vec()))
         }
-        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(object_store::Error::NotFound { .. }) => {
+            eprintln!("schema snapshot not found in S3 at {path}");
+            Ok(None)
+        }
         Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
-            "failed to load schema snapshot: {e}"
+            "failed to load schema snapshot from {path}: {e}"
         ))),
     }
 }
