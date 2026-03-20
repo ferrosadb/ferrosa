@@ -1,6 +1,6 @@
 # Component Architecture
 
-> Last updated: 2026-03-14
+> Last updated: 2026-03-20
 > Status: Approved
 
 ## Overview
@@ -117,7 +117,7 @@ graph BT
 - **Purpose**: Storage engine with S3 write-behind
 - **Location**: `ferrosa-storage/`
 - **Dependencies**: `ferrosa-common`, `ferrosa-sstable`, `arc-swap`, `parking_lot`, `crc32fast`, `object_store` (S3), `tokio`, `serde`, `serde_json`, `bytes`, `crossbeam-skiplist` (optional)
-- **Status**: Parts A/B/C implemented — memtable, flush, merge, commit log, compaction, S3 upload manager, manifest, local cache, StorageEngine composition, `WriteObserver` trait (sync/async modes with bounded-channel backpressure)
+- **Status**: Parts A/B/C implemented + PITR (archiver, snapshots, restore) + sidecar index persistence
 - **Modules**:
   - `memtable/` — `Memtable` trait with two implementations: `ShardedBTreeMemtable` (64-shard `BTreeMap` with `parking_lot::RwLock`), `SkipListMemtable` (lock-free, behind `skiplist-memtable` feature flag)
   - `flush.rs` — `FlushTarget` trait, `FileFlushTarget` (disk), `InMemoryFlushTarget` (testing)
@@ -135,6 +135,10 @@ graph BT
   - `index/tracker.rs` — `IndexStateTracker` (per-index staleness: Current/Building/Stale/Failed), `IndexState`, coverage tracking
   - `index/scheduler.rs` — `IndexBuildScheduler` (channel-based worker pool following `CompactionExecutor` pattern), `IndexBuildJob`, `BuildPriority`
   - `index/virtual_table.rs` — `SecondaryIndexesVirtualTable` for `system_views.secondary_indexes` operational metrics
+  - `archiver.rs` — `CommitLogArchiver` (tokio task polling closed segments, S3 upload with exponential backoff, SHA-256 checksums, archive manifest with CAS)
+  - `snapshot.rs` — `SnapshotManager` (atomic snapshot creation: flush + manifest + schema copy, `SnapshotMetadata` with serde, list/delete, TTL cleanup)
+  - `restore.rs` — `RestoreManager` (full restore workflow: snapshot download, segment continuity validation, timestamp-filtered replay, node-id validation, schema validation)
+  - `sidecar.rs` — Sidecar index file I/O: header (magic/version/count/CRC32) + sorted entries, read/write roundtrip
 - **Concurrency**:
   - *Memtable writes*: 64-shard `BTreeMap` — different partitions write in parallel; same-shard writes serialize on a per-shard `RwLock`. Alternative: `SkipListMemtable` (lock-free, `crossbeam-skiplist`, behind feature flag).
   - *Memtable flush*: Atomic swap via `arc-swap` — current memtable replaced with a fresh one; old memtable flushed to SSTable. Reads check both active and flushing memtable.
@@ -189,9 +193,10 @@ graph BT
   - `subscribe.rs` — `SubscriptionState`, `SubscriptionHandle` for per-connection lifecycle management of virtual table subscriptions
   - `prometheus.rs` — `render_metrics()` — Prometheus text exposition format from virtual tables (connections, queries, storage stats)
   - `client.rs` — `CqlClient`, thin async CQL client for admin tooling (`QueryResult`, `ResultRow`)
+  - `planner.rs` — `ScanPlan` enum (PrimaryKey/SingleIndex/IndexIntersection/FullScan), `plan()` function resolving indexes by (keyspace, table, column)
 - **Key interfaces**: Full CQL query lifecycle — frame decode → parse → route → execute → encode result
 - **Auth**: SASL PLAIN with `Schema::authenticate()`, rate limiting, connection state machine
-- **Supported operations**: SELECT, INSERT, UPDATE, DELETE, BATCH, CREATE/ALTER/DROP KEYSPACE/TABLE, CREATE/DROP INDEX (USING 'btree'/'hash'/'composite'/'phonetic'/'vector'), CREATE/ALTER/DROP ROLE, GRANT/REVOKE, TRUNCATE, USE, PREPARE/EXECUTE, system table queries
+- **Supported operations**: SELECT, INSERT, UPDATE, DELETE, BATCH, CREATE/ALTER/DROP KEYSPACE/TABLE, CREATE/DROP INDEX (USING 'btree'/'hash'/'composite'/'phonetic'/'vector'), CREATE/ALTER/DROP ROLE, GRANT/REVOKE, TRUNCATE, USE, PREPARE/EXECUTE, EXPLAIN, system table queries
 - **Target**: All standard CQL drivers connect without modification
 
 ### ferrosa-graph
@@ -222,7 +227,7 @@ graph BT
 - **Dependencies**: `ferrosa-cql`, `clap`, `ratatui`, `crossterm`, `tabled`, `tokio`
 - **Status**: Implemented — CLI subcommands for node inspection, live TUI dashboard with auto-refresh
 - **Modules**:
-  - `main.rs` — CLI entry point with `clap` derive, subcommands: `status`, `connections`, `queries`, `storage`, `topology`, `peers`, `monitor`
+  - `main.rs` — CLI entry point with `clap` derive, subcommands: `status`, `connections`, `queries`, `storage`, `topology`, `peers`, `monitor`, `snapshot` (create/list/delete), `restore`
   - `commands.rs` — Async subcommand implementations using `CqlClient` to query virtual tables
   - `tui.rs` — `ratatui` TUI with `Panel` enum (`Connections`/`Queries`/`Storage`), `AppState`, 2-second auto-refresh, keyboard navigation
 - **Key interfaces**: Connects to a Ferrosa node via CQL protocol using `ferrosa-cql::CqlClient`, queries `system_virtual.*` tables for live metrics
@@ -251,7 +256,7 @@ graph BT
 - **Purpose**: Distributed coordination — Raft consensus, token ring, tunable CL, pair mode, DDL replication, failover
 - **Location**: `ferrosa-cluster/`
 - **Dependencies**: `ferrosa-common`, `ferrosa-net`, `ferrosa-storage`, `ferrosa-schema`, `openraft`, `sled`, `arc-swap`, `async-trait`, `bytes`, `serde`, `serde_json`, `tokio`, `uuid`
-- **Status**: Phase 2 complete — Raft consensus, token ring, coordinator pattern, plus Phase 1 pair mode
+- **Status**: Phase 3 complete — Raft consensus, token ring, coordinator, hinted handoff, node lifecycle (join/decommission/streaming/rebalance), plus Phase 1 pair mode
 - **Modules**:
   - `controller.rs` — `ModeController` (standalone → pair → degraded → cluster transitions), `ClusterStateHolder`, reverse connections, catch-up orchestration, `transition_to_cluster()` (3rd peer triggers Raft group + token ring + coordinator)
   - `write_path.rs` — `WritePath` enum (Direct/Pair/Cluster/Unavailable) for atomic write routing
@@ -274,17 +279,17 @@ graph BT
   - `consistency.rs` — `ConsistencyLevel` with `blockFor()` + property tests
   - `config.rs`, `error.rs`, `mode.rs`, `state.rs`
 - **Key interfaces**: `ModeController::force_promote()`, `ModeController::switchover()`, `ModeController::transition_to_cluster()`, `ClusterCoordinator` (write/read fan-out), `TokenRing` (replica selection), REST API (`/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`)
-- **Phase 3 (planned)**: End-to-end cluster wiring in binary, hinted handoff, repair, node lifecycle (leave/decommission/bootstrap), `NetworkTopologyStrategy` (multi-DC), read repair, automatic token rebalancing
+- **Remaining**: NetworkTopologyStrategy (multi-DC), read repair (full inline), Quorum Lease / Mencius optimizations
 
 ### ferrosa (binary)
 
 - **Purpose**: Compose all crates into the running database
 - **Location**: `ferrosa/` (workspace root binary)
 - **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `ferrosa-cql`, `ferrosa-graph`, `ferrosa-cluster`, `ferrosa-net`, `axum`, `rust-embed`, `tokio`, `tracing`, `tracing-subscriber`, `uuid`
-- **Status**: Pair-mode operation implemented — CQL on 9042, graph on 7474, web console + cluster API on 9090, internode on 7000
+- **Status**: Cluster-mode operation — CQL on 9042, graph HTTP on 7474, Bolt on 7687, web console + cluster API on 9090, Prometheus metrics, internode on 7000
 - **Modules**:
   - `web/mod.rs` — `WebConfig`, `start_web_server()` on port 9090 (configurable), Axum router composition
-  - `web/api.rs` — Axum JSON API routes: `/api/connections`, `/api/storage_stats`, `/api/active_queries`, `/api/tables`, `/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`
+  - `web/api.rs` — Axum JSON API routes: `/api/connections`, `/api/storage_stats`, `/api/active_queries`, `/api/tables`, `/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`, `GET/POST/DELETE /api/snapshots`, `GET /api/archive_status`, `POST /api/restore/preflight`, `POST /api/restore`
   - `web/static_files.rs` — `rust-embed` static file serving for the dashboard UI
   - `web/index.html` — Single-file HTML/CSS/JS dashboard with auto-refresh, connection/query/storage panels
 - **Startup sequence**: tracing init → host_id load/generate → `StorageEngine::new()` → `Schema::new()` → `ModeController::new()` → `PeerManager::new()` → RPC server on :7000 → `CqlServer::start_background()` → optional `GraphEngine` + HTTP → web admin + cluster API on :9090 → background seed connection → ctrl-c → graceful shutdown

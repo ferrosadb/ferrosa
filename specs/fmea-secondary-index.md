@@ -1,6 +1,6 @@
 # FMEA: Secondary Index Pipeline
 
-> Last updated: 2026-03-18
+> Last updated: 2026-03-20
 
 ## Failure Mode Analysis
 
@@ -24,9 +24,28 @@
 | RPN Range | Count | Items |
 |-----------|-------|-------|
 | Critical (>= 200) | 0 | — |
-| High (100-199) | 3 | F5 (105), F8 (105), F10 (120), F11 (108) |
+| High (100-199) | 4 | F5 (105), F8 (105), F10 (120), F11 (108) |
 | Medium (50-99) | 4 | F1 (70), F2 (81), F3 (72), F4 (72) |
 | Low (< 50) | 5 | F6 (18), F7 (54), F9 (64), F12 (48) |
+
+## Implementation Status
+
+> Updated: 2026-03-20
+
+| ID | RPN | Mitigation Status | Sprint | Evidence |
+|----|-----|-------------------|--------|----------|
+| F1 | 70 | **Implemented** — ArcSwap atomic load/store in MemtableIndex | I-1 | `886b496` |
+| F2 | 81 | **Implemented** — MemtableIndex shares flush threshold, dropped on flush | I-1 | `8e36625` |
+| F3 | 72 | **Implemented** — CRC32 header checksum + post-fetch validation | I-4 | `e6fdcdc` |
+| F4 | 72 | **Implemented** — Startup rebuild from SSTable when sidecar missing | I-3 | `a8ea7aa` |
+| F5 | 105 | **Accepted** — v1 accepts suboptimal plans; cost-based planner deferred | I-2 | By design |
+| F6 | 18 | **Implemented** — Planner resolves by (keyspace, table, column) triple | I-2 | `5ccf3f9` |
+| F7 | 54 | **Implemented** — RowPosition PartialEq/Eq/Hash, intersection tested | I-4 | `e6fdcdc` |
+| F8 | 105 | **Implemented** — Null indexed column treated as non-fatal skip | I-1 | `886b496` |
+| F9 | 64 | **Implemented** — Tombstone-aware sidecar merge during compaction | I-3 | `e780306` |
+| F10 | 120 | **Implemented** — Sidecar written after SSTable flush completes | I-3 | `63910ac` |
+| F11 | 108 | **Implemented** — Result cap at 10K RowPositions | I-1 | `8e36625` |
+| F12 | 48 | **Accepted** — EXPLAIN is advisory, documents schema-at-query-time | I-2 | `22d9fb3` |
 
 ## Test Cases for RPN >= 50
 

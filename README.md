@@ -42,15 +42,21 @@ graph TB
     subgraph Clients
         D1[CQL Drivers]
         D2[cqlsh]
+        D3[ferrosa-ctl<br/>CLI + TUI Monitor]
+        D4[Graph Clients<br/>Bolt / HTTP]
     end
 
     subgraph "Ferrosa Node"
         CQL[ferrosa-cql<br/>CQL Protocol v5]
-        Schema[ferrosa-schema<br/>DDL, System KS]
+        Graph[ferrosa-graph<br/>Cypher + Bolt v5]
+        Schema[ferrosa-schema<br/>DDL, Auth, Audit]
         Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
-        Storage[ferrosa-storage<br/>Memtable, Cache, Compaction]
+        Index[ferrosa-index<br/>Secondary + Vector Indexes]
+        UDF[ferrosa-udf<br/>WASM Sandbox]
+        Storage[ferrosa-storage<br/>Memtable, Cache, Compaction, PITR]
         SST[ferrosa-sstable<br/>BTI Read + Write]
         Net[ferrosa-net<br/>Internode Protocol]
+        Web[Web Console<br/>Port 9090]
     end
 
     subgraph "Persistence"
@@ -58,17 +64,31 @@ graph TB
         S3[S3-Compatible Store<br/>Durable Storage]
     end
 
+    subgraph "Other Ferrosa Nodes"
+        N2[Node 2]
+        N3[Node 3]
+    end
+
     D1 & D2 -->|CQL Native Protocol v5| CQL
+    D3 -->|CQL + HTTP| CQL & Web
+    D4 -->|Bolt v5 / HTTP| Graph
     CQL --> Schema
     CQL --> Storage
     CQL --> Cluster
+    CQL --> Index
+    CQL --> UDF
+    Graph --> Schema
+    Graph --> Storage
     Cluster --> Storage
+    Index --> Storage
     Cluster --> Net
     Storage --> SST
     SST --> NVMe
     SST -.->|async upload| S3
     Storage --> NVMe
-    Storage -.->|write-behind| S3
+    Storage -.->|write-behind + PITR archive| S3
+    Net <-->|Internode| N2 & N3
+    Cluster -.->|Raft consensus| N2 & N3
 ```
 
 ### Storage Model: Write-Behind Async S3
@@ -114,34 +134,17 @@ Distributed transactions (Accord-style) are a research item, not yet implemented
 | Crate | Description |
 |-------|-------------|
 | `ferrosa` | Binary — composes all crates into the running database |
-| `ferrosa-cluster` | Raft metadata, node membership, tunable CL, request routing |
-| `ferrosa-cql` | CQL native protocol v5, query parsing, execution |
-| `ferrosa-graph` | Graph query engine — Cypher parser, adjacency index, HTTP endpoint |
+| `ferrosa-cluster` | Raft metadata, node membership, tunable CL, request routing, hinted handoff |
+| `ferrosa-cql` | CQL native protocol v5, query parsing, execution, EXPLAIN |
+| `ferrosa-graph` | Graph query engine — Cypher parser, Bolt v5, adjacency index, HTTP endpoint |
 | `ferrosa-index` | Pluggable secondary indexes — B-tree, hash, composite, phonetic, vector |
-| `ferrosa-storage` | Memtable, commit log, compaction, S3 write-behind, cache management |
+| `ferrosa-udf` | WASM-sandboxed user-defined functions and aggregates |
+| `ferrosa-storage` | Memtable, commit log, compaction, S3 write-behind, PITR, cache management |
 | `ferrosa-schema` | Table/keyspace definitions, auth, audit, system keyspaces |
 | `ferrosa-sstable` | Read/write BTI SSTables, trie indices, Bloom filter, compression |
 | `ferrosa-net` | Internode protocol, connection management, priority-lane RPC |
-| `ferrosa-ctl` | CLI admin tool with TUI monitoring dashboard |
+| `ferrosa-ctl` | CLI admin tool with TUI monitoring, snapshot/restore commands |
 | `ferrosa-common` | Shared types: Token, PartitionKey, DecoratedKey, CQL types |
-
-## Migrating from Cassandra
-
-Ferrosa provides tools for importing data from existing Cassandra clusters:
-
-```bash
-# Inspect a Cassandra SSTable
-ferrosa-sstable-dump /path/to/cassandra/data/keyspace/table/
-
-# Import SSTables into Ferrosa's S3 storage
-ferrosa-sstable-import \
-  --source /path/to/cassandra/data/ \
-  --target s3://ferrosa-data/cluster-1/ \
-  --keyspace my_keyspace
-```
-
-Migration is a one-way import: Cassandra SSTables are read and uploaded to S3 in BTI
-format. Ferrosa clusters are standalone — they do not join existing Cassandra clusters.
 
 ## Testing
 
@@ -154,9 +157,11 @@ cargo fmt --check                 # Format check
 
 ## Project Status
 
-All 11 crates are implemented with ~68,000 lines of Rust and ~1,370 tests. Pair-mode
-two-node operation is production-ready; full Raft-based cluster mode (Phase 2) is
-complete and Phase 3 (production cluster wiring) is next. See the
+All 12 crates are implemented with ~115,000+ lines of Rust and ~1,650+ tests. The
+production cluster sprint is complete with Raft consensus, hinted handoff, node
+lifecycle management, and integration tests. Secondary indexes have a full query
+planner pipeline. Point-in-time recovery is implemented with commit log archiving,
+snapshot management, and timestamp-filtered restoration. See the
 [architecture specs](specs/README.md) for the full specification and status.
 
 ## License

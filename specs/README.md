@@ -1,6 +1,6 @@
 # Ferrosa Architecture Specs
 
-> Last updated: 2026-03-15
+> Last updated: 2026-03-20
 
 Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassandra with S3-backed storage.
 
@@ -10,16 +10,16 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 |-------|--------|
 | ferrosa-common | Done |
 | ferrosa-sstable | Done |
-| ferrosa-storage | Done (core engine + observers + subscription observer + storage stats) |
-| ferrosa-schema | Done (DDL, auth, audit, system KS, graph extensions, virtual tables, UDT metadata, index metadata) |
-| ferrosa-cql | Done (Parts A-D + observability + LZ4/Snappy frame compression + UDT DDL + UDF DDL parsing) |
+| ferrosa-storage | Done (core engine + PITR + sidecar indexes + observers + virtual tables) |
+| ferrosa-schema | Done (DDL, auth, audit, system KS, graph, virtual tables, UDT, index, BACKUP permission) |
+| ferrosa-cql | Done (Parts A-D + observability + compression + UDT/UDF DDL + EXPLAIN + query planner) |
 | ferrosa-index | Done (8 secondary index types + 2 vector index types: HNSW, IVFFlat) |
 | ferrosa-udf | Done (parser, schema, DDL replication, Wasmtime compilation, router wiring; wit-bindgen invoke TODO) |
 | ferrosa-graph | Done (eval, aggregations, var-length paths, SUBSCRIBE, leapfrog triejoin, Bolt v5, HTTP+auth) |
 | ferrosa-net | Done (Phase 1 + reconnection, graceful drain) |
 | ferrosa-cluster | Done (Phase 1-3 + UDT/index DDL replication) |
-| ferrosa-ctl | Done (CLI + TUI + cluster management commands) |
-| ferrosa (binary) | Done (CQL on 9042, graph HTTP on 7474, Bolt on 7687, web console + cluster API on 9090, Prometheus) |
+| ferrosa-ctl | Done (CLI + TUI + cluster management + snapshot/restore commands) |
+| ferrosa (binary) | Done (CQL 9042, graph HTTP 7474, Bolt 7687, web 9090, Prometheus, PITR REST API) |
 
 ## Specs Index
 
@@ -37,15 +37,21 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [Threat Model](threat-model.md) | STRIDE threat analysis: trust boundaries, threat inventory, mitigations | Draft |
 | [Threat Model — CQL B/C](threat-model-cql-bc.md) | STRIDE for CQL parser, routing, prepared cache | Approved |
 | [Threat Model — Graph](threat-model-graph.md) | STRIDE for graph engine, HTTP endpoint, adjacency index | Draft |
-| [Graph Gap Closure](graph-gap-closure.md) | Architecture for remaining graph gaps: SUBSCRIBE, aggregations, var-length paths, Bolt | Draft |
-| [Graph Gap FMEA](graph-gap-fmea.md) | Failure modes for graph gap closure (14 failure modes, 14 test cases) | Draft |
-| [Graph Gap Project Plan](graph-gap-project-plan.md) | 3-sprint plan: eval+agg, varpath+subscribe, Bolt | Draft |
+| [Graph Gap Closure](graph-gap-closure.md) | Architecture for remaining graph gaps: SUBSCRIBE, aggregations, var-length paths, Bolt | Complete |
+| [Graph Gap FMEA](graph-gap-fmea.md) | Failure modes for graph gap closure (14 failure modes, 14 test cases) | Complete |
+| [Graph Gap Project Plan](graph-gap-project-plan.md) | 3-sprint plan: eval+agg, varpath+subscribe, Bolt | Complete |
 | [Threat Model — Net/Cluster](threat-model-net-cluster.md) | STRIDE for internode protocol, Raft, pair mode, coordinator | Draft |
 | [Threat Model — Schema Replication](threat-model-schema-replication.md) | STRIDE for schema snapshot sync, DDL forwarding (T21-T28) | Draft |
-| [PITR](pitr.md) | Point-in-time restoration: S3-native snapshots, commit log archiving, restore | Draft |
-| [Threat Model — PITR](threat-model-pitr.md) | STRIDE for backup/restore: archive integrity, snapshot tampering, restore safety | Draft |
-| [PITR FMEA](pitr-fmea.md) | Failure modes for PITR (16 modes, 21 test cases) | Draft |
-| [PITR Project Plan](pitr-project-plan.md) | 4-sprint plan: archiving, snapshots, restore, tooling | Draft |
+| [Secondary Index Pipeline](secondary-index-pipeline.md) | Secondary index query integration: planner, sidecar persistence, vector indexes | Implemented |
+| [Threat Model — Secondary Index](threat-model-secondary-index.md) | STRIDE for secondary index pipeline | Implemented |
+| [FMEA — Secondary Index](fmea-secondary-index.md) | Failure modes for secondary index pipeline | Implemented |
+| [Secondary Index Project Plan](project-plan-secondary-index.md) | 4-sprint plan: sidecar files, query planner, persistence, vector indexes | Complete |
+| [PITR](pitr.md) | Point-in-time restoration: S3-native snapshots, commit log archiving, restore | Implemented |
+| [Threat Model — PITR](threat-model-pitr.md) | STRIDE for backup/restore: archive integrity, snapshot tampering, restore safety | Implemented |
+| [PITR FMEA](pitr-fmea.md) | Failure modes for PITR (16 modes, 21 test cases) | Implemented |
+| [PITR Project Plan](pitr-project-plan.md) | 4-sprint plan: archiving, snapshots, restore, tooling | Complete |
+| [Combined Project Plan](project-plan-combined.md) | Parallel index + PITR workstreams, execution status | Complete |
+| [Nightly Test Infrastructure](../superpowers/specs/2026-03-19-nightly-test-infrastructure-design.md) | Nightly test infrastructure design | Draft |
 | [Cluster Phase 2 Design](../superpowers/specs/2026-03-14-cluster-phase2-design.md) | Raft consensus, token ring, coordinator pattern | Implemented |
 
 ## Architecture Decision Records

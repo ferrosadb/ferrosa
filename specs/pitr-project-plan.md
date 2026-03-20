@@ -1,11 +1,23 @@
 # PITR Project Plan
 
-> Last updated: 2026-03-18
-> Status: Draft
+> Last updated: 2026-03-20
+> Status: Complete
 
 ## Overview
 
-Implementation plan for point-in-time restoration, organized into 4 sprints prioritized by FMEA risk scores and threat model findings. Each sprint is independently shippable.
+Implementation plan for point-in-time restoration, organized into 5 sprints prioritized by FMEA risk scores and threat model findings. Each sprint is independently shippable.
+
+## Completion Summary
+
+> All 5 sprints completed as of 2026-03-20.
+
+| Sprint | Status | Key Commits |
+|--------|--------|-------------|
+| 1 — Commit Log Archiving | **Complete** | `6dd71e5`, `b2c2c9b`, `1e73f66` |
+| 2 — Snapshot Management | **Complete** | `a8d4500`, `ed0df9d`, `bf0afdb`, `a0160de`, `31ad2a4` |
+| 3 — Point-in-Time Restoration | **Complete** | `9c549ee`, `abf30dc`, `6b03ba8` |
+| 4 — Operational Tooling | **Complete** | `d4b0a49`, `faf52e6`, `97c329a` |
+| 5 — Web Console & API | **Complete** | `1444060`, `c848710` |
 
 ## Sprint 1: Commit Log Archiving (Foundation)
 
@@ -113,11 +125,11 @@ Implementation plan for point-in-time restoration, organized into 4 sprints prio
 
 | Risk | Likelihood | Impact | Mitigation | Status |
 |------|-----------|--------|------------|--------|
-| SSTable GC deletes snapshot-referenced data (FM13) | Medium | Critical | Sprint 2 task 2.5 | Open |
-| Timestamp boundary off-by-one (FM10) | Medium | High | Sprint 3 task 3.3 with boundary tests | Open |
-| Archiver falls behind under load (FM2) | Medium | High | Sprint 1 task 1.5 + Sprint 4 task 4.3 | Open |
-| Restore from wrong node (T8/FM11) | Low | Critical | Sprint 3 task 3.4 | Open |
-| Archive gaps from S3 failures (FM1) | Medium | High | Sprint 1 task 1.2 retry logic | Open |
+| SSTable GC deletes snapshot-referenced data (FM13) | Medium | Critical | Sprint 2 task 2.5 | Mitigated |
+| Timestamp boundary off-by-one (FM10) | Medium | High | Sprint 3 task 3.3 with boundary tests | Mitigated |
+| Archiver falls behind under load (FM2) | Medium | High | Sprint 1 task 1.5 + Sprint 4 task 4.3 | Mitigated |
+| Restore from wrong node (T8/FM11) | Low | Critical | Sprint 3 task 3.4 | Mitigated |
+| Archive gaps from S3 failures (FM1) | Medium | High | Sprint 1 task 1.2 retry logic | Mitigated |
 
 ## Dependencies
 
