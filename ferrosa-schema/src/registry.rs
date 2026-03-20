@@ -665,14 +665,15 @@ impl Schema {
                     // Validate source_label and target_label reference vertex tables
                     for label_key in &["graph.source_label", "graph.target_label"] {
                         let label = &extensions[*label_key];
-                        // Find table by graph.label extension, not by table name
-                        let ref_table = snap.tables.iter().find(|((k, _), meta)| {
+                        // Find table by graph.label extension OR by table name (fallback).
+                        let ref_table = snap.tables.iter().find(|((k, t), meta)| {
                             k == ks
-                                && meta
+                                && (meta
                                     .extensions
                                     .get("graph.label")
                                     .map(|l| l.eq_ignore_ascii_case(label))
                                     .unwrap_or(false)
+                                    || t.eq_ignore_ascii_case(label))
                         });
                         match ref_table {
                             None => {
