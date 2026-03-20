@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -9,6 +10,9 @@ use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 
 use crate::error::{ClusterError, Result};
 use crate::pair::PairRole;
+
+/// Timeout for switchover RPC.
+const SWITCHOVER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Initiate switchover from the primary side.
 ///
@@ -23,17 +27,24 @@ pub async fn initiate_switchover(
         return Err(ClusterError::NotPrimary);
     }
 
-    let resp = peer_manager
-        .send(
+    let resp = tokio::time::timeout(
+        SWITCHOVER_TIMEOUT,
+        peer_manager.send(
             peer_host_id,
             Message::RoleSwap {
                 new_primary: peer_host_id,
                 new_secondary: local_host_id,
             },
             Lane::Raft,
-        )
-        .await
-        .map_err(ClusterError::Net)?;
+        ),
+    )
+    .await
+    .map_err(|_| {
+        ClusterError::Net(ferrosa_net::error::NetError::Timeout(
+            "switchover timed out waiting for peer".into(),
+        ))
+    })?
+    .map_err(ClusterError::Net)?;
 
     match resp {
         Message::RoleSwap {
