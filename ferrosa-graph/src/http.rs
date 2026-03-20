@@ -117,17 +117,8 @@ async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // Graph HTTP endpoints always require auth — FERROSA_AUTH_DISABLED applies
-    // to CQL protocol auth only.  When auth is disabled we inject a superuser
-    // context so handlers can proceed without explicit credentials.
-    if state.auth_disabled {
-        req.extensions_mut().insert(AuthContext {
-            role: "cassandra".to_string(),
-            is_superuser: true,
-            must_change_password: false,
-        });
-        return next.run(req).await;
-    }
+    // Graph HTTP endpoints always require auth -- FERROSA_AUTH_DISABLED applies
+    // to CQL protocol auth only, not graph HTTP endpoints.
 
     let auth_header = req
         .headers()
