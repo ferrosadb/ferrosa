@@ -1302,6 +1302,113 @@ mod tests {
         }
     }
 
+    // ---- Cache lifecycle tests ----
+
+    #[test]
+    fn compile_valid_component_populates_cache() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        let key = ("ks".to_string(), "func".to_string());
+        assert!(!executor.cache.contains_key(&key));
+
+        executor
+            .compile("ks", "func", &minimal_component_bytes())
+            .unwrap();
+        assert!(
+            executor.cache.contains_key(&key),
+            "cache should contain compiled function after compile()"
+        );
+    }
+
+    #[test]
+    fn compile_same_name_replaces_cached_entry() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+
+        // Compile once
+        executor
+            .compile("ks", "func", &minimal_component_bytes())
+            .unwrap();
+        let key = ("ks".to_string(), "func".to_string());
+        let first = executor.cache.get(&key).unwrap();
+        let first_ptr = Arc::as_ptr(&first);
+
+        // Compile same (keyspace, name) again
+        executor
+            .compile("ks", "func", &minimal_component_bytes())
+            .unwrap();
+        let second = executor.cache.get(&key).unwrap();
+        let second_ptr = Arc::as_ptr(&second);
+
+        // The Arc pointers should differ (new CompiledFunction inserted)
+        assert_ne!(
+            first_ptr, second_ptr,
+            "recompiling should insert a new cache entry"
+        );
+    }
+
+    #[test]
+    fn compile_different_keyspaces_are_independent() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor
+            .compile("ks1", "func", &minimal_component_bytes())
+            .unwrap();
+        executor
+            .compile("ks2", "func", &minimal_component_bytes())
+            .unwrap();
+
+        let key1 = ("ks1".to_string(), "func".to_string());
+        let key2 = ("ks2".to_string(), "func".to_string());
+        assert!(executor.cache.contains_key(&key1));
+        assert!(executor.cache.contains_key(&key2));
+
+        // Invalidating one keyspace should not affect the other
+        executor.invalidate("ks1", "func");
+        assert!(!executor.cache.contains_key(&key1));
+        assert!(executor.cache.contains_key(&key2));
+    }
+
+    #[test]
+    fn call_compiled_component_without_invoke_export_fails() {
+        // The minimal component has no "invoke" export, so call() should fail
+        // with an execution error (not NotFound).
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor
+            .compile("ks", "noinvoke", &minimal_component_bytes())
+            .unwrap();
+
+        let err = executor
+            .call("ks", "noinvoke", vec![], &[], &CqlType::Int)
+            .unwrap_err();
+        assert!(
+            matches!(err, UdfError::ExecutionFailed(ref msg) if msg.contains("invoke")),
+            "expected ExecutionFailed mentioning 'invoke', got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn invalidate_then_call_returns_not_found() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor
+            .compile("ks", "func", &minimal_component_bytes())
+            .unwrap();
+        executor.invalidate("ks", "func");
+
+        let err = executor
+            .call("ks", "func", vec![], &[], &CqlType::Int)
+            .unwrap_err();
+        assert!(
+            matches!(err, UdfError::NotFound { .. }),
+            "expected NotFound after invalidate, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn invalidate_nonexistent_is_noop() {
+        // Invalidating a function that was never compiled should not panic.
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor.invalidate("ks", "never_compiled");
+        // No assertion needed — the test passes if it doesn't panic.
+    }
+
     /// Generate a minimal valid WASM component binary.
     /// This is the smallest valid component that wasmtime will accept.
     fn minimal_component_bytes() -> Vec<u8> {
