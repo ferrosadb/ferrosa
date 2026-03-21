@@ -287,6 +287,95 @@ impl RpcHandler for BatchlogReplayHandler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Background batchlog replay task
+// ---------------------------------------------------------------------------
+
+/// Background task that scans the local batchlog for stale entries and
+/// replays them by applying their mutations to local storage.
+///
+/// This handles the crash recovery case: if a coordinator wrote a batchlog
+/// entry but crashed before completing the batch, a batchlog replica's
+/// replay task will eventually apply the mutations.
+pub struct BatchlogReplayTask;
+
+impl BatchlogReplayTask {
+    /// Run a single scan-and-replay pass. Called periodically by the
+    /// background maintenance loop.
+    pub fn run_once(storage: &StorageEngine) -> Result<(), String> {
+        let batchlog = match storage.batchlog() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let stale = batchlog.scan_stale(now_ms);
+
+        for entry in &stale {
+            // Apply mutations locally.
+            for m in &entry.mutations {
+                let table_id = ferrosa_storage::TableId::new(&m.keyspace, &m.table);
+                for row in &m.rows {
+                    if let Err(e) = storage.write(&table_id, &m.key, row.clone(), m.timestamp) {
+                        tracing::warn!(
+                            batch_id = %entry.id,
+                            table = %table_id,
+                            "batchlog replay: failed to apply mutation: {e}"
+                        );
+                    }
+                }
+            }
+
+            // Delete the replayed entry.
+            if let Err(e) = batchlog.delete_entry(entry.id) {
+                tracing::warn!(
+                    batch_id = %entry.id,
+                    "batchlog replay: failed to delete entry: {e}"
+                );
+            }
+        }
+
+        if !stale.is_empty() {
+            tracing::info!(
+                count = stale.len(),
+                "batchlog replay: replayed stale entries"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Spawn the background replay loop. Runs `run_once()` every
+    /// `interval` until the shutdown receiver signals.
+    pub fn spawn(
+        storage: Arc<StorageEngine>,
+        interval: std::time::Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = shutdown.changed() => {
+                        if result.is_err() || *shutdown.borrow() {
+                            tracing::info!("batchlog replay task: shutting down");
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(interval) => {
+                        if let Err(e) = Self::run_once(&storage) {
+                            tracing::warn!("batchlog replay task error: {e}");
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +599,67 @@ mod tests {
         let table_id = TableId::new("test_ks", "test_tbl");
         let result = storage.read(&table_id, &test_key()).unwrap();
         assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn batchlog_replay_task_replays_stale_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        // Write a stale batchlog entry (created_at = 0, threshold = 20_000ms).
+        let batchlog = storage.batchlog().unwrap();
+        let batch_id = Uuid::new_v4();
+        batchlog
+            .write_entry(BatchlogEntry {
+                id: batch_id,
+                created_at: 0,
+                mutations: vec![Mutation {
+                    keyspace: "test_ks".to_string(),
+                    table: "test_tbl".to_string(),
+                    key: test_key(),
+                    rows: vec![test_row()],
+                    timestamp: 1000,
+                }],
+            })
+            .unwrap();
+        assert_eq!(batchlog.entry_count(), 1);
+
+        // Run one replay scan.
+        BatchlogReplayTask::run_once(&storage).unwrap();
+
+        // Entry should have been replayed and deleted.
+        assert_eq!(batchlog.entry_count(), 0);
+
+        // Mutation should be visible.
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let result = storage.read(&table_id, &test_key()).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn batchlog_replay_task_skips_fresh_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+
+        let batchlog = storage.batchlog().unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        // Entry created just now -- should NOT be stale.
+        batchlog
+            .write_entry(BatchlogEntry {
+                id: Uuid::new_v4(),
+                created_at: now_ms,
+                mutations: vec![],
+            })
+            .unwrap();
+
+        BatchlogReplayTask::run_once(&storage).unwrap();
+
+        // Entry should still be in the batchlog (not replayed).
+        assert_eq!(batchlog.entry_count(), 1);
     }
 }
