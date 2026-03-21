@@ -538,6 +538,24 @@ impl<F: FlushTarget> TableStore<F> {
         self.flush_target.last_generation()
     }
 
+    /// Returns generation IDs for all SSTables currently in the store.
+    ///
+    /// Used by `add_index` to submit backfill jobs for existing SSTables.
+    /// Returns IDs based on the flush target's generation counter: the most
+    /// recent flush is `last_generation`, and prior ones count down from there.
+    pub fn sstable_generation_ids(&self) -> Vec<String> {
+        let count = self.sstable_count();
+        let last_gen = self.flush_target.last_generation();
+        // Generations are numbered 1..=last_gen.
+        // The store holds `count` SSTables (may be fewer than last_gen after compaction).
+        // Return the most recent `count` generation IDs.
+        if count == 0 || last_gen == 0 {
+            return vec![];
+        }
+        let start = last_gen.saturating_sub(count as u64) + 1;
+        (start..=last_gen).map(|g| format!("{g}")).collect()
+    }
+
     /// Number of SSTables currently in the store.
     pub fn sstable_count(&self) -> usize {
         self.view.load().sstables.len()

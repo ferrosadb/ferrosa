@@ -116,10 +116,8 @@ pub struct StorageEngine {
     /// Default channel capacity for async observers.
     async_observer_capacity: usize,
     /// Index build scheduler — rebuilds secondary indexes after compaction.
-    #[allow(dead_code)] // Used in compaction and flush wiring below.
     index_scheduler: Option<crate::index::IndexBuildScheduler>,
     /// Shared index state tracker.
-    #[allow(dead_code)] // Used in compaction and flush wiring below.
     index_tracker: Arc<crate::index::IndexStateTracker>,
     /// Background archiver task handle, if archiving is enabled.
     archiver_handle: Option<tokio::task::JoinHandle<()>>,
@@ -483,6 +481,12 @@ impl StorageEngine {
             )
         };
 
+        // Register each declared index in the tracker.
+        for (index_name, _col_pos) in store.indexed_columns() {
+            self.index_tracker
+                .register_index(table_id.keyspace(), table_id.table(), index_name);
+        }
+
         let state = TableState { schema, store };
         self.tables.write().insert(table_id, state);
         Ok(())
@@ -503,12 +507,18 @@ impl StorageEngine {
     ///
     /// Called when CREATE INDEX is processed. Updates the TableStore's
     /// indexed_columns so future writes are indexed in the memtable.
+    /// Registers the index in the tracker and submits rebuild jobs for
+    /// all existing SSTables.
     pub fn add_index(
         &self,
         table_id: &TableId,
         index_name: &str,
         column_position: usize,
     ) -> ferrosa_common::Result<()> {
+        // Register with the tracker.
+        self.index_tracker
+            .register_index(table_id.keyspace(), table_id.table(), index_name);
+
         let mut tables = self.tables.write();
         let state = tables.get_mut(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
@@ -516,6 +526,29 @@ impl StorageEngine {
         state
             .store
             .add_index(index_name.to_string(), column_position);
+
+        // Submit rebuild jobs for all existing SSTables.
+        if let Some(ref scheduler) = self.index_scheduler {
+            let sstable_ids = state.store.sstable_generation_ids();
+            for sst_id in sstable_ids {
+                let job = crate::index::IndexBuildJob {
+                    sstable_id: sst_id,
+                    index_name: index_name.to_string(),
+                    index_type: ferrosa_index::IndexType::BTree,
+                    table: (
+                        table_id.keyspace().to_string(),
+                        table_id.table().to_string(),
+                    ),
+                    priority: crate::index::BuildPriority::Initial,
+                    enqueued_at: std::time::Instant::now(),
+                    column_position,
+                };
+                if let Err(e) = scheduler.submit(job) {
+                    eprintln!("[engine] failed to submit index backfill: {e}");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1048,6 +1081,37 @@ impl StorageEngine {
 
         state.store.flush()?;
 
+        // Submit index rebuild for the newly flushed SSTable if needed.
+        // This handles the case where CREATE INDEX was called after data
+        // was already in the memtable -- flush produces the SSTable but
+        // the sidecar may be incomplete, so we rebuild it.
+        if let Some(ref scheduler) = self.index_scheduler {
+            let gen = state.store.last_flush_generation();
+            for (index_name, col_pos) in state.store.indexed_columns() {
+                let tracker_state =
+                    self.index_tracker
+                        .get_state(table_id.keyspace(), table_id.table(), index_name);
+                // Only submit if the index needs building (not already current).
+                if let Some(idx_state) = tracker_state {
+                    if !idx_state.indexed_sstables.contains(&format!("{gen}")) {
+                        let job = crate::index::IndexBuildJob {
+                            sstable_id: format!("{gen}"),
+                            index_name: index_name.clone(),
+                            index_type: ferrosa_index::IndexType::BTree,
+                            table: (
+                                table_id.keyspace().to_string(),
+                                table_id.table().to_string(),
+                            ),
+                            priority: crate::index::BuildPriority::Normal,
+                            enqueued_at: std::time::Instant::now(),
+                            column_position: *col_pos,
+                        };
+                        let _ = scheduler.submit(job);
+                    }
+                }
+            }
+        }
+
         // Check for compaction after flush.
         self.maybe_compact(table_id, state);
 
@@ -1099,6 +1163,29 @@ impl StorageEngine {
                     std::collections::HashMap::new(),
                 ) {
                     eprintln!("[compaction] swap failed: {e}");
+                }
+
+                // Submit index rebuild jobs for the compacted output.
+                if let Some(ref scheduler) = self.index_scheduler {
+                    for (index_name, col_pos) in state.store.indexed_columns() {
+                        let job = crate::index::IndexBuildJob {
+                            sstable_id: result.output.id.clone(),
+                            index_name: index_name.clone(),
+                            index_type: ferrosa_index::IndexType::BTree,
+                            table: (
+                                table_id.keyspace().to_string(),
+                                table_id.table().to_string(),
+                            ),
+                            priority: crate::index::BuildPriority::Normal,
+                            enqueued_at: std::time::Instant::now(),
+                            column_position: *col_pos,
+                        };
+                        if let Err(e) = scheduler.submit(job) {
+                            eprintln!(
+                                "[compaction] failed to submit index rebuild for {index_name}: {e}"
+                            );
+                        }
+                    }
                 }
             }
 
