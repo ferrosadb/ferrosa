@@ -485,6 +485,69 @@ impl ClusterCoordinator {
             }
         }
     }
+
+    /// Coordinate a read using NetworkTopologyStrategy with DC-aware consistency.
+    ///
+    /// For `LOCAL_QUORUM` / `LOCAL_ONE`: only replicas in the local DC
+    /// participate in the quorum calculation.
+    /// For `EACH_QUORUM`: all DCs must independently satisfy quorum.
+    /// For other CLs: uses total RF as before.
+    pub async fn coordinate_read_nts(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+    ) -> crate::error::Result<Option<Vec<Row>>> {
+        let ring = self.ring.load();
+        let all_replicas = ring.replicas_for_strategy(key.token.0, strategy);
+
+        let local_dc = ring
+            .get_node(self.local_node_id)
+            .map(|n| n.data_center.clone())
+            .unwrap_or_default();
+
+        // For LOCAL_* CLs, filter to local DC replicas for quorum counting.
+        let (effective_replicas, required) = match cl {
+            ConsistencyLevel::LocalQuorum | ConsistencyLevel::LocalOne => {
+                let local_replicas: Vec<u64> = all_replicas
+                    .iter()
+                    .copied()
+                    .filter(|&id| {
+                        ring.get_node(id)
+                            .map(|n| n.data_center == local_dc)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                let local_rf = strategy
+                    .dc_replication_factors()
+                    .get(&local_dc)
+                    .copied()
+                    .unwrap_or(1);
+                let req = cl.block_for_dc(local_rf);
+                (local_replicas, req)
+            }
+            _ => {
+                let rf = strategy.replication_factor();
+                let req = cl.block_for(rf);
+                (all_replicas, req)
+            }
+        };
+        drop(ring);
+
+        if effective_replicas.len() < required {
+            return Err(ClusterError::Unavailable {
+                consistency: cl.to_string(),
+                required,
+                alive: effective_replicas.len(),
+            });
+        }
+
+        // Delegate to the existing coordinate_read_with logic using
+        // the effective replica set and required count.
+        self.coordinate_read_with(table_id, key, cl, effective_replicas.len())
+            .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -994,5 +1057,106 @@ mod tests {
             result.is_none(),
             "full_refetch should return None when replica is unreachable"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // NTS read coordination tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn coordinate_read_nts_local_quorum_reads_from_local_dc() {
+        // Setup: dc1 has local node with data, dc2 has unreachable node.
+        // CL=LOCAL_QUORUM with dc1_rf=1 => block_for_dc(1) = 1.
+        // Local node has data => should succeed.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut local_info = make_node("10.0.0.1:7000");
+        local_info.data_center = "dc1".to_string();
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local_info);
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            Arc::new(PeerManager::new(
+                Arc::new(ferrosa_net::config::NetConfig::default()),
+                Uuid::new_v4(),
+                Arc::new(NoopListener),
+            )),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::LocalQuorum,
+        );
+
+        // Write data directly to storage
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let row = test_row(1000);
+        storage.write(&table_id, &key, row, 1000).unwrap();
+
+        let dc_rf = std::collections::HashMap::from([("dc1".to_string(), 1usize)]);
+        let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology { dc_rf };
+
+        let result = coordinator
+            .coordinate_read_nts(&table_id, &key, ConsistencyLevel::LocalQuorum, &strategy)
+            .await
+            .unwrap();
+
+        assert!(result.is_some(), "should read back written data");
+    }
+
+    #[tokio::test]
+    async fn coordinate_read_nts_unavailable_when_insufficient_local_replicas() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        // dc1 has 1 node (local), dc1_rf=3, CL=LOCAL_QUORUM => need 2
+        // Only 1 local DC replica => Unavailable
+        let local_node_id = 1u64;
+        let mut local_info = make_node("10.0.0.1:7000");
+        local_info.data_center = "dc1".to_string();
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local_info);
+        ring.assign_tokens(local_node_id, &[100]);
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            Arc::new(PeerManager::new(
+                Arc::new(ferrosa_net::config::NetConfig::default()),
+                Uuid::new_v4(),
+                Arc::new(NoopListener),
+            )),
+            local_node_id,
+            storage.clone(),
+            3,
+            ConsistencyLevel::LocalQuorum,
+        );
+
+        let dc_rf = std::collections::HashMap::from([("dc1".to_string(), 3usize)]);
+        let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology { dc_rf };
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+
+        let result = coordinator
+            .coordinate_read_nts(&table_id, &key, ConsistencyLevel::LocalQuorum, &strategy)
+            .await;
+
+        match result {
+            Err(ClusterError::Unavailable {
+                required, alive, ..
+            }) => {
+                assert_eq!(required, 2, "LOCAL_QUORUM of rf=3 requires 2");
+                assert_eq!(alive, 1, "only 1 local DC replica");
+            }
+            other => panic!("expected Unavailable, got: {other:?}"),
+        }
     }
 }
