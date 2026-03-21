@@ -84,7 +84,6 @@ pub struct IndexBuildResult {
 /// iterates all rows, and produces sidecar entries for each index.
 pub struct LocalBackend {
     /// Root data directory where SSTable files live.
-    #[allow(dead_code)] // Used in Task 4 when SSTable reading is wired.
     data_dir: PathBuf,
 }
 
@@ -97,10 +96,67 @@ impl LocalBackend {
 
 impl IndexBuildBackend for LocalBackend {
     fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
-        let start = Instant::now();
+        use ferrosa_index::{IndexKey, RowPosition};
+        use ferrosa_sstable::io::FileReadAt;
+        use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
 
-        // TODO: Task 4 will add actual SSTable reading and sidecar building.
-        let sidecar_entries = HashMap::new();
+        let start = Instant::now();
+        let gen = &job.sstable_id;
+        let dir = &self.data_dir;
+
+        // Open SSTable components.
+        let data = FileReadAt::open(dir.join(format!("{gen}-Data.db")))
+            .map_err(|e| format!("open data: {e}"))?;
+        let partitions_file = FileReadAt::open(dir.join(format!("{gen}-Partitions.db")))
+            .map_err(|e| format!("open partitions: {e}"))?;
+        let rows_file = FileReadAt::open(dir.join(format!("{gen}-Rows.db")))
+            .map_err(|e| format!("open rows: {e}"))?;
+        let filter = std::fs::read(dir.join(format!("{gen}-Filter.db")))
+            .map_err(|e| format!("read filter: {e}"))?;
+        let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db")))
+            .map_err(|e| format!("read statistics: {e}"))?;
+        let compression_info = std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
+
+        let reader = SSTableReader::open(SSTableComponents {
+            data,
+            partitions: partitions_file,
+            rows: rows_file,
+            filter,
+            compression_info,
+            statistics,
+        })
+        .map_err(|e| format!("open sstable: {e}"))?;
+
+        // Read all partitions and build sidecar entries.
+        let all_partitions = reader
+            .read_all_partitions()
+            .map_err(|e| format!("read partitions: {e}"))?;
+
+        let mut entries: Vec<(IndexKey, RowPosition)> = Vec::new();
+
+        for partition in &all_partitions {
+            let pk_bytes = partition.key.key.as_bytes().to_vec();
+            for row in &partition.rows {
+                // Find the cell at the first column position (column ordinal 0).
+                // The column_position field will be added in Task 5.
+                if let Some((_col_pos, cell)) = row.cells.first() {
+                    if let Some(ref value) = cell.value {
+                        entries.push((
+                            IndexKey(value.clone()),
+                            RowPosition {
+                                partition_key: pk_bytes.clone(),
+                                clustering_key: row.clustering.clone(),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut sidecar_entries = HashMap::new();
+        if !entries.is_empty() {
+            sidecar_entries.insert(job.index_name.clone(), entries);
+        }
 
         Ok(IndexBuildResult {
             sstable_id: job.sstable_id.clone(),
@@ -200,6 +256,7 @@ impl IndexBuildScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flush::FlushTarget;
     use crate::index::IndexStatus;
     use std::time::Duration;
 
@@ -340,8 +397,6 @@ mod tests {
 
     #[test]
     fn local_backend_returns_result_for_job() {
-        use std::path::PathBuf;
-
         let backend = LocalBackend::new(PathBuf::from("/tmp/test-data"));
         let job = IndexBuildJob {
             sstable_id: "sst-001".to_string(),
@@ -355,5 +410,125 @@ mod tests {
         assert!(result.is_ok());
         let result = result.unwrap();
         assert_eq!(result.sstable_id, "sst-001");
+    }
+
+    #[test]
+    fn local_backend_builds_sidecar_from_sstable() {
+        use ferrosa_common::cell::CellValue;
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+        use ferrosa_sstable::writer::SSTableWriter;
+        use ferrosa_sstable::WriteOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sstable_dir = dir.path().to_path_buf();
+
+        // Create a table schema with one clustering and one regular column.
+        let schema = TableSchema {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+
+        // Build two partitions with distinct values.
+        let mut partitions = vec![
+            Partition {
+                key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"alice".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                }],
+            },
+            Partition {
+                key: DecoratedKey::new(PartitionKey::new(b"pk2".to_vec())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x02],
+                    cells: vec![(0, CellValue::live(b"bob".to_vec(), 2000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(2000),
+                }],
+            },
+        ];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let header = crate::flush::build_serialization_header(&schema, &partitions);
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let mut writer = SSTableWriter::new(options, header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        // Write SSTable files to disk with generation "1".
+        let flush_target = crate::flush::FileFlushTarget::new(sstable_dir.clone()).unwrap();
+        let _reader = flush_target.flush(output).unwrap();
+        let gen = flush_target.generation();
+
+        // Build using LocalBackend.
+        let backend = LocalBackend::new(sstable_dir.clone());
+        let job = IndexBuildJob {
+            sstable_id: format!("{gen}"),
+            index_name: "val_idx".to_string(),
+            index_type: IndexType::BTree,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+        };
+        let result = backend.build(&job).unwrap();
+
+        assert_eq!(result.sstable_id, format!("{gen}"));
+        // The backend should produce sidecar entries for the "val_idx" index.
+        assert!(
+            result.sidecar_entries.contains_key("val_idx"),
+            "expected val_idx in sidecar_entries, got keys: {:?}",
+            result.sidecar_entries.keys().collect::<Vec<_>>()
+        );
+        let entries = &result.sidecar_entries["val_idx"];
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected 2 sidecar entries, got {}",
+            entries.len()
+        );
+    }
+
+    #[test]
+    fn local_backend_returns_error_for_missing_sstable() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_path_buf());
+        let job = IndexBuildJob {
+            sstable_id: "nonexistent".to_string(),
+            index_name: "idx".to_string(),
+            index_type: IndexType::BTree,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+        };
+        let result = backend.build(&job);
+        assert!(result.is_err(), "expected error for missing SSTable");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("open data"),
+            "expected file-open error, got: {err}"
+        );
     }
 }
