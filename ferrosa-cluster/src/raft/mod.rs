@@ -95,8 +95,8 @@ pub struct NodeInfo {
 /// Per-node build status for a secondary index.
 ///
 /// Replicated via Raft so all nodes see consistent index readiness.
-/// Used in [`RaftState::index_state_map`] to track which nodes have
-/// finished building which indexes.
+/// Used in [`state_machine::RaftState::index_state_map`] to track which
+/// nodes have finished building which indexes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexNodeStatus {
     /// The node is actively building the index.

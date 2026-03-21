@@ -154,8 +154,10 @@ mod tests {
 
     #[test]
     fn cluster_config_serde_with_node_role() {
-        let mut config = ClusterConfig::default();
-        config.node_role = NodeRole::Indexer;
+        let config = ClusterConfig {
+            node_role: NodeRole::Indexer,
+            ..ClusterConfig::default()
+        };
 
         let bytes = bincode::serialize(&config).unwrap();
         let decoded: ClusterConfig = bincode::deserialize(&bytes).unwrap();

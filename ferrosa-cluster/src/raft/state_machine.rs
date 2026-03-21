@@ -1938,7 +1938,7 @@ mod tests {
             .unwrap();
         // Both nodes should be marked Building.
         assert_eq!(entry.len(), 2);
-        for (_, status) in entry {
+        for status in entry.values() {
             assert_eq!(*status, IndexNodeStatus::Building);
         }
     }
