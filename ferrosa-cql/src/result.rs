@@ -122,8 +122,8 @@ pub fn encode_prepared(
     buf.put_u16(16u16);
     buf.put_slice(id);
 
-    // Bind-variable metadata
-    encode_rows_metadata(&mut buf, bound_names, bound_types, keyspace, table);
+    // Bind-variable metadata (includes pk_count + pk_indexes per CQL protocol v4+)
+    encode_prepared_bind_metadata(&mut buf, bound_names, bound_types, keyspace, table);
 
     // Result-column metadata
     if result_column_names.is_empty() {
@@ -150,6 +150,30 @@ pub fn encode_prepared(
 fn encode_string(buf: &mut BytesMut, s: &str) {
     buf.put_u16(s.len() as u16);
     buf.put_slice(s.as_bytes());
+}
+
+/// Write bind-variable metadata for Prepared results.
+///
+/// Per CQL native protocol v4+ (section 4.2.5.4), the bind-variable
+/// metadata includes `pk_count` and `pk_indexes` between `columns_count`
+/// and the global table spec. We write `pk_count=0` which tells drivers
+/// there are no primary key index hints.
+fn encode_prepared_bind_metadata(
+    buf: &mut BytesMut,
+    column_names: &[String],
+    column_types: &[CqlType],
+    keyspace: &str,
+    table: &str,
+) {
+    buf.put_i32(0x0001); // flags: Global_tables_spec
+    buf.put_i32(column_names.len() as i32);
+    buf.put_i32(0); // pk_count: 0 (no PK index hints)
+    encode_string(buf, keyspace);
+    encode_string(buf, table);
+    for (name, cql_type) in column_names.iter().zip(column_types.iter()) {
+        encode_string(buf, name);
+        encode_type(buf, cql_type);
+    }
 }
 
 /// Write column metadata used by both Rows and Prepared results.
@@ -395,6 +419,11 @@ mod tests {
         pos += 4;
         // bind metadata: col_count
         let bind_col_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        // bind metadata: pk_count + pk_indexes (CQL protocol v4+)
+        let pk_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(pk_count, 0, "pk_count should be 0");
         pos += 4;
 
         if bind_flags & 0x0001 != 0 {
