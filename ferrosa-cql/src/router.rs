@@ -828,6 +828,20 @@ fn route_select_user_table(
             ),
             None => vec![],
         }
+    } else if let Some(in_rows) = try_pk_in_lookup(
+        &s.where_clauses,
+        table_meta,
+        ks,
+        &state.schema,
+        &state.engine,
+        &table_id,
+        &all_col_names,
+        &all_col_types,
+        &pk_indices,
+        &ck_indices,
+    )? {
+        // PK IN (...) — multi-partition lookup
+        in_rows
     } else {
         // No PK — use the query planner to decide the access path.
         let planner_indexes: Vec<(String, Vec<String>)> = snap
@@ -1662,11 +1676,15 @@ async fn route_delete(
         }
     }
 
-    // Build delete column indices (empty = row-level delete)
+    // Build delete column indices (empty = row-level delete).
+    // MapElement targets are treated as whole-column deletes for now —
+    // the storage layer tombstones the column, which is safe (if broader
+    // than strictly necessary).
     let delete_columns: Vec<u16> = s
         .columns
         .iter()
-        .map(|col_name| {
+        .map(|target| {
+            let col_name = target.column_name();
             table_meta
                 .columns
                 .get_index_of(col_name)
@@ -2061,7 +2079,8 @@ fn materialize_delete(
     let delete_columns: Vec<u16> = s
         .columns
         .iter()
-        .map(|col_name| {
+        .map(|target| {
+            let col_name = target.column_name();
             table_meta
                 .columns
                 .get_index_of(col_name)
@@ -3290,6 +3309,125 @@ fn extract_pk_values(
     Ok(values)
 }
 
+/// Try to handle `WHERE partition_key IN (v1, v2, ...)` by performing a
+/// separate PK lookup for each value in the IN list.
+///
+/// Returns `Ok(Some(rows))` if the WHERE clause contains an IN predicate on
+/// all partition key columns (currently supports single-column PK with IN,
+/// or multi-column PK where all but one column are `Eq` and one is `In`).
+/// Returns `Ok(None)` if no IN predicate is found on PK columns, letting
+/// the caller fall through to the planner.
+#[allow(clippy::too_many_arguments)]
+fn try_pk_in_lookup(
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+    engine: &StorageEngine,
+    table_id: &TableId,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    pk_indices: &[usize],
+    ck_indices: &[usize],
+) -> Result<Option<Vec<Vec<Option<CqlValue>>>>, CqlError> {
+    let pk_names = &table_meta.partition_key;
+
+    // Find which PK column (if any) has an IN predicate.
+    let in_col_idx = pk_names.iter().position(|pk_name| {
+        where_clauses
+            .iter()
+            .any(|w| w.column == *pk_name && w.op == ComparisonOp::In)
+    });
+
+    let in_col_idx = match in_col_idx {
+        Some(idx) => idx,
+        None => return Ok(None),
+    };
+
+    // For the IN column, every other PK column must have an Eq predicate.
+    for (i, pk_name) in pk_names.iter().enumerate() {
+        if i == in_col_idx {
+            continue;
+        }
+        let has_eq = where_clauses
+            .iter()
+            .any(|w| w.column == *pk_name && w.op == ComparisonOp::Eq);
+        if !has_eq {
+            return Ok(None);
+        }
+    }
+
+    // Extract the IN list values.
+    let in_wc = where_clauses
+        .iter()
+        .find(|w| w.column == pk_names[in_col_idx] && w.op == ComparisonOp::In)
+        .expect("IN predicate verified above");
+
+    let in_terms = match &in_wc.value {
+        Term::InList(terms) => terms,
+        _ => {
+            return Err(CqlError::Invalid(
+                "IN predicate value must be a list".into(),
+            ));
+        }
+    };
+
+    if in_terms.is_empty() {
+        return Ok(Some(vec![]));
+    }
+
+    // Resolve PK column types.
+    let pk_types: Vec<CqlType> = pk_names
+        .iter()
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, schema))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Pre-resolve the Eq values for non-IN PK columns.
+    let mut eq_values: Vec<Option<CqlValue>> = vec![None; pk_names.len()];
+    for (i, pk_name) in pk_names.iter().enumerate() {
+        if i == in_col_idx {
+            continue;
+        }
+        let wc = where_clauses
+            .iter()
+            .find(|w| w.column == *pk_name && w.op == ComparisonOp::Eq)
+            .expect("Eq predicate verified above");
+        eq_values[i] = Some(bridge::term_to_cql_value(&wc.value, &pk_types[i])?);
+    }
+
+    // Iterate over each value in the IN list, build PK, and read.
+    let in_col_type = &pk_types[in_col_idx];
+    let mut all_rows = Vec::new();
+
+    for term in in_terms {
+        let in_value = bridge::term_to_cql_value(term, in_col_type)?;
+
+        // Assemble the full PK values vector in column order.
+        let mut pk_values = Vec::with_capacity(pk_names.len());
+        for (i, _) in pk_names.iter().enumerate() {
+            if i == in_col_idx {
+                pk_values.push(in_value.clone());
+            } else {
+                pk_values.push(eq_values[i].clone().expect("Eq value resolved above"));
+            }
+        }
+
+        let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+        if let Some(partition) = engine.read(table_id, &decorated_key)? {
+            let mut prows = bridge::partition_to_rows(
+                &partition,
+                all_col_names,
+                all_col_types,
+                pk_indices,
+                ck_indices,
+            );
+            all_rows.append(&mut prows);
+        }
+    }
+
+    Ok(Some(all_rows))
+}
+
 /// Convert a WHERE clause `Term` for a given column into an `IndexKey` for
 /// secondary index lookup.
 fn term_to_index_key(
@@ -3742,6 +3880,13 @@ async fn route_create_function(
     let resolved_return = bridge::resolve_type_name(&return_type, &ks, &state.schema)?;
     let common_return = cql_type_to_common(&resolved_return);
 
+    // Build arg type name strings for the SCHEMA_CHANGE response (CQL protocol
+    // requires a [string list] of argument type names for FUNCTION targets).
+    let arg_type_names: Vec<String> = arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
+
     // Decode hex body to WASM bytes and compile
     let wasm_bytes = hex_decode(&body)?;
     state
@@ -3756,10 +3901,11 @@ async fn route_create_function(
             // Drop the old one first, then create the new one
             state.udf_executor.invalidate(&ks, &name);
         } else if if_not_exists {
-            return Ok(result::encode_schema_change(
+            return Ok(result::encode_schema_change_with_args(
                 "CREATED",
                 "FUNCTION",
                 &[&ks, &name],
+                &arg_type_names,
             ));
         } else {
             return Err(CqlError::Invalid(format!(
@@ -3802,10 +3948,11 @@ async fn route_create_function(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "CREATED",
         "FUNCTION",
         &[&ks, &name],
+        &arg_type_names,
     ))
 }
 
@@ -3848,10 +3995,11 @@ async fn route_drop_function(
             match matching.len() {
                 0 => {
                     if if_exists {
-                        return Ok(result::encode_schema_change(
+                        return Ok(result::encode_schema_change_with_args(
                             "DROPPED",
                             "FUNCTION",
                             &[&ks, &name],
+                            &[],
                         ));
                     }
                     return Err(CqlError::Invalid(format!("function {ks}.{name} not found")));
@@ -3871,6 +4019,12 @@ async fn route_drop_function(
         }
     };
 
+    // Build arg type name strings for the SCHEMA_CHANGE response.
+    let resolved_arg_type_names: Vec<String> = resolved_arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
+
     // IF EXISTS check
     if if_exists
         && state
@@ -3878,10 +4032,11 @@ async fn route_drop_function(
             .get_function(&ks, &name, &resolved_arg_types)
             .is_none()
     {
-        return Ok(result::encode_schema_change(
+        return Ok(result::encode_schema_change_with_args(
             "DROPPED",
             "FUNCTION",
             &[&ks, &name],
+            &resolved_arg_type_names,
         ));
     }
 
@@ -3923,10 +4078,11 @@ async fn route_drop_function(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "DROPPED",
         "FUNCTION",
         &[&ks, &name],
+        &resolved_arg_type_names,
     ))
 }
 
@@ -3961,6 +4117,12 @@ async fn route_create_aggregate(
             Ok(cql_type_to_common(&resolved))
         })
         .collect::<Result<_, CqlError>>()?;
+
+    // Build arg type name strings for the SCHEMA_CHANGE response.
+    let agg_arg_type_names: Vec<String> = arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
 
     // Resolve state type
     let resolved_state_type = bridge::resolve_type_name(&state_type, &ks, &state.schema)?;
@@ -4012,10 +4174,11 @@ async fn route_create_aggregate(
         if or_replace {
             // Will be replaced by the new creation
         } else if if_not_exists {
-            return Ok(result::encode_schema_change(
+            return Ok(result::encode_schema_change_with_args(
                 "CREATED",
                 "AGGREGATE",
                 &[&ks, &name],
+                &agg_arg_type_names,
             ));
         } else {
             return Err(CqlError::Invalid(format!(
@@ -4059,10 +4222,11 @@ async fn route_create_aggregate(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "CREATED",
         "AGGREGATE",
         &[&ks, &name],
+        &agg_arg_type_names,
     ))
 }
 
@@ -4104,10 +4268,11 @@ async fn route_drop_aggregate(
             match matching.len() {
                 0 => {
                     if if_exists {
-                        return Ok(result::encode_schema_change(
+                        return Ok(result::encode_schema_change_with_args(
                             "DROPPED",
                             "AGGREGATE",
                             &[&ks, &name],
+                            &[],
                         ));
                     }
                     return Err(CqlError::Invalid(format!(
@@ -4129,6 +4294,12 @@ async fn route_drop_aggregate(
         }
     };
 
+    // Build arg type name strings for the SCHEMA_CHANGE response.
+    let resolved_agg_arg_type_names: Vec<String> = resolved_arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
+
     // IF EXISTS check
     if if_exists
         && state
@@ -4136,10 +4307,11 @@ async fn route_drop_aggregate(
             .get_aggregate(&ks, &name, &resolved_arg_types)
             .is_none()
     {
-        return Ok(result::encode_schema_change(
+        return Ok(result::encode_schema_change_with_args(
             "DROPPED",
             "AGGREGATE",
             &[&ks, &name],
+            &resolved_agg_arg_type_names,
         ));
     }
 
@@ -4178,10 +4350,11 @@ async fn route_drop_aggregate(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "DROPPED",
         "AGGREGATE",
         &[&ks, &name],
+        &resolved_agg_arg_type_names,
     ))
 }
 

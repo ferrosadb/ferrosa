@@ -398,12 +398,24 @@ impl<'input> Parser<'input> {
         })
     }
 
-    fn parse_delete_columns(&mut self) -> Result<Vec<String>, CqlError> {
-        let mut cols = vec![self.parse_ident()?];
+    fn parse_delete_columns(&mut self) -> Result<Vec<DeleteTarget>, CqlError> {
+        let mut cols = vec![self.parse_delete_target()?];
         while self.lexer.eat(&TokenKind::Comma)? {
-            cols.push(self.parse_ident()?);
+            cols.push(self.parse_delete_target()?);
         }
         Ok(cols)
+    }
+
+    /// Parse a single delete target: either `col` or `col[key]`.
+    fn parse_delete_target(&mut self) -> Result<DeleteTarget, CqlError> {
+        let col = self.parse_ident()?;
+        if self.lexer.eat(&TokenKind::LBracket)? {
+            let key = self.parse_term()?;
+            self.lexer.expect(&TokenKind::RBracket)?;
+            Ok(DeleteTarget::MapElement { column: col, key })
+        } else {
+            Ok(DeleteTarget::Column(col))
+        }
     }
 
     // ---------------------------------------------------------------
@@ -2306,7 +2318,32 @@ mod tests {
         let stmt = parse("DELETE name, email FROM users WHERE id = 1").unwrap();
         match stmt {
             Statement::Delete(s) => {
-                assert_eq!(s.columns, vec!["name".to_string(), "email".to_string()]);
+                assert_eq!(
+                    s.columns,
+                    vec![
+                        DeleteTarget::Column("name".into()),
+                        DeleteTarget::Column("email".into()),
+                    ]
+                );
+            }
+            other => panic!("expected Delete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_delete_map_element() {
+        let stmt = parse("DELETE social_links['twitter'] FROM users WHERE id = 1").unwrap();
+        match stmt {
+            Statement::Delete(s) => {
+                assert_eq!(
+                    s.columns,
+                    vec![DeleteTarget::MapElement {
+                        column: "social_links".into(),
+                        key: Term::StringLiteral("twitter".into()),
+                    }]
+                );
+                assert_eq!(s.table, "users");
+                assert_eq!(s.where_clauses.len(), 1);
             }
             other => panic!("expected Delete, got {:?}", other),
         }

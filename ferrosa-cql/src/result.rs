@@ -35,15 +35,38 @@ pub fn encode_set_keyspace(keyspace: &str) -> BytesMut {
 /// Encode a SchemaChange RESULT body.
 ///
 /// `change_type` is one of `"CREATED"`, `"UPDATED"`, `"DROPPED"`.
-/// `target` is one of `"KEYSPACE"`, `"TABLE"`.
-/// `options` contains the keyspace name and, for table targets, the table name.
+/// `target` is one of `"KEYSPACE"`, `"TABLE"`, `"TYPE"`, `"FUNCTION"`, `"AGGREGATE"`.
+/// `options` contains the keyspace name and, for non-keyspace targets, the object name.
+/// `arg_types` is the list of argument type names, required for FUNCTION/AGGREGATE targets
+/// per CQL native protocol v5 section 4.2.5.5. Pass an empty slice for other targets.
 pub fn encode_schema_change(change_type: &str, target: &str, options: &[&str]) -> BytesMut {
+    encode_schema_change_with_args(change_type, target, options, &[])
+}
+
+/// Encode a schema change result with function/aggregate argument types.
+///
+/// The CQL native protocol requires FUNCTION and AGGREGATE schema change
+/// events to include a `[string list]` of argument types after the
+/// keyspace and object name.
+pub fn encode_schema_change_with_args(
+    change_type: &str,
+    target: &str,
+    options: &[&str],
+    arg_types: &[String],
+) -> BytesMut {
     let mut buf = BytesMut::new();
     buf.put_i32(0x0005); // SchemaChange kind
     encode_string(&mut buf, change_type);
     encode_string(&mut buf, target);
     for opt in options {
         encode_string(&mut buf, opt);
+    }
+    if target == "FUNCTION" || target == "AGGREGATE" {
+        // CQL native protocol requires a [string list] of argument types
+        buf.put_u16(arg_types.len() as u16);
+        for arg in arg_types {
+            encode_string(&mut buf, arg);
+        }
     }
     buf
 }
@@ -248,6 +271,52 @@ mod tests {
     fn encode_schema_change_created() {
         let buf = encode_schema_change("CREATED", "TABLE", &["ks", "users"]);
         assert_eq!(&buf[0..4], &0x0005i32.to_be_bytes());
+    }
+
+    #[test]
+    fn encode_schema_change_function_includes_arg_types() {
+        let arg_types = vec!["int".to_string(), "text".to_string()];
+        let buf =
+            encode_schema_change_with_args("CREATED", "FUNCTION", &["ks", "my_func"], &arg_types);
+        assert_eq!(&buf[0..4], &0x0005i32.to_be_bytes());
+
+        // Parse forward: kind(4) + change_type string + target string + ks string + name string
+        let mut pos = 4;
+
+        // change_type "CREATED"
+        let len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos += 2 + len;
+
+        // target "FUNCTION"
+        let len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos += 2 + len;
+
+        // keyspace "ks"
+        let len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos += 2 + len;
+
+        // function name "my_func"
+        let len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos += 2 + len;
+
+        // arg_types string list: [u16 count][string]*
+        let count = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        pos += 2;
+        assert_eq!(count, 2, "arg_types list should have 2 entries");
+
+        // first arg type "int"
+        let len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos += 2;
+        assert_eq!(&buf[pos..pos + len], b"int");
+        pos += len;
+
+        // second arg type "text"
+        let len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos += 2;
+        assert_eq!(&buf[pos..pos + len], b"text");
+        pos += len;
+
+        assert_eq!(pos, buf.len(), "no trailing bytes");
     }
 
     #[test]

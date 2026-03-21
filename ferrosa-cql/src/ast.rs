@@ -208,11 +208,30 @@ pub struct UpdateStatement {
     pub using_ttl: Option<i32>,
 }
 
+/// A column target in a DELETE statement — either a whole column or a map element.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteTarget {
+    /// Delete entire column: `DELETE col FROM ...`
+    Column(String),
+    /// Delete a single map element: `DELETE col['key'] FROM ...`
+    MapElement { column: String, key: Term },
+}
+
+impl DeleteTarget {
+    /// Returns the column name regardless of variant.
+    pub fn column_name(&self) -> &str {
+        match self {
+            DeleteTarget::Column(name) => name,
+            DeleteTarget::MapElement { column, .. } => column,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteStatement {
     pub keyspace: Option<String>,
     pub table: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<DeleteTarget>,
     pub where_clauses: Vec<WhereClause>,
     pub if_exists: bool,
     pub using_timestamp: Option<i64>,
