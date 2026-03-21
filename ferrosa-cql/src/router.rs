@@ -747,17 +747,15 @@ fn route_select_user_table(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    // Reject ALLOW FILTERING — Ferrosa requires queries to use indexed columns
-    // or partition keys rather than full-table scans.
-    // Exception: ALLOW FILTERING is permitted when UDFs appear in WHERE predicates,
-    // since UDF-filtered queries inherently require post-scan evaluation.
+    // ALLOW FILTERING: permit full-table scans with post-filter when the
+    // client explicitly opts in.  Log a warning so operators can identify
+    // expensive queries, but do not reject.
     if s.allow_filtering && !where_has_udf_calls(&s.where_clauses) {
-        return Err(CqlError::Invalid(
-            "ALLOW FILTERING is not supported. Ferrosa requires queries to use \
-             indexed columns or partition keys. Create an index on the filtered \
-             column or restructure your query."
-                .into(),
-        ));
+        tracing::warn!(
+            keyspace = ks,
+            table = %s.table,
+            "executing query with ALLOW FILTERING — full table scan with post-filter"
+        );
     }
 
     // If WHERE contains UDF calls but ALLOW FILTERING is not set, reject.
@@ -860,12 +858,12 @@ fn route_select_user_table(
                 ..
             } => {
                 // IndexScanWithFilter means some WHERE columns are not covered
-                // by any index — reject these queries.
-                if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) {
+                // by any index — require ALLOW FILTERING for these queries.
+                if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) && !s.allow_filtering {
                     return Err(CqlError::Invalid(
                         "Cannot execute this query as it requires filtering on non-indexed \
-                         columns. Create a secondary index on the filtered columns or \
-                         restructure your query to use partition keys."
+                         columns. Use ALLOW FILTERING, create a secondary index on the \
+                         filtered columns, or restructure your query to use partition keys."
                             .into(),
                     ));
                 }
@@ -1005,11 +1003,11 @@ fn route_select_user_table(
                     .iter()
                     .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
 
-                if !s.where_clauses.is_empty() && !all_where_columns_indexed {
+                if !s.where_clauses.is_empty() && !all_where_columns_indexed && !s.allow_filtering {
                     return Err(CqlError::Invalid(
                         "Cannot execute this query as it requires filtering on non-indexed \
-                         columns. Create a secondary index on the filtered columns or \
-                         restructure your query to use partition keys."
+                         columns. Use ALLOW FILTERING, create a secondary index on the \
+                         filtered columns, or restructure your query to use partition keys."
                             .into(),
                     ));
                 }
@@ -5566,13 +5564,14 @@ mod tests {
         }
     }
 
-    // ── ALLOW FILTERING is always rejected ────────────────────────
+    // ── ALLOW FILTERING executes full scan with post-filter ────────
     //
-    // Ferrosa policy: ALLOW FILTERING is not supported.  Queries must use
-    // partition keys or secondary indexes.
+    // ALLOW FILTERING performs a full table scan and filters rows in
+    // memory.  Queries without ALLOW FILTERING on non-indexed columns
+    // are still rejected.
 
     #[tokio::test]
-    async fn allow_filtering_rejected() {
+    async fn allow_filtering_executes_full_scan() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -5592,20 +5591,16 @@ mod tests {
 
         let stmt =
             crate::parser::parse("SELECT * FROM ks.t WHERE score > 25 ALLOW FILTERING").unwrap();
-        match route(&state, &ctx, stmt).await {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("ALLOW FILTERING"),
-                    "error should mention ALLOW FILTERING: {msg}"
-                );
-            }
-            Ok(_) => panic!("ALLOW FILTERING should be rejected"),
-        }
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALLOW FILTERING should execute full scan, got: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
-    async fn allow_filtering_with_limit_also_rejected() {
+    async fn allow_filtering_with_limit_executes() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -5627,8 +5622,9 @@ mod tests {
                 .unwrap();
         let result = route(&state, &ctx, stmt).await;
         assert!(
-            result.is_err(),
-            "ALLOW FILTERING with LIMIT should also be rejected"
+            result.is_ok(),
+            "ALLOW FILTERING with LIMIT should execute, got: {:?}",
+            result.err()
         );
     }
 
@@ -5703,9 +5699,10 @@ mod tests {
         }
     }
 
-    /// Even with an index on some columns, ALLOW FILTERING is rejected.
+    /// With an index on some columns and ALLOW FILTERING, the query should
+    /// succeed — the index narrows the scan, post-filter handles the rest.
     #[tokio::test]
-    async fn allow_filtering_rejected_even_with_partial_index() {
+    async fn allow_filtering_with_partial_index_succeeds() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -5733,7 +5730,11 @@ mod tests {
         )
         .unwrap();
         let result = route(&state, &ctx, stmt).await;
-        assert!(result.is_err(), "ALLOW FILTERING should be rejected");
+        assert!(
+            result.is_ok(),
+            "ALLOW FILTERING with partial index should succeed: {:?}",
+            result.err()
+        );
     }
 
     /// Querying on a fully-indexed column without ALLOW FILTERING must succeed.
