@@ -77,6 +77,10 @@ pub enum MsgType {
     PairSchemaSync = 0x45,
     PairDdlForward = 0x46,
     PairDdlAck = 0x47,
+    // Batchlog
+    BatchlogWrite = 0x50,
+    BatchlogDelete = 0x51,
+    BatchlogReplay = 0x52,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -107,6 +111,9 @@ impl TryFrom<u8> for MsgType {
             0x45 => Ok(Self::PairSchemaSync),
             0x46 => Ok(Self::PairDdlForward),
             0x47 => Ok(Self::PairDdlAck),
+            0x50 => Ok(Self::BatchlogWrite),
+            0x51 => Ok(Self::BatchlogDelete),
+            0x52 => Ok(Self::BatchlogReplay),
             _ => Err(NetError::UnknownMessageType(value)),
         }
     }
