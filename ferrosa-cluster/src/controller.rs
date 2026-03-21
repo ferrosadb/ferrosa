@@ -34,7 +34,7 @@ use ferrosa_storage::CommitLogPosition;
 
 use crate::config::ClusterConfig;
 use crate::consistency::ConsistencyLevel;
-use crate::coordinator::ClusterCoordinator;
+use crate::coordinator::{ClusterCoordinator, RepairWriteHandler};
 use crate::ddl_path::{ClusterDdlForwardHandler, DdlPath};
 use crate::error::{ClusterError, Result};
 use crate::hints::delivery::HintDeliveryTask;
@@ -775,6 +775,8 @@ impl ModeController {
             ConsistencyLevel::Quorum,
         ));
 
+        let repair_metrics_for_handler = coordinator.repair_metrics.clone();
+
         // 6. Swap write path — cluster coordinator handles replica routing
         self.write_path
             .store(Arc::new(WritePath::cluster(coordinator)));
@@ -815,6 +817,7 @@ impl ModeController {
         let ddl_path = self.ddl_path.clone();
         let registry = self.registry.clone();
         let storage_for_handler = self.storage.clone();
+        let repair_metrics = repair_metrics_for_handler;
         let cluster_name = self.config.cluster_name.clone();
         tokio::spawn(async move {
             // Build openraft Config
@@ -864,6 +867,12 @@ impl ModeController {
 
             let snapshot_handler = Arc::new(RaftSnapshotHandler::new((*raft_arc).clone()));
             registry.register(MsgType::RaftInstallSnapshot, snapshot_handler);
+
+            let repair_handler = Arc::new(RepairWriteHandler::new(
+                storage_for_handler.clone(),
+                repair_metrics,
+            ));
+            registry.register(MsgType::RepairWrite, repair_handler);
 
             let read_handler = Arc::new(ReadRequestHandler::new(storage_for_handler));
             registry.register(MsgType::ReadRequest, read_handler);
