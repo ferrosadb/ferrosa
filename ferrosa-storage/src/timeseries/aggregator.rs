@@ -534,7 +534,7 @@ mod tests {
         use super::super::consolidation::{consolidate_values, ConsolidationFn};
 
         // Verify consolidation logic works end-to-end for a task's window entries.
-        let entries = vec![
+        let entries = [
             RingEntry {
                 timestamp: 0,
                 values: SmallVec::from_slice(&[1.0]),
@@ -610,7 +610,7 @@ mod tests {
         use super::super::consolidation::{consolidate_values, ConsolidationFn};
 
         // 3 entries, 2 columns each.
-        let entries = vec![
+        let entries = [
             RingEntry {
                 timestamp: 0,
                 values: SmallVec::from_slice(&[10.0, 100.0]),
