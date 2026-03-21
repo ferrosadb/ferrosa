@@ -250,6 +250,11 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 }
                 Ok(CqlValue::Udt(result))
             }
+            // CQL ambiguity: `{}` parses as an empty map literal but is also a valid
+            // empty set literal. Cassandra disambiguates at execution time based on the
+            // target column type. We do the same: an empty MapLiteral coerces to an
+            // empty set when the target is a set type.
+            CqlType::Set(_) if pairs.is_empty() => Ok(CqlValue::Set(Vec::new())),
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got map literal",
                 cql_type_name(target)
@@ -1194,6 +1199,27 @@ mod tests {
     fn term_string_to_ascii() {
         let val = term_to_cql_value(&Term::StringLiteral("hello".into()), &CqlType::Ascii).unwrap();
         assert_eq!(val, CqlValue::Ascii("hello".into()));
+    }
+
+    #[test]
+    fn empty_map_literal_coerces_to_empty_set() {
+        // CQL `{}` is parsed as MapLiteral([]) but should coerce to an empty set
+        // when the target column type is set<T>.
+        let term = Term::MapLiteral(vec![]);
+        let val = term_to_cql_value(&term, &CqlType::Set(Box::new(CqlType::Varchar))).unwrap();
+        assert_eq!(val, CqlValue::Set(vec![]));
+    }
+
+    #[test]
+    fn nonempty_map_literal_rejected_for_set() {
+        // A non-empty map literal cannot be coerced to a set — the ambiguity only
+        // applies to the empty `{}` form.
+        let term = Term::MapLiteral(vec![(
+            Term::StringLiteral("k".into()),
+            Term::StringLiteral("v".into()),
+        )]);
+        let result = term_to_cql_value(&term, &CqlType::Set(Box::new(CqlType::Varchar)));
+        assert!(result.is_err());
     }
 
     // --- parse_cql_type tests ---

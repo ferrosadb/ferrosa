@@ -1019,16 +1019,28 @@ impl Schema {
 
     /// Create a secondary index with authorization.
     ///
-    /// Requires `Alter` permission on the parent table.
+    /// Requires `Alter` permission on the parent table. Bumps the schema
+    /// version so that CQL clients (e.g. cqlsh) detect the schema change.
     pub fn create_index(&self, index: IndexMetadata, auth: &AuthContext) -> crate::Result<()> {
         let resource = Resource::Table(index.keyspace.clone(), index.table.clone());
         self.check_permission(auth, Permission::Alter, &resource)?;
-        self.create_index_internal(index)
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (*self.inner.load_full()).clone();
+        let key = (
+            index.keyspace.clone(),
+            index.table.clone(),
+            index.name.clone(),
+        );
+        snap.indexes.entry(key).or_insert(index);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
     }
 
     /// Drop a secondary index with authorization.
     ///
-    /// Requires `Alter` permission on the parent table.
+    /// Requires `Alter` permission on the parent table. Bumps the schema
+    /// version so that CQL clients (e.g. cqlsh) detect the schema change.
     pub fn drop_index(
         &self,
         keyspace: &str,
@@ -1038,7 +1050,13 @@ impl Schema {
     ) -> crate::Result<()> {
         let resource = Resource::Table(keyspace.to_string(), table.to_string());
         self.check_permission(auth, Permission::Alter, &resource)?;
-        self.drop_index_internal(keyspace, table, name)
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (*self.inner.load_full()).clone();
+        snap.indexes
+            .remove(&(keyspace.to_string(), table.to_string(), name.to_string()));
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+        Ok(())
     }
 
     // ---- Role CRUD ----
@@ -1531,6 +1549,7 @@ pub fn is_system_keyspace(name: &str) -> bool {
             | "system_distributed"
             | "system_traces"
             | "system_virtual_schema"
+            | "system_observability"
     )
 }
 

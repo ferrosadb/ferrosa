@@ -3679,6 +3679,11 @@ async fn route_drop_type(
 
 /// Decode a hex-encoded string to bytes.
 fn hex_decode(hex: &str) -> Result<Vec<u8>, CqlError> {
+    // Strip optional 0x / 0X prefix.
+    let hex = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
     if !hex.len().is_multiple_of(2) {
         return Err(CqlError::Invalid("hex body has odd length".into()));
     }
