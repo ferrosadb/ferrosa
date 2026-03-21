@@ -2167,8 +2167,26 @@ impl<'input> Parser<'input> {
     /// Parse IF EXISTS, returning true if present.
     fn parse_if_exists(&mut self) -> Result<bool, CqlError> {
         if self.lexer.eat(&TokenKind::Keyword(Keyword::If))? {
-            self.lexer.expect(&TokenKind::Keyword(Keyword::Exists))?;
-            Ok(true)
+            if self.lexer.eat(&TokenKind::Keyword(Keyword::Exists))? {
+                Ok(true)
+            } else {
+                // IF <condition> (LWT conditional): parse and discard the
+                // condition.  Ferrosa does not enforce LWT conditions yet
+                // but must accept the syntax to avoid parse errors.
+                // Consume tokens until we hit a semicolon, EOF, or USING.
+                loop {
+                    let tok = self.lexer.peek()?;
+                    match tok.kind {
+                        TokenKind::Eof
+                        | TokenKind::Semicolon
+                        | TokenKind::Keyword(Keyword::Using) => break,
+                        _ => {
+                            self.lexer.next_token()?;
+                        }
+                    }
+                }
+                Ok(false)
+            }
         } else {
             Ok(false)
         }

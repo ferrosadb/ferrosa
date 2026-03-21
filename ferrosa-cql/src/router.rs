@@ -1027,12 +1027,16 @@ fn route_select_user_table(
                     .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
                     .collect();
 
-                let all_where_columns_indexed = s
-                    .where_clauses
+                // Exclude token() predicates — they are range scan hints,
+                // not column filters that require indexing.
+                let non_token_clauses: Vec<&WhereClause> =
+                    s.where_clauses.iter().filter(|wc| !wc.token_fn).collect();
+                let all_where_columns_indexed = non_token_clauses
                     .iter()
                     .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
 
-                if !s.where_clauses.is_empty() && !all_where_columns_indexed && !s.allow_filtering {
+                if !non_token_clauses.is_empty() && !all_where_columns_indexed && !s.allow_filtering
+                {
                     return Err(CqlError::Invalid(
                         "Cannot execute this query as it requires filtering on non-indexed \
                          columns. Use ALLOW FILTERING, create a secondary index on the \
@@ -3277,7 +3281,10 @@ fn build_column_info(
                 alias,
                 args,
             } => {
-                let display_name = alias.clone().unwrap_or_else(|| format!("system.{}", name));
+                let display_name = alias.clone().unwrap_or_else(|| {
+                    let prefix = func_ks.as_deref().unwrap_or("system");
+                    format!("{}.{}", prefix, name)
+                });
                 let fn_lower = name.to_lowercase();
                 let cql_type = match fn_lower.as_str() {
                     "count" => CqlType::Bigint,
