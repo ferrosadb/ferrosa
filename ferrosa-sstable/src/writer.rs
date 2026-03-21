@@ -824,6 +824,72 @@ mod tests {
         }
     }
 
+    /// Verify that the BTI trie index returns correct data file offsets
+    /// for both partitions when accessed via SSTableReader::get_partition.
+    #[test]
+    fn trie_index_offsets_correct_for_two_partitions() {
+        use crate::reader::{SSTableComponents, SSTableReader};
+
+        let header = test_header();
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let ts = 1_000_042i64;
+        // Two partitions with different key sizes
+        let p1 = make_partition(b"short", &[0x00, 0x00, 0x00, 0x01], b"value1", ts);
+        let p2 = make_partition(
+            b"this_is_a_longer_partition_key_that_pushes_offset_past_128",
+            &[0x00, 0x00, 0x00, 0x02],
+            b"value2_with_some_extra_data_to_make_it_bigger",
+            ts,
+        );
+
+        // Sort by key (required by writer)
+        let mut partitions = vec![p1, p2];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        eprintln!("Data.db size: {} bytes", output.data.len());
+        eprintln!("Partitions.db size: {} bytes", output.partitions.len());
+
+        // Build reader from output
+        let components = SSTableComponents {
+            data: output.data.as_slice(),
+            partitions: output.partitions.as_slice(),
+            rows: output.rows.as_slice(),
+            filter: output.filter.clone(),
+            compression_info: output.compression_info.clone(),
+            statistics: output.statistics.clone(),
+        };
+        let reader = SSTableReader::open(components).unwrap();
+
+        // Both partitions must be findable via trie index
+        for p in &partitions {
+            let found = reader.get_partition(&p.key).unwrap_or_else(|e| {
+                panic!(
+                    "get_partition for key {:?} failed: {e}",
+                    String::from_utf8_lossy(p.key.key.as_bytes())
+                )
+            });
+            assert!(
+                found.is_some(),
+                "partition {:?} not found via trie lookup",
+                String::from_utf8_lossy(p.key.key.as_bytes())
+            );
+            let found = found.unwrap();
+            assert_eq!(found.rows.len(), 1);
+            assert_eq!(found.rows[0].cells.len(), 1);
+        }
+    }
+
     #[test]
     fn write_multiple_partitions_verify_count_and_bloom() {
         let header = test_header();
