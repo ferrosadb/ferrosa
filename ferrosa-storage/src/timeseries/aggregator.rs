@@ -240,11 +240,41 @@ impl WriteObserver for TimeSeriesAggregator {
 }
 
 /// Metrics for consolidation observability.
+///
+/// All counters use relaxed ordering since they are monotonic and
+/// approximate counts are acceptable for observability.
 #[derive(Debug, Default)]
 pub struct ConsolidationMetrics {
+    /// Total number of windows that have been consolidated.
     pub windows_consolidated: AtomicU64,
+    /// Total number of late-arriving data points detected.
     pub late_arrivals: AtomicU64,
+    /// Total number of consolidation tasks dropped (channel full).
     pub consolidation_drops: AtomicU64,
+}
+
+impl ConsolidationMetrics {
+    /// Create a new metrics instance with all counters at zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns a point-in-time snapshot of all metric values.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            windows_consolidated: self.windows_consolidated.load(Ordering::Relaxed),
+            late_arrivals: self.late_arrivals.load(Ordering::Relaxed),
+            consolidation_drops: self.consolidation_drops.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time snapshot of consolidation metrics for reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub windows_consolidated: u64,
+    pub late_arrivals: u64,
+    pub consolidation_drops: u64,
 }
 
 /// Async worker that processes consolidation tasks.
@@ -823,5 +853,61 @@ mod tests {
 
         // The boundary crossing should have tried to send and been dropped.
         assert!(aggregator.drop_count() >= 1);
+    }
+
+    // --- Task 22: ConsolidationMetrics tests ---
+
+    #[test]
+    fn consolidation_metrics_default() {
+        let metrics = ConsolidationMetrics::default();
+        assert_eq!(metrics.windows_consolidated.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.late_arrivals.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.consolidation_drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn consolidation_metrics_increment() {
+        let metrics = ConsolidationMetrics::default();
+        metrics.windows_consolidated.fetch_add(1, Ordering::Relaxed);
+        metrics.late_arrivals.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(metrics.windows_consolidated.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.late_arrivals.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn consolidation_metrics_snapshot() {
+        let metrics = ConsolidationMetrics::new();
+        metrics.windows_consolidated.fetch_add(5, Ordering::Relaxed);
+        metrics.late_arrivals.fetch_add(2, Ordering::Relaxed);
+        metrics.consolidation_drops.fetch_add(1, Ordering::Relaxed);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.windows_consolidated, 5);
+        assert_eq!(snap.late_arrivals, 2);
+        assert_eq!(snap.consolidation_drops, 1);
+    }
+
+    #[test]
+    fn consolidation_metrics_concurrent_increments() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let metrics = Arc::new(ConsolidationMetrics::new());
+        let mut handles = vec![];
+
+        for _ in 0..4 {
+            let m = Arc::clone(&metrics);
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    m.windows_consolidated.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(metrics.windows_consolidated.load(Ordering::Relaxed), 400);
     }
 }
