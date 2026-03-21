@@ -7,6 +7,7 @@
 //! Workers currently only update the [`IndexStateTracker`] — actual SSTable
 //! reading and index building will be wired in a later task.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -41,6 +42,21 @@ pub struct IndexBuildJob {
     pub priority: BuildPriority,
     /// When this job was enqueued.
     pub enqueued_at: Instant,
+}
+
+/// Result of a completed index build for a single SSTable.
+///
+/// Contains the sidecar entries produced by the backend for each index.
+/// The scheduler uses this to write sidecar files and update the tracker.
+#[derive(Debug, Clone)]
+pub struct IndexBuildResult {
+    /// SSTable that was indexed.
+    pub sstable_id: String,
+    /// Per-index sidecar entries: index_name -> [(key, position)].
+    pub sidecar_entries:
+        HashMap<String, Vec<(ferrosa_index::IndexKey, ferrosa_index::RowPosition)>>,
+    /// How long the build took.
+    pub build_duration: std::time::Duration,
 }
 
 /// Background scheduler that dispatches index build jobs to worker threads.
@@ -215,5 +231,32 @@ mod tests {
         assert_eq!(state.indexed_sstables.len(), 3);
 
         scheduler.shutdown();
+    }
+
+    #[test]
+    fn index_build_result_creation() {
+        use ferrosa_index::{IndexKey, RowPosition};
+
+        let entries = vec![(
+            IndexKey(b"val1".to_vec()),
+            RowPosition {
+                partition_key: b"pk1".to_vec(),
+                clustering_key: b"ck1".to_vec(),
+            },
+        )];
+
+        let mut sidecar_entries = std::collections::HashMap::new();
+        sidecar_entries.insert("my_idx".to_string(), entries);
+
+        let result = IndexBuildResult {
+            sstable_id: "sst-001".to_string(),
+            sidecar_entries,
+            build_duration: Duration::from_millis(42),
+        };
+
+        assert_eq!(result.sstable_id, "sst-001");
+        assert_eq!(result.sidecar_entries.len(), 1);
+        assert!(result.sidecar_entries.contains_key("my_idx"));
+        assert_eq!(result.build_duration.as_millis(), 42);
     }
 }
