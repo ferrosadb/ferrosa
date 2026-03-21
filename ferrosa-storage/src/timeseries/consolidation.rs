@@ -202,4 +202,34 @@ mod tests {
         assert!((acc.sum() - 42.0).abs() < f64::EPSILON);
         assert!((acc.stddev() - 0.0).abs() < f64::EPSILON);
     }
+
+    // -- Median tests --
+
+    #[test]
+    fn accumulator_median_odd() {
+        let mut acc = Accumulator::new(true);
+        for v in &[3.0, 1.0, 4.0, 1.0, 5.0] {
+            acc.push(*v);
+        }
+        // Sorted: [1, 1, 3, 4, 5]. Median = 3.0.
+        assert!((acc.median() - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn accumulator_median_even() {
+        let mut acc = Accumulator::new(true);
+        for v in &[1.0, 2.0, 3.0, 4.0] {
+            acc.push(*v);
+        }
+        // Sorted: [1, 2, 3, 4]. Median = (2+3)/2 = 2.5.
+        assert!((acc.median() - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[should_panic(expected = "needs_median=true")]
+    fn accumulator_median_panics_without_flag() {
+        let mut acc = Accumulator::new(false);
+        acc.push(1.0);
+        let _ = acc.median();
+    }
 }
