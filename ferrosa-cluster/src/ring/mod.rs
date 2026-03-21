@@ -110,9 +110,9 @@ impl TokenRing {
         }
     }
 
-    /// Select replicas based on a [`ReplicationStrategy`].
+    /// Select replicas based on a [`strategy::ReplicationStrategy`].
     ///
-    /// Dispatches to [`replicas`] for `Simple` or [`nts_replicas`] for
+    /// Dispatches to [`Self::replicas`] for `Simple` or [`Self::nts_replicas`] for
     /// `NetworkTopology`.
     pub fn replicas_for_strategy(
         &self,
