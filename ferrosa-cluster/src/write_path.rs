@@ -55,6 +55,39 @@ impl WritePath {
         Self::Unavailable
     }
 
+    /// Write a logged batch atomically. In standalone mode this goes
+    /// through `StorageEngine::write_atomic_batch()`. In pair mode each
+    /// mutation is forwarded individually (atomic guarantee comes from
+    /// the batchlog). In cluster mode the `ClusterCoordinator` handles
+    /// the 3-phase batchlog protocol.
+    pub async fn write_batch(
+        &self,
+        mutations: Vec<Mutation>,
+        _cl: ConsistencyLevel,
+        _rf: usize,
+    ) -> ferrosa_common::Result<()> {
+        match self {
+            Self::Direct(engine) => engine.write_atomic_batch(mutations),
+            Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
+            )),
+            Self::Pair(coordinator) => {
+                // Pair mode: forward each mutation individually.
+                for m in mutations {
+                    coordinator
+                        .coordinate_write(&m)
+                        .await
+                        .map_err(|e| ferrosa_common::Error::InvalidData(format!("pair: {e}")))?;
+                }
+                Ok(())
+            }
+            Self::Cluster(coordinator) => coordinator
+                .coordinate_logged_batch(mutations)
+                .await
+                .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+        }
+    }
+
     /// Write a row. In standalone mode this goes directly to storage.
     /// In pair mode this goes through the PairCoordinator which handles
     /// replication (primary) or forwarding (secondary).

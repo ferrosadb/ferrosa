@@ -48,6 +48,7 @@ fn index_build_lifecycle() {
             table: ("test_ks".to_string(), "users".to_string()),
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
+            column_position: 0,
         })
         .expect("submit should succeed");
 
@@ -111,6 +112,7 @@ fn multiple_indexes_with_independent_staleness() {
             table: ("ks".to_string(), "tbl_a".to_string()),
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
+            column_position: 0,
         })
         .unwrap();
 

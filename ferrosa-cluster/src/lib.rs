@@ -5,6 +5,7 @@ pub mod coordinator;
 pub mod ddl_path;
 pub mod error;
 pub mod hints;
+pub mod index_coordination;
 pub mod mode;
 pub mod pair;
 pub mod raft;
@@ -12,12 +13,17 @@ pub mod rebalance;
 pub mod ring;
 pub mod state;
 pub mod streaming;
+pub mod system_table_loader;
+pub mod system_table_writer;
 pub mod write_path;
 
 pub use config::ClusterConfig;
 pub use consistency::ConsistencyLevel;
 pub use controller::{ClusterStateHolder, ModeController, ModeControllerHandles};
-pub use coordinator::{ClusterCoordinator, MutationForwardHandler};
+pub use coordinator::batch::{
+    BatchlogDeleteHandler, BatchlogReplayHandler, BatchlogReplayTask, BatchlogWriteHandler,
+};
+pub use coordinator::{ClusterCoordinator, MutationForwardHandler, RepairWriteHandler};
 pub use ddl_path::DdlPath;
 pub use error::{ClusterError, Result};
 pub use mode::DeploymentMode;

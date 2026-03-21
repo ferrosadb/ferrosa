@@ -95,6 +95,7 @@ pub enum Message {
     MutationAck(Bytes),
     ReadRequest(Bytes),
     ReadResponse(Bytes),
+    RepairWrite(Bytes),
 
     // Streaming — opaque payloads
     StreamStart(Bytes),
@@ -119,6 +120,18 @@ pub enum Message {
     PairDdlForward(Bytes),
     /// DDL acknowledgment.
     PairDdlAck(Bytes),
+
+    // Batchlog
+    /// Batchlog write request (serialized BatchlogEntry).
+    BatchlogWrite(Bytes),
+    /// Batchlog delete request (batch UUID).
+    BatchlogDelete(Bytes),
+    /// Batchlog replay request (serialized BatchlogEntry).
+    BatchlogReplay(Bytes),
+
+    // Index build coordination -- opaque payloads
+    IndexBuildRequest(Bytes),
+    IndexBuildComplete(Bytes),
 }
 
 impl Message {
@@ -137,6 +150,7 @@ impl Message {
             Self::MutationAck(_) => MsgType::MutationAck,
             Self::ReadRequest(_) => MsgType::ReadRequest,
             Self::ReadResponse(_) => MsgType::ReadResponse,
+            Self::RepairWrite(_) => MsgType::RepairWrite,
             Self::StreamStart(_) => MsgType::StreamStart,
             Self::StreamChunk(_) => MsgType::StreamChunk,
             Self::StreamEnd(_) => MsgType::StreamEnd,
@@ -148,6 +162,11 @@ impl Message {
             Self::PairSchemaSync(_) => MsgType::PairSchemaSync,
             Self::PairDdlForward(_) => MsgType::PairDdlForward,
             Self::PairDdlAck(_) => MsgType::PairDdlAck,
+            Self::BatchlogWrite(_) => MsgType::BatchlogWrite,
+            Self::BatchlogDelete(_) => MsgType::BatchlogDelete,
+            Self::BatchlogReplay(_) => MsgType::BatchlogReplay,
+            Self::IndexBuildRequest(_) => MsgType::IndexBuildRequest,
+            Self::IndexBuildComplete(_) => MsgType::IndexBuildComplete,
         }
     }
 
@@ -208,6 +227,7 @@ impl Message {
             | Self::MutationAck(b)
             | Self::ReadRequest(b)
             | Self::ReadResponse(b)
+            | Self::RepairWrite(b)
             | Self::StreamStart(b)
             | Self::StreamChunk(b)
             | Self::StreamEnd(b)
@@ -216,7 +236,12 @@ impl Message {
             | Self::PairCatchUpResponse(b)
             | Self::PairSchemaSync(b)
             | Self::PairDdlForward(b)
-            | Self::PairDdlAck(b) => buf.put_slice(b),
+            | Self::PairDdlAck(b)
+            | Self::BatchlogWrite(b)
+            | Self::BatchlogDelete(b)
+            | Self::BatchlogReplay(b)
+            | Self::IndexBuildRequest(b)
+            | Self::IndexBuildComplete(b) => buf.put_slice(b),
         }
         Ok(())
     }
@@ -312,6 +337,7 @@ impl Message {
             MsgType::MutationAck => Self::MutationAck(body.split_to(body.remaining())),
             MsgType::ReadRequest => Self::ReadRequest(body.split_to(body.remaining())),
             MsgType::ReadResponse => Self::ReadResponse(body.split_to(body.remaining())),
+            MsgType::RepairWrite => Self::RepairWrite(body.split_to(body.remaining())),
             MsgType::StreamStart => Self::StreamStart(body.split_to(body.remaining())),
             MsgType::StreamChunk => Self::StreamChunk(body.split_to(body.remaining())),
             MsgType::StreamEnd => Self::StreamEnd(body.split_to(body.remaining())),
@@ -323,6 +349,13 @@ impl Message {
             MsgType::PairSchemaSync => Self::PairSchemaSync(body.split_to(body.remaining())),
             MsgType::PairDdlForward => Self::PairDdlForward(body.split_to(body.remaining())),
             MsgType::PairDdlAck => Self::PairDdlAck(body.split_to(body.remaining())),
+            MsgType::BatchlogWrite => Self::BatchlogWrite(body.split_to(body.remaining())),
+            MsgType::BatchlogDelete => Self::BatchlogDelete(body.split_to(body.remaining())),
+            MsgType::BatchlogReplay => Self::BatchlogReplay(body.split_to(body.remaining())),
+            MsgType::IndexBuildRequest => Self::IndexBuildRequest(body.split_to(body.remaining())),
+            MsgType::IndexBuildComplete => {
+                Self::IndexBuildComplete(body.split_to(body.remaining()))
+            }
         })
     }
 }
@@ -368,12 +401,87 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
+    #[test]
+    fn repair_write_roundtrip() {
+        let payload = Bytes::from_static(b"repair-data");
+        let msg = Message::RepairWrite(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::RepairWrite);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::RepairWrite, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::RepairWrite(payload));
+    }
+
+    #[test]
+    fn batchlog_write_roundtrip() {
+        let payload = Bytes::from_static(b"test-batchlog-entry");
+        let msg = Message::BatchlogWrite(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::BatchlogWrite);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::BatchlogWrite, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::BatchlogWrite(payload));
+    }
+
+    #[test]
+    fn batchlog_delete_roundtrip() {
+        let payload = Bytes::from_static(b"batch-uuid-bytes");
+        let msg = Message::BatchlogDelete(payload.clone());
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::BatchlogDelete, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::BatchlogDelete(payload));
+    }
+
+    #[test]
+    fn batchlog_replay_roundtrip() {
+        let payload = Bytes::from_static(b"replay-data");
+        let msg = Message::BatchlogReplay(payload.clone());
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::BatchlogReplay, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::BatchlogReplay(payload));
+    }
+
+    #[test]
+    fn batchlog_msg_types_from_u8() {
+        assert_eq!(MsgType::try_from(0x50).unwrap(), MsgType::BatchlogWrite);
+        assert_eq!(MsgType::try_from(0x51).unwrap(), MsgType::BatchlogDelete);
+        assert_eq!(MsgType::try_from(0x52).unwrap(), MsgType::BatchlogReplay);
+    }
+
+    #[test]
+    fn index_build_request_roundtrip() {
+        let payload = Bytes::from(b"test payload".to_vec());
+        let msg = Message::IndexBuildRequest(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::IndexBuildRequest);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::IndexBuildRequest, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::IndexBuildRequest(payload));
+    }
+
+    #[test]
+    fn index_build_complete_roundtrip() {
+        let payload = Bytes::from(b"complete".to_vec());
+        let msg = Message::IndexBuildComplete(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::IndexBuildComplete);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::IndexBuildComplete, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::IndexBuildComplete(payload));
+    }
+
     proptest! {
         #[test]
         fn decode_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
             let bytes = Bytes::from(data);
             // Try decoding as each message type — should return Ok or Err, never panic
-            for msg_type_byte in 0x01..=0x47u8 {
+            for msg_type_byte in 0x01..=0x61u8 {
                 if let Ok(msg_type) = MsgType::try_from(msg_type_byte) {
                     let _ = Message::decode(msg_type, &mut bytes.clone());
                 }

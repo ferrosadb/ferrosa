@@ -64,6 +64,7 @@ pub enum MsgType {
     MutationAck = 0x21,
     ReadRequest = 0x22,
     ReadResponse = 0x23,
+    RepairWrite = 0x24,
     // Streaming
     StreamStart = 0x30,
     StreamChunk = 0x31,
@@ -77,6 +78,13 @@ pub enum MsgType {
     PairSchemaSync = 0x45,
     PairDdlForward = 0x46,
     PairDdlAck = 0x47,
+    // Batchlog
+    BatchlogWrite = 0x50,
+    BatchlogDelete = 0x51,
+    BatchlogReplay = 0x52,
+    // Index build coordination
+    IndexBuildRequest = 0x60,
+    IndexBuildComplete = 0x61,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -96,6 +104,7 @@ impl TryFrom<u8> for MsgType {
             0x21 => Ok(Self::MutationAck),
             0x22 => Ok(Self::ReadRequest),
             0x23 => Ok(Self::ReadResponse),
+            0x24 => Ok(Self::RepairWrite),
             0x30 => Ok(Self::StreamStart),
             0x31 => Ok(Self::StreamChunk),
             0x32 => Ok(Self::StreamEnd),
@@ -107,6 +116,11 @@ impl TryFrom<u8> for MsgType {
             0x45 => Ok(Self::PairSchemaSync),
             0x46 => Ok(Self::PairDdlForward),
             0x47 => Ok(Self::PairDdlAck),
+            0x50 => Ok(Self::BatchlogWrite),
+            0x51 => Ok(Self::BatchlogDelete),
+            0x52 => Ok(Self::BatchlogReplay),
+            0x60 => Ok(Self::IndexBuildRequest),
+            0x61 => Ok(Self::IndexBuildComplete),
             _ => Err(NetError::UnknownMessageType(value)),
         }
     }
@@ -325,6 +339,27 @@ mod tests {
         header.encode(&mut buf);
         let err = codec.decode(&mut buf).unwrap_err();
         assert!(matches!(err, NetError::FrameTooLarge { .. }));
+    }
+
+    #[test]
+    fn msg_type_repair_write() {
+        let mt = MsgType::try_from(0x24u8).unwrap();
+        assert_eq!(mt, MsgType::RepairWrite);
+        assert_eq!(mt as u8, 0x24);
+    }
+
+    #[test]
+    fn index_build_request_msg_type_roundtrip() {
+        let val = MsgType::IndexBuildRequest as u8;
+        let parsed = MsgType::try_from(val).unwrap();
+        assert_eq!(parsed, MsgType::IndexBuildRequest);
+    }
+
+    #[test]
+    fn index_build_complete_msg_type_roundtrip() {
+        let val = MsgType::IndexBuildComplete as u8;
+        let parsed = MsgType::try_from(val).unwrap();
+        assert_eq!(parsed, MsgType::IndexBuildComplete);
     }
 
     #[test]

@@ -182,6 +182,176 @@ impl ClusterCoordinator {
             })
         }
     }
+
+    /// Coordinate a write using NetworkTopologyStrategy with DC-aware consistency.
+    ///
+    /// For `LOCAL_QUORUM`: compute required ACKs from the local DC's RF only.
+    /// For `EACH_QUORUM`: compute required ACKs per-DC and track per-DC.
+    /// For other CLs: compute from total RF as before.
+    pub async fn coordinate_write_nts(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        row: Row,
+        timestamp: i64,
+        cl: ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+    ) -> crate::error::Result<()> {
+        let ring = self.ring.load();
+        let replicas = ring.replicas_for_strategy(key.token.0, strategy);
+
+        let local_dc = ring
+            .get_node(self.local_node_id)
+            .map(|n| n.data_center.clone())
+            .unwrap_or_default();
+
+        // Compute required ACKs based on CL and strategy.
+        let required = match cl {
+            ConsistencyLevel::LocalQuorum | ConsistencyLevel::LocalOne => {
+                let local_rf = strategy
+                    .dc_replication_factors()
+                    .get(&local_dc)
+                    .copied()
+                    .unwrap_or(strategy.replication_factor());
+                cl.block_for_dc(local_rf)
+            }
+            ConsistencyLevel::EachQuorum => {
+                // For EACH_QUORUM we need to track per-DC.
+                // Set required to total for the availability check.
+                strategy
+                    .dc_replication_factors()
+                    .values()
+                    .map(|&rf| cl.block_for_dc(rf))
+                    .sum()
+            }
+            _ => cl.block_for(strategy.replication_factor()),
+        };
+
+        if replicas.len() < required {
+            return Err(ClusterError::Unavailable {
+                consistency: cl.to_string(),
+                required,
+                alive: replicas.len(),
+            });
+        }
+
+        // Build the mutation payload.
+        let mutation = Mutation {
+            keyspace: table_id.keyspace.clone(),
+            table: table_id.table.clone(),
+            key: key.clone(),
+            rows: vec![row.clone()],
+            timestamp,
+        };
+        let body = encode_mutation(&mutation);
+
+        let replica_targets: Vec<(u64, Option<uuid::Uuid>, String)> = replicas
+            .iter()
+            .map(|&replica_id| {
+                let node = ring.get_node(replica_id);
+                let host_id = node.map(|info| info.host_id);
+                let dc = node
+                    .map(|info| info.data_center.clone())
+                    .unwrap_or_default();
+                (replica_id, host_id, dc)
+            })
+            .collect();
+        drop(ring);
+
+        // Fan out.
+        let mut fan_out: FuturesUnordered<_> = replica_targets
+            .into_iter()
+            .map(|(replica_id, host_id, dc)| {
+                let storage = self.storage.clone();
+                let peer_manager = self.peer_manager.clone();
+                let table_id = table_id.clone();
+                let key = key.clone();
+                let row = row.clone();
+                let body = body.clone();
+                let local_node_id = self.local_node_id;
+
+                async move {
+                    let result = if replica_id == local_node_id {
+                        match storage.write(&table_id, &key, row, timestamp) {
+                            Ok(()) => ReplicaResult::Ack,
+                            Err(_) => ReplicaResult::Failure { host_id: None },
+                        }
+                    } else {
+                        match host_id {
+                            None => ReplicaResult::Failure { host_id: None },
+                            Some(hid) => {
+                                match peer_manager
+                                    .send(hid, Message::MutationForward(body), Lane::Data)
+                                    .await
+                                {
+                                    Ok(Message::MutationAck(_)) => ReplicaResult::Ack,
+                                    Ok(_) => ReplicaResult::Failure { host_id: Some(hid) },
+                                    Err(_) => ReplicaResult::Failure { host_id: Some(hid) },
+                                }
+                            }
+                        }
+                    };
+                    (result, dc)
+                }
+            })
+            .collect();
+
+        // Drain results, track per-DC if EACH_QUORUM.
+        let mut total_acks = 0usize;
+        let mut dc_acks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut failed_replicas: Vec<uuid::Uuid> = Vec::new();
+
+        while let Some((result, dc)) = fan_out.next().await {
+            match result {
+                ReplicaResult::Ack => {
+                    total_acks += 1;
+                    *dc_acks.entry(dc).or_insert(0) += 1;
+                }
+                ReplicaResult::Failure { host_id: Some(hid) } => {
+                    failed_replicas.push(hid);
+                }
+                ReplicaResult::Failure { host_id: None } => {}
+            }
+        }
+
+        // Check satisfaction.
+        let satisfied = match cl {
+            ConsistencyLevel::EachQuorum => {
+                strategy.dc_replication_factors().iter().all(|(dc, &rf)| {
+                    let acks = dc_acks.get(dc).copied().unwrap_or(0);
+                    acks >= cl.block_for_dc(rf)
+                })
+            }
+            ConsistencyLevel::LocalQuorum | ConsistencyLevel::LocalOne => total_acks >= required,
+            _ => total_acks >= required,
+        };
+
+        if satisfied {
+            // Store hints for failed replicas.
+            if let Some(ref hint_store) = self.hint_store {
+                let hint_row = body.to_vec();
+                let hint_key = key.key.as_bytes().to_vec();
+                for peer_id in &failed_replicas {
+                    let _ = hint_store.store(
+                        *peer_id,
+                        &table_id.keyspace,
+                        &table_id.table,
+                        hint_key.clone(),
+                        hint_row.clone(),
+                        timestamp,
+                    );
+                }
+            }
+            Ok(())
+        } else {
+            Err(ClusterError::WriteTimeout {
+                consistency: cl.to_string(),
+                received: total_acks,
+                required,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -740,6 +910,147 @@ mod tests {
             hint_store.pending_count(remote_uuid_3),
             0,
             "no hints for remote_3 on failed write"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NTS write coordination tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn coordinate_write_nts_local_quorum_single_dc_local_replica() {
+        // 2-DC setup: local node in dc1. RF: dc1=2, dc2=1.
+        // CL=LOCAL_QUORUM => block_for_dc(dc1_rf=2) = 2.
+        // Only local node is reachable => 1 ACK. Should WriteTimeout.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut local_info = make_node("10.0.0.1:7000");
+        local_info.data_center = "dc1".to_string();
+
+        let mut node2 = make_node("10.0.0.2:7000");
+        node2.data_center = "dc1".to_string();
+        let mut node3 = make_node("10.0.0.3:7000");
+        node3.data_center = "dc2".to_string();
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local_info);
+        ring.add_node(2, node2);
+        ring.add_node(3, node3);
+        ring.assign_tokens(local_node_id, &[100]);
+        ring.assign_tokens(2, &[200]);
+        ring.assign_tokens(3, &[300]);
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            3,
+            ConsistencyLevel::LocalQuorum,
+        );
+
+        let dc_rf = std::collections::HashMap::from([
+            ("dc1".to_string(), 2usize),
+            ("dc2".to_string(), 1usize),
+        ]);
+        let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology { dc_rf };
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let row = test_row();
+
+        let result = coordinator
+            .coordinate_write_nts(
+                &table_id,
+                &key,
+                row,
+                1000,
+                ConsistencyLevel::LocalQuorum,
+                &strategy,
+            )
+            .await;
+
+        // Local node ACKs (1), but LOCAL_QUORUM for dc1_rf=2 requires 2 => WriteTimeout
+        match result {
+            Err(ClusterError::WriteTimeout {
+                required, received, ..
+            }) => {
+                assert_eq!(required, 2, "LOCAL_QUORUM of dc1 rf=2 requires 2");
+                assert_eq!(received, 1, "only local replica ACKed");
+            }
+            other => panic!("expected WriteTimeout, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinate_write_nts_each_quorum_fails_when_dc_missing() {
+        // 2-DC, dc1_rf=1, dc2_rf=1. CL=EACH_QUORUM.
+        // Only dc1 local node reachable, dc2 node unreachable.
+        // EACH_QUORUM requires quorum in EACH DC => fails.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut local_info = make_node("10.0.0.1:7000");
+        local_info.data_center = "dc1".to_string();
+        let remote_uuid = Uuid::new_v4();
+        let mut remote_info = make_node("10.0.0.2:7000");
+        remote_info.data_center = "dc2".to_string();
+        remote_info.host_id = remote_uuid;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local_info);
+        ring.add_node(2, remote_info);
+        ring.assign_tokens(local_node_id, &[100]);
+        ring.assign_tokens(2, &[200]);
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        pm.add_peer_entry((remote_uuid, "10.0.0.2:7000".parse().unwrap()))
+            .await;
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            pm,
+            local_node_id,
+            storage.clone(),
+            2,
+            ConsistencyLevel::EachQuorum,
+        );
+
+        let dc_rf = std::collections::HashMap::from([
+            ("dc1".to_string(), 1usize),
+            ("dc2".to_string(), 1usize),
+        ]);
+        let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology { dc_rf };
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let row = test_row();
+
+        let result = coordinator
+            .coordinate_write_nts(
+                &table_id,
+                &key,
+                row,
+                1000,
+                ConsistencyLevel::EachQuorum,
+                &strategy,
+            )
+            .await;
+
+        // dc1 ACK=1 (local), dc2 ACK=0 (remote unreachable)
+        // EACH_QUORUM requires quorum in both => fail
+        assert!(
+            matches!(result, Err(ClusterError::WriteTimeout { .. })),
+            "expected WriteTimeout, got: {result:?}"
         );
     }
 }

@@ -89,6 +89,27 @@ pub struct NodeInfo {
 }
 
 // ---------------------------------------------------------------------------
+// IndexNodeStatus
+// ---------------------------------------------------------------------------
+
+/// Per-node build status for a secondary index.
+///
+/// Replicated via Raft so all nodes see consistent index readiness.
+/// Used in [`state_machine::RaftState::index_state_map`] to track which
+/// nodes have finished building which indexes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexNodeStatus {
+    /// The node is actively building the index.
+    Building,
+    /// The index is fully built and ready for queries on this node.
+    Ready,
+    /// The last build attempt on this node failed.
+    Failed(String),
+    /// The index is out of date (e.g., compaction produced new SSTables).
+    Stale,
+}
+
+// ---------------------------------------------------------------------------
 // RaftOp — the concrete DDL/admin operation
 // ---------------------------------------------------------------------------
 
@@ -133,6 +154,19 @@ pub enum RaftOp {
         keyspace: String,
         table: String,
         index: String,
+    },
+    /// Report per-node index build status (Building/Ready/Failed/Stale).
+    IndexStatus {
+        /// openraft NodeId of the reporting node.
+        node_id: u64,
+        /// Keyspace of the indexed table.
+        keyspace: String,
+        /// Table the index belongs to.
+        table: String,
+        /// Name of the index.
+        index_name: String,
+        /// New status for this node's copy of the index.
+        status: IndexNodeStatus,
     },
     CreateType(UserTypeMetadata),
     DropType {
@@ -328,6 +362,70 @@ mod tests {
         let bytes = bincode::serialize(&cmd).unwrap();
         let decoded: RaftCommand = bincode::deserialize(&bytes).unwrap();
         assert!(matches!(decoded.op, RaftOp::ApproveNode { .. }));
+    }
+
+    #[test]
+    fn index_node_status_serde_roundtrip() {
+        let statuses = vec![
+            IndexNodeStatus::Building,
+            IndexNodeStatus::Ready,
+            IndexNodeStatus::Failed("disk full".to_string()),
+            IndexNodeStatus::Stale,
+        ];
+        for status in statuses {
+            let encoded = bincode::serialize(&status).expect("serialize");
+            let decoded: IndexNodeStatus = bincode::deserialize(&encoded).expect("deserialize");
+            assert_eq!(decoded, status);
+        }
+    }
+
+    #[test]
+    fn raft_command_index_status_roundtrip() {
+        let node_id = uuid_to_node_id(Uuid::new_v4());
+        let cmd = wrap(RaftOp::IndexStatus {
+            node_id,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            index_name: "idx_email".to_string(),
+            status: IndexNodeStatus::Ready,
+        });
+        let encoded = bincode::serialize(&cmd).expect("serialize");
+        let decoded: RaftCommand = bincode::deserialize(&encoded).expect("deserialize");
+        match decoded.op {
+            RaftOp::IndexStatus {
+                node_id: rid,
+                keyspace,
+                table,
+                index_name,
+                status,
+            } => {
+                assert_eq!(rid, node_id);
+                assert_eq!(keyspace, "ks");
+                assert_eq!(table, "tbl");
+                assert_eq!(index_name, "idx_email");
+                assert_eq!(status, IndexNodeStatus::Ready);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raft_command_index_status_failed_roundtrip() {
+        let cmd = wrap(RaftOp::IndexStatus {
+            node_id: 42,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            index_name: "idx".to_string(),
+            status: IndexNodeStatus::Failed("OOM".to_string()),
+        });
+        let encoded = bincode::serialize(&cmd).expect("serialize");
+        let decoded: RaftCommand = bincode::deserialize(&encoded).expect("deserialize");
+        match decoded.op {
+            RaftOp::IndexStatus { status, .. } => {
+                assert_eq!(status, IndexNodeStatus::Failed("OOM".to_string()));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

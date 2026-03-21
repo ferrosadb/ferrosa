@@ -115,9 +115,12 @@ pub struct StorageEngine {
     async_observers: RwLock<Vec<AsyncObserverState>>,
     /// Default channel capacity for async observers.
     async_observer_capacity: usize,
-    /// Optional index build scheduler — wiring to flush/compaction is deferred.
-    #[allow(dead_code)]
+    /// Index build scheduler — rebuilds secondary indexes after compaction.
     index_scheduler: Option<crate::index::IndexBuildScheduler>,
+    /// Shared index state tracker.
+    index_tracker: Arc<crate::index::IndexStateTracker>,
+    /// Batchlog manager for logged batch coordination.
+    batchlog: Option<crate::batchlog::BatchlogManager>,
     /// Background archiver task handle, if archiving is enabled.
     archiver_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -178,6 +181,19 @@ impl StorageEngine {
         let local_cache =
             LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
 
+        let index_tracker = Arc::new(crate::index::IndexStateTracker::new());
+        let index_scheduler = {
+            let backend = Arc::new(crate::index::LocalBackend::new(config.data_dir.clone()));
+            Some(
+                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
+                    2,
+                    Arc::clone(&index_tracker),
+                    backend,
+                    config.data_dir.clone(),
+                ),
+            )
+        };
+
         Ok(Self {
             config,
             tables: RwLock::new(HashMap::new()),
@@ -188,7 +204,11 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
-            index_scheduler: None,
+            index_scheduler,
+            index_tracker,
+            batchlog: Some(crate::batchlog::BatchlogManager::new(
+                crate::batchlog::BatchlogConfig::default(),
+            )),
             archiver_handle: None,
         })
     }
@@ -280,6 +300,19 @@ impl StorageEngine {
             _ => None,
         };
 
+        let index_tracker = Arc::new(crate::index::IndexStateTracker::new());
+        let index_scheduler = {
+            let backend = Arc::new(crate::index::LocalBackend::new(config.data_dir.clone()));
+            Some(
+                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
+                    2,
+                    Arc::clone(&index_tracker),
+                    backend,
+                    config.data_dir.clone(),
+                ),
+            )
+        };
+
         Ok(Self {
             config,
             tables: RwLock::new(HashMap::new()),
@@ -290,7 +323,11 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
-            index_scheduler: None,
+            index_scheduler,
+            index_tracker,
+            batchlog: Some(crate::batchlog::BatchlogManager::new(
+                crate::batchlog::BatchlogConfig::default(),
+            )),
             archiver_handle,
         })
     }
@@ -333,6 +370,19 @@ impl StorageEngine {
         let local_cache =
             LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
 
+        let index_tracker = Arc::new(crate::index::IndexStateTracker::new());
+        let index_scheduler = {
+            let backend = Arc::new(crate::index::LocalBackend::new(config.data_dir.clone()));
+            Some(
+                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
+                    2,
+                    Arc::clone(&index_tracker),
+                    backend,
+                    config.data_dir.clone(),
+                ),
+            )
+        };
+
         let engine = Self {
             config,
             tables: RwLock::new(HashMap::new()),
@@ -343,7 +393,11 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
-            index_scheduler: None,
+            index_scheduler,
+            index_tracker,
+            batchlog: Some(crate::batchlog::BatchlogManager::new(
+                crate::batchlog::BatchlogConfig::default(),
+            )),
             archiver_handle: None,
         };
 
@@ -368,6 +422,19 @@ impl StorageEngine {
                 }
             }
             // Tables not yet registered are silently skipped.
+        }
+        Ok(())
+    }
+
+    /// Registers all system table schemas (`system_schema.*` and `system_auth.*`)
+    /// so the storage engine can persist system metadata.
+    ///
+    /// Called during bootstrap before any DDL or auth operations. System tables
+    /// use the same flush/compaction/S3 pipeline as user tables. Idempotent:
+    /// safe to call multiple times.
+    pub fn register_system_tables(&self) -> ferrosa_common::Result<()> {
+        for schema in ferrosa_schema::system::persistence::all_system_table_schemas() {
+            self.register_table(schema)?;
         }
         Ok(())
     }
@@ -397,13 +464,19 @@ impl StorageEngine {
     }
 
     /// Internal: create a `TableStore` for a table, loading existing SSTables
-    /// and sidecar files from disk.
+    /// and sidecar files from disk. Idempotent: skips already-registered tables.
     fn register_table_inner(
         &self,
         schema: TableSchema,
         indexed_columns: Vec<(String, usize)>,
     ) -> ferrosa_common::Result<()> {
         let table_id = TableId::new(&schema.keyspace, &schema.table);
+        {
+            let tables = self.tables.read();
+            if tables.contains_key(&table_id) {
+                return Ok(());
+            }
+        }
         let table_dir = self
             .config
             .data_dir
@@ -438,6 +511,12 @@ impl StorageEngine {
             )
         };
 
+        // Register each declared index in the tracker.
+        for (index_name, _col_pos) in store.indexed_columns() {
+            self.index_tracker
+                .register_index(table_id.keyspace(), table_id.table(), index_name);
+        }
+
         let state = TableState { schema, store };
         self.tables.write().insert(table_id, state);
         Ok(())
@@ -458,12 +537,18 @@ impl StorageEngine {
     ///
     /// Called when CREATE INDEX is processed. Updates the TableStore's
     /// indexed_columns so future writes are indexed in the memtable.
+    /// Registers the index in the tracker and submits rebuild jobs for
+    /// all existing SSTables.
     pub fn add_index(
         &self,
         table_id: &TableId,
         index_name: &str,
         column_position: usize,
     ) -> ferrosa_common::Result<()> {
+        // Register with the tracker.
+        self.index_tracker
+            .register_index(table_id.keyspace(), table_id.table(), index_name);
+
         let mut tables = self.tables.write();
         let state = tables.get_mut(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
@@ -471,6 +556,29 @@ impl StorageEngine {
         state
             .store
             .add_index(index_name.to_string(), column_position);
+
+        // Submit rebuild jobs for all existing SSTables.
+        if let Some(ref scheduler) = self.index_scheduler {
+            let sstable_ids = state.store.sstable_generation_ids();
+            for sst_id in sstable_ids {
+                let job = crate::index::IndexBuildJob {
+                    sstable_id: sst_id,
+                    index_name: index_name.to_string(),
+                    index_type: ferrosa_index::IndexType::BTree,
+                    table: (
+                        table_id.keyspace().to_string(),
+                        table_id.table().to_string(),
+                    ),
+                    priority: crate::index::BuildPriority::Initial,
+                    enqueued_at: std::time::Instant::now(),
+                    column_position,
+                };
+                if let Err(e) = scheduler.submit(job) {
+                    eprintln!("[engine] failed to submit index backfill: {e}");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -748,6 +856,53 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Returns a reference to the batchlog manager, if enabled.
+    pub fn batchlog(&self) -> Option<&crate::batchlog::BatchlogManager> {
+        self.batchlog.as_ref()
+    }
+
+    /// Writes a batch of mutations atomically.
+    ///
+    /// All mutations are appended to the commit log first, then applied to
+    /// their respective memtables. If the process crashes between commit log
+    /// append and memtable apply, commit log replay will recover all mutations.
+    ///
+    /// This is the single-node fast path for logged batches: no batchlog
+    /// coordination needed because the commit log provides the atomicity
+    /// guarantee.
+    pub fn write_atomic_batch(&self, mutations: Vec<Mutation>) -> ferrosa_common::Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 1: Append all mutations to the commit log.
+        for m in &mutations {
+            self.commit_log.append(m)?;
+        }
+
+        // Phase 2: Apply to memtables.
+        let tables = self.tables.read();
+        for m in &mutations {
+            let table_id = TableId::new(&m.keyspace, &m.table);
+            let state = tables.get(&table_id).ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+            })?;
+            for row in &m.rows {
+                state.store.write(&m.key, row.clone())?;
+            }
+        }
+        drop(tables);
+
+        // Phase 3: Notify observers.
+        for m in &mutations {
+            let table_id = TableId::new(&m.keyspace, &m.table);
+            self.dispatch_sync_observers(&table_id, m);
+            self.dispatch_async_observers(&table_id, m);
+        }
+
+        Ok(())
+    }
+
     /// Reads a partition from a table, merging memtable and SSTable sources.
     pub fn read(
         &self,
@@ -1003,6 +1158,37 @@ impl StorageEngine {
 
         state.store.flush()?;
 
+        // Submit index rebuild for the newly flushed SSTable if needed.
+        // This handles the case where CREATE INDEX was called after data
+        // was already in the memtable -- flush produces the SSTable but
+        // the sidecar may be incomplete, so we rebuild it.
+        if let Some(ref scheduler) = self.index_scheduler {
+            let gen = state.store.last_flush_generation();
+            for (index_name, col_pos) in state.store.indexed_columns() {
+                let tracker_state =
+                    self.index_tracker
+                        .get_state(table_id.keyspace(), table_id.table(), index_name);
+                // Only submit if the index needs building (not already current).
+                if let Some(idx_state) = tracker_state {
+                    if !idx_state.indexed_sstables.contains(&format!("{gen}")) {
+                        let job = crate::index::IndexBuildJob {
+                            sstable_id: format!("{gen}"),
+                            index_name: index_name.clone(),
+                            index_type: ferrosa_index::IndexType::BTree,
+                            table: (
+                                table_id.keyspace().to_string(),
+                                table_id.table().to_string(),
+                            ),
+                            priority: crate::index::BuildPriority::Normal,
+                            enqueued_at: std::time::Instant::now(),
+                            column_position: *col_pos,
+                        };
+                        let _ = scheduler.submit(job);
+                    }
+                }
+            }
+        }
+
         // Check for compaction after flush.
         self.maybe_compact(table_id, state);
 
@@ -1054,6 +1240,29 @@ impl StorageEngine {
                     std::collections::HashMap::new(),
                 ) {
                     eprintln!("[compaction] swap failed: {e}");
+                }
+
+                // Submit index rebuild jobs for the compacted output.
+                if let Some(ref scheduler) = self.index_scheduler {
+                    for (index_name, col_pos) in state.store.indexed_columns() {
+                        let job = crate::index::IndexBuildJob {
+                            sstable_id: result.output.id.clone(),
+                            index_name: index_name.clone(),
+                            index_type: ferrosa_index::IndexType::BTree,
+                            table: (
+                                table_id.keyspace().to_string(),
+                                table_id.table().to_string(),
+                            ),
+                            priority: crate::index::BuildPriority::Normal,
+                            enqueued_at: std::time::Instant::now(),
+                            column_position: *col_pos,
+                        };
+                        if let Err(e) = scheduler.submit(job) {
+                            eprintln!(
+                                "[compaction] failed to submit index rebuild for {index_name}: {e}"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -1123,6 +1332,11 @@ impl StorageEngine {
             if let Err(e) = self.flush(table_id) {
                 eprintln!("[storage-engine] flush failed for {table_id}: {e}");
             }
+        }
+
+        // Drain index scheduler.
+        if let Some(ref scheduler) = self.index_scheduler {
+            scheduler.shutdown_with_timeout(std::time::Duration::from_secs(30));
         }
 
         // Stop compaction.
@@ -2461,5 +2675,134 @@ mod tests {
             );
             assert_eq!(results[0].key.key.as_bytes(), b"user1");
         }
+    }
+
+    #[test]
+    fn engine_has_batchlog_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        assert!(engine.batchlog().is_some());
+    }
+
+    #[test]
+    fn engine_write_atomic_batch() {
+        use ferrosa_common::Token;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // Register two tables
+        use ferrosa_common::schema::TableSchema;
+        for tbl in &["tbl_a", "tbl_b"] {
+            let schema = TableSchema {
+                keyspace: "ks".to_string(),
+                table: tbl.to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![ColumnDefinition {
+                    name: "val".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                }],
+            };
+            engine.register_table(schema).unwrap();
+        }
+
+        let mutations = vec![
+            Mutation {
+                keyspace: "ks".to_string(),
+                table: "tbl_a".to_string(),
+                key: DecoratedKey {
+                    token: Token(1),
+                    key: PartitionKey::new(b"pk1".to_vec()),
+                },
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(b"val_a".to_vec(), 100))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(100),
+                }],
+                timestamp: 100,
+            },
+            Mutation {
+                keyspace: "ks".to_string(),
+                table: "tbl_b".to_string(),
+                key: DecoratedKey {
+                    token: Token(2),
+                    key: PartitionKey::new(b"pk2".to_vec()),
+                },
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(b"val_b".to_vec(), 100))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(100),
+                }],
+                timestamp: 100,
+            },
+        ];
+
+        engine.write_atomic_batch(mutations).unwrap();
+
+        // Both writes should be visible
+        let table_a = TableId::new("ks", "tbl_a");
+        let key_a = DecoratedKey {
+            token: Token(1),
+            key: PartitionKey::new(b"pk1".to_vec()),
+        };
+        let result_a = engine.read(&table_a, &key_a).unwrap();
+        assert!(result_a.is_some(), "mutation to tbl_a should be visible");
+
+        let table_b = TableId::new("ks", "tbl_b");
+        let key_b = DecoratedKey {
+            token: Token(2),
+            key: PartitionKey::new(b"pk2".to_vec()),
+        };
+        let result_b = engine.read(&table_b, &key_b).unwrap();
+        assert!(result_b.is_some(), "mutation to tbl_b should be visible");
+    }
+
+    // -- System table registration tests --
+
+    #[test]
+    fn register_system_tables_creates_six_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.register_system_tables().unwrap();
+
+        // Verify all 6 system tables are registered by attempting writes.
+        let system_tables = [
+            ("system_schema", "keyspaces"),
+            ("system_schema", "tables"),
+            ("system_schema", "columns"),
+            ("system_auth", "roles"),
+            ("system_auth", "role_members"),
+            ("system_auth", "role_permissions"),
+        ];
+
+        for (ks, tbl) in &system_tables {
+            let tid = TableId::new(*ks, *tbl);
+            let key = make_key("test");
+            let row = make_row(b"v", 1);
+            let result = engine.write(&tid, &key, row, 1);
+            assert!(
+                result.is_ok(),
+                "system table {ks}.{tbl} should be registered"
+            );
+        }
+    }
+
+    #[test]
+    fn register_system_tables_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.register_system_tables().unwrap();
+        // Second call should not error.
+        engine.register_system_tables().unwrap();
     }
 }
