@@ -1,0 +1,44 @@
+package ferrosa:udf@0.1.0;
+
+// Simplified CQL value type for guest use. The recursive collection variants
+// (list-val, set-val, map-val, tuple-val, udt-val) from the host WIT are
+// represented here as opaque blob-val payloads; the host is responsible for
+// serializing/deserializing nested structures across the component boundary.
+// This avoids recursive type cycles that WIT's topological resolver rejects.
+interface types {
+    variant cql-value {
+        null,
+        int-val(s32),
+        bigint-val(s64),
+        float-val(f32),
+        double-val(f64),
+        boolean-val(bool),
+        text-val(string),
+        blob-val(list<u8>),
+        uuid-val(string),
+        timestamp-val(s64),
+        date-val(s32),
+        time-val(s64),
+        smallint-val(s16),
+        tinyint-val(s8),
+        inet-val(string),
+        // Collection and composite types are passed as msgpack-encoded blobs
+        // across the component boundary to avoid recursive WIT type cycles.
+        // The host encodes and decodes these; guests receive blob-val for them.
+        collection-val(list<u8>),
+    }
+}
+
+world udf {
+    use types.{cql-value};
+    export invoke: func(args: list<cql-value>) -> result<cql-value, string>;
+}
+
+world uda {
+    use types.{cql-value};
+    export init: func(init-cond: option<cql-value>) -> result<_, string>;
+    export accumulate: func(args: list<cql-value>) -> result<_, string>;
+    export merge: func(serialized-state: list<u8>) -> result<_, string>;
+    export serialize-state: func() -> list<u8>;
+    export finalize: func() -> result<cql-value, string>;
+}

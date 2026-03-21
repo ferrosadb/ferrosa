@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "guest-uda"
+version = "0.1.0"
+edition = "2021"
+description = "Example UDA guest crate compiled to WASM Component Model (weighted_avg, histogram)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.43", default-features = false, features = ["macros", "realloc"] }
+
+[package.metadata.component]
+package = "ferrosa:guest-uda"
+target = { path = "wit", world = "uda" }
