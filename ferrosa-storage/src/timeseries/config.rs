@@ -257,6 +257,123 @@ pub fn detect_cascade_cycle(
     Ok(())
 }
 
+/// Describes a downstream table to be auto-created in a cascade chain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CascadeTableSpec {
+    /// Name of the downstream table.
+    pub table_name: String,
+    /// Consolidation interval for this tier.
+    pub interval: Duration,
+    /// Target table for this tier's consolidation output (next tier or empty for terminal).
+    pub target: Option<String>,
+    /// Output column names: `{original}_{function}`.
+    pub output_columns: Vec<String>,
+}
+
+/// Generate the cascade chain specification from a source table's config.
+///
+/// Returns a list of downstream tables to create (not including the source).
+/// The last table in the chain has no target (terminal).
+pub fn generate_cascade_chain(
+    source_table: &str,
+    config: &ConsolidationConfig,
+) -> Vec<CascadeTableSpec> {
+    if !config.cascade {
+        return vec![];
+    }
+
+    let mut chain = Vec::new();
+    let mut current_interval = config.interval;
+    let mut current_target_name = config.target_table.clone();
+
+    let output_columns: Vec<String> = config
+        .columns
+        .iter()
+        .flat_map(|col| {
+            config
+                .functions
+                .iter()
+                .filter_map(|f| {
+                    let suffix = match f {
+                        ConsolidationFn::Min => Some("min"),
+                        ConsolidationFn::Max => Some("max"),
+                        ConsolidationFn::Avg => Some("avg"),
+                        ConsolidationFn::Median => Some("median"),
+                        ConsolidationFn::StdDev => Some("stddev"),
+                        ConsolidationFn::Count => Some("count"),
+                        ConsolidationFn::Sum => Some("sum"),
+                        _ => None,
+                    };
+                    suffix.map(|s| format!("{}_{}", col, s))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    for (i, &multiplier) in config.cascade_multipliers.iter().enumerate() {
+        let next_interval =
+            Duration::from_micros(current_interval.as_micros() as u64 * multiplier as u64);
+
+        // Derive the next table name from the source pattern and the computed interval.
+        let next_table_name = derive_table_name(source_table, &next_interval);
+
+        let is_last_multiplier = i + 1 >= config.cascade_multipliers.len();
+
+        // Current tier outputs to the next tier.
+        let next_target = if is_last_multiplier {
+            // Terminal: no further consolidation from the next table, but we still
+            // point this tier's output to the next table.
+            None
+        } else {
+            Some(next_table_name.clone())
+        };
+
+        chain.push(CascadeTableSpec {
+            table_name: current_target_name.clone(),
+            interval: current_interval,
+            target: next_target,
+            output_columns: output_columns.clone(),
+        });
+
+        current_interval = next_interval;
+        current_target_name = next_table_name;
+    }
+
+    // Add the final terminal table (receives data but does not consolidate further).
+    chain.push(CascadeTableSpec {
+        table_name: current_target_name,
+        interval: current_interval,
+        target: None,
+        output_columns,
+    });
+
+    chain
+}
+
+/// Derive a table name from the source table and interval.
+/// e.g., "sensor_1s" with 15m interval -> "sensor_15m".
+fn derive_table_name(source: &str, interval: &Duration) -> String {
+    let suffix = format_duration_short(interval);
+    // Try to replace the last _Xs suffix, else append.
+    if let Some(base) = source.rsplit_once('_') {
+        format!("{}_{}", base.0, suffix)
+    } else {
+        format!("{}_{}", source, suffix)
+    }
+}
+
+/// Format a duration as a short string: "5m", "15m", "1h".
+fn format_duration_short(d: &Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +556,71 @@ mod tests {
 
         let err = detect_cascade_cycle("self_table", &all_ext).unwrap_err();
         assert!(err.contains("cycle"));
+    }
+
+    // --- Task 19: Auto-cascade table creation tests ---
+
+    #[test]
+    fn generate_cascade_chain_3_tiers() {
+        let config = ConsolidationConfig {
+            interval: Duration::from_secs(300), // 5m
+            functions: vec![
+                super::super::consolidation::ConsolidationFn::Min,
+                super::super::consolidation::ConsolidationFn::Max,
+                super::super::consolidation::ConsolidationFn::Avg,
+            ],
+            target_table: "sensor_5m".into(),
+            cascade: true,
+            columns: vec!["value".into()],
+            cascade_multipliers: vec![3, 4],
+            ..ConsolidationConfig::default()
+        };
+
+        let chain = generate_cascade_chain("sensor_1s", &config);
+
+        // Should produce 3 specs: sensor_5m -> sensor_15m -> sensor_1h (terminal).
+        assert_eq!(chain.len(), 3);
+
+        assert_eq!(chain[0].table_name, "sensor_5m");
+        assert_eq!(chain[0].interval, Duration::from_secs(300));
+        assert_eq!(chain[0].target, Some("sensor_15m".into()));
+
+        assert_eq!(chain[1].table_name, "sensor_15m");
+        assert_eq!(chain[1].interval, Duration::from_secs(900)); // 15m
+        assert_eq!(chain[1].target, None);
+
+        assert_eq!(chain[2].table_name, "sensor_1h");
+        assert_eq!(chain[2].interval, Duration::from_secs(3600)); // 1h
+        assert_eq!(chain[2].target, None);
+    }
+
+    #[test]
+    fn generate_cascade_chain_no_cascade() {
+        let config = ConsolidationConfig {
+            cascade: false,
+            ..ConsolidationConfig::default()
+        };
+        let chain = generate_cascade_chain("t", &config);
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn derive_table_name_replaces_suffix() {
+        assert_eq!(
+            derive_table_name("sensor_1s", &Duration::from_secs(900)),
+            "sensor_15m"
+        );
+        assert_eq!(
+            derive_table_name("sensor_5m", &Duration::from_secs(3600)),
+            "sensor_1h"
+        );
+    }
+
+    #[test]
+    fn format_duration_short_variants() {
+        assert_eq!(format_duration_short(&Duration::from_secs(300)), "5m");
+        assert_eq!(format_duration_short(&Duration::from_secs(900)), "15m");
+        assert_eq!(format_duration_short(&Duration::from_secs(3600)), "1h");
+        assert_eq!(format_duration_short(&Duration::from_secs(45)), "45s");
     }
 }
