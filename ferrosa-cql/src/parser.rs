@@ -106,6 +106,10 @@ impl<'input> Parser<'input> {
     fn parse_select(&mut self) -> Result<SelectStatement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Select))?;
 
+        // Optional DISTINCT — consume and treat as a no-op.
+        // Ferrosa returns deduplicated partition-key rows by default.
+        let _distinct = self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))?;
+
         // Columns: * or comma-separated identifiers
         let columns = self.parse_select_columns()?;
 
@@ -2120,6 +2124,7 @@ impl<'input> Parser<'input> {
             Keyword::As => "as",
             Keyword::Contains => "contains",
             Keyword::Explain => "explain",
+            Keyword::Distinct => "distinct",
         }
         .to_string()
     }
@@ -2923,6 +2928,24 @@ mod tests {
                         Term::IntegerLiteral(3),
                     ])
                 );
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_select_distinct() {
+        let stmt = parse("SELECT DISTINCT group_id, group_name FROM static_cols").unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(
+                    s.columns,
+                    vec![
+                        SelectColumn::Column("group_id".into()),
+                        SelectColumn::Column("group_name".into()),
+                    ]
+                );
+                assert_eq!(s.table, "static_cols");
             }
             other => panic!("expected Select, got {:?}", other),
         }

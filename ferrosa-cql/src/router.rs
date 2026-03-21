@@ -3787,6 +3787,11 @@ fn apply_tojson_projections(
 }
 
 /// Project rows to a selected column subset.
+///
+/// Columns that do not match any name in `all_names` (e.g. UDF display
+/// names like `"ks.to_celsius"`) get a `None` placeholder so the
+/// projected row has exactly `selected.len()` cells. The caller can
+/// then overwrite those placeholders with UDF results.
 fn select_columns(
     rows: &[Vec<Option<CqlValue>>],
     all_names: &[String],
@@ -3796,13 +3801,21 @@ fn select_columns(
     if all_names == selected {
         return rows.to_vec();
     }
-    // Build index mapping
-    let indices: Vec<usize> = selected
+    // Build index mapping: Some(idx) for real columns, None for function calls.
+    let indices: Vec<Option<usize>> = selected
         .iter()
-        .filter_map(|name| all_names.iter().position(|n| n == name))
+        .map(|name| all_names.iter().position(|n| n == name))
         .collect();
     rows.iter()
-        .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
+        .map(|row| {
+            indices
+                .iter()
+                .map(|opt_i| match opt_i {
+                    Some(i) => row[*i].clone(),
+                    None => None,
+                })
+                .collect()
+        })
         .collect()
 }
 

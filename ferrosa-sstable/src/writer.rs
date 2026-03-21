@@ -642,6 +642,52 @@ mod tests {
         assert!(reader.read_partition().unwrap().is_none());
     }
 
+    /// Large cell values (100KB+) must survive a write-read roundtrip.
+    /// This is a P0 regression test: embedding hex-encoded WASM binaries
+    /// (~160KB) as CQL function bodies corrupted the SSTable data file,
+    /// causing subsequent reads to fail with "read_exact_at: wanted N
+    /// bytes, got M" or "range tombstone markers not yet supported".
+    #[test]
+    fn write_large_cell_value_roundtrip() {
+        let header = test_header();
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        // 100KB value — larger than a typical SSTable chunk.
+        let large_value: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let timestamp = 1_000_042i64;
+        let partition = make_partition(
+            b"pk_large",
+            &[0x00, 0x00, 0x00, 0x01],
+            &large_value,
+            timestamp,
+        );
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        // Read back — must not corrupt or error.
+        let mut reader = DataReader::new(&output.data, &header, 0);
+        let read_partition = reader
+            .read_partition()
+            .unwrap()
+            .expect("expected partition with large cell");
+
+        assert_eq!(read_partition.key.key.as_bytes(), b"pk_large");
+        assert_eq!(read_partition.rows.len(), 1);
+        let (_, ref cell) = read_partition.rows[0].cells[0];
+        assert_eq!(
+            cell.value.as_deref().unwrap().len(),
+            100_000,
+            "large value should survive roundtrip"
+        );
+        assert_eq!(cell.value.as_deref().unwrap(), large_value.as_slice());
+    }
+
     #[test]
     fn write_multiple_partitions_verify_count_and_bloom() {
         let header = test_header();

@@ -183,7 +183,8 @@ fn encode_rows_metadata(
 /// Simple types: `[u16 type_id]`
 /// List/Set:     `[u16 type_id][u16 elem_type_id]`
 /// Map:          `[u16 type_id][u16 key_type_id][u16 val_type_id]`
-/// Tuple:        `[u16 type_id][u16 count][u16 type_id]*count`
+/// Tuple:        `[u16 type_id][u16 count][type]*count`
+/// UDT:          `[u16 type_id][string ks][string name][u16 n][string field_name + type]*n`
 fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
     buf.put_u16(cql_type.type_id());
     match cql_type {
@@ -198,6 +199,19 @@ fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
             buf.put_u16(types.len() as u16);
             for t in types {
                 encode_type(buf, t);
+            }
+        }
+        CqlType::Udt {
+            keyspace,
+            name,
+            fields,
+        } => {
+            encode_string(buf, keyspace);
+            encode_string(buf, name);
+            buf.put_u16(fields.len() as u16);
+            for (field_name, field_type) in fields {
+                encode_string(buf, field_name);
+                encode_type(buf, field_type);
             }
         }
         // All simple types: type_id alone is sufficient.

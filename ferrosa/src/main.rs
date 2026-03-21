@@ -371,8 +371,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         require_tls: cql_require_tls == "true" || cql_require_tls == "1",
         ..ferrosa_cql::server::ServerConfig::default()
     };
+    // Determine the advertised CQL address for system.local.rpc_address.
+    // CQL drivers use this to create connection pools, so it must be a
+    // reachable address (not 0.0.0.0).
+    let cql_broadcast_addr = match std::env::var("FERROSA_CQL_BROADCAST") {
+        Ok(addr_str) => addr_str.parse::<std::net::IpAddr>().unwrap_or_else(|_| {
+            // Try parsing as SocketAddr (ip:port) and extract IP.
+            addr_str
+                .parse::<std::net::SocketAddr>()
+                .map(|sa| sa.ip())
+                .unwrap_or_else(|_| {
+                    tracing::warn!(
+                        "FERROSA_CQL_BROADCAST={addr_str} is not a valid address, \
+                             falling back to 127.0.0.1"
+                    );
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                })
+        }),
+        Err(_) => {
+            if cql_bind.ip().is_unspecified() {
+                // 0.0.0.0 → substitute 127.0.0.1 as safe local default.
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            } else {
+                cql_bind.ip()
+            }
+        }
+    };
     let node_config = Arc::new(ferrosa_schema::NodeConfig {
-        rpc_address: cql_bind.ip(),
+        rpc_address: cql_broadcast_addr,
         rpc_port: cql_bind.port(),
         host_id,
         listen_port: internode_addr.port(),
