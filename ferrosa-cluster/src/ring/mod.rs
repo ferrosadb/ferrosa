@@ -110,6 +110,25 @@ impl TokenRing {
         }
     }
 
+    /// Select replicas based on a [`ReplicationStrategy`].
+    ///
+    /// Dispatches to [`replicas`] for `Simple` or [`nts_replicas`] for
+    /// `NetworkTopology`.
+    pub fn replicas_for_strategy(
+        &self,
+        token: Token,
+        strategy: &strategy::ReplicationStrategy,
+    ) -> Vec<u64> {
+        match strategy {
+            strategy::ReplicationStrategy::Simple { replication_factor } => {
+                self.replicas(token, *replication_factor)
+            }
+            strategy::ReplicationStrategy::NetworkTopology { dc_rf } => {
+                self.nts_replicas(token, dc_rf)
+            }
+        }
+    }
+
     /// Find replicas for a token using NetworkTopologyStrategy.
     ///
     /// Walks clockwise from `token`, filling per-DC quotas from `dc_rf`
@@ -554,6 +573,41 @@ mod tests {
 
         // Should get 1 from dc1, 0 from dc2 (no nodes exist)
         assert_eq!(replicas.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // replicas_for_strategy dispatch tests
+    // -----------------------------------------------------------------------
+
+    use crate::ring::strategy::ReplicationStrategy;
+
+    #[test]
+    fn replicas_for_strategy_simple_delegates() {
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node("10.0.0.1:7000"));
+        ring.add_node(2, make_node("10.0.0.2:7000"));
+        ring.assign_tokens(1, &[100]);
+        ring.assign_tokens(2, &[200]);
+
+        let strategy = ReplicationStrategy::Simple {
+            replication_factor: 2,
+        };
+        let replicas = ring.replicas_for_strategy(0, &strategy);
+        assert_eq!(replicas.len(), 2);
+    }
+
+    #[test]
+    fn replicas_for_strategy_nts_delegates() {
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node_dc("10.0.0.1:7000", "dc1", "rack-a"));
+        ring.add_node(2, make_node_dc("10.0.0.2:7000", "dc2", "rack-a"));
+        ring.assign_tokens(1, &[100]);
+        ring.assign_tokens(2, &[200]);
+
+        let dc_rf = HashMap::from([("dc1".to_string(), 1usize), ("dc2".to_string(), 1usize)]);
+        let strategy = ReplicationStrategy::NetworkTopology { dc_rf };
+        let replicas = ring.replicas_for_strategy(0, &strategy);
+        assert_eq!(replicas.len(), 2);
     }
 
     use proptest::prelude::*;
