@@ -131,6 +131,196 @@ pub fn encode_uuid(val: &uuid::Uuid) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Row conversion functions
+// ---------------------------------------------------------------------------
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+/// Returns the current timestamp in microseconds for cell timestamps.
+fn now_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64
+}
+
+/// Convert a `KeyspaceMetadata` into a storage row for `system_schema.keyspaces`.
+///
+/// Returns (partition_key, row, timestamp).
+pub fn keyspace_to_row(ks: &KeyspaceMetadata) -> (DecoratedKey, Row, i64) {
+    let ts = now_micros();
+    let key = DecoratedKey::new(PartitionKey::new(ks.name.as_bytes().to_vec()));
+
+    let mut replication_map = ks.replication.options.clone();
+    replication_map.insert("class".to_string(), ks.replication.strategy.clone());
+    let replication_json = serde_json::to_vec(&replication_map).unwrap_or_default();
+
+    let row = Row {
+        clustering: vec![],
+        cells: vec![
+            (
+                KEYSPACES_COL_DURABLE_WRITES,
+                CellValue::live(encode_bool(ks.durable_writes), ts),
+            ),
+            (
+                KEYSPACES_COL_REPLICATION,
+                CellValue::live(replication_json, ts),
+            ),
+        ],
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness: LivenessInfo::with_timestamp(ts),
+    };
+
+    (key, row, ts)
+}
+
+/// Result of converting a `TableMetadata` to storage rows.
+pub struct TableMutationRows {
+    /// Row for `system_schema.tables`.
+    pub table_row: SystemRow,
+    /// Rows for `system_schema.columns` (one per column).
+    pub column_rows: Vec<SystemRow>,
+    /// Timestamp used for all cells.
+    pub timestamp: i64,
+}
+
+/// A single row destined for a system table.
+pub struct SystemRow {
+    /// Partition key.
+    pub key: DecoratedKey,
+    /// Row data.
+    pub row: Row,
+}
+
+/// Convert a `TableMetadata` into storage rows for `system_schema.tables`
+/// and `system_schema.columns`.
+pub fn table_to_rows(table: &TableMetadata) -> TableMutationRows {
+    let ts = now_micros();
+    let key = DecoratedKey::new(PartitionKey::new(table.keyspace.as_bytes().to_vec()));
+
+    // system_schema.tables row: clustering = table_name, cell = id
+    let table_row = SystemRow {
+        key: key.clone(),
+        row: Row {
+            clustering: table.name.as_bytes().to_vec(),
+            cells: vec![(TABLES_COL_ID, CellValue::live(encode_uuid(&table.id), ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        },
+    };
+
+    // system_schema.columns rows: one per column
+    let column_rows: Vec<SystemRow> = table
+        .columns
+        .values()
+        .map(|col| {
+            // Composite clustering: table_name + column_name
+            let mut clustering = Vec::new();
+            clustering.extend_from_slice(&(table.name.len() as u16).to_be_bytes());
+            clustering.extend_from_slice(table.name.as_bytes());
+            clustering.extend_from_slice(col.name.as_bytes());
+
+            let kind_str = match col.kind {
+                crate::metadata::column::ColumnKind::PartitionKey => "partition_key",
+                crate::metadata::column::ColumnKind::Clustering => "clustering",
+                crate::metadata::column::ColumnKind::Regular => "regular",
+                crate::metadata::column::ColumnKind::Static => "static",
+            };
+            let order_str = match col.clustering_order {
+                crate::metadata::column::ClusteringOrder::Asc => "asc",
+                crate::metadata::column::ClusteringOrder::Desc => "desc",
+                crate::metadata::column::ClusteringOrder::None => "none",
+            };
+
+            SystemRow {
+                key: key.clone(),
+                row: Row {
+                    clustering,
+                    cells: vec![
+                        (
+                            COLUMNS_COL_KIND,
+                            CellValue::live(kind_str.as_bytes().to_vec(), ts),
+                        ),
+                        (
+                            COLUMNS_COL_POSITION,
+                            CellValue::live(encode_i32(col.position), ts),
+                        ),
+                        (
+                            COLUMNS_COL_TYPE,
+                            CellValue::live(col.column_type.as_bytes().to_vec(), ts),
+                        ),
+                        (
+                            COLUMNS_COL_CLUSTERING_ORDER,
+                            CellValue::live(order_str.as_bytes().to_vec(), ts),
+                        ),
+                    ],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(ts),
+                },
+            }
+        })
+        .collect();
+
+    TableMutationRows {
+        table_row,
+        column_rows,
+        timestamp: ts,
+    }
+}
+
+/// Convert a `RoleMetadata` into a storage row for `system_auth.roles`.
+pub fn role_to_row(role: &RoleMetadata) -> (DecoratedKey, Row, i64) {
+    let ts = now_micros();
+    let key = DecoratedKey::new(PartitionKey::new(role.name.as_bytes().to_vec()));
+
+    let hash_cell = match &role.salted_hash {
+        Some(h) => CellValue::live(h.as_bytes().to_vec(), ts),
+        None => CellValue::tombstone(ts, (ts / 1_000_000) as i32),
+    };
+
+    let row = Row {
+        clustering: vec![],
+        cells: vec![
+            (
+                ROLES_COL_IS_SUPERUSER,
+                CellValue::live(encode_bool(role.is_superuser), ts),
+            ),
+            (
+                ROLES_COL_CAN_LOGIN,
+                CellValue::live(encode_bool(role.can_login), ts),
+            ),
+            (ROLES_COL_SALTED_HASH, hash_cell),
+        ],
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness: LivenessInfo::with_timestamp(ts),
+    };
+
+    (key, row, ts)
+}
+
+/// Convert a `GrantEntry` into a storage row for `system_auth.role_permissions`.
+pub fn grant_to_row(grant: &GrantEntry) -> (DecoratedKey, Row, i64) {
+    let ts = now_micros();
+    let key = DecoratedKey::new(PartitionKey::new(grant.role.as_bytes().to_vec()));
+
+    let resource_str = grant.resource.to_string();
+    let perms: Vec<String> = grant.permissions.iter().map(|p| p.to_string()).collect();
+    let perms_json = serde_json::to_vec(&perms).unwrap_or_default();
+
+    let row = Row {
+        clustering: resource_str.as_bytes().to_vec(),
+        cells: vec![(PERMISSIONS_COL_PERMISSIONS, CellValue::live(perms_json, ts))],
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness: LivenessInfo::with_timestamp(ts),
+    };
+
+    (key, row, ts)
+}
+
+// ---------------------------------------------------------------------------
 // System table TableSchema builders
 // ---------------------------------------------------------------------------
 
@@ -438,5 +628,173 @@ mod tests {
     #[test]
     fn encode_i32_value() {
         assert_eq!(encode_i32(42), 42i32.to_be_bytes().to_vec());
+    }
+
+    // -- Task 6: keyspace_to_row tests --
+
+    #[test]
+    fn keyspace_mutation_produces_row() {
+        use crate::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
+
+        let ks = KeyspaceMetadata {
+            name: "test_ks".to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: std::collections::HashMap::from([(
+                    "replication_factor".to_string(),
+                    "3".to_string(),
+                )]),
+            },
+        };
+
+        let (key, row, timestamp) = keyspace_to_row(&ks);
+
+        // Partition key is the keyspace name.
+        assert_eq!(key.key.as_bytes(), b"test_ks");
+
+        // Row should have 2 cells.
+        assert_eq!(row.cells.len(), 2);
+
+        // Cell 0: durable_writes = true (0x01).
+        let (idx, cell) = &row.cells[0];
+        assert_eq!(*idx, KEYSPACES_COL_DURABLE_WRITES);
+        assert_eq!(cell.value.as_deref(), Some(&[0x01][..]));
+
+        // Cell 1: replication as JSON.
+        let (idx, cell) = &row.cells[1];
+        assert_eq!(*idx, KEYSPACES_COL_REPLICATION);
+        assert!(cell.value.is_some());
+
+        // Timestamp should be positive.
+        assert!(timestamp > 0);
+    }
+
+    // -- Task 7: table_to_rows tests --
+
+    #[test]
+    fn table_mutation_produces_tables_and_columns_rows() {
+        use crate::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
+        use crate::metadata::table::TableParams;
+
+        let mut table = TableMetadata {
+            keyspace: "ks".to_string(),
+            name: "users".to_string(),
+            id: uuid::Uuid::nil(),
+            columns: indexmap::IndexMap::new(),
+            partition_key: vec!["id".to_string()],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: std::collections::HashSet::new(),
+            extensions: std::collections::HashMap::new(),
+            is_system: false,
+        };
+        table.columns.insert(
+            "id".to_string(),
+            ColumnMetadata {
+                name: "id".to_string(),
+                kind: ColumnKind::PartitionKey,
+                position: 0,
+                column_type: "uuid".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        table.columns.insert(
+            "name".to_string(),
+            ColumnMetadata {
+                name: "name".to_string(),
+                kind: ColumnKind::Regular,
+                position: 0,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+
+        let result = table_to_rows(&table);
+
+        // table_row: written to system_schema.tables
+        assert_eq!(result.table_row.key.key.as_bytes(), b"ks");
+        assert_eq!(result.table_row.row.cells.len(), 1); // id column
+                                                         // Clustering key should be the table name.
+        assert_eq!(result.table_row.row.clustering, b"users");
+
+        // column_rows: written to system_schema.columns
+        assert_eq!(result.column_rows.len(), 2);
+    }
+
+    // -- Task 8: role_to_row tests --
+
+    #[test]
+    fn role_mutation_produces_row() {
+        use crate::auth::role::RoleMetadata;
+
+        let role = RoleMetadata {
+            name: "analyst".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: Some("$2b$hash".to_string()),
+            member_of: std::collections::HashSet::new(),
+        };
+
+        let (key, row, _ts) = role_to_row(&role);
+
+        assert_eq!(key.key.as_bytes(), b"analyst");
+        assert_eq!(row.cells.len(), 3);
+
+        let (idx, cell) = &row.cells[0];
+        assert_eq!(*idx, ROLES_COL_IS_SUPERUSER);
+        assert_eq!(cell.value.as_deref(), Some(&[0x00][..])); // false
+
+        let (idx, cell) = &row.cells[1];
+        assert_eq!(*idx, ROLES_COL_CAN_LOGIN);
+        assert_eq!(cell.value.as_deref(), Some(&[0x01][..])); // true
+
+        let (idx, cell) = &row.cells[2];
+        assert_eq!(*idx, ROLES_COL_SALTED_HASH);
+        assert!(cell.value.is_some());
+    }
+
+    #[test]
+    fn role_with_no_hash_produces_tombstone_cell() {
+        use crate::auth::role::RoleMetadata;
+
+        let role = RoleMetadata {
+            name: "nohash".to_string(),
+            is_superuser: false,
+            can_login: false,
+            salted_hash: None,
+            member_of: std::collections::HashSet::new(),
+        };
+
+        let (_key, row, _ts) = role_to_row(&role);
+        let (idx, cell) = &row.cells[2];
+        assert_eq!(*idx, ROLES_COL_SALTED_HASH);
+        // Null value -> tombstone cell.
+        assert!(cell.value.is_none());
+    }
+
+    // -- Task 9: grant_to_row tests --
+
+    #[test]
+    fn grant_mutation_produces_row() {
+        use crate::auth::permission::{GrantEntry, Permission, Resource};
+
+        let grant = GrantEntry {
+            role: "reader".to_string(),
+            resource: Resource::Table("ks".to_string(), "t".to_string()),
+            permissions: [Permission::Select].into_iter().collect(),
+        };
+
+        let (key, row, _ts) = grant_to_row(&grant);
+
+        assert_eq!(key.key.as_bytes(), b"reader");
+        // Clustering key = resource string.
+        assert!(!row.clustering.is_empty());
+        // One cell: permissions as JSON.
+        assert_eq!(row.cells.len(), 1);
+        let (idx, _cell) = &row.cells[0];
+        assert_eq!(*idx, PERMISSIONS_COL_PERMISSIONS);
     }
 }
