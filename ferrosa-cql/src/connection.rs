@@ -747,10 +747,30 @@ fn handle_prepare(
     // Determine keyspace and table from the statement for the prepared metadata.
     let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
 
-    // Build bound_columns from the statement (simplified — no full type inference).
-    let bound_columns: Vec<(String, CqlType)> = Vec::new();
+    // Build bound_columns: resolve bind marker column names to their CQL types
+    // from the table schema.
+    let bind_col_names = extract_bind_column_names(&stmt);
+    let bound_columns: Vec<(String, CqlType)> = {
+        let snapshot = state.schema.snapshot();
+        let key = (table_ks.clone(), table_name.clone());
+        if let Some(table_meta) = snapshot.tables.get(&key) {
+            bind_col_names
+                .iter()
+                .map(|col_name| {
+                    let cql_type = table_meta
+                        .columns
+                        .get(col_name)
+                        .map(|cm| col_type_str_to_cql_type(&cm.column_type))
+                        .unwrap_or(CqlType::Blob);
+                    (col_name.clone(), cql_type)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
 
-    // Build result_columns (simplified — empty for non-SELECT).
+    // Build result_columns for SELECT statements.
     let result_columns: Vec<(String, CqlType)> = Vec::new();
 
     // Compute pk_indexes: map each partition key column to its position in the
@@ -1130,6 +1150,33 @@ fn extract_bind_column_names(stmt: &crate::ast::Statement) -> Vec<String> {
             names
         }
         _ => Vec::new(),
+    }
+}
+
+/// Map a column type string (from schema metadata) to the CQL wire type.
+fn col_type_str_to_cql_type(type_str: &str) -> CqlType {
+    match type_str.to_lowercase().as_str() {
+        "ascii" => CqlType::Ascii,
+        "bigint" => CqlType::Bigint,
+        "blob" => CqlType::Blob,
+        "boolean" => CqlType::Boolean,
+        "counter" => CqlType::Counter,
+        "decimal" => CqlType::Decimal,
+        "double" => CqlType::Double,
+        "float" => CqlType::Float,
+        "int" => CqlType::Int,
+        "timestamp" => CqlType::Timestamp,
+        "uuid" => CqlType::Uuid,
+        "varchar" | "text" => CqlType::Varchar,
+        "varint" => CqlType::Varint,
+        "timeuuid" => CqlType::Timeuuid,
+        "inet" => CqlType::Inet,
+        "date" => CqlType::Date,
+        "time" => CqlType::Time,
+        "smallint" => CqlType::Smallint,
+        "tinyint" => CqlType::Tinyint,
+        "duration" => CqlType::Duration,
+        _ => CqlType::Blob, // fallback for complex/unknown types
     }
 }
 
