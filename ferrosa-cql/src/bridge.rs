@@ -235,13 +235,18 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 fields: field_defs, ..
             } => {
                 // UDT literal: {field_name: value, ...}
-                // Keys in the map literal must be string literals matching field names.
+                // Keys are bare identifiers (parsed as FunctionCall with no args)
+                // or string literals matching field names.
                 let mut result = Vec::with_capacity(field_defs.len());
                 for (field_name, field_type) in field_defs {
                     let value = pairs
                         .iter()
                         .find(|(k, _)| match k {
                             Term::StringLiteral(s) => s.eq_ignore_ascii_case(field_name),
+                            // Bare identifiers are parsed as FunctionCall { name, args: [] }
+                            Term::FunctionCall { name, args, .. } if args.is_empty() => {
+                                name.eq_ignore_ascii_case(field_name)
+                            }
                             _ => false,
                         })
                         .map(|(_, v)| term_to_cql_value(v, field_type))

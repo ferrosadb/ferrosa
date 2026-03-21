@@ -3281,18 +3281,18 @@ fn build_column_info(
                 alias,
                 args,
             } => {
-                let display_name = alias.clone().unwrap_or_else(|| {
+                let builtin_display_name = alias.clone().unwrap_or_else(|| {
                     let prefix = func_ks.as_deref().unwrap_or("system");
                     format!("{}.{}", prefix, name)
                 });
                 let fn_lower = name.to_lowercase();
-                let cql_type = match fn_lower.as_str() {
-                    "count" => CqlType::Bigint,
-                    "writetime" => CqlType::Bigint,
-                    "ttl" => CqlType::Int,
+                let (display_name, cql_type) = match fn_lower.as_str() {
+                    "count" => (builtin_display_name, CqlType::Bigint),
+                    "writetime" => (builtin_display_name, CqlType::Bigint),
+                    "ttl" => (builtin_display_name, CqlType::Int),
                     "avg" | "min" | "max" | "sum" => {
                         // Resolve the argument column type.
-                        if let Some(arg) = args.first() {
+                        let t = if let Some(arg) = args.first() {
                             if let Ok(col_name) = extract_column_name(arg) {
                                 let col = table_meta.columns.get(&col_name).ok_or_else(|| {
                                     CqlError::Invalid(format!(
@@ -3317,7 +3317,8 @@ fn build_column_info(
                             }
                         } else {
                             CqlType::Double
-                        }
+                        };
+                        (builtin_display_name, t)
                     }
                     _ => {
                         // Try to resolve as UDF/UDA — need table column info.
@@ -3338,7 +3339,10 @@ fn build_column_info(
                             &all_col_types,
                             schema,
                         )?;
-                        resolved.return_type.clone()
+                        // Use the resolved display_name so it matches the
+                        // name produced by resolve_select_function during
+                        // UDF evaluation (ensures col_names alignment).
+                        (resolved.display_name, resolved.return_type.clone())
                     }
                 };
                 names.push(display_name);
