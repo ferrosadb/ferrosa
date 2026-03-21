@@ -135,6 +135,9 @@ pub struct WhereClause {
     pub column: String,
     pub op: ComparisonOp,
     pub value: Term,
+    /// When true, this clause represents `token(column) op token(value)`
+    /// and should be evaluated as a token-range predicate.
+    pub token_fn: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

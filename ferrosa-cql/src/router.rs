@@ -3142,6 +3142,11 @@ fn evaluate_where_predicates(
     schema: &Schema,
 ) -> bool {
     for wc in where_clauses {
+        // Skip token() predicates — token range filtering is handled by
+        // the scan bounds, not by post-filter row evaluation.
+        if wc.token_fn {
+            continue;
+        }
         let col_idx = match all_col_names.iter().position(|n| n == &wc.column) {
             Some(i) => i,
             None => return false,
@@ -4309,7 +4314,7 @@ fn term_has_udf_call(term: &Term) -> bool {
             let lower = name.to_lowercase();
             let is_builtin = matches!(
                 lower.as_str(),
-                "uuid" | "now" | "totimestamp" | "todate" | "count" | "writetime" | "ttl"
+                "uuid" | "now" | "totimestamp" | "todate" | "count" | "writetime" | "ttl" | "token"
             );
             if !is_builtin && !args.is_empty() {
                 return true;

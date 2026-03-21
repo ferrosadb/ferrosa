@@ -1544,6 +1544,18 @@ impl<'input> Parser<'input> {
         let mut clauses = vec![];
         loop {
             let column = self.parse_ident()?;
+
+            // Check for token(column) pattern: `token` followed by `(`.
+            let is_token_fn =
+                column.eq_ignore_ascii_case("token") && self.lexer.eat(&TokenKind::LParen)?;
+            let actual_column = if is_token_fn {
+                let col = self.parse_ident()?;
+                self.lexer.expect(&TokenKind::RParen)?;
+                col
+            } else {
+                column
+            };
+
             let op = self.parse_comparison_op()?;
             let value = if op == ComparisonOp::In {
                 // IN (term, term, ...)
@@ -1554,7 +1566,12 @@ impl<'input> Parser<'input> {
             } else {
                 self.parse_term()?
             };
-            clauses.push(WhereClause { column, op, value });
+            clauses.push(WhereClause {
+                column: actual_column,
+                op,
+                value,
+                token_fn: is_token_fn,
+            });
             if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
                 break;
             }
@@ -2759,6 +2776,29 @@ mod tests {
         let stmt = parse("SELECT * FROM t WHERE x = 1 ALLOW FILTERING").unwrap();
         match stmt {
             Statement::Select(s) => assert!(s.allow_filtering),
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_token_range_where() {
+        let stmt = parse("SELECT * FROM t WHERE token(id) > token(3)").unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.where_clauses.len(), 1);
+                let wc = &s.where_clauses[0];
+                assert!(wc.token_fn, "WHERE clause should be marked as token_fn");
+                assert_eq!(wc.column, "id");
+                assert_eq!(wc.op, ComparisonOp::Gt);
+                // RHS is token(3) parsed as FunctionCall
+                match &wc.value {
+                    Term::FunctionCall { name, args, .. } => {
+                        assert_eq!(name, "token");
+                        assert_eq!(args.len(), 1);
+                    }
+                    other => panic!("expected FunctionCall, got {:?}", other),
+                }
+            }
             other => panic!("expected Select, got {:?}", other),
         }
     }
