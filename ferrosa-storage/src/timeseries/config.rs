@@ -184,6 +184,21 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(n))
 }
 
+/// Check if the number of consolidation columns exceeds the SmallVec inline limit.
+/// Returns a warning message if > 8 columns.
+pub fn check_column_count_warning(column_count: usize) -> Option<String> {
+    if column_count > 8 {
+        Some(format!(
+            "consolidation covers {} columns (> 8). SmallVec will spill to heap, \
+             which is functional but slower. Consider reducing the number of \
+             consolidated columns for optimal performance.",
+            column_count
+        ))
+    } else {
+        None
+    }
+}
+
 /// Validate that all consolidation columns are numeric types.
 ///
 /// Accepts: double, float, int, bigint, counter.
@@ -337,6 +352,21 @@ mod tests {
 
         let config = ConsolidationConfig::from_extensions(&ext).unwrap().unwrap();
         assert_eq!(config.interval_micros(), 300_000_000);
+    }
+
+    // --- Task 18: SmallVec column count warning tests ---
+
+    #[test]
+    fn column_count_warning_none_for_8_or_fewer() {
+        assert!(check_column_count_warning(1).is_none());
+        assert!(check_column_count_warning(8).is_none());
+    }
+
+    #[test]
+    fn column_count_warning_some_for_more_than_8() {
+        let warning = check_column_count_warning(9).unwrap();
+        assert!(warning.contains("9 columns"));
+        assert!(warning.contains("heap"));
     }
 
     // --- Task 17: DDL validation tests ---
