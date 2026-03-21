@@ -184,7 +184,30 @@ pub struct IndexBuildScheduler {
 
 impl IndexBuildScheduler {
     /// Creates and starts the index build scheduler with `worker_count` threads.
+    ///
+    /// Uses a no-op stub backend for backward compatibility. Call
+    /// [`with_backend()`](Self::with_backend) for production use with a real backend.
     pub fn new(worker_count: usize, tracker: Arc<IndexStateTracker>) -> Self {
+        // Stub backend that does nothing -- preserves existing test behavior.
+        struct StubBackend;
+        impl IndexBuildBackend for StubBackend {
+            fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
+                Ok(IndexBuildResult {
+                    sstable_id: job.sstable_id.clone(),
+                    sidecar_entries: HashMap::new(),
+                    build_duration: std::time::Duration::from_millis(0),
+                })
+            }
+        }
+        Self::with_backend(worker_count, tracker, Arc::new(StubBackend))
+    }
+
+    /// Creates a scheduler with the given backend for executing builds.
+    pub fn with_backend(
+        worker_count: usize,
+        tracker: Arc<IndexStateTracker>,
+        backend: Arc<dyn IndexBuildBackend>,
+    ) -> Self {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<IndexBuildJob>();
         let task_rx = Arc::new(Mutex::new(task_rx));
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -195,11 +218,12 @@ impl IndexBuildScheduler {
             let rx = Arc::clone(&task_rx);
             let stop = Arc::clone(&stop_flag);
             let tracker = Arc::clone(&tracker);
+            let backend = Arc::clone(&backend);
 
             let handle = thread::Builder::new()
                 .name(format!("index-builder-{i}"))
                 .spawn(move || {
-                    Self::worker_loop(&rx, &stop, &tracker);
+                    Self::worker_loop_with_backend(&rx, &stop, &tracker, &*backend);
                 })
                 .expect("failed to spawn index builder thread");
 
@@ -223,22 +247,20 @@ impl IndexBuildScheduler {
     /// Shuts down the scheduler, waiting for all worker threads to finish.
     pub fn shutdown(&self) {
         self.stop_flag.store(true, Ordering::Release);
-        // Drop the sender so workers see Disconnected. We can't drop self.task_tx
-        // directly, but the stop flag will make workers exit on timeout.
         let mut handles = self.handles.lock();
         for handle in handles.drain(..) {
             let _ = handle.join();
         }
     }
 
-    /// Worker loop: pull jobs from the shared receiver and process them.
-    fn worker_loop(
+    /// Worker loop that delegates to the backend.
+    fn worker_loop_with_backend(
         rx: &Mutex<std::sync::mpsc::Receiver<IndexBuildJob>>,
         stop: &AtomicBool,
         tracker: &IndexStateTracker,
+        backend: &dyn IndexBuildBackend,
     ) {
         while !stop.load(Ordering::Acquire) {
-            // Lock the receiver briefly to pull one job.
             let job = {
                 let rx_guard = rx.lock();
                 rx_guard.recv_timeout(std::time::Duration::from_millis(100))
@@ -246,10 +268,21 @@ impl IndexBuildScheduler {
 
             match job {
                 Ok(job) => {
-                    // Stub: actual SSTable reading and index building is deferred.
-                    // For now, just mark the SSTable as indexed in the tracker.
                     let (keyspace, table) = &job.table;
-                    tracker.mark_indexed(keyspace, table, &job.index_name, &job.sstable_id);
+                    match backend.build(&job) {
+                        Ok(_result) => {
+                            tracker.mark_indexed(keyspace, table, &job.index_name, &job.sstable_id);
+                        }
+                        Err(err) => {
+                            tracker.mark_failed(
+                                keyspace,
+                                table,
+                                &job.index_name,
+                                err,
+                                std::time::Duration::from_secs(60),
+                            );
+                        }
+                    }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -555,5 +588,93 @@ mod tests {
             err.contains("open data"),
             "expected file-open error, got: {err}"
         );
+    }
+
+    #[test]
+    fn scheduler_delegates_to_backend() {
+        use std::sync::atomic::AtomicUsize;
+
+        static BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        struct CountingBackend;
+        impl IndexBuildBackend for CountingBackend {
+            fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
+                BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+                Ok(IndexBuildResult {
+                    sstable_id: job.sstable_id.clone(),
+                    sidecar_entries: std::collections::HashMap::new(),
+                    build_duration: Duration::from_millis(1),
+                })
+            }
+        }
+
+        BUILD_COUNT.store(0, Ordering::Relaxed);
+        let tracker = Arc::new(IndexStateTracker::new());
+        tracker.register_index("ks", "tbl", "idx");
+        tracker.mark_pending("ks", "tbl", "idx", "sst-001", 100);
+
+        let backend: Arc<dyn IndexBuildBackend> = Arc::new(CountingBackend);
+        let scheduler = IndexBuildScheduler::with_backend(2, Arc::clone(&tracker), backend);
+
+        scheduler
+            .submit(IndexBuildJob {
+                sstable_id: "sst-001".to_string(),
+                index_name: "idx".to_string(),
+                index_type: IndexType::BTree,
+                table: ("ks".to_string(), "tbl".to_string()),
+                priority: BuildPriority::Normal,
+                enqueued_at: Instant::now(),
+                column_position: 0,
+            })
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        assert_eq!(BUILD_COUNT.load(Ordering::Relaxed), 1);
+        let state = tracker.get_state("ks", "tbl", "idx").unwrap();
+        assert!(matches!(state.status, IndexStatus::Current));
+
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn scheduler_backend_failure_marks_index_failed() {
+        struct FailingBackend;
+        impl IndexBuildBackend for FailingBackend {
+            fn build(&self, _job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
+                Err("disk full".to_string())
+            }
+        }
+
+        let tracker = Arc::new(IndexStateTracker::new());
+        tracker.register_index("ks", "tbl", "idx");
+        tracker.mark_pending("ks", "tbl", "idx", "sst-001", 100);
+
+        let backend: Arc<dyn IndexBuildBackend> = Arc::new(FailingBackend);
+        let scheduler = IndexBuildScheduler::with_backend(1, Arc::clone(&tracker), backend);
+
+        scheduler
+            .submit(IndexBuildJob {
+                sstable_id: "sst-001".to_string(),
+                index_name: "idx".to_string(),
+                index_type: IndexType::BTree,
+                table: ("ks".to_string(), "tbl".to_string()),
+                priority: BuildPriority::Normal,
+                enqueued_at: Instant::now(),
+                column_position: 0,
+            })
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        let state = tracker.get_state("ks", "tbl", "idx").unwrap();
+        assert!(
+            matches!(state.status, IndexStatus::Failed { .. }),
+            "expected Failed status, got {:?}",
+            state.status
+        );
+        assert_eq!(state.total_build_errors, 1);
+
+        scheduler.shutdown();
     }
 }
