@@ -50,6 +50,8 @@ pub struct TimeSeriesAggregator {
     drop_count: AtomicU64,
     /// Maximum number of ring buffers.
     max_rings: usize,
+    /// Optional shared metrics for observability.
+    shared_metrics: Option<Arc<ConsolidationMetrics>>,
 }
 
 impl TimeSeriesAggregator {
@@ -73,7 +75,23 @@ impl TimeSeriesAggregator {
             task_tx,
             drop_count: AtomicU64::new(0),
             max_rings,
+            shared_metrics: None,
         }
+    }
+
+    /// Create a new aggregator with externally managed shared metrics.
+    pub fn with_metrics(
+        config: ConsolidationConfig,
+        table_id: TableId,
+        value_column_indices: Vec<u16>,
+        task_tx: std::sync::mpsc::SyncSender<ConsolidationTask>,
+        _metrics: Arc<ConsolidationMetrics>,
+    ) -> Self {
+        // Store metrics reference for observability; the aggregator still uses
+        // its internal drop_count for the fast path.
+        let mut agg = Self::new(config, table_id, value_column_indices, task_tx);
+        agg.shared_metrics = Some(_metrics);
+        agg
     }
 
     /// Returns the number of active ring buffers.
@@ -84,6 +102,11 @@ impl TimeSeriesAggregator {
     /// Returns the total number of dropped consolidation tasks.
     pub fn drop_count(&self) -> u64 {
         self.drop_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns a reference to the shared metrics, if set.
+    pub fn metrics(&self) -> Option<&Arc<ConsolidationMetrics>> {
+        self.shared_metrics.as_ref()
     }
 
     /// Extract f64 values from a mutation row for the configured columns.
@@ -215,6 +238,11 @@ impl WriteObserver for TimeSeriesAggregator {
                         };
                         if self.task_tx.try_send(task).is_err() {
                             self.drop_count.fetch_add(1, Ordering::Relaxed);
+                            if let Some(ref m) = self.shared_metrics {
+                                m.consolidation_drops.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else if let Some(ref m) = self.shared_metrics {
+                            m.windows_consolidated.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -229,6 +257,11 @@ impl WriteObserver for TimeSeriesAggregator {
                     };
                     if self.task_tx.try_send(task).is_err() {
                         self.drop_count.fetch_add(1, Ordering::Relaxed);
+                        if let Some(ref m) = self.shared_metrics {
+                            m.consolidation_drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else if let Some(ref m) = self.shared_metrics {
+                        m.late_arrivals.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 BoundaryStatus::Normal => {}
@@ -283,7 +316,6 @@ pub struct MetricsSnapshot {
 /// and writes results to downstream tables via `StorageEngine::write()`.
 pub struct ConsolidationWorker {
     config: ConsolidationConfig,
-    #[allow(dead_code)]
     task_rx: std::sync::mpsc::Receiver<ConsolidationTask>,
     metrics: Arc<ConsolidationMetrics>,
 }
@@ -315,6 +347,11 @@ impl ConsolidationWorker {
     /// Returns a reference to the metrics.
     pub fn metrics(&self) -> &Arc<ConsolidationMetrics> {
         &self.metrics
+    }
+
+    /// Returns a reference to the task receiver for polling.
+    pub fn task_rx(&self) -> &std::sync::mpsc::Receiver<ConsolidationTask> {
+        &self.task_rx
     }
 }
 
