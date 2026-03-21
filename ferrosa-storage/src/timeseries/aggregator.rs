@@ -128,6 +128,15 @@ impl TimeSeriesAggregator {
                         if let Some(v) = decode_numeric_bytes(bytes) {
                             values.push(v);
                         } else {
+                            tracing::warn!(
+                                table = %self.table_id.table,
+                                column_index = col_idx,
+                                byte_len = bytes.len(),
+                                "failed to decode numeric bytes for consolidation column"
+                            );
+                            if let Some(ref m) = self.shared_metrics {
+                                m.decode_failures.fetch_add(1, Ordering::Relaxed);
+                            }
                             return None; // non-decodable value, skip this row
                         }
                     } else {
@@ -284,6 +293,8 @@ pub struct ConsolidationMetrics {
     pub late_arrivals: AtomicU64,
     /// Total number of consolidation tasks dropped (channel full).
     pub consolidation_drops: AtomicU64,
+    /// Total number of failed numeric byte decodes during value extraction.
+    pub decode_failures: AtomicU64,
 }
 
 impl ConsolidationMetrics {
@@ -298,6 +309,7 @@ impl ConsolidationMetrics {
             windows_consolidated: self.windows_consolidated.load(Ordering::Relaxed),
             late_arrivals: self.late_arrivals.load(Ordering::Relaxed),
             consolidation_drops: self.consolidation_drops.load(Ordering::Relaxed),
+            decode_failures: self.decode_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -308,6 +320,7 @@ pub struct MetricsSnapshot {
     pub windows_consolidated: u64,
     pub late_arrivals: u64,
     pub consolidation_drops: u64,
+    pub decode_failures: u64,
 }
 
 /// Async worker that processes consolidation tasks.
@@ -946,5 +959,59 @@ mod tests {
         }
 
         assert_eq!(metrics.windows_consolidated.load(Ordering::Relaxed), 400);
+    }
+
+    // --- FMEA Fix 2: Track decode failures in metrics ---
+
+    #[test]
+    fn metrics_track_decode_failures() {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let metrics = Arc::new(ConsolidationMetrics::new());
+
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ring_capacity: 64,
+            max_rings: 100,
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+        let aggregator = TimeSeriesAggregator::with_metrics(
+            config,
+            table_id.clone(),
+            vec![0],
+            tx,
+            metrics.clone(),
+        );
+
+        // Send a mutation with non-decodable bytes (3 bytes -- not 4 or 8).
+        let bad_bytes = vec![0xDE, 0xAD, 0xFF];
+        let mutation = Mutation {
+            keyspace: "ks".to_string(),
+            table: "sensor".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
+            rows: vec![Row {
+                clustering: 1_000_000_i64.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(bad_bytes, 1_000_000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000_000),
+            }],
+            timestamp: 1_000_000,
+        };
+
+        aggregator.on_write(&table_id, &mutation);
+
+        // decode_failures should have been incremented.
+        assert_eq!(metrics.decode_failures.load(Ordering::Relaxed), 1);
+
+        // Ring should NOT have been created (row was skipped).
+        assert_eq!(aggregator.ring_count(), 0);
     }
 }
