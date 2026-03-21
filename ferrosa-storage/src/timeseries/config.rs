@@ -60,9 +60,12 @@ impl ConsolidationConfig {
     fn parse_extensions(ext: &HashMap<String, String>) -> Result<Self, String> {
         let mut config = Self::default();
 
-        // Required: interval.
+        // Required: interval (must be > 0).
         if let Some(interval_str) = ext.get("consolidation.interval") {
             config.interval = parse_duration(interval_str)?;
+            if config.interval == Duration::ZERO {
+                return Err("consolidation.interval must be positive (non-zero)".to_string());
+            }
         } else {
             return Err("consolidation.interval is required".to_string());
         }
@@ -103,11 +106,14 @@ impl ConsolidationConfig {
                 .collect();
         }
 
-        // Optional: ring_capacity.
+        // Optional: ring_capacity (must be > 0).
         if let Some(cap_str) = ext.get("consolidation.ring_capacity") {
             config.ring_capacity = cap_str
                 .parse()
                 .map_err(|_| format!("invalid ring_capacity: '{cap_str}'"))?;
+            if config.ring_capacity == 0 {
+                return Err("ring_capacity must be greater than zero".to_string());
+            }
         }
 
         // Optional: max_rings.
@@ -622,5 +628,46 @@ mod tests {
         assert_eq!(format_duration_short(&Duration::from_secs(900)), "15m");
         assert_eq!(format_duration_short(&Duration::from_secs(3600)), "1h");
         assert_eq!(format_duration_short(&Duration::from_secs(45)), "45s");
+    }
+
+    // --- FMEA Fix 1: Reject zero interval and zero capacity at parse time ---
+
+    #[test]
+    fn config_rejects_zero_interval() {
+        let mut ext = HashMap::new();
+        ext.insert("consolidation.interval".into(), "0s".into());
+        ext.insert("consolidation.functions".into(), "avg".into());
+        ext.insert("consolidation.target".into(), "t".into());
+        ext.insert("consolidation.columns".into(), "v".into());
+
+        let result = ConsolidationConfig::from_extensions(&ext).unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("interval"),
+            "error should mention interval: {err}"
+        );
+        assert!(
+            err.contains("zero") || err.contains("positive"),
+            "error should mention zero/positive: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_zero_capacity() {
+        let mut ext = HashMap::new();
+        ext.insert("consolidation.interval".into(), "5m".into());
+        ext.insert("consolidation.functions".into(), "avg".into());
+        ext.insert("consolidation.target".into(), "t".into());
+        ext.insert("consolidation.columns".into(), "v".into());
+        ext.insert("consolidation.ring_capacity".into(), "0".into());
+
+        let result = ConsolidationConfig::from_extensions(&ext).unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("ring_capacity"),
+            "error should mention ring_capacity: {err}"
+        );
     }
 }
