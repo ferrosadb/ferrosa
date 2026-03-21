@@ -17,6 +17,7 @@ use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
 use crate::consistency::ConsistencyLevel;
+use crate::coordinator::metrics::ReadRepairMetrics;
 use crate::hints::HintStore;
 use crate::pair::coordinator::decode_mutation;
 use crate::ring::TokenRing;
@@ -33,6 +34,8 @@ pub struct ClusterCoordinator {
     /// after a successful quorum write.  When `None` (e.g. in unit tests),
     /// hint storage is skipped.
     pub(crate) hint_store: Option<Arc<HintStore>>,
+    /// Read repair metrics (attempted/succeeded/failed counters).
+    pub repair_metrics: Arc<ReadRepairMetrics>,
 }
 
 impl ClusterCoordinator {
@@ -52,6 +55,7 @@ impl ClusterCoordinator {
             default_rf,
             default_cl,
             hint_store: None,
+            repair_metrics: Arc::new(ReadRepairMetrics::new()),
         }
     }
 
@@ -102,6 +106,7 @@ mod tests {
     use crate::error::ClusterError;
     use crate::pair::coordinator::encode_mutation;
     use crate::raft::{NodeInfo, NodeState};
+    use crate::ring::TokenRing;
     use ferrosa_common::key::DecoratedKey;
     use ferrosa_common::schema::{ColumnDefinition, TableSchema};
     use ferrosa_common::{CellValue, PartitionKey, Token};
@@ -165,6 +170,32 @@ mod tests {
             }],
         };
         storage.register_table(schema).unwrap();
+    }
+
+    #[test]
+    fn coordinator_has_repair_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+
+        let local_node_id = 1u64;
+        let ring = TokenRing::new();
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            Arc::new(PeerManager::new(
+                Arc::new(ferrosa_net::config::NetConfig::default()),
+                Uuid::new_v4(),
+                Arc::new(NoopListener),
+            )),
+            local_node_id,
+            storage,
+            1,
+            ConsistencyLevel::One,
+        );
+
+        // Metrics should start at zero.
+        let text = coordinator.repair_metrics.to_prometheus_text();
+        assert!(text.contains("ferrosa_read_repairs_attempted_total 0"));
     }
 
     #[tokio::test]
