@@ -2056,6 +2056,118 @@ mod tests {
         }
     }
 
+    /// Regression: SSTable corruption with long composite partition keys.
+    /// Row 1 (long value) corrupts after flush; Row 2 (short value) survives.
+    /// Reproduces the exact memo_cache scenario from production.
+    #[test]
+    fn write_flush_read_long_composite_pk_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // memo_cache schema: ((content_hash text, model_version text), tenant_id uuid)
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "agent_memory".into(),
+            table: "memo_cache".into(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.UTF8Type)".into(),
+            clustering_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "tenant_id".into(),
+                type_name: "org.apache.cassandra.db.marshal.UUIDType".into(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "result".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new("agent_memory", "memo_cache");
+
+        // Row 1: long hash + medium model version + 31-byte result (CORRUPTS in prod)
+        let hash1 = "cac0302657b4c1d0dfd5aec98f2754f46a42f117e53c77a9ba384ebf2095633a"; // pragma: allowlist secret
+        let model1 = "claude-opus-4-6";
+        let result1 = "The capital of France is Paris.";
+        // Composite key encoding: [u16 len][bytes][0x00] per component
+        let mut pk1_bytes = Vec::new();
+        pk1_bytes.extend_from_slice(&(hash1.len() as u16).to_be_bytes());
+        pk1_bytes.extend_from_slice(hash1.as_bytes());
+        pk1_bytes.push(0x00);
+        pk1_bytes.extend_from_slice(&(model1.len() as u16).to_be_bytes());
+        pk1_bytes.extend_from_slice(model1.as_bytes());
+        pk1_bytes.push(0x00);
+
+        let key1 = DecoratedKey::new(PartitionKey::new(pk1_bytes.clone()));
+        let row1 = Row {
+            clustering: vec![0x11u8; 16], // UUID
+            cells: vec![(0, CellValue::live(result1.as_bytes().to_vec(), 1000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key1, row1, 1000).unwrap();
+
+        // Row 2: long hash + short model version + 1-byte result (SURVIVES in prod)
+        let hash2 = "4bbe47ee6bb1d0ecaa4d47fce3d99e2044cdfdbfac4dde0c0c083f97e4fad000"; // pragma: allowlist secret
+        let model2 = "test-v1";
+        let result2 = "4";
+        let mut pk2_bytes = Vec::new();
+        pk2_bytes.extend_from_slice(&(hash2.len() as u16).to_be_bytes());
+        pk2_bytes.extend_from_slice(hash2.as_bytes());
+        pk2_bytes.push(0x00);
+        pk2_bytes.extend_from_slice(&(model2.len() as u16).to_be_bytes());
+        pk2_bytes.extend_from_slice(model2.as_bytes());
+        pk2_bytes.push(0x00);
+
+        let key2 = DecoratedKey::new(PartitionKey::new(pk2_bytes.clone()));
+        let row2 = Row {
+            clustering: vec![0x22u8; 16], // UUID
+            cells: vec![(0, CellValue::live(result2.as_bytes().to_vec(), 2000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
+        };
+        engine.write(&tid, &key2, row2, 2000).unwrap();
+
+        // Verify memtable reads work
+        assert!(
+            engine.read(&tid, &key1).unwrap().is_some(),
+            "row1 memtable read"
+        );
+        assert!(
+            engine.read(&tid, &key2).unwrap().is_some(),
+            "row2 memtable read"
+        );
+
+        // Flush to SSTable
+        engine.flush_all().unwrap();
+        assert!(engine.sstable_count(&tid) >= 1);
+
+        // Point reads after flush — BOTH must succeed with data
+        let p1 = engine
+            .read(&tid, &key1)
+            .expect("row1 read after flush should not error")
+            .expect("row1 should exist after flush");
+        assert!(
+            !p1.rows.is_empty(),
+            "row1 partition should have rows after flush"
+        );
+
+        let p2 = engine
+            .read(&tid, &key2)
+            .expect("row2 read after flush should not error")
+            .expect("row2 should exist after flush");
+        assert!(
+            !p2.rows.is_empty(),
+            "row2 partition should have rows after flush"
+        );
+
+        // Range scan should return both partitions
+        let all = engine.read_range(&tid, None, None, 100).unwrap();
+        assert_eq!(all.len(), 2, "range scan should find both partitions");
+    }
+
     /// A test observer that counts `on_write` calls.
     struct CountingObserver {
         watched: Vec<TableId>,
