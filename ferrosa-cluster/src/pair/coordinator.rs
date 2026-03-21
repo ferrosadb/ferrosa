@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -69,18 +70,20 @@ impl PairCoordinator {
         Ok(())
     }
 
-    /// Send a mutation to the peer and wait for ACK.
+    /// Send a mutation to the peer and wait for ACK (with timeout).
     pub(crate) async fn replicate_to_peer(&self, mutation: &Mutation) -> Result<()> {
         let body = encode_mutation(mutation);
-        let resp = self
-            .peer_manager
-            .send(
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.peer_manager.send(
                 self.peer_host_id,
                 Message::PairWriteForward(body),
                 Lane::Data,
-            )
-            .await
-            .map_err(ClusterError::Net)?;
+            ),
+        )
+        .await
+        .map_err(|_| ClusterError::Internal("write replication timed out".into()))?
+        .map_err(ClusterError::Net)?;
 
         match resp {
             Message::PairWriteAck(_) => Ok(()),
@@ -91,18 +94,20 @@ impl PairCoordinator {
         }
     }
 
-    /// Forward a write to the primary and wait for ACK.
+    /// Forward a write to the primary and wait for ACK (with timeout).
     async fn forward_to_primary(&self, mutation: &Mutation) -> Result<()> {
         let body = encode_mutation(mutation);
-        let resp = self
-            .peer_manager
-            .send(
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.peer_manager.send(
                 self.peer_host_id,
                 Message::PairWriteForward(body),
                 Lane::Data,
-            )
-            .await
-            .map_err(ClusterError::Net)?;
+            ),
+        )
+        .await
+        .map_err(|_| ClusterError::Internal("write forward to primary timed out".into()))?
+        .map_err(ClusterError::Net)?;
 
         match resp {
             Message::PairWriteAck(_) => Ok(()),
