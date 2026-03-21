@@ -28,13 +28,52 @@ use ferrosa_sstable::types::{Partition, Row};
 use ferrosa_storage::TableId;
 
 use ferrosa_storage::Mutation;
+use std::collections::BTreeMap;
 
 use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
 use crate::pair::coordinator::encode_mutation;
 use crate::raft::handlers::{partition_from_wire, ReadRequestPayload, ReadResponsePayload};
+use crate::raft::IndexNodeStatus;
 
 use super::ClusterCoordinator;
+
+/// Reorder replicas so that nodes with [`IndexNodeStatus::Ready`] for the given
+/// index come first. Nodes without status information or with non-Ready status
+/// are appended in their original order. Returns all replicas (never filters).
+///
+/// Called by the coordinator during index-aware reads to prefer replicas
+/// that have finished building the queried index.
+pub fn select_index_ready_replicas(
+    replicas: &[u64],
+    keyspace: &str,
+    table: &str,
+    index_name: &str,
+    index_state_map: &BTreeMap<(String, String, String), BTreeMap<u64, IndexNodeStatus>>,
+) -> Vec<u64> {
+    let key = (
+        keyspace.to_string(),
+        table.to_string(),
+        index_name.to_string(),
+    );
+    let node_statuses = match index_state_map.get(&key) {
+        Some(statuses) => statuses,
+        None => return replicas.to_vec(),
+    };
+
+    let mut ready = Vec::new();
+    let mut rest = Vec::new();
+
+    for &replica in replicas {
+        match node_statuses.get(&replica) {
+            Some(IndexNodeStatus::Ready) => ready.push(replica),
+            _ => rest.push(replica),
+        }
+    }
+
+    ready.extend(rest);
+    ready
+}
 
 // ---------------------------------------------------------------------------
 // Internal result type for a single replica read
@@ -1487,5 +1526,73 @@ mod tests {
             }
             other => panic!("expected Unavailable, got: {other:?}"),
         }
+    }
+
+    // -- index-aware replica selection tests --------------------------------
+
+    #[test]
+    fn select_index_ready_replicas_prefers_ready() {
+        let mut index_state_map: BTreeMap<
+            (String, String, String),
+            BTreeMap<u64, IndexNodeStatus>,
+        > = BTreeMap::new();
+        let mut node_statuses = BTreeMap::new();
+        node_statuses.insert(1u64, IndexNodeStatus::Building);
+        node_statuses.insert(2u64, IndexNodeStatus::Ready);
+        node_statuses.insert(3u64, IndexNodeStatus::Ready);
+        index_state_map.insert(("ks".into(), "tbl".into(), "idx".into()), node_statuses);
+
+        let replicas = vec![1u64, 2, 3];
+        let result = select_index_ready_replicas(&replicas, "ks", "tbl", "idx", &index_state_map);
+
+        // Ready replicas (2, 3) should come before Building (1).
+        assert_eq!(result[0], 2);
+        assert_eq!(result[1], 3);
+        assert_eq!(result[2], 1);
+    }
+
+    #[test]
+    fn select_index_ready_replicas_no_state_returns_original_order() {
+        let index_state_map = BTreeMap::new();
+        let replicas = vec![1u64, 2, 3];
+        let result = select_index_ready_replicas(&replicas, "ks", "tbl", "idx", &index_state_map);
+        assert_eq!(result, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn select_index_ready_replicas_all_building_returns_all() {
+        let mut index_state_map: BTreeMap<
+            (String, String, String),
+            BTreeMap<u64, IndexNodeStatus>,
+        > = BTreeMap::new();
+        let mut node_statuses = BTreeMap::new();
+        node_statuses.insert(1u64, IndexNodeStatus::Building);
+        node_statuses.insert(2u64, IndexNodeStatus::Building);
+        index_state_map.insert(("ks".into(), "tbl".into(), "idx".into()), node_statuses);
+
+        let replicas = vec![1u64, 2];
+        let result = select_index_ready_replicas(&replicas, "ks", "tbl", "idx", &index_state_map);
+        // All Building -- original order preserved.
+        assert_eq!(result, vec![1, 2]);
+    }
+
+    #[test]
+    fn select_index_ready_replicas_stable_sort_preserves_ready_order() {
+        let mut index_state_map: BTreeMap<
+            (String, String, String),
+            BTreeMap<u64, IndexNodeStatus>,
+        > = BTreeMap::new();
+        let mut node_statuses = BTreeMap::new();
+        node_statuses.insert(1u64, IndexNodeStatus::Ready);
+        node_statuses.insert(2u64, IndexNodeStatus::Failed("err".into()));
+        node_statuses.insert(3u64, IndexNodeStatus::Ready);
+        node_statuses.insert(4u64, IndexNodeStatus::Stale);
+        index_state_map.insert(("ks".into(), "tbl".into(), "idx".into()), node_statuses);
+
+        let replicas = vec![4u64, 3, 2, 1];
+        let result = select_index_ready_replicas(&replicas, "ks", "tbl", "idx", &index_state_map);
+
+        // Ready nodes first (3, 1 -- in original relative order), then rest (4, 2).
+        assert_eq!(result, vec![3, 1, 4, 2]);
     }
 }

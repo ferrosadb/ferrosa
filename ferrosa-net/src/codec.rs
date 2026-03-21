@@ -82,6 +82,9 @@ pub enum MsgType {
     BatchlogWrite = 0x50,
     BatchlogDelete = 0x51,
     BatchlogReplay = 0x52,
+    // Index build coordination
+    IndexBuildRequest = 0x60,
+    IndexBuildComplete = 0x61,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -116,6 +119,8 @@ impl TryFrom<u8> for MsgType {
             0x50 => Ok(Self::BatchlogWrite),
             0x51 => Ok(Self::BatchlogDelete),
             0x52 => Ok(Self::BatchlogReplay),
+            0x60 => Ok(Self::IndexBuildRequest),
+            0x61 => Ok(Self::IndexBuildComplete),
             _ => Err(NetError::UnknownMessageType(value)),
         }
     }
@@ -341,6 +346,20 @@ mod tests {
         let mt = MsgType::try_from(0x24u8).unwrap();
         assert_eq!(mt, MsgType::RepairWrite);
         assert_eq!(mt as u8, 0x24);
+    }
+
+    #[test]
+    fn index_build_request_msg_type_roundtrip() {
+        let val = MsgType::IndexBuildRequest as u8;
+        let parsed = MsgType::try_from(val).unwrap();
+        assert_eq!(parsed, MsgType::IndexBuildRequest);
+    }
+
+    #[test]
+    fn index_build_complete_msg_type_roundtrip() {
+        let val = MsgType::IndexBuildComplete as u8;
+        let parsed = MsgType::try_from(val).unwrap();
+        assert_eq!(parsed, MsgType::IndexBuildComplete);
     }
 
     #[test]

@@ -171,6 +171,9 @@ impl IndexBuildBackend for LocalBackend {
     }
 }
 
+/// Callback invoked after each index build job completes successfully.
+pub type BuildCompleteCallback = Box<dyn Fn(&IndexBuildJob) + Send + Sync>;
+
 /// Background scheduler that dispatches index build jobs to worker threads.
 ///
 /// Follows the `CompactionExecutor` pattern: an mpsc channel feeds N worker
@@ -183,6 +186,8 @@ pub struct IndexBuildScheduler {
     /// Root data directory for writing sidecar files.
     #[allow(dead_code)]
     data_dir: Option<PathBuf>,
+    #[allow(dead_code)]
+    on_build_complete: Arc<Option<BuildCompleteCallback>>,
 }
 
 impl IndexBuildScheduler {
@@ -205,6 +210,47 @@ impl IndexBuildScheduler {
         Self::with_backend(worker_count, tracker, Arc::new(StubBackend))
     }
 
+    /// Creates the scheduler with an optional completion callback (no backend).
+    ///
+    /// The callback is invoked on the worker thread after each successful
+    /// build. The cluster layer uses this to propose `RaftOp::IndexStatus`.
+    pub fn with_callback(
+        worker_count: usize,
+        tracker: Arc<IndexStateTracker>,
+        on_build_complete: Option<BuildCompleteCallback>,
+    ) -> Self {
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<IndexBuildJob>();
+        let task_rx = Arc::new(Mutex::new(task_rx));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let on_build_complete = Arc::new(on_build_complete);
+
+        let mut handles = Vec::with_capacity(worker_count);
+
+        for i in 0..worker_count {
+            let rx = Arc::clone(&task_rx);
+            let stop = Arc::clone(&stop_flag);
+            let tracker = Arc::clone(&tracker);
+            let callback = Arc::clone(&on_build_complete);
+
+            let handle = thread::Builder::new()
+                .name(format!("index-builder-{i}"))
+                .spawn(move || {
+                    Self::worker_loop(&rx, &stop, &tracker, &callback);
+                })
+                .expect("failed to spawn index builder thread");
+
+            handles.push(handle);
+        }
+
+        Self {
+            task_tx,
+            handles: Mutex::new(handles),
+            stop_flag,
+            data_dir: None,
+            on_build_complete,
+        }
+    }
+
     /// Creates a scheduler with the given backend for executing builds.
     pub fn with_backend(
         worker_count: usize,
@@ -214,6 +260,7 @@ impl IndexBuildScheduler {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<IndexBuildJob>();
         let task_rx = Arc::new(Mutex::new(task_rx));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let on_build_complete = Arc::new(None);
 
         let mut handles = Vec::with_capacity(worker_count);
 
@@ -238,6 +285,7 @@ impl IndexBuildScheduler {
             handles: Mutex::new(handles),
             stop_flag,
             data_dir: None,
+            on_build_complete,
         }
     }
 
@@ -251,6 +299,7 @@ impl IndexBuildScheduler {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<IndexBuildJob>();
         let task_rx = Arc::new(Mutex::new(task_rx));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let on_build_complete = Arc::new(None);
 
         let mut handles = Vec::with_capacity(worker_count);
 
@@ -276,6 +325,7 @@ impl IndexBuildScheduler {
             handles: Mutex::new(handles),
             stop_flag,
             data_dir: Some(data_dir),
+            on_build_complete,
         }
     }
 
@@ -321,6 +371,33 @@ impl IndexBuildScheduler {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// Worker loop with optional callback after each successful build.
+    fn worker_loop(
+        rx: &Mutex<std::sync::mpsc::Receiver<IndexBuildJob>>,
+        stop: &AtomicBool,
+        tracker: &IndexStateTracker,
+        on_build_complete: &Option<BuildCompleteCallback>,
+    ) {
+        while !stop.load(Ordering::Acquire) {
+            let job = {
+                let rx_guard = rx.lock();
+                rx_guard.recv_timeout(std::time::Duration::from_millis(100))
+            };
+
+            match job {
+                Ok(job) => {
+                    let (keyspace, table) = &job.table;
+                    tracker.mark_indexed(keyspace, table, &job.index_name, &job.sstable_id);
+                    if let Some(cb) = on_build_complete.as_ref() {
+                        cb(&job);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
     }
@@ -964,6 +1041,107 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].partition_key, b"pk1");
 
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn scheduler_invokes_on_build_complete_callback() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let tracker = Arc::new(IndexStateTracker::new());
+        tracker.register_index("ks", "tbl", "my_idx");
+        tracker.mark_pending("ks", "tbl", "my_idx", "sst-001", 500);
+
+        let callback_count = Arc::new(AtomicU32::new(0));
+        let cb_count = Arc::clone(&callback_count);
+
+        let scheduler = IndexBuildScheduler::with_callback(
+            2,
+            Arc::clone(&tracker),
+            Some(Box::new(move |job: &IndexBuildJob| {
+                cb_count.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(job.index_name, "my_idx");
+            })),
+        );
+
+        scheduler
+            .submit(IndexBuildJob {
+                sstable_id: "sst-001".to_string(),
+                index_name: "my_idx".to_string(),
+                index_type: IndexType::BTree,
+                table: ("ks".to_string(), "tbl".to_string()),
+                priority: BuildPriority::Normal,
+                enqueued_at: Instant::now(),
+                column_position: 0,
+            })
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn scheduler_callback_not_called_when_no_jobs() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let tracker = Arc::new(IndexStateTracker::new());
+        let callback_count = Arc::new(AtomicU32::new(0));
+        let cb_count = Arc::clone(&callback_count);
+
+        let scheduler = IndexBuildScheduler::with_callback(
+            1,
+            tracker,
+            Some(Box::new(move |_: &IndexBuildJob| {
+                cb_count.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+
+        std::thread::sleep(Duration::from_millis(300));
+        scheduler.shutdown();
+
+        assert_eq!(callback_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn scheduler_callback_invoked_for_each_job() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let tracker = Arc::new(IndexStateTracker::new());
+        tracker.register_index("ks", "tbl", "idx");
+        for id in ["sst-001", "sst-002", "sst-003"] {
+            tracker.mark_pending("ks", "tbl", "idx", id, 100);
+        }
+
+        let callback_count = Arc::new(AtomicU32::new(0));
+        let cb_count = Arc::clone(&callback_count);
+
+        let scheduler = IndexBuildScheduler::with_callback(
+            2,
+            Arc::clone(&tracker),
+            Some(Box::new(move |_: &IndexBuildJob| {
+                cb_count.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+
+        for id in ["sst-001", "sst-002", "sst-003"] {
+            scheduler
+                .submit(IndexBuildJob {
+                    sstable_id: id.to_string(),
+                    index_name: "idx".to_string(),
+                    index_type: IndexType::Hash,
+                    table: ("ks".to_string(), "tbl".to_string()),
+                    priority: BuildPriority::Initial,
+                    enqueued_at: Instant::now(),
+                    column_position: 0,
+                })
+                .unwrap();
+        }
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        assert_eq!(callback_count.load(Ordering::SeqCst), 3);
         scheduler.shutdown();
     }
 }

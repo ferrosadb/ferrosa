@@ -21,6 +21,7 @@ use crate::consistency::ConsistencyLevel;
 use crate::coordinator::metrics::ReadRepairMetrics;
 use crate::hints::HintStore;
 use crate::pair::coordinator::decode_mutation;
+use crate::raft::state_machine::RaftState;
 use crate::ring::TokenRing;
 
 /// Coordinates writes and reads across replicas in cluster mode.
@@ -37,6 +38,8 @@ pub struct ClusterCoordinator {
     pub(crate) hint_store: Option<Arc<HintStore>>,
     /// Read repair metrics (attempted/succeeded/failed counters).
     pub repair_metrics: Arc<ReadRepairMetrics>,
+    /// Optional snapshot of Raft state for index-aware replica selection.
+    pub(crate) raft_state: Option<Arc<ArcSwap<RaftState>>>,
 }
 
 impl ClusterCoordinator {
@@ -57,6 +60,7 @@ impl ClusterCoordinator {
             default_cl,
             hint_store: None,
             repair_metrics: Arc::new(ReadRepairMetrics::new()),
+            raft_state: None,
         }
     }
 
@@ -74,6 +78,12 @@ impl ClusterCoordinator {
         let ring = self.ring.load();
         ring.get_node(self.local_node_id)
             .map(|info| info.data_center.clone())
+    }
+
+    /// Attach a Raft state snapshot for index-aware replica selection.
+    pub fn with_raft_state(mut self, state: Arc<ArcSwap<RaftState>>) -> Self {
+        self.raft_state = Some(state);
+        self
     }
 }
 
