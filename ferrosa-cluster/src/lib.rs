@@ -17,7 +17,7 @@ pub mod write_path;
 pub use config::ClusterConfig;
 pub use consistency::ConsistencyLevel;
 pub use controller::{ClusterStateHolder, ModeController, ModeControllerHandles};
-pub use coordinator::{ClusterCoordinator, MutationForwardHandler};
+pub use coordinator::{ClusterCoordinator, MutationForwardHandler, RepairWriteHandler};
 pub use ddl_path::DdlPath;
 pub use error::{ClusterError, Result};
 pub use mode::DeploymentMode;

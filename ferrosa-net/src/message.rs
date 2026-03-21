@@ -95,6 +95,7 @@ pub enum Message {
     MutationAck(Bytes),
     ReadRequest(Bytes),
     ReadResponse(Bytes),
+    RepairWrite(Bytes),
 
     // Streaming — opaque payloads
     StreamStart(Bytes),
@@ -137,6 +138,7 @@ impl Message {
             Self::MutationAck(_) => MsgType::MutationAck,
             Self::ReadRequest(_) => MsgType::ReadRequest,
             Self::ReadResponse(_) => MsgType::ReadResponse,
+            Self::RepairWrite(_) => MsgType::RepairWrite,
             Self::StreamStart(_) => MsgType::StreamStart,
             Self::StreamChunk(_) => MsgType::StreamChunk,
             Self::StreamEnd(_) => MsgType::StreamEnd,
@@ -208,6 +210,7 @@ impl Message {
             | Self::MutationAck(b)
             | Self::ReadRequest(b)
             | Self::ReadResponse(b)
+            | Self::RepairWrite(b)
             | Self::StreamStart(b)
             | Self::StreamChunk(b)
             | Self::StreamEnd(b)
@@ -312,6 +315,7 @@ impl Message {
             MsgType::MutationAck => Self::MutationAck(body.split_to(body.remaining())),
             MsgType::ReadRequest => Self::ReadRequest(body.split_to(body.remaining())),
             MsgType::ReadResponse => Self::ReadResponse(body.split_to(body.remaining())),
+            MsgType::RepairWrite => Self::RepairWrite(body.split_to(body.remaining())),
             MsgType::StreamStart => Self::StreamStart(body.split_to(body.remaining())),
             MsgType::StreamChunk => Self::StreamChunk(body.split_to(body.remaining())),
             MsgType::StreamEnd => Self::StreamEnd(body.split_to(body.remaining())),
@@ -366,6 +370,18 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = Message::decode(MsgType::PairCatchUp, &mut buf.freeze()).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn repair_write_roundtrip() {
+        let payload = Bytes::from_static(b"repair-data");
+        let msg = Message::RepairWrite(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::RepairWrite);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::RepairWrite, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::RepairWrite(payload));
     }
 
     proptest! {

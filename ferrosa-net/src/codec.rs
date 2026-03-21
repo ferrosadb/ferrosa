@@ -64,6 +64,7 @@ pub enum MsgType {
     MutationAck = 0x21,
     ReadRequest = 0x22,
     ReadResponse = 0x23,
+    RepairWrite = 0x24,
     // Streaming
     StreamStart = 0x30,
     StreamChunk = 0x31,
@@ -96,6 +97,7 @@ impl TryFrom<u8> for MsgType {
             0x21 => Ok(Self::MutationAck),
             0x22 => Ok(Self::ReadRequest),
             0x23 => Ok(Self::ReadResponse),
+            0x24 => Ok(Self::RepairWrite),
             0x30 => Ok(Self::StreamStart),
             0x31 => Ok(Self::StreamChunk),
             0x32 => Ok(Self::StreamEnd),
@@ -325,6 +327,13 @@ mod tests {
         header.encode(&mut buf);
         let err = codec.decode(&mut buf).unwrap_err();
         assert!(matches!(err, NetError::FrameTooLarge { .. }));
+    }
+
+    #[test]
+    fn msg_type_repair_write() {
+        let mt = MsgType::try_from(0x24u8).unwrap();
+        assert_eq!(mt, MsgType::RepairWrite);
+        assert_eq!(mt as u8, 0x24);
     }
 
     #[test]
