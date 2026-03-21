@@ -295,6 +295,36 @@ impl IndexBuildScheduler {
         }
     }
 
+    /// Shuts down the scheduler, waiting up to `timeout` for in-flight builds.
+    ///
+    /// Sets the stop flag, then joins each worker thread with the given timeout.
+    /// Workers that do not finish within the timeout are detached (their threads
+    /// will exit when their current job completes, but we stop waiting).
+    pub fn shutdown_with_timeout(&self, timeout: std::time::Duration) {
+        self.stop_flag.store(true, Ordering::Release);
+        let deadline = Instant::now() + timeout;
+        let mut handles = self.handles.lock();
+        for handle in handles.drain(..) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Timeout exhausted; detach remaining threads.
+                break;
+            }
+            let start = Instant::now();
+            loop {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                    break;
+                }
+                if start.elapsed() >= remaining {
+                    // Timeout for this thread; detach it.
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
     /// Worker loop that delegates to the backend.
     fn worker_loop_with_backend(
         rx: &Mutex<std::sync::mpsc::Receiver<IndexBuildJob>>,
@@ -772,6 +802,96 @@ mod tests {
         assert_eq!(state.total_build_errors, 1);
 
         scheduler.shutdown();
+    }
+
+    #[test]
+    fn scheduler_shutdown_with_timeout_completes_in_flight_jobs() {
+        use std::sync::atomic::AtomicUsize;
+
+        static COMPLETED: AtomicUsize = AtomicUsize::new(0);
+
+        struct SlowBackend;
+        impl IndexBuildBackend for SlowBackend {
+            fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
+                std::thread::sleep(Duration::from_millis(200));
+                COMPLETED.fetch_add(1, Ordering::Relaxed);
+                Ok(IndexBuildResult {
+                    sstable_id: job.sstable_id.clone(),
+                    sidecar_entries: HashMap::new(),
+                    build_duration: Duration::from_millis(200),
+                })
+            }
+        }
+
+        COMPLETED.store(0, Ordering::Relaxed);
+        let tracker = Arc::new(IndexStateTracker::new());
+        tracker.register_index("ks", "tbl", "idx");
+        tracker.mark_pending("ks", "tbl", "idx", "sst-001", 100);
+
+        let backend: Arc<dyn IndexBuildBackend> = Arc::new(SlowBackend);
+        let scheduler = IndexBuildScheduler::with_backend(1, Arc::clone(&tracker), backend);
+
+        scheduler
+            .submit(IndexBuildJob {
+                sstable_id: "sst-001".to_string(),
+                index_name: "idx".to_string(),
+                index_type: IndexType::BTree,
+                table: ("ks".to_string(), "tbl".to_string()),
+                priority: BuildPriority::Normal,
+                enqueued_at: Instant::now(),
+                column_position: 0,
+            })
+            .unwrap();
+
+        // Give the job time to be picked up by the worker thread.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Shutdown with a 5-second timeout -- the 200ms job should complete.
+        scheduler.shutdown_with_timeout(Duration::from_secs(5));
+
+        assert_eq!(COMPLETED.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn scheduler_shutdown_timeout_does_not_hang_on_slow_job() {
+        struct VerySlowBackend;
+        impl IndexBuildBackend for VerySlowBackend {
+            fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
+                std::thread::sleep(Duration::from_secs(30));
+                Ok(IndexBuildResult {
+                    sstable_id: job.sstable_id.clone(),
+                    sidecar_entries: HashMap::new(),
+                    build_duration: Duration::from_secs(30),
+                })
+            }
+        }
+
+        let tracker = Arc::new(IndexStateTracker::new());
+        let backend: Arc<dyn IndexBuildBackend> = Arc::new(VerySlowBackend);
+        let scheduler = IndexBuildScheduler::with_backend(1, Arc::clone(&tracker), backend);
+
+        scheduler
+            .submit(IndexBuildJob {
+                sstable_id: "sst-slow".to_string(),
+                index_name: "idx".to_string(),
+                index_type: IndexType::BTree,
+                table: ("ks".to_string(), "tbl".to_string()),
+                priority: BuildPriority::Normal,
+                enqueued_at: Instant::now(),
+                column_position: 0,
+            })
+            .unwrap();
+
+        let start = Instant::now();
+        // Short timeout: 500ms. The 30s job will not finish.
+        scheduler.shutdown_with_timeout(Duration::from_millis(500));
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shutdown should return within ~500ms, took {:?}",
+            elapsed
+        );
     }
 
     #[test]
