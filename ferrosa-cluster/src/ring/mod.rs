@@ -109,6 +109,114 @@ impl TokenRing {
             info.state = state;
         }
     }
+
+    /// Find replicas for a token using NetworkTopologyStrategy.
+    ///
+    /// Walks clockwise from `token`, filling per-DC quotas from `dc_rf`
+    /// with rack diversity: prefers nodes from unrepresented racks before
+    /// accepting duplicate racks. Matches Cassandra's
+    /// `NetworkTopologyStrategy.calculateNaturalReplicas`.
+    pub fn nts_replicas(
+        &self,
+        token: Token,
+        dc_rf: &std::collections::HashMap<String, usize>,
+    ) -> Vec<u64> {
+        use std::collections::HashMap as Map;
+
+        // Pre-compute: distinct racks per DC
+        let mut dc_racks: Map<&str, HashSet<&str>> = Map::new();
+        for info in self.nodes.values() {
+            if dc_rf.contains_key(&info.data_center) {
+                dc_racks
+                    .entry(&info.data_center)
+                    .or_default()
+                    .insert(&info.rack);
+            }
+        }
+        let rack_count: Map<&str, usize> = dc_racks
+            .iter()
+            .map(|(&dc, racks)| (dc, racks.len()))
+            .collect();
+
+        let total_rf: usize = dc_rf.values().sum();
+        let mut result = Vec::with_capacity(total_rf);
+        let mut seen = HashSet::new();
+
+        // Per-DC state
+        let mut needed: Map<&str, usize> =
+            dc_rf.iter().map(|(dc, &rf)| (dc.as_str(), rf)).collect();
+        let mut seen_racks: Map<&str, HashSet<&str>> = Map::new();
+        let mut skipped: Map<&str, Vec<u64>> = Map::new();
+
+        let all_filled = |needed: &Map<&str, usize>| needed.values().all(|&n| n == 0);
+
+        // Clockwise iterator: range [token..] then wrap to [..token)
+        let clockwise = self.ring.range(token..).chain(self.ring.range(..token));
+
+        for (_, &node_id) in clockwise {
+            if all_filled(&needed) {
+                break;
+            }
+            if !seen.insert(node_id) {
+                continue; // skip duplicate vnodes
+            }
+
+            let info = match self.nodes.get(&node_id) {
+                Some(i) => i,
+                None => continue,
+            };
+            let dc = info.data_center.as_str();
+            let rack = info.rack.as_str();
+
+            let dc_needed = match needed.get_mut(dc) {
+                Some(n) if *n > 0 => n,
+                _ => continue, // DC not in dc_rf or already filled
+            };
+
+            let dc_rack_count = rack_count.get(dc).copied().unwrap_or(0);
+            let dc_seen_racks = seen_racks.entry(dc).or_default();
+
+            if dc_seen_racks.len() < dc_rack_count {
+                // Not all racks represented yet for this DC
+                if dc_seen_racks.contains(rack) {
+                    // This rack already represented; skip for now
+                    skipped.entry(dc).or_default().push(node_id);
+                    continue;
+                }
+                dc_seen_racks.insert(rack);
+            }
+
+            result.push(node_id);
+            *dc_needed -= 1;
+
+            // If all racks now covered for this DC, drain skipped nodes
+            if dc_seen_racks.len() == dc_rack_count {
+                let dc_skipped = skipped.entry(dc).or_default();
+                while *dc_needed > 0 && !dc_skipped.is_empty() {
+                    let skipped_node = dc_skipped.remove(0);
+                    result.push(skipped_node);
+                    *dc_needed -= 1;
+                }
+            }
+        }
+
+        // Final drain: if we went around the whole ring and some DCs still
+        // have skipped nodes that weren't drained (e.g., more racks in dc_rf
+        // than exist), drain them now.
+        for (dc, dc_skipped) in &mut skipped {
+            let dc_needed = match needed.get_mut(dc) {
+                Some(n) if *n > 0 => n,
+                _ => continue,
+            };
+            while *dc_needed > 0 && !dc_skipped.is_empty() {
+                let node = dc_skipped.remove(0);
+                result.push(node);
+                *dc_needed -= 1;
+            }
+        }
+
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +227,7 @@ impl TokenRing {
 mod tests {
     use super::*;
     use crate::raft::NodeState;
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     fn make_node(addr: &str) -> NodeInfo {
@@ -127,6 +236,16 @@ mod tests {
             addr: addr.to_string(),
             data_center: "dc1".to_string(),
             rack: "rack1".to_string(),
+            state: NodeState::Normal,
+        }
+    }
+
+    fn make_node_dc(addr: &str, dc: &str, rack: &str) -> NodeInfo {
+        NodeInfo {
+            host_id: Uuid::new_v4(),
+            addr: addr.to_string(),
+            data_center: dc.to_string(),
+            rack: rack.to_string(),
             state: NodeState::Normal,
         }
     }
@@ -303,5 +422,219 @@ mod tests {
         assert_eq!(ring.token_count(), 3);
         assert!(ring.get_node(1).is_none());
         assert!(ring.tokens_for_node(1).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // NTS replica selection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nts_replicas_two_dc_basic() {
+        // 6 nodes: 3 in dc1 (racks a,b,c), 3 in dc2 (racks a,b,c)
+        // dc1_rf=3, dc2_rf=2 => total 5 replicas
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node_dc("10.0.0.1:7000", "dc1", "rack-a"));
+        ring.add_node(2, make_node_dc("10.0.0.2:7000", "dc1", "rack-b"));
+        ring.add_node(3, make_node_dc("10.0.0.3:7000", "dc1", "rack-c"));
+        ring.add_node(4, make_node_dc("10.0.0.4:7000", "dc2", "rack-a"));
+        ring.add_node(5, make_node_dc("10.0.0.5:7000", "dc2", "rack-b"));
+        ring.add_node(6, make_node_dc("10.0.0.6:7000", "dc2", "rack-c"));
+
+        // Interleave tokens so nodes alternate DCs
+        ring.assign_tokens(1, &[100]);
+        ring.assign_tokens(4, &[200]);
+        ring.assign_tokens(2, &[300]);
+        ring.assign_tokens(5, &[400]);
+        ring.assign_tokens(3, &[500]);
+        ring.assign_tokens(6, &[600]);
+
+        let dc_rf = HashMap::from([("dc1".to_string(), 3usize), ("dc2".to_string(), 2usize)]);
+        let replicas = ring.nts_replicas(0, &dc_rf);
+
+        // Should have 5 total replicas
+        assert_eq!(replicas.len(), 5);
+        // 3 from dc1
+        let dc1_count = replicas
+            .iter()
+            .filter(|&&id| ring.get_node(id).unwrap().data_center == "dc1")
+            .count();
+        assert_eq!(dc1_count, 3, "dc1 should have 3 replicas");
+        // 2 from dc2
+        let dc2_count = replicas
+            .iter()
+            .filter(|&&id| ring.get_node(id).unwrap().data_center == "dc2")
+            .count();
+        assert_eq!(dc2_count, 2, "dc2 should have 2 replicas");
+        // All distinct
+        let unique: HashSet<u64> = replicas.iter().copied().collect();
+        assert_eq!(unique.len(), 5, "all replicas should be distinct nodes");
+    }
+
+    #[test]
+    fn nts_replicas_prefers_rack_diversity() {
+        // 4 nodes in dc1: 2 in rack-a, 2 in rack-b. dc1_rf=3.
+        // The algorithm should pick from both racks before doubling up.
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node_dc("10.0.0.1:7000", "dc1", "rack-a"));
+        ring.add_node(2, make_node_dc("10.0.0.2:7000", "dc1", "rack-a"));
+        ring.add_node(3, make_node_dc("10.0.0.3:7000", "dc1", "rack-b"));
+        ring.add_node(4, make_node_dc("10.0.0.4:7000", "dc1", "rack-b"));
+
+        // Token order: node1(100), node2(200), node3(300), node4(400)
+        ring.assign_tokens(1, &[100]);
+        ring.assign_tokens(2, &[200]);
+        ring.assign_tokens(3, &[300]);
+        ring.assign_tokens(4, &[400]);
+
+        let dc_rf = HashMap::from([("dc1".to_string(), 3usize)]);
+        let replicas = ring.nts_replicas(0, &dc_rf);
+
+        assert_eq!(replicas.len(), 3);
+
+        // Both racks must be represented
+        let racks: HashSet<&str> = replicas
+            .iter()
+            .map(|&id| ring.get_node(id).unwrap().rack.as_str())
+            .collect();
+        assert!(racks.contains("rack-a"), "rack-a must be represented");
+        assert!(racks.contains("rack-b"), "rack-b must be represented");
+    }
+
+    #[test]
+    fn nts_replicas_wraps_around_ring() {
+        // All nodes near the end of the ring. Query from near i64::MAX.
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node_dc("10.0.0.1:7000", "dc1", "rack-a"));
+        ring.add_node(2, make_node_dc("10.0.0.2:7000", "dc1", "rack-b"));
+        ring.assign_tokens(1, &[i64::MIN]);
+        ring.assign_tokens(2, &[i64::MIN + 100]);
+
+        let dc_rf = HashMap::from([("dc1".to_string(), 2usize)]);
+        let replicas = ring.nts_replicas(i64::MAX, &dc_rf);
+
+        assert_eq!(replicas.len(), 2);
+        let unique: HashSet<u64> = replicas.iter().copied().collect();
+        assert_eq!(unique.len(), 2);
+    }
+
+    #[test]
+    fn nts_replicas_rf_exceeds_dc_nodes() {
+        // dc1 has 2 nodes but rf=3: should return only 2 from dc1
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node_dc("10.0.0.1:7000", "dc1", "rack-a"));
+        ring.add_node(2, make_node_dc("10.0.0.2:7000", "dc1", "rack-b"));
+
+        ring.assign_tokens(1, &[100]);
+        ring.assign_tokens(2, &[200]);
+
+        let dc_rf = HashMap::from([("dc1".to_string(), 3usize)]);
+        let replicas = ring.nts_replicas(0, &dc_rf);
+
+        // Can only return 2 (all dc1 nodes), not 3
+        assert_eq!(replicas.len(), 2);
+    }
+
+    #[test]
+    fn nts_replicas_empty_ring() {
+        let ring = TokenRing::new();
+        let dc_rf = HashMap::from([("dc1".to_string(), 3usize)]);
+        let replicas = ring.nts_replicas(42, &dc_rf);
+        assert!(replicas.is_empty());
+    }
+
+    #[test]
+    fn nts_replicas_dc_not_in_ring() {
+        // dc_rf references "dc2" but no nodes are in dc2
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node_dc("10.0.0.1:7000", "dc1", "rack-a"));
+        ring.assign_tokens(1, &[100]);
+
+        let dc_rf = HashMap::from([("dc1".to_string(), 1usize), ("dc2".to_string(), 2usize)]);
+        let replicas = ring.nts_replicas(0, &dc_rf);
+
+        // Should get 1 from dc1, 0 from dc2 (no nodes exist)
+        assert_eq!(replicas.len(), 1);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn nts_replicas_never_exceed_available_nodes(
+            num_dc1_nodes in 1usize..=8,
+            num_dc2_nodes in 1usize..=8,
+            dc1_rf in 1usize..=5,
+            dc2_rf in 1usize..=5,
+            query_token in prop::num::i64::ANY,
+        ) {
+            let mut ring = TokenRing::new();
+            let mut next_id = 1u64;
+            let mut token = -1_000_000i64;
+
+            for i in 0..num_dc1_nodes {
+                let rack = format!("rack-{}", i % 3);
+                ring.add_node(next_id, make_node_dc(
+                    &format!("10.0.1.{}:7000", next_id),
+                    "dc1",
+                    &rack,
+                ));
+                ring.assign_tokens(next_id, &[token]);
+                next_id += 1;
+                token += 100;
+            }
+            for i in 0..num_dc2_nodes {
+                let rack = format!("rack-{}", i % 3);
+                ring.add_node(next_id, make_node_dc(
+                    &format!("10.0.2.{}:7000", next_id),
+                    "dc2",
+                    &rack,
+                ));
+                ring.assign_tokens(next_id, &[token]);
+                next_id += 1;
+                token += 100;
+            }
+
+            let dc_rf = HashMap::from([
+                ("dc1".to_string(), dc1_rf),
+                ("dc2".to_string(), dc2_rf),
+            ]);
+            let replicas = ring.nts_replicas(query_token, &dc_rf);
+
+            // Invariant 1: no duplicate nodes
+            let unique: HashSet<u64> = replicas.iter().copied().collect();
+            prop_assert_eq!(unique.len(), replicas.len(),
+                "replicas must be distinct");
+
+            // Invariant 2: per-DC count <= min(dc_rf, dc_nodes)
+            let dc1_replicas: Vec<_> = replicas.iter()
+                .filter(|&&id| ring.get_node(id).unwrap().data_center == "dc1")
+                .collect();
+            let dc2_replicas: Vec<_> = replicas.iter()
+                .filter(|&&id| ring.get_node(id).unwrap().data_center == "dc2")
+                .collect();
+            prop_assert!(dc1_replicas.len() <= dc1_rf.min(num_dc1_nodes),
+                "dc1 replicas {} exceeds min(rf={}, nodes={})",
+                dc1_replicas.len(), dc1_rf, num_dc1_nodes);
+            prop_assert!(dc2_replicas.len() <= dc2_rf.min(num_dc2_nodes),
+                "dc2 replicas {} exceeds min(rf={}, nodes={})",
+                dc2_replicas.len(), dc2_rf, num_dc2_nodes);
+
+            // Invariant 3: total replicas = sum of per-DC actual counts
+            prop_assert_eq!(
+                replicas.len(),
+                dc1_replicas.len() + dc2_replicas.len(),
+                "total should equal dc1 + dc2"
+            );
+
+            // Invariant 4: when enough nodes, per-DC count equals RF
+            if num_dc1_nodes >= dc1_rf {
+                prop_assert_eq!(dc1_replicas.len(), dc1_rf,
+                    "dc1 should fill to rf={} with {} nodes", dc1_rf, num_dc1_nodes);
+            }
+            if num_dc2_nodes >= dc2_rf {
+                prop_assert_eq!(dc2_replicas.len(), dc2_rf,
+                    "dc2 should fill to rf={} with {} nodes", dc2_rf, num_dc2_nodes);
+            }
+        }
     }
 }
