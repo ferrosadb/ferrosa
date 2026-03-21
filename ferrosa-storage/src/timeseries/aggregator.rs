@@ -474,4 +474,56 @@ mod tests {
             _ => panic!("expected BoundaryCrossed"),
         }
     }
+
+    // --- Task 11: decode_numeric_bytes tests ---
+
+    #[test]
+    fn decode_double_bytes() {
+        let val = 42.5_f64;
+        let bytes = val.to_be_bytes();
+        assert!((decode_numeric_bytes(&bytes).unwrap() - 42.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn decode_int_bytes() {
+        let val = 1000_i32;
+        let bytes = val.to_be_bytes();
+        assert!((decode_numeric_bytes(&bytes).unwrap() - 1000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn decode_invalid_length() {
+        assert!(decode_numeric_bytes(&[1, 2, 3]).is_none());
+        assert!(decode_numeric_bytes(&[]).is_none());
+        assert!(decode_numeric_bytes(&[1, 2, 3, 4, 5]).is_none());
+    }
+
+    #[test]
+    fn decode_typed_float() {
+        let val = 42.5_f32;
+        let bytes = val.to_be_bytes();
+        let result = decode_typed_numeric(&bytes, "float").unwrap();
+        assert!((result - 42.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn decode_typed_bigint() {
+        let val = 1_000_000_i64;
+        let bytes = val.to_be_bytes();
+        let result = decode_typed_numeric(&bytes, "bigint").unwrap();
+        assert!((result - 1_000_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn decode_typed_counter() {
+        let val = 42_i64;
+        let bytes = val.to_be_bytes();
+        let result = decode_typed_numeric(&bytes, "counter").unwrap();
+        assert!((result - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn decode_typed_unknown_type() {
+        assert!(decode_typed_numeric(&[0; 8], "text").is_none());
+    }
 }
