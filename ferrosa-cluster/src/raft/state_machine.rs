@@ -1609,10 +1609,9 @@ mod tests {
         });
 
         assert!(
-            sm.state()
+            !sm.state()
                 .index_state_map
-                .get(&("ks".into(), "tbl".into(), "idx".into()))
-                .is_none(),
+                .contains_key(&("ks".into(), "tbl".into(), "idx".into())),
             "index_state_map should be cleaned up after DropIndex"
         );
     }

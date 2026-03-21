@@ -5,6 +5,21 @@ use serde::{Deserialize, Serialize};
 use crate::consistency::ConsistencyLevel;
 use crate::mode::DeploymentMode;
 
+/// Role of this node in the cluster.
+///
+/// Controls whether the node owns data (token ranges), runs index builds,
+/// or both. `Indexer`-only nodes don't serve reads/writes but offload
+/// index builds from data nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeRole {
+    /// Owns token ranges, serves reads and writes. Builds indexes locally.
+    Data,
+    /// Dedicated index builder. No token ownership, reads from S3.
+    Indexer,
+    /// Both data and indexer (default).
+    Both,
+}
+
 /// Cluster configuration. Parsed from `FERROSA_*` environment variables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
@@ -28,6 +43,8 @@ pub struct ClusterConfig {
     pub auto_join: bool,
     /// Directory for Raft log store (sled). Defaults to `FERROSA_DATA_DIR/raft`.
     pub raft_data_dir: Option<PathBuf>,
+    /// Role of this node: data, indexer, or both.
+    pub node_role: NodeRole,
 }
 
 impl Default for ClusterConfig {
@@ -43,6 +60,7 @@ impl Default for ClusterConfig {
             hinted_handoff_max_mb: 1024,
             auto_join: false,
             raft_data_dir: None,
+            node_role: NodeRole::Both,
         }
     }
 }
@@ -90,6 +108,14 @@ impl ClusterConfig {
         if let Ok(auto) = std::env::var("FERROSA_AUTO_JOIN") {
             config.auto_join = auto == "true" || auto == "1";
         }
+        if let Ok(role) = std::env::var("FERROSA_NODE_ROLE") {
+            config.node_role = match role.to_lowercase().as_str() {
+                "data" => NodeRole::Data,
+                "indexer" => NodeRole::Indexer,
+                "both" => NodeRole::Both,
+                _ => NodeRole::Both,
+            };
+        }
 
         config
     }
@@ -109,5 +135,20 @@ mod tests {
         assert_eq!(config.default_cl, ConsistencyLevel::Quorum);
         assert_eq!(config.hinted_handoff_max_mb, 1024);
         assert!(!config.auto_join);
+    }
+
+    #[test]
+    fn node_role_default_is_both() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.node_role, NodeRole::Both);
+    }
+
+    #[test]
+    fn node_role_serde_roundtrip() {
+        for role in [NodeRole::Data, NodeRole::Indexer, NodeRole::Both] {
+            let json = serde_json::to_string(&role).unwrap();
+            let back: NodeRole = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, role);
+        }
     }
 }

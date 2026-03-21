@@ -18,6 +18,7 @@ use ferrosa_storage::TableId;
 use crate::consistency::ConsistencyLevel;
 use crate::hints::HintStore;
 use crate::pair::coordinator::decode_mutation;
+use crate::raft::state_machine::RaftState;
 use crate::ring::TokenRing;
 
 /// Coordinates writes and reads across replicas in cluster mode.
@@ -32,6 +33,8 @@ pub struct ClusterCoordinator {
     /// after a successful quorum write.  When `None` (e.g. in unit tests),
     /// hint storage is skipped.
     pub(crate) hint_store: Option<Arc<HintStore>>,
+    /// Optional snapshot of Raft state for index-aware replica selection.
+    pub(crate) raft_state: Option<Arc<ArcSwap<RaftState>>>,
 }
 
 impl ClusterCoordinator {
@@ -51,12 +54,19 @@ impl ClusterCoordinator {
             default_rf,
             default_cl,
             hint_store: None,
+            raft_state: None,
         }
     }
 
     /// Attach a hint store to this coordinator.
     pub fn with_hint_store(mut self, hint_store: Arc<HintStore>) -> Self {
         self.hint_store = Some(hint_store);
+        self
+    }
+
+    /// Attach a Raft state snapshot for index-aware replica selection.
+    pub fn with_raft_state(mut self, state: Arc<ArcSwap<RaftState>>) -> Self {
+        self.raft_state = Some(state);
         self
     }
 }
