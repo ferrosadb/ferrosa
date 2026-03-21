@@ -36,6 +36,53 @@ impl ReplicationStrategy {
     }
 }
 
+use ferrosa_schema::metadata::keyspace::ReplicationParams;
+
+/// Error parsing a [`ReplicationStrategy`] from [`ReplicationParams`].
+#[derive(Debug, Clone)]
+pub struct StrategyParseError(pub String);
+
+impl std::fmt::Display for StrategyParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid replication strategy: {}", self.0)
+    }
+}
+
+impl std::error::Error for StrategyParseError {}
+
+impl TryFrom<&ReplicationParams> for ReplicationStrategy {
+    type Error = StrategyParseError;
+
+    fn try_from(params: &ReplicationParams) -> Result<Self, Self::Error> {
+        match params.strategy.as_str() {
+            "SimpleStrategy" | "org.apache.cassandra.locator.SimpleStrategy" => {
+                let rf_str = params.options.get("replication_factor").ok_or_else(|| {
+                    StrategyParseError("SimpleStrategy requires 'replication_factor'".into())
+                })?;
+                let rf: usize = rf_str.parse().map_err(|_| {
+                    StrategyParseError(format!("invalid replication_factor: '{rf_str}'"))
+                })?;
+                Ok(Self::Simple {
+                    replication_factor: rf,
+                })
+            }
+            "NetworkTopologyStrategy" | "org.apache.cassandra.locator.NetworkTopologyStrategy" => {
+                let mut dc_rf = HashMap::new();
+                for (k, v) in &params.options {
+                    let rf: usize = v.parse().map_err(|_| {
+                        StrategyParseError(format!(
+                            "invalid replication factor for DC '{k}': '{v}'"
+                        ))
+                    })?;
+                    dc_rf.insert(k.clone(), rf);
+                }
+                Ok(Self::NetworkTopology { dc_rf })
+            }
+            other => Err(StrategyParseError(format!("unknown strategy: '{other}'"))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +127,61 @@ mod tests {
             replication_factor: 3,
         };
         assert!(s.dc_replication_factors().is_empty());
+    }
+
+    use ferrosa_schema::metadata::keyspace::ReplicationParams;
+
+    #[test]
+    fn parse_simple_strategy_from_params() {
+        let params = ReplicationParams {
+            strategy: "SimpleStrategy".to_string(),
+            options: HashMap::from([("replication_factor".to_string(), "3".to_string())]),
+        };
+        let strategy = ReplicationStrategy::try_from(&params).unwrap();
+        assert_eq!(strategy.replication_factor(), 3);
+        assert!(matches!(
+            strategy,
+            ReplicationStrategy::Simple {
+                replication_factor: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_nts_from_params() {
+        let params = ReplicationParams {
+            strategy: "NetworkTopologyStrategy".to_string(),
+            options: HashMap::from([
+                ("dc1".to_string(), "3".to_string()),
+                ("dc2".to_string(), "2".to_string()),
+            ]),
+        };
+        let strategy = ReplicationStrategy::try_from(&params).unwrap();
+        assert_eq!(strategy.replication_factor(), 5);
+        match &strategy {
+            ReplicationStrategy::NetworkTopology { dc_rf } => {
+                assert_eq!(dc_rf.get("dc1"), Some(&3));
+                assert_eq!(dc_rf.get("dc2"), Some(&2));
+            }
+            other => panic!("expected NetworkTopology, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_strategy_fails() {
+        let params = ReplicationParams {
+            strategy: "UnknownStrategy".to_string(),
+            options: HashMap::new(),
+        };
+        assert!(ReplicationStrategy::try_from(&params).is_err());
+    }
+
+    #[test]
+    fn parse_nts_non_numeric_rf_fails() {
+        let params = ReplicationParams {
+            strategy: "NetworkTopologyStrategy".to_string(),
+            options: HashMap::from([("dc1".to_string(), "abc".to_string())]),
+        };
+        assert!(ReplicationStrategy::try_from(&params).is_err());
     }
 }
