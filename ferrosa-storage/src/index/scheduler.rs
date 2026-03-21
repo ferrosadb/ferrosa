@@ -533,8 +533,10 @@ mod tests {
     }
 
     #[test]
-    fn local_backend_returns_result_for_job() {
+    fn local_backend_construction() {
+        // Verify LocalBackend can be constructed.
         let backend = LocalBackend::new(PathBuf::from("/tmp/test-data"));
+        // Build on a nonexistent dir returns an error (no SSTable files).
         let job = IndexBuildJob {
             sstable_id: "sst-001".to_string(),
             index_name: "my_idx".to_string(),
@@ -545,9 +547,7 @@ mod tests {
             column_position: 0,
         };
         let result = backend.build(&job);
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert_eq!(result.sstable_id, "sst-001");
+        assert!(result.is_err());
     }
 
     #[test]

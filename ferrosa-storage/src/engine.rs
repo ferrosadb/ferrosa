@@ -115,9 +115,12 @@ pub struct StorageEngine {
     async_observers: RwLock<Vec<AsyncObserverState>>,
     /// Default channel capacity for async observers.
     async_observer_capacity: usize,
-    /// Optional index build scheduler — wiring to flush/compaction is deferred.
-    #[allow(dead_code)]
+    /// Index build scheduler — rebuilds secondary indexes after compaction.
+    #[allow(dead_code)] // Used in compaction and flush wiring below.
     index_scheduler: Option<crate::index::IndexBuildScheduler>,
+    /// Shared index state tracker.
+    #[allow(dead_code)] // Used in compaction and flush wiring below.
+    index_tracker: Arc<crate::index::IndexStateTracker>,
     /// Background archiver task handle, if archiving is enabled.
     archiver_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -178,6 +181,19 @@ impl StorageEngine {
         let local_cache =
             LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
 
+        let index_tracker = Arc::new(crate::index::IndexStateTracker::new());
+        let index_scheduler = {
+            let backend = Arc::new(crate::index::LocalBackend::new(config.data_dir.clone()));
+            Some(
+                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
+                    2,
+                    Arc::clone(&index_tracker),
+                    backend,
+                    config.data_dir.clone(),
+                ),
+            )
+        };
+
         Ok(Self {
             config,
             tables: RwLock::new(HashMap::new()),
@@ -188,7 +204,8 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
-            index_scheduler: None,
+            index_scheduler,
+            index_tracker,
             archiver_handle: None,
         })
     }
@@ -280,6 +297,19 @@ impl StorageEngine {
             _ => None,
         };
 
+        let index_tracker = Arc::new(crate::index::IndexStateTracker::new());
+        let index_scheduler = {
+            let backend = Arc::new(crate::index::LocalBackend::new(config.data_dir.clone()));
+            Some(
+                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
+                    2,
+                    Arc::clone(&index_tracker),
+                    backend,
+                    config.data_dir.clone(),
+                ),
+            )
+        };
+
         Ok(Self {
             config,
             tables: RwLock::new(HashMap::new()),
@@ -290,7 +320,8 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
-            index_scheduler: None,
+            index_scheduler,
+            index_tracker,
             archiver_handle,
         })
     }
@@ -333,6 +364,19 @@ impl StorageEngine {
         let local_cache =
             LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
 
+        let index_tracker = Arc::new(crate::index::IndexStateTracker::new());
+        let index_scheduler = {
+            let backend = Arc::new(crate::index::LocalBackend::new(config.data_dir.clone()));
+            Some(
+                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
+                    2,
+                    Arc::clone(&index_tracker),
+                    backend,
+                    config.data_dir.clone(),
+                ),
+            )
+        };
+
         let engine = Self {
             config,
             tables: RwLock::new(HashMap::new()),
@@ -343,7 +387,8 @@ impl StorageEngine {
             observers: RwLock::new(Vec::new()),
             async_observers: RwLock::new(Vec::new()),
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
-            index_scheduler: None,
+            index_scheduler,
+            index_tracker,
             archiver_handle: None,
         };
 

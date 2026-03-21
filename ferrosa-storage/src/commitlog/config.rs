@@ -35,6 +35,16 @@ impl TableId {
             table: table.into(),
         }
     }
+
+    /// Returns the keyspace name.
+    pub fn keyspace(&self) -> &str {
+        &self.keyspace
+    }
+
+    /// Returns the table name.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
 }
 
 impl std::fmt::Display for TableId {

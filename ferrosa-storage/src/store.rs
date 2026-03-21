@@ -528,6 +528,16 @@ impl<F: FlushTarget> TableStore<F> {
         guard.indexes.get(name).cloned()
     }
 
+    /// Returns the current secondary index declarations.
+    pub fn indexed_columns(&self) -> &[(String, usize)] {
+        &self.indexed_columns
+    }
+
+    /// Returns the generation number of the most recently flushed SSTable.
+    pub fn last_flush_generation(&self) -> u64 {
+        self.flush_target.last_generation()
+    }
+
     /// Number of SSTables currently in the store.
     pub fn sstable_count(&self) -> usize {
         self.view.load().sstables.len()
