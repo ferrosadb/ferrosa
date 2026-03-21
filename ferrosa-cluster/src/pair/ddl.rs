@@ -176,6 +176,10 @@ impl DdlCoordinator {
     /// replicates to the secondary. If replication fails, the DDL
     /// still succeeds — the secondary will catch up via schema sync
     /// when it reconnects.
+    ///
+    /// On the secondary: forwards to the primary. The secondary does
+    /// not accept CQL connections, so this path only runs for internal
+    /// operations.
     pub async fn coordinate_ddl(&self, op: DdlOperation) -> Result<()> {
         match **self.role.load() {
             PairRole::Primary => {
@@ -187,18 +191,7 @@ impl DdlCoordinator {
                 }
                 Ok(())
             }
-            PairRole::Secondary => {
-                // Forward to primary for authority, but always apply locally
-                // so the DDL is available immediately on this node.
-                let forward_result = self.forward_ddl(&op).await;
-                self.apply_ddl_locally(&op)?;
-                let version = Uuid::new_v4();
-                self.schema.set_schema_version(version);
-                if let Err(e) = forward_result {
-                    tracing::warn!("DDL forward to primary failed ({e}), applied locally only");
-                }
-                Ok(())
-            }
+            PairRole::Secondary => self.forward_ddl(&op).await,
         }
     }
 
