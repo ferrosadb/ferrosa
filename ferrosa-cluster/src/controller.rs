@@ -222,6 +222,18 @@ impl ModeController {
         ctx.as_ref().map(|c| **c.role.load())
     }
 
+    /// Whether this node should accept CQL client connections.
+    ///
+    /// In pair mode only the primary accepts clients; the secondary exists
+    /// solely for replication.  Standalone and cluster nodes always accept.
+    pub fn is_cql_ready(&self) -> bool {
+        match self.mode() {
+            DeploymentMode::Standalone => true,
+            DeploymentMode::Pair => self.role() == Some(PairRole::Primary),
+            DeploymentMode::Cluster => true,
+        }
+    }
+
     /// Get local host_id.
     pub fn host_id(&self) -> Uuid {
         self.local_host_id
@@ -1730,6 +1742,71 @@ mod tests {
         assert!(
             matches!(result, Err(ClusterError::Internal(_))),
             "decommission without raft must fail: got {result:?}"
+        );
+    }
+
+    // ---- is_cql_ready tests ------------------------------------------------
+
+    #[test]
+    fn is_cql_ready_standalone_returns_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let schema = test_schema();
+        let config = Arc::new(ClusterConfig::default());
+        let net_config = Arc::new(NetConfig::default());
+        let host_id = Uuid::new_v4();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) =
+            ModeController::new(config, net_config, host_id, storage, schema, registry);
+
+        assert_eq!(controller.mode(), DeploymentMode::Standalone);
+        assert!(
+            controller.is_cql_ready(),
+            "standalone node must accept CQL connections"
+        );
+    }
+
+    #[test]
+    fn is_cql_ready_pair_secondary_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let schema = test_schema();
+        let config = Arc::new(ClusterConfig::default());
+        let net_config = Arc::new(NetConfig::default());
+        let local_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) = ModeController::new(
+            config,
+            net_config.clone(),
+            local_id,
+            storage,
+            schema,
+            registry,
+        );
+
+        let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+        controller.set_peer_manager(pm);
+
+        // Connect a peer to enter pair mode (always Primary from standalone).
+        let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        controller.on_peer_connected((peer_id, peer_addr));
+        assert_eq!(controller.mode(), DeploymentMode::Pair);
+        assert_eq!(controller.role(), Some(PairRole::Primary));
+
+        // Directly swap the role to Secondary to simulate the secondary's view.
+        {
+            let ctx = controller.pair_context.lock().unwrap();
+            let ctx = ctx.as_ref().expect("pair context must exist");
+            ctx.role.store(Arc::new(PairRole::Secondary));
+        }
+
+        assert_eq!(controller.role(), Some(PairRole::Secondary));
+        assert!(
+            !controller.is_cql_ready(),
+            "pair secondary must NOT accept CQL connections"
         );
     }
 }
