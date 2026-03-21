@@ -42,6 +42,10 @@ pub struct TimeSeriesAggregator {
     table_id: TableId,
     /// Column indices to extract from mutations (by position in cells vec).
     value_column_indices: Vec<u16>,
+    /// CQL type names for each column (e.g., "double", "float", "int", "bigint").
+    /// When present, enables type-aware decoding via `decode_typed_numeric`.
+    /// Must be the same length as `value_column_indices`.
+    column_types: Vec<String>,
     /// Per-partition_key ring buffers. DashMap provides per-shard locking.
     rings: DashMap<Vec<u8>, RingBuffer>,
     /// Channel sender for async consolidation tasks.
@@ -71,12 +75,34 @@ impl TimeSeriesAggregator {
             config,
             table_id,
             value_column_indices,
+            column_types: vec![],
             rings: DashMap::new(),
             task_tx,
             drop_count: AtomicU64::new(0),
             max_rings,
             shared_metrics: None,
         }
+    }
+
+    /// Create a new aggregator with CQL column type metadata for type-aware decoding.
+    ///
+    /// `column_types` must be the same length as `value_column_indices`, with CQL
+    /// type names such as "double", "float", "int", "bigint", "counter".
+    pub fn with_column_types(
+        config: ConsolidationConfig,
+        table_id: TableId,
+        value_column_indices: Vec<u16>,
+        column_types: Vec<String>,
+        task_tx: std::sync::mpsc::SyncSender<ConsolidationTask>,
+    ) -> Self {
+        assert_eq!(
+            value_column_indices.len(),
+            column_types.len(),
+            "column_types must match value_column_indices length"
+        );
+        let mut agg = Self::new(config, table_id, value_column_indices, task_tx);
+        agg.column_types = column_types;
+        agg
     }
 
     /// Create a new aggregator with externally managed shared metrics.
@@ -111,21 +137,27 @@ impl TimeSeriesAggregator {
 
     /// Extract f64 values from a mutation row for the configured columns.
     ///
-    /// Decodes CQL big-endian bytes to f64. Supports double (8 bytes),
-    /// float (4 bytes), int (4 bytes), bigint (8 bytes).
+    /// Uses type-aware decoding when `column_types` is available, falling back
+    /// to length-based heuristic via `decode_numeric_bytes` otherwise.
     fn extract_values(
         &self,
         row: &ferrosa_sstable::types::Row,
     ) -> Option<(i64, SmallVec<[f64; 8]>)> {
         let mut values = SmallVec::new();
         let timestamp = row.primary_key_liveness.timestamp;
+        let has_types = !self.column_types.is_empty();
 
-        for &col_idx in &self.value_column_indices {
+        for (i, &col_idx) in self.value_column_indices.iter().enumerate() {
             let cell = row.cells.iter().find(|(idx, _)| *idx == col_idx);
             match cell {
                 Some((_, cv)) => {
                     if let Some(ref bytes) = cv.value {
-                        if let Some(v) = decode_numeric_bytes(bytes) {
+                        let decoded = if has_types {
+                            decode_typed_numeric(bytes, &self.column_types[i])
+                        } else {
+                            decode_numeric_bytes(bytes)
+                        };
+                        if let Some(v) = decoded {
                             values.push(v);
                         } else {
                             tracing::warn!(
@@ -1013,5 +1045,67 @@ mod tests {
 
         // Ring should NOT have been created (row was skipped).
         assert_eq!(aggregator.ring_count(), 0);
+    }
+
+    // --- FMEA Fix 5: Typed decode using column type metadata ---
+
+    #[test]
+    fn extract_values_uses_typed_decode() {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["temp".to_string()],
+            ring_capacity: 64,
+            max_rings: 100,
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+
+        // Create aggregator WITH column types -- "float" means 4-byte IEEE 754.
+        let aggregator = TimeSeriesAggregator::with_column_types(
+            config,
+            table_id.clone(),
+            vec![0],
+            vec!["float".to_string()],
+            tx,
+        );
+
+        // Encode a float32 value (42.5f32).
+        let float_bytes = 42.5_f32.to_be_bytes().to_vec();
+        let mutation = Mutation {
+            keyspace: "ks".to_string(),
+            table: "sensor".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
+            rows: vec![Row {
+                clustering: 1_000_000_i64.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(float_bytes, 1_000_000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000_000),
+            }],
+            timestamp: 1_000_000,
+        };
+
+        aggregator.on_write(&table_id, &mutation);
+
+        // Ring should have been created -- typed decode of float succeeds.
+        assert_eq!(aggregator.ring_count(), 1);
+
+        // Verify the value was decoded correctly as float (not as i32).
+        let ring = aggregator.rings.get(&b"pk1".to_vec()).unwrap();
+        let entries = ring.window(0, 2_000_000);
+        assert_eq!(entries.len(), 1);
+        // float decode of 42.5f32 should be ~42.5 (not 1110179840 which is i32 interpretation).
+        assert!(
+            (entries[0].values[0] - 42.5).abs() < 0.01,
+            "expected ~42.5, got {}",
+            entries[0].values[0]
+        );
     }
 }
