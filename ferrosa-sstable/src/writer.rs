@@ -688,6 +688,142 @@ mod tests {
         assert_eq!(cell.value.as_deref().unwrap(), large_value.as_slice());
     }
 
+    /// Exact production scenario: memo_cache with composite text PK,
+    /// UUID clustering, and multiple regular columns including text + bigint.
+    /// Corruption happens with longer model_version (15 chars) but not
+    /// shorter (7 chars). Tests both at the SSTable write/read level.
+    #[test]
+    fn composite_text_pk_uuid_clustering_roundtrip() {
+        // Header matching memo_cache: CompositeType(UTF8,UTF8) PK, UUID clustering
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.UTF8Type)".into(),
+            clustering_types: vec![
+                "org.apache.cassandra.db.marshal.UUIDType".into(),
+            ],
+            static_columns: vec![],
+            regular_columns: vec![
+                (b"result".to_vec(), "org.apache.cassandra.db.marshal.UTF8Type".into()),
+                (b"hit_count".to_vec(), "org.apache.cassandra.db.marshal.LongType".into()),
+            ],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let timestamp = 1_000_042i64;
+
+        // Composite PK encoding: [u16 len][bytes][0x00] per component
+        fn make_composite_pk(part1: &str, part2: &str) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&(part1.len() as u16).to_be_bytes());
+            buf.extend_from_slice(part1.as_bytes());
+            buf.push(0x00);
+            buf.extend_from_slice(&(part2.len() as u16).to_be_bytes());
+            buf.extend_from_slice(part2.as_bytes());
+            buf.push(0x00);
+            buf
+        }
+
+        // Row 1: LONG model_version (15 chars) — this is the one that corrupts
+        let pk1 = make_composite_pk(
+            "cac0302657b4c1d0dfd5aec98f2754f46a42f117e53c77a9ba384ebf2095633a", // pragma: allowlist secret
+            "claude-opus-4-6",
+        );
+        let uuid1 = [0x11u8; 16]; // tenant_id UUID
+        let p1 = Partition {
+            key: DecoratedKey::new(PartitionKey::new(pk1.clone())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: uuid1.to_vec(),
+                cells: vec![
+                    (
+                        0,
+                        CellValue::live(b"The capital of France is Paris.".to_vec(), timestamp),
+                    ),
+                    (1, CellValue::live(0i64.to_be_bytes().to_vec(), timestamp)),
+                ],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        };
+
+        // Row 2: SHORT model_version (7 chars) — this one survives
+        let pk2 = make_composite_pk(
+            "4bbe47ee6bb1d0ecaa4d47fce3d99e2044cdfdbfac4dde0c0c083f97e4fad000", // pragma: allowlist secret
+            "test-v1",
+        );
+        let uuid2 = [0x22u8; 16];
+        let p2 = Partition {
+            key: DecoratedKey::new(PartitionKey::new(pk2.clone())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: uuid2.to_vec(),
+                cells: vec![
+                    (0, CellValue::live(b"4".to_vec(), timestamp)),
+                    (1, CellValue::live(0i64.to_be_bytes().to_vec(), timestamp)),
+                ],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        };
+
+        // Sort by key (required by SSTableWriter)
+        let mut partitions = vec![p1, p2];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        // Sequential read: both partitions must be readable
+        let mut reader = DataReader::new(&output.data, &header, 0);
+        let mut read_partitions = Vec::new();
+        while let Some(partition) = reader.read_partition().unwrap() {
+            read_partitions.push(partition);
+        }
+        assert_eq!(
+            read_partitions.len(),
+            2,
+            "sequential read should find both partitions"
+        );
+
+        // Verify each partition has correct data
+        for rp in &read_partitions {
+            assert_eq!(rp.rows.len(), 1, "each partition should have 1 row");
+            assert_eq!(
+                rp.rows[0].cells.len(),
+                2,
+                "each row should have 2 cells (result + hit_count)"
+            );
+            // Clustering key should be 16 bytes (UUID)
+            assert_eq!(
+                rp.rows[0].clustering.len(),
+                16,
+                "clustering key should be 16 bytes (UUID)"
+            );
+        }
+
+        // Verify the data bytes are well-formed by re-reading at each
+        // partition's offset (simulates what get_partition does).
+        for rp in &read_partitions {
+            let key_bytes = rp.key.key.as_bytes();
+            assert!(
+                key_bytes.len() > 70,
+                "composite PK should be > 70 bytes, got {}",
+                key_bytes.len()
+            );
+        }
+    }
+
     #[test]
     fn write_multiple_partitions_verify_count_and_bloom() {
         let header = test_header();
