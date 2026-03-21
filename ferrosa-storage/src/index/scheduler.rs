@@ -44,6 +44,24 @@ pub struct IndexBuildJob {
     pub enqueued_at: Instant,
 }
 
+/// Strategy for executing index builds.
+///
+/// The default implementation is [`LocalBackend`], which reads the SSTable
+/// from local disk and produces sidecar entries in-process. Future
+/// implementations can offload builds to remote nodes or external workers
+/// by sending the SSTable's S3 path and index metadata over the network.
+///
+/// The trait is synchronous because the scheduler runs on dedicated OS
+/// threads with a blocking mpsc channel (same pattern as `CompactionExecutor`).
+pub trait IndexBuildBackend: Send + Sync {
+    /// Build index entries for the given job.
+    ///
+    /// Returns sidecar entries on success, or a human-readable error string
+    /// on failure. Failures are recorded in the `IndexStateTracker` but do
+    /// not block compaction.
+    fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String>;
+}
+
 /// Result of a completed index build for a single SSTable.
 ///
 /// Contains the sidecar entries produced by the backend for each index.
@@ -258,5 +276,32 @@ mod tests {
         assert_eq!(result.sidecar_entries.len(), 1);
         assert!(result.sidecar_entries.contains_key("my_idx"));
         assert_eq!(result.build_duration.as_millis(), 42);
+    }
+
+    #[test]
+    fn index_build_backend_is_object_safe() {
+        // Verify the trait can be used as a trait object.
+        struct MockBackend;
+        impl IndexBuildBackend for MockBackend {
+            fn build(&self, _job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
+                Ok(IndexBuildResult {
+                    sstable_id: "mock".to_string(),
+                    sidecar_entries: std::collections::HashMap::new(),
+                    build_duration: Duration::from_millis(0),
+                })
+            }
+        }
+
+        let backend: Arc<dyn IndexBuildBackend> = Arc::new(MockBackend);
+        let job = IndexBuildJob {
+            sstable_id: "sst-test".to_string(),
+            index_name: "idx".to_string(),
+            index_type: IndexType::BTree,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+        };
+        let result = backend.build(&job).unwrap();
+        assert_eq!(result.sstable_id, "mock");
     }
 }
