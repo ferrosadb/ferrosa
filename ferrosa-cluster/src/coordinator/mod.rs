@@ -442,7 +442,7 @@ mod tests {
                 Arc::new(NoopListener),
             )),
             local_node_id,
-            test_storage(&tempfile::tempdir().unwrap().path()),
+            test_storage(tempfile::tempdir().unwrap().path()),
             1,
             ConsistencyLevel::One,
         );
