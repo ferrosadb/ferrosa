@@ -29,6 +29,7 @@ pub mod restore;
 pub mod snapshot;
 pub mod store;
 pub mod subscription_observer;
+pub mod timeseries;
 pub mod upload;
 pub mod virtual_tables;
 
