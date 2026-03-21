@@ -185,7 +185,7 @@ impl CqlServer {
                             warn!("connection limit reached, rejecting {peer}");
                             let codec = CqlCodec::new(max_frame_size);
                             let mut framed = Framed::new(stream, codec);
-                            let err = CqlError::Overloaded;
+                            let err = CqlError::Overloaded("connection limit reached".into());
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {
@@ -209,7 +209,10 @@ impl CqlServer {
                             );
                             let codec = CqlCodec::new(max_frame_size);
                             let mut framed = Framed::new(stream, codec);
-                            let err = CqlError::Overloaded;
+                            let err = CqlError::Overloaded(
+                                "writes disallowed on read replica; connect to the primary node"
+                                    .into(),
+                            );
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {
@@ -231,7 +234,8 @@ impl CqlServer {
                             warn!("per-IP limit reached for {peer_ip}, rejecting");
                             let codec = CqlCodec::new(max_frame_size);
                             let mut framed = Framed::new(stream, codec);
-                            let err = CqlError::Overloaded;
+                            let err =
+                                CqlError::Overloaded("per-IP connection limit reached".into());
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {
