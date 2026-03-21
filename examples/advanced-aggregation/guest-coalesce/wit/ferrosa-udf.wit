@@ -1,0 +1,76 @@
+package ferrosa:udf@0.1.0;
+
+/// Simplified scalar-only CQL value type for guest UDFs.
+///
+/// The canonical `ferrosa-udf.wit` defines the full `cql-value` variant
+/// including recursive collection types (list-val, set-val, map-val, etc.).
+/// The WebAssembly Component Model type system does not support recursive
+/// variant types via code-generation (wit-bindgen reports "type depends on
+/// itself").  The host works around this using the dynamic `Val` API.
+///
+/// For scalar UDFs -- which operate only on primitive CQL types -- this
+/// simplified variant is equivalent: all scalar cases are identical, and the
+/// collection cases are replaced by a single `unsupported` catch-all that the
+/// host never sends to a scalar function.
+interface types {
+    variant cql-value {
+        /// SQL-style NULL.
+        null,
+        /// CQL int (32-bit signed).
+        int-val(s32),
+        /// CQL bigint (64-bit signed).
+        bigint-val(s64),
+        /// CQL float (32-bit IEEE 754).
+        float-val(f32),
+        /// CQL double (64-bit IEEE 754).
+        double-val(f64),
+        /// CQL boolean.
+        boolean-val(bool),
+        /// CQL text / varchar.
+        text-val(string),
+        /// CQL blob.
+        blob-val(list<u8>),
+        /// CQL uuid / timeuuid (string-encoded).
+        uuid-val(string),
+        /// CQL timestamp (milliseconds since epoch).
+        timestamp-val(s64),
+        /// CQL date (days since epoch, signed).
+        date-val(s32),
+        /// CQL time (nanoseconds since midnight).
+        time-val(s64),
+        /// CQL smallint (16-bit signed).
+        smallint-val(s16),
+        /// CQL tinyint (8-bit signed).
+        tinyint-val(s8),
+        /// CQL inet address (dotted-decimal or IPv6 string).
+        inet-val(string),
+        /// CQL decimal (unscaled big-endian bytes, scale).
+        decimal-val(tuple<list<u8>, s32>),
+        /// CQL varint (big-endian signed bytes).
+        varint-val(list<u8>),
+        /// CQL duration (months, days, nanoseconds).
+        duration-val(tuple<s32, s32, s64>),
+        /// CQL ascii.
+        ascii-val(string),
+        /// CQL timeuuid (string-encoded).
+        timeuuid-val(string),
+        /// CQL counter (64-bit signed).
+        counter-val(s64),
+        /// Collection types (list/set/map/tuple/udt) are not supported for
+        /// scalar UDFs.  The host will never pass a collection to a scalar
+        /// function; this case exists only to keep the variant exhaustively
+        /// matchable in implementations that use a wildcard arm.
+        unsupported,
+    }
+}
+
+world udf {
+    use types.{cql-value};
+
+    /// Entry point called by the Ferrosa UDF executor.
+    ///
+    /// `args` contains the function arguments in declaration order.
+    /// Return `ok(cql-value::null)` to return SQL NULL.
+    /// Return `err(string)` to signal a runtime error.
+    export invoke: func(args: list<cql-value>) -> result<cql-value, string>;
+}

@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "ferrosa-udf-coalesce"
+version = "0.1.0"
+edition = "2021"
+description = "Example scalar UDF guest crate for coalesce(), compiled to WASM Component Model"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.41", default-features = false, features = ["macros", "realloc"] }
+
+[package.metadata.component]
+package = "ferrosa:udf-coalesce"
+target = { path = "wit", world = "udf" }
