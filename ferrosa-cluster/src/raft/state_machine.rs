@@ -27,9 +27,12 @@ use ferrosa_schema::metadata::index::IndexMetadata;
 use ferrosa_schema::metadata::keyspace::KeyspaceMetadata;
 use ferrosa_schema::metadata::table::TableMetadata;
 use ferrosa_schema::metadata::user_type::UserTypeMetadata;
+use ferrosa_schema::system::persistence::SystemTableMutation;
 use ferrosa_schema::{GrantEntry, RoleMetadata, Schema};
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
+
+use crate::system_table_writer::SystemTableWriter;
 
 use crate::config::ClusterConfig;
 use crate::raft::{FerrosRaftConfig, NodeInfo, RaftCommand, RaftOp, RaftResponse, Token};
@@ -113,6 +116,8 @@ pub struct FerrosStateMachine {
     /// Optional live token ring — updated after topology commands
     /// (`JoinNode`, `LeaveNode`, `AssignTokens`).
     ring: Option<Arc<ArcSwap<TokenRing>>>,
+    /// Optional system table writer for persisting DDL/auth mutations.
+    system_writer: Option<SystemTableWriter>,
 }
 
 impl FerrosStateMachine {
@@ -126,12 +131,14 @@ impl FerrosStateMachine {
             schema: None,
             engine: None,
             ring: None,
+            system_writer: None,
         }
     }
 
     /// Create a new state machine wired to local `Schema` and `StorageEngine`
     /// for side-effect propagation.
     pub fn with_side_effects(schema: Arc<Schema>, engine: Arc<StorageEngine>) -> Self {
+        let system_writer = Some(SystemTableWriter::new(Arc::clone(&engine)));
         Self {
             state: RaftState::default(),
             last_applied: None,
@@ -140,6 +147,7 @@ impl FerrosStateMachine {
             schema: Some(schema),
             engine: Some(engine),
             ring: None,
+            system_writer,
         }
     }
 
@@ -200,12 +208,16 @@ impl FerrosStateMachine {
         match op {
             // ---- DDL: Keyspaces ----------------------------------------
             RaftOp::CreateKeyspace(ks) => {
+                let ks_clone = ks.clone();
                 self.state
                     .keyspaces
                     .entry(ks.name.clone())
                     .or_insert_with(|| ks.clone());
                 if let Some(schema) = &self.schema {
                     let _ = schema.create_keyspace_internal(ks);
+                }
+                if let Some(writer) = &self.system_writer {
+                    let _ = writer.apply(SystemTableMutation::KeyspaceCreated(ks_clone));
                 }
             }
             RaftOp::DropKeyspace(name) => {
@@ -235,6 +247,9 @@ impl FerrosStateMachine {
                         let _ = engine.unregister_table(&tid);
                     }
                 }
+                if let Some(writer) = &self.system_writer {
+                    let _ = writer.apply(SystemTableMutation::KeyspaceDropped(name.clone()));
+                }
             }
             RaftOp::AlterKeyspace { name, updates } => {
                 if let Some(ks) = self.state.keyspaces.get_mut(&name) {
@@ -247,6 +262,11 @@ impl FerrosStateMachine {
                 }
                 if let Some(schema) = &self.schema {
                     let _ = schema.alter_keyspace_internal(&name, updates);
+                }
+                if let Some(writer) = &self.system_writer {
+                    if let Some(ks) = self.state.keyspaces.get(&name) {
+                        let _ = writer.apply(SystemTableMutation::KeyspaceCreated(ks.clone()));
+                    }
                 }
             }
 
@@ -263,6 +283,9 @@ impl FerrosStateMachine {
                 if let Some(engine) = &self.engine {
                     let _ = engine.register_table(table.to_storage_schema());
                 }
+                if let Some(writer) = &self.system_writer {
+                    let _ = writer.apply(SystemTableMutation::TableCreated(table.clone()));
+                }
             }
             RaftOp::DropTable { keyspace, table } => {
                 self.state.tables.remove(&(keyspace.clone(), table.clone()));
@@ -276,6 +299,12 @@ impl FerrosStateMachine {
                 if let Some(engine) = &self.engine {
                     let tid = TableId::new(&keyspace, &table);
                     let _ = engine.unregister_table(&tid);
+                }
+                if let Some(writer) = &self.system_writer {
+                    let _ = writer.apply(SystemTableMutation::TableDropped {
+                        keyspace: keyspace.clone(),
+                        table: table.clone(),
+                    });
                 }
             }
             RaftOp::AlterTable {
@@ -411,6 +440,9 @@ impl FerrosStateMachine {
                     .roles
                     .entry(role.name.clone())
                     .or_insert_with(|| role.clone());
+                if let Some(writer) = &self.system_writer {
+                    let _ = writer.apply(SystemTableMutation::RoleCreated(role.clone()));
+                }
                 if let Some(schema) = &self.schema {
                     let _ = schema.create_role_internal(role);
                 }
@@ -430,6 +462,11 @@ impl FerrosStateMachine {
                         role.member_of = member_of.clone();
                     }
                 }
+                if let Some(writer) = &self.system_writer {
+                    if let Some(role) = self.state.roles.get(&name) {
+                        let _ = writer.apply(SystemTableMutation::RoleCreated(role.clone()));
+                    }
+                }
                 if let Some(schema) = &self.schema {
                     let _ = schema.alter_role_internal(&name, updates);
                 }
@@ -440,6 +477,9 @@ impl FerrosStateMachine {
                 if let Some(schema) = &self.schema {
                     let _ = schema.drop_role_internal(&name);
                 }
+                if let Some(writer) = &self.system_writer {
+                    let _ = writer.apply(SystemTableMutation::RoleDropped(name.clone()));
+                }
             }
             RaftOp::Grant(entry) => {
                 let grants = self.state.grants.entry(entry.role.clone()).or_default();
@@ -449,6 +489,9 @@ impl FerrosStateMachine {
                         .extend(entry.permissions.iter().copied());
                 } else {
                     grants.push(entry.clone());
+                }
+                if let Some(writer) = &self.system_writer {
+                    let _ = writer.apply(SystemTableMutation::GrantUpdated(entry.clone()));
                 }
                 if let Some(schema) = &self.schema {
                     let _ = schema.grant_internal(entry);
@@ -467,6 +510,13 @@ impl FerrosStateMachine {
                     if grants.is_empty() {
                         self.state.grants.remove(&role);
                     }
+                }
+                if let Some(writer) = &self.system_writer {
+                    let _ = writer.apply(SystemTableMutation::PermissionRevoked {
+                        role: role.clone(),
+                        resource: resource.clone(),
+                        permission,
+                    });
                 }
                 if let Some(schema) = &self.schema {
                     let _ = schema.revoke_internal(&role, &resource, &permission);
@@ -606,7 +656,8 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             current_snapshot: self.current_snapshot.clone(),
             schema: None, // snapshot builder doesn't need side effects
             engine: None,
-            ring: None, // snapshot builder doesn't need live ring
+            ring: None,          // snapshot builder doesn't need live ring
+            system_writer: None, // snapshot builder doesn't need system writer
         }
     }
 
@@ -1387,5 +1438,132 @@ mod tests {
             0,
             "live ring must have no tokens after LeaveNode"
         );
+    }
+
+    // -- System table writer integration tests --
+
+    fn test_schema_instance() -> ferrosa_schema::Schema {
+        use ferrosa_schema::{
+            AuthMethod, LogAuditSink, PasswordHasher, PasswordPolicy, RateLimitConfig, SchemaConfig,
+        };
+        let config = SchemaConfig {
+            hasher: PasswordHasher::default(),
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(LogAuditSink),
+            secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+            mode: ferrosa_schema::startup::DeploymentMode::Development,
+        };
+        ferrosa_schema::Schema::new(config).unwrap()
+    }
+
+    fn test_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
+        use ferrosa_storage::engine::StorageEngineConfig;
+        use ferrosa_storage::{CommitLogConfig, CompactionConfig};
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                log_dir: dir.to_path_buf(),
+                checkpoint_dir: dir.to_path_buf(),
+                archive: None,
+                ..CommitLogConfig::default()
+            },
+            compaction: CompactionConfig::from_env(dir.join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            flush_threshold_bytes: 4096,
+            data_dir: dir.to_path_buf(),
+        };
+        Arc::new(StorageEngine::new(config, None).unwrap())
+    }
+
+    #[tokio::test]
+    async fn create_keyspace_emits_system_table_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        let schema = test_schema_instance();
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::new(schema), Arc::clone(&engine));
+
+        let ks = simple_keyspace("wire_ks");
+        let entry = make_entry(1, 1, RaftOp::CreateKeyspace(ks));
+        sm.apply(vec![entry]).await.unwrap();
+
+        // Verify system_schema.keyspaces has a row for "wire_ks".
+        let tid = TableId::new("system_schema", "keyspaces");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"wire_ks".to_vec(),
+        ));
+        let partition = engine.read(&tid, &key).unwrap();
+        assert!(
+            partition.is_some(),
+            "CreateKeyspace should write to system_schema.keyspaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_table_emits_system_table_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        let schema = test_schema_instance();
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::new(schema), Arc::clone(&engine));
+
+        let ks = simple_keyspace("tbl_ks");
+        let table = simple_table("tbl_ks", "users");
+        let entries = vec![
+            make_entry(1, 1, RaftOp::CreateKeyspace(ks)),
+            make_entry(1, 2, RaftOp::CreateTable(Box::new(table))),
+        ];
+        sm.apply(entries).await.unwrap();
+
+        let tid = TableId::new("system_schema", "tables");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"tbl_ks".to_vec(),
+        ));
+        let partition = engine.read(&tid, &key).unwrap();
+        assert!(
+            partition.is_some(),
+            "CreateTable should write to system_schema.tables"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_lifecycle_writes_to_system_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        let schema = test_schema_instance();
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::new(schema), Arc::clone(&engine));
+
+        let role = RoleMetadata {
+            name: "tester".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: HashSet::new(),
+        };
+
+        let entries = vec![make_entry(1, 1, RaftOp::CreateRole(role))];
+        sm.apply(entries).await.unwrap();
+
+        let tid = TableId::new("system_auth", "roles");
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"tester".to_vec(),
+        ));
+        let partition = engine.read(&tid, &key).unwrap();
+        assert!(
+            partition.is_some(),
+            "CreateRole should persist to system_auth.roles"
+        );
+
+        // Now drop the role.
+        let entries = vec![make_entry(1, 2, RaftOp::DropRole("tester".to_string()))];
+        sm.apply(entries).await.unwrap();
+
+        // After drop, the write should not error (tombstone was written).
     }
 }
