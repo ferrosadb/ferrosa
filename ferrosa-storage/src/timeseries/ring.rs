@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 /// Ring buffer entry. Packed for density -- cache-line alignment is on
 /// the buffer base, not individual entries.
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RingEntry {
     /// Timestamp in microseconds since epoch.
     pub timestamp: i64,
