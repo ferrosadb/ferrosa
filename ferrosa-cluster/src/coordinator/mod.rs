@@ -100,6 +100,56 @@ impl RpcHandler for MutationForwardHandler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RepairWriteHandler — receives RepairWrite RPCs from coordinators
+// ---------------------------------------------------------------------------
+
+/// RPC handler that receives `RepairWrite` messages from coordinators
+/// performing inline read repair. Applies the mutation directly to local
+/// storage without forwarding to other replicas (prevents cascade).
+pub struct RepairWriteHandler {
+    storage: Arc<StorageEngine>,
+    metrics: Arc<metrics::ReadRepairMetrics>,
+}
+
+impl RepairWriteHandler {
+    pub fn new(storage: Arc<StorageEngine>, metrics: Arc<metrics::ReadRepairMetrics>) -> Self {
+        Self { storage, metrics }
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for RepairWriteHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let body = match msg {
+            Message::RepairWrite(b) => b,
+            _ => return None,
+        };
+        let mutation = match decode_mutation(&body) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("RepairWriteHandler: failed to decode mutation: {e}");
+                self.metrics.inc_failed();
+                return None;
+            }
+        };
+        let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+        for row in &mutation.rows {
+            if let Err(e) =
+                self.storage
+                    .write(&table_id, &mutation.key, row.clone(), mutation.timestamp)
+            {
+                tracing::warn!("RepairWriteHandler: storage write failed: {e}");
+                self.metrics.inc_failed();
+                return None;
+            }
+        }
+        self.metrics.inc_succeeded();
+        // Fire-and-forget: no response.
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +402,77 @@ mod tests {
         fn on_peer_suspected(&self, _peer: PeerId) {}
         fn on_peer_recovered(&self, _peer_id: uuid::Uuid) {}
         fn on_peer_failed(&self, _peer_id: uuid::Uuid) {}
+    }
+
+    #[tokio::test]
+    async fn repair_write_handler_applies_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let metrics = Arc::new(super::metrics::ReadRepairMetrics::new());
+        let handler = super::RepairWriteHandler::new(storage.clone(), metrics.clone());
+
+        let mutation = Mutation {
+            keyspace: "test_ks".to_string(),
+            table: "test_tbl".to_string(),
+            key: test_key(),
+            rows: vec![test_row()],
+            timestamp: 1000,
+        };
+        let body = encode_mutation(&mutation);
+        let msg = Message::RepairWrite(body);
+
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let response = handler.handle(peer_id, msg).await;
+
+        // Fire-and-forget: no response expected.
+        assert!(response.is_none(), "RepairWrite is fire-and-forget");
+
+        // Verify the mutation was applied to storage.
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let result = storage.read(&table_id, &test_key()).unwrap();
+        assert!(result.is_some(), "repair write should land in storage");
+
+        // Metrics should show one success.
+        assert_eq!(
+            metrics
+                .read_repairs_succeeded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_write_handler_ignores_wrong_message_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let metrics = Arc::new(super::metrics::ReadRepairMetrics::new());
+        let handler = super::RepairWriteHandler::new(storage, metrics);
+
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let msg = Message::Ping { nonce: 42 };
+        let response = handler.handle(peer_id, msg).await;
+        assert!(response.is_none());
+    }
+
+    #[tokio::test]
+    async fn repair_write_handler_corrupt_body_increments_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let metrics = Arc::new(super::metrics::ReadRepairMetrics::new());
+        let handler = super::RepairWriteHandler::new(storage, metrics.clone());
+
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let msg = Message::RepairWrite(Bytes::from_static(b"garbage"));
+        let response = handler.handle(peer_id, msg).await;
+        assert!(response.is_none());
+
+        assert_eq!(
+            metrics
+                .read_repairs_failed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 }
