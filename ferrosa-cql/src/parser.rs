@@ -917,6 +917,9 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Type) => self.parse_drop_type(),
             TokenKind::Keyword(Keyword::Function) => self.parse_drop_function(),
             TokenKind::Keyword(Keyword::Aggregate) => self.parse_drop_aggregate(),
+            // Bare identifier after DROP: treat as DROP TABLE (Cassandra shorthand).
+            // e.g., "DROP cycling.race_winners" → DROP TABLE cycling.race_winners
+            TokenKind::Ident(_) => self.parse_drop_table().map(Statement::DropTable),
             _ => Err(CqlError::SyntaxError(format!(
                 "DROP {:?} not yet supported at position {}",
                 tok.kind, tok.pos
@@ -933,7 +936,8 @@ impl<'input> Parser<'input> {
     }
 
     fn parse_drop_table(&mut self) -> Result<DropTableStatement, CqlError> {
-        self.lexer.expect(&TokenKind::Keyword(Keyword::Table))?;
+        // TABLE keyword is optional (Cassandra accepts "DROP ks.tbl" shorthand)
+        let _ = self.lexer.eat(&TokenKind::Keyword(Keyword::Table))?;
         let if_exists = self.parse_if_exists()?;
         let (keyspace, table) = self.parse_table_ref()?;
 
