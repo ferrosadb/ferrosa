@@ -146,3 +146,108 @@ fn writer_persists_table_creation() {
     let partition = engine.read(&columns_tid, &key).unwrap();
     assert!(partition.is_some(), "columns rows should exist");
 }
+
+// -- Bootstrap loader tests --
+
+#[test]
+fn load_keyspaces_from_engine() {
+    let (_dir, engine) = setup_engine();
+    let writer = SystemTableWriter::new(Arc::clone(&engine));
+
+    // Write two keyspaces.
+    use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
+    for name in &["ks1", "ks2"] {
+        let ks = KeyspaceMetadata {
+            name: name.to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: std::collections::HashMap::from([(
+                    "replication_factor".to_string(),
+                    "1".to_string(),
+                )]),
+            },
+        };
+        writer
+            .apply(SystemTableMutation::KeyspaceCreated(ks))
+            .unwrap();
+    }
+
+    // Load keyspaces from engine (reads from memtable).
+    let loader = ferrosa_cluster::system_table_loader::SystemTableLoader::new(Arc::clone(&engine));
+    let keyspace_names = loader.load_keyspace_names().unwrap();
+    assert!(
+        keyspace_names.contains(&"ks1".to_string()),
+        "expected ks1 in {keyspace_names:?}"
+    );
+    assert!(
+        keyspace_names.contains(&"ks2".to_string()),
+        "expected ks2 in {keyspace_names:?}"
+    );
+}
+
+#[test]
+fn bootstrap_system_tables_registers_and_validates() {
+    use ferrosa_cluster::system_table_loader::bootstrap_system_tables;
+
+    let (_dir, engine) = setup_engine();
+    let writer = SystemTableWriter::new(Arc::clone(&engine));
+
+    // Pre-populate a keyspace.
+    use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
+    let ks = KeyspaceMetadata {
+        name: "existing".to_string(),
+        durable_writes: true,
+        replication: ReplicationParams {
+            strategy: "SimpleStrategy".to_string(),
+            options: std::collections::HashMap::from([(
+                "replication_factor".to_string(),
+                "1".to_string(),
+            )]),
+        },
+    };
+    writer
+        .apply(SystemTableMutation::KeyspaceCreated(ks))
+        .unwrap();
+    engine
+        .flush(&TableId::new("system_schema", "keyspaces"))
+        .unwrap();
+
+    // Raft state has "existing" + "new_ks".
+    let raft_keyspaces = vec!["existing".to_string(), "new_ks".to_string()];
+
+    let report = bootstrap_system_tables(Arc::clone(&engine), &raft_keyspaces).unwrap();
+
+    assert!(!report.divergences.is_empty()); // "new_ks" not in SSTables
+    assert_eq!(report.validated_keyspaces.len(), 2);
+}
+
+#[test]
+fn bootstrap_empty_sstables_uses_raft() {
+    use ferrosa_cluster::system_table_loader::bootstrap_system_tables;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = StorageEngineConfig {
+        commit_log: CommitLogConfig {
+            log_dir: dir.path().to_path_buf(),
+            checkpoint_dir: dir.path().to_path_buf(),
+            archive: None,
+            ..CommitLogConfig::default()
+        },
+        compaction: CompactionConfig::from_env(dir.path().join("compaction")),
+        object_store: None,
+        local_cache_max_bytes: 1024 * 1024,
+        flush_threshold_bytes: 4096,
+        data_dir: dir.path().to_path_buf(),
+    };
+    let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+
+    let raft_keyspaces = vec!["ks_from_raft".to_string()];
+
+    let report = bootstrap_system_tables(Arc::clone(&engine), &raft_keyspaces).unwrap();
+
+    // With no SSTables, Raft is sole authority.
+    assert_eq!(report.validated_keyspaces.len(), 1);
+    assert_eq!(report.validated_keyspaces[0], "ks_from_raft");
+    assert!(!report.divergences.is_empty()); // "ks_from_raft" not in SSTables
+}
