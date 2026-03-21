@@ -5,6 +5,7 @@ pub mod coordinator;
 pub mod ddl_path;
 pub mod error;
 pub mod hints;
+pub mod index_coordination;
 pub mod mode;
 pub mod pair;
 pub mod raft;

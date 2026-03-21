@@ -333,6 +333,24 @@ impl FerrosStateMachine {
                     .indexes
                     .entry(key)
                     .or_insert_with(|| index.clone());
+                // Initialize empty per-node status map for this index.
+                let state_key = (
+                    index.keyspace.clone(),
+                    index.table.clone(),
+                    index.name.clone(),
+                );
+                self.state
+                    .index_state_map
+                    .entry(state_key.clone())
+                    .or_default();
+                // Mark all current cluster members as Building for the new index.
+                if let Some(statuses) = self.state.index_state_map.get_mut(&state_key) {
+                    for &member_node_id in self.state.members.keys() {
+                        statuses
+                            .entry(member_node_id)
+                            .or_insert(IndexNodeStatus::Building);
+                    }
+                }
                 if let Some(schema) = &self.schema {
                     let _ = schema.create_index_internal(index);
                 }
@@ -512,6 +530,10 @@ impl FerrosStateMachine {
                 let node_id = super::uuid_to_node_id(node_info.host_id);
                 self.state.members.insert(node_id, node_info);
                 self.sync_ring();
+                // Mark the new node as Building for all existing indexes.
+                for statuses in self.state.index_state_map.values_mut() {
+                    statuses.entry(node_id).or_insert(IndexNodeStatus::Building);
+                }
             }
             RaftOp::LeaveNode { node_id } => {
                 self.state.members.remove(&node_id);
@@ -1788,5 +1810,136 @@ mod tests {
         assert_eq!(entry.len(), 1);
         assert!(entry.get(&1).is_none());
         assert_eq!(entry.get(&2), Some(&IndexNodeStatus::Ready));
+    }
+
+    #[test]
+    fn create_index_initializes_index_state_map_entry() {
+        let mut sm = FerrosStateMachine::new();
+
+        sm.apply_command(RaftCommand {
+            op: RaftOp::CreateIndex(IndexMetadata {
+                keyspace: "ks".into(),
+                table: "tbl".into(),
+                name: "idx".into(),
+                index_type: ferrosa_index::IndexType::BTree,
+                target_columns: vec!["col".into()],
+                filter_predicate: None,
+                options: std::collections::HashMap::new(),
+            }),
+            schema_version: Uuid::new_v4(),
+        });
+
+        // index_state_map should have an entry (empty since no members).
+        let entry = sm
+            .state()
+            .index_state_map
+            .get(&("ks".into(), "tbl".into(), "idx".into()));
+        assert!(
+            entry.is_some(),
+            "CreateIndex should initialize index_state_map entry"
+        );
+        assert!(entry.unwrap().is_empty());
+    }
+
+    #[test]
+    fn join_node_marks_building_for_existing_indexes() {
+        let mut sm = FerrosStateMachine::new();
+
+        // Create an index first.
+        sm.apply_command(RaftCommand {
+            op: RaftOp::CreateIndex(IndexMetadata {
+                keyspace: "ks".into(),
+                table: "tbl".into(),
+                name: "idx".into(),
+                index_type: ferrosa_index::IndexType::BTree,
+                target_columns: vec!["col".into()],
+                filter_predicate: None,
+                options: std::collections::HashMap::new(),
+            }),
+            schema_version: Uuid::new_v4(),
+        });
+
+        // Node 1 is already Ready.
+        sm.apply_command(RaftCommand {
+            op: RaftOp::IndexStatus {
+                node_id: 1,
+                keyspace: "ks".into(),
+                table: "tbl".into(),
+                index_name: "idx".into(),
+                status: IndexNodeStatus::Ready,
+            },
+            schema_version: Uuid::new_v4(),
+        });
+
+        // New node joins.
+        let host_id = Uuid::new_v4();
+        let node_id = crate::raft::uuid_to_node_id(host_id);
+        sm.apply_command(RaftCommand {
+            op: RaftOp::JoinNode(NodeInfo {
+                host_id,
+                addr: "10.0.0.2:7000".into(),
+                data_center: "dc1".into(),
+                rack: "rack1".into(),
+                state: NodeState::Joining,
+            }),
+            schema_version: Uuid::new_v4(),
+        });
+
+        // New node should be marked Building for the existing index.
+        let entry = sm
+            .state()
+            .index_state_map
+            .get(&("ks".into(), "tbl".into(), "idx".into()))
+            .unwrap();
+        assert_eq!(entry.get(&node_id), Some(&IndexNodeStatus::Building));
+        // Existing node 1 should still be Ready.
+        assert_eq!(entry.get(&1), Some(&IndexNodeStatus::Ready));
+    }
+
+    #[test]
+    fn create_index_marks_all_members_building() {
+        let mut sm = FerrosStateMachine::new();
+
+        // Add two nodes to the cluster.
+        for (host_id_seed, addr) in [(100u64, "10.0.0.1:7000"), (200, "10.0.0.2:7000")] {
+            let host_id = Uuid::from_u128(host_id_seed as u128);
+            sm.apply_command(RaftCommand {
+                op: RaftOp::JoinNode(NodeInfo {
+                    host_id,
+                    addr: addr.into(),
+                    data_center: "dc1".into(),
+                    rack: "rack1".into(),
+                    state: NodeState::Normal,
+                }),
+                schema_version: Uuid::new_v4(),
+            });
+        }
+
+        assert_eq!(sm.state().members.len(), 2);
+
+        // Create an index.
+        sm.apply_command(RaftCommand {
+            op: RaftOp::CreateIndex(IndexMetadata {
+                keyspace: "ks".into(),
+                table: "tbl".into(),
+                name: "idx".into(),
+                index_type: ferrosa_index::IndexType::BTree,
+                target_columns: vec!["col".into()],
+                filter_predicate: None,
+                options: std::collections::HashMap::new(),
+            }),
+            schema_version: Uuid::new_v4(),
+        });
+
+        let entry = sm
+            .state()
+            .index_state_map
+            .get(&("ks".into(), "tbl".into(), "idx".into()))
+            .unwrap();
+        // Both nodes should be marked Building.
+        assert_eq!(entry.len(), 2);
+        for (_, status) in entry {
+            assert_eq!(*status, IndexNodeStatus::Building);
+        }
     }
 }

@@ -151,4 +151,14 @@ mod tests {
             assert_eq!(back, role);
         }
     }
+
+    #[test]
+    fn cluster_config_serde_with_node_role() {
+        let mut config = ClusterConfig::default();
+        config.node_role = NodeRole::Indexer;
+
+        let bytes = bincode::serialize(&config).unwrap();
+        let decoded: ClusterConfig = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.node_role, NodeRole::Indexer);
+    }
 }
