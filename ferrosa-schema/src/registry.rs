@@ -3254,6 +3254,7 @@ mod tests {
                 final_func: Some("avg_final".into()),
                 init_cond: None,
                 return_type: CqlType::Double,
+                wasm_body: None,
             },
         );
         let json = serde_json::to_string(&snap)

@@ -3685,6 +3685,7 @@ async fn route_create_aggregate(
         final_func,
         init_cond: common_init_cond,
         return_type,
+        wasm_body: None,
     };
 
     let ddl_guard = state.ddl_path.load();

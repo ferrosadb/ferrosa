@@ -258,6 +258,7 @@ mod tests {
                 Some(CqlValue::Int(0)),
             ])),
             return_type: CqlType::Double,
+            wasm_body: None,
         };
         let snap = snapshot_with_aggregate(agg);
         let table = SystemSchemaAggregatesTable::new(snap);
@@ -297,6 +298,7 @@ mod tests {
             final_func: None,
             init_cond: Some(CqlValue::Int(0)),
             return_type: CqlType::Int,
+            wasm_body: None,
         };
         let snap = snapshot_with_aggregate(agg);
         let table = SystemSchemaAggregatesTable::new(snap);
@@ -331,6 +333,7 @@ mod tests {
             final_func: None,
             init_cond: None,
             return_type: CqlType::Bigint,
+            wasm_body: None,
         };
         let snap = snapshot_with_aggregate(agg);
         let table = SystemSchemaAggregatesTable::new(snap);
