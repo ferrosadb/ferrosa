@@ -11,5 +11,8 @@ pub mod sidecar;
 pub mod tracker;
 pub mod virtual_table;
 
-pub use scheduler::{BuildPriority, IndexBuildJob, IndexBuildScheduler};
+pub use scheduler::{
+    BuildPriority, IndexBuildBackend, IndexBuildJob, IndexBuildResult, IndexBuildScheduler,
+    LocalBackend,
+};
 pub use tracker::{IndexState, IndexStateTracker, IndexStatus};
