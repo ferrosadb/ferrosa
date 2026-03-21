@@ -12,6 +12,7 @@ num-bigint = "0.4"
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+bumpalo = { version = "3", features = ["collections"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
