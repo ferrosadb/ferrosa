@@ -168,7 +168,7 @@ pub async fn handle_connection<S>(
                         Ok(permit) => Some(permit),
                         Err(_) => {
                             debug!("in-flight limit reached for {peer}, rejecting request");
-                            let err = CqlError::Overloaded;
+                            let err = CqlError::Overloaded("request backpressure".into());
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {

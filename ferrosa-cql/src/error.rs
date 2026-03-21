@@ -18,7 +18,7 @@ pub enum CqlError {
     /// 0x1000 — not enough replicas.
     Unavailable,
     /// 0x1100 — server backpressure.
-    Overloaded,
+    Overloaded(String),
     /// 0x2000 — CQL syntax error.
     SyntaxError(String),
     /// 0x2100 — insufficient permissions.
@@ -41,7 +41,7 @@ impl CqlError {
             Self::Protocol(_) => 0x000A,
             Self::BadCredentials => 0x0100,
             Self::Unavailable => 0x1000,
-            Self::Overloaded => 0x1100,
+            Self::Overloaded(_) => 0x1100,
             Self::SyntaxError(_) => 0x2000,
             Self::Unauthorized(_) => 0x2100,
             Self::Invalid(_) => 0x2200,
@@ -88,7 +88,7 @@ impl std::fmt::Display for CqlError {
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Self::BadCredentials => write!(f, "bad credentials"),
             Self::Unavailable => write!(f, "unavailable"),
-            Self::Overloaded => write!(f, "overloaded"),
+            Self::Overloaded(msg) => write!(f, "{msg}"),
             Self::SyntaxError(msg) => write!(f, "{msg}"),
             Self::Unauthorized(msg) => write!(f, "unauthorized: {msg}"),
             Self::Invalid(msg) => write!(f, "{msg}"),
@@ -206,7 +206,7 @@ mod tests {
         assert_eq!(CqlError::Protocol("".into()).error_code(), 0x000A);
         assert_eq!(CqlError::BadCredentials.error_code(), 0x0100);
         assert_eq!(CqlError::Unavailable.error_code(), 0x1000);
-        assert_eq!(CqlError::Overloaded.error_code(), 0x1100);
+        assert_eq!(CqlError::Overloaded("test".into()).error_code(), 0x1100);
         assert_eq!(CqlError::SyntaxError("".into()).error_code(), 0x2000);
         assert_eq!(CqlError::Unauthorized("".into()).error_code(), 0x2100);
         assert_eq!(CqlError::Invalid("".into()).error_code(), 0x2200);
