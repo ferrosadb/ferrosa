@@ -69,6 +69,68 @@ pub const ROLES_COL_SALTED_HASH: u16 = 2;
 pub const PERMISSIONS_COL_PERMISSIONS: u16 = 0;
 
 // ---------------------------------------------------------------------------
+// SystemTableMutation enum
+// ---------------------------------------------------------------------------
+
+use crate::auth::permission::{GrantEntry, Permission, Resource};
+use crate::auth::role::RoleMetadata;
+use crate::metadata::keyspace::KeyspaceMetadata;
+use crate::metadata::table::TableMetadata;
+
+/// A mutation to a system table, emitted by the Raft state machine after
+/// applying a DDL or auth command. The `SystemTableWriter` converts these
+/// into `StorageEngine::write()` calls.
+#[derive(Debug, Clone)]
+pub enum SystemTableMutation {
+    // ---- system_schema.keyspaces ----
+    /// A keyspace was created or altered (upsert row).
+    KeyspaceCreated(KeyspaceMetadata),
+    /// A keyspace was dropped (tombstone row).
+    KeyspaceDropped(String),
+
+    // ---- system_schema.tables + system_schema.columns ----
+    /// A table was created or altered (upsert rows in both tables and columns).
+    TableCreated(Box<TableMetadata>),
+    /// A table was dropped (tombstone rows in both tables and columns).
+    TableDropped { keyspace: String, table: String },
+
+    // ---- system_auth.roles ----
+    /// A role was created or altered (upsert row).
+    RoleCreated(RoleMetadata),
+    /// A role was dropped (tombstone row + clean up members/permissions).
+    RoleDropped(String),
+
+    // ---- system_auth.role_permissions ----
+    /// A grant was added or modified (upsert row).
+    GrantUpdated(GrantEntry),
+    /// A permission was revoked. If all permissions removed, tombstone the row.
+    PermissionRevoked {
+        role: String,
+        resource: Resource,
+        permission: Permission,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Encoding helpers
+// ---------------------------------------------------------------------------
+
+/// Encode a boolean as a 1-byte cell value.
+pub fn encode_bool(val: bool) -> Vec<u8> {
+    vec![if val { 0x01 } else { 0x00 }]
+}
+
+/// Encode an i32 as a 4-byte big-endian cell value.
+pub fn encode_i32(val: i32) -> Vec<u8> {
+    val.to_be_bytes().to_vec()
+}
+
+/// Encode a UUID as 16-byte cell value.
+pub fn encode_uuid(val: &uuid::Uuid) -> Vec<u8> {
+    val.as_bytes().to_vec()
+}
+
+// ---------------------------------------------------------------------------
 // System table TableSchema builders
 // ---------------------------------------------------------------------------
 
@@ -319,5 +381,62 @@ mod tests {
         assert!(names.contains(&(&"system_auth".to_string(), &"roles".to_string())));
         assert!(names.contains(&(&"system_auth".to_string(), &"role_members".to_string())));
         assert!(names.contains(&(&"system_auth".to_string(), &"role_permissions".to_string())));
+    }
+
+    // -- Task 4: SystemTableMutation tests --
+
+    #[test]
+    fn system_table_mutation_keyspace_created() {
+        use crate::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
+        let ks = KeyspaceMetadata {
+            name: "my_ks".to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: std::collections::HashMap::from([(
+                    "replication_factor".to_string(),
+                    "3".to_string(),
+                )]),
+            },
+        };
+        let mutation = SystemTableMutation::KeyspaceCreated(ks.clone());
+        match &mutation {
+            SystemTableMutation::KeyspaceCreated(k) => assert_eq!(k.name, "my_ks"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn system_table_mutation_role_created() {
+        use crate::auth::role::RoleMetadata;
+        let role = RoleMetadata {
+            name: "admin".to_string(),
+            is_superuser: true,
+            can_login: true,
+            salted_hash: Some("$2b$hash".to_string()),
+            member_of: std::collections::HashSet::new(),
+        };
+        let mutation = SystemTableMutation::RoleCreated(role);
+        match &mutation {
+            SystemTableMutation::RoleCreated(r) => assert_eq!(r.name, "admin"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // -- Task 5: Encoding helper tests --
+
+    #[test]
+    fn encode_bool_true() {
+        assert_eq!(encode_bool(true), vec![0x01]);
+    }
+
+    #[test]
+    fn encode_bool_false() {
+        assert_eq!(encode_bool(false), vec![0x00]);
+    }
+
+    #[test]
+    fn encode_i32_value() {
+        assert_eq!(encode_i32(42), 42i32.to_be_bytes().to_vec());
     }
 }
