@@ -89,6 +89,8 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
     });
     let udf_executor =
         Arc::new(ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default()).unwrap());
+    let mode_controller =
+        ferrosa_cluster::ModeController::standalone_for_test(schema.clone(), engine.clone());
     let state = Arc::new(SharedState {
         engine: engine.clone(),
         schema: schema.clone(),
@@ -106,6 +108,7 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         query_tracker: Arc::new(QueryTracker::new()),
         udf_executor,
         event_sender: tokio::sync::broadcast::channel(64).0,
+        mode_controller,
     });
     (state, dir)
 }

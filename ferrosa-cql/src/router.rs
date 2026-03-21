@@ -60,6 +60,8 @@ pub struct SharedState {
     pub udf_executor: Arc<UdfExecutor>,
     /// Broadcast channel for CQL EVENT push notifications.
     pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
+    /// Mode controller for checking CQL readiness (pair mode gating).
+    pub mode_controller: Arc<ferrosa_cluster::ModeController>,
 }
 
 /// Per-request context: authentication, current keyspace, and consistency level.
@@ -3917,6 +3919,8 @@ mod tests {
         let udf_executor =
             Arc::new(ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default()).unwrap());
 
+        let mode_controller =
+            ferrosa_cluster::ModeController::standalone_for_test(schema.clone(), engine.clone());
         let state = SharedState {
             engine: engine.clone(),
             schema: schema.clone(),
@@ -3931,6 +3935,7 @@ mod tests {
             query_tracker: Arc::new(QueryTracker::new()),
             udf_executor,
             event_sender: tokio::sync::broadcast::channel(64).0,
+            mode_controller,
         };
         (state, dir)
     }

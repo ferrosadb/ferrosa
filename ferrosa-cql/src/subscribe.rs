@@ -226,6 +226,8 @@ mod tests {
 
         let udf_executor =
             Arc::new(ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default()).unwrap());
+        let mode_controller =
+            ferrosa_cluster::ModeController::standalone_for_test(schema.clone(), engine.clone());
 
         let state = SharedState {
             engine: engine.clone(),
@@ -241,6 +243,7 @@ mod tests {
             query_tracker: Arc::new(QueryTracker::new()),
             udf_executor,
             event_sender: tokio::sync::broadcast::channel(64).0,
+            mode_controller,
         };
 
         (Arc::new(state), dir)

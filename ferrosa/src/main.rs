@@ -397,6 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         query_tracker,
         udf_executor,
         event_sender: tokio::sync::broadcast::channel(64).0,
+        mode_controller: Arc::clone(&mode_controller),
     });
     let auth_disabled = cql_config.auth_disabled;
 
@@ -630,9 +631,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ = schema_sync_interval.tick() => {
                     if !has_s3 { continue; }
-                    // Only save if schema changed since last sync.
                     let snap = maintenance_schema.snapshot();
                     if snap.version != last_schema_version {
+                        // Flush all memtables before persisting schema so SSTables
+                        // in S3 match the schema snapshot (Cassandra SNAPSHOT reason).
+                        if let Err(e) = maintenance_engine.flush_all() {
+                            tracing::warn!(%e, "pre-schema-persist flush failed, skipping schema persist");
+                            continue; // Don't persist schema without data — retry next tick
+                        }
+                        // Sync flushed SSTables to S3 before saving schema.
+                        match maintenance_engine.sync_sstables_to_s3().await {
+                            Ok(n) if n > 0 => {
+                                tracing::info!(count = n, "pre-schema-persist S3 sync");
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "pre-schema-persist S3 sync failed, skipping schema persist");
+                                continue; // Don't persist schema without data — retry next tick
+                            }
+                            _ => {}
+                        }
                         persist_schema_to_s3(&maintenance_engine, &maintenance_schema).await;
                         last_schema_version = snap.version;
                     }
