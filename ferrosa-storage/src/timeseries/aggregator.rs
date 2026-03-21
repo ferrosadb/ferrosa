@@ -526,4 +526,143 @@ mod tests {
     fn decode_typed_unknown_type() {
         assert!(decode_typed_numeric(&[0; 8], "text").is_none());
     }
+
+    // --- Task 12: ConsolidationWorker tests ---
+
+    #[test]
+    fn worker_processes_boundary_task() {
+        use super::super::consolidation::{consolidate_values, ConsolidationFn};
+
+        // Verify consolidation logic works end-to-end for a task's window entries.
+        let entries = vec![
+            RingEntry {
+                timestamp: 0,
+                values: SmallVec::from_slice(&[1.0]),
+            },
+            RingEntry {
+                timestamp: 1_000_000,
+                values: SmallVec::from_slice(&[2.0]),
+            },
+            RingEntry {
+                timestamp: 2_000_000,
+                values: SmallVec::from_slice(&[3.0]),
+            },
+        ];
+
+        // Extract column 0 values.
+        let values: Vec<f64> = entries.iter().map(|e| e.values[0]).collect();
+        let funcs = vec![
+            ConsolidationFn::Min,
+            ConsolidationFn::Max,
+            ConsolidationFn::Avg,
+        ];
+        let results = consolidate_values(&values, &funcs);
+
+        assert!((results[0] - 1.0).abs() < f64::EPSILON); // min
+        assert!((results[1] - 3.0).abs() < f64::EPSILON); // max
+        assert!((results[2] - 2.0).abs() < f64::EPSILON); // avg
+    }
+
+    #[test]
+    fn worker_consolidate_window_method() {
+        use super::super::consolidation::ConsolidationFn;
+
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![
+                ConsolidationFn::Min,
+                ConsolidationFn::Max,
+                ConsolidationFn::Avg,
+            ],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ..ConsolidationConfig::default()
+        };
+
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(10);
+        let metrics = Arc::new(ConsolidationMetrics::default());
+        let worker = ConsolidationWorker::new(config, rx, metrics);
+
+        let entries = vec![
+            RingEntry {
+                timestamp: 0,
+                values: SmallVec::from_slice(&[1.0]),
+            },
+            RingEntry {
+                timestamp: 1_000_000,
+                values: SmallVec::from_slice(&[2.0]),
+            },
+            RingEntry {
+                timestamp: 2_000_000,
+                values: SmallVec::from_slice(&[3.0]),
+            },
+        ];
+
+        let results = worker.consolidate_window(&entries, 0);
+        assert_eq!(results.len(), 3);
+        assert!((results[0] - 1.0).abs() < f64::EPSILON); // min
+        assert!((results[1] - 3.0).abs() < f64::EPSILON); // max
+        assert!((results[2] - 2.0).abs() < f64::EPSILON); // avg
+    }
+
+    #[test]
+    fn worker_multi_column_consolidation() {
+        use super::super::consolidation::{consolidate_values, ConsolidationFn};
+
+        // 3 entries, 2 columns each.
+        let entries = vec![
+            RingEntry {
+                timestamp: 0,
+                values: SmallVec::from_slice(&[10.0, 100.0]),
+            },
+            RingEntry {
+                timestamp: 1_000_000,
+                values: SmallVec::from_slice(&[20.0, 200.0]),
+            },
+            RingEntry {
+                timestamp: 2_000_000,
+                values: SmallVec::from_slice(&[30.0, 300.0]),
+            },
+        ];
+
+        let funcs = vec![ConsolidationFn::Avg];
+
+        // Column 0.
+        let col0: Vec<f64> = entries.iter().map(|e| e.values[0]).collect();
+        let results0 = consolidate_values(&col0, &funcs);
+        assert!((results0[0] - 20.0).abs() < f64::EPSILON);
+
+        // Column 1.
+        let col1: Vec<f64> = entries.iter().map(|e| e.values[1]).collect();
+        let results1 = consolidate_values(&col1, &funcs);
+        assert!((results1[0] - 200.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn worker_consolidate_empty_entries() {
+        use super::super::consolidation::ConsolidationFn;
+
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ..ConsolidationConfig::default()
+        };
+
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(10);
+        let metrics = Arc::new(ConsolidationMetrics::default());
+        let worker = ConsolidationWorker::new(config, rx, metrics);
+
+        let results = worker.consolidate_window(&[], 0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn worker_metrics_default() {
+        let metrics = ConsolidationMetrics::default();
+        assert_eq!(metrics.windows_consolidated.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.late_arrivals.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.consolidation_drops.load(Ordering::Relaxed), 0);
+    }
 }
