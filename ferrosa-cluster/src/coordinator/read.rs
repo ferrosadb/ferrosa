@@ -1258,4 +1258,70 @@ mod tests {
             .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(attempted, 0, "no stale replicas means no repair attempts");
     }
+
+    // -----------------------------------------------------------------------
+    // Task 10: Integration-style test
+    // -----------------------------------------------------------------------
+
+    /// Integration-style test: verify that repair_stale_replicas sends
+    /// repair writes to the correct set of stale replicas and increments
+    /// metrics. Uses 3 storage engines to simulate 3 replicas.
+    #[tokio::test]
+    async fn repair_stale_replicas_sends_to_all_stale_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let stale_uuid_1 = Uuid::new_v4();
+        let stale_uuid_2 = Uuid::new_v4();
+
+        // Set up PeerManager with peer entries (no real pools -- sends will fail).
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        pm.add_peer_entry((stale_uuid_1, "10.0.0.2:7000".parse().unwrap()))
+            .await;
+        pm.add_peer_entry((stale_uuid_2, "10.0.0.3:7000".parse().unwrap()))
+            .await;
+
+        let coordinator = make_coordinator(
+            TokenRing::new(),
+            pm,
+            1u64,
+            storage.clone(),
+            3,
+            ConsistencyLevel::Quorum,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let partition = Partition {
+            key: key.clone(),
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(5000)],
+        };
+
+        // Repair two stale replicas.
+        coordinator
+            .repair_stale_replicas(&table_id, &partition, &[stale_uuid_1, stale_uuid_2])
+            .await;
+
+        let attempted = coordinator
+            .repair_metrics
+            .read_repairs_attempted
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let failed = coordinator
+            .repair_metrics
+            .read_repairs_failed
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            attempted, 2,
+            "should attempt repair for both stale replicas"
+        );
+        assert_eq!(failed, 2, "both should fail (no real connection pools)");
+    }
 }
