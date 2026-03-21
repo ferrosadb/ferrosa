@@ -6,7 +6,7 @@
 ## Scoring Criteria
 
 | Score | Severity (S) | Occurrence (O) | Detection (D) |
-|-------|-------------|----------------|----------------|
+| ----- | ------------ | -------------- | -------------- |
 | 1 | Negligible | Almost never | Always detected before impact |
 | 2-3 | Minor degradation | Rare | Usually detected |
 | 4-6 | Significant impact | Occasional | Sometimes detected |
@@ -18,7 +18,7 @@ RPN = Severity x Occurrence x Detection. **Action required for RPN >= 50.**
 ## Failure Mode Table
 
 | # | Component | Failure Mode | S | O | D | RPN | Mitigation | Test Case |
-|---|-----------|-------------|---|---|---|-----|------------|-----------|
+| --- | --------- | ----------- | --- | --- | --- | --- | ---------- | --------- |
 | FM1 | config.rs | Zero interval/capacity passes parsing, panics at RingBuffer::new() | 9 | 7 | 3 | **189** | Validate `interval > 0`, `capacity > 0` at parse time | config_rejects_zero_interval, config_rejects_zero_capacity |
 | FM2 | aggregator.rs | Silent skip on failed numeric decode — user unaware rows dropped | 8 | 6 | 8 | **384** | Log tracing::warn + increment decode_failures counter | metrics_track_decode_failures |
 | FM3 | ring.rs | Massive timestamp gap causes unbounded loop in boundary advance | 9 | 2 | 9 | **162** | Cap loop at 1000 iterations; direct calculation on overflow | boundary_advance_massive_gap_does_not_hang |
@@ -33,7 +33,7 @@ RPN = Severity x Occurrence x Detection. **Action required for RPN >= 50.**
 ## Risk Priority Summary
 
 | Priority | Count | Items |
-|----------|-------|-------|
+| -------- | ----- | ----- |
 | Critical (RPN >= 150) | 6 | FM1 (189), FM2 (384), FM3 (162), FM4 (175), FM5 (189), FM6 (168) |
 | High (RPN 100-149) | 1 | FM8 (147) |
 | Medium (RPN 50-99) | 3 | FM7 (96), FM9 (64), FM10 (60) |
@@ -43,7 +43,7 @@ RPN = Severity x Occurrence x Detection. **Action required for RPN >= 50.**
 > Updated: 2026-03-21
 
 | ID | RPN | Status | Evidence |
-|----|-----|--------|----------|
+| ---- | ----- | -------- | -------- |
 | FM1 | 189 | **Mitigated** | `45e5d27` — validate interval > 0 and capacity > 0 at parse |
 | FM2 | 384 | **Mitigated** | `d4f0782` — tracing::warn + decode_failures counter |
 | FM3 | 162 | **Mitigated** | `54cb8d9` — cap loop at 1000 iterations, direct calc on overflow |
