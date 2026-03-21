@@ -1989,6 +1989,73 @@ mod tests {
         );
     }
 
+    /// Regression test: write data, flush to SSTable, read back the exact
+    /// partition key. Catches format mismatches where read_exact_at fails
+    /// with "wanted N bytes, got M" after a flush (e.g., when the SSTable
+    /// format changes between binary versions).
+    #[test]
+    fn write_flush_read_point_query_no_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // Table with composite partition key + clustering + regular column
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "memo_cache".into(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.UTF8Type)".into(),
+            clustering_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "tenant_id".into(),
+                type_name: "org.apache.cassandra.db.marshal.UUIDType".into(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "result".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new("test_ks", "memo_cache");
+
+        // Write multiple partitions with different composite keys
+        for i in 0..5 {
+            let pk_bytes = format!("hash_{i}\x00v1");
+            let key = DecoratedKey::new(PartitionKey::new(pk_bytes.into_bytes()));
+            let row = Row {
+                clustering: vec![0u8; 16], // UUID-sized clustering
+                cells: vec![(
+                    0,
+                    CellValue::live(format!("result_{i}").into_bytes(), 1000 + i),
+                )],
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                    1000 + i,
+                ),
+            };
+            engine.write(&tid, &key, row, 1000 + i).unwrap();
+        }
+
+        // Force flush to SSTable
+        engine.flush_all().unwrap();
+        assert!(engine.sstable_count(&tid) >= 1, "should have flushed");
+
+        // Point read each partition — must not error
+        for i in 0..5 {
+            let pk_bytes = format!("hash_{i}\x00v1");
+            let key = DecoratedKey::new(PartitionKey::new(pk_bytes.into_bytes()));
+            let result = engine.read(&tid, &key);
+            assert!(
+                result.is_ok(),
+                "point read after flush failed for partition {i}: {:?}",
+                result.err()
+            );
+        }
+    }
+
     /// A test observer that counts `on_write` calls.
     struct CountingObserver {
         watched: Vec<TableId>,

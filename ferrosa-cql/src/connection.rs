@@ -24,7 +24,7 @@ use crate::auth::{
     encode_auth_success, encode_authenticate_response, parse_sasl_plain, MAX_AUTH_ATTEMPTS,
 };
 use crate::error::CqlError;
-use crate::frame::{Compression, CqlCodec, CqlFrame, FrameHeader, Opcode, VERSION_RESPONSE};
+use crate::frame::{Compression, CqlCodec, CqlFrame, FrameHeader, Opcode};
 use crate::parser;
 use crate::prepared::{PreparedCache, PreparedPlan};
 use crate::result;
@@ -111,6 +111,10 @@ pub async fn handle_connection<S>(
     let mut current_keyspace: Option<String> = None;
     let mut subscription_state = SubscriptionState::new(8);
     let mut pending_compression: Option<Compression> = None;
+    // Track the client's negotiated protocol version. Response frames
+    // MUST use the same version byte (0x80 | client_version).
+    // Default to v5; overwritten when we see the first request frame.
+    let mut client_version: u8 = 5;
 
     // Channel for subscription tasks to push streaming frames.
     let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<crate::subscribe::SubscriptionPush>(64);
@@ -157,6 +161,12 @@ pub async fn handle_connection<S>(
             }
             FrameOrPush::ClientFrame(maybe_frame) => {
                 let stream_id = maybe_frame.header.stream_id;
+                // Capture the client's protocol version from the request frame.
+                // Response version = 0x80 | request version.
+                let req_version = maybe_frame.header.version & 0x7F;
+                if (3..=5).contains(&req_version) {
+                    client_version = req_version;
+                }
 
                 // Check in-flight limit for request opcodes (QUERY, EXECUTE, BATCH).
                 let is_request = matches!(
@@ -172,7 +182,7 @@ pub async fn handle_connection<S>(
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {
-                                    version: VERSION_RESPONSE,
+                                    version: 0x80 | client_version,
                                     flags: 0,
                                     stream_id,
                                     opcode: Opcode::Error,
@@ -224,7 +234,7 @@ pub async fn handle_connection<S>(
                         let body_bytes = body.freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: 0x80 | client_version,
                                 flags: 0,
                                 stream_id,
                                 opcode,
@@ -264,7 +274,7 @@ pub async fn handle_connection<S>(
                                 let body = err.encode_body().freeze();
                                 let frame = CqlFrame {
                                     header: FrameHeader {
-                                        version: VERSION_RESPONSE,
+                                        version: 0x80 | client_version,
                                         flags: 0,
                                         stream_id,
                                         opcode: Opcode::Error,
@@ -290,7 +300,7 @@ pub async fn handle_connection<S>(
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {
-                                    version: VERSION_RESPONSE,
+                                    version: 0x80 | client_version,
                                     flags: 0,
                                     stream_id,
                                     opcode: Opcode::Error,
@@ -308,7 +318,7 @@ pub async fn handle_connection<S>(
                         let ack_body = crate::result::encode_void().freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: 0x80 | client_version,
                                 flags: 0,
                                 stream_id,
                                 opcode: Opcode::Result,
@@ -348,7 +358,7 @@ pub async fn handle_connection<S>(
                         let body = crate::result::encode_void().freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: 0x80 | client_version,
                                 flags: 0,
                                 stream_id,
                                 opcode: Opcode::Result,
@@ -364,7 +374,7 @@ pub async fn handle_connection<S>(
                         let body_bytes = body.freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: 0x80 | client_version,
                                 flags: 0,
                                 stream_id,
                                 opcode,
@@ -863,10 +873,64 @@ async fn handle_execute(
         }
     };
 
-    // Re-route the stored statement (simplified: no bound value substitution).
+    // Parse flags and positional bind values from the EXECUTE body.
+    // CQL v4 format after consistency: [byte flags][short n_values][bytes value]*
+    let mut stmt = plan.statement.clone();
+    if cursor.remaining() >= 1 {
+        let flags = cursor.get_u8();
+        let _has_values = flags & 0x01 != 0;
+        let has_names = flags & 0x40 != 0;
+
+        if _has_values && cursor.remaining() >= 2 {
+            let n_values = cursor.get_u16() as usize;
+            let bind_col_names = extract_bind_column_names(&stmt);
+            let mut values: Vec<(String, Vec<u8>)> = Vec::with_capacity(n_values);
+
+            for i in 0..n_values {
+                let name = if has_names && cursor.remaining() >= 2 {
+                    let name_len = cursor.get_u16() as usize;
+                    if cursor.remaining() >= name_len {
+                        let n = std::str::from_utf8(&cursor[..name_len])
+                            .unwrap_or("")
+                            .to_string();
+                        cursor.advance(name_len);
+                        n
+                    } else {
+                        break;
+                    }
+                } else {
+                    // Positional: use the column name from the prepared statement
+                    bind_col_names.get(i).cloned().unwrap_or_default()
+                };
+
+                if cursor.remaining() >= 4 {
+                    let val_len = cursor.get_i32();
+                    if val_len < 0 {
+                        // NULL value
+                        values.push((name, Vec::new()));
+                    } else {
+                        let val_len = val_len as usize;
+                        if cursor.remaining() >= val_len {
+                            let val_bytes = cursor[..val_len].to_vec();
+                            cursor.advance(val_len);
+                            values.push((name, val_bytes));
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Substitute bind markers in the statement with actual values.
+            substitute_bind_values(&mut stmt, &values, &plan.bound_columns);
+        }
+    }
+
     let ctx = build_request_context(auth_context, current_keyspace, cl);
 
-    match crate::router::route(state, &ctx, plan.statement.clone()).await {
+    match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
         Ok(RouteResult::SetKeyspace(ks, body)) => {
             *current_keyspace = Some(ks);
@@ -1161,6 +1225,124 @@ fn extract_bind_column_names(stmt: &crate::ast::Statement) -> Vec<String> {
             names
         }
         _ => Vec::new(),
+    }
+}
+
+/// Substitute bind markers in a statement with actual values from EXECUTE.
+///
+/// Matches positional values to bind markers in the order they appear.
+/// Uses the column type from `bound_columns` to decode raw bytes into
+/// the appropriate `Term` variant.
+fn substitute_bind_values(
+    stmt: &mut crate::ast::Statement,
+    values: &[(String, Vec<u8>)],
+    bound_columns: &[(String, CqlType)],
+) {
+    use crate::ast::{Assignment, Statement, Term};
+
+    // Build a map of column_name -> Term from the raw values.
+    let mut value_map: std::collections::HashMap<String, Term> = std::collections::HashMap::new();
+    for (i, (name, bytes)) in values.iter().enumerate() {
+        let cql_type = bound_columns
+            .get(i)
+            .map(|(_, t)| t.clone())
+            .unwrap_or(CqlType::Blob);
+
+        let term = if bytes.is_empty() {
+            Term::Null
+        } else {
+            raw_bytes_to_term(bytes, &cql_type)
+        };
+        value_map.insert(name.clone(), term);
+    }
+
+    // Replace BindMarker terms in the statement with resolved values.
+    match stmt {
+        Statement::Insert(ins) => {
+            for (col, val) in ins.columns.iter().zip(ins.values.iter_mut()) {
+                if matches!(val, Term::BindMarker(_)) {
+                    if let Some(resolved) = value_map.get(col) {
+                        *val = resolved.clone();
+                    }
+                }
+            }
+        }
+        Statement::Select(sel) => {
+            for wc in &mut sel.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    if let Some(resolved) = value_map.get(&wc.column) {
+                        wc.value = resolved.clone();
+                    }
+                }
+            }
+        }
+        Statement::Update(upd) => {
+            for assign in &mut upd.assignments {
+                match assign {
+                    Assignment::Simple { column, value }
+                        if matches!(value, Term::BindMarker(_)) =>
+                    {
+                        if let Some(resolved) = value_map.get(column) {
+                            *value = resolved.clone();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for wc in &mut upd.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    if let Some(resolved) = value_map.get(&wc.column) {
+                        wc.value = resolved.clone();
+                    }
+                }
+            }
+        }
+        Statement::Delete(del) => {
+            for wc in &mut del.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    if let Some(resolved) = value_map.get(&wc.column) {
+                        wc.value = resolved.clone();
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert raw CQL wire bytes to a Term based on the column type.
+fn raw_bytes_to_term(bytes: &[u8], cql_type: &CqlType) -> crate::ast::Term {
+    use crate::ast::Term;
+
+    match cql_type {
+        CqlType::Int if bytes.len() == 4 => {
+            Term::IntegerLiteral(i32::from_be_bytes(bytes.try_into().unwrap()) as i64)
+        }
+        CqlType::Bigint | CqlType::Counter | CqlType::Timestamp if bytes.len() == 8 => {
+            Term::IntegerLiteral(i64::from_be_bytes(bytes.try_into().unwrap()))
+        }
+        CqlType::Smallint if bytes.len() == 2 => {
+            Term::IntegerLiteral(i16::from_be_bytes(bytes.try_into().unwrap()) as i64)
+        }
+        CqlType::Tinyint if bytes.len() == 1 => Term::IntegerLiteral(bytes[0] as i8 as i64),
+        CqlType::Float if bytes.len() == 4 => {
+            Term::FloatLiteral(f32::from_be_bytes(bytes.try_into().unwrap()) as f64)
+        }
+        CqlType::Double if bytes.len() == 8 => {
+            Term::FloatLiteral(f64::from_be_bytes(bytes.try_into().unwrap()))
+        }
+        CqlType::Boolean if bytes.len() == 1 => Term::BoolLiteral(bytes[0] != 0),
+        CqlType::Varchar | CqlType::Ascii => {
+            Term::StringLiteral(String::from_utf8_lossy(bytes).to_string())
+        }
+        CqlType::Uuid | CqlType::Timeuuid if bytes.len() == 16 => {
+            let uuid = uuid::Uuid::from_bytes(bytes.try_into().unwrap());
+            Term::UuidLiteral(uuid)
+        }
+        _ => {
+            // Fallback: treat as blob
+            Term::BlobLiteral(bytes.to_vec())
+        }
     }
 }
 
