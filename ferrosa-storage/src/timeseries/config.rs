@@ -239,6 +239,36 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // --- Task 16: Cascade and ring param parsing tests ---
+
+    #[test]
+    fn config_cascade_multipliers() {
+        let mut ext = HashMap::new();
+        ext.insert("consolidation.interval".into(), "5m".into());
+        ext.insert("consolidation.functions".into(), "avg".into());
+        ext.insert("consolidation.target".into(), "t".into());
+        ext.insert("consolidation.columns".into(), "v".into());
+        ext.insert("consolidation.cascade_multipliers".into(), "3,4,6".into());
+
+        let config = ConsolidationConfig::from_extensions(&ext).unwrap().unwrap();
+        assert_eq!(config.cascade_multipliers, vec![3, 4, 6]);
+    }
+
+    #[test]
+    fn config_custom_ring_params() {
+        let mut ext = HashMap::new();
+        ext.insert("consolidation.interval".into(), "1m".into());
+        ext.insert("consolidation.functions".into(), "sum".into());
+        ext.insert("consolidation.target".into(), "t".into());
+        ext.insert("consolidation.columns".into(), "v".into());
+        ext.insert("consolidation.ring_capacity".into(), "1024".into());
+        ext.insert("consolidation.max_rings".into(), "5000".into());
+
+        let config = ConsolidationConfig::from_extensions(&ext).unwrap().unwrap();
+        assert_eq!(config.ring_capacity, 1024);
+        assert_eq!(config.max_rings, 5000);
+    }
+
     #[test]
     fn config_interval_micros() {
         let mut ext = HashMap::new();
