@@ -728,6 +728,61 @@ mod tests {
         assert_eq!(aggregator.ring_count(), 2);
     }
 
+    // --- Task 14: Late data detection in on_write ---
+
+    #[test]
+    fn aggregator_late_data_sends_task() {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ring_capacity: 64,
+            max_rings: 100,
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+        let aggregator = TimeSeriesAggregator::new(config, table_id.clone(), vec![0], tx);
+
+        let make_mutation = |ts: i64, val: f64| Mutation {
+            keyspace: "ks".to_string(),
+            table: "sensor".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"s1".to_vec())),
+            rows: vec![Row {
+                clustering: ts.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(val.to_be_bytes().to_vec(), ts))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+            timestamp: ts,
+        };
+
+        // Write at ts=15M (boundary at 20M).
+        aggregator.on_write(&table_id, &make_mutation(15_000_000, 1.0));
+
+        // Cross boundary to 30M.
+        aggregator.on_write(&table_id, &make_mutation(25_000_000, 2.0));
+        let _ = rx.try_recv(); // consume BoundaryCrossed
+
+        // Late write at ts=5M (before boundary - interval = 20M).
+        aggregator.on_write(&table_id, &make_mutation(5_000_000, 3.0));
+
+        // Should get a LateData task.
+        let task = rx.try_recv().expect("expected LateData task");
+        match task {
+            ConsolidationTask::LateData { late_timestamp, .. } => {
+                assert_eq!(late_timestamp, 5_000_000);
+            }
+            _ => panic!("expected LateData"),
+        }
+    }
+
     #[test]
     fn aggregator_drop_count_tracks_channel_full() {
         let config = ConsolidationConfig {
