@@ -20,6 +20,7 @@ object_store = { version = "0.11", features = ["aws"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 bytes = "1"
 sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 crossbeam-skiplist = { version = "0.1", optional = true }
 
 [features]

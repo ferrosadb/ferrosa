@@ -13,6 +13,7 @@
 //! - **Cache**: local disk cache with LRU eviction (Part C)
 //! - **Engine**: top-level `StorageEngine` composing all components (Part C)
 
+pub mod batchlog;
 pub mod cache;
 pub mod commitlog;
 pub mod compaction;
@@ -31,6 +32,7 @@ pub mod subscription_observer;
 pub mod upload;
 pub mod virtual_tables;
 
+pub use batchlog::{BatchlogConfig, BatchlogEntry, BatchlogManager};
 pub use cache::LocalCache;
 pub use commitlog::cdc::CdcReader;
 pub use commitlog::{

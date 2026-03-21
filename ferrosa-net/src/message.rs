@@ -120,6 +120,14 @@ pub enum Message {
     PairDdlForward(Bytes),
     /// DDL acknowledgment.
     PairDdlAck(Bytes),
+
+    // Batchlog
+    /// Batchlog write request (serialized BatchlogEntry).
+    BatchlogWrite(Bytes),
+    /// Batchlog delete request (batch UUID).
+    BatchlogDelete(Bytes),
+    /// Batchlog replay request (serialized BatchlogEntry).
+    BatchlogReplay(Bytes),
 }
 
 impl Message {
@@ -150,6 +158,9 @@ impl Message {
             Self::PairSchemaSync(_) => MsgType::PairSchemaSync,
             Self::PairDdlForward(_) => MsgType::PairDdlForward,
             Self::PairDdlAck(_) => MsgType::PairDdlAck,
+            Self::BatchlogWrite(_) => MsgType::BatchlogWrite,
+            Self::BatchlogDelete(_) => MsgType::BatchlogDelete,
+            Self::BatchlogReplay(_) => MsgType::BatchlogReplay,
         }
     }
 
@@ -219,7 +230,10 @@ impl Message {
             | Self::PairCatchUpResponse(b)
             | Self::PairSchemaSync(b)
             | Self::PairDdlForward(b)
-            | Self::PairDdlAck(b) => buf.put_slice(b),
+            | Self::PairDdlAck(b)
+            | Self::BatchlogWrite(b)
+            | Self::BatchlogDelete(b)
+            | Self::BatchlogReplay(b) => buf.put_slice(b),
         }
         Ok(())
     }
@@ -327,6 +341,9 @@ impl Message {
             MsgType::PairSchemaSync => Self::PairSchemaSync(body.split_to(body.remaining())),
             MsgType::PairDdlForward => Self::PairDdlForward(body.split_to(body.remaining())),
             MsgType::PairDdlAck => Self::PairDdlAck(body.split_to(body.remaining())),
+            MsgType::BatchlogWrite => Self::BatchlogWrite(body.split_to(body.remaining())),
+            MsgType::BatchlogDelete => Self::BatchlogDelete(body.split_to(body.remaining())),
+            MsgType::BatchlogReplay => Self::BatchlogReplay(body.split_to(body.remaining())),
         })
     }
 }
@@ -384,12 +401,51 @@ mod tests {
         assert_eq!(decoded, Message::RepairWrite(payload));
     }
 
+    #[test]
+    fn batchlog_write_roundtrip() {
+        let payload = Bytes::from_static(b"test-batchlog-entry");
+        let msg = Message::BatchlogWrite(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::BatchlogWrite);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::BatchlogWrite, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::BatchlogWrite(payload));
+    }
+
+    #[test]
+    fn batchlog_delete_roundtrip() {
+        let payload = Bytes::from_static(b"batch-uuid-bytes");
+        let msg = Message::BatchlogDelete(payload.clone());
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::BatchlogDelete, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::BatchlogDelete(payload));
+    }
+
+    #[test]
+    fn batchlog_replay_roundtrip() {
+        let payload = Bytes::from_static(b"replay-data");
+        let msg = Message::BatchlogReplay(payload.clone());
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::BatchlogReplay, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::BatchlogReplay(payload));
+    }
+
+    #[test]
+    fn batchlog_msg_types_from_u8() {
+        assert_eq!(MsgType::try_from(0x50).unwrap(), MsgType::BatchlogWrite);
+        assert_eq!(MsgType::try_from(0x51).unwrap(), MsgType::BatchlogDelete);
+        assert_eq!(MsgType::try_from(0x52).unwrap(), MsgType::BatchlogReplay);
+    }
+
     proptest! {
         #[test]
         fn decode_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
             let bytes = Bytes::from(data);
             // Try decoding as each message type — should return Ok or Err, never panic
-            for msg_type_byte in 0x01..=0x47u8 {
+            for msg_type_byte in 0x01..=0x52u8 {
                 if let Ok(msg_type) = MsgType::try_from(msg_type_byte) {
                     let _ = Message::decode(msg_type, &mut bytes.clone());
                 }

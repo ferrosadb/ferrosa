@@ -17,6 +17,9 @@ pub mod write_path;
 pub use config::ClusterConfig;
 pub use consistency::ConsistencyLevel;
 pub use controller::{ClusterStateHolder, ModeController, ModeControllerHandles};
+pub use coordinator::batch::{
+    BatchlogDeleteHandler, BatchlogReplayHandler, BatchlogReplayTask, BatchlogWriteHandler,
+};
 pub use coordinator::{ClusterCoordinator, MutationForwardHandler, RepairWriteHandler};
 pub use ddl_path::DdlPath;
 pub use error::{ClusterError, Result};

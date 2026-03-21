@@ -103,6 +103,30 @@ impl TokenRing {
             .collect()
     }
 
+    /// Select up to `count` batchlog replica host_ids, excluding the local node.
+    ///
+    /// Prefers nodes in a different datacenter. Falls back to same-DC nodes
+    /// if the cluster is single-DC. Returns an empty vec if this is a
+    /// single-node cluster.
+    pub fn select_batchlog_replicas(&self, local_node_id: u64, count: usize) -> Vec<uuid::Uuid> {
+        let local_dc = self.get_node(local_node_id).map(|n| n.data_center.clone());
+
+        // Collect all nodes except local.
+        let mut candidates: Vec<&NodeInfo> = self
+            .nodes
+            .iter()
+            .filter(|(id, _)| **id != local_node_id)
+            .map(|(_, info)| info)
+            .collect();
+
+        // Sort: different DC first, then same DC.
+        if let Some(ref dc) = local_dc {
+            candidates.sort_by_key(|n| if n.data_center == *dc { 1 } else { 0 });
+        }
+
+        candidates.iter().take(count).map(|n| n.host_id).collect()
+    }
+
     /// Update the lifecycle state of a node.
     pub fn set_node_state(&mut self, node_id: u64, state: crate::raft::NodeState) {
         if let Some(info) = self.nodes.get_mut(&node_id) {
@@ -608,6 +632,50 @@ mod tests {
         let strategy = ReplicationStrategy::NetworkTopology { dc_rf };
         let replicas = ring.replicas_for_strategy(0, &strategy);
         assert_eq!(replicas.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Batchlog replica selection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn select_batchlog_replicas_excludes_local() {
+        let mut ring = TokenRing::new();
+        let node1 = make_node("10.0.0.1:7000");
+        let node2 = make_node("10.0.0.2:7000");
+        let node3 = make_node("10.0.0.3:7000");
+
+        let id2 = node2.host_id;
+        let id3 = node3.host_id;
+
+        ring.add_node(1, node1);
+        ring.add_node(2, node2);
+        ring.add_node(3, node3);
+        ring.assign_tokens(1, &[0]);
+        ring.assign_tokens(2, &[100]);
+        ring.assign_tokens(3, &[200]);
+
+        let replicas = ring.select_batchlog_replicas(1, 2);
+        assert_eq!(replicas.len(), 2);
+        // Should not include the local node's host_id
+        let local_host_id = ring.get_node(1).unwrap().host_id;
+        assert!(!replicas.contains(&local_host_id));
+        // Should include both remote nodes
+        assert!(replicas.contains(&id2));
+        assert!(replicas.contains(&id3));
+    }
+
+    #[test]
+    fn select_batchlog_replicas_single_node_returns_empty() {
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node("10.0.0.1:7000"));
+        ring.assign_tokens(1, &[0]);
+
+        let replicas = ring.select_batchlog_replicas(1, 2);
+        assert!(
+            replicas.is_empty(),
+            "single node ring has no remote replicas"
+        );
     }
 
     use proptest::prelude::*;

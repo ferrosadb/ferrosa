@@ -119,6 +119,8 @@ pub struct StorageEngine {
     index_scheduler: Option<crate::index::IndexBuildScheduler>,
     /// Shared index state tracker.
     index_tracker: Arc<crate::index::IndexStateTracker>,
+    /// Batchlog manager for logged batch coordination.
+    batchlog: Option<crate::batchlog::BatchlogManager>,
     /// Background archiver task handle, if archiving is enabled.
     archiver_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -204,6 +206,9 @@ impl StorageEngine {
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
+            batchlog: Some(crate::batchlog::BatchlogManager::new(
+                crate::batchlog::BatchlogConfig::default(),
+            )),
             archiver_handle: None,
         })
     }
@@ -320,6 +325,9 @@ impl StorageEngine {
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
+            batchlog: Some(crate::batchlog::BatchlogManager::new(
+                crate::batchlog::BatchlogConfig::default(),
+            )),
             archiver_handle,
         })
     }
@@ -387,6 +395,9 @@ impl StorageEngine {
             async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
             index_scheduler,
             index_tracker,
+            batchlog: Some(crate::batchlog::BatchlogManager::new(
+                crate::batchlog::BatchlogConfig::default(),
+            )),
             archiver_handle: None,
         };
 
@@ -821,6 +832,53 @@ impl StorageEngine {
             // Notify observers after successful commit log + memtable write.
             self.dispatch_sync_observers(table_id, &mutation);
             self.dispatch_async_observers(table_id, &mutation);
+        }
+
+        Ok(())
+    }
+
+    /// Returns a reference to the batchlog manager, if enabled.
+    pub fn batchlog(&self) -> Option<&crate::batchlog::BatchlogManager> {
+        self.batchlog.as_ref()
+    }
+
+    /// Writes a batch of mutations atomically.
+    ///
+    /// All mutations are appended to the commit log first, then applied to
+    /// their respective memtables. If the process crashes between commit log
+    /// append and memtable apply, commit log replay will recover all mutations.
+    ///
+    /// This is the single-node fast path for logged batches: no batchlog
+    /// coordination needed because the commit log provides the atomicity
+    /// guarantee.
+    pub fn write_atomic_batch(&self, mutations: Vec<Mutation>) -> ferrosa_common::Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 1: Append all mutations to the commit log.
+        for m in &mutations {
+            self.commit_log.append(m)?;
+        }
+
+        // Phase 2: Apply to memtables.
+        let tables = self.tables.read();
+        for m in &mutations {
+            let table_id = TableId::new(&m.keyspace, &m.table);
+            let state = tables.get(&table_id).ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+            })?;
+            for row in &m.rows {
+                state.store.write(&m.key, row.clone())?;
+            }
+        }
+        drop(tables);
+
+        // Phase 3: Notify observers.
+        for m in &mutations {
+            let table_id = TableId::new(&m.keyspace, &m.table);
+            self.dispatch_sync_observers(&table_id, m);
+            self.dispatch_async_observers(&table_id, m);
         }
 
         Ok(())
@@ -2598,5 +2656,91 @@ mod tests {
             );
             assert_eq!(results[0].key.key.as_bytes(), b"user1");
         }
+    }
+
+    #[test]
+    fn engine_has_batchlog_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        assert!(engine.batchlog().is_some());
+    }
+
+    #[test]
+    fn engine_write_atomic_batch() {
+        use ferrosa_common::Token;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // Register two tables
+        use ferrosa_common::schema::TableSchema;
+        for tbl in &["tbl_a", "tbl_b"] {
+            let schema = TableSchema {
+                keyspace: "ks".to_string(),
+                table: tbl.to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![ColumnDefinition {
+                    name: "val".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                }],
+            };
+            engine.register_table(schema).unwrap();
+        }
+
+        let mutations = vec![
+            Mutation {
+                keyspace: "ks".to_string(),
+                table: "tbl_a".to_string(),
+                key: DecoratedKey {
+                    token: Token(1),
+                    key: PartitionKey::new(b"pk1".to_vec()),
+                },
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(b"val_a".to_vec(), 100))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(100),
+                }],
+                timestamp: 100,
+            },
+            Mutation {
+                keyspace: "ks".to_string(),
+                table: "tbl_b".to_string(),
+                key: DecoratedKey {
+                    token: Token(2),
+                    key: PartitionKey::new(b"pk2".to_vec()),
+                },
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(b"val_b".to_vec(), 100))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(100),
+                }],
+                timestamp: 100,
+            },
+        ];
+
+        engine.write_atomic_batch(mutations).unwrap();
+
+        // Both writes should be visible
+        let table_a = TableId::new("ks", "tbl_a");
+        let key_a = DecoratedKey {
+            token: Token(1),
+            key: PartitionKey::new(b"pk1".to_vec()),
+        };
+        let result_a = engine.read(&table_a, &key_a).unwrap();
+        assert!(result_a.is_some(), "mutation to tbl_a should be visible");
+
+        let table_b = TableId::new("ks", "tbl_b");
+        let key_b = DecoratedKey {
+            token: Token(2),
+            key: PartitionKey::new(b"pk2".to_vec()),
+        };
+        let result_b = engine.read(&table_b, &key_b).unwrap();
+        assert!(result_b.is_some(), "mutation to tbl_b should be visible");
     }
 }

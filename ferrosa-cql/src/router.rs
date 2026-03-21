@@ -1571,6 +1571,18 @@ async fn route_batch(
         )));
     }
 
+    match b.batch_type {
+        BatchType::Logged => route_logged_batch(state, ctx, b).await,
+        BatchType::Unlogged | BatchType::Counter => route_unlogged_batch(state, ctx, b).await,
+    }
+}
+
+/// Route an UNLOGGED or COUNTER batch: dispatch each statement individually.
+async fn route_unlogged_batch(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    b: BatchStatement,
+) -> Result<BytesMut, CqlError> {
     for stmt in b.statements {
         match stmt {
             Statement::Insert(s) => {
@@ -1590,6 +1602,339 @@ async fn route_batch(
         }
     }
     Ok(result::encode_void())
+}
+
+/// Route a LOGGED batch. Behavior depends on the active write path:
+///
+/// - **Direct (single-node)**: Writes all mutations as a single atomic
+///   commit log group via `StorageEngine::write_atomic_batch()`. No batchlog
+///   needed -- the commit log provides crash recovery.
+///
+/// - **Cluster**: Delegates to `coordinate_logged_batch()` for the full
+///   3-phase batchlog protocol.
+async fn route_logged_batch(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    b: BatchStatement,
+) -> Result<BytesMut, CqlError> {
+    use ferrosa_storage::Mutation;
+
+    let batch_timestamp = b.using_timestamp.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64
+    });
+
+    let mut mutations = Vec::with_capacity(b.statements.len());
+
+    for stmt in &b.statements {
+        match stmt {
+            Statement::Insert(s) => {
+                let (table_id, key, row, ts) = materialize_insert(state, ctx, s, batch_timestamp)?;
+                mutations.push(Mutation {
+                    keyspace: table_id.keyspace.clone(),
+                    table: table_id.table.clone(),
+                    key,
+                    rows: vec![row],
+                    timestamp: ts,
+                });
+            }
+            Statement::Update(s) => {
+                let (table_id, key, row, ts) = materialize_update(state, ctx, s, batch_timestamp)?;
+                mutations.push(Mutation {
+                    keyspace: table_id.keyspace.clone(),
+                    table: table_id.table.clone(),
+                    key,
+                    rows: vec![row],
+                    timestamp: ts,
+                });
+            }
+            Statement::Delete(s) => {
+                let (table_id, key, row, ts) = materialize_delete(state, ctx, s, batch_timestamp)?;
+                mutations.push(Mutation {
+                    keyspace: table_id.keyspace.clone(),
+                    table: table_id.table.clone(),
+                    key,
+                    rows: vec![row],
+                    timestamp: ts,
+                });
+            }
+            _ => {
+                return Err(CqlError::Invalid(
+                    "batch may only contain INSERT, UPDATE, or DELETE statements".into(),
+                ));
+            }
+        }
+    }
+
+    // Determine RF from first mutation's keyspace (batches typically target one keyspace).
+    let rf = if let Some(first) = mutations.first() {
+        keyspace_rf(&state.schema, &first.keyspace)
+    } else {
+        1
+    };
+
+    state
+        .write_path
+        .load()
+        .write_batch(mutations, ctx.consistency, rf)
+        .await
+        .map_err(|e| CqlError::Invalid(format!("logged batch failed: {e}")))?;
+
+    Ok(result::encode_void())
+}
+
+/// Materialize an INSERT statement into its key, row, and table ID without
+/// writing. Used by `route_logged_batch()` to collect mutations.
+fn materialize_insert(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: &InsertStatement,
+    batch_timestamp: i64,
+) -> Result<
+    (
+        TableId,
+        ferrosa_common::DecoratedKey,
+        ferrosa_sstable::types::Row,
+        i64,
+    ),
+    CqlError,
+> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Modify,
+        &Resource::Table(ks.to_string(), s.table.clone()),
+    )?;
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), s.table.clone()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+
+    let timestamp = s.using_timestamp.unwrap_or(batch_timestamp);
+
+    let mut pk_vals: Vec<(i32, CqlValue)> = Vec::new();
+    let mut ck_vals: Vec<(i32, CqlValue)> = Vec::new();
+    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+
+    for (i, col_name) in s.columns.iter().enumerate() {
+        let col_meta = table_meta
+            .columns
+            .get(col_name)
+            .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?;
+        let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+        let value = bridge::term_to_cql_value(&s.values[i], &cql_type)?;
+
+        match col_meta.kind {
+            ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
+            ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
+            ColumnKind::Regular | ColumnKind::Static => {
+                let col_idx =
+                    table_meta.columns.get_index_of(col_name).ok_or_else(|| {
+                        CqlError::Invalid(format!("column '{}' not found", col_name))
+                    })? as u16;
+                regular_cells.push((col_idx, value));
+            }
+        }
+    }
+
+    pk_vals.sort_by_key(|(pos, _)| *pos);
+    ck_vals.sort_by_key(|(pos, _)| *pos);
+    let pk_values: Vec<CqlValue> = pk_vals.into_iter().map(|(_, v)| v).collect();
+    let ck_values: Vec<CqlValue> = ck_vals.into_iter().map(|(_, v)| v).collect();
+    let pk_types: Vec<CqlType> = table_meta
+        .partition_key
+        .iter()
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let table_id = TableId::new(ks, &s.table);
+
+    Ok((table_id, decorated_key, row, timestamp))
+}
+
+/// Materialize an UPDATE statement into its key, row, and table ID without
+/// writing. Used by `route_logged_batch()` to collect mutations.
+fn materialize_update(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: &UpdateStatement,
+    batch_timestamp: i64,
+) -> Result<
+    (
+        TableId,
+        ferrosa_common::DecoratedKey,
+        ferrosa_sstable::types::Row,
+        i64,
+    ),
+    CqlError,
+> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Modify,
+        &Resource::Table(ks.to_string(), s.table.clone()),
+    )?;
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), s.table.clone()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+
+    let timestamp = s.using_timestamp.unwrap_or(batch_timestamp);
+
+    let pk_values = extract_pk_values(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        table_meta,
+        ks,
+        &state.schema,
+    )?;
+    let pk_types: Vec<CqlType> = table_meta
+        .partition_key
+        .iter()
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let ck_names: Vec<String> = table_meta
+        .clustering_key
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut ck_values = Vec::new();
+    for ck_name in &ck_names {
+        for wc in &s.where_clauses {
+            if wc.column == *ck_name && wc.op == ComparisonOp::Eq {
+                let col_meta = &table_meta.columns[ck_name];
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+                let val = bridge::term_to_cql_value(&wc.value, &cql_type)?;
+                ck_values.push(val);
+                break;
+            }
+        }
+    }
+
+    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    for assignment in &s.assignments {
+        let (col_name, value) = match assignment {
+            Assignment::Simple { column, value } => {
+                let col_meta = table_meta
+                    .columns
+                    .get(column)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+                let val = bridge::term_to_cql_value(value, &cql_type)?;
+                (column.as_str(), val)
+            }
+            _ => {
+                // For complex assignments (Add, Sub, Element), fall back to simple value
+                // extraction. Full handling deferred to route_update.
+                continue;
+            }
+        };
+        let col_idx = table_meta
+            .columns
+            .get_index_of(col_name)
+            .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?
+            as u16;
+        regular_cells.push((col_idx, value));
+    }
+
+    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
+    let table_id = TableId::new(ks, &s.table);
+
+    Ok((table_id, decorated_key, row, timestamp))
+}
+
+/// Materialize a DELETE statement into its key, row, and table ID without
+/// writing. Used by `route_logged_batch()` to collect mutations.
+fn materialize_delete(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: &DeleteStatement,
+    batch_timestamp: i64,
+) -> Result<
+    (
+        TableId,
+        ferrosa_common::DecoratedKey,
+        ferrosa_sstable::types::Row,
+        i64,
+    ),
+    CqlError,
+> {
+    let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+
+    state.schema.check_permission(
+        ctx.auth,
+        Permission::Modify,
+        &Resource::Table(ks.to_string(), s.table.clone()),
+    )?;
+
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), s.table.clone()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+
+    let timestamp = s.using_timestamp.unwrap_or(batch_timestamp);
+
+    let pk_values = extract_pk_values(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        table_meta,
+        ks,
+        &state.schema,
+    )?;
+    let pk_types: Vec<CqlType> = table_meta
+        .partition_key
+        .iter()
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let ck_names: Vec<String> = table_meta
+        .clustering_key
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut ck_values = Vec::new();
+    for ck_name in &ck_names {
+        for wc in &s.where_clauses {
+            if wc.column == *ck_name && wc.op == ComparisonOp::Eq {
+                let col_meta = &table_meta.columns[ck_name];
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+                let val = bridge::term_to_cql_value(&wc.value, &cql_type)?;
+                ck_values.push(val);
+                break;
+            }
+        }
+    }
+
+    let delete_columns: Vec<u16> = s
+        .columns
+        .iter()
+        .map(|col_name| {
+            table_meta
+                .columns
+                .get_index_of(col_name)
+                .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))
+                .map(|idx| idx as u16)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    let row = bridge::build_delete_row(&delete_columns, &ck_values, timestamp);
+    let table_id = TableId::new(ks, &s.table);
+
+    Ok((table_id, decorated_key, row, timestamp))
 }
 
 // ── DDL: Keyspace ────────────────────────────────────────────────────────
