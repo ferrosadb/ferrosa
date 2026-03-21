@@ -1213,6 +1213,25 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Flush all non-empty memtables regardless of size threshold.
+    ///
+    /// Used before S3 schema persistence to ensure data and metadata
+    /// stay in sync.  Equivalent to Cassandra's SNAPSHOT flush reason.
+    pub fn flush_all(&self) -> ferrosa_common::Result<()> {
+        let tables = self.tables.read();
+        let to_flush: Vec<TableId> = tables
+            .iter()
+            .filter(|(_, state)| state.store.memtable_size() > 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+        drop(tables);
+
+        for table_id in to_flush {
+            self.flush(&table_id)?;
+        }
+        Ok(())
+    }
+
     /// Polls for completed compaction results and integrates them.
     pub fn poll_compactions(&self) {
         let results = self.compaction_executor.poll_results();
@@ -1926,6 +1945,48 @@ mod tests {
         engine.flush_if_needed().unwrap();
 
         assert_eq!(engine.sstable_count(&tid), 1);
+    }
+
+    #[test]
+    fn flush_all_flushes_small_memtables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        // Default threshold is 64 MB — our test row is well below that.
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("k1"), make_row(b"tiny", 1000), 1000)
+            .unwrap();
+
+        // Memtable should have data.
+        assert!(
+            engine.memtable_size(&tid) > 0,
+            "memtable should be non-empty after write"
+        );
+
+        // flush_if_needed should NOT flush — data is below 64 MB threshold.
+        engine.flush_if_needed().unwrap();
+        assert!(
+            engine.memtable_size(&tid) > 0,
+            "flush_if_needed should skip small memtable"
+        );
+        assert_eq!(engine.sstable_count(&tid), 0, "no SSTable should exist yet");
+
+        // flush_all should flush regardless of size.
+        engine.flush_all().unwrap();
+        assert_eq!(
+            engine.memtable_size(&tid),
+            0,
+            "memtable should be empty after flush_all"
+        );
+        assert_eq!(
+            engine.sstable_count(&tid),
+            1,
+            "one SSTable should exist after flush_all"
+        );
     }
 
     /// A test observer that counts `on_write` calls.
