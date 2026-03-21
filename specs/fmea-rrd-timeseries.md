@@ -44,12 +44,12 @@ RPN = Severity x Occurrence x Detection. **Action required for RPN >= 50.**
 
 | ID | RPN | Status | Evidence |
 |----|-----|--------|----------|
-| FM1 | 189 | **In progress** | Fix agent running |
-| FM2 | 384 | **In progress** | Fix agent running |
-| FM3 | 162 | **In progress** | Fix agent running |
-| FM4 | 175 | **In progress** | Fix agent running |
-| FM5 | 189 | **In progress** | Fix agent running |
-| FM6 | 168 | **In progress** | Fix agent running |
+| FM1 | 189 | **Mitigated** | `45e5d27` — validate interval > 0 and capacity > 0 at parse |
+| FM2 | 384 | **Mitigated** | `d4f0782` — tracing::warn + decode_failures counter |
+| FM3 | 162 | **Mitigated** | `54cb8d9` — cap loop at 1000 iterations, direct calc on overflow |
+| FM4 | 175 | **Mitigated** | `a831458` — channel_capacity configurable, default 1024 |
+| FM5 | 189 | **Mitigated** | `563ae61` — decode_typed_numeric with column type metadata |
+| FM6 | 168 | **Mitigated** | `be94fca` — max_pending limit (default 10,000) with eviction |
 | FM7 | 96 | Open | DDL validation needed |
 | FM8 | 147 | Open | NaN filtering needed |
 | FM9 | 64 | Open | Multiplier cap needed |
