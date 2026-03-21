@@ -1257,6 +1257,11 @@ impl StorageEngine {
             }
         }
 
+        // Drain index scheduler.
+        if let Some(ref scheduler) = self.index_scheduler {
+            scheduler.shutdown_with_timeout(std::time::Duration::from_secs(30));
+        }
+
         // Stop compaction.
         self.compaction_executor.shutdown();
 
