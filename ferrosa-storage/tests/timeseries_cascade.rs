@@ -18,7 +18,6 @@ use ferrosa_storage::timeseries::aggregator::{
 use ferrosa_storage::timeseries::config::ConsolidationConfig;
 use ferrosa_storage::timeseries::consolidation::{consolidate_values, ConsolidationFn};
 use ferrosa_storage::TableId;
-use smallvec::SmallVec;
 
 fn make_mutation(table: &str, pk: &[u8], ts: i64, value: f64) -> ferrosa_storage::Mutation {
     ferrosa_storage::Mutation {
