@@ -1,4 +1,4 @@
-//! WASM function executor with compilation cache.
+//! WASM function executor with SlotMap-backed function registry.
 //!
 //! Provides real Wasmtime Component Model compilation and invocation for
 //! CQL User-Defined Functions. The executor validates WASM at compile time
@@ -10,9 +10,11 @@
 //! Instead, we use the dynamic `Val` API with `Val::Variant` to correctly encode
 //! the `cql-value` discriminant names and payloads matching the WIT contract.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use ferrosa_common::{CqlType, CqlValue};
+use slotmap::{DefaultKey, SlotMap};
 use wasmtime::component::{Component, Linker, Val};
 use wasmtime::{Engine, Store};
 
@@ -20,27 +22,42 @@ use crate::convert::{cql_to_wit, wit_to_cql, WitCqlValue};
 use crate::error::UdfError;
 use crate::sandbox::SandboxConfig;
 
-/// Whether a compiled WASM component implements a scalar UDF or aggregate UDA.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FunctionKind {
-    Scalar,
-    Aggregate,
-}
+/// Opaque handle to a compiled function. O(1) array-index lookup on hot path.
+/// Ephemeral: per-process only, never serialized or sent over the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FunctionKey(DefaultKey);
 
 /// Compiled WASM component ready for instantiation.
 struct CompiledFunction {
     component: Component,
-    kind: FunctionKind,
+}
+
+/// Registry mapping (keyspace, name) -> compiled function via SlotMap.
+///
+/// The `slots` SlotMap provides O(1) generational-index lookup on the hot path.
+/// The `index` HashMap maps the logical function name to its SlotMap key.
+struct FunctionRegistry {
+    slots: SlotMap<DefaultKey, Arc<CompiledFunction>>,
+    index: HashMap<(String, String), FunctionKey>,
+}
+
+impl FunctionRegistry {
+    fn new() -> Self {
+        Self {
+            slots: SlotMap::new(),
+            index: HashMap::new(),
+        }
+    }
 }
 
 /// Executor for WASM-based User-Defined Functions.
 ///
-/// Manages the Wasmtime engine, compilation cache, and sandbox policy.
+/// Manages the Wasmtime engine, function registry, and sandbox policy.
 /// Thread-safe — can be shared across async tasks via `Arc`.
 pub struct UdfExecutor {
     engine: Engine,
     config: SandboxConfig,
-    cache: moka::sync::Cache<(String, String), Arc<CompiledFunction>>,
+    registry: RwLock<FunctionRegistry>,
 }
 
 impl UdfExecutor {
@@ -54,21 +71,18 @@ impl UdfExecutor {
         let engine = Engine::new(&engine_config)
             .map_err(|e| UdfError::CompilationFailed(format!("engine creation failed: {e}")))?;
 
-        let cache = moka::sync::Cache::builder()
-            .max_capacity(config.cache_capacity)
-            .build();
-
         Ok(Self {
             engine,
             config,
-            cache,
+            registry: RwLock::new(FunctionRegistry::new()),
         })
     }
 
     /// Pre-compile a WASM binary. Called on INSERT into wasm_binaries.
     ///
     /// Validates the WASM component bytes using the Wasmtime compiler.
-    /// The compiled component is cached for later invocation.
+    /// The compiled component is registered for later invocation.
+    /// If an entry already exists for (keyspace, name) it is replaced (CREATE OR REPLACE).
     pub fn compile(&self, keyspace: &str, name: &str, wasm_bytes: &[u8]) -> Result<(), UdfError> {
         if wasm_bytes.len() > self.config.max_wasm_size {
             return Err(UdfError::BinaryTooLarge {
@@ -80,233 +94,69 @@ impl UdfExecutor {
         let component = Component::new(&self.engine, wasm_bytes)
             .map_err(|e| UdfError::CompilationFailed(format!("{e}")))?;
 
-        // Detect kind by instantiating temporarily and checking exports.
-        let kind = {
-            let linker = Linker::<()>::new(&self.engine);
-            let mut probe_store = Store::new(&self.engine, ());
-            probe_store
-                .set_fuel(self.config.max_fuel)
-                .map_err(|e| UdfError::CompilationFailed(format!("fuel setup failed: {e}")))?;
-            let instance = linker
-                .instantiate(&mut probe_store, &component)
-                .map_err(|e| UdfError::CompilationFailed(format!("instantiation failed: {e}")))?;
-            if instance.get_func(&mut probe_store, "invoke").is_some() {
-                FunctionKind::Scalar
-            } else if instance.get_func(&mut probe_store, "accumulate").is_some() {
-                FunctionKind::Aggregate
-            } else {
-                return Err(UdfError::CompilationFailed(
-                    "component exports neither 'invoke' (UDF) nor 'accumulate' (UDA)".into(),
-                ));
-            }
-        };
-
         tracing::info!(
             keyspace,
             name,
             size = wasm_bytes.len(),
-            ?kind,
             "compiled WASM function"
         );
 
-        self.cache.insert(
-            (keyspace.to_string(), name.to_string()),
-            Arc::new(CompiledFunction { component, kind }),
-        );
+        let key = (keyspace.to_string(), name.to_string());
+        let compiled = Arc::new(CompiledFunction { component });
+
+        let mut reg = self.registry.write().expect("registry lock poisoned");
+        // Remove old slot if replacing an existing entry.
+        if let Some(existing) = reg.index.remove(&key) {
+            reg.slots.remove(existing.0);
+        }
+        let slot_key = reg.slots.insert(compiled);
+        reg.index.insert(key, FunctionKey(slot_key));
         Ok(())
     }
 
-    /// Invalidate cached compilation (on CREATE OR REPLACE).
+    /// Invalidate a registered function (on DROP or CREATE OR REPLACE pre-clear).
     pub fn invalidate(&self, keyspace: &str, name: &str) {
-        self.cache
-            .invalidate(&(keyspace.to_string(), name.to_string()));
-    }
-
-    /// Return the `FunctionKind` for a cached function, or `None` if not compiled.
-    pub fn get_kind(&self, keyspace: &str, name: &str) -> Option<FunctionKind> {
-        self.cache
-            .get(&(keyspace.to_string(), name.to_string()))
-            .map(|cf| cf.kind)
-    }
-
-    /// Create a fresh store and instantiated component for one UDA aggregation run.
-    ///
-    /// The store is configured with `max_aggregate_fuel` so the entire accumulation
-    /// lifecycle (init → accumulate* → finalize) shares a single fuel budget.
-    pub fn create_uda_instance(
-        &self,
-        keyspace: &str,
-        name: &str,
-    ) -> Result<(Store<()>, wasmtime::component::Instance), UdfError> {
         let key = (keyspace.to_string(), name.to_string());
-        let compiled = self.cache.get(&key).ok_or_else(|| UdfError::NotFound {
-            keyspace: keyspace.to_string(),
-            name: name.to_string(),
-        })?;
-
-        let mut store = Store::new(&self.engine, ());
-        store
-            .set_fuel(self.config.max_aggregate_fuel)
-            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
-        store.epoch_deadline_trap();
-        store.set_epoch_deadline(1);
-
-        let linker = Linker::<()>::new(&self.engine);
-        let instance = linker
-            .instantiate(&mut store, &compiled.component)
-            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
-
-        Ok((store, instance))
-    }
-
-    /// Call the UDA `init` export with an optional initial condition.
-    ///
-    /// `init_cond` is passed as `option<cql-value>` encoded as `Val::Option`.
-    pub fn uda_init(
-        &self,
-        store: &mut Store<()>,
-        instance: &wasmtime::component::Instance,
-        init_cond: Option<&CqlValue>,
-    ) -> Result<(), UdfError> {
-        let func = instance.get_func(&mut *store, "init").ok_or_else(|| {
-            UdfError::ExecutionFailed("UDA component does not export 'init'".into())
-        })?;
-
-        let opt_val = match init_cond {
-            Some(v) => {
-                let wit = cql_to_wit(v);
-                Val::Option(Some(Box::new(wit_cql_value_to_val(&wit))))
-            }
-            None => Val::Option(None),
-        };
-
-        let mut results = vec![Val::Bool(false)];
-        func.call(&mut *store, &[opt_val], &mut results)
-            .map_err(map_wasm_error)?;
-        func.post_return(&mut *store)
-            .map_err(|e| UdfError::ExecutionFailed(format!("post_return failed: {e}")))?;
-
-        check_unit_result(&results[0], "init")
-    }
-
-    /// Call the UDA `accumulate` export with a row's argument values.
-    pub fn uda_accumulate(
-        &self,
-        store: &mut Store<()>,
-        instance: &wasmtime::component::Instance,
-        args: &[CqlValue],
-    ) -> Result<(), UdfError> {
-        let func = instance
-            .get_func(&mut *store, "accumulate")
-            .ok_or_else(|| {
-                UdfError::ExecutionFailed("UDA component does not export 'accumulate'".into())
-            })?;
-
-        let wit_args: Vec<WitCqlValue> = args.iter().map(cql_to_wit).collect();
-        let args_val = wit_cql_list_to_val(&wit_args);
-
-        let mut results = vec![Val::Bool(false)];
-        func.call(&mut *store, &[args_val], &mut results)
-            .map_err(map_wasm_error)?;
-        func.post_return(&mut *store)
-            .map_err(|e| UdfError::ExecutionFailed(format!("post_return failed: {e}")))?;
-
-        check_unit_result(&results[0], "accumulate")
-    }
-
-    /// Call the UDA `finalize` export and convert the result to `CqlValue`.
-    pub fn uda_finalize(
-        &self,
-        store: &mut Store<()>,
-        instance: &wasmtime::component::Instance,
-        return_type: &CqlType,
-    ) -> Result<CqlValue, UdfError> {
-        let func = instance.get_func(&mut *store, "finalize").ok_or_else(|| {
-            UdfError::ExecutionFailed("UDA component does not export 'finalize'".into())
-        })?;
-
-        let mut results = vec![Val::Bool(false)];
-        func.call(&mut *store, &[], &mut results)
-            .map_err(map_wasm_error)?;
-        func.post_return(&mut *store)
-            .map_err(|e| UdfError::ExecutionFailed(format!("post_return failed: {e}")))?;
-
-        val_to_cql_result(&results[0], return_type)
-    }
-
-    /// Call the UDA `serialize-state` export and return the state as raw bytes.
-    pub fn uda_serialize_state(
-        &self,
-        store: &mut Store<()>,
-        instance: &wasmtime::component::Instance,
-    ) -> Result<Vec<u8>, UdfError> {
-        let func = instance
-            .get_func(&mut *store, "serialize-state")
-            .ok_or_else(|| {
-                UdfError::ExecutionFailed("UDA component does not export 'serialize-state'".into())
-            })?;
-
-        let mut results = vec![Val::Bool(false)];
-        func.call(&mut *store, &[], &mut results)
-            .map_err(map_wasm_error)?;
-        func.post_return(&mut *store)
-            .map_err(|e| UdfError::ExecutionFailed(format!("post_return failed: {e}")))?;
-
-        // Expect result<list<u8>, string>
-        match &results[0] {
-            Val::Result(r) => match r.as_ref() {
-                Ok(Some(inner)) => match inner.as_ref() {
-                    Val::List(items) => items
-                        .iter()
-                        .map(|v| match v {
-                            Val::U8(b) => Ok(*b),
-                            other => Err(UdfError::TypeMismatch(format!(
-                                "serialize-state: expected U8, got {other:?}"
-                            ))),
-                        })
-                        .collect(),
-                    other => Err(UdfError::TypeMismatch(format!(
-                        "serialize-state: expected List, got {other:?}"
-                    ))),
-                },
-                Ok(None) => Ok(vec![]),
-                Err(Some(err_val)) => {
-                    let msg = match err_val.as_ref() {
-                        Val::String(s) => s.clone(),
-                        other => format!("serialize-state error: {other:?}"),
-                    };
-                    Err(UdfError::ExecutionFailed(msg))
-                }
-                Err(None) => Err(UdfError::ExecutionFailed(
-                    "serialize-state returned error".into(),
-                )),
-            },
-            other => Err(UdfError::TypeMismatch(format!(
-                "serialize-state: expected Result, got {other:?}"
-            ))),
+        let mut reg = self.registry.write().expect("registry lock poisoned");
+        if let Some(fk) = reg.index.remove(&key) {
+            reg.slots.remove(fk.0);
         }
     }
 
-    /// Call the UDA `merge` export to fold serialized remote state into current state.
-    pub fn uda_merge(
+    /// Resolve a function name to its opaque key and kind for query planning.
+    ///
+    /// Acquires a read lock and returns immediately. The returned `FunctionKey`
+    /// can be passed to `call_by_key` on the hot path without another name lookup.
+    pub fn resolve(
         &self,
-        store: &mut Store<()>,
-        instance: &wasmtime::component::Instance,
-        state: &[u8],
-    ) -> Result<(), UdfError> {
-        let func = instance.get_func(&mut *store, "merge").ok_or_else(|| {
-            UdfError::ExecutionFailed("UDA component does not export 'merge'".into())
-        })?;
+        keyspace: &str,
+        name: &str,
+    ) -> Result<(FunctionKey, FunctionKind), UdfError> {
+        let reg = self.registry.read().expect("registry lock poisoned");
+        let fk = *reg
+            .index
+            .get(&(keyspace.to_string(), name.to_string()))
+            .ok_or_else(|| UdfError::NotFound {
+                keyspace: keyspace.to_string(),
+                name: name.to_string(),
+            })?;
+        // All functions registered via compile() are scalar UDFs.
+        // UDA support will extend this when UDA metadata is tracked.
+        Ok((fk, FunctionKind::Scalar))
+    }
 
-        let state_val = Val::List(state.iter().map(|b| Val::U8(*b)).collect());
-
-        let mut results = vec![Val::Bool(false)];
-        func.call(&mut *store, &[state_val], &mut results)
-            .map_err(map_wasm_error)?;
-        func.post_return(&mut *store)
-            .map_err(|e| UdfError::ExecutionFailed(format!("post_return failed: {e}")))?;
-
-        check_unit_result(&results[0], "merge")
+    /// Look up the kind of a compiled function by name.
+    ///
+    /// Returns `NotFound` if the function has not been compiled.
+    pub fn get_kind(&self, keyspace: &str, name: &str) -> Result<FunctionKind, UdfError> {
+        let reg = self.registry.read().expect("registry lock poisoned");
+        reg.index
+            .get(&(keyspace.to_string(), name.to_string()))
+            .map(|_| FunctionKind::Scalar)
+            .ok_or_else(|| UdfError::NotFound {
+                keyspace: keyspace.to_string(),
+                name: name.to_string(),
+            })
     }
 
     /// Invoke a UDF. Returns the function's result.
@@ -329,11 +179,17 @@ impl UdfExecutor {
         _arg_types: &[CqlType],
         return_type: &CqlType,
     ) -> Result<CqlValue, UdfError> {
-        let key = (keyspace.to_string(), func_name.to_string());
-        let compiled = self.cache.get(&key).ok_or_else(|| UdfError::NotFound {
-            keyspace: keyspace.to_string(),
-            name: func_name.to_string(),
-        })?;
+        let compiled = {
+            let reg = self.registry.read().expect("registry lock poisoned");
+            let fk = reg
+                .index
+                .get(&(keyspace.to_string(), func_name.to_string()))
+                .ok_or_else(|| UdfError::NotFound {
+                    keyspace: keyspace.to_string(),
+                    name: func_name.to_string(),
+                })?;
+            Arc::clone(reg.slots.get(fk.0).expect("index/slots out of sync"))
+        };
 
         // Create a store with fuel metering
         let mut store = Store::new(&self.engine, ());
@@ -364,7 +220,16 @@ impl UdfExecutor {
         let mut results = vec![Val::Bool(false)]; // placeholder for result slot
         invoke_func
             .call(&mut store, &[args_val], &mut results)
-            .map_err(map_wasm_error)?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("fuel") {
+                    UdfError::ResourceExhausted(format!("out of fuel: {msg}"))
+                } else if msg.contains("epoch") {
+                    UdfError::ResourceExhausted(format!("execution timeout: {msg}"))
+                } else {
+                    UdfError::ExecutionFailed(msg)
+                }
+            })?;
 
         // Post-call cleanup required by wasmtime component model
         invoke_func
@@ -380,51 +245,144 @@ impl UdfExecutor {
 
         val_to_cql_result(&result_val, return_type)
     }
-}
 
-// ---------------------------------------------------------------------------
-// WASM error helpers
-// ---------------------------------------------------------------------------
+    /// Invoke a UDF by opaque key (hot path — O(1) SlotMap lookup).
+    ///
+    /// The caller must have obtained `key` from `resolve()` at query-plan time.
+    /// Acquires a read lock, clones the `Arc`, releases the lock, then proceeds
+    /// identically to `call()`.
+    pub fn call_by_key(
+        &self,
+        key: FunctionKey,
+        args: Vec<CqlValue>,
+        _arg_types: &[CqlType],
+        return_type: &CqlType,
+    ) -> Result<CqlValue, UdfError> {
+        let compiled = {
+            let reg = self.registry.read().expect("registry lock poisoned");
+            Arc::clone(reg.slots.get(key.0).ok_or(UdfError::KeyInvalid)?)
+        };
 
-/// Map a wasmtime trap/error from a component call to a `UdfError`.
-///
-/// Distinguishes fuel exhaustion and epoch timeout from general execution failures.
-fn map_wasm_error(e: wasmtime::Error) -> UdfError {
-    let msg = e.to_string();
-    if msg.contains("fuel") {
-        UdfError::ResourceExhausted(format!("out of fuel: {msg}"))
-    } else if msg.contains("epoch") {
-        UdfError::ResourceExhausted(format!("execution timeout: {msg}"))
-    } else {
-        UdfError::ExecutionFailed(msg)
+        let mut store = Store::new(&self.engine, ());
+        store
+            .set_fuel(self.config.max_fuel)
+            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+
+        store.epoch_deadline_trap();
+        store.set_epoch_deadline(1);
+
+        let linker = Linker::<()>::new(&self.engine);
+        let instance = linker
+            .instantiate(&mut store, &compiled.component)
+            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+
+        let invoke_func = instance.get_func(&mut store, "invoke").ok_or_else(|| {
+            UdfError::ExecutionFailed("component does not export 'invoke' function".into())
+        })?;
+
+        let wit_args: Vec<WitCqlValue> = args.iter().map(cql_to_wit).collect();
+        let args_val = wit_cql_list_to_val(&wit_args);
+
+        let mut results = vec![Val::Bool(false)];
+        invoke_func
+            .call(&mut store, &[args_val], &mut results)
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("fuel") {
+                    UdfError::ResourceExhausted(format!("out of fuel: {msg}"))
+                } else if msg.contains("epoch") {
+                    UdfError::ResourceExhausted(format!("execution timeout: {msg}"))
+                } else {
+                    UdfError::ExecutionFailed(msg)
+                }
+            })?;
+
+        invoke_func
+            .post_return(&mut store)
+            .map_err(|e| UdfError::ExecutionFailed(format!("post_return failed: {e}")))?;
+
+        let result_val = results
+            .into_iter()
+            .next()
+            .ok_or_else(|| UdfError::ExecutionFailed("invoke returned no result".into()))?;
+
+        val_to_cql_result(&result_val, return_type)
+    }
+
+    /// Create a fresh UDA instance by opaque key (hot path — O(1) SlotMap lookup).
+    ///
+    /// Returns a `(Store, Instance)` pair ready for UDA state accumulation.
+    /// The caller must have obtained `key` from `resolve()` at query-plan time.
+    pub fn create_uda_instance_by_key(
+        &self,
+        key: FunctionKey,
+    ) -> Result<(Store<()>, wasmtime::component::Instance), UdfError> {
+        let compiled = {
+            let reg = self.registry.read().expect("registry lock poisoned");
+            Arc::clone(reg.slots.get(key.0).ok_or(UdfError::KeyInvalid)?)
+        };
+
+        let mut store = Store::new(&self.engine, ());
+        store
+            .set_fuel(self.config.max_aggregate_fuel)
+            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+
+        store.epoch_deadline_trap();
+        store.set_epoch_deadline(1);
+
+        let linker = Linker::<()>::new(&self.engine);
+        let instance = linker
+            .instantiate(&mut store, &compiled.component)
+            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+
+        Ok((store, instance))
+    }
+
+    /// Create a fresh UDA instance by name.
+    ///
+    /// Acquires a read lock, clones the `Arc`, releases the lock, then
+    /// creates a `Store` with the aggregate fuel cap and instantiates the component.
+    pub fn create_uda_instance(
+        &self,
+        keyspace: &str,
+        name: &str,
+    ) -> Result<(Store<()>, wasmtime::component::Instance), UdfError> {
+        let compiled = {
+            let reg = self.registry.read().expect("registry lock poisoned");
+            let fk = reg
+                .index
+                .get(&(keyspace.to_string(), name.to_string()))
+                .ok_or_else(|| UdfError::NotFound {
+                    keyspace: keyspace.to_string(),
+                    name: name.to_string(),
+                })?;
+            Arc::clone(reg.slots.get(fk.0).expect("index/slots out of sync"))
+        };
+
+        let mut store = Store::new(&self.engine, ());
+        store
+            .set_fuel(self.config.max_aggregate_fuel)
+            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+
+        store.epoch_deadline_trap();
+        store.set_epoch_deadline(1);
+
+        let linker = Linker::<()>::new(&self.engine);
+        let instance = linker
+            .instantiate(&mut store, &compiled.component)
+            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+
+        Ok((store, instance))
     }
 }
 
-/// Inspect a `result<_, string>` Val and return `Ok(())` or propagate the error string.
-///
-/// Used for UDA exports (init, accumulate, merge) whose WIT return type carries
-/// no success payload.
-fn check_unit_result(val: &Val, export_name: &str) -> Result<(), UdfError> {
-    match val {
-        Val::Result(r) => match r.as_ref() {
-            Ok(_) => Ok(()),
-            Err(Some(err_val)) => {
-                let msg = match err_val.as_ref() {
-                    Val::String(s) => s.clone(),
-                    other => format!("{export_name} error: {other:?}"),
-                };
-                Err(UdfError::ExecutionFailed(msg))
-            }
-            Err(None) => Err(UdfError::ExecutionFailed(format!(
-                "{export_name} returned error"
-            ))),
-        },
-        // If the component returned () directly (no result wrapper), treat as success.
-        Val::Tuple(fields) if fields.is_empty() => Ok(()),
-        other => Err(UdfError::TypeMismatch(format!(
-            "{export_name}: expected Result, got {other:?}"
-        ))),
-    }
+/// The kind of a compiled function — scalar UDF or aggregate UDA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionKind {
+    /// User-Defined Function: maps arguments -> return value.
+    Scalar,
+    /// User-Defined Aggregate: accumulates state across rows.
+    Aggregate,
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +393,7 @@ fn check_unit_result(val: &Val, export_name: &str) -> Result<(), UdfError> {
 ///
 /// Each element is encoded as `Val::Variant` with the discriminant name
 /// matching the WIT `cql-value` variant case (e.g. `"null"`, `"int-val"`, etc.).
-pub(crate) fn wit_cql_list_to_val(values: &[WitCqlValue]) -> Val {
+fn wit_cql_list_to_val(values: &[WitCqlValue]) -> Val {
     let items: Vec<Val> = values.iter().map(wit_cql_value_to_val).collect();
     Val::List(items)
 }
@@ -474,7 +432,7 @@ pub(crate) fn wit_cql_list_to_val(values: &[WitCqlValue]) -> Val {
 /// | `tuple-val(list<…>)`   | `"tuple-val"`     | `Val::List(Vec<cql-value variant>)` |
 /// | `udt-val(list<…>)`     | `"udt-val"`       | `Val::List(Vec<Tuple<str, cv>>)`    |
 /// | `counter-val(s64)`     | `"counter-val"`   | `Val::S64`                          |
-pub(crate) fn wit_cql_value_to_val(v: &WitCqlValue) -> Val {
+fn wit_cql_value_to_val(v: &WitCqlValue) -> Val {
     match v {
         WitCqlValue::Null => Val::Variant("null".into(), None),
         WitCqlValue::IntVal(i) => variant_with("int-val", Val::S32(*i)),
@@ -981,22 +939,15 @@ mod tests {
     #[test]
     fn invalidate_removes_cached_function() {
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
-        let key = ("ks".to_string(), "func".to_string());
-        executor.cache.insert(
-            key.clone(),
-            Arc::new(CompiledFunction {
-                component: Component::new(
-                    &executor.engine,
-                    // Minimal valid WASM component (empty)
-                    minimal_component_bytes(),
-                )
-                .unwrap(),
-                kind: FunctionKind::Scalar,
-            }),
-        );
-        assert!(executor.cache.contains_key(&key));
+        // Insert via compile() so the registry is populated.
+        executor
+            .compile("ks", "func", &minimal_component_bytes())
+            .unwrap();
+        // Confirm it is present.
+        assert!(executor.resolve("ks", "func").is_ok());
         executor.invalidate("ks", "func");
-        assert!(!executor.cache.contains_key(&key));
+        // Confirm it is gone.
+        assert!(executor.resolve("ks", "func").is_err());
     }
 
     #[test]
