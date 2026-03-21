@@ -180,6 +180,9 @@ pub struct IndexBuildScheduler {
     task_tx: std::sync::mpsc::Sender<IndexBuildJob>,
     handles: Mutex<Vec<thread::JoinHandle<()>>>,
     stop_flag: Arc<AtomicBool>,
+    /// Root data directory for writing sidecar files.
+    #[allow(dead_code)]
+    data_dir: Option<PathBuf>,
 }
 
 impl IndexBuildScheduler {
@@ -234,6 +237,45 @@ impl IndexBuildScheduler {
             task_tx,
             handles: Mutex::new(handles),
             stop_flag,
+            data_dir: None,
+        }
+    }
+
+    /// Creates a scheduler with backend and data directory for sidecar writes.
+    pub fn with_backend_and_data_dir(
+        worker_count: usize,
+        tracker: Arc<IndexStateTracker>,
+        backend: Arc<dyn IndexBuildBackend>,
+        data_dir: PathBuf,
+    ) -> Self {
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<IndexBuildJob>();
+        let task_rx = Arc::new(Mutex::new(task_rx));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let mut handles = Vec::with_capacity(worker_count);
+
+        for i in 0..worker_count {
+            let rx = Arc::clone(&task_rx);
+            let stop = Arc::clone(&stop_flag);
+            let tracker = Arc::clone(&tracker);
+            let backend = Arc::clone(&backend);
+            let data_dir = data_dir.clone();
+
+            let handle = thread::Builder::new()
+                .name(format!("index-builder-{i}"))
+                .spawn(move || {
+                    Self::worker_loop_full(&rx, &stop, &tracker, &*backend, &data_dir);
+                })
+                .expect("failed to spawn index builder thread");
+
+            handles.push(handle);
+        }
+
+        Self {
+            task_tx,
+            handles: Mutex::new(handles),
+            stop_flag,
+            data_dir: Some(data_dir),
         }
     }
 
@@ -271,6 +313,60 @@ impl IndexBuildScheduler {
                     let (keyspace, table) = &job.table;
                     match backend.build(&job) {
                         Ok(_result) => {
+                            tracker.mark_indexed(keyspace, table, &job.index_name, &job.sstable_id);
+                        }
+                        Err(err) => {
+                            tracker.mark_failed(
+                                keyspace,
+                                table,
+                                &job.index_name,
+                                err,
+                                std::time::Duration::from_secs(60),
+                            );
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    /// Worker loop that delegates to backend and writes sidecar files.
+    fn worker_loop_full(
+        rx: &Mutex<std::sync::mpsc::Receiver<IndexBuildJob>>,
+        stop: &AtomicBool,
+        tracker: &IndexStateTracker,
+        backend: &dyn IndexBuildBackend,
+        data_dir: &std::path::Path,
+    ) {
+        use crate::index::sidecar::SidecarWriter;
+
+        while !stop.load(Ordering::Acquire) {
+            let job = {
+                let rx_guard = rx.lock();
+                rx_guard.recv_timeout(std::time::Duration::from_millis(100))
+            };
+
+            match job {
+                Ok(job) => {
+                    let (keyspace, table) = &job.table;
+                    match backend.build(&job) {
+                        Ok(result) => {
+                            // Write sidecar files.
+                            for (index_name, entries) in &result.sidecar_entries {
+                                if entries.is_empty() {
+                                    continue;
+                                }
+                                let path = data_dir
+                                    .join(format!("{}-{}.sidecar", job.sstable_id, index_name));
+                                if let Err(e) = SidecarWriter::write(&path, entries) {
+                                    eprintln!(
+                                        "[index-build] failed to write sidecar {}: {e}",
+                                        path.display()
+                                    );
+                                }
+                            }
                             tracker.mark_indexed(keyspace, table, &job.index_name, &job.sstable_id);
                         }
                         Err(err) => {
@@ -674,6 +770,79 @@ mod tests {
             state.status
         );
         assert_eq!(state.total_build_errors, 1);
+
+        scheduler.shutdown();
+    }
+
+    #[test]
+    fn scheduler_writes_sidecar_files_from_backend_result() {
+        use ferrosa_index::{IndexKey, RowPosition};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_dir = dir.path().to_path_buf();
+
+        struct SidecarBackend;
+        impl IndexBuildBackend for SidecarBackend {
+            fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
+                let mut sidecar_entries = HashMap::new();
+                sidecar_entries.insert(
+                    job.index_name.clone(),
+                    vec![(
+                        IndexKey(b"val1".to_vec()),
+                        RowPosition {
+                            partition_key: b"pk1".to_vec(),
+                            clustering_key: vec![],
+                        },
+                    )],
+                );
+                Ok(IndexBuildResult {
+                    sstable_id: job.sstable_id.clone(),
+                    sidecar_entries,
+                    build_duration: Duration::from_millis(1),
+                })
+            }
+        }
+
+        let tracker = Arc::new(IndexStateTracker::new());
+        tracker.register_index("ks", "tbl", "my_idx");
+        tracker.mark_pending("ks", "tbl", "my_idx", "1", 100);
+
+        let backend: Arc<dyn IndexBuildBackend> = Arc::new(SidecarBackend);
+        let scheduler = IndexBuildScheduler::with_backend_and_data_dir(
+            1,
+            Arc::clone(&tracker),
+            backend,
+            sidecar_dir.clone(),
+        );
+
+        scheduler
+            .submit(IndexBuildJob {
+                sstable_id: "1".to_string(),
+                index_name: "my_idx".to_string(),
+                index_type: IndexType::BTree,
+                table: ("ks".to_string(), "tbl".to_string()),
+                priority: BuildPriority::Normal,
+                enqueued_at: Instant::now(),
+                column_position: 0,
+            })
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Verify sidecar file was written.
+        let sidecar_path = sidecar_dir.join("1-my_idx.sidecar");
+        assert!(
+            sidecar_path.exists(),
+            "sidecar file should exist at {}",
+            sidecar_path.display()
+        );
+
+        // Verify contents.
+        let reader = crate::index::sidecar::SidecarReader::open(&sidecar_path).unwrap();
+        assert_eq!(reader.entry_count(), 1);
+        let results = reader.lookup(&IndexKey(b"val1".to_vec())).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].partition_key, b"pk1");
 
         scheduler.shutdown();
     }
