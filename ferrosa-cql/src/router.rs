@@ -2375,14 +2375,23 @@ async fn route_create_table(
             // Register with storage engine
             let storage_schema = table_meta.to_storage_schema();
             state.engine.register_table(storage_schema)?;
+
+            // Auto-create cascade tables if consolidation.cascade is enabled.
+            create_cascade_tables_if_needed(state, &table_meta)?;
         }
         DdlPath::Pair(coordinator) => {
-            let op = DdlOperation::CreateTable(Box::new(table_meta));
+            let op = DdlOperation::CreateTable(Box::new(table_meta.clone()));
             coordinator.coordinate_ddl(op).await?;
+
+            // Auto-create cascade tables after primary table is created.
+            create_cascade_tables_if_needed(state, &table_meta)?;
         }
         DdlPath::Cluster { .. } => {
-            let op = DdlOperation::CreateTable(Box::new(table_meta));
+            let op = DdlOperation::CreateTable(Box::new(table_meta.clone()));
             ddl.execute(op).await.map_err(CqlError::from)?;
+
+            // Auto-create cascade tables after primary table is created.
+            create_cascade_tables_if_needed(state, &table_meta)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -2396,6 +2405,174 @@ async fn route_create_table(
         "TABLE",
         &[ks, &s.name],
     ))
+}
+
+/// If the table has `consolidation.cascade = true` in its extensions,
+/// auto-create the downstream cascade tables (e.g., sensor_5m, sensor_15m, sensor_1h).
+fn create_cascade_tables_if_needed(
+    state: &SharedState,
+    source: &TableMetadata,
+) -> Result<(), CqlError> {
+    use ferrosa_storage::timeseries::config::{generate_cascade_chain, ConsolidationConfig};
+
+    let config = match ConsolidationConfig::from_extensions(&source.extensions) {
+        Some(Ok(c)) if c.cascade => c,
+        Some(Err(e)) => {
+            tracing::warn!(
+                table = %source.name,
+                "invalid consolidation extensions: {e}"
+            );
+            return Ok(());
+        }
+        _ => return Ok(()), // no consolidation or cascade disabled
+    };
+
+    let chain = generate_cascade_chain(&source.name, &config);
+    if chain.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        table = %source.name,
+        cascade_len = chain.len(),
+        "auto-creating cascade tables"
+    );
+
+    for spec in &chain {
+        // Build columns: same partition key + clustering key as source,
+        // plus output columns (e.g., value_min, value_max, value_avg, value_stddev).
+        let mut columns = IndexMap::new();
+
+        // Copy partition key columns from source.
+        for pk_name in &source.partition_key {
+            if let Some(col) = source.columns.get(pk_name) {
+                columns.insert(pk_name.clone(), col.clone());
+            }
+        }
+
+        // Clustering key: `ts timestamp` (DESC).
+        let ck_name = source
+            .clustering_key
+            .first()
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| "ts".to_string());
+
+        if !columns.contains_key(&ck_name) {
+            columns.insert(
+                ck_name.clone(),
+                ColumnMetadata {
+                    name: ck_name.clone(),
+                    kind: ColumnKind::Clustering,
+                    position: 0,
+                    column_type: "timestamp".to_string(),
+                    clustering_order: SchemaClusteringOrder::Desc,
+                    mask: None,
+                },
+            );
+        }
+
+        // Add output columns (value_min, value_max, value_avg, etc.).
+        for (i, col_name) in spec.output_columns.iter().enumerate() {
+            columns.insert(
+                col_name.clone(),
+                ColumnMetadata {
+                    name: col_name.clone(),
+                    kind: ColumnKind::Regular,
+                    position: i as i32,
+                    column_type: "double".to_string(),
+                    clustering_order: SchemaClusteringOrder::None,
+                    mask: None,
+                },
+            );
+        }
+
+        // Build extensions for this tier's consolidation config.
+        let mut extensions = HashMap::new();
+        if let Some(ref target) = spec.target {
+            extensions.insert("consolidation.target".to_string(), target.clone());
+            extensions.insert(
+                "consolidation.interval".to_string(),
+                format_consolidation_interval(&spec.interval),
+            );
+            // Inherit functions and columns from source config.
+            let fn_str: String = config
+                .functions
+                .iter()
+                .filter_map(|f| consolidation_fn_name(f))
+                .collect::<Vec<_>>()
+                .join(",");
+            extensions.insert("consolidation.functions".to_string(), fn_str);
+            extensions.insert(
+                "consolidation.columns".to_string(),
+                spec.output_columns
+                    .iter()
+                    .filter_map(|c| c.rsplit_once('_').map(|(base, _)| base.to_string()))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+
+        let cascade_table = TableMetadata {
+            keyspace: source.keyspace.clone(),
+            name: spec.table_name.clone(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: source.partition_key.clone(),
+            clustering_key: vec![(ck_name.clone(), SchemaClusteringOrder::Desc)],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions,
+            is_system: false,
+        };
+
+        // Idempotent: silently succeeds if table already exists.
+        state
+            .schema
+            .create_table_internal(cascade_table.clone())
+            .map_err(|e| CqlError::ServerError(format!("cascade table creation failed: {e}")))?;
+
+        let storage_schema = cascade_table.to_storage_schema();
+        // Ignore error if already registered.
+        let _ = state.engine.register_table(storage_schema);
+
+        tracing::info!(
+            cascade_table = %spec.table_name,
+            "created cascade table"
+        );
+    }
+
+    Ok(())
+}
+
+/// Format a Duration as a consolidation interval string (e.g., "5m", "15m", "1h").
+fn format_consolidation_interval(d: &std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// Map a ConsolidationFn to its string name for extension serialization.
+fn consolidation_fn_name(
+    f: &ferrosa_storage::timeseries::consolidation::ConsolidationFn,
+) -> Option<&'static str> {
+    use ferrosa_storage::timeseries::consolidation::ConsolidationFn;
+    match f {
+        ConsolidationFn::Min => Some("min"),
+        ConsolidationFn::Max => Some("max"),
+        ConsolidationFn::Avg => Some("avg"),
+        ConsolidationFn::Median => Some("median"),
+        ConsolidationFn::StdDev => Some("stddev"),
+        ConsolidationFn::Count => Some("count"),
+        ConsolidationFn::Sum => Some("sum"),
+        _ => None,
+    }
 }
 
 async fn route_alter_table(

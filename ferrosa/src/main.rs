@@ -416,6 +416,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shared_state.query_tracker.clone(),
         ),
     ));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::consolidation_status::ConsolidationStatusTable::new(
+            schema.clone(),
+        ),
+    ));
     // TODO: Register StorageStatsTable once StorageEngine implements StorageStatsProvider.
     // Until then, GET /api/storage_stats will return [].
 
