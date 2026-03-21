@@ -43,6 +43,8 @@ pub struct IndexBuildJob {
     pub priority: BuildPriority,
     /// When this job was enqueued.
     pub enqueued_at: Instant,
+    /// Column position within the row to index.
+    pub column_position: usize,
 }
 
 /// Strategy for executing index builds.
@@ -137,9 +139,12 @@ impl IndexBuildBackend for LocalBackend {
         for partition in &all_partitions {
             let pk_bytes = partition.key.key.as_bytes().to_vec();
             for row in &partition.rows {
-                // Find the cell at the first column position (column ordinal 0).
-                // The column_position field will be added in Task 5.
-                if let Some((_col_pos, cell)) = row.cells.first() {
+                // Find the cell at the declared column position.
+                let cell_opt = row
+                    .cells
+                    .iter()
+                    .find(|(pos, _)| *pos == job.column_position as u16);
+                if let Some((_col_pos, cell)) = cell_opt {
                     if let Some(ref value) = cell.value {
                         entries.push((
                             IndexKey(value.clone()),
@@ -275,6 +280,7 @@ mod tests {
             table: ("ks".to_string(), "tbl".to_string()),
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
+            column_position: 0,
         };
 
         scheduler.submit(job).unwrap();
@@ -327,6 +333,7 @@ mod tests {
                     table: ("ks".to_string(), "tbl".to_string()),
                     priority: BuildPriority::Initial,
                     enqueued_at: Instant::now(),
+                    column_position: 0,
                 })
                 .unwrap();
         }
@@ -390,6 +397,7 @@ mod tests {
             table: ("ks".to_string(), "tbl".to_string()),
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
+            column_position: 0,
         };
         let result = backend.build(&job).unwrap();
         assert_eq!(result.sstable_id, "mock");
@@ -405,6 +413,7 @@ mod tests {
             table: ("ks".to_string(), "tbl".to_string()),
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
+            column_position: 0,
         };
         let result = backend.build(&job);
         assert!(result.is_ok());
@@ -492,6 +501,7 @@ mod tests {
             table: ("ks".to_string(), "tbl".to_string()),
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
+            column_position: 0,
         };
         let result = backend.build(&job).unwrap();
 
@@ -512,6 +522,20 @@ mod tests {
     }
 
     #[test]
+    fn index_build_job_has_column_position() {
+        let job = IndexBuildJob {
+            sstable_id: "sst-001".to_string(),
+            index_name: "val_idx".to_string(),
+            index_type: IndexType::BTree,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 2,
+        };
+        assert_eq!(job.column_position, 2);
+    }
+
+    #[test]
     fn local_backend_returns_error_for_missing_sstable() {
         let dir = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(dir.path().to_path_buf());
@@ -522,6 +546,7 @@ mod tests {
             table: ("ks".to_string(), "tbl".to_string()),
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
+            column_position: 0,
         };
         let result = backend.build(&job);
         assert!(result.is_err(), "expected error for missing SSTable");
