@@ -748,25 +748,32 @@ fn handle_prepare(
     let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
 
     // Build bound_columns: resolve bind marker column names to their CQL types
-    // from the table schema.
+    // from the table schema. If any column can't be resolved, fall back to empty
+    // metadata (columns_count=0) which drivers handle gracefully.
     let bind_col_names = extract_bind_column_names(&stmt);
     let bound_columns: Vec<(String, CqlType)> = {
         let snapshot = state.schema.snapshot();
         let key = (table_ks.clone(), table_name.clone());
-        if let Some(table_meta) = snapshot.tables.get(&key) {
-            bind_col_names
-                .iter()
-                .map(|col_name| {
-                    let cql_type = table_meta
-                        .columns
-                        .get(col_name)
-                        .map(|cm| col_type_str_to_cql_type(&cm.column_type))
-                        .unwrap_or(CqlType::Blob);
-                    (col_name.clone(), cql_type)
-                })
-                .collect()
-        } else {
-            Vec::new()
+        match snapshot.tables.get(&key) {
+            Some(table_meta) => {
+                let mut cols = Vec::with_capacity(bind_col_names.len());
+                let mut all_resolved = true;
+                for col_name in &bind_col_names {
+                    if let Some(cm) = table_meta.columns.get(col_name) {
+                        cols.push((col_name.clone(), col_type_str_to_cql_type(&cm.column_type)));
+                    } else {
+                        // Column not found in schema — can't build reliable metadata.
+                        all_resolved = false;
+                        break;
+                    }
+                }
+                if all_resolved {
+                    cols
+                } else {
+                    Vec::new()
+                }
+            }
+            None => Vec::new(),
         }
     };
 
@@ -775,7 +782,11 @@ fn handle_prepare(
 
     // Compute pk_indexes: map each partition key column to its position in the
     // bind variable list. If any PK column is not bound, pass empty (pk_count=0).
-    let pk_indexes = compute_pk_indexes(&stmt, state, &table_ks, &table_name);
+    let pk_indexes = if bound_columns.is_empty() {
+        Vec::new() // No bind metadata — pk_indexes must also be empty
+    } else {
+        compute_pk_indexes(&stmt, state, &table_ks, &table_name)
+    };
 
     let plan = PreparedPlan {
         id,

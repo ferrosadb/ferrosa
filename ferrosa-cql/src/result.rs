@@ -571,4 +571,98 @@ mod tests {
         let idx1 = i16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
         assert_eq!(idx1, 2, "second PK column at bind index 2");
     }
+
+    /// Exhaustive byte-level test: INSERT INTO t (id uuid, flag boolean) VALUES (?, ?)
+    /// Verifies every byte matches CQL protocol v4 PreparedMetadata spec.
+    #[test]
+    fn encode_prepared_uuid_boolean_full_parse() {
+        let id = [0x42u8; 16];
+        let buf = encode_prepared(
+            &id,
+            &["id".into(), "flag".into()],
+            &[CqlType::Uuid, CqlType::Boolean],
+            &[], // INSERT — no result columns
+            &[],
+            "test_ks",
+            "test_bool",
+            &[0], // PK "id" at bind index 0
+        );
+
+        let mut pos = 0usize;
+
+        // kind = 0x0004 (Prepared)
+        assert_eq!(
+            i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()),
+            0x0004
+        );
+        pos += 4;
+
+        // prepared id: [u16 len=16][16 bytes]
+        assert_eq!(
+            u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()),
+            16
+        );
+        pos += 2 + 16;
+
+        // --- Bind metadata ---
+        // flags
+        let flags = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(flags & 0x0001, 0x0001, "Global_tables_spec should be set");
+        pos += 4;
+
+        // columns_count
+        let col_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(col_count, 2, "2 bind variables");
+        pos += 4;
+
+        // pk_count
+        let pk_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(pk_count, 1, "1 PK column");
+        pos += 4;
+
+        // pk_indexes[0]
+        let pk_idx = i16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
+        assert_eq!(pk_idx, 0, "PK at bind index 0");
+        pos += 2;
+
+        // Global table spec: keyspace "test_ks"
+        let ks_len = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        assert_eq!(&buf[pos + 2..pos + 2 + ks_len], b"test_ks");
+        pos += 2 + ks_len;
+
+        // Global table spec: table "test_bool"
+        let tbl_len = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        assert_eq!(&buf[pos + 2..pos + 2 + tbl_len], b"test_bool");
+        pos += 2 + tbl_len;
+
+        // Column 0: "id" uuid (0x000C)
+        let name_len = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        assert_eq!(&buf[pos + 2..pos + 2 + name_len], b"id");
+        pos += 2 + name_len;
+        let type_id = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
+        assert_eq!(type_id, 0x000C, "uuid type_id");
+        pos += 2;
+
+        // Column 1: "flag" boolean (0x0004)
+        let name_len = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        assert_eq!(&buf[pos + 2..pos + 2 + name_len], b"flag");
+        pos += 2 + name_len;
+        let type_id = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
+        assert_eq!(type_id, 0x0004, "boolean type_id");
+        pos += 2;
+
+        // --- Result metadata ---
+        // flags = No_metadata (0x0004)
+        let result_flags = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(result_flags, 0x0004, "No_metadata flag for INSERT");
+        pos += 4;
+
+        // columns_count = 0
+        let result_col_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(result_col_count, 0);
+        pos += 4;
+
+        // Must be at the exact end of the buffer
+        assert_eq!(pos, buf.len(), "no trailing bytes — exact CQL frame");
+    }
 }
