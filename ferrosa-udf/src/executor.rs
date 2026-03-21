@@ -1302,6 +1302,126 @@ mod tests {
         }
     }
 
+    // ---- Cache lifecycle tests ----
+
+    #[test]
+    fn compile_valid_component_populates_cache() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+
+        // Before compile: resolve should fail with NotFound.
+        assert!(
+            executor.resolve("ks", "func").is_err(),
+            "resolve should fail before compile()"
+        );
+
+        executor
+            .compile("ks", "func", &minimal_component_bytes())
+            .unwrap();
+
+        // After compile: resolve should succeed.
+        assert!(
+            executor.resolve("ks", "func").is_ok(),
+            "registry should contain compiled function after compile()"
+        );
+    }
+
+    #[test]
+    fn compile_same_name_replaces_cached_entry() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+
+        // Compile once and capture the FunctionKey.
+        executor
+            .compile("ks", "func", &minimal_component_bytes())
+            .unwrap();
+        let (first_key, _) = executor.resolve("ks", "func").unwrap();
+
+        // Compile same (keyspace, name) again — old slot is removed, new one inserted.
+        executor
+            .compile("ks", "func", &minimal_component_bytes())
+            .unwrap();
+        let (second_key, _) = executor.resolve("ks", "func").unwrap();
+
+        // The SlotMap keys should differ because the old slot was replaced.
+        assert_ne!(
+            first_key, second_key,
+            "recompiling should produce a new FunctionKey (old slot removed)"
+        );
+    }
+
+    #[test]
+    fn compile_different_keyspaces_are_independent() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor
+            .compile("ks1", "func", &minimal_component_bytes())
+            .unwrap();
+        executor
+            .compile("ks2", "func", &minimal_component_bytes())
+            .unwrap();
+
+        assert!(
+            executor.resolve("ks1", "func").is_ok(),
+            "ks1/func should be registered"
+        );
+        assert!(
+            executor.resolve("ks2", "func").is_ok(),
+            "ks2/func should be registered"
+        );
+
+        // Invalidating one keyspace should not affect the other.
+        executor.invalidate("ks1", "func");
+        assert!(
+            executor.resolve("ks1", "func").is_err(),
+            "ks1/func should be gone after invalidate"
+        );
+        assert!(
+            executor.resolve("ks2", "func").is_ok(),
+            "ks2/func should still be registered"
+        );
+    }
+
+    #[test]
+    fn call_compiled_component_without_invoke_export_fails() {
+        // The minimal component has no "invoke" export, so call() should fail
+        // with an execution error (not NotFound).
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor
+            .compile("ks", "noinvoke", &minimal_component_bytes())
+            .unwrap();
+
+        let err = executor
+            .call("ks", "noinvoke", vec![], &[], &CqlType::Int)
+            .unwrap_err();
+        assert!(
+            matches!(err, UdfError::ExecutionFailed(ref msg) if msg.contains("invoke")),
+            "expected ExecutionFailed mentioning 'invoke', got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn invalidate_then_call_returns_not_found() {
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor
+            .compile("ks", "func", &minimal_component_bytes())
+            .unwrap();
+        executor.invalidate("ks", "func");
+
+        let err = executor
+            .call("ks", "func", vec![], &[], &CqlType::Int)
+            .unwrap_err();
+        assert!(
+            matches!(err, UdfError::NotFound { .. }),
+            "expected NotFound after invalidate, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn invalidate_nonexistent_is_noop() {
+        // Invalidating a function that was never compiled should not panic.
+        let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
+        executor.invalidate("ks", "never_compiled");
+        // No assertion needed — the test passes if it doesn't panic.
+    }
+
     /// Generate a minimal valid WASM component binary.
     /// This is the smallest valid component that wasmtime will accept.
     fn minimal_component_bytes() -> Vec<u8> {
