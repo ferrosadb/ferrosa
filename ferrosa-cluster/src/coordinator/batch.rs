@@ -146,6 +146,147 @@ impl ClusterCoordinator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RPC Handlers for batchlog messages
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+
+use ferrosa_net::message::Message;
+use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+use ferrosa_storage::engine::StorageEngine;
+
+/// RPC handler that receives `BatchlogWrite` messages and stores them
+/// in the local batchlog.
+pub struct BatchlogWriteHandler {
+    storage: Arc<StorageEngine>,
+}
+
+impl BatchlogWriteHandler {
+    pub fn new(storage: Arc<StorageEngine>) -> Self {
+        Self { storage }
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for BatchlogWriteHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let body = match msg {
+            Message::BatchlogWrite(b) => b,
+            _ => return None,
+        };
+
+        let entry = match BatchlogEntry::deserialize(&body) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("batchlog write handler: deserialize failed: {e}");
+                return None;
+            }
+        };
+
+        if let Some(batchlog) = self.storage.batchlog() {
+            if let Err(e) = batchlog.write_entry(entry) {
+                tracing::warn!("batchlog write handler: store failed: {e}");
+                return None;
+            }
+        }
+
+        // ACK with empty BatchlogWrite response.
+        Some(Message::BatchlogWrite(Bytes::new()))
+    }
+}
+
+/// RPC handler that receives `BatchlogDelete` messages and removes entries
+/// from the local batchlog.
+pub struct BatchlogDeleteHandler {
+    storage: Arc<StorageEngine>,
+}
+
+impl BatchlogDeleteHandler {
+    pub fn new(storage: Arc<StorageEngine>) -> Self {
+        Self { storage }
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for BatchlogDeleteHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let body = match msg {
+            Message::BatchlogDelete(b) => b,
+            _ => return None,
+        };
+
+        if body.len() < 16 {
+            tracing::warn!("batchlog delete handler: body too short for UUID");
+            return None;
+        }
+
+        let mut uuid_bytes = [0u8; 16];
+        uuid_bytes.copy_from_slice(&body[..16]);
+        let batch_id = Uuid::from_bytes(uuid_bytes);
+
+        if let Some(batchlog) = self.storage.batchlog() {
+            if let Err(e) = batchlog.delete_entry(batch_id) {
+                tracing::warn!("batchlog delete handler: remove failed: {e}");
+                return None;
+            }
+        }
+
+        // ACK with empty BatchlogDelete response.
+        Some(Message::BatchlogDelete(Bytes::new()))
+    }
+}
+
+/// RPC handler that receives `BatchlogReplay` messages and applies the
+/// contained mutations to local storage.
+pub struct BatchlogReplayHandler {
+    storage: Arc<StorageEngine>,
+}
+
+impl BatchlogReplayHandler {
+    pub fn new(storage: Arc<StorageEngine>) -> Self {
+        Self { storage }
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for BatchlogReplayHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let body = match msg {
+            Message::BatchlogReplay(b) => b,
+            _ => return None,
+        };
+
+        let entry = match BatchlogEntry::deserialize(&body) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("batchlog replay handler: deserialize failed: {e}");
+                return None;
+            }
+        };
+
+        // Apply each mutation to local storage.
+        for m in &entry.mutations {
+            let table_id = ferrosa_storage::TableId::new(&m.keyspace, &m.table);
+            for row in &m.rows {
+                if let Err(e) = self
+                    .storage
+                    .write(&table_id, &m.key, row.clone(), m.timestamp)
+                {
+                    tracing::warn!(
+                        table = %table_id,
+                        "batchlog replay handler: write failed: {e}"
+                    );
+                }
+            }
+        }
+
+        Some(Message::BatchlogReplay(Bytes::new()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +417,94 @@ mod tests {
 
         // Batchlog should be empty (entry was deleted after success).
         assert_eq!(batchlog.entry_count(), 0);
+
+        // Mutation should be visible in storage.
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let result = storage.read(&table_id, &test_key()).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn batchlog_write_handler_stores_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+
+        let handler = BatchlogWriteHandler::new(storage.clone());
+
+        let entry = BatchlogEntry {
+            id: Uuid::new_v4(),
+            created_at: 1000,
+            mutations: vec![],
+        };
+        let entry_id = entry.id;
+        let payload = Bytes::from(entry.serialize());
+        let msg = Message::BatchlogWrite(payload);
+
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let response = handler.handle(peer_id, msg).await;
+
+        // Should ACK with a BatchlogWrite response (empty body = success).
+        assert!(response.is_some());
+
+        // Entry should be in the local batchlog.
+        let batchlog = storage.batchlog().unwrap();
+        assert_eq!(batchlog.entry_count(), 1);
+        assert!(batchlog.get_entry(entry_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn batchlog_delete_handler_removes_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+
+        let batchlog = storage.batchlog().unwrap();
+        let batch_id = Uuid::new_v4();
+        batchlog
+            .write_entry(BatchlogEntry {
+                id: batch_id,
+                created_at: 1000,
+                mutations: vec![],
+            })
+            .unwrap();
+        assert_eq!(batchlog.entry_count(), 1);
+
+        let handler = BatchlogDeleteHandler::new(storage.clone());
+        let payload = Bytes::copy_from_slice(batch_id.as_bytes());
+        let msg = Message::BatchlogDelete(payload);
+
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let response = handler.handle(peer_id, msg).await;
+
+        assert!(response.is_some());
+        assert_eq!(batchlog.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn batchlog_replay_handler_applies_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let handler = BatchlogReplayHandler::new(storage.clone());
+
+        let entry = BatchlogEntry {
+            id: Uuid::new_v4(),
+            created_at: 1000,
+            mutations: vec![Mutation {
+                keyspace: "test_ks".to_string(),
+                table: "test_tbl".to_string(),
+                key: test_key(),
+                rows: vec![test_row()],
+                timestamp: 1000,
+            }],
+        };
+        let payload = Bytes::from(entry.serialize());
+        let msg = Message::BatchlogReplay(payload);
+
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let response = handler.handle(peer_id, msg).await;
+
+        assert!(response.is_some());
 
         // Mutation should be visible in storage.
         let table_id = TableId::new("test_ks", "test_tbl");
