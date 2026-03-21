@@ -1,6 +1,7 @@
 //! Cluster coordinator -- fans out writes and reads to replicas
 //! with tunable consistency level enforcement.
 
+pub mod metrics;
 pub mod read;
 pub mod write;
 
