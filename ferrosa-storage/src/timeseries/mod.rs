@@ -7,4 +7,5 @@
 pub mod aggregator;
 pub mod config;
 pub mod consolidation;
+pub mod late_data;
 pub mod ring;
