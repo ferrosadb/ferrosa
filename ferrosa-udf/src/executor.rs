@@ -1,8 +1,14 @@
-//! WASM function executor with SlotMap-backed function registry.
+//! WASM function executor with SlotMap-backed function registry and instance pooling.
 //!
 //! Provides real Wasmtime Component Model compilation and invocation for
 //! CQL User-Defined Functions. The executor validates WASM at compile time
 //! and invokes the `invoke` export at call time with fuel-based metering.
+//!
+//! Instance pooling amortises the per-call instantiation overhead: a pool
+//! of pre-instantiated `(Store, Instance)` pairs is kept per function key.
+//! On `call()` the executor tries the pool first; on miss it falls back to
+//! fresh instantiation. After a call the instance is returned to the pool
+//! (if the pool is not full).
 //!
 //! The WIT `cql-value` variant is a recursive type (list/set/map/tuple/udt
 //! variants contain `cql-value`), which prevents use of `wasmtime::component::bindgen!`
@@ -11,11 +17,11 @@
 //! the `cql-value` discriminant names and payloads matching the WIT contract.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ferrosa_common::{CqlType, CqlValue};
 use slotmap::{DefaultKey, SlotMap};
-use wasmtime::component::{Component, Linker, Val};
+use wasmtime::component::{Component, Instance, Linker, Val};
 use wasmtime::{Engine, Store};
 
 use crate::convert::{cql_to_wit, wit_to_cql, WitCqlValue};
@@ -26,6 +32,10 @@ use crate::sandbox::SandboxConfig;
 /// Ephemeral: per-process only, never serialized or sent over the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionKey(DefaultKey);
+
+// Maximum number of pooled instances kept per function.
+// Using a fixed constant avoids a `num_cpus` dependency.
+const POOL_MAX_PER_FUNCTION: usize = 8;
 
 /// Compiled WASM component ready for instantiation.
 struct CompiledFunction {
@@ -50,18 +60,81 @@ impl FunctionRegistry {
     }
 }
 
+/// A pre-instantiated WASM component instance with its associated store.
+struct PooledInstance {
+    store: Store<()>,
+    instance: Instance,
+}
+
+/// Per-function pool of warm `(Store, Instance)` pairs.
+///
+/// Each function key maps to a `Mutex<Vec<PooledInstance>>`. Acquire pops
+/// from the vec; release pushes back (up to `max_per_function`).
+struct InstancePool {
+    pools: HashMap<(String, String), Mutex<Vec<PooledInstance>>>,
+    max_per_function: usize,
+}
+
+impl InstancePool {
+    fn new(max_per_function: usize) -> Self {
+        Self {
+            pools: HashMap::new(),
+            max_per_function,
+        }
+    }
+
+    /// Ensure a pool entry exists for `key`. No-op if already present.
+    fn ensure_pool(&mut self, key: (String, String)) {
+        self.pools
+            .entry(key)
+            .or_insert_with(|| Mutex::new(Vec::new()));
+    }
+
+    /// Try to take a warm instance from the pool. Returns `None` on miss.
+    fn acquire(&self, key: &(String, String)) -> Option<PooledInstance> {
+        let pool = self.pools.get(key)?;
+        let mut guard = pool.lock().ok()?;
+        guard.pop()
+    }
+
+    /// Return an instance to the pool. Drops the instance if the pool is full.
+    fn release(&self, key: &(String, String), instance: PooledInstance) {
+        if let Some(pool) = self.pools.get(key) {
+            if let Ok(mut guard) = pool.lock() {
+                if guard.len() < self.max_per_function {
+                    guard.push(instance);
+                }
+            }
+        }
+    }
+
+    /// Remove and drop all pooled instances for `key` (called on invalidate).
+    fn drain(&self, key: &(String, String)) {
+        if let Some(pool) = self.pools.get(key) {
+            if let Ok(mut guard) = pool.lock() {
+                guard.clear();
+            }
+        }
+    }
+}
+
 /// Executor for WASM-based User-Defined Functions.
 ///
-/// Manages the Wasmtime engine, function registry, and sandbox policy.
-/// Thread-safe — can be shared across async tasks via `Arc`.
+/// Manages the Wasmtime engine, function registry, instance pool, and sandbox
+/// policy. Thread-safe — can be shared across async tasks via `Arc`.
 pub struct UdfExecutor {
     engine: Engine,
     config: SandboxConfig,
     registry: RwLock<FunctionRegistry>,
+    pool: RwLock<InstancePool>,
 }
 
 impl UdfExecutor {
     /// Create a new executor with the given sandbox configuration.
+    ///
+    /// Spawns a background thread (`udf-epoch-ticker`) that increments the
+    /// engine epoch once per `config.max_execution_time` interval. This is
+    /// required for epoch-based interruption to trigger correctly.
     pub fn new(config: SandboxConfig) -> Result<Self, UdfError> {
         let mut engine_config = wasmtime::Config::new();
         engine_config.consume_fuel(true);
@@ -71,17 +144,34 @@ impl UdfExecutor {
         let engine = Engine::new(&engine_config)
             .map_err(|e| UdfError::CompilationFailed(format!("engine creation failed: {e}")))?;
 
+        // Spawn the epoch ticker thread so epoch interruption actually fires.
+        let engine_for_ticker = engine.clone();
+        let tick_interval = config.max_execution_time;
+        std::thread::Builder::new()
+            .name("udf-epoch-ticker".into())
+            .spawn(move || loop {
+                std::thread::sleep(tick_interval);
+                engine_for_ticker.increment_epoch();
+            })
+            .map_err(|e| {
+                UdfError::CompilationFailed(format!("failed to spawn epoch ticker: {e}"))
+            })?;
+
+        let pool = RwLock::new(InstancePool::new(POOL_MAX_PER_FUNCTION));
+
         Ok(Self {
             engine,
             config,
             registry: RwLock::new(FunctionRegistry::new()),
+            pool,
         })
     }
 
     /// Pre-compile a WASM binary. Called on INSERT into wasm_binaries.
     ///
     /// Validates the WASM component bytes using the Wasmtime compiler.
-    /// The compiled component is registered for later invocation.
+    /// The compiled component is registered for later invocation and a pool
+    /// slot is pre-allocated for the function key.
     /// If an entry already exists for (keyspace, name) it is replaced (CREATE OR REPLACE).
     pub fn compile(&self, keyspace: &str, name: &str, wasm_bytes: &[u8]) -> Result<(), UdfError> {
         if wasm_bytes.len() > self.config.max_wasm_size {
@@ -110,16 +200,30 @@ impl UdfExecutor {
             reg.slots.remove(existing.0);
         }
         let slot_key = reg.slots.insert(compiled);
-        reg.index.insert(key, FunctionKey(slot_key));
+        reg.index.insert(key.clone(), FunctionKey(slot_key));
+        drop(reg);
+
+        // Ensure the pool has an entry for this key.
+        if let Ok(mut pool) = self.pool.write() {
+            pool.ensure_pool(key);
+        }
+
         Ok(())
     }
 
     /// Invalidate a registered function (on DROP or CREATE OR REPLACE pre-clear).
+    ///
+    /// Removes the compiled function from the registry and drains any pooled
+    /// instances so stale code is not reused.
     pub fn invalidate(&self, keyspace: &str, name: &str) {
         let key = (keyspace.to_string(), name.to_string());
         let mut reg = self.registry.write().expect("registry lock poisoned");
         if let Some(fk) = reg.index.remove(&key) {
             reg.slots.remove(fk.0);
+        }
+        drop(reg);
+        if let Ok(pool) = self.pool.read() {
+            pool.drain(&key);
         }
     }
 
@@ -161,9 +265,9 @@ impl UdfExecutor {
 
     /// Invoke a UDF. Returns the function's result.
     ///
-    /// Creates a fresh `Store` with fuel limits, instantiates the cached
-    /// component, converts CQL arguments to WIT variant values, calls the
-    /// `invoke` export, and converts the result back to `CqlValue`.
+    /// Tries to acquire a warm `(Store, Instance)` from the instance pool.
+    /// On a pool miss a fresh store and instance are created. After the call
+    /// the instance is returned to the pool for reuse.
     ///
     /// The conversion chain is:
     /// 1. `CqlValue` -> `WitCqlValue` via `cql_to_wit` (preserves all 26 types)
@@ -179,33 +283,42 @@ impl UdfExecutor {
         _arg_types: &[CqlType],
         return_type: &CqlType,
     ) -> Result<CqlValue, UdfError> {
+        let key = (keyspace.to_string(), func_name.to_string());
+
         let compiled = {
             let reg = self.registry.read().expect("registry lock poisoned");
-            let fk = reg
-                .index
-                .get(&(keyspace.to_string(), func_name.to_string()))
-                .ok_or_else(|| UdfError::NotFound {
-                    keyspace: keyspace.to_string(),
-                    name: func_name.to_string(),
-                })?;
+            let fk = reg.index.get(&key).ok_or_else(|| UdfError::NotFound {
+                keyspace: keyspace.to_string(),
+                name: func_name.to_string(),
+            })?;
             Arc::clone(reg.slots.get(fk.0).expect("index/slots out of sync"))
         };
 
-        // Create a store with fuel metering
-        let mut store = Store::new(&self.engine, ());
-        store
-            .set_fuel(self.config.max_fuel)
-            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+        // Try to acquire a warm instance from the pool.
+        let pooled = self.pool.read().ok().and_then(|p| p.acquire(&key));
 
-        // Epoch-based interruption for wall-clock timeout
-        store.epoch_deadline_trap();
-        store.set_epoch_deadline(1);
+        let (mut store, instance) = if let Some(warm) = pooled {
+            // Reset resource limits on the warm store before reuse.
+            let mut s = warm.store;
+            s.set_fuel(self.config.max_fuel)
+                .map_err(|e| UdfError::ExecutionFailed(format!("failed to reset fuel: {e}")))?;
+            s.epoch_deadline_trap();
+            s.set_epoch_deadline(1);
+            (s, warm.instance)
+        } else {
+            // Pool miss — create a fresh store and instantiate.
+            let mut s = Store::new(&self.engine, ());
+            s.set_fuel(self.config.max_fuel)
+                .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+            s.epoch_deadline_trap();
+            s.set_epoch_deadline(1);
 
-        // Instantiate the component
-        let linker = Linker::<()>::new(&self.engine);
-        let instance = linker
-            .instantiate(&mut store, &compiled.component)
-            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+            let linker = Linker::<()>::new(&self.engine);
+            let inst = linker
+                .instantiate(&mut s, &compiled.component)
+                .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+            (s, inst)
+        };
 
         // Look up the "invoke" export
         let invoke_func = instance.get_func(&mut store, "invoke").ok_or_else(|| {
@@ -218,7 +331,7 @@ impl UdfExecutor {
 
         // Call the function with dynamic args/results
         let mut results = vec![Val::Bool(false)]; // placeholder for result slot
-        invoke_func
+        let call_result = invoke_func
             .call(&mut store, &[args_val], &mut results)
             .map_err(|e| {
                 let msg = e.to_string();
@@ -229,21 +342,32 @@ impl UdfExecutor {
                 } else {
                     UdfError::ExecutionFailed(msg)
                 }
-            })?;
+            });
+
+        // Propagate call errors without returning the instance to the pool.
+        call_result?;
 
         // Post-call cleanup required by wasmtime component model
         invoke_func
             .post_return(&mut store)
             .map_err(|e| UdfError::ExecutionFailed(format!("post_return failed: {e}")))?;
 
-        // Convert result Val back to CqlValue
-        // The WIT contract returns result<cql-value, string>
+        // Convert result Val back to CqlValue before returning the instance.
         let result_val = results
             .into_iter()
             .next()
             .ok_or_else(|| UdfError::ExecutionFailed("invoke returned no result".into()))?;
 
-        val_to_cql_result(&result_val, return_type)
+        let cql_result = val_to_cql_result(&result_val, return_type);
+
+        // Return the instance to the pool (only on success; discard on error).
+        if cql_result.is_ok() {
+            if let Ok(pool) = self.pool.read() {
+                pool.release(&key, PooledInstance { store, instance });
+            }
+        }
+
+        cql_result
     }
 
     /// Invoke a UDF by opaque key (hot path — O(1) SlotMap lookup).
