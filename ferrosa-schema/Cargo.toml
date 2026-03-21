@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-index = { path = "../ferrosa-index" }
+ferrosa-sstable = { path = "../ferrosa-sstable" }
 arc-swap = "1.7"
 bcrypt = "0.16"
 argon2 = "0.5"

@@ -426,6 +426,19 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Registers all system table schemas (`system_schema.*` and `system_auth.*`)
+    /// so the storage engine can persist system metadata.
+    ///
+    /// Called during bootstrap before any DDL or auth operations. System tables
+    /// use the same flush/compaction/S3 pipeline as user tables. Idempotent:
+    /// safe to call multiple times.
+    pub fn register_system_tables(&self) -> ferrosa_common::Result<()> {
+        for schema in ferrosa_schema::system::persistence::all_system_table_schemas() {
+            self.register_table(schema)?;
+        }
+        Ok(())
+    }
+
     /// Registers a table schema so the engine can accept writes for it.
     ///
     /// Creates the per-table `FileFlushTarget` directory and `TableStore`.
@@ -451,13 +464,19 @@ impl StorageEngine {
     }
 
     /// Internal: create a `TableStore` for a table, loading existing SSTables
-    /// and sidecar files from disk.
+    /// and sidecar files from disk. Idempotent: skips already-registered tables.
     fn register_table_inner(
         &self,
         schema: TableSchema,
         indexed_columns: Vec<(String, usize)>,
     ) -> ferrosa_common::Result<()> {
         let table_id = TableId::new(&schema.keyspace, &schema.table);
+        {
+            let tables = self.tables.read();
+            if tables.contains_key(&table_id) {
+                return Ok(());
+            }
+        }
         let table_dir = self
             .config
             .data_dir
@@ -2742,5 +2761,48 @@ mod tests {
         };
         let result_b = engine.read(&table_b, &key_b).unwrap();
         assert!(result_b.is_some(), "mutation to tbl_b should be visible");
+    }
+
+    // -- System table registration tests --
+
+    #[test]
+    fn register_system_tables_creates_six_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.register_system_tables().unwrap();
+
+        // Verify all 6 system tables are registered by attempting writes.
+        let system_tables = [
+            ("system_schema", "keyspaces"),
+            ("system_schema", "tables"),
+            ("system_schema", "columns"),
+            ("system_auth", "roles"),
+            ("system_auth", "role_members"),
+            ("system_auth", "role_permissions"),
+        ];
+
+        for (ks, tbl) in &system_tables {
+            let tid = TableId::new(*ks, *tbl);
+            let key = make_key("test");
+            let row = make_row(b"v", 1);
+            let result = engine.write(&tid, &key, row, 1);
+            assert!(
+                result.is_ok(),
+                "system table {ks}.{tbl} should be registered"
+            );
+        }
+    }
+
+    #[test]
+    fn register_system_tables_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.register_system_tables().unwrap();
+        // Second call should not error.
+        engine.register_system_tables().unwrap();
     }
 }

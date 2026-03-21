@@ -12,6 +12,8 @@ pub mod rebalance;
 pub mod ring;
 pub mod state;
 pub mod streaming;
+pub mod system_table_loader;
+pub mod system_table_writer;
 pub mod write_path;
 
 pub use config::ClusterConfig;
