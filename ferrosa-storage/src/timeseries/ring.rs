@@ -143,8 +143,18 @@ impl RingBuffer {
         } else if timestamp >= self.boundary_ts {
             let status = BoundaryStatus::BoundaryCrossed;
             // Advance boundary to cover the new timestamp.
+            // Cap iterations to avoid hanging on massive time gaps.
+            const MAX_ADVANCE_ITERS: u32 = 1000;
+            let mut iters = 0u32;
             while self.boundary_ts <= timestamp {
                 self.boundary_ts += self.interval_micros;
+                iters += 1;
+                if iters >= MAX_ADVANCE_ITERS {
+                    // Jump directly to the correct boundary.
+                    self.boundary_ts = (timestamp / self.interval_micros) * self.interval_micros
+                        + self.interval_micros;
+                    break;
+                }
             }
             status
         } else {
@@ -356,5 +366,35 @@ mod tests {
         assert_eq!(window.len(), 4);
         assert_eq!(window[0].timestamp, 2_000_000);
         assert_eq!(window[3].timestamp, 5_000_000);
+    }
+
+    // --- FMEA Fix 3: Cap boundary advance loop iterations ---
+
+    #[test]
+    fn boundary_advance_massive_gap_does_not_hang() {
+        // Interval = 1 microsecond. First write at ts=0 sets boundary to 1.
+        // Second write at ts=10_000_000 (10 seconds later) would require
+        // 10 million loop iterations without the cap.
+        let interval = 1_i64; // 1 microsecond
+        let mut rb = RingBuffer::new(64, interval, vec![0]);
+
+        // First write sets boundary.
+        rb.insert(0, SmallVec::from_slice(&[1.0]));
+        assert_eq!(rb.boundary_ts(), 1);
+
+        // Massive time gap: this must complete quickly, not loop millions of times.
+        let start = std::time::Instant::now();
+        let status = rb.insert(10_000_000, SmallVec::from_slice(&[2.0]));
+        let elapsed = start.elapsed();
+
+        assert_eq!(status, BoundaryStatus::BoundaryCrossed);
+        // Boundary must be > timestamp.
+        assert!(rb.boundary_ts() > 10_000_000);
+        // Must complete in under 10ms (the uncapped loop would take seconds).
+        assert!(
+            elapsed.as_millis() < 10,
+            "boundary advance took too long: {:?}",
+            elapsed
+        );
     }
 }
