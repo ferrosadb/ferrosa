@@ -98,3 +98,62 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_descriptor_index_build_serde_roundtrip() {
+        let task = TaskDescriptor::IndexBuild {
+            sstable_s3_paths: vec!["s3://b/sst".into()],
+            keyspace: "ks".into(),
+            table: "tbl".into(),
+            index_name: "idx".into(),
+            index_metadata_json: "{}".into(),
+            table_schema_json: "{}".into(),
+            output_s3_prefix: "s3://b/out/".into(),
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        let back: TaskDescriptor = serde_json::from_str(&json).unwrap();
+        match back {
+            TaskDescriptor::IndexBuild {
+                keyspace,
+                table,
+                index_name,
+                ..
+            } => {
+                assert_eq!(keyspace, "ks");
+                assert_eq!(table, "tbl");
+                assert_eq!(index_name, "idx");
+            }
+        }
+    }
+
+    #[test]
+    fn task_result_success_serde() {
+        let result = TaskResult {
+            success: true,
+            output_paths: vec!["s3://b/out/idx.fxsi".into()],
+            error: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: TaskResult = serde_json::from_str(&json).unwrap();
+        assert!(back.success);
+        assert_eq!(back.output_paths.len(), 1);
+        assert!(back.error.is_none());
+    }
+
+    #[test]
+    fn task_result_failure_serde() {
+        let result = TaskResult {
+            success: false,
+            output_paths: vec![],
+            error: Some("boom".into()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: TaskResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.success);
+        assert_eq!(back.error.as_deref(), Some("boom"));
+    }
+}
