@@ -1118,7 +1118,17 @@ fn route_select_user_table(
             // Skip built-in functions — they are handled inline.
             if matches!(
                 fn_lower.as_str(),
-                "count" | "writetime" | "ttl" | "uuid" | "now" | "totimestamp" | "todate"
+                "count"
+                    | "avg"
+                    | "min"
+                    | "max"
+                    | "sum"
+                    | "writetime"
+                    | "ttl"
+                    | "uuid"
+                    | "now"
+                    | "totimestamp"
+                    | "todate"
             ) {
                 continue;
             }
@@ -2859,10 +2869,12 @@ async fn route_create_index(
         }
     }
 
+    // CQL native protocol: INDEX schema changes use TABLE as the target
+    // so cqlsh refreshes the table metadata (which includes indexes).
     Ok(result::encode_schema_change(
         "CREATED",
-        "INDEX",
-        &[ks, &index_name],
+        "TABLE",
+        &[ks, &s.table],
     ))
 }
 
@@ -3271,6 +3283,35 @@ fn build_column_info(
                     "count" => CqlType::Bigint,
                     "writetime" => CqlType::Bigint,
                     "ttl" => CqlType::Int,
+                    "avg" | "min" | "max" | "sum" => {
+                        // Resolve the argument column type.
+                        if let Some(arg) = args.first() {
+                            if let Ok(col_name) = extract_column_name(arg) {
+                                let col = table_meta.columns.get(&col_name).ok_or_else(|| {
+                                    CqlError::Invalid(format!(
+                                        "unknown column in {}(): {}",
+                                        fn_lower, col_name
+                                    ))
+                                })?;
+                                let arg_type = resolve_col_type(&col.column_type, ks, schema)?;
+                                if fn_lower == "avg" {
+                                    // avg always returns Double (matches Cassandra for
+                                    // non-decimal types; close enough for now).
+                                    match arg_type {
+                                        CqlType::Float => CqlType::Float,
+                                        _ => CqlType::Double,
+                                    }
+                                } else {
+                                    // min, max, sum return the same type as the column.
+                                    arg_type
+                                }
+                            } else {
+                                CqlType::Double
+                            }
+                        } else {
+                            CqlType::Double
+                        }
+                    }
                     _ => {
                         // Try to resolve as UDF/UDA — need table column info.
                         let all_col_names: Vec<String> =
