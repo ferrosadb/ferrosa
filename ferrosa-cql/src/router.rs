@@ -45,6 +45,40 @@ use crate::virtual_tables::connections::ConnectionTracker;
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
 const MAX_BATCH_STATEMENTS: usize = 500;
 
+// ── UDF/UDA query-time resolution types ──────────────────────────────────
+
+/// A user-defined function (scalar or aggregate) resolved from the schema,
+/// ready for query-time execution.
+#[derive(Debug, Clone)]
+struct ResolvedFunction {
+    /// Keyspace and function name.
+    func_name: String,
+    /// The keyspace in which the function is defined.
+    func_keyspace: String,
+    /// Scalar or aggregate.
+    kind: ResolvedFunctionKind,
+    /// CQL return type of the function.
+    return_type: CqlType,
+    /// Whether the function should be called when any argument is NULL.
+    called_on_null: bool,
+    /// Indices into the full row column list for each argument that references
+    /// a column (non-column literal args use `usize::MAX` as sentinel).
+    arg_indices: Vec<usize>,
+    /// The original `Term` arguments (needed for literal extraction).
+    arg_terms: Vec<Term>,
+    /// The inferred CQL types of each argument.
+    arg_types: Vec<CqlType>,
+    /// Display name (alias or default) for the result column.
+    display_name: String,
+}
+
+/// Whether a resolved function is scalar or aggregate.
+#[derive(Debug, Clone)]
+enum ResolvedFunctionKind {
+    Scalar,
+    Aggregate { init_cond: Option<CqlValue> },
+}
+
 /// Shared state available to all request handlers.
 pub struct SharedState {
     pub engine: Arc<StorageEngine>,
@@ -715,13 +749,29 @@ fn route_select_user_table(
 
     // Reject ALLOW FILTERING — Ferrosa requires queries to use indexed columns
     // or partition keys rather than full-table scans.
-    if s.allow_filtering {
+    // Exception: ALLOW FILTERING is permitted when UDFs appear in WHERE predicates,
+    // since UDF-filtered queries inherently require post-scan evaluation.
+    if s.allow_filtering && !where_has_udf_calls(&s.where_clauses) {
         return Err(CqlError::Invalid(
             "ALLOW FILTERING is not supported. Ferrosa requires queries to use \
              indexed columns or partition keys. Create an index on the filtered \
              column or restructure your query."
                 .into(),
         ));
+    }
+
+    // If WHERE contains UDF calls but ALLOW FILTERING is not set, reject.
+    if where_has_udf_calls(&s.where_clauses) && !s.allow_filtering {
+        return Err(CqlError::Invalid(
+            "queries with UDFs in WHERE predicates require ALLOW FILTERING".into(),
+        ));
+    }
+    if where_has_udf_calls(&s.where_clauses) {
+        tracing::warn!(
+            keyspace = ks,
+            table = %s.table,
+            "executing query with UDF in WHERE — full scan with ALLOW FILTERING"
+        );
     }
 
     // Build column info for result
@@ -1027,18 +1077,70 @@ fn route_select_user_table(
         rows
     };
 
-    // Check for aggregate functions (e.g. COUNT(*))
-    let is_aggregate = s.columns.iter().any(|c| {
+    // Resolve UDFs/UDAs in SELECT columns.
+    let mut resolved_funcs: Vec<(usize, ResolvedFunction)> = Vec::new();
+    for (i, sc) in s.columns.iter().enumerate() {
+        if let SelectColumn::FunctionCall {
+            keyspace: func_ks,
+            name,
+            args,
+            alias,
+        } = sc
+        {
+            let fn_lower = name.to_lowercase();
+            // Skip built-in functions — they are handled inline.
+            if matches!(
+                fn_lower.as_str(),
+                "count" | "writetime" | "ttl" | "uuid" | "now" | "totimestamp" | "todate"
+            ) {
+                continue;
+            }
+            let resolved = resolve_select_function(
+                ks,
+                func_ks.as_deref(),
+                name,
+                args,
+                alias.as_deref(),
+                &all_col_names,
+                &all_col_types,
+                &state.schema,
+            )?;
+            resolved_funcs.push((i, resolved));
+        }
+    }
+
+    // Check for aggregate functions (builtin COUNT(*) or UDA).
+    let has_builtin_agg = s.columns.iter().any(|c| {
         matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
     });
+    let has_uda = resolved_funcs
+        .iter()
+        .any(|(_, f)| matches!(f.kind, ResolvedFunctionKind::Aggregate { .. }));
+    let is_aggregate = has_builtin_agg || has_uda;
 
     if is_aggregate {
-        // Build a single result row with aggregate values
-        let mut agg_row: Vec<Option<CqlValue>> = Vec::new();
-        for sc in &s.columns {
+        // Build a single result row with aggregate values.
+        let mut agg_row: Vec<Option<CqlValue>> = Vec::with_capacity(s.columns.len());
+        for (col_idx, sc) in s.columns.iter().enumerate() {
             match sc {
                 SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count") => {
                     agg_row.push(Some(CqlValue::Bigint(rows.len() as i64)));
+                }
+                SelectColumn::FunctionCall { .. } => {
+                    // Check if this column is a resolved UDA.
+                    if let Some((_, ref func)) = resolved_funcs.iter().find(|(i, _)| *i == col_idx)
+                    {
+                        if matches!(func.kind, ResolvedFunctionKind::Aggregate { .. }) {
+                            let result = execute_uda(state, ks, func, &rows)?;
+                            agg_row.push(Some(result));
+                        } else {
+                            // Scalar UDF in an aggregate query — evaluate on
+                            // first row if available, otherwise NULL.
+                            agg_row.push(None);
+                        }
+                    } else {
+                        agg_row.push(None);
+                    }
                 }
                 _ => {
                     agg_row.push(None);
@@ -1053,6 +1155,44 @@ fn route_select_user_table(
 
     // Apply column selection if not Star
     let selected_rows = select_columns(&rows, &all_col_names, &col_names);
+
+    // Evaluate scalar UDFs on each projected row.
+    let selected_rows = if resolved_funcs.is_empty() {
+        selected_rows
+    } else {
+        // We need the full rows to extract UDF args, then replace the UDF
+        // columns in the projected output.
+        let scalar_funcs: Vec<&ResolvedFunction> = resolved_funcs
+            .iter()
+            .filter(|(_, f)| matches!(f.kind, ResolvedFunctionKind::Scalar))
+            .map(|(_, f)| f)
+            .collect();
+
+        if scalar_funcs.is_empty() {
+            selected_rows
+        } else {
+            let mut result_rows = selected_rows;
+            for (full_row, projected_row) in rows.iter().zip(result_rows.iter_mut()) {
+                let udf_results = evaluate_row_udfs(state, full_row, &scalar_funcs)?;
+                // Map UDF results back into the projected row. Each resolved
+                // func knows its column index in the SELECT list.
+                for ((col_idx, _), udf_val) in resolved_funcs.iter().zip(udf_results.iter()) {
+                    // Find the position of col_idx in the projected columns.
+                    if let Some(proj_pos) = col_names.iter().position(|n| {
+                        if let Some((_, ref f)) = resolved_funcs.iter().find(|(i, _)| i == col_idx)
+                        {
+                            *n == f.display_name
+                        } else {
+                            false
+                        }
+                    }) {
+                        projected_row[proj_pos] = udf_val.clone();
+                    }
+                }
+            }
+            result_rows
+        }
+    };
 
     // Apply LIMIT
     let limited = if let Some(limit) = s.limit {
@@ -2906,7 +3046,12 @@ fn build_column_info(
                 names.push(name.clone());
                 types.push(resolve_col_type(&col.column_type, ks, schema)?);
             }
-            SelectColumn::FunctionCall { name, alias, .. } => {
+            SelectColumn::FunctionCall {
+                keyspace: func_ks,
+                name,
+                alias,
+                args,
+            } => {
                 let display_name = alias.clone().unwrap_or_else(|| format!("system.{}", name));
                 let fn_lower = name.to_lowercase();
                 let cql_type = match fn_lower.as_str() {
@@ -2914,7 +3059,25 @@ fn build_column_info(
                     "writetime" => CqlType::Bigint,
                     "ttl" => CqlType::Int,
                     _ => {
-                        return Err(CqlError::Invalid(format!("unknown function: {}", name)));
+                        // Try to resolve as UDF/UDA — need table column info.
+                        let all_col_names: Vec<String> =
+                            table_meta.columns.keys().cloned().collect();
+                        let all_col_types: Vec<CqlType> = table_meta
+                            .columns
+                            .values()
+                            .map(|c| resolve_col_type(&c.column_type, ks, schema))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let resolved = resolve_select_function(
+                            ks,
+                            func_ks.as_deref(),
+                            name,
+                            args,
+                            alias.as_deref(),
+                            &all_col_names,
+                            &all_col_types,
+                            schema,
+                        )?;
+                        resolved.return_type.clone()
                     }
                 };
                 names.push(display_name);
@@ -3850,6 +4013,321 @@ fn cql_type_to_common(cql_type: &CqlType) -> ferrosa_common::CqlType {
 fn cql_value_to_common(val: &CqlValue) -> ferrosa_common::CqlValue {
     // CqlValue in ferrosa-cql IS ferrosa_common::CqlValue — same type, identity conversion.
     val.clone()
+}
+
+// ── UDF/UDA query-time resolution and execution ──────────────────────────
+
+/// Infer the CQL type of a `Term` expression.
+///
+/// For column references (parsed as `Term::FunctionCall { name, args: [] }`),
+/// the column name is looked up in `all_col_names` / `all_col_types` to return
+/// the column's declared type.
+fn infer_term_type(
+    term: &Term,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+) -> Result<CqlType, CqlError> {
+    match term {
+        Term::IntegerLiteral(_) => Ok(CqlType::Int),
+        Term::FloatLiteral(_) => Ok(CqlType::Double),
+        Term::StringLiteral(_) => Ok(CqlType::Varchar),
+        Term::BoolLiteral(_) => Ok(CqlType::Boolean),
+        Term::UuidLiteral(_) => Ok(CqlType::Uuid),
+        Term::BlobLiteral(_) => Ok(CqlType::Blob),
+        Term::Null => Ok(CqlType::Varchar), // default for untyped null
+        Term::FunctionCall { name, args, .. } if args.is_empty() => {
+            // Zero-arg function call may actually be a column reference.
+            if let Some(idx) = all_col_names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(name))
+            {
+                Ok(all_col_types[idx].clone())
+            } else {
+                // Actual zero-arg function — treat return type as Varchar as a
+                // default; the real type will be resolved during function lookup.
+                Ok(CqlType::Varchar)
+            }
+        }
+        _ => Err(CqlError::Invalid(format!(
+            "cannot infer type for term: {:?}",
+            term
+        ))),
+    }
+}
+
+/// Resolve a `SelectColumn::FunctionCall` into a `ResolvedFunction`.
+///
+/// Looks up the function in the schema (trying aggregates first, then scalar
+/// UDFs) and builds the argument index mapping.
+#[allow(clippy::too_many_arguments)]
+fn resolve_select_function(
+    ks: &str,
+    func_keyspace: Option<&str>,
+    func_name: &str,
+    args: &[Term],
+    alias: Option<&str>,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    schema: &Schema,
+) -> Result<ResolvedFunction, CqlError> {
+    let func_ks = func_keyspace.unwrap_or(ks);
+
+    // Infer argument types.
+    let arg_types: Vec<CqlType> = args
+        .iter()
+        .map(|a| infer_term_type(a, all_col_names, all_col_types))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Build arg_indices: for each arg, if it is a column reference, record its
+    // index in the full row; otherwise use usize::MAX as sentinel for literals.
+    let arg_indices: Vec<usize> = args
+        .iter()
+        .map(|a| match a {
+            Term::FunctionCall {
+                name,
+                args: inner_args,
+                ..
+            } if inner_args.is_empty() => all_col_names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(name))
+                .unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        })
+        .collect();
+
+    let display_name = alias
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| format!("{}.{}", func_ks, func_name));
+
+    // Try aggregate first.
+    if let Some(agg_meta) = schema.get_aggregate(func_ks, func_name, &arg_types) {
+        return Ok(ResolvedFunction {
+            func_name: func_name.to_string(),
+            func_keyspace: func_ks.to_string(),
+            kind: ResolvedFunctionKind::Aggregate {
+                init_cond: agg_meta.init_cond.clone(),
+            },
+            return_type: agg_meta.return_type.clone(),
+            called_on_null: false, // aggregates always accumulate
+            arg_indices,
+            arg_terms: args.to_vec(),
+            arg_types,
+            display_name,
+        });
+    }
+
+    // Try scalar UDF.
+    if let Some(func_meta) = schema.get_function(func_ks, func_name, &arg_types) {
+        return Ok(ResolvedFunction {
+            func_name: func_name.to_string(),
+            func_keyspace: func_ks.to_string(),
+            kind: ResolvedFunctionKind::Scalar,
+            return_type: func_meta.return_type.clone(),
+            called_on_null: func_meta.called_on_null,
+            arg_indices,
+            arg_terms: args.to_vec(),
+            arg_types,
+            display_name,
+        });
+    }
+
+    Err(CqlError::Invalid(format!(
+        "unknown function: {}.{}({})",
+        func_ks,
+        func_name,
+        arg_types
+            .iter()
+            .map(bridge::cql_type_display_name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+/// Extract the argument values for a UDF call from a full row.
+///
+/// For each arg: if it references a column (arg_indices[i] != usize::MAX),
+/// extract the column value from the row; otherwise convert the literal Term.
+fn extract_udf_args(
+    row: &[Option<CqlValue>],
+    func: &ResolvedFunction,
+) -> Result<Vec<CqlValue>, CqlError> {
+    let mut values = Vec::with_capacity(func.arg_indices.len());
+    for (i, &idx) in func.arg_indices.iter().enumerate() {
+        if idx != usize::MAX {
+            // Column reference — use row value (or Null).
+            let val = row
+                .get(idx)
+                .and_then(|v| v.clone())
+                .unwrap_or(CqlValue::Null);
+            values.push(val);
+        } else {
+            // Literal — convert the term using the inferred type.
+            let val = bridge::term_to_cql_value(&func.arg_terms[i], &func.arg_types[i])?;
+            values.push(val);
+        }
+    }
+    Ok(values)
+}
+
+/// Evaluate scalar UDFs against a single row, returning the UDF results
+/// in the order of `resolved_funcs`.
+///
+/// Each resolved function is evaluated using the WASM executor. If the function
+/// is not `called_on_null` and any argument is NULL, the result is NULL without
+/// invoking WASM.
+fn evaluate_row_udfs(
+    state: &SharedState,
+    row: &[Option<CqlValue>],
+    resolved_funcs: &[&ResolvedFunction],
+) -> Result<Vec<Option<CqlValue>>, CqlError> {
+    let mut results = Vec::with_capacity(resolved_funcs.len());
+    for func in resolved_funcs {
+        if !matches!(func.kind, ResolvedFunctionKind::Scalar) {
+            // Aggregates are handled separately.
+            results.push(None);
+            continue;
+        }
+        let args = extract_udf_args(row, func)?;
+
+        // Called-on-null short circuit: if any arg is Null and the function is
+        // not marked CALLED ON NULL INPUT, return Null without invoking WASM.
+        if !func.called_on_null && args.iter().any(|v| matches!(v, CqlValue::Null)) {
+            results.push(None);
+            continue;
+        }
+
+        let result = state.udf_executor.call(
+            &func.func_keyspace,
+            &func.func_name,
+            args,
+            &func.arg_types,
+            &func.return_type,
+        )?;
+        results.push(Some(result));
+    }
+    Ok(results)
+}
+
+/// Execute a user-defined aggregate (UDA) over a set of rows.
+///
+/// Runs the state function per row and the optional final function once,
+/// returning the aggregated result.
+fn execute_uda(
+    state: &SharedState,
+    ks: &str,
+    func: &ResolvedFunction,
+    rows: &[Vec<Option<CqlValue>>],
+) -> Result<CqlValue, CqlError> {
+    let init_cond = match &func.kind {
+        ResolvedFunctionKind::Aggregate { init_cond } => init_cond.clone(),
+        _ => {
+            return Err(CqlError::Invalid(
+                "execute_uda called on non-aggregate function".into(),
+            ));
+        }
+    };
+
+    // Look up the aggregate metadata to get state_func, final_func, state_type.
+    let agg_meta = state
+        .schema
+        .get_aggregate(&func.func_keyspace, &func.func_name, &func.arg_types)
+        .ok_or_else(|| {
+            CqlError::Invalid(format!(
+                "aggregate not found: {}.{}",
+                func.func_keyspace, func.func_name
+            ))
+        })?;
+
+    // Initialize accumulator.
+    let mut acc = init_cond.unwrap_or(CqlValue::Null);
+
+    // Look up the state function metadata (needed for called_on_null).
+    let state_func_arg_types: Vec<CqlType> = {
+        let mut types = vec![agg_meta.state_type.clone()];
+        types.extend(func.arg_types.iter().cloned());
+        types
+    };
+
+    let state_func_meta =
+        state
+            .schema
+            .get_function(ks, &agg_meta.state_func, &state_func_arg_types);
+    let state_func_called_on_null = state_func_meta
+        .as_ref()
+        .map(|m| m.called_on_null)
+        .unwrap_or(false);
+
+    // Accumulate: call state_func(acc, row_args...) for each row.
+    for row in rows {
+        let row_args = extract_udf_args(row, func)?;
+
+        // Skip rows with null args if state func is not called on null.
+        if !state_func_called_on_null && row_args.iter().any(|v| matches!(v, CqlValue::Null)) {
+            continue;
+        }
+
+        let mut call_args = vec![acc.clone()];
+        call_args.extend(row_args);
+
+        acc = state.udf_executor.call(
+            ks,
+            &agg_meta.state_func,
+            call_args,
+            &state_func_arg_types,
+            &agg_meta.state_type,
+        )?;
+    }
+
+    // Finalize: if there is a final function, call it on the accumulator.
+    if let Some(ref final_func_name) = agg_meta.final_func {
+        let final_arg_types = vec![agg_meta.state_type.clone()];
+        acc = state.udf_executor.call(
+            ks,
+            final_func_name,
+            vec![acc],
+            &final_arg_types,
+            &func.return_type,
+        )?;
+    }
+
+    Ok(acc)
+}
+
+/// Check if any WHERE clause value contains a non-builtin function call,
+/// indicating a UDF in WHERE that requires ALLOW FILTERING.
+fn where_has_udf_calls(where_clauses: &[WhereClause]) -> bool {
+    for wc in where_clauses {
+        if term_has_udf_call(&wc.value) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a Term contains a non-builtin function call.
+fn term_has_udf_call(term: &Term) -> bool {
+    match term {
+        Term::FunctionCall { name, args, .. } => {
+            let lower = name.to_lowercase();
+            let is_builtin = matches!(
+                lower.as_str(),
+                "uuid" | "now" | "totimestamp" | "todate" | "count" | "writetime" | "ttl"
+            );
+            if !is_builtin && !args.is_empty() {
+                return true;
+            }
+            // Also check nested args.
+            args.iter().any(term_has_udf_call)
+        }
+        Term::InList(items) | Term::ListLiteral(items) | Term::SetLiteral(items) => {
+            items.iter().any(term_has_udf_call)
+        }
+        Term::TupleLiteral(items) => items.iter().any(term_has_udf_call),
+        Term::MapLiteral(pairs) => pairs
+            .iter()
+            .any(|(k, v)| term_has_udf_call(k) || term_has_udf_call(v)),
+        _ => false,
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

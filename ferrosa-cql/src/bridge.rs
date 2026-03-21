@@ -298,7 +298,10 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     let inner = term_to_cql_value(&args[0], &CqlType::Date)?;
                     Ok(inner)
                 }
-                _ => Err(CqlError::Invalid(format!("unknown function: {name}"))),
+                _ => Err(CqlError::Invalid(format!(
+                    "unknown function: {name}. If this is a UDF used in WHERE, \
+                     the query requires ALLOW FILTERING"
+                ))),
             }
         }
     }
