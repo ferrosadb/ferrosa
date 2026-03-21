@@ -244,6 +244,52 @@ impl ModeController {
         })
     }
 
+    /// Create a pair-secondary `ModeController` for unit tests.
+    ///
+    /// Like `standalone_for_test`, but the mode is `Pair` and the role is
+    /// `Secondary`, so `is_cql_ready()` returns `false`.  Useful for testing
+    /// CQL connection rejection on secondary nodes.
+    pub fn pair_secondary_for_test(schema: Arc<Schema>, engine: Arc<StorageEngine>) -> Arc<Self> {
+        let write_path = Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone())));
+        let cluster_state = Arc::new(ArcSwap::from_pointee(ClusterStateHolder::Standalone));
+        let ddl_path = Arc::new(ArcSwap::from_pointee(DdlPath::Direct {
+            schema: schema.clone(),
+            engine: engine.clone(),
+        }));
+        let hint_config = HintConfig::default();
+        let hint_store = Arc::new(HintStore::new(hint_config.clone()).expect("test hint store"));
+
+        let role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+        let pair_ctx = PairContext {
+            role,
+            peer_host_id: Uuid::new_v4(),
+            peer_addr: "127.0.0.1:7000".parse().unwrap(),
+        };
+
+        Arc::new(Self {
+            mode: ArcSwap::from_pointee(DeploymentMode::Pair),
+            write_path,
+            cluster_state,
+            storage: engine,
+            schema,
+            ddl_path,
+            config: Arc::new(ClusterConfig::default()),
+            net_config: Arc::new(NetConfig::default()),
+            local_host_id: Uuid::new_v4(),
+            peer_manager: ArcSwap::from_pointee(None),
+            registry: Arc::new(HandlerRegistry::new()),
+            pair_context: Mutex::new(Some(pair_ctx)),
+            force_promoted: AtomicBool::new(false),
+            connected_peers: Mutex::new(Vec::new()),
+            raft_instance: Arc::new(ArcSwap::from_pointee(None)),
+            hint_store,
+            hint_config,
+            approved_nodes: Mutex::new(BTreeSet::new()),
+            ring: Arc::new(ArcSwap::from_pointee(None)),
+            pending_joins: Mutex::new(Vec::new()),
+        })
+    }
+
     /// Set the peer manager reference. Must be called after PeerManager is created.
     pub fn set_peer_manager(&self, pm: Arc<PeerManager>) {
         self.peer_manager.store(Arc::new(Some(pm)));

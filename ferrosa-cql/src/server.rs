@@ -200,6 +200,30 @@ impl CqlServer {
                             let _ = framed.send(frame).await;
                             continue;
                         }
+                        // In pair mode, only the primary accepts CQL connections.
+                        // Secondaries reject with Overloaded so drivers retry on the primary.
+                        if !state.mode_controller.is_cql_ready() {
+                            active.fetch_sub(1, Ordering::Relaxed);
+                            tracing::debug!(
+                                "rejecting CQL connection: node is pair-mode secondary"
+                            );
+                            let codec = CqlCodec::new(max_frame_size);
+                            let mut framed = Framed::new(stream, codec);
+                            let err = CqlError::Overloaded;
+                            let body = err.encode_body().freeze();
+                            let frame = CqlFrame {
+                                header: FrameHeader {
+                                    version: VERSION_RESPONSE,
+                                    flags: 0,
+                                    stream_id: -1,
+                                    opcode: Opcode::Error,
+                                    length: 0,
+                                },
+                                body,
+                            };
+                            let _ = framed.send(frame).await;
+                            continue;
+                        }
                         // Per-IP rate limiting
                         let peer_ip = peer.ip();
                         if !ip_tracker.try_acquire(peer_ip, max_connections_per_ip) {
@@ -503,6 +527,104 @@ mod tests {
         // key_path is None — should fail
         let server = CqlServer::new(config, state);
         assert!(server.build_tls_acceptor().is_err());
+    }
+
+    /// Build a SharedState where the ModeController is pair-mode secondary,
+    /// so `is_cql_ready()` returns false.
+    fn setup_secondary_state() -> (Arc<SharedState>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let commit_log = CommitLogConfig {
+            segment_size: 4096,
+            max_segment_age: std::time::Duration::from_secs(60),
+            sync_strategy: SyncStrategyConfig::Batch,
+            log_dir: dir.path().join("commitlog"),
+            checkpoint_dir: dir.path().join("commitlog"),
+            archive: None,
+        };
+        let compaction = CompactionConfig::from_env(dir.path().join("compaction"));
+        let engine_config = StorageEngineConfig {
+            commit_log,
+            compaction,
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            flush_threshold_bytes: 4096,
+            data_dir: dir.path().to_path_buf(),
+        };
+        let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
+        let schema = Arc::new(
+            Schema::new(SchemaConfig {
+                hasher: PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: PasswordPolicy::permissive(),
+                auth_method: AuthMethod::Password,
+                rate_limit: RateLimitConfig::default(),
+                audit_sink: Box::new(TestAuditSink::new()),
+                secrets: Box::new(EnvSecretsProvider),
+                mode: DeploymentMode::Development,
+            })
+            .unwrap(),
+        );
+        let node_config = Arc::new(NodeConfig {
+            cluster_name: "test".into(),
+            data_center: "dc1".into(),
+            rack: "rack1".into(),
+            rpc_port: 9042,
+            host_id: uuid::Uuid::new_v4(),
+            listen_address: "127.0.0.1".parse().unwrap(),
+            listen_port: 7000,
+            broadcast_address: "127.0.0.1".parse().unwrap(),
+            broadcast_port: 7000,
+            rpc_address: "127.0.0.1".parse().unwrap(),
+            tokens: vec![],
+        });
+        let udf_executor =
+            Arc::new(ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default()).unwrap());
+        let mode_controller = ferrosa_cluster::ModeController::pair_secondary_for_test(
+            schema.clone(),
+            engine.clone(),
+        );
+        let state = Arc::new(SharedState {
+            engine: engine.clone(),
+            schema: schema.clone(),
+            node_config,
+            cluster_state: Arc::new(ArcSwap::from_pointee(
+                ferrosa_cluster::ClusterStateHolder::Standalone,
+            )),
+            write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
+            ddl_path: Arc::new(ArcSwap::from_pointee(ferrosa_cluster::DdlPath::Direct {
+                schema,
+                engine,
+            })),
+            prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
+            connection_tracker: Arc::new(ConnectionTracker::new()),
+            query_tracker: Arc::new(QueryTracker::new()),
+            udf_executor,
+            event_sender: tokio::sync::broadcast::channel(64).0,
+            mode_controller,
+        });
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn secondary_rejects_cql_with_overloaded() {
+        let (state, _dir) = setup_secondary_state();
+        assert!(
+            !state.mode_controller.is_cql_ready(),
+            "secondary must not be CQL-ready"
+        );
+        let server = CqlServer::new(test_config(10, 64), state);
+        let addr = server.start_background().await.unwrap();
+
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut buf = vec![0u8; 256];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert!(n >= HEADER_SIZE, "expected at least a frame header");
+        let header = FrameHeader::decode(&buf[..HEADER_SIZE]).unwrap();
+        assert_eq!(header.opcode, Opcode::Error);
+        // 0x1100 = Overloaded error code
+        let error_code = i32::from_be_bytes(buf[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap());
+        assert_eq!(error_code, 0x1100, "expected Overloaded error code");
     }
 
     #[test]
