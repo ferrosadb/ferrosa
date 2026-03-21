@@ -161,6 +161,97 @@ impl Accumulator {
     }
 }
 
+impl ConsolidationFn {
+    /// Parse a function name string into a `ConsolidationFn`.
+    ///
+    /// Supports: min, max, avg, mean, median, stddev, count, sum.
+    /// Returns `None` for unrecognized names.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_lowercase().as_str() {
+            "min" => Some(ConsolidationFn::Min),
+            "max" => Some(ConsolidationFn::Max),
+            "avg" | "mean" => Some(ConsolidationFn::Avg),
+            "median" => Some(ConsolidationFn::Median),
+            "stddev" => Some(ConsolidationFn::StdDev),
+            "count" => Some(ConsolidationFn::Count),
+            "sum" => Some(ConsolidationFn::Sum),
+            _ => None,
+        }
+    }
+
+    /// Parse a comma-separated list of function names.
+    /// Returns error with the unrecognized name if any function is unknown.
+    pub fn parse_list(s: &str) -> Result<Vec<Self>, String> {
+        let mut funcs = Vec::new();
+        for name in s.split(',') {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            match Self::parse(name) {
+                Some(f) => funcs.push(f),
+                None => return Err(format!("unknown consolidation function: '{name}'")),
+            }
+        }
+        Ok(funcs)
+    }
+}
+
+/// Run consolidation functions over a slice of f64 values.
+///
+/// Returns one f64 result per function. For `Composite`, returns results
+/// for each inner function (flattened). `Wasm` is not handled here -- see
+/// the async worker path.
+pub fn consolidate_values(values: &[f64], functions: &[ConsolidationFn]) -> Vec<f64> {
+    assert!(!values.is_empty(), "cannot consolidate empty window");
+
+    // Determine if median is needed anywhere.
+    let needs_median = functions_need_median(functions);
+
+    let mut acc = Accumulator::new(needs_median);
+    for &v in values {
+        acc.push(v);
+    }
+
+    let mut results = Vec::new();
+    collect_results(&mut acc, functions, &mut results);
+    results
+}
+
+/// Check if any function in the list (including nested Composite) needs median.
+fn functions_need_median(functions: &[ConsolidationFn]) -> bool {
+    for f in functions {
+        match f {
+            ConsolidationFn::Median => return true,
+            ConsolidationFn::Composite(inner) => {
+                if functions_need_median(inner) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Collect results for each function from the accumulator.
+fn collect_results(acc: &mut Accumulator, functions: &[ConsolidationFn], results: &mut Vec<f64>) {
+    for f in functions {
+        match f {
+            ConsolidationFn::Composite(inner) => {
+                collect_results(acc, inner, results);
+            }
+            ConsolidationFn::Wasm { .. } => {
+                // WASM is handled externally; push NaN as placeholder.
+                results.push(f64::NAN);
+            }
+            other => {
+                results.push(acc.result_for(other));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +322,140 @@ mod tests {
         let mut acc = Accumulator::new(false);
         acc.push(1.0);
         let _ = acc.median();
+    }
+
+    // -- Composite and consolidate tests --
+
+    #[test]
+    fn composite_produces_same_as_individual() {
+        let values = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+
+        // Individual accumulators.
+        let mut min_acc = Accumulator::new(false);
+        let mut max_acc = Accumulator::new(false);
+        let mut avg_acc = Accumulator::new(false);
+        for &v in &values {
+            min_acc.push(v);
+            max_acc.push(v);
+            avg_acc.push(v);
+        }
+
+        // Composite: single pass.
+        let funcs = vec![
+            ConsolidationFn::Min,
+            ConsolidationFn::Max,
+            ConsolidationFn::Avg,
+        ];
+        let results = consolidate_values(&values, &funcs);
+
+        assert_eq!(results.len(), 3);
+        assert!((results[0] - min_acc.min()).abs() < f64::EPSILON);
+        assert!((results[1] - max_acc.max()).abs() < f64::EPSILON);
+        assert!((results[2] - avg_acc.avg()).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn composite_with_median() {
+        let values = vec![1.0, 3.0, 5.0, 7.0, 9.0];
+        let funcs = vec![
+            ConsolidationFn::Avg,
+            ConsolidationFn::Median,
+            ConsolidationFn::StdDev,
+        ];
+        let results = consolidate_values(&values, &funcs);
+
+        assert_eq!(results.len(), 3);
+        // avg = 5.0
+        assert!((results[0] - 5.0).abs() < f64::EPSILON);
+        // median = 5.0
+        assert!((results[1] - 5.0).abs() < f64::EPSILON);
+        // stddev = sqrt((16+4+0+4+16)/5) = sqrt(8)
+        assert!((results[2] - (8.0_f64).sqrt()).abs() < 1e-10);
+    }
+
+    // -- Parse tests --
+
+    #[test]
+    fn consolidation_fn_parse() {
+        assert_eq!(ConsolidationFn::parse("min"), Some(ConsolidationFn::Min));
+        assert_eq!(ConsolidationFn::parse("Max"), Some(ConsolidationFn::Max));
+        assert_eq!(ConsolidationFn::parse("avg"), Some(ConsolidationFn::Avg));
+        assert_eq!(ConsolidationFn::parse("mean"), Some(ConsolidationFn::Avg));
+        assert_eq!(
+            ConsolidationFn::parse("median"),
+            Some(ConsolidationFn::Median)
+        );
+        assert_eq!(
+            ConsolidationFn::parse("STDDEV"),
+            Some(ConsolidationFn::StdDev)
+        );
+        assert_eq!(ConsolidationFn::parse("unknown"), None);
+    }
+
+    #[test]
+    fn consolidation_fn_parse_list() {
+        let funcs = ConsolidationFn::parse_list("min,max, avg ,stddev").unwrap();
+        assert_eq!(funcs.len(), 4);
+        assert_eq!(funcs[0], ConsolidationFn::Min);
+        assert_eq!(funcs[1], ConsolidationFn::Max);
+        assert_eq!(funcs[2], ConsolidationFn::Avg);
+        assert_eq!(funcs[3], ConsolidationFn::StdDev);
+    }
+
+    #[test]
+    fn consolidation_fn_parse_list_error() {
+        let err = ConsolidationFn::parse_list("min,percentile99").unwrap_err();
+        assert!(err.contains("percentile99"));
+    }
+}
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn accumulator_sum_matches_brute_force(
+            values in prop::collection::vec(-1e6_f64..1e6, 1..200)
+        ) {
+            let mut acc = Accumulator::new(false);
+            for &v in &values {
+                acc.push(v);
+            }
+            let brute_sum: f64 = values.iter().sum();
+            prop_assert!((acc.sum() - brute_sum).abs() < 1e-6);
+            prop_assert_eq!(acc.count(), values.len() as u64);
+
+            let brute_min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+            let brute_max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            prop_assert!((acc.min() - brute_min).abs() < f64::EPSILON);
+            prop_assert!((acc.max() - brute_max).abs() < f64::EPSILON);
+        }
+
+        #[test]
+        fn consolidate_values_matches_individual(
+            values in prop::collection::vec(-1e3_f64..1e3, 1..100)
+        ) {
+            let funcs = vec![
+                ConsolidationFn::Min,
+                ConsolidationFn::Max,
+                ConsolidationFn::Avg,
+                ConsolidationFn::Sum,
+                ConsolidationFn::Count,
+            ];
+            let results = consolidate_values(&values, &funcs);
+
+            let brute_min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+            let brute_max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let brute_sum: f64 = values.iter().sum();
+            let brute_avg = brute_sum / values.len() as f64;
+
+            prop_assert!((results[0] - brute_min).abs() < f64::EPSILON);
+            prop_assert!((results[1] - brute_max).abs() < f64::EPSILON);
+            prop_assert!((results[2] - brute_avg).abs() < 1e-10);
+            prop_assert!((results[3] - brute_sum).abs() < 1e-6);
+            prop_assert!((results[4] - values.len() as f64).abs() < f64::EPSILON);
+        }
     }
 }
