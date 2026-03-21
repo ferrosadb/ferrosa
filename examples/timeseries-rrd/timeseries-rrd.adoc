@@ -1,0 +1,209 @@
+= RRD Cascading Time-Series Aggregation
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Automatic multi-tier aggregation for high-frequency time-series data.
+Write raw readings at 1-second resolution and let the database consolidate them into 5-minute, 15-minute, and 1-hour summaries using RRD-style cascading.
+
+NOTE: Complete the <<cluster-setup.adoc#,3-Node Cluster Setup>> tutorial first, or have a running Ferrosa cluster accessible on `localhost:9042`.
+
+== The Problem
+
+=== High-frequency sensor data
+
+Consider a fleet of 10,000 IoT sensors, each reporting once per second.
+That is 10,000 writes per second -- 864 million rows per day.
+
+At this scale, dashboards cannot query raw data directly.
+A chart showing 24 hours of data for a single sensor would need to scan 86,400 rows.
+For a fleet view across 100 sensors, that is 8.6 million rows per chart refresh.
+
+The standard solution is pre-aggregation: compute min, max, avg, and stddev over fixed time windows and store the results in a separate table at coarser resolution.
+Tools like RRDtool and Graphite have used this pattern for decades.
+
+Ferrosa automates this with *cascading consolidation*.
+You define the aggregation rules in the table's `extensions` map at `CREATE TABLE` time, and the storage engine handles the rest.
+
+== How It Works
+
+=== The 4-tier cascade
+
+The example creates a cascade with four resolution tiers:
+
+[cols="1,1,1,1"]
+|===
+| Tier | Table | Resolution | Aggregation
+
+| 0 | `sensor_1s` | 1 second (raw) | None (source)
+| 1 | `sensor_5m` | 5 minutes | min, max, avg, stddev
+| 2 | `sensor_15m` | 15 minutes | min, max, avg, stddev
+| 3 | `sensor_1h` | 1 hour | min, max, avg, stddev
+|===
+
+Each tier consolidates data from the tier above it.
+When 5 minutes of raw data accumulates in `sensor_1s`, the aggregator computes the summary statistics and writes them to `sensor_5m`.
+When three 5-minute windows accumulate in `sensor_5m`, they are consolidated into `sensor_15m`, and so on.
+
+=== Consolidation extensions
+
+Aggregation is configured via `extensions` on the source table:
+
+[source,sql]
+----
+include::schema.cql[lines=12..25]
+----
+
+The key parameters:
+
+* `consolidation.interval` -- the window size (5 minutes for Tier 0).
+* `consolidation.functions` -- which aggregates to compute (min, max, avg, stddev).
+* `consolidation.target` -- the downstream table to write results to.
+* `consolidation.cascade` -- when `true`, downstream tables are auto-created with escalating intervals.
+* `consolidation.late_window` -- how far back to accept late data for re-aggregation.
+* `consolidation.columns` -- which numeric columns to aggregate.
+
+== Create the Schema
+
+[source,sql]
+----
+include::schema.cql[]
+----
+
+Tiers 1-3 (`sensor_5m`, `sensor_15m`, `sensor_1h`) are auto-created by the cascade engine.
+Each downstream table's consolidation interval is derived from the cascade multipliers (default: 3x then 4x).
+
+== Insert Sample Data
+
+[source,sql]
+----
+include::data.cql[]
+----
+
+As data timestamps cross 5-minute boundaries, the consolidation observer fires automatically.
+No cron jobs, no external ETL -- the aggregation runs inline with the write path.
+
+== Query Each Tier
+
+=== Raw data (1-second resolution)
+
+[source,sql]
+----
+include::queries.cql[lines=7..11]
+----
+
+=== 5-minute aggregates
+
+[source,sql]
+----
+include::queries.cql[lines=13..17]
+----
+
+=== 15-minute aggregates
+
+[source,sql]
+----
+include::queries.cql[lines=19..23]
+----
+
+=== 1-hour aggregates
+
+[source,sql]
+----
+include::queries.cql[lines=25..29]
+----
+
+== Built-in Functions
+
+Ferrosa provides seven built-in consolidation functions.
+See `built-in-functions.cql` for a complete example of each.
+
+[cols="1,3"]
+|===
+| Function | Description
+
+| `min` | Lowest value in the window
+| `max` | Highest value in the window
+| `avg` | Arithmetic mean
+| `stddev` | Population standard deviation (Welford's online algorithm)
+| `count` | Number of data points
+| `sum` | Total of all values
+| `median` | Middle value (requires sort, O(n log n))
+|===
+
+All functions except `median` are computed in a single pass using Welford's online algorithm.
+Median requires a sorted copy of the window values and is computed separately.
+
+== Multi-Column Composite
+
+When a table has multiple numeric columns, all functions are applied to each column independently:
+
+[source,sql]
+----
+include::composite.cql[lines=10..23]
+----
+
+This produces nine output columns (3 columns x 3 functions): `temperature_min`, `temperature_max`, `temperature_avg`, `humidity_min`, etc.
+
+== Custom WASM UDF
+
+For domain-specific aggregation logic, use a WASM UDF:
+
+[source,sql]
+----
+include::custom-wasm-udf.cql[lines=24..36]
+----
+
+The `wasm:keyspace.function_name` syntax routes the window values to the WASM executor after the built-in accumulator pass completes.
+
+== Late-Arriving Data
+
+Real-world data streams are never perfectly ordered.
+Ferrosa handles late-arriving data with automatic re-aggregation:
+
+[source,sql]
+----
+include::late-data.cql[lines=14..15]
+----
+
+When a data point falls into an already-consolidated window:
+
+1. The aggregator detects that the timestamp is before the current boundary.
+2. A `LateData` task is sent to the async worker.
+3. The worker reads the full window from disk and re-runs consolidation.
+4. The corrected aggregate is upserted into the downstream table.
+5. The cascade continues: the upsert triggers the next tier's observer.
+
+Late data is only accepted within the `late_window` (default: 2x the consolidation interval).
+Multiple late arrivals for the same window are debounced to avoid redundant re-aggregation.
+
+== Observability
+
+Monitor consolidation health via the virtual table:
+
+[source,sql]
+----
+SELECT * FROM system_observability.consolidation_status;
+----
+
+This shows per-table metrics:
+
+* `windows_consolidated` -- total windows processed.
+* `late_arrivals` -- late data points detected.
+* `consolidation_drops` -- tasks dropped due to backpressure (channel full).
+
+== Files in This Example
+
+[cols="1,3"]
+|===
+| File | Purpose
+
+| `schema.cql` | Keyspace and raw table with consolidation extensions
+| `data.cql` | Sample sensor data for two sensors across two 5-minute windows
+| `queries.cql` | Queries against each tier plus observability
+| `built-in-functions.cql` | Demonstrates each built-in function individually
+| `composite.cql` | Multi-column composite aggregation
+| `median.cql` | Median-specific example with latency monitoring
+| `custom-wasm-udf.cql` | Custom WASM UDF for 95th percentile
+| `late-data.cql` | Late-arriving data and re-aggregation cascade
+|===
