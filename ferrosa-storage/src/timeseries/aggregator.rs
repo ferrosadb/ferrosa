@@ -665,4 +665,108 @@ mod tests {
         assert_eq!(metrics.late_arrivals.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.consolidation_drops.load(Ordering::Relaxed), 0);
     }
+
+    // --- Task 13: LRU eviction tests ---
+
+    #[test]
+    fn aggregator_lru_eviction() {
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ring_capacity: 4,
+            max_rings: 2, // only allow 2 rings
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+        let aggregator = TimeSeriesAggregator::new(config, table_id, vec![0], tx);
+
+        // Insert into 3 different partitions, exceeding max_rings=2.
+        for pk in &[b"pk1".to_vec(), b"pk2".to_vec(), b"pk3".to_vec()] {
+            aggregator
+                .rings
+                .insert(pk.clone(), RingBuffer::new(4, 10_000_000, vec![0]));
+        }
+
+        assert_eq!(aggregator.ring_count(), 3);
+
+        // Run eviction sweep -- should remove oldest (coldest) ring.
+        let evicted = aggregator.evict_cold_rings();
+        assert!(evicted >= 1);
+        assert!(aggregator.ring_count() <= 2);
+    }
+
+    #[test]
+    fn aggregator_eviction_noop_when_under_limit() {
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ring_capacity: 4,
+            max_rings: 10,
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+        let aggregator = TimeSeriesAggregator::new(config, table_id, vec![0], tx);
+
+        // Insert only 2 rings, well under max_rings=10.
+        aggregator
+            .rings
+            .insert(b"pk1".to_vec(), RingBuffer::new(4, 10_000_000, vec![0]));
+        aggregator
+            .rings
+            .insert(b"pk2".to_vec(), RingBuffer::new(4, 10_000_000, vec![0]));
+
+        let evicted = aggregator.evict_cold_rings();
+        assert_eq!(evicted, 0);
+        assert_eq!(aggregator.ring_count(), 2);
+    }
+
+    #[test]
+    fn aggregator_drop_count_tracks_channel_full() {
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "sensor_10s".to_string(),
+            columns: vec!["value".to_string()],
+            ring_capacity: 64,
+            max_rings: 100,
+            ..ConsolidationConfig::default()
+        };
+
+        // Channel with capacity 0 -- every send will fail.
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(0);
+        let table_id = TableId::new("ks", "sensor_1s");
+        let aggregator = TimeSeriesAggregator::new(config, table_id.clone(), vec![0], tx);
+
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let make_mutation = |ts: i64, val: f64| Mutation {
+            keyspace: "ks".to_string(),
+            table: "sensor_1s".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"s1".to_vec())),
+            rows: vec![Row {
+                clustering: ts.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(val.to_be_bytes().to_vec(), ts))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+            timestamp: ts,
+        };
+
+        // Write within first window, then cross boundary.
+        aggregator.on_write(&table_id, &make_mutation(1_000_000, 1.0));
+        aggregator.on_write(&table_id, &make_mutation(10_000_000, 2.0));
+
+        // The boundary crossing should have tried to send and been dropped.
+        assert!(aggregator.drop_count() >= 1);
+    }
 }
