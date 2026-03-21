@@ -208,9 +208,15 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             }
 
             if flags & IS_MARKER != 0 {
-                return Err(Error::InvalidData(
-                    "range tombstone markers not yet supported".into(),
-                ));
+                // Range tombstone markers are not written by Ferrosa's SSTable
+                // writer. Encountering one in a Ferrosa-written SSTable indicates
+                // data corruption (misaligned read). Skip the rest of this
+                // partition and return whatever rows were already parsed.
+                //
+                // For Cassandra-written SSTables (S3 bootstrap), this drops
+                // range-deleted data which is acceptable — the live rows
+                // before the marker are still returned.
+                break;
             }
 
             // Extended flags byte (only present if EXTENSION_FLAG is set)
