@@ -8,6 +8,7 @@
 //! reading and index building will be wired in a later task.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -75,6 +76,38 @@ pub struct IndexBuildResult {
         HashMap<String, Vec<(ferrosa_index::IndexKey, ferrosa_index::RowPosition)>>,
     /// How long the build took.
     pub build_duration: std::time::Duration,
+}
+
+/// Default backend that builds indexes in-process from local SSTable files.
+///
+/// Reads the SSTable from `data_dir/{sstable_id}-Data.db`,
+/// iterates all rows, and produces sidecar entries for each index.
+pub struct LocalBackend {
+    /// Root data directory where SSTable files live.
+    #[allow(dead_code)] // Used in Task 4 when SSTable reading is wired.
+    data_dir: PathBuf,
+}
+
+impl LocalBackend {
+    /// Create a new `LocalBackend` rooted at the given data directory.
+    pub fn new(data_dir: PathBuf) -> Self {
+        Self { data_dir }
+    }
+}
+
+impl IndexBuildBackend for LocalBackend {
+    fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
+        let start = Instant::now();
+
+        // TODO: Task 4 will add actual SSTable reading and sidecar building.
+        let sidecar_entries = HashMap::new();
+
+        Ok(IndexBuildResult {
+            sstable_id: job.sstable_id.clone(),
+            sidecar_entries,
+            build_duration: start.elapsed(),
+        })
+    }
 }
 
 /// Background scheduler that dispatches index build jobs to worker threads.
@@ -303,5 +336,24 @@ mod tests {
         };
         let result = backend.build(&job).unwrap();
         assert_eq!(result.sstable_id, "mock");
+    }
+
+    #[test]
+    fn local_backend_returns_result_for_job() {
+        use std::path::PathBuf;
+
+        let backend = LocalBackend::new(PathBuf::from("/tmp/test-data"));
+        let job = IndexBuildJob {
+            sstable_id: "sst-001".to_string(),
+            index_name: "my_idx".to_string(),
+            index_type: IndexType::BTree,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+        };
+        let result = backend.build(&job);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.sstable_id, "sst-001");
     }
 }

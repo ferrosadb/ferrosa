@@ -13,5 +13,6 @@ pub mod virtual_table;
 
 pub use scheduler::{
     BuildPriority, IndexBuildBackend, IndexBuildJob, IndexBuildResult, IndexBuildScheduler,
+    LocalBackend,
 };
 pub use tracker::{IndexState, IndexStateTracker, IndexStatus};
