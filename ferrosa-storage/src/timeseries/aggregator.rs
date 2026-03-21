@@ -695,7 +695,7 @@ mod tests {
         let metrics = Arc::new(ConsolidationMetrics::default());
         let worker = ConsolidationWorker::new(config, rx, metrics);
 
-        let entries = vec![
+        let entries = [
             RingEntry {
                 timestamp: 0,
                 values: SmallVec::from_slice(&[1.0]),
