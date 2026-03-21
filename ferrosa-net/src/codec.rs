@@ -77,6 +77,9 @@ pub enum MsgType {
     PairSchemaSync = 0x45,
     PairDdlForward = 0x46,
     PairDdlAck = 0x47,
+    // Index build coordination
+    IndexBuildRequest = 0x50,
+    IndexBuildComplete = 0x51,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -107,6 +110,8 @@ impl TryFrom<u8> for MsgType {
             0x45 => Ok(Self::PairSchemaSync),
             0x46 => Ok(Self::PairDdlForward),
             0x47 => Ok(Self::PairDdlAck),
+            0x50 => Ok(Self::IndexBuildRequest),
+            0x51 => Ok(Self::IndexBuildComplete),
             _ => Err(NetError::UnknownMessageType(value)),
         }
     }
@@ -325,6 +330,20 @@ mod tests {
         header.encode(&mut buf);
         let err = codec.decode(&mut buf).unwrap_err();
         assert!(matches!(err, NetError::FrameTooLarge { .. }));
+    }
+
+    #[test]
+    fn index_build_request_msg_type_roundtrip() {
+        let val = MsgType::IndexBuildRequest as u8;
+        let parsed = MsgType::try_from(val).unwrap();
+        assert_eq!(parsed, MsgType::IndexBuildRequest);
+    }
+
+    #[test]
+    fn index_build_complete_msg_type_roundtrip() {
+        let val = MsgType::IndexBuildComplete as u8;
+        let parsed = MsgType::try_from(val).unwrap();
+        assert_eq!(parsed, MsgType::IndexBuildComplete);
     }
 
     #[test]

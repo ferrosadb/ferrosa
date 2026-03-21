@@ -119,6 +119,10 @@ pub enum Message {
     PairDdlForward(Bytes),
     /// DDL acknowledgment.
     PairDdlAck(Bytes),
+
+    // Index build coordination — opaque payloads
+    IndexBuildRequest(Bytes),
+    IndexBuildComplete(Bytes),
 }
 
 impl Message {
@@ -148,6 +152,8 @@ impl Message {
             Self::PairSchemaSync(_) => MsgType::PairSchemaSync,
             Self::PairDdlForward(_) => MsgType::PairDdlForward,
             Self::PairDdlAck(_) => MsgType::PairDdlAck,
+            Self::IndexBuildRequest(_) => MsgType::IndexBuildRequest,
+            Self::IndexBuildComplete(_) => MsgType::IndexBuildComplete,
         }
     }
 
@@ -216,7 +222,9 @@ impl Message {
             | Self::PairCatchUpResponse(b)
             | Self::PairSchemaSync(b)
             | Self::PairDdlForward(b)
-            | Self::PairDdlAck(b) => buf.put_slice(b),
+            | Self::PairDdlAck(b)
+            | Self::IndexBuildRequest(b)
+            | Self::IndexBuildComplete(b) => buf.put_slice(b),
         }
         Ok(())
     }
@@ -323,6 +331,10 @@ impl Message {
             MsgType::PairSchemaSync => Self::PairSchemaSync(body.split_to(body.remaining())),
             MsgType::PairDdlForward => Self::PairDdlForward(body.split_to(body.remaining())),
             MsgType::PairDdlAck => Self::PairDdlAck(body.split_to(body.remaining())),
+            MsgType::IndexBuildRequest => Self::IndexBuildRequest(body.split_to(body.remaining())),
+            MsgType::IndexBuildComplete => {
+                Self::IndexBuildComplete(body.split_to(body.remaining()))
+            }
         })
     }
 }
@@ -368,12 +380,36 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
+    #[test]
+    fn index_build_request_roundtrip() {
+        let payload = Bytes::from(b"test payload".to_vec());
+        let msg = Message::IndexBuildRequest(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::IndexBuildRequest);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::IndexBuildRequest, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::IndexBuildRequest(payload));
+    }
+
+    #[test]
+    fn index_build_complete_roundtrip() {
+        let payload = Bytes::from(b"complete".to_vec());
+        let msg = Message::IndexBuildComplete(payload.clone());
+        assert_eq!(msg.msg_type(), MsgType::IndexBuildComplete);
+
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::IndexBuildComplete, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, Message::IndexBuildComplete(payload));
+    }
+
     proptest! {
         #[test]
         fn decode_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
             let bytes = Bytes::from(data);
             // Try decoding as each message type — should return Ok or Err, never panic
-            for msg_type_byte in 0x01..=0x47u8 {
+            for msg_type_byte in 0x01..=0x51u8 {
                 if let Ok(msg_type) = MsgType::try_from(msg_type_byte) {
                     let _ = Message::decode(msg_type, &mut bytes.clone());
                 }
