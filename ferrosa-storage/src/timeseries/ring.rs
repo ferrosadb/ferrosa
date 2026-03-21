@@ -151,6 +151,49 @@ impl RingBuffer {
             BoundaryStatus::Normal
         }
     }
+
+    /// Extract entries within `[start_ts, end_ts)` from the ring buffer.
+    ///
+    /// Returns entries sorted by timestamp. Scans all live entries in the buffer.
+    pub fn window(&self, start_ts: i64, end_ts: i64) -> Vec<&RingEntry> {
+        assert!(start_ts <= end_ts, "start_ts must be <= end_ts");
+
+        let count = self.len();
+        let capacity = self.capacity();
+        let mut result = Vec::new();
+
+        // Determine the range of valid entries.
+        // If write_cursor <= capacity, entries are at indices 0..write_cursor.
+        // If write_cursor > capacity, entries wrap: oldest is at (write_cursor & capacity_mask).
+        let start_idx = if self.write_cursor <= capacity {
+            0
+        } else {
+            self.write_cursor & self.capacity_mask
+        };
+
+        for i in 0..count {
+            let idx = (start_idx + i) & self.capacity_mask;
+            let entry = &self.entries[idx];
+            if entry.timestamp >= start_ts && entry.timestamp < end_ts {
+                result.push(entry);
+            }
+        }
+
+        result.sort_by_key(|e| e.timestamp);
+        result
+    }
+
+    /// Extract owned copies of entries within `[start_ts, end_ts)`.
+    /// Used when sending window data to the async worker channel.
+    pub fn window_owned(&self, start_ts: i64, end_ts: i64) -> Vec<RingEntry> {
+        self.window(start_ts, end_ts)
+            .into_iter()
+            .map(|e| RingEntry {
+                timestamp: e.timestamp,
+                values: e.values.clone(),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -275,5 +318,43 @@ mod tests {
 
         let status = rb.insert(5_000_000, SmallVec::from_slice(&[3.0]));
         assert_eq!(status, BoundaryStatus::LateData);
+    }
+
+    // -- Window extraction tests --
+
+    #[test]
+    fn ring_buffer_window_extraction() {
+        let interval = 10_000_000_i64;
+        let mut rb = RingBuffer::new(64, interval, vec![0]);
+
+        for i in 0..20 {
+            let ts = i as i64 * 1_000_000;
+            rb.insert(ts, SmallVec::from_slice(&[i as f64]));
+        }
+
+        let window = rb.window(0, 10_000_000);
+        assert_eq!(window.len(), 10);
+        for (i, entry) in window.iter().enumerate() {
+            assert_eq!(entry.timestamp, i as i64 * 1_000_000);
+        }
+
+        let window = rb.window(10_000_000, 20_000_000);
+        assert_eq!(window.len(), 10);
+    }
+
+    #[test]
+    fn ring_buffer_window_after_wraparound() {
+        let interval = 100_000_000_i64;
+        let mut rb = RingBuffer::new(4, interval, vec![0]);
+
+        for i in 0..6 {
+            rb.insert(i as i64 * 1_000_000, SmallVec::from_slice(&[i as f64]));
+        }
+        assert_eq!(rb.len(), 4);
+
+        let window = rb.window(0, 6_000_000);
+        assert_eq!(window.len(), 4);
+        assert_eq!(window[0].timestamp, 2_000_000);
+        assert_eq!(window[3].timestamp, 5_000_000);
     }
 }
