@@ -59,6 +59,16 @@ impl ClusterCoordinator {
         self.hint_store = Some(hint_store);
         self
     }
+
+    /// Return the data center of this coordinator's local node.
+    ///
+    /// Looks up `local_node_id` in the current token ring snapshot.
+    /// Returns `None` if the local node is not (yet) registered.
+    pub fn local_dc(&self) -> Option<String> {
+        let ring = self.ring.load();
+        ring.get_node(self.local_node_id)
+            .map(|info| info.data_center.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -320,5 +330,30 @@ mod tests {
         fn on_peer_suspected(&self, _peer: PeerId) {}
         fn on_peer_recovered(&self, _peer_id: uuid::Uuid) {}
         fn on_peer_failed(&self, _peer_id: uuid::Uuid) {}
+    }
+
+    #[test]
+    fn local_dc_returns_coordinator_datacenter() {
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        let mut node = make_node("10.0.0.1:7000");
+        node.data_center = "us-east-1".to_string();
+        ring.add_node(local_node_id, node);
+        ring.assign_tokens(local_node_id, &[0]);
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            Arc::new(PeerManager::new(
+                Arc::new(ferrosa_net::config::NetConfig::default()),
+                Uuid::new_v4(),
+                Arc::new(NoopListener),
+            )),
+            local_node_id,
+            test_storage(&tempfile::tempdir().unwrap().path()),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        assert_eq!(coordinator.local_dc(), Some("us-east-1".to_string()));
     }
 }
