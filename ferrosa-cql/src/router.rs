@@ -2903,7 +2903,7 @@ async fn route_drop_index(
             if s.if_exists {
                 return Ok(result::encode_schema_change(
                     "DROPPED",
-                    "INDEX",
+                    "TABLE",
                     &[ks, &s.name],
                 ));
             }
@@ -2952,10 +2952,11 @@ async fn route_drop_index(
         }
     }
 
+    // Return TABLE event so cqlsh refreshes table metadata (includes indexes).
     Ok(result::encode_schema_change(
         "DROPPED",
-        "INDEX",
-        &[ks, &s.name],
+        "TABLE",
+        &[ks, &table_name],
     ))
 }
 

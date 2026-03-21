@@ -753,6 +753,10 @@ fn handle_prepare(
     // Build result_columns (simplified — empty for non-SELECT).
     let result_columns: Vec<(String, CqlType)> = Vec::new();
 
+    // Compute pk_indexes: map each partition key column to its position in the
+    // bind variable list. If any PK column is not bound, pass empty (pk_count=0).
+    let pk_indexes = compute_pk_indexes(&stmt, state, &table_ks, &table_name);
+
     let plan = PreparedPlan {
         id,
         query: query.to_string(),
@@ -779,6 +783,7 @@ fn handle_prepare(
         &result_types,
         &table_ks,
         &table_name,
+        &pk_indexes,
     );
 
     HandleResult::Reply(Opcode::Result, result_body)
@@ -1002,6 +1007,129 @@ fn build_request_context<'a>(
         auth: auth_context.as_ref().unwrap(),
         current_keyspace,
         consistency,
+    }
+}
+
+/// Compute partition-key bind-variable indexes for a prepared statement.
+///
+/// Looks up the table's partition key columns in the schema, then finds each
+/// PK column's position in the statement's bind variable list. Returns the
+/// indexes in partition key order. If the table is not found in the schema or
+/// any PK column does not appear as a bind variable, returns an empty vec
+/// (which writes `pk_count=0`, disabling token-aware routing in drivers).
+fn compute_pk_indexes(
+    stmt: &crate::ast::Statement,
+    state: &SharedState,
+    table_ks: &str,
+    table_name: &str,
+) -> Vec<u16> {
+    if table_ks.is_empty() || table_name.is_empty() {
+        return Vec::new();
+    }
+
+    // Look up the table in the schema to get partition key column names.
+    let snapshot = state.schema.snapshot();
+    let key = (table_ks.to_string(), table_name.to_string());
+    let table_meta = match snapshot.tables.get(&key) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    if table_meta.partition_key.is_empty() {
+        return Vec::new();
+    }
+
+    // Extract the ordered list of column names that have bind markers.
+    let bind_columns = extract_bind_column_names(stmt);
+
+    // For each PK column (in partition key order), find its index in bind_columns.
+    let mut pk_indexes = Vec::with_capacity(table_meta.partition_key.len());
+    for pk_col in &table_meta.partition_key {
+        match bind_columns.iter().position(|name| name == pk_col) {
+            Some(idx) => pk_indexes.push(idx as u16),
+            None => return Vec::new(), // PK column not bound — disable routing
+        }
+    }
+
+    pk_indexes
+}
+
+/// Extract the ordered list of column names that have bind markers in a statement.
+///
+/// The returned order matches the bind variable order in the CQL protocol:
+/// - INSERT: columns whose corresponding value is a `BindMarker`, in column order
+/// - SELECT/UPDATE/DELETE: `WHERE` clause columns with bind markers, in clause order
+/// - UPDATE: assignments with bind markers come before WHERE bind markers
+fn extract_bind_column_names(stmt: &crate::ast::Statement) -> Vec<String> {
+    use crate::ast::{Assignment, Statement, Term};
+
+    match stmt {
+        Statement::Insert(ins) => {
+            let mut names = Vec::new();
+            for (col, val) in ins.columns.iter().zip(ins.values.iter()) {
+                if matches!(val, Term::BindMarker(_)) {
+                    names.push(col.clone());
+                }
+            }
+            names
+        }
+        Statement::Select(sel) => {
+            let mut names = Vec::new();
+            for wc in &sel.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    names.push(wc.column.clone());
+                }
+            }
+            names
+        }
+        Statement::Update(upd) => {
+            let mut names = Vec::new();
+            // SET assignments first (bind variables in assignment order)
+            for assign in &upd.assignments {
+                match assign {
+                    Assignment::Simple {
+                        column,
+                        value: Term::BindMarker(_),
+                    }
+                    | Assignment::Add {
+                        column,
+                        value: Term::BindMarker(_),
+                    }
+                    | Assignment::Sub {
+                        column,
+                        value: Term::BindMarker(_),
+                    } => {
+                        names.push(column.clone());
+                    }
+                    Assignment::Element { column, key, value } => {
+                        if matches!(key, Term::BindMarker(_)) {
+                            names.push(column.clone());
+                        }
+                        if matches!(value, Term::BindMarker(_)) {
+                            names.push(column.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // WHERE clauses after assignments
+            for wc in &upd.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    names.push(wc.column.clone());
+                }
+            }
+            names
+        }
+        Statement::Delete(del) => {
+            let mut names = Vec::new();
+            for wc in &del.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    names.push(wc.column.clone());
+                }
+            }
+            names
+        }
+        _ => Vec::new(),
     }
 }
 

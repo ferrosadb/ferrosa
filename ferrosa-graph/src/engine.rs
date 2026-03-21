@@ -133,6 +133,7 @@ impl GraphEngine {
             keyspace,
             &self.config,
             Some(self.schema.virtual_tables()),
+            Some(&self.schema),
         )
     }
 
@@ -189,6 +190,7 @@ impl GraphEngine {
             keyspace,
             &self.config,
             Some(self.schema.virtual_tables()),
+            Some(&self.schema),
         )?;
 
         Ok((result, interval, delta))

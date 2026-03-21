@@ -39,6 +39,7 @@ pub fn execute_var_length(
     config: &GraphEngineConfig,
     start: Instant,
     virtual_tables: Option<&VirtualTableRegistry>,
+    schema: Option<&ferrosa_schema::Schema>,
 ) -> Result<GraphResult> {
     let mut stats = QueryStats::default();
 
@@ -64,10 +65,12 @@ pub fn execute_var_length(
 
     // Apply WHERE filters to anchor partitions.
     let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
+    let anchor_col_names =
+        super::expand::column_names_for_table(schema, &anchor.table.keyspace, &anchor.table.table);
     let mut seed_keys: Vec<DecoratedKey> = Vec::with_capacity(anchor_partitions.len());
     for partition in &anchor_partitions {
         let hex_id = hex::encode(partition.key.key.as_bytes());
-        let row_json = eval::partition_to_json(partition, &hex_id);
+        let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
         let mut bindings = HashMap::new();
         bindings.insert(anchor_var.to_string(), row_json);
 
@@ -170,6 +173,13 @@ pub fn execute_var_length(
         anchor_table_id
     };
 
+    // Resolve column names for the projection table (may differ from anchor).
+    let proj_col_names = if let Some(ref vt) = hop.vertex_table {
+        super::expand::column_names_for_table(schema, &vt.keyspace, &vt.table)
+    } else {
+        anchor_col_names.clone()
+    };
+
     // Determine the variable name for result binding.
     let result_var = hop.var.as_deref().unwrap_or(anchor_var);
 
@@ -183,7 +193,7 @@ pub fn execute_var_length(
         let hex_id = hex::encode(key.key.as_bytes());
 
         let row_json = if let Some(ref part) = partition {
-            eval::partition_to_json(part, &hex_id)
+            eval::partition_to_json(part, &hex_id, &proj_col_names)
         } else {
             serde_json::Value::String(hex_id.clone())
         };
@@ -411,6 +421,7 @@ mod tests {
             &test_config(),
             Instant::now(),
             None,
+            None,
         )
         .unwrap();
 
@@ -440,6 +451,7 @@ mod tests {
             &simple_return("b"),
             &test_config(),
             Instant::now(),
+            None,
             None,
         )
         .unwrap();
@@ -493,6 +505,7 @@ mod tests {
             &simple_return("b"),
             &config,
             Instant::now(),
+            None,
             None,
         );
 

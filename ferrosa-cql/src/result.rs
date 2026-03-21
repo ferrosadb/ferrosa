@@ -106,6 +106,11 @@ pub fn encode_rows(
 /// 1. The prepared statement ID (16 bytes, prefixed by u16 length).
 /// 2. Bind-variable metadata (same layout as Rows metadata).
 /// 3. Result-column metadata (same layout as Rows metadata).
+///
+/// `pk_indexes` contains the 0-based positions of partition key columns within the
+/// bind variable list. Pass an empty slice when any PK column has no bind marker
+/// (equivalent to `pk_count=0`, which disables token-aware routing in drivers).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_prepared(
     id: &[u8; 16],
     bound_names: &[String],
@@ -114,6 +119,7 @@ pub fn encode_prepared(
     result_column_types: &[CqlType],
     keyspace: &str,
     table: &str,
+    pk_indexes: &[u16],
 ) -> BytesMut {
     let mut buf = BytesMut::new();
     buf.put_i32(0x0004); // Prepared kind
@@ -123,7 +129,14 @@ pub fn encode_prepared(
     buf.put_slice(id);
 
     // Bind-variable metadata (includes pk_count + pk_indexes per CQL protocol v4+)
-    encode_prepared_bind_metadata(&mut buf, bound_names, bound_types, keyspace, table);
+    encode_prepared_bind_metadata(
+        &mut buf,
+        bound_names,
+        bound_types,
+        keyspace,
+        table,
+        pk_indexes,
+    );
 
     // Result-column metadata
     if result_column_names.is_empty() {
@@ -156,18 +169,24 @@ fn encode_string(buf: &mut BytesMut, s: &str) {
 ///
 /// Per CQL native protocol v4+ (section 4.2.5.4), the bind-variable
 /// metadata includes `pk_count` and `pk_indexes` between `columns_count`
-/// and the global table spec. We write `pk_count=0` which tells drivers
-/// there are no primary key index hints.
+/// and the global table spec. `pk_indexes` maps each partition key column
+/// to its 0-based position in the bind variable list — this enables
+/// token-aware routing in CQL drivers. An empty `pk_indexes` writes
+/// `pk_count=0`, which disables token-aware routing.
 fn encode_prepared_bind_metadata(
     buf: &mut BytesMut,
     column_names: &[String],
     column_types: &[CqlType],
     keyspace: &str,
     table: &str,
+    pk_indexes: &[u16],
 ) {
     buf.put_i32(0x0001); // flags: Global_tables_spec
     buf.put_i32(column_names.len() as i32);
-    buf.put_i32(0); // pk_count: 0 (no PK index hints)
+    buf.put_i32(pk_indexes.len() as i32);
+    for &idx in pk_indexes {
+        buf.put_i16(idx as i16);
+    }
     encode_string(buf, keyspace);
     encode_string(buf, table);
     for (name, cql_type) in column_names.iter().zip(column_types.iter()) {
@@ -368,6 +387,7 @@ mod tests {
             &[CqlType::Int, CqlType::Varchar],
             "ks",
             "t",
+            &[0], // PK column "k" is at bind variable index 0
         );
         assert_eq!(&buf[0..4], &0x0004i32.to_be_bytes());
         // Verify ID follows
@@ -379,26 +399,30 @@ mod tests {
     /// metadata section must use the No_metadata flag (0x0004) with column
     /// count 0, and must NOT include keyspace/table strings after that.
     ///
+    /// This test also verifies that pk_indexes are written correctly when
+    /// partition key columns have bind markers.
+    ///
     /// Buffer layout we parse forward through:
     ///   [0..4]   kind = 0x0004 (Prepared)
     ///   [4..6]   id_len = 16
     ///   [6..22]  id bytes
-    ///   [22..]   bind metadata: flags(4) + col_count(4) + ks_str + tbl_str + per-column specs
+    ///   [22..]   bind metadata: flags(4) + col_count(4) + pk_count(4) + pk_indexes + ks_str + tbl_str + per-column specs
     ///            result metadata: flags(4) + col_count(4)
     #[test]
     fn encode_prepared_insert_no_result_columns_uses_no_metadata_flag() {
         let id = [0xABu8; 16];
         let keyspace = "ks";
         let table = "users";
-        // Simulate INSERT: one bind variable, no result columns.
+        // Simulate INSERT with two bind variables: "id" (PK at index 0) and "name".
         let buf = encode_prepared(
             &id,
-            &["name".into()],
-            &[CqlType::Varchar],
+            &["id".into(), "name".into()],
+            &[CqlType::Int, CqlType::Varchar],
             &[], // no result columns
             &[],
             keyspace,
             table,
+            &[0], // PK column "id" is at bind variable index 0
         );
 
         // --- Parse forward ---
@@ -419,12 +443,22 @@ mod tests {
         pos += 4;
         // bind metadata: col_count
         let bind_col_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        assert_eq!(bind_col_count, 2, "should have 2 bind variables");
         pos += 4;
 
         // bind metadata: pk_count + pk_indexes (CQL protocol v4+)
         let pk_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
-        assert_eq!(pk_count, 0, "pk_count should be 0");
+        assert_eq!(pk_count, 1, "pk_count should be 1 (one PK column)");
         pos += 4;
+
+        // Read pk_indexes
+        for i in 0..pk_count {
+            let pk_idx = i16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
+            if i == 0 {
+                assert_eq!(pk_idx, 0, "PK column 'id' should be at bind index 0");
+            }
+            pos += 2;
+        }
 
         if bind_flags & 0x0001 != 0 {
             // Global_tables_spec: skip ks and table strings
@@ -442,7 +476,7 @@ mod tests {
             // type_id u16
             let type_id = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
             pos += 2;
-            // skip type params (Varchar is simple — no extra bytes)
+            // skip type params (Int and Varchar are simple — no extra bytes)
             match type_id {
                 // List(0x0020) or Set(0x0022): 1 extra u16
                 0x0020 | 0x0022 => pos += 2,
@@ -471,5 +505,70 @@ mod tests {
             buf.len(),
             "no keyspace/table strings should follow result metadata for INSERT"
         );
+    }
+
+    /// Verify that pk_count=0 is written when no pk_indexes are provided
+    /// (e.g. when not all PK columns have bind markers).
+    #[test]
+    fn encode_prepared_empty_pk_indexes() {
+        let id = [0xCDu8; 16];
+        let buf = encode_prepared(
+            &id,
+            &["name".into()],
+            &[CqlType::Varchar],
+            &[],
+            &[],
+            "ks",
+            "t",
+            &[], // no PK indexes — disables token-aware routing
+        );
+
+        // Skip to bind metadata: kind(4) + id_len(2) + id(16) = offset 22
+        let pos = 22;
+        // flags(4)
+        let pos = pos + 4;
+        // col_count(4)
+        let pos = pos + 4;
+        // pk_count
+        let pk_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(pk_count, 0, "pk_count should be 0 for empty pk_indexes");
+    }
+
+    /// Verify composite partition key writes multiple pk_indexes.
+    #[test]
+    fn encode_prepared_composite_pk_indexes() {
+        let id = [0xEFu8; 16];
+        // INSERT INTO t (a, b, c, d) VALUES (?, ?, ?, ?)
+        // Composite PK: (a, c) — bind indexes 0 and 2
+        let buf = encode_prepared(
+            &id,
+            &["a".into(), "b".into(), "c".into(), "d".into()],
+            &[CqlType::Int, CqlType::Int, CqlType::Int, CqlType::Varchar],
+            &[],
+            &[],
+            "ks",
+            "t",
+            &[0, 2], // PK columns at bind indexes 0 and 2
+        );
+
+        // Skip to bind metadata: kind(4) + id_len(2) + id(16) = offset 22
+        let mut pos = 22;
+        // flags(4)
+        pos += 4;
+        // col_count(4)
+        let col_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(col_count, 4);
+        pos += 4;
+        // pk_count
+        let pk_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(pk_count, 2, "composite PK with 2 columns");
+        pos += 4;
+        // pk_indexes[0]
+        let idx0 = i16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
+        assert_eq!(idx0, 0, "first PK column at bind index 0");
+        pos += 2;
+        // pk_indexes[1]
+        let idx1 = i16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
+        assert_eq!(idx1, 2, "second PK column at bind index 2");
     }
 }

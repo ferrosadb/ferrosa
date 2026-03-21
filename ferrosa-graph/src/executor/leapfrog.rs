@@ -163,6 +163,7 @@ pub fn execute_wco_join(
     config: &GraphEngineConfig,
     start: Instant,
     virtual_tables: Option<&VirtualTableRegistry>,
+    schema: Option<&ferrosa_schema::Schema>,
 ) -> Result<GraphResult> {
     let _ = virtual_tables; // Reserved for future virtual table support.
     let mut stats = QueryStats::default();
@@ -220,6 +221,7 @@ pub fn execute_wco_join(
             config,
             start,
             &mut stats,
+            schema,
         )?;
     }
 
@@ -267,6 +269,7 @@ fn enumerate_bindings(
     config: &GraphEngineConfig,
     start: Instant,
     stats: &mut QueryStats,
+    schema: Option<&ferrosa_schema::Schema>,
 ) -> Result<()> {
     if result_rows.len() >= config.max_result_rows {
         return Ok(());
@@ -279,7 +282,7 @@ fn enumerate_bindings(
         // Check that every relation is satisfied with current bindings.
         if verify_all_relations(storage, adj_table_id, plan, var_bindings, stats)? {
             // Build a result row from the bindings.
-            let row = project_bindings(storage, plan, var_bindings, return_clause, stats)?;
+            let row = project_bindings(storage, plan, var_bindings, return_clause, stats, schema)?;
             result_rows.push(row);
         }
         return Ok(());
@@ -365,6 +368,7 @@ fn enumerate_bindings(
                     config,
                     start,
                     stats,
+                    schema,
                 )?;
             }
             var_bindings.remove(current_var);
@@ -393,6 +397,7 @@ fn enumerate_bindings(
             config,
             start,
             stats,
+            schema,
         )?;
     }
     var_bindings.remove(current_var);
@@ -453,6 +458,7 @@ fn project_bindings(
     var_bindings: &HashMap<String, Vec<u8>>,
     return_clause: &ReturnClause,
     stats: &mut QueryStats,
+    schema: Option<&ferrosa_schema::Schema>,
 ) -> Result<Vec<serde_json::Value>> {
     // Build JSON bindings for eval_expr by reading each variable's partition.
     let mut json_bindings: HashMap<String, serde_json::Value> = HashMap::new();
@@ -465,8 +471,10 @@ fn project_bindings(
             let partition = storage.read(&table_id, &dk)?;
             stats.vertices_read += 1;
 
+            let col_names =
+                super::expand::column_names_for_table(schema, &table_id.keyspace, &table_id.table);
             let row_json = if let Some(ref part) = partition {
-                eval::partition_to_json(part, &hex_id)
+                eval::partition_to_json(part, &hex_id, &col_names)
             } else {
                 serde_json::Value::String(hex_id)
             };
