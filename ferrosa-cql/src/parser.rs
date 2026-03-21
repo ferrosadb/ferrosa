@@ -3460,6 +3460,59 @@ mod tests {
     fn parse_explain_rejects_non_select() {
         assert!(parse("EXPLAIN INSERT INTO t (a) VALUES (1)").is_err());
     }
+
+    #[test]
+    fn parse_tojson_with_alias() {
+        let stmt = parse(
+            "SELECT keyspace_name, toJson(replication) AS replication FROM system_schema.keyspaces",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.keyspace, Some("system_schema".into()));
+                assert_eq!(s.table, "keyspaces");
+                assert_eq!(s.columns.len(), 2);
+                assert_eq!(s.columns[0], SelectColumn::Column("keyspace_name".into()));
+                match &s.columns[1] {
+                    SelectColumn::FunctionCall {
+                        name, args, alias, ..
+                    } => {
+                        assert_eq!(name, "tojson");
+                        assert_eq!(args.len(), 1);
+                        // replication is a keyword, parsed as Term::FunctionCall with empty args
+                        match &args[0] {
+                            Term::FunctionCall { name, args, .. } => {
+                                assert_eq!(name, "replication");
+                                assert!(args.is_empty());
+                            }
+                            other => panic!("expected FunctionCall(replication), got {:?}", other),
+                        }
+                        assert_eq!(alias, &Some("replication".into()));
+                    }
+                    other => panic!("expected FunctionCall, got {:?}", other),
+                }
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_tojson_without_alias() {
+        let stmt = parse("SELECT toJson(name) FROM users").unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.columns.len(), 1);
+                match &s.columns[0] {
+                    SelectColumn::FunctionCall { name, alias, .. } => {
+                        assert_eq!(name, "tojson");
+                        assert_eq!(alias, &None);
+                    }
+                    other => panic!("expected FunctionCall, got {:?}", other),
+                }
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
 }
 
 #[cfg(test)]

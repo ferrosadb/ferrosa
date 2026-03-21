@@ -1012,6 +1012,236 @@ fn decode_clustering(bytes: &[u8], num_components: usize) -> Vec<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// toJson() — CQL value to Cassandra-compatible JSON string
+// ---------------------------------------------------------------------------
+
+/// Convert a [`CqlValue`] to its Cassandra-compatible JSON string representation.
+///
+/// This implements the CQL `toJson()` built-in function. The output format matches
+/// Apache Cassandra's `toJson()` behaviour:
+///
+/// - Integers, floats, booleans -> JSON scalars
+/// - Strings, UUIDs, timestamps, IPs -> quoted JSON strings
+/// - Collections (list, set, map) -> JSON arrays/objects
+/// - Null -> `"null"`
+pub fn cql_value_to_json(value: &CqlValue) -> String {
+    match value {
+        CqlValue::Null => "null".to_string(),
+
+        // Numeric scalars — unquoted
+        CqlValue::Int(n) => n.to_string(),
+        CqlValue::Bigint(n) | CqlValue::Counter(n) | CqlValue::Timestamp(n) => n.to_string(),
+        CqlValue::Smallint(n) => n.to_string(),
+        CqlValue::Tinyint(n) => n.to_string(),
+        CqlValue::Float(bits) => {
+            let f = f32::from_bits(*bits);
+            format_json_float_f32(f)
+        }
+        CqlValue::Double(bits) => {
+            let f = f64::from_bits(*bits);
+            format_json_float_f64(f)
+        }
+        CqlValue::Varint(n) => n.to_string(),
+        CqlValue::Decimal { scale, unscaled } => {
+            if *scale <= 0 {
+                let factor = BigInt::from(10).pow((-*scale) as u32);
+                (unscaled * factor).to_string()
+            } else {
+                let s = unscaled.to_string();
+                let is_negative = s.starts_with('-');
+                let digits = if is_negative { &s[1..] } else { &s };
+                let scale_usize = *scale as usize;
+                if digits.len() <= scale_usize {
+                    let zeros = scale_usize - digits.len();
+                    let prefix = if is_negative { "-0." } else { "0." };
+                    format!("{}{}{}", prefix, "0".repeat(zeros), digits)
+                } else {
+                    let split_at = digits.len() - scale_usize;
+                    let prefix = if is_negative { "-" } else { "" };
+                    format!(
+                        "{}{}{}{}",
+                        prefix,
+                        &digits[..split_at],
+                        if scale_usize > 0 { "." } else { "" },
+                        &digits[split_at..],
+                    )
+                }
+            }
+        }
+        CqlValue::Date(d) => {
+            // CQL Date is days since epoch (0x80000000 = 1970-01-01)
+            let days_from_epoch = (*d as i64) - 0x8000_0000_i64;
+            format!("\"1970-01-01+{}days\"", days_from_epoch)
+        }
+        CqlValue::Time(nanos) => {
+            let total_secs = *nanos / 1_000_000_000;
+            let h = total_secs / 3600;
+            let m = (total_secs % 3600) / 60;
+            let s = total_secs % 60;
+            let ns = *nanos % 1_000_000_000;
+            if ns == 0 {
+                format!("\"{:02}:{:02}:{:02}\"", h, m, s)
+            } else {
+                format!("\"{:02}:{:02}:{:02}.{:09}\"", h, m, s, ns)
+            }
+        }
+        CqlValue::Duration {
+            months,
+            days,
+            nanos,
+        } => {
+            format!("\"{}mo{}d{}ns\"", months, days, nanos)
+        }
+
+        // Boolean — unquoted
+        CqlValue::Boolean(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+
+        // Strings — JSON-escaped and quoted
+        CqlValue::Ascii(s) | CqlValue::Text(s) => json_escape_string(s),
+
+        // UUID/Timeuuid — quoted
+        CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => format!("\"{}\"", u),
+
+        // Inet — quoted
+        CqlValue::Inet(ip) => format!("\"{}\"", ip),
+
+        // Blob — quoted hex
+        CqlValue::Blob(b) => {
+            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            format!("\"0x{}\"", hex)
+        }
+
+        // List and Set — JSON array
+        CqlValue::List(items) | CqlValue::Set(items) => {
+            let elements: Vec<String> = items.iter().map(cql_value_to_json).collect();
+            format!("[{}]", elements.join(", "))
+        }
+
+        // Map — JSON object
+        CqlValue::Map(entries) => {
+            let pairs: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| {
+                    let key_str = cql_value_to_json_key(k);
+                    let val_str = cql_value_to_json(v);
+                    format!("{}: {}", key_str, val_str)
+                })
+                .collect();
+            format!("{{{}}}", pairs.join(", "))
+        }
+
+        // Tuple — JSON array
+        CqlValue::Tuple(elements) => {
+            let items: Vec<String> = elements
+                .iter()
+                .map(|opt| match opt {
+                    Some(v) => cql_value_to_json(v),
+                    None => "null".to_string(),
+                })
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+
+        // UDT — JSON object
+        CqlValue::Udt(fields) => {
+            let pairs: Vec<String> = fields
+                .iter()
+                .map(|(name, opt)| {
+                    let val_str = match opt {
+                        Some(v) => cql_value_to_json(v),
+                        None => "null".to_string(),
+                    };
+                    format!("{}: {}", json_escape_string(name), val_str)
+                })
+                .collect();
+            format!("{{{}}}", pairs.join(", "))
+        }
+    }
+}
+
+/// Format a map key as a JSON string key. All keys are quoted strings.
+fn cql_value_to_json_key(value: &CqlValue) -> String {
+    match value {
+        CqlValue::Ascii(s) | CqlValue::Text(s) => json_escape_string(s),
+        other => {
+            let rendered = cql_value_to_json(other);
+            if rendered.starts_with('"') && rendered.ends_with('"') {
+                rendered
+            } else {
+                format!("\"{}\"", rendered)
+            }
+        }
+    }
+}
+
+/// JSON-escape a string and wrap it in double quotes.
+fn json_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Format f32 for JSON output.
+fn format_json_float_f32(f: f32) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    let s = format!("{}", f);
+    if s.contains('.') || s.contains('E') || s.contains('e') {
+        s
+    } else {
+        format!("{}.0", s)
+    }
+}
+
+/// Format f64 for JSON output.
+fn format_json_float_f64(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    let s = format!("{}", f);
+    if s.contains('.') || s.contains('E') || s.contains('e') {
+        s
+    } else {
+        format!("{}.0", s)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1848,5 +2078,105 @@ mod tests {
             }
             other => panic!("expected Udt, got {:?}", other),
         }
+    }
+
+    // ── toJson tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn tojson_null() {
+        assert_eq!(cql_value_to_json(&CqlValue::Null), "null");
+    }
+
+    #[test]
+    fn tojson_int() {
+        assert_eq!(cql_value_to_json(&CqlValue::Int(42)), "42");
+    }
+
+    #[test]
+    fn tojson_bigint() {
+        assert_eq!(cql_value_to_json(&CqlValue::Bigint(123456789)), "123456789");
+    }
+
+    #[test]
+    fn tojson_boolean() {
+        assert_eq!(cql_value_to_json(&CqlValue::Boolean(true)), "true");
+        assert_eq!(cql_value_to_json(&CqlValue::Boolean(false)), "false");
+    }
+
+    #[test]
+    fn tojson_text() {
+        assert_eq!(
+            cql_value_to_json(&CqlValue::Text("hello".into())),
+            "\"hello\""
+        );
+    }
+
+    #[test]
+    fn tojson_text_with_special_chars() {
+        assert_eq!(
+            cql_value_to_json(&CqlValue::Text("he said \"hi\"".into())),
+            "\"he said \\\"hi\\\"\""
+        );
+    }
+
+    #[test]
+    fn tojson_uuid() {
+        let u = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            cql_value_to_json(&CqlValue::Uuid(u)),
+            "\"550e8400-e29b-41d4-a716-446655440000\""
+        );
+    }
+
+    #[test]
+    fn tojson_map_text_text() {
+        let map = CqlValue::Map(vec![
+            (
+                CqlValue::Text("class".into()),
+                CqlValue::Text("SimpleStrategy".into()),
+            ),
+            (
+                CqlValue::Text("replication_factor".into()),
+                CqlValue::Text("1".into()),
+            ),
+        ]);
+        let json = cql_value_to_json(&map);
+        // Map order is preserved from the Vec
+        assert!(json.contains("\"class\": \"SimpleStrategy\""));
+        assert!(json.contains("\"replication_factor\": \"1\""));
+        assert!(json.starts_with('{'));
+        assert!(json.ends_with('}'));
+    }
+
+    #[test]
+    fn tojson_list() {
+        let list = CqlValue::List(vec![CqlValue::Int(1), CqlValue::Int(2), CqlValue::Int(3)]);
+        assert_eq!(cql_value_to_json(&list), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn tojson_set() {
+        let set = CqlValue::Set(vec![CqlValue::Text("a".into()), CqlValue::Text("b".into())]);
+        assert_eq!(cql_value_to_json(&set), "[\"a\", \"b\"]");
+    }
+
+    #[test]
+    fn tojson_float() {
+        let f = CqlValue::Float(1.5_f32.to_bits());
+        let json = cql_value_to_json(&f);
+        assert_eq!(json, "1.5");
+    }
+
+    #[test]
+    fn tojson_double() {
+        let d = CqlValue::Double(1.25_f64.to_bits());
+        let json = cql_value_to_json(&d);
+        assert_eq!(json, "1.25");
+    }
+
+    #[test]
+    fn tojson_inet() {
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(cql_value_to_json(&CqlValue::Inet(ip)), "\"127.0.0.1\"");
     }
 }

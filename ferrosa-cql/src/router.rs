@@ -451,24 +451,39 @@ fn route_select(
         ("system_schema", "keyspaces") => {
             let snap = state.schema.snapshot();
             let ks_rows = query_keyspaces(&snap);
-            let col_names = vec!["keyspace_name".into(), "durable_writes".into()];
-            let col_types = vec![CqlType::Varchar, CqlType::Boolean];
-            let rows: Vec<Vec<Option<CqlValue>>> = ks_rows
+            let all_col_names: Vec<String> = vec![
+                "keyspace_name".into(),
+                "durable_writes".into(),
+                "replication".into(),
+            ];
+            let map_type = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Varchar));
+            let all_col_types = vec![CqlType::Varchar, CqlType::Boolean, map_type];
+            let all_rows: Vec<Vec<Option<CqlValue>>> = ks_rows
                 .iter()
                 .map(|k| {
+                    // Build the replication map as CqlValue::Map
+                    let repl_map: Vec<(CqlValue, CqlValue)> = k
+                        .replication
+                        .iter()
+                        .map(|(key, val)| {
+                            (CqlValue::Text(key.clone()), CqlValue::Text(val.clone()))
+                        })
+                        .collect();
                     vec![
                         Some(CqlValue::Text(k.keyspace_name.clone())),
                         Some(CqlValue::Boolean(k.durable_writes)),
+                        Some(CqlValue::Map(repl_map)),
                     ]
                 })
                 .collect();
-            Ok(result::encode_rows(
-                &col_names,
-                &col_types,
+            apply_system_select(
+                &s.columns,
+                &all_col_names,
+                &all_col_types,
+                &all_rows,
                 "system_schema",
                 "keyspaces",
-                &rows,
-            ))
+            )
         }
         ("system_schema", "tables") => {
             let snap = state.schema.snapshot();
@@ -1205,6 +1220,10 @@ fn route_select_user_table(
             result_rows
         }
     };
+
+    // Apply toJson() built-in on projected columns.
+    let selected_rows =
+        apply_tojson_projections(&s.columns, &col_names, &all_col_names, &rows, selected_rows);
 
     // Apply LIMIT
     let limited = if let Some(limit) = s.limit {
@@ -3505,6 +3524,225 @@ fn evaluate_where_predicates(
         }
     }
     true
+}
+
+/// Apply column selection (with `toJson()` support) to system table query results.
+///
+/// System table handlers build the full set of columns, then this function
+/// projects down to the columns requested in the `SELECT` list. If the
+/// `SELECT` list contains `toJson(col)`, the column value is serialized to
+/// a JSON string using [`bridge::cql_value_to_json`].
+fn apply_system_select(
+    select_columns_ast: &[SelectColumn],
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    all_rows: &[Vec<Option<CqlValue>>],
+    keyspace: &str,
+    table: &str,
+) -> Result<BytesMut, CqlError> {
+    // Star — return everything
+    if select_columns_ast
+        .iter()
+        .any(|c| matches!(c, SelectColumn::Star))
+    {
+        return Ok(result::encode_rows(
+            all_col_names,
+            all_col_types,
+            keyspace,
+            table,
+            all_rows,
+        ));
+    }
+
+    // Build projected column names, types, and transform descriptors.
+    let mut proj_names: Vec<String> = Vec::new();
+    let mut proj_types: Vec<CqlType> = Vec::new();
+    // Each entry: (source column index, apply_tojson)
+    let mut proj_ops: Vec<(usize, bool)> = Vec::new();
+
+    for sc in select_columns_ast {
+        match sc {
+            SelectColumn::Star => unreachable!(),
+            SelectColumn::Column(name) => {
+                let idx = all_col_names
+                    .iter()
+                    .position(|n| n == name)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", name)))?;
+                proj_names.push(name.clone());
+                proj_types.push(all_col_types[idx].clone());
+                proj_ops.push((idx, false));
+            }
+            SelectColumn::FunctionCall {
+                name, args, alias, ..
+            } => {
+                let fn_lower = name.to_lowercase();
+                if fn_lower == "tojson" {
+                    // toJson(column_ref) — single argument expected
+                    if args.len() != 1 {
+                        return Err(CqlError::Invalid(
+                            "toJson() requires exactly one argument".into(),
+                        ));
+                    }
+                    let col_name = extract_column_name(&args[0])?;
+                    let idx = all_col_names
+                        .iter()
+                        .position(|n| *n == col_name)
+                        .ok_or_else(|| {
+                            CqlError::Invalid(format!("unknown column: {}", col_name))
+                        })?;
+                    let display = alias
+                        .clone()
+                        .unwrap_or_else(|| format!("system.tojson({})", col_name));
+                    proj_names.push(display);
+                    proj_types.push(CqlType::Varchar); // toJson returns text
+                    proj_ops.push((idx, true));
+                } else if fn_lower == "count" {
+                    let display = alias.clone().unwrap_or_else(|| "system.count".to_string());
+                    proj_names.push(display);
+                    proj_types.push(CqlType::Bigint);
+                    // COUNT is handled below as aggregate
+                    proj_ops.push((usize::MAX, false));
+                } else {
+                    return Err(CqlError::Invalid(format!(
+                        "unsupported function in system table query: {}",
+                        name
+                    )));
+                }
+            }
+        }
+    }
+
+    // Check for COUNT(*) aggregate
+    let has_count = select_columns_ast.iter().any(|c| {
+        matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+    });
+
+    if has_count {
+        // Aggregate query — return a single row
+        let mut agg_row: Vec<Option<CqlValue>> = Vec::new();
+        for (i, sc) in select_columns_ast.iter().enumerate() {
+            if matches!(sc, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+            {
+                agg_row.push(Some(CqlValue::Bigint(all_rows.len() as i64)));
+            } else {
+                let (src_idx, apply_tojson) = proj_ops[i];
+                if src_idx < all_col_names.len() {
+                    let val = all_rows
+                        .first()
+                        .and_then(|r| r.get(src_idx))
+                        .cloned()
+                        .flatten();
+                    if apply_tojson {
+                        let json =
+                            bridge::cql_value_to_json(val.as_ref().unwrap_or(&CqlValue::Null));
+                        agg_row.push(Some(CqlValue::Text(json)));
+                    } else {
+                        agg_row.push(val);
+                    }
+                } else {
+                    agg_row.push(None);
+                }
+            }
+        }
+        return Ok(result::encode_rows(
+            &proj_names,
+            &proj_types,
+            keyspace,
+            table,
+            &[agg_row],
+        ));
+    }
+
+    // Non-aggregate: project each row
+    let projected: Vec<Vec<Option<CqlValue>>> = all_rows
+        .iter()
+        .map(|row| {
+            proj_ops
+                .iter()
+                .map(|&(src_idx, apply_tojson)| {
+                    let val = row.get(src_idx).cloned().flatten();
+                    if apply_tojson {
+                        let json =
+                            bridge::cql_value_to_json(val.as_ref().unwrap_or(&CqlValue::Null));
+                        Some(CqlValue::Text(json))
+                    } else {
+                        val
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    Ok(result::encode_rows(
+        &proj_names,
+        &proj_types,
+        keyspace,
+        table,
+        &projected,
+    ))
+}
+
+/// Extract a column name from a `Term` that should reference a column.
+///
+/// In the `parse_term` codepath, bare identifiers in function arguments are
+/// parsed as `Term::FunctionCall { name, args: [] }` (zero-arg function call).
+fn extract_column_name(term: &Term) -> Result<String, CqlError> {
+    match term {
+        Term::FunctionCall { name, args, .. } if args.is_empty() => Ok(name.to_lowercase()),
+        Term::StringLiteral(s) => Ok(s.clone()),
+        _ => Err(CqlError::Invalid(format!(
+            "expected column reference in toJson(), got {:?}",
+            term
+        ))),
+    }
+}
+
+/// Apply `toJson()` transformations to projected rows for user-table SELECT queries.
+///
+/// Scans the SELECT column list for `toJson(col)` calls. For each one, finds the
+/// source column value from the full (unprojected) row and replaces the projected
+/// cell with its JSON representation.
+fn apply_tojson_projections(
+    select_columns_ast: &[SelectColumn],
+    proj_col_names: &[String],
+    all_col_names: &[String],
+    full_rows: &[Vec<Option<CqlValue>>],
+    mut projected_rows: Vec<Vec<Option<CqlValue>>>,
+) -> Vec<Vec<Option<CqlValue>>> {
+    // Find toJson columns: (projected_index, source_column_index)
+    let mut tojson_ops: Vec<(usize, usize)> = Vec::new();
+    for (proj_idx, sc) in select_columns_ast.iter().enumerate() {
+        if let SelectColumn::FunctionCall { name, args, .. } = sc {
+            if name.eq_ignore_ascii_case("tojson") {
+                if let Some(arg) = args.first() {
+                    if let Ok(col_name) = extract_column_name(arg) {
+                        if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name) {
+                            if proj_idx < proj_col_names.len() {
+                                tojson_ops.push((proj_idx, src_idx));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if tojson_ops.is_empty() {
+        return projected_rows;
+    }
+
+    for (full_row, proj_row) in full_rows.iter().zip(projected_rows.iter_mut()) {
+        for &(proj_idx, src_idx) in &tojson_ops {
+            let val = full_row
+                .get(src_idx)
+                .and_then(|v| v.as_ref())
+                .unwrap_or(&CqlValue::Null);
+            let json = bridge::cql_value_to_json(val);
+            proj_row[proj_idx] = Some(CqlValue::Text(json));
+        }
+    }
+
+    projected_rows
 }
 
 /// Project rows to a selected column subset.
