@@ -184,6 +184,64 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(n))
 }
 
+/// Validate that all consolidation columns are numeric types.
+///
+/// Accepts: double, float, int, bigint, counter.
+/// Rejects: text, blob, uuid, timestamp, boolean, etc.
+pub fn validate_numeric_columns(
+    column_names: &[String],
+    column_types: &HashMap<String, String>,
+) -> Result<(), String> {
+    let numeric_types = ["double", "float", "int", "bigint", "counter"];
+    for col in column_names {
+        match column_types.get(col) {
+            Some(ct) => {
+                if !numeric_types.contains(&ct.as_str()) {
+                    return Err(format!(
+                        "column '{}' has type '{}', but consolidation requires a numeric type \
+                         (double, float, int, bigint, counter)",
+                        col, ct
+                    ));
+                }
+            }
+            None => {
+                return Err(format!("column '{}' not found in table", col));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Detect cycles in the consolidation cascade chain.
+///
+/// Walks from `source_table` through each table's `consolidation.target` extension,
+/// checking for cycles. Returns `Err` if a cycle is detected.
+pub fn detect_cascade_cycle(
+    source_table: &str,
+    all_extensions: &HashMap<String, HashMap<String, String>>,
+) -> Result<(), String> {
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(source_table.to_string());
+
+    let mut current = source_table.to_string();
+    while let Some(ext) = all_extensions.get(&current) {
+        let target = match ext.get("consolidation.target") {
+            Some(t) => t.clone(),
+            None => break, // no consolidation config, chain terminates
+        };
+
+        if !visited.insert(target.clone()) {
+            return Err(format!(
+                "cascade cycle detected: '{}' -> '{}' creates a loop",
+                current, target
+            ));
+        }
+        current = target;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +337,77 @@ mod tests {
 
         let config = ConsolidationConfig::from_extensions(&ext).unwrap().unwrap();
         assert_eq!(config.interval_micros(), 300_000_000);
+    }
+
+    // --- Task 17: DDL validation tests ---
+
+    #[test]
+    fn validate_numeric_columns_accepts_numeric() {
+        let mut types = HashMap::new();
+        types.insert("temp".into(), "double".into());
+        types.insert("count".into(), "bigint".into());
+        types.insert("pressure".into(), "float".into());
+
+        assert!(validate_numeric_columns(&["temp".into(), "count".into()], &types).is_ok());
+    }
+
+    #[test]
+    fn validate_numeric_columns_rejects_text() {
+        let mut types = HashMap::new();
+        types.insert("name".into(), "text".into());
+
+        let err = validate_numeric_columns(&["name".into()], &types).unwrap_err();
+        assert!(err.contains("text"));
+        assert!(err.contains("numeric"));
+    }
+
+    #[test]
+    fn validate_numeric_columns_rejects_missing() {
+        let types = HashMap::new();
+        let err = validate_numeric_columns(&["missing".into()], &types).unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn detect_cycle_no_cycle() {
+        let mut all_ext = HashMap::new();
+        let mut ext_1s = HashMap::new();
+        ext_1s.insert("consolidation.target".into(), "sensor_5m".into());
+        all_ext.insert("sensor_1s".into(), ext_1s);
+
+        let mut ext_5m = HashMap::new();
+        ext_5m.insert("consolidation.target".into(), "sensor_15m".into());
+        all_ext.insert("sensor_5m".into(), ext_5m);
+
+        // sensor_15m has no consolidation (terminal).
+        all_ext.insert("sensor_15m".into(), HashMap::new());
+
+        assert!(detect_cascade_cycle("sensor_1s", &all_ext).is_ok());
+    }
+
+    #[test]
+    fn detect_cycle_finds_cycle() {
+        let mut all_ext = HashMap::new();
+        let mut ext_a = HashMap::new();
+        ext_a.insert("consolidation.target".into(), "b".into());
+        all_ext.insert("a".into(), ext_a);
+
+        let mut ext_b = HashMap::new();
+        ext_b.insert("consolidation.target".into(), "a".into()); // cycle!
+        all_ext.insert("b".into(), ext_b);
+
+        let err = detect_cascade_cycle("a", &all_ext).unwrap_err();
+        assert!(err.contains("cycle"));
+    }
+
+    #[test]
+    fn detect_cycle_self_reference() {
+        let mut all_ext = HashMap::new();
+        let mut ext = HashMap::new();
+        ext.insert("consolidation.target".into(), "self_table".into());
+        all_ext.insert("self_table".into(), ext);
+
+        let err = detect_cascade_cycle("self_table", &all_ext).unwrap_err();
+        assert!(err.contains("cycle"));
     }
 }
