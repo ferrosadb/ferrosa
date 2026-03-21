@@ -65,7 +65,7 @@ pub const ROLES_COL_SALTED_HASH: u16 = 2;
 // Clustering key: resource (text)
 // Regular columns:
 
-/// `permissions` set<text>, stored as JSON array bytes.
+/// `permissions` `set<text>`, stored as JSON array bytes.
 pub const PERMISSIONS_COL_PERMISSIONS: u16 = 0;
 
 // ---------------------------------------------------------------------------
