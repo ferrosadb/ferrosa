@@ -26,6 +26,8 @@ pub struct ConsolidationConfig {
     pub max_rings: usize,
     /// Cascade multipliers for auto-creating downstream tables.
     pub cascade_multipliers: Vec<u32>,
+    /// Bounded channel capacity for consolidation tasks (default 1024).
+    pub channel_capacity: usize,
 }
 
 impl Default for ConsolidationConfig {
@@ -40,6 +42,7 @@ impl Default for ConsolidationConfig {
             ring_capacity: 512,
             max_rings: 10_000,
             cascade_multipliers: vec![3, 4],
+            channel_capacity: 1024,
         }
     }
 }
@@ -121,6 +124,13 @@ impl ConsolidationConfig {
             config.max_rings = max_str
                 .parse()
                 .map_err(|_| format!("invalid max_rings: '{max_str}'"))?;
+        }
+
+        // Optional: channel_capacity (default 1024).
+        if let Some(cap_str) = ext.get("consolidation.channel_capacity") {
+            config.channel_capacity = cap_str
+                .parse()
+                .map_err(|_| format!("invalid channel_capacity: '{cap_str}'"))?;
         }
 
         // Optional: cascade_multipliers.
@@ -669,5 +679,29 @@ mod tests {
             err.contains("ring_capacity"),
             "error should mention ring_capacity: {err}"
         );
+    }
+
+    // --- FMEA Fix 4: Default channel capacity ---
+
+    #[test]
+    fn config_default_channel_capacity() {
+        let config = ConsolidationConfig::default();
+        assert_eq!(
+            config.channel_capacity, 1024,
+            "default channel_capacity should be 1024"
+        );
+    }
+
+    #[test]
+    fn config_parses_custom_channel_capacity() {
+        let mut ext = HashMap::new();
+        ext.insert("consolidation.interval".into(), "5m".into());
+        ext.insert("consolidation.functions".into(), "avg".into());
+        ext.insert("consolidation.target".into(), "t".into());
+        ext.insert("consolidation.columns".into(), "v".into());
+        ext.insert("consolidation.channel_capacity".into(), "2048".into());
+
+        let config = ConsolidationConfig::from_extensions(&ext).unwrap().unwrap();
+        assert_eq!(config.channel_capacity, 2048);
     }
 }
