@@ -598,10 +598,10 @@ async fn send_repair_writes(
     for &host_id in stale_host_ids {
         metrics.inc_attempted();
         match peer_manager
-            .send(host_id, Message::RepairWrite(body.clone()), Lane::Data)
+            .fire(host_id, Message::RepairWrite(body.clone()), Lane::Data)
             .await
         {
-            Ok(_) => {
+            Ok(()) => {
                 tracing::info!(
                     %host_id,
                     table = %table_id,

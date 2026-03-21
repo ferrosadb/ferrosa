@@ -94,6 +94,28 @@ impl PeerManager {
         }
     }
 
+    /// Fire-and-forget a message to a peer on the specified lane.
+    ///
+    /// Unlike [`send()`](Self::send), this does not wait for a response. Used for
+    /// repair writes and other best-effort messages.
+    pub async fn fire(
+        &self,
+        host_id: uuid::Uuid,
+        msg: Message,
+        lane: Lane,
+    ) -> crate::error::Result<()> {
+        let peers = self.peers.read().await;
+        let state = peers
+            .get(&host_id)
+            .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
+        match &state.pool {
+            Some(pool) => pool.fire(msg, lane).await,
+            None => Err(crate::error::NetError::Protocol(
+                "no connection pool".into(),
+            )),
+        }
+    }
+
     /// Heartbeat loop: sends Ping at configured interval, marks peers suspected
     /// after 3 missed heartbeats.
     pub async fn run_heartbeat_loop(&self) {
@@ -348,5 +370,16 @@ mod tests {
             0,
             "no pool means no reconnect and therefore no recovered event"
         );
+    }
+
+    #[tokio::test]
+    async fn fire_returns_error_for_unknown_peer() {
+        let config = Arc::new(NetConfig::default());
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(config, uuid::Uuid::new_v4(), listener);
+        let result = pm
+            .fire(uuid::Uuid::new_v4(), Message::Ping { nonce: 1 }, Lane::Data)
+            .await;
+        assert!(result.is_err(), "fire to unknown peer should fail");
     }
 }
