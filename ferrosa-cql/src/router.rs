@@ -922,7 +922,34 @@ fn route_select_user_table(
 
         match scan_plan {
             ScanPlan::PartitionKeyLookup => {
-                unreachable!("PK lookup should have been handled above");
+                // This can happen when extract_pk_values fails (e.g., bind
+                // values that can't be coerced to the PK column type) but
+                // the planner still sees Eq predicates on all PK columns.
+                // Fall through to a full scan rather than panicking.
+                let scan_limit = 10_000;
+                let partitions = state.engine.read_range(&table_id, None, None, scan_limit)?;
+                let mut all_rows = Vec::new();
+                for partition in &partitions {
+                    let mut prows = bridge::partition_to_rows(
+                        partition,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                    );
+                    all_rows.append(&mut prows);
+                }
+                all_rows.retain(|row| {
+                    evaluate_where_predicates(
+                        row,
+                        &s.where_clauses,
+                        &all_col_names,
+                        table_meta,
+                        ks,
+                        &state.schema,
+                    )
+                });
+                all_rows
             }
 
             ScanPlan::SingleIndex {
