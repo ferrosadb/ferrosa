@@ -24,6 +24,9 @@ use ferrosa_index::IndexType;
 pub enum BuildPriority {
     /// Normal priority — triggered by flush or compaction.
     Normal,
+    /// High priority — eager build on flush/compaction completion.
+    /// Keeps MemtableIndex (Layer 4) bounded to 0-1 entries in steady state.
+    High,
     /// Initial build — the index was just created and needs a full build.
     Initial,
 }
