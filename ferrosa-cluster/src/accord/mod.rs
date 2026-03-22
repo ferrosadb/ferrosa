@@ -5,6 +5,7 @@
 
 pub mod clock_validation;
 pub mod cross_shard;
+pub mod ddl_drain;
 pub mod proptests;
 pub mod recovery;
 pub mod recovery_scenarios;
@@ -16,6 +17,7 @@ pub use clock_validation::{
     validate_timestamp_drift, ClockDriftRejection, DEFAULT_MAX_CLOCK_DRIFT_NS,
 };
 pub use cross_shard::{CrossShardCoordinator, CrossShardOutcome, ShardId, ShardResult};
+pub use ddl_drain::{DdlDrainGuard, DrainError};
 pub use recovery::{RecoverOKResponse, RecoveryCoordinator, RecoveryDecision};
 pub use reorder_buffer::ReorderBuffer;
 pub use state_machine::{AccordStateMachine, SmResponse};
