@@ -12,7 +12,9 @@
 //! - **Manifest**: S3 manifest with etag-based CAS (Part C)
 //! - **Cache**: local disk cache with LRU eviction (Part C)
 //! - **Engine**: top-level `StorageEngine` composing all components (Part C)
+//! - **Accord**: per-shard conflict detection for Accord transactions
 
+pub mod accord;
 pub mod batchlog;
 pub mod cache;
 pub mod commitlog;
