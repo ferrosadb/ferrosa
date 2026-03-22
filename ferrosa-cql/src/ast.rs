@@ -88,6 +88,41 @@ pub enum Statement {
         stream_id: Option<u16>,
     },
     Explain(Box<SelectStatement>),
+    /// BEGIN TRANSACTION — starts a multi-statement Accord transaction.
+    BeginTransaction,
+    /// COMMIT — commits the current Accord transaction.
+    Commit,
+    /// ROLLBACK — aborts the current Accord transaction.
+    Rollback,
+}
+
+impl Statement {
+    /// Returns true if this is a DDL statement (schema-modifying).
+    /// DDL is not permitted inside Accord transactions.
+    pub fn is_ddl(&self) -> bool {
+        matches!(
+            self,
+            Statement::CreateKeyspace(_)
+                | Statement::AlterKeyspace(_)
+                | Statement::DropKeyspace(_)
+                | Statement::CreateTable(_)
+                | Statement::AlterTable(_)
+                | Statement::DropTable(_)
+                | Statement::CreateRole(_)
+                | Statement::AlterRole(_)
+                | Statement::DropRole(_)
+                | Statement::CreateIndex(_)
+                | Statement::DropIndex(_)
+                | Statement::CreateType { .. }
+                | Statement::AlterType { .. }
+                | Statement::DropType { .. }
+                | Statement::CreateFunction { .. }
+                | Statement::DropFunction { .. }
+                | Statement::CreateAggregate { .. }
+                | Statement::DropAggregate { .. }
+                | Statement::Truncate(_)
+        )
+    }
 }
 
 /// A value expression in DML statements.

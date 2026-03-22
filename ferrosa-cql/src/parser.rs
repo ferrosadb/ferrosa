@@ -88,7 +88,9 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Alter) => self.parse_alter(),
             TokenKind::Keyword(Keyword::Drop) => self.parse_drop(),
             TokenKind::Keyword(Keyword::Use) => self.parse_use().map(Statement::Use),
-            TokenKind::Keyword(Keyword::Begin) => self.parse_batch().map(Statement::Batch),
+            TokenKind::Keyword(Keyword::Begin) => self.parse_begin(),
+            TokenKind::Keyword(Keyword::Commit) => self.parse_commit(),
+            TokenKind::Keyword(Keyword::Rollback) => self.parse_rollback(),
             TokenKind::Keyword(Keyword::Truncate) => self.parse_truncate().map(Statement::Truncate),
             TokenKind::Keyword(Keyword::Grant) => self.parse_grant().map(Statement::Grant),
             TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke().map(Statement::Revoke),
@@ -451,12 +453,38 @@ impl<'input> Parser<'input> {
     }
 
     // ---------------------------------------------------------------
+    // BEGIN — disambiguate BATCH vs TRANSACTION
+    // ---------------------------------------------------------------
+
+    fn parse_begin(&mut self) -> Result<Statement, CqlError> {
+        // Consume BEGIN, then peek to decide: TRANSACTION or BATCH
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Begin))?;
+
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::Transaction))? {
+            return Ok(Statement::BeginTransaction);
+        }
+
+        // Otherwise it's a BATCH statement — delegate to parse_batch_body
+        // (BEGIN already consumed)
+        self.parse_batch_body().map(Statement::Batch)
+    }
+
+    fn parse_commit(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Commit))?;
+        Ok(Statement::Commit)
+    }
+
+    fn parse_rollback(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Rollback))?;
+        Ok(Statement::Rollback)
+    }
+
+    // ---------------------------------------------------------------
     // BATCH
     // ---------------------------------------------------------------
 
-    fn parse_batch(&mut self) -> Result<BatchStatement, CqlError> {
-        self.lexer.expect(&TokenKind::Keyword(Keyword::Begin))?;
-
+    /// Parse the body of a BATCH statement (after BEGIN has already been consumed).
+    fn parse_batch_body(&mut self) -> Result<BatchStatement, CqlError> {
         // Optional batch type
         let batch_type = if self.lexer.eat(&TokenKind::Keyword(Keyword::Unlogged))? {
             BatchType::Unlogged
@@ -2194,6 +2222,9 @@ impl<'input> Parser<'input> {
             Keyword::Contains => "contains",
             Keyword::Explain => "explain",
             Keyword::Distinct => "distinct",
+            Keyword::Transaction => "transaction",
+            Keyword::Commit => "commit",
+            Keyword::Rollback => "rollback",
         }
         .to_string()
     }
@@ -3910,6 +3941,102 @@ mod tests {
             }
             other => panic!("expected Delete, got {:?}", other),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Accord transaction tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_begin_commit_rollback() {
+        // BEGIN TRANSACTION
+        let stmt = parse("BEGIN TRANSACTION").unwrap();
+        assert!(
+            matches!(stmt, Statement::BeginTransaction),
+            "expected BeginTransaction, got {:?}",
+            stmt
+        );
+
+        // COMMIT
+        let stmt = parse("COMMIT").unwrap();
+        assert!(
+            matches!(stmt, Statement::Commit),
+            "expected Commit, got {:?}",
+            stmt
+        );
+
+        // ROLLBACK
+        let stmt = parse("ROLLBACK").unwrap();
+        assert!(
+            matches!(stmt, Statement::Rollback),
+            "expected Rollback, got {:?}",
+            stmt
+        );
+    }
+
+    #[test]
+    fn parse_begin_transaction_case_insensitive() {
+        let stmt = parse("begin transaction").unwrap();
+        assert!(matches!(stmt, Statement::BeginTransaction));
+
+        let stmt = parse("Begin Transaction").unwrap();
+        assert!(matches!(stmt, Statement::BeginTransaction));
+    }
+
+    #[test]
+    fn parse_nested_transaction_rejected() {
+        use crate::session::TransactionState;
+        let mut txn_state = TransactionState::new();
+
+        // First BEGIN is accepted.
+        let stmt = parse("BEGIN TRANSACTION").unwrap();
+        txn_state.validate_and_transition(&stmt).unwrap();
+
+        // Second BEGIN inside the transaction must be rejected.
+        let stmt = parse("BEGIN TRANSACTION").unwrap();
+        let err = txn_state.validate_and_transition(&stmt);
+        assert!(err.is_err(), "nested BEGIN TRANSACTION should be rejected");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("nested"),
+            "error should mention 'nested', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_ddl_in_transaction_rejected() {
+        use crate::session::TransactionState;
+        let mut txn_state = TransactionState::new();
+
+        // Start a transaction.
+        let begin = parse("BEGIN TRANSACTION").unwrap();
+        txn_state.validate_and_transition(&begin).unwrap();
+
+        // DDL inside transaction must be rejected.
+        let ddl = parse("CREATE TABLE ks.t (k int PRIMARY KEY)").unwrap();
+        let err = txn_state.validate_and_transition(&ddl);
+        assert!(err.is_err(), "DDL inside transaction should be rejected");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("DDL"),
+            "error should mention 'DDL', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_empty_transaction() {
+        use crate::session::TransactionState;
+        let mut txn_state = TransactionState::new();
+
+        // BEGIN immediately followed by COMMIT is legal.
+        let begin = parse("BEGIN TRANSACTION").unwrap();
+        txn_state.validate_and_transition(&begin).unwrap();
+
+        let commit = parse("COMMIT").unwrap();
+        txn_state.validate_and_transition(&commit).unwrap();
+
+        // After commit, we're back to no-transaction state.
+        assert!(!txn_state.in_transaction());
     }
 }
 

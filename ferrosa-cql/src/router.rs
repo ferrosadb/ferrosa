@@ -368,6 +368,11 @@ pub async fn route(
             .await
             .map(RouteResult::Result),
         Statement::Explain(s) => route_explain(state, ctx, *s).map(RouteResult::Result),
+        // Accord transaction control statements are handled at the session/connection
+        // level, not in the router. If they reach here, return a void result.
+        Statement::BeginTransaction | Statement::Commit | Statement::Rollback => {
+            Ok(RouteResult::Result(crate::result::encode_void()))
+        }
     }
 }
 
