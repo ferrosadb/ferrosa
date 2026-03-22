@@ -8,7 +8,7 @@
 //! - **Client retry with same TxnId** (A6.4): Idempotent retry support using
 //!   cached results keyed by [`TxnId`].
 //! - **Cross-shard conflict detection** (A6.5): Multi-partition transactions
-//!   register in the [`ConflictIndex`] of each participating shard.
+//!   register in the `ConflictIndex` of each participating shard.
 //!
 //! # Design
 //!
@@ -70,7 +70,7 @@ pub enum CrossShardOutcome {
 
 /// Coordinates Accord transaction execution across multiple shards.
 ///
-/// Each shard has its own [`AccordStateMachine`] and [`ConflictIndex`].
+/// Each shard has its own [`AccordStateMachine`] and `ConflictIndex`.
 /// The coordinator dispatches operations in parallel and collects results.
 /// A result cache provides idempotent retry for client retries with the
 /// same [`TxnId`].

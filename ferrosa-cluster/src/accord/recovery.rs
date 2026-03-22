@@ -63,7 +63,7 @@ pub struct RecoverOKResponse {
 /// Usage:
 /// 1. Call [`RecoveryCoordinator::start_recovery`] to create a coordinator
 ///    and get the ballot to use in `Recover` messages.
-/// 2. For each `RecoverOK` received, call [`handle_recover_ok`].
+/// 2. For each `RecoverOK` received, call `handle_recover_ok()`.
 /// 3. When enough responses are collected, the method returns a
 ///    [`RecoveryDecision`].
 pub struct RecoveryCoordinator {

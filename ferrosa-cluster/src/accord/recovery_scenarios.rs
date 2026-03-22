@@ -2,7 +2,7 @@
 //!
 //! These tests exercise coordinator crashes at various protocol phases and
 //! verify that the recovery protocol correctly restores consensus. All tests
-//! use the deterministic [`TestCluster`] harness — no tokio, no timers,
+//! use the deterministic `TestCluster` harness — no tokio, no timers,
 //! fully reproducible.
 
 #[cfg(test)]

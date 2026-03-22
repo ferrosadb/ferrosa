@@ -512,6 +512,7 @@ mod tests {
     }
 
     /// Helper: create a simple Commit test message (generates no response).
+    #[allow(dead_code)]
     fn commit_msg(src: u64, dst: u64, t0_micros: u64) -> TestMessage {
         let t0 = Timestamp::synthetic(t0_micros);
         let txn_id = TxnId::new(src, t0);

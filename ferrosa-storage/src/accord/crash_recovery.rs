@@ -60,7 +60,7 @@ pub struct ReplayedConflictEntry {
 
 /// Drives Accord crash recovery by replaying persisted entries.
 ///
-/// After calling [`replay`], the caller can inspect:
+/// After calling `replay()`, the caller can inspect:
 /// - `txn_states` — per-transaction consensus state
 /// - `applied_txn_ids` — transactions that must NOT be re-applied
 /// - `conflict_entries` — entries for rebuilding the ConflictIndex

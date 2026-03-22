@@ -32,7 +32,7 @@ pub struct FlushCompleteEvent {
 
 /// Hook that fires on flush/compaction completion to schedule eager index builds.
 ///
-/// Each call to [`on_flush_complete`] submits one `IndexBuildJob` per declared
+/// Each call to `on_flush_complete()` submits one `IndexBuildJob` per declared
 /// secondary index at `BuildPriority::High`. The scheduler processes high-priority
 /// jobs before normal ones, keeping the MemtableIndex bounded.
 pub struct EagerIndexBuilder {
@@ -77,7 +77,7 @@ impl EagerIndexBuilder {
 
     /// Schedule high-priority index builds after compaction produces a new SSTable.
     ///
-    /// Identical to [`on_flush_complete`] — compaction output needs the same
+    /// Identical to `on_flush_complete()` — compaction output needs the same
     /// eager index treatment to keep sidecar indexes current.
     pub fn on_compaction_complete(&self, event: &FlushCompleteEvent) -> usize {
         self.on_flush_complete(event)
