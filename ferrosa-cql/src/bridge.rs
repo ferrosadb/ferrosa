@@ -218,6 +218,14 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             CqlType::Double if b.len() == 8 => Ok(CqlValue::Double(u64::from_be_bytes(
                 b.as_slice().try_into().unwrap(),
             ))),
+            CqlType::Vector(_, dim) if b.len() == *dim * 4 => {
+                // Raw vector bytes: N big-endian f32 values
+                let floats: Vec<u32> = b
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                Ok(CqlValue::Vector(floats))
+            }
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got blob literal ({} bytes)",
                 cql_type_name(target),
