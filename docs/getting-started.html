@@ -346,6 +346,33 @@ session.Query(<span class="str">"SELECT name, email FROM demo.users LIMIT 1"</sp
   <pre><span class="cm"># Standard cqlsh connects directly</span>
 <span class="kw">cqlsh</span> 127.0.0.1 9042</pre>
 
+  <h3>Transactions</h3>
+  <p>Ferrosa supports strict serializable distributed transactions via the Accord protocol. Lightweight transactions (LWT) work with any CQL driver:</p>
+
+  <pre><span class="cm"># Conditional insert — only succeeds if the row doesn't exist</span>
+session.execute(<span class="str">"""
+    INSERT INTO demo.users (user_id, name, email)
+    VALUES (uuid(), 'Bob', 'bob@example.com')
+    IF NOT EXISTS
+"""</span>)
+
+<span class="cm"># Compare-and-set update</span>
+session.execute(<span class="str">"""
+    UPDATE demo.users SET email = 'newemail@example.com'
+    WHERE user_id = ?
+    IF email = 'bob@example.com'
+"""</span>, [user_id])
+
+<span class="cm"># Multi-partition transaction</span>
+session.execute(<span class="str">"""
+    BEGIN TRANSACTION
+      UPDATE accounts SET balance = balance - 100
+        WHERE id = 'acct-1' IF balance >= 100;
+      UPDATE accounts SET balance = balance + 100
+        WHERE id = 'acct-2';
+    COMMIT TRANSACTION
+"""</span>)</pre>
+
   <!-- ── Config ── -->
   <h2 id="config">Configuration Reference</h2>
 
