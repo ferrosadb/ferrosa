@@ -197,6 +197,27 @@ pub enum Assignment {
     },
 }
 
+/// Comparison operator in an IF condition on UPDATE/DELETE (LWT).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IfOperator {
+    Eq,    // =
+    NotEq, // !=
+    Lt,    // <
+    Gt,    // >
+    LtEq,  // <=
+    GtEq,  // >=
+    In,    // IN
+}
+
+/// A condition in an IF clause on UPDATE/DELETE (LWT).
+/// e.g., `IF col = 'value' AND other_col != 42`
+#[derive(Debug, Clone, PartialEq)]
+pub struct IfCondition {
+    pub column: String,
+    pub operator: IfOperator,
+    pub value: Term,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStatement {
     pub keyspace: Option<String>,
@@ -204,6 +225,7 @@ pub struct UpdateStatement {
     pub assignments: Vec<Assignment>,
     pub where_clauses: Vec<WhereClause>,
     pub if_exists: bool,
+    pub if_conditions: Vec<IfCondition>,
     pub using_timestamp: Option<i64>,
     pub using_ttl: Option<i32>,
 }
@@ -234,6 +256,7 @@ pub struct DeleteStatement {
     pub columns: Vec<DeleteTarget>,
     pub where_clauses: Vec<WhereClause>,
     pub if_exists: bool,
+    pub if_conditions: Vec<IfCondition>,
     pub using_timestamp: Option<i64>,
 }
 
