@@ -264,6 +264,84 @@ impl ConflictIndex {
         }
     }
 
+    /// Mark a transaction as Applied across all index entries.
+    ///
+    /// Updates the status of all single-key entries for this transaction
+    /// to `TxnStatus::Applied`, making them eligible for garbage collection
+    /// via [`gc_applied`](ConflictIndex::gc_applied).
+    pub fn mark_applied(&mut self, txn_id: &TxnId) {
+        for writes in self.single_key.values_mut() {
+            for entry in writes.iter_mut() {
+                if entry.txn_id == *txn_id {
+                    entry.status = TxnStatus::Applied;
+                }
+            }
+        }
+    }
+
+    /// Garbage-collect all entries with status `TxnStatus::Applied`.
+    ///
+    /// Removes applied entries from single-key, range, and indexed-write
+    /// maps. Decrements `current_entries` for each removal from single-key
+    /// and range maps.
+    ///
+    /// The caller is responsible for only marking transactions as Applied
+    /// once all dependents have been resolved.
+    pub fn gc_applied(&mut self) {
+        // Collect applied TxnIds from single_key for range/indexed cleanup.
+        let mut applied_txn_ids = Vec::new();
+        let mut removed = 0usize;
+
+        self.single_key.retain(|_key, writes| {
+            let before = writes.len();
+            for w in writes.iter() {
+                if w.status == TxnStatus::Applied {
+                    applied_txn_ids.push(w.txn_id);
+                }
+            }
+            writes.retain(|w| w.status != TxnStatus::Applied);
+            removed += before - writes.len();
+            !writes.is_empty()
+        });
+
+        // Remove applied transactions from range_ops.
+        let mut empty_ranges = Vec::new();
+        for (range, txn_set) in &mut self.range_ops {
+            let before = txn_set.len();
+            txn_set.retain(|(_ts, tid)| !applied_txn_ids.contains(tid));
+            removed += before - txn_set.len();
+            if txn_set.is_empty() {
+                empty_ranges.push(range.clone());
+            }
+        }
+        for range in empty_ranges {
+            self.range_ops.remove(&range);
+        }
+
+        // Remove applied transactions from indexed_writes.
+        let mut empty_columns = Vec::new();
+        for (column, value_map) in &mut self.indexed_writes {
+            let mut empty_values = Vec::new();
+            for (value, txn_ids) in value_map.iter_mut() {
+                txn_ids.retain(|tid| !applied_txn_ids.contains(tid));
+                if txn_ids.is_empty() {
+                    empty_values.push(value.clone());
+                }
+            }
+            for value in empty_values {
+                value_map.remove(&value);
+            }
+            if value_map.is_empty() {
+                empty_columns.push(column.clone());
+            }
+        }
+        for column in empty_columns {
+            self.indexed_writes.remove(&column);
+        }
+
+        self.current_entries = self.current_entries.saturating_sub(removed);
+    }
+
     /// Current number of entries (single-key + range).
     pub fn len(&self) -> usize {
         self.current_entries
@@ -507,5 +585,58 @@ mod tests {
 
         // Query for a different column should return None.
         assert!(idx.get_indexed_writes("name", b"25").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 10: GC respects deps — only removes Applied
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conflict_index_gc_respects_deps() {
+        let mut idx = ConflictIndex::new(100);
+        let key = b"users:alice";
+
+        // Register T1 and T2 on the same key. T2 depends on T1.
+        idx.register(key, write_entry(100)).unwrap();
+        idx.register(key, write_entry(200)).unwrap();
+        assert_eq!(idx.len(), 2);
+
+        // Verify T2 sees T1 as a dependency.
+        let deps = idx.deps_before_t0(key, &ts(200));
+        assert_eq!(deps.len(), 1);
+        assert!(deps.contains(&txn(100)));
+
+        // Mark T1 as Applied and GC.
+        idx.mark_applied(&txn(100));
+        idx.gc_applied();
+
+        // T1 should be removed.
+        assert_eq!(idx.len(), 1);
+
+        // T2 should still be present (not applied).
+        assert_eq!(idx.max_conflicting_timestamp(key), Some(ts(200)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 11: GC after apply removes entry completely
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conflict_index_gc_after_apply() {
+        let mut idx = ConflictIndex::new(100);
+        let key = b"orders:123";
+
+        idx.register(key, write_entry(100)).unwrap();
+        assert_eq!(idx.len(), 1);
+
+        idx.mark_applied(&txn(100));
+        idx.gc_applied();
+
+        assert_eq!(idx.len(), 0);
+        assert!(idx.is_empty());
+
+        // No deps should remain.
+        let deps = idx.deps_before_t0(key, &ts(200));
+        assert!(deps.is_empty());
     }
 }

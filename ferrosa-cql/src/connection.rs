@@ -683,11 +683,11 @@ async fn handle_query(
         ferrosa_cluster::consistency::ConsistencyLevel::One
     };
 
-    // Parse query flags and extract page_size / paging_state.
+    // Parse query flags and extract page_size / paging_state / serial_consistency.
     // CQL v5 QUERY frame after consistency: [byte flags][...]
     // Flag bits: 0x01 = values, 0x04 = page_size, 0x08 = paging_state,
     //            0x10 = serial_consistency, 0x20 = default_timestamp
-    let paging = parse_query_paging_params(&mut cursor);
+    let (paging, serial_cl) = parse_query_paging_params(&mut cursor);
 
     // Parse the CQL statement.
     let stmt = match parser::parse(query) {
@@ -698,7 +698,7 @@ async fn handle_query(
     };
 
     // Build an auth context for routing (use a default if auth was disabled).
-    let ctx = build_request_context(auth_context, current_keyspace, cl, paging);
+    let ctx = build_request_context(auth_context, current_keyspace, cl, serial_cl, paging);
 
     match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
@@ -937,7 +937,7 @@ async fn handle_execute(
     // Parse paging params for EXECUTE (same format as QUERY after values).
     let paging = parse_execute_paging_params(cursor);
 
-    let ctx = build_request_context(auth_context, current_keyspace, cl, paging);
+    let ctx = build_request_context(auth_context, current_keyspace, cl, None, paging);
 
     match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
@@ -1072,6 +1072,7 @@ async fn handle_batch(
             auth_context,
             current_keyspace,
             cl,
+            None,
             crate::paging::PagingParams::default(),
         );
         match crate::router::route(state, &ctx, stmt).await {
@@ -1113,11 +1114,17 @@ fn handle_register() -> HandleResult {
 /// [i32 page_size if flag 0x04]
 /// [int len][bytes paging_state if flag 0x08]
 /// ```
-fn parse_query_paging_params(cursor: &mut &[u8]) -> crate::paging::PagingParams {
+fn parse_query_paging_params(
+    cursor: &mut &[u8],
+) -> (
+    crate::paging::PagingParams,
+    Option<ferrosa_cluster::consistency::ConsistencyLevel>,
+) {
     let mut params = crate::paging::PagingParams::default();
+    let mut serial_cl = None;
 
     if cursor.remaining() < 1 {
-        return params;
+        return (params, serial_cl);
     }
     let flags = cursor.get_u8();
 
@@ -1131,7 +1138,7 @@ fn parse_query_paging_params(cursor: &mut &[u8]) -> crate::paging::PagingParams 
                 if cursor.remaining() >= name_len {
                     cursor.advance(name_len);
                 } else {
-                    return params;
+                    return (params, serial_cl);
                 }
             }
             // Skip value bytes
@@ -1142,11 +1149,11 @@ fn parse_query_paging_params(cursor: &mut &[u8]) -> crate::paging::PagingParams 
                     if cursor.remaining() >= val_len {
                         cursor.advance(val_len);
                     } else {
-                        return params;
+                        return (params, serial_cl);
                     }
                 }
             } else {
-                return params;
+                return (params, serial_cl);
             }
         }
     }
@@ -1156,7 +1163,7 @@ fn parse_query_paging_params(cursor: &mut &[u8]) -> crate::paging::PagingParams 
         if cursor.remaining() >= 4 {
             params.page_size = Some(cursor.get_i32());
         } else {
-            return params;
+            return (params, serial_cl);
         }
     }
 
@@ -1172,7 +1179,13 @@ fn parse_query_paging_params(cursor: &mut &[u8]) -> crate::paging::PagingParams 
         }
     }
 
-    params
+    // serial_consistency (flag 0x10)
+    if flags & 0x10 != 0 && cursor.remaining() >= 2 {
+        let wire_scl = cursor.get_u16();
+        serial_cl = ferrosa_cluster::consistency::ConsistencyLevel::from_wire(wire_scl);
+    }
+
+    (params, serial_cl)
 }
 
 /// Parse paging params from EXECUTE frame after bind values.
@@ -1199,6 +1212,7 @@ fn build_request_context<'a>(
     auth_context: &'a mut Option<AuthContext>,
     current_keyspace: &'a Option<String>,
     consistency: ferrosa_cluster::consistency::ConsistencyLevel,
+    serial_consistency: Option<ferrosa_cluster::consistency::ConsistencyLevel>,
     paging: crate::paging::PagingParams,
 ) -> RequestContext<'a> {
     // If auth was disabled, we need a default auth context.
@@ -1213,6 +1227,7 @@ fn build_request_context<'a>(
         auth: auth_context.as_ref().unwrap(),
         current_keyspace,
         consistency,
+        serial_consistency,
         paging,
     }
 }
