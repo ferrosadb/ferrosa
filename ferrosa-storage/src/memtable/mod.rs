@@ -5,6 +5,7 @@
 //! persistent structures) without changing any consumer code.
 
 pub mod index;
+pub mod mem_index;
 pub mod sharded;
 #[cfg(feature = "skiplist-memtable")]
 pub mod skiplist;
