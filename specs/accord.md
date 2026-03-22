@@ -263,18 +263,25 @@ BTreeMap<CellValue, BTreeMap<Timestamp, MemIndexEntry>>
 - GC'd on flush: `flush_gc(flushed_up_to_ts)` removes entries covered by persistent index
 - Partition reverse lookup: `HashMap<PartitionKey, HashSet<CellValue>>` for DELETE handling
 
-## Commit Log Extensions
+## Commit Log Architecture
 
-Four new entry types added to `CommitLogEntry` enum:
+Accord uses a dual-log architecture:
+
+**Protocol Log** (local-only, NOT uploaded to S3):
 
 | Entry | Persisted Before | GC Condition |
 |-------|-----------------|--------------|
-| `AccordPreAccepted` | Sending `PreAcceptOK` | After `AccordApplied` flushed to SSTable |
-| `AccordAccepted` | Sending `AcceptOK` | After `AccordApplied` flushed to SSTable |
-| `AccordCommitted` | Setting `committed` flag | After `AccordApplied` flushed to SSTable |
-| `AccordApplied` | Setting `applied` flag | After SSTable uploaded to S3 |
+| `AccordPreAccepted` | Sending `PreAcceptOK` | After `AccordApplied` written to main log |
+| `AccordAccepted` | Sending `AcceptOK` | After `AccordApplied` written to main log |
+| `AccordCommitted` | Setting `committed` flag | After `AccordApplied` written to main log |
 
-Write amplification: 4 commit log entries per transaction vs 1 today. Monitor `FERROSA_S3_UPLOAD_QUEUE_DEPTH`.
+**Main Commit Log** (uploaded to S3, existing infrastructure):
+
+| Entry | Persisted Before | GC Condition |
+|-------|-----------------|--------------|
+| `AccordApplied` + data mutation | Setting `applied` flag | After SSTable uploaded to S3 |
+
+Protocol state is ephemeral — GC'd aggressively after Applied, reconstructable from peers on restart. Main commit log stays at ~1x S3 upload volume (no amplification vs today).
 
 ## Flexible Electorates
 
@@ -316,13 +323,15 @@ Recovery coordinators select values by `max(accepted_ballot)`, never `max(max_ba
 
 **Enforcement:** Distinct newtype wrappers prevent compile-time confusion. The 24-step EPaxos correctness test is a mandatory CI gate.
 
-### ADR: All Writes Through Accord
+### ADR: All Writes Through Accord (CL=ONE Fire-and-Forget)
 
-**Context:** Mixing Accord and non-Accord writes makes non-Accord writes invisible to dependency tracking, violating strict serializability.
+**Context:** Mixing Accord and non-Accord writes makes non-Accord writes invisible to dependency tracking, violating strict serializability (FM16, RPN 250). However, CL=ONE workloads (telemetry, IoT, event logs) explicitly opted out of consistency and care about throughput.
 
-**Decision:** All writes — including single-key INSERT/UPDATE — route through Accord. No bypass for any CL setting.
+**Decision:** All writes route through Accord. CL=ONE uses fire-and-forget mode: enters Accord, gets `t0`, broadcasts PreAccept, returns ACK to client after PreAccept quorum, but skips the Execute/Apply wait. The transaction completes asynchronously in the background. The write is registered in the ConflictIndex, so subsequent Accord transactions see it as a dependency.
 
-**Trade-off:** Single-key writes add one network round-trip (PreAccept) vs current direct quorum write. Leaseholder optimization recovers most of this cost.
+**Implementation:** `AccordStateMachine` carries a `FireAndForget` flag that skips the Execute/Read/Apply wait loop. The PreAccept→Commit path completes asynchronously. Client gets ACK after PreAccept quorum (~0.5 RTT added vs bypassing Accord entirely).
+
+**Trade-off:** ~0.5 RTT overhead for CL=ONE vs full bypass, but dependency tracking is preserved. Subsequent Accord transactions are never blind to CL=ONE writes.
 
 ### ADR: Superset Dependency Model
 
@@ -352,10 +361,36 @@ Recovery coordinators select values by `max(accepted_ballot)`, never `max(max_ba
 | 3: Transactional 2i | 2i correctness + dep-wait P99 < 5ms | MemIndex integration, READ_2I algorithm, CommitIndex projections, eager index build |
 | 4: Electorate Reconfig | Chaos test + Jepsen all-tests with nemesis | Epoch propagation, JoinElectorate, electorate shrink |
 
-## Open Questions
+### ADR: Schema Changes — Drain-and-Block, Then Two-Phase DDL
 
-1. **CL=ONE bypass?** Proposed: CL=ONE still goes through Accord but skips Execute phase (fire-and-forget after Commit). Preserves dependency tracking.
-2. **Schema changes as Accord transactions?** Phase 1: blocking drain. Phase 4: model DDL as spanning all partitions.
-3. **SUBSCRIBE ordering with Accord timestamps.** Apply order becomes deterministic (Accord `t` ordering). Expose `accord_ts` in change event payload.
-4. **S3 upload queue depth.** 4x commit log entries may need queue increase from 16 to 64.
-5. **AccordApplied.result in SSTables.** Options: (a) separate column family, (b) hidden system column, (c) separate file per SSTable. Needs profiling.
+**Context:** DDL (ALTER TABLE, CREATE INDEX) must conflict with all DML on the affected table. Modeling DDL as an Accord transaction spanning "all partitions of table X" is conceptually clean but O(num_partitions) in ConflictIndex — impractical for large tables.
+
+**Decision (Phase 1):** Drain-and-block. Stop accepting new Accord transactions for the table, wait for in-flight to complete, apply DDL via Raft, resume. Table is unavailable during DDL (seconds to minutes depending on drain). Simple, correct, DDL is infrequent.
+
+**Decision (Phase 4):** Two-phase DDL. Phase 1 — broadcast "DDL pending" marker via Raft, which causes all new Accord transactions to include the pending DDL in their dep set. Phase 2 — after all pre-marker transactions complete, apply DDL. New transactions that dep-waited on the DDL proceed with the updated schema. Very short unavailability window.
+
+**Transition:** Phase 1's drain logic becomes Phase 4's "wait for pre-marker txns to complete" step. No throwaway work.
+
+### ADR: SUBSCRIBE Dual Timestamps
+
+**Context:** CDC/SUBSCRIBE consumers currently see changes in Apply order (arrival-time-based). With Accord, Apply order becomes deterministic (Accord `t` ordering). This is strictly more correct but is a behavioral change.
+
+**Decision:** Emit both `accord_ts` (commit order) and `apply_ts` (wall-clock apply time) in the SUBSCRIBE change event payload. Default ordering is `accord_ts`. Consumers that need arrival-order semantics can sort by `apply_ts`.
+
+**Wire compatibility:** Additive change — old consumers ignore the new `accord_ts` field. Ordering change is the correct one (strictly more correct than arrival order).
+
+### ADR: Separate Protocol Log
+
+**Context:** Each Accord transaction generates 4 commit log entries (PreAccepted, Accepted, Committed, Applied) vs 1 today. This 4x write amplification increases commit log segment rotation and S3 upload pressure.
+
+**Decision:** Accord protocol state (PreAccepted, Accepted, Committed) goes to a dedicated local-only protocol log that is NOT uploaded to S3. Only `AccordApplied` + the actual data mutation go to the main commit log (which IS uploaded). Protocol state is ephemeral by design — GC'd after Applied, reconstructable from peers on restart.
+
+**Effect:** Main commit log stays at ~1x S3 upload volume. Protocol log uses smaller segments with aggressive local GC. Pairs well with CL=ONE fire-and-forget: fire-and-forget transactions write to the protocol log for dependency tracking but generate zero S3 upload pressure until Applied.
+
+### ADR: Sidecar `.accord` File for Result Persistence
+
+**Context:** `AccordApplied.result` must be durable for recovery. If shard A applied but shard B didn't, recovery re-applies using A's persisted result. This result needs a home in the SSTable format.
+
+**Decision:** When an SSTable is flushed, a companion `.accord` sidecar file is written alongside it containing all `AccordApplied` results for transactions in that SSTable, keyed by `TxnId`. Deleted when all shards confirm Applied (via ExclusiveSyncPoint). Normal reads never touch the sidecar. Recovery reads the sidecar.
+
+**Rationale:** Zero per-row overhead in the SSTable data format. Fits the existing sidecar pattern (sidecar index files). S3 upload pipeline already handles companion files. Results are only needed for recovery (a rare event) — no reason to pollute every row with a hidden column.
