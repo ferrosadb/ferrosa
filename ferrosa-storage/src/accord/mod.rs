@@ -19,6 +19,7 @@ pub mod conflict_index;
 pub mod crash_recovery;
 pub mod entries;
 pub mod protocol_log;
+pub mod read_2i;
 pub mod sidecar;
 pub mod sync_writer;
 pub mod write_gate;
@@ -29,6 +30,9 @@ pub use crash_recovery::{
 };
 pub use entries::{AccordAppliedEntry, AccordProtocolEntry};
 pub use protocol_log::ProtocolLog;
+pub use read_2i::{
+    ConsistencyMode, DepWaitOutcome, IndexResult, LayerId, Read2iMerger, Read2iQuery,
+};
 pub use sidecar::{AccordSidecar, SidecarUploadManifest, SIDECAR_EXTENSION};
 pub use sync_writer::{FileSyncWriter, MockSyncWriter, SyncWriteResult, SyncWriter};
 pub use write_gate::{check_write_gate, check_write_gate_range, WriteGateDecision};
