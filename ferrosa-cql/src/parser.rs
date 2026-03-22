@@ -1559,6 +1559,7 @@ impl<'input> Parser<'input> {
         let tok = self.lexer.next_token()?;
         let text = match &tok.kind {
             TokenKind::Ident(s) => s.to_string(),
+            TokenKind::StringLiteral(s) => s.to_string(),
             _ => {
                 return Err(CqlError::SyntaxError(format!(
                     "expected duration (e.g. 5s, 500ms, 1m), got {:?} at position {}",

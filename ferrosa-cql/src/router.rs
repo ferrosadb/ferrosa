@@ -4005,9 +4005,11 @@ fn evaluate_where_predicates(
 
         let matches = match wc.op {
             ComparisonOp::Eq if has_phonetic_index => {
-                // Case-insensitive string comparison as partial phonetic matching.
+                // Phonetic matching via simplified Soundex-like comparison.
+                // Words that sound similar should match even if spelled differently
+                // (e.g., "John Smith" matches "Jon Smyth").
                 match (actual, &expected) {
-                    (CqlValue::Text(a), CqlValue::Text(b)) => a.to_lowercase() == b.to_lowercase(),
+                    (CqlValue::Text(a), CqlValue::Text(b)) => phonetic_match(a, b),
                     _ => *actual == expected,
                 }
             }
@@ -5485,6 +5487,24 @@ fn where_has_udf_calls(where_clauses: &[WhereClause]) -> bool {
         }
     }
     false
+}
+
+/// Simple phonetic matching: compare two strings word-by-word using Soundex.
+/// Returns true if all words have the same Soundex code.
+/// Phonetic matching using the Double Metaphone encoder from ferrosa-index.
+/// Compares word-by-word: "John Smith" matches "Jon Smyth" because each
+/// word pair produces the same phonetic code.
+fn phonetic_match(a: &str, b: &str) -> bool {
+    let encoder = ferrosa_index::phonetic::PhoneticAlgorithm::DoubleMetaphone.encoder();
+    let a_words: Vec<&str> = a.split_whitespace().collect();
+    let b_words: Vec<&str> = b.split_whitespace().collect();
+    if a_words.len() != b_words.len() {
+        return false;
+    }
+    a_words
+        .iter()
+        .zip(b_words.iter())
+        .all(|(wa, wb)| encoder.encode(wa) == encoder.encode(wb))
 }
 
 /// Check if a Term contains a non-builtin function call.
