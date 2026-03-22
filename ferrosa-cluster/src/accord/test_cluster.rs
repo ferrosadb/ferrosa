@@ -254,13 +254,25 @@ impl TestReplica {
             .entry(txn_id)
             .or_insert_with(|| TxnState::new(txn_id, t0));
 
+        // NACK if recovery ballot is lower than our promised ballot.
+        if ballot < state.max_ballot_seen.0 {
+            return vec![TestMessage {
+                src: self.node_id,
+                dst: from,
+                payload: TestMessagePayload::Nack {
+                    txn_id,
+                    max_ballot_seen: state.max_ballot_seen,
+                },
+            }];
+        }
+
         // Update promised ballot if recovery ballot is higher.
+        // CRITICAL: do NOT update accepted_ballot — recovery is a promise phase.
         if ballot > state.max_ballot_seen.0 {
             state.max_ballot_seen = PromisedBallot(ballot);
         }
 
-        // The state we return is the current state (not modified by recovery
-        // ballot — accepted_ballot stays the same).
+        // Return the current state (accepted_ballot stays the same).
         vec![TestMessage {
             src: self.node_id,
             dst: from,
