@@ -3647,10 +3647,7 @@ fn build_column_info(
                 alias,
                 args,
             } => {
-                let builtin_display_name = alias.clone().unwrap_or_else(|| {
-                    let prefix = func_ks.as_deref().unwrap_or("system");
-                    format!("{}.{}", prefix, name)
-                });
+                let builtin_display_name = alias.clone().unwrap_or_else(|| name.to_lowercase());
                 let fn_lower = name.to_lowercase();
                 let (display_name, cql_type) = match fn_lower.as_str() {
                     // COUNT(*) column name must be "count" (not "system.count")
