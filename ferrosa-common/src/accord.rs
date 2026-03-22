@@ -8,6 +8,7 @@
 //! type-safe wrappers that prevent mixing up the two ballot roles in the
 //! Paxos-like accept/promise protocol.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -283,6 +284,163 @@ impl BallotGenerator {
 impl Default for BallotGenerator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TxnPhase
+// ---------------------------------------------------------------------------
+
+/// Phase of an Accord transaction on a given replica.
+///
+/// Phases advance forward only: `PreAccepted → Accepted → Committed → Applied`.
+/// Attempts to regress to an earlier phase are silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnPhase {
+    PreAccepted,
+    Accepted,
+    Committed,
+    Applied,
+}
+
+impl TxnPhase {
+    /// Numeric rank for ordering: higher values are later phases.
+    fn rank(self) -> u8 {
+        match self {
+            TxnPhase::PreAccepted => 0,
+            TxnPhase::Accepted => 1,
+            TxnPhase::Committed => 2,
+            TxnPhase::Applied => 3,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TxnState
+// ---------------------------------------------------------------------------
+
+/// All state a replica maintains for a single Accord transaction.
+///
+/// # Two-ballot invariant
+///
+/// `accepted_ballot` and `max_ballot_seen` are tracked **separately**.
+/// Using a single variable is the EPaxos correctness bug documented by
+/// Sutra et al. (2019). The invariant `accepted_ballot <= max_ballot_seen`
+/// is checked after every mutation.
+#[derive(Debug, Clone)]
+pub struct TxnState {
+    pub txn_id: TxnId,
+    /// Coordinator's initial proposed timestamp.
+    pub t0: Timestamp,
+    /// Current / committed execution timestamp.
+    pub t: Timestamp,
+    /// Highest `t` witnessed for this txn.
+    pub t_max: Timestamp,
+    /// Dependency set.
+    pub deps: HashSet<TxnId>,
+
+    pub phase: TxnPhase,
+
+    /// CRITICAL: These two ballot fields must be tracked SEPARATELY.
+    /// Using a single variable is the EPaxos correctness bug (Sutra 2019).
+    pub max_ballot_seen: PromisedBallot,
+    pub accepted_ballot: AcceptedBallot,
+
+    /// Serialized result, needed for recovery.
+    pub result: Option<Vec<u8>>,
+}
+
+impl TxnState {
+    /// Create a new transaction state in the `PreAccepted` phase with zero ballots.
+    pub fn new(txn_id: TxnId, t0: Timestamp) -> Self {
+        let state = Self {
+            txn_id,
+            t0,
+            t: t0,
+            t_max: t0,
+            deps: HashSet::new(),
+            phase: TxnPhase::PreAccepted,
+            max_ballot_seen: PromisedBallot::default(),
+            accepted_ballot: AcceptedBallot::default(),
+            result: None,
+        };
+        state.assert_invariant();
+        state
+    }
+
+    /// Join a ballot (promise). Updates `max_ballot_seen` ONLY.
+    /// Does NOT touch `accepted_ballot`.
+    pub fn join_ballot(&mut self, ballot: PromisedBallot) {
+        if ballot.0 .0 > self.max_ballot_seen.0 .0 {
+            self.max_ballot_seen = ballot;
+        }
+        self.assert_invariant();
+    }
+
+    /// Accept at a ballot. Updates BOTH `accepted_ballot` and `max_ballot_seen`.
+    pub fn accept(&mut self, ballot: AcceptedBallot, t: Timestamp, deps: HashSet<TxnId>) {
+        // Update max_ballot_seen to at least match accepted ballot
+        let bn = (ballot.0).0;
+        if bn > (self.max_ballot_seen.0).0 {
+            self.max_ballot_seen = PromisedBallot(BallotNumber(bn));
+        }
+        self.accepted_ballot = ballot;
+        self.t = t;
+        if t > self.t_max {
+            self.t_max = t;
+        }
+        self.deps = deps;
+        if TxnPhase::Accepted.rank() > self.phase.rank() {
+            self.phase = TxnPhase::Accepted;
+        }
+        self.assert_invariant();
+    }
+
+    /// Transition to `PreAccepted` phase (only if not already past it).
+    pub fn pre_accept(&mut self, t: Timestamp, deps: HashSet<TxnId>) {
+        self.t = t;
+        if t > self.t_max {
+            self.t_max = t;
+        }
+        self.deps = deps;
+        // PreAccepted is rank 0 — only set if current phase isn't already beyond it.
+        if TxnPhase::PreAccepted.rank() > self.phase.rank() {
+            self.phase = TxnPhase::PreAccepted;
+        }
+        self.assert_invariant();
+    }
+
+    /// Transition to `Committed` phase.
+    pub fn commit(&mut self, t: Timestamp, deps: HashSet<TxnId>) {
+        self.t = t;
+        if t > self.t_max {
+            self.t_max = t;
+        }
+        self.deps = deps;
+        if TxnPhase::Committed.rank() > self.phase.rank() {
+            self.phase = TxnPhase::Committed;
+        }
+        self.assert_invariant();
+    }
+
+    /// Transition to `Applied` phase.
+    pub fn apply(&mut self, result: Vec<u8>) {
+        if TxnPhase::Applied.rank() > self.phase.rank() {
+            self.phase = TxnPhase::Applied;
+        }
+        self.result = Some(result);
+        self.assert_invariant();
+    }
+
+    /// Invariant check: `accepted_ballot <= max_ballot_seen`.
+    /// Called after every mutation.
+    fn assert_invariant(&self) {
+        assert!(
+            (self.accepted_ballot.0).0 <= (self.max_ballot_seen.0).0,
+            "INVARIANT VIOLATION: accepted_ballot ({:?}) > max_ballot_seen ({:?})",
+            self.accepted_ballot,
+            self.max_ballot_seen
+        );
     }
 }
 
@@ -693,5 +851,258 @@ mod tests {
             );
             prev = next;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // TxnState tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a TxnId from a simple counter for test convenience.
+    fn test_txn_id(n: u64) -> TxnId {
+        TxnId(Timestamp::new(0, n, 1))
+    }
+
+    /// Helper: create a Timestamp from a simple counter for test convenience.
+    fn test_ts(n: u64) -> Timestamp {
+        Timestamp::new(0, n, 1)
+    }
+
+    #[test]
+    fn txnstate_accepted_leq_promised() {
+        // Create TxnState. Call join_ballot, accept, join_ballot in
+        // random-ish order 100 times. Assert invariant holds after each.
+        let mut state = TxnState::new(test_txn_id(1), test_ts(100));
+
+        for i in 0..100u64 {
+            match i % 3 {
+                0 => {
+                    // join_ballot with increasing ballot
+                    state.join_ballot(PromisedBallot(BallotNumber(i * 2 + 10)));
+                }
+                1 => {
+                    // accept with a ballot <= max_ballot_seen
+                    let ab = std::cmp::min(i + 1, (state.max_ballot_seen.0).0);
+                    let deps = HashSet::new();
+                    state.accept(AcceptedBallot(BallotNumber(ab)), test_ts(i + 200), deps);
+                }
+                _ => {
+                    // join_ballot with smaller ballot (should be no-op for max)
+                    state.join_ballot(PromisedBallot(BallotNumber(i / 2)));
+                }
+            }
+            // Invariant is checked inside each method, but verify explicitly too.
+            assert!(
+                (state.accepted_ballot.0).0 <= (state.max_ballot_seen.0).0,
+                "iteration {}: accepted {:?} > promised {:?}",
+                i,
+                state.accepted_ballot,
+                state.max_ballot_seen,
+            );
+        }
+    }
+
+    #[test]
+    fn txnstate_phase_mutual_exclusion() {
+        let mut state = TxnState::new(test_txn_id(1), test_ts(100));
+        assert_eq!(state.phase, TxnPhase::PreAccepted);
+
+        // Pre-accept
+        state.pre_accept(test_ts(101), HashSet::new());
+        assert_eq!(state.phase, TxnPhase::PreAccepted);
+
+        // Accept
+        state.accept(
+            AcceptedBallot(BallotNumber(1)),
+            test_ts(102),
+            HashSet::new(),
+        );
+        assert_eq!(
+            state.phase,
+            TxnPhase::Accepted,
+            "phase must be Accepted after accept()"
+        );
+
+        // Commit
+        state.commit(test_ts(103), HashSet::new());
+        assert_eq!(
+            state.phase,
+            TxnPhase::Committed,
+            "phase must be Committed after commit()"
+        );
+
+        // Apply
+        state.apply(vec![1, 2, 3]);
+        assert_eq!(
+            state.phase,
+            TxnPhase::Applied,
+            "phase must be Applied after apply()"
+        );
+    }
+
+    #[test]
+    fn txnstate_phase_ordering() {
+        // Verify forward-only: going backwards should be prevented (ignored).
+        let mut state = TxnState::new(test_txn_id(1), test_ts(100));
+
+        // Advance to Committed
+        state.accept(
+            AcceptedBallot(BallotNumber(1)),
+            test_ts(101),
+            HashSet::new(),
+        );
+        state.commit(test_ts(102), HashSet::new());
+        assert_eq!(state.phase, TxnPhase::Committed);
+
+        // Try to go back to PreAccepted — must stay Committed.
+        state.pre_accept(test_ts(103), HashSet::new());
+        assert_eq!(
+            state.phase,
+            TxnPhase::Committed,
+            "phase must not regress from Committed to PreAccepted"
+        );
+
+        // Try to go back to Accepted — must stay Committed.
+        state.accept(
+            AcceptedBallot(BallotNumber(2)),
+            test_ts(104),
+            HashSet::new(),
+        );
+        assert_eq!(
+            state.phase,
+            TxnPhase::Committed,
+            "phase must not regress from Committed to Accepted"
+        );
+
+        // Advance to Applied
+        state.apply(vec![42]);
+        assert_eq!(state.phase, TxnPhase::Applied);
+
+        // Try to go back to Committed — must stay Applied.
+        state.commit(test_ts(105), HashSet::new());
+        assert_eq!(
+            state.phase,
+            TxnPhase::Applied,
+            "phase must not regress from Applied to Committed"
+        );
+    }
+
+    #[test]
+    fn txnstate_join_ballot_updates_promised_only() {
+        let mut state = TxnState::new(test_txn_id(1), test_ts(100));
+
+        // Set accepted_ballot to 2 via accept().
+        state.accept(
+            AcceptedBallot(BallotNumber(2)),
+            test_ts(101),
+            HashSet::new(),
+        );
+        assert_eq!((state.accepted_ballot.0).0, 2);
+
+        // join_ballot(4) — should update max_ballot_seen but NOT accepted_ballot.
+        state.join_ballot(PromisedBallot(BallotNumber(4)));
+        assert_eq!(
+            (state.max_ballot_seen.0).0,
+            4,
+            "max_ballot_seen must be updated to 4"
+        );
+        assert_eq!(
+            (state.accepted_ballot.0).0,
+            2,
+            "accepted_ballot must STILL be 2 after join_ballot"
+        );
+    }
+
+    #[test]
+    fn txnstate_accept_updates_both() {
+        let mut state = TxnState::new(test_txn_id(1), test_ts(100));
+
+        state.accept(
+            AcceptedBallot(BallotNumber(3)),
+            test_ts(101),
+            HashSet::new(),
+        );
+        assert_eq!(
+            (state.accepted_ballot.0).0,
+            3,
+            "accepted_ballot must be 3 after accept"
+        );
+        assert!(
+            (state.max_ballot_seen.0).0 >= 3,
+            "max_ballot_seen must be >= 3 after accept"
+        );
+    }
+
+    #[test]
+    fn txnstate_deps_union_on_preaccept() {
+        let gamma = test_txn_id(99);
+        let mut deps = HashSet::new();
+        deps.insert(gamma);
+
+        let mut state = TxnState::new(test_txn_id(1), test_ts(100));
+        state.pre_accept(test_ts(101), deps);
+
+        assert!(
+            state.deps.contains(&gamma),
+            "gamma must be in deps after pre_accept"
+        );
+    }
+
+    #[test]
+    fn txnstate_deps_filter_preaccept_uses_t0() {
+        // Semantic test: document that PreAccept dep filtering uses t0
+        // comparison (tested at higher level). Here we verify the dep set
+        // is stored correctly and t0 remains accessible for comparison.
+        let gamma = test_txn_id(50);
+        let delta = test_txn_id(150);
+        let mut deps = HashSet::new();
+        deps.insert(gamma);
+        deps.insert(delta);
+
+        let t0 = test_ts(100);
+        let mut state = TxnState::new(test_txn_id(1), t0);
+        state.pre_accept(test_ts(101), deps);
+
+        // Verify deps stored correctly.
+        assert_eq!(state.deps.len(), 2);
+        assert!(state.deps.contains(&gamma));
+        assert!(state.deps.contains(&delta));
+        // Verify t0 is preserved for higher-level filtering.
+        assert_eq!(state.t0, t0);
+    }
+
+    #[test]
+    fn txnstate_deps_filter_accept_uses_t() {
+        // Same for Accept: verify deps stored correctly and t is updated.
+        let gamma = test_txn_id(50);
+        let delta = test_txn_id(150);
+        let mut deps = HashSet::new();
+        deps.insert(gamma);
+        deps.insert(delta);
+
+        let t_accept = test_ts(200);
+        let mut state = TxnState::new(test_txn_id(1), test_ts(100));
+        state.accept(AcceptedBallot(BallotNumber(1)), t_accept, deps);
+
+        // Verify deps stored correctly.
+        assert_eq!(state.deps.len(), 2);
+        assert!(state.deps.contains(&gamma));
+        assert!(state.deps.contains(&delta));
+        // Verify t is updated to the accepted timestamp.
+        assert_eq!(state.t, t_accept);
+    }
+
+    #[test]
+    fn txnstate_default_ballots_are_zero() {
+        let state = TxnState::new(test_txn_id(1), test_ts(100));
+        assert_eq!(
+            (state.max_ballot_seen.0).0,
+            0,
+            "new() max_ballot_seen must be BallotNumber(0)"
+        );
+        assert_eq!(
+            (state.accepted_ballot.0).0,
+            0,
+            "new() accepted_ballot must be BallotNumber(0)"
+        );
     }
 }

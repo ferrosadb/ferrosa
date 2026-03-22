@@ -25,7 +25,7 @@ pub mod test_generators;
 
 pub use accord::{
     AcceptedBallot, BallotGenerator, BallotNumber, HybridLogicalClock, PromisedBallot,
-    Timestamp as AccordTimestamp, TxnId,
+    Timestamp as AccordTimestamp, TxnId, TxnPhase, TxnState,
 };
 pub use cell::{CellValue, Timestamp, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
 pub use cql_type::{CqlType, CqlValue};
