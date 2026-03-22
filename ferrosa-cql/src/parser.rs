@@ -917,6 +917,7 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Type) => self.parse_drop_type(),
             TokenKind::Keyword(Keyword::Function) => self.parse_drop_function(),
             TokenKind::Keyword(Keyword::Aggregate) => self.parse_drop_aggregate(),
+            TokenKind::Keyword(Keyword::Role) => self.parse_drop_role().map(Statement::DropRole),
             // Bare identifier after DROP: treat as DROP TABLE (Cassandra shorthand).
             // e.g., "DROP cycling.race_winners" → DROP TABLE cycling.race_winners
             TokenKind::Ident(_) => self.parse_drop_table().map(Statement::DropTable),
@@ -933,6 +934,14 @@ impl<'input> Parser<'input> {
         let name = self.parse_ident()?;
 
         Ok(DropKeyspaceStatement { name, if_exists })
+    }
+
+    fn parse_drop_role(&mut self) -> Result<DropRoleStatement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Role))?;
+        let if_exists = self.parse_if_exists()?;
+        let name = self.parse_ident()?;
+
+        Ok(DropRoleStatement { name, if_exists })
     }
 
     fn parse_drop_table(&mut self) -> Result<DropTableStatement, CqlError> {
@@ -2328,6 +2337,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_collection_add() {
+        let stmt = parse("UPDATE t SET tags = tags + {'new_tag'} WHERE id = 1").unwrap();
+        match stmt {
+            Statement::Update(s) => {
+                assert_eq!(s.table, "t");
+                assert_eq!(s.assignments.len(), 1);
+                match &s.assignments[0] {
+                    Assignment::Add { column, value } => {
+                        assert_eq!(column, "tags");
+                        assert!(
+                            matches!(value, Term::SetLiteral(elems) if elems.len() == 1),
+                            "expected SetLiteral, got {:?}",
+                            value
+                        );
+                    }
+                    other => panic!("expected Add assignment, got {:?}", other),
+                }
+            }
+            other => panic!("expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_update_collection_sub() {
+        let stmt = parse("UPDATE t SET items = items - ['old'] WHERE id = 1").unwrap();
+        match stmt {
+            Statement::Update(s) => {
+                assert_eq!(s.assignments.len(), 1);
+                match &s.assignments[0] {
+                    Assignment::Sub { column, value } => {
+                        assert_eq!(column, "items");
+                        assert!(
+                            matches!(value, Term::ListLiteral(elems) if elems.len() == 1),
+                            "expected ListLiteral, got {:?}",
+                            value
+                        );
+                    }
+                    other => panic!("expected Sub assignment, got {:?}", other),
+                }
+            }
+            other => panic!("expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_delete() {
         let stmt = parse("DELETE FROM users WHERE id = 1").unwrap();
         match stmt {
@@ -2628,6 +2682,30 @@ mod tests {
                 assert!(s.if_exists);
             }
             other => panic!("expected DropKeyspace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_drop_role() {
+        let stmt = parse("DROP ROLE admin").unwrap();
+        match stmt {
+            Statement::DropRole(s) => {
+                assert_eq!(s.name, "admin");
+                assert!(!s.if_exists);
+            }
+            other => panic!("expected DropRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_drop_role_if_exists() {
+        let stmt = parse("DROP ROLE IF EXISTS reader").unwrap();
+        match stmt {
+            Statement::DropRole(s) => {
+                assert_eq!(s.name, "reader");
+                assert!(s.if_exists);
+            }
+            other => panic!("expected DropRole, got {:?}", other),
         }
     }
 

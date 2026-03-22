@@ -6,7 +6,9 @@
 //!   `GET /api/tables`               → list of registered virtual tables
 //!   `GET /api/connections`          → CQL connection rows
 //!   `GET /api/storage_stats`        → per-table storage metrics
+//!   `GET /api/storage`              → alias for `/api/storage_stats`
 //!   `GET /api/active_queries`       → active query rows
+//!   `GET /api/queries`              → alias for `/api/active_queries`
 //!   `GET /api/cluster/status`       → cluster mode, role, host_id
 //!   `POST /api/cluster/promote`     → force-promote to standalone primary
 //!   `POST /api/cluster/switchover`  → swap primary/secondary roles

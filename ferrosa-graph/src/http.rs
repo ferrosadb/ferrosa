@@ -601,7 +601,11 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state.clone());
 
     // Health check does not require auth.
-    let health = Router::new().route("/graph/health", get(handle_health));
+    // /graph/health is the canonical path; /health is an alias for convenience
+    // (e.g. load-balancer probes that hit the root path prefix).
+    let health = Router::new()
+        .route("/graph/health", get(handle_health))
+        .route("/health", get(handle_health));
 
     Router::new().merge(authenticated).merge(health)
 }

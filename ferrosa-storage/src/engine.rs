@@ -1413,6 +1413,11 @@ impl StorageEngine {
         self.upload_manager.is_some()
     }
 
+    /// Returns the shared index state tracker.
+    pub fn index_tracker(&self) -> &Arc<crate::index::IndexStateTracker> {
+        &self.index_tracker
+    }
+
     /// Returns the S3 object store and config, if S3 is configured.
     pub fn object_store_and_config(
         &self,
@@ -1638,6 +1643,58 @@ impl StorageEngine {
                 }
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual table provider implementations
+// ---------------------------------------------------------------------------
+
+impl crate::virtual_tables::StorageStatsProvider for StorageEngine {
+    fn collect_stats(&self) -> Vec<crate::virtual_tables::StorageStats> {
+        let tables = self.tables.read();
+        tables
+            .iter()
+            .map(|(table_id, state)| crate::virtual_tables::StorageStats {
+                keyspace: table_id.keyspace().to_string(),
+                table_name: table_id.table().to_string(),
+                memtable_size_bytes: state.store.memtable_size() as i64,
+                memtable_count: 1, // One active memtable per table
+                sstable_count: state.store.sstable_count() as i32,
+                sstable_size_bytes: 0,  // Exact tracking not yet implemented
+                s3_object_count: 0,     // S3 stats not yet tracked per-table
+                s3_bytes: 0,            // S3 stats not yet tracked per-table
+                pending_compactions: 0, // Per-table pending count not yet exposed
+            })
+            .collect()
+    }
+}
+
+impl crate::virtual_tables::ArchiveStatusProvider for StorageEngine {
+    fn archive_status(&self) -> crate::virtual_tables::ArchiveStatusRow {
+        let archived = self.commit_log.archived_segments();
+        crate::virtual_tables::ArchiveStatusRow {
+            // Approximate: total closed segments minus archived ones would
+            // require knowing the full closed set. For now report archived count
+            // as "0 unarchived" if any archiving has occurred.
+            unarchived_segments: 0,
+            oldest_unarchived_age_secs: 0,
+            last_archive_success: if archived.is_empty() {
+                "never".to_string()
+            } else {
+                "unknown".to_string()
+            },
+            archive_errors_total: 0,
+        }
+    }
+}
+
+/// Snapshot listing requires async S3 access which cannot be called from
+/// the synchronous [`VirtualTable::read`] method. Returns an empty list
+/// until a background cache is implemented.
+impl crate::virtual_tables::SnapshotInfoProvider for StorageEngine {
+    fn snapshot_info(&self) -> Vec<crate::virtual_tables::SnapshotInfoRow> {
+        Vec::new()
     }
 }
 

@@ -148,6 +148,10 @@ fn system_table_rows() -> Vec<TableRow> {
         ("system_observability", "connections"),
         ("system_observability", "active_queries"),
         ("system_observability", "consolidation_status"),
+        ("system_observability", "storage_stats"),
+        ("system_observability", "secondary_indexes"),
+        ("system_observability", "archive_status"),
+        ("system_observability", "snapshots"),
     ];
     tables
         .iter()
@@ -294,6 +298,105 @@ fn system_column_rows() -> Vec<ColumnRow> {
             } else {
                 "none".to_string()
             },
+        });
+    }
+
+    // system_observability.storage_stats columns
+    let storage_stats_cols: &[(&str, &str, &str, i32)] = &[
+        ("keyspace", "partition_key", "text", 0),
+        ("table_name", "clustering", "text", 0),
+        ("memtable_size_bytes", "regular", "bigint", -1),
+        ("memtable_count", "regular", "int", -1),
+        ("sstable_count", "regular", "int", -1),
+        ("sstable_size_bytes", "regular", "bigint", -1),
+        ("s3_object_count", "regular", "int", -1),
+        ("s3_bytes", "regular", "bigint", -1),
+        ("pending_compactions", "regular", "int", -1),
+    ];
+    for (name, kind, cql_type, pos) in storage_stats_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "storage_stats".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: if *kind == "clustering" {
+                "asc".to_string()
+            } else {
+                "none".to_string()
+            },
+        });
+    }
+
+    // system_observability.secondary_indexes columns
+    let secondary_indexes_cols: &[(&str, &str, &str, i32)] = &[
+        ("keyspace_name", "partition_key", "text", 0),
+        ("table_name", "clustering", "text", 0),
+        ("index_name", "clustering", "text", 1),
+        ("index_type", "regular", "text", -1),
+        ("status", "regular", "text", -1),
+        ("indexed_sstable_count", "regular", "int", -1),
+        ("pending_sstable_count", "regular", "int", -1),
+        ("pending_bytes", "regular", "bigint", -1),
+        ("lag_seconds", "regular", "double", -1),
+        ("last_build_ms", "regular", "bigint", -1),
+        ("total_builds", "regular", "bigint", -1),
+        ("build_errors", "regular", "bigint", -1),
+    ];
+    for (name, kind, cql_type, pos) in secondary_indexes_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "secondary_indexes".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: if *kind == "clustering" {
+                "asc".to_string()
+            } else {
+                "none".to_string()
+            },
+        });
+    }
+
+    // system_observability.archive_status columns
+    let archive_status_cols: &[(&str, &str, &str, i32)] = &[
+        ("unarchived_segments", "partition_key", "bigint", 0),
+        ("oldest_unarchived_age_secs", "regular", "bigint", -1),
+        ("last_archive_success", "regular", "text", -1),
+        ("archive_errors_total", "regular", "bigint", -1),
+    ];
+    for (name, kind, cql_type, pos) in archive_status_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "archive_status".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: "none".to_string(),
+        });
+    }
+
+    // system_observability.snapshots columns
+    let snapshots_cols: &[(&str, &str, &str, i32)] = &[
+        ("name", "partition_key", "text", 0),
+        ("created_at", "regular", "text", -1),
+        ("expires_at", "regular", "text", -1),
+        ("commit_log_segment", "regular", "bigint", -1),
+        ("commit_log_offset", "regular", "bigint", -1),
+        ("node_id", "regular", "text", -1),
+    ];
+    for (name, kind, cql_type, pos) in snapshots_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "snapshots".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: "none".to_string(),
         });
     }
 

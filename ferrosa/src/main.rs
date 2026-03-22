@@ -447,8 +447,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             schema.clone(),
         ),
     ));
-    // TODO: Register StorageStatsTable once StorageEngine implements StorageStatsProvider.
-    // Until then, GET /api/storage_stats will return [].
+    // Storage-backed virtual tables: StorageEngine implements the provider traits.
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_storage::virtual_tables::StorageStatsTable::new(storage.clone()),
+    ));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_storage::virtual_tables::ArchiveStatusTable::new(storage.clone()),
+    ));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_storage::virtual_tables::SnapshotsTable::new(storage.clone()),
+    ));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_storage::index::virtual_table::SecondaryIndexesVirtualTable::new(
+            storage.index_tracker().clone(),
+        ),
+    ));
 
     let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state);
     let cql_addr = cql_server.start_background().await?;

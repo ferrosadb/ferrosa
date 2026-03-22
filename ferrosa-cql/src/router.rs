@@ -1584,6 +1584,69 @@ async fn route_update(
         }
     }
 
+    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    let table_id = TableId::new(ks, &s.table);
+
+    // Check if any assignments require a read-modify-write (collection +/-)
+    let needs_read = s.assignments.iter().any(|a| match a {
+        Assignment::Add { column, .. } | Assignment::Sub { column, .. } => {
+            if let Some(col_meta) = table_meta.columns.get(column) {
+                !matches!(
+                    resolve_col_type(&col_meta.column_type, ks, &state.schema),
+                    Ok(CqlType::Counter)
+                )
+            } else {
+                false
+            }
+        }
+        _ => false,
+    });
+
+    // Lazily read existing row for collection Add/Sub merge
+    let existing_row: Option<Vec<Option<CqlValue>>> = if needs_read {
+        let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+        let all_col_types: Vec<CqlType> = table_meta
+            .columns
+            .values()
+            .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pk_indices: Vec<usize> = table_meta
+            .partition_key
+            .iter()
+            .filter_map(|name| table_meta.columns.get_index_of(name))
+            .collect();
+        let ck_indices: Vec<usize> = table_meta
+            .clustering_key
+            .iter()
+            .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
+            .collect();
+
+        if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+            let rows = bridge::partition_to_rows(
+                &partition,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+            );
+            // Find the row matching our CK values
+            if ck_values.is_empty() {
+                rows.into_iter().next()
+            } else {
+                rows.into_iter().find(|row| {
+                    ck_indices
+                        .iter()
+                        .zip(ck_values.iter())
+                        .all(|(&idx, ck_val)| row.get(idx).and_then(|v| v.as_ref()) == Some(ck_val))
+                })
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Build cells from SET assignments
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
     for assignment in &s.assignments {
@@ -1604,7 +1667,7 @@ async fn route_update(
                     .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
                 let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
 
-                // For counters: increment. For collections: append.
+                // For counters: increment. For collections: read-modify-write append/merge.
                 match &cql_type {
                     CqlType::Counter => {
                         let increment = bridge::term_to_cql_value(value, &CqlType::Bigint)?;
@@ -1617,9 +1680,17 @@ async fn route_update(
                         }
                     }
                     _ => {
-                        // Collection append: store the new value (simplified)
-                        let val = bridge::term_to_cql_value(value, &cql_type)?;
-                        (column.as_str(), val)
+                        let new_val = bridge::term_to_cql_value(value, &cql_type)?;
+                        let col_table_idx = table_meta
+                            .columns
+                            .get_index_of(column)
+                            .expect("column verified above");
+                        let existing = existing_row
+                            .as_ref()
+                            .and_then(|row| row.get(col_table_idx))
+                            .and_then(|v| v.as_ref());
+                        let merged = collection_add(existing, &new_val);
+                        (column.as_str(), merged)
                     }
                 }
             }
@@ -1643,15 +1714,32 @@ async fn route_update(
                     }
                     CqlType::Map(key_type, _) => {
                         // Map subtraction: RHS is a set of keys to remove.
-                        // Coerce the set literal to Set<K>, not Map<K,V>.
                         let set_of_keys = CqlType::Set(key_type.clone());
-                        let val = bridge::term_to_cql_value(value, &set_of_keys)?;
-                        (column.as_str(), val)
+                        let keys_to_remove = bridge::term_to_cql_value(value, &set_of_keys)?;
+                        let col_table_idx = table_meta
+                            .columns
+                            .get_index_of(column)
+                            .expect("column verified above");
+                        let existing = existing_row
+                            .as_ref()
+                            .and_then(|row| row.get(col_table_idx))
+                            .and_then(|v| v.as_ref());
+                        let merged = collection_sub_map(existing, &keys_to_remove);
+                        (column.as_str(), merged)
                     }
                     _ => {
-                        // Set/list subtraction: RHS is the same collection type.
-                        let val = bridge::term_to_cql_value(value, &cql_type)?;
-                        (column.as_str(), val)
+                        // Set/list subtraction: remove matching elements.
+                        let to_remove = bridge::term_to_cql_value(value, &cql_type)?;
+                        let col_table_idx = table_meta
+                            .columns
+                            .get_index_of(column)
+                            .expect("column verified above");
+                        let existing = existing_row
+                            .as_ref()
+                            .and_then(|row| row.get(col_table_idx))
+                            .and_then(|v| v.as_ref());
+                        let merged = collection_sub(existing, &to_remove);
+                        (column.as_str(), merged)
                     }
                 }
             }
@@ -1681,9 +1769,7 @@ async fn route_update(
         regular_cells.push((col_idx, value));
     }
 
-    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
-    let table_id = TableId::new(ks, &s.table);
     let rf = keyspace_rf(&state.schema, ks);
 
     state
@@ -1699,6 +1785,91 @@ async fn route_update(
         )
         .await?;
     Ok(result::encode_void())
+}
+
+/// Merge a new collection value into an existing one (for `col = col + val`).
+///
+/// - List: appends new elements to the end of the existing list.
+/// - Set: merges new elements into the existing set (deduplicating).
+/// - Map: merges new key-value pairs, overwriting existing keys.
+/// - Non-collection: returns the new value as-is.
+fn collection_add(existing: Option<&CqlValue>, new_val: &CqlValue) -> CqlValue {
+    match (existing, new_val) {
+        (Some(CqlValue::List(old)), CqlValue::List(add)) => {
+            let mut merged = old.clone();
+            merged.extend(add.iter().cloned());
+            CqlValue::List(merged)
+        }
+        (Some(CqlValue::Set(old)), CqlValue::Set(add)) => {
+            let mut merged = old.clone();
+            for item in add {
+                if !merged.contains(item) {
+                    merged.push(item.clone());
+                }
+            }
+            CqlValue::Set(merged)
+        }
+        (Some(CqlValue::Map(old)), CqlValue::Map(add)) => {
+            let mut merged = old.clone();
+            for (k, v) in add {
+                if let Some(entry) = merged.iter_mut().find(|(ek, _)| ek == k) {
+                    entry.1 = v.clone();
+                } else {
+                    merged.push((k.clone(), v.clone()));
+                }
+            }
+            CqlValue::Map(merged)
+        }
+        (None, _) => new_val.clone(),
+        _ => new_val.clone(),
+    }
+}
+
+/// Subtract elements from a collection (for `col = col - val` on list/set).
+///
+/// - List: removes all occurrences of each element in `to_remove`.
+/// - Set: removes matching elements.
+/// - Non-collection: returns the existing value or Null.
+fn collection_sub(existing: Option<&CqlValue>, to_remove: &CqlValue) -> CqlValue {
+    match (existing, to_remove) {
+        (Some(CqlValue::List(old)), CqlValue::List(remove)) => {
+            let filtered: Vec<CqlValue> = old
+                .iter()
+                .filter(|item| !remove.contains(item))
+                .cloned()
+                .collect();
+            CqlValue::List(filtered)
+        }
+        (Some(CqlValue::Set(old)), CqlValue::Set(remove)) => {
+            let filtered: Vec<CqlValue> = old
+                .iter()
+                .filter(|item| !remove.contains(item))
+                .cloned()
+                .collect();
+            CqlValue::Set(filtered)
+        }
+        (Some(existing_val), _) => existing_val.clone(),
+        (None, _) => CqlValue::Null,
+    }
+}
+
+/// Remove map entries by key (for `col = col - {key_set}` on maps).
+///
+/// The `keys_to_remove` is a Set of keys. All map entries whose key appears
+/// in the set are removed.
+fn collection_sub_map(existing: Option<&CqlValue>, keys_to_remove: &CqlValue) -> CqlValue {
+    match (existing, keys_to_remove) {
+        (Some(CqlValue::Map(old)), CqlValue::Set(remove_keys)) => {
+            let filtered: Vec<(CqlValue, CqlValue)> = old
+                .iter()
+                .filter(|(k, _)| !remove_keys.contains(k))
+                .cloned()
+                .collect();
+            CqlValue::Map(filtered)
+        }
+        (Some(existing_val), _) => existing_val.clone(),
+        (None, _) => CqlValue::Null,
+    }
 }
 
 // ── DELETE ────────────────────────────────────────────────────────────────
