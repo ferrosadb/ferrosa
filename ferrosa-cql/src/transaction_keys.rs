@@ -325,6 +325,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             allow_filtering: false,
+            ann_of: None,
         })
     }
 
@@ -362,6 +363,7 @@ mod tests {
                 token_fn: false,
             }],
             if_exists: false,
+            if_conditions: vec![],
             using_timestamp: None,
             using_ttl: None,
         })
@@ -380,6 +382,7 @@ mod tests {
                 token_fn: false,
             }],
             if_exists: false,
+            if_conditions: vec![],
             using_timestamp: None,
         })
     }
@@ -535,6 +538,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             allow_filtering: false,
+            ann_of: None,
         });
 
         let keys = extract_keys(&sel, "ks");
