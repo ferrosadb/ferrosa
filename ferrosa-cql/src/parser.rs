@@ -18,6 +18,10 @@ use crate::lexer::{Keyword, Lexer, TokenKind};
 /// Security mitigation M2.
 const MAX_NESTING_DEPTH: usize = 32;
 
+/// Return type for ORDER BY parsing: standard ordering clauses plus an
+/// optional ANN OF (Approximate Nearest Neighbor) clause.
+type OrderByResult = (Vec<(String, OrderDirection)>, Option<(String, Term)>);
+
 /// Maximum number of elements in a collection literal.
 /// Security mitigation M6.
 const MAX_COLLECTION_ELEMENTS: usize = 65_536;
@@ -123,12 +127,12 @@ impl<'input> Parser<'input> {
             vec![]
         };
 
-        // Optional ORDER BY
-        let order_by = if self.lexer.eat(&TokenKind::Keyword(Keyword::Order))? {
+        // Optional ORDER BY (including ANN OF for vector similarity search)
+        let (order_by, ann_of) = if self.lexer.eat(&TokenKind::Keyword(Keyword::Order))? {
             self.lexer.expect(&TokenKind::Keyword(Keyword::By))?;
-            self.parse_order_by()?
+            self.parse_order_by_with_ann()?
         } else {
-            vec![]
+            (vec![], None)
         };
 
         // Optional LIMIT
@@ -168,6 +172,7 @@ impl<'input> Parser<'input> {
             order_by,
             limit,
             allow_filtering,
+            ann_of,
         })
     }
 
@@ -218,10 +223,31 @@ impl<'input> Parser<'input> {
         Ok(cols)
     }
 
-    fn parse_order_by(&mut self) -> Result<Vec<(String, OrderDirection)>, CqlError> {
+    /// Parse ORDER BY clause, handling both standard `col ASC|DESC` and
+    /// ANN (Approximate Nearest Neighbor) syntax: `col ANN OF <term>`.
+    fn parse_order_by_with_ann(&mut self) -> Result<OrderByResult, CqlError> {
         let mut items = vec![];
+        let mut ann_of = None;
         loop {
             let col = self.parse_ident()?;
+
+            // Check for ANN OF <term> syntax (vector similarity ordering).
+            // ANN is not a keyword — it arrives as Ident("ann") after lowercasing
+            // by parse_ident, or as a raw Ident token we peek at directly.
+            let peek = self.lexer.peek()?;
+            let is_ann = matches!(&peek.kind, TokenKind::Ident(s) if s.eq_ignore_ascii_case("ann"));
+            if is_ann {
+                // Consume "ANN"
+                self.lexer.next_token()?;
+                // Expect "OF"
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Of))?;
+                // Parse the vector term (bind marker, list literal, etc.)
+                let term = self.parse_term()?;
+                ann_of = Some((col, term));
+                // ANN OF is always the sole ordering clause — break out.
+                break;
+            }
+
             let dir = if self.lexer.eat(&TokenKind::Keyword(Keyword::Desc))? {
                 OrderDirection::Desc
             } else {
@@ -234,7 +260,7 @@ impl<'input> Parser<'input> {
                 break;
             }
         }
-        Ok(items)
+        Ok((items, ann_of))
     }
 
     // ---------------------------------------------------------------

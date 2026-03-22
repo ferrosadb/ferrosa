@@ -167,6 +167,9 @@ pub struct SelectStatement {
     pub order_by: Vec<(String, OrderDirection)>,
     pub limit: Option<i32>,
     pub allow_filtering: bool,
+    /// ANN (Approximate Nearest Neighbor) ordering: `ORDER BY col ANN OF <term>`.
+    /// Stores the column name and the vector term for similarity search.
+    pub ann_of: Option<(String, Term)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -436,6 +439,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             allow_filtering: false,
+            ann_of: None,
         });
         let stmt = Statement::Subscribe {
             inner: Box::new(inner),

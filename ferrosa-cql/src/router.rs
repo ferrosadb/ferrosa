@@ -1151,6 +1151,18 @@ fn route_select_user_table(
         }
     };
 
+    // ANN OF ordering: vector similarity search is deferred — log and fall
+    // through to normal result ordering. The query parses successfully but
+    // ANN execution will be implemented when the vector index query path is
+    // wired up.
+    if s.ann_of.is_some() {
+        tracing::warn!(
+            keyspace = ks,
+            table = %s.table,
+            "ORDER BY ... ANN OF parsed but ANN execution is deferred — returning unordered results"
+        );
+    }
+
     // Apply ORDER BY sorting (FRSA-BUG-004)
     let rows = if !s.order_by.is_empty() {
         let mut sorted = rows;
@@ -3641,7 +3653,13 @@ fn build_column_info(
                 });
                 let fn_lower = name.to_lowercase();
                 let (display_name, cql_type) = match fn_lower.as_str() {
-                    "count" => (builtin_display_name, CqlType::Bigint),
+                    // COUNT(*) column name must be "count" (not "system.count")
+                    // to match Cassandra driver expectations. The alias takes
+                    // precedence if provided.
+                    "count" => {
+                        let display = alias.clone().unwrap_or_else(|| "count".to_string());
+                        (display, CqlType::Bigint)
+                    }
                     "writetime" => (builtin_display_name, CqlType::Bigint),
                     "ttl" => (builtin_display_name, CqlType::Int),
                     "avg" | "min" | "max" | "sum" => {
@@ -3971,7 +3989,31 @@ fn evaluate_where_predicates(
             Ok(v) => v,
             Err(_) => return false,
         };
+
+        // Phonetic index support: when the predicate is Eq on a column that
+        // has a phonetic index, use case-insensitive comparison as a partial
+        // phonetic match. Full Double Metaphone matching requires the SOUNDS
+        // LIKE syntax (deferred).
+        let has_phonetic_index = if wc.op == ComparisonOp::Eq {
+            let snap = schema.snapshot();
+            snap.indexes.values().any(|idx| {
+                idx.keyspace == table_meta.keyspace
+                    && idx.table == table_meta.name
+                    && idx.index_type == IndexType::Phonetic
+                    && idx.target_columns.contains(&wc.column)
+            })
+        } else {
+            false
+        };
+
         let matches = match wc.op {
+            ComparisonOp::Eq if has_phonetic_index => {
+                // Case-insensitive string comparison as partial phonetic matching.
+                match (actual, &expected) {
+                    (CqlValue::Text(a), CqlValue::Text(b)) => a.to_lowercase() == b.to_lowercase(),
+                    _ => *actual == expected,
+                }
+            }
             ComparisonOp::Eq => *actual == expected,
             ComparisonOp::Ne => *actual != expected,
             ComparisonOp::Gt => *actual > expected,
