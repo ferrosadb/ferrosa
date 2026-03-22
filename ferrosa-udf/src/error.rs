@@ -22,4 +22,7 @@ pub enum UdfError {
 
     #[error("WASM binary too large: {size} bytes exceeds {max} byte limit")]
     BinaryTooLarge { size: usize, max: usize },
+
+    #[error("function key is invalid or has been evicted")]
+    KeyInvalid,
 }

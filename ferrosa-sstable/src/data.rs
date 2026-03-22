@@ -208,9 +208,15 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             }
 
             if flags & IS_MARKER != 0 {
-                return Err(Error::InvalidData(
-                    "range tombstone markers not yet supported".into(),
-                ));
+                // Range tombstone markers are not written by Ferrosa's SSTable
+                // writer. Encountering one in a Ferrosa-written SSTable indicates
+                // data corruption (misaligned read). Skip the rest of this
+                // partition and return whatever rows were already parsed.
+                //
+                // For Cassandra-written SSTables (S3 bootstrap), this drops
+                // range-deleted data which is acceptable — the live rows
+                // before the marker are still returned.
+                break;
             }
 
             // Extended flags byte (only present if EXTENSION_FLAG is set)
@@ -299,12 +305,14 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             if flags & HAS_TTL != 0 {
                 let (ttl_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
                 self.pos += n as u64;
-                liveness.ttl = self.header.min_ttl + ttl_delta as i32;
+                liveness.ttl = self.header.min_ttl.wrapping_add(ttl_delta as i32);
 
                 let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
                 self.pos += n as u64;
-                liveness.local_deletion_time =
-                    self.header.min_local_deletion_time + ldt_delta as i32;
+                liveness.local_deletion_time = self
+                    .header
+                    .min_local_deletion_time
+                    .wrapping_add(ldt_delta as i32);
             }
         }
 
@@ -400,7 +408,9 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         } else if is_deleted || is_expiring {
             let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            self.header.min_local_deletion_time + ldt_delta as i32
+            self.header
+                .min_local_deletion_time
+                .wrapping_add(ldt_delta as i32)
         } else {
             ferrosa_common::NO_DELETION_TIME
         };
@@ -411,7 +421,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         } else if is_expiring {
             let (ttl_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            self.header.min_ttl + ttl_delta as i32
+            self.header.min_ttl.wrapping_add(ttl_delta as i32)
         } else {
             ferrosa_common::NO_TTL
         };

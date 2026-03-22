@@ -17,6 +17,10 @@ pub struct UserAggregateMetadata {
     pub final_func: Option<String>,
     pub init_cond: Option<CqlValue>,
     pub return_type: CqlType,
+    /// Optional WASM binary for monolithic UDA component (high-performance path).
+    /// When present, the component exports init/accumulate/finalize/merge/serialize-state.
+    /// When absent, the classic sfunc/final_func composition path is used.
+    pub wasm_body: Option<String>,
 }
 
 #[cfg(test)]
@@ -34,6 +38,7 @@ mod tests {
             final_func: Some("avg_final".into()),
             init_cond: None,
             return_type: CqlType::Double,
+            wasm_body: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: UserAggregateMetadata = serde_json::from_str(&json).unwrap();
@@ -51,6 +56,7 @@ mod tests {
             final_func: None,
             init_cond: Some(CqlValue::Bigint(0)),
             return_type: CqlType::Bigint,
+            wasm_body: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: UserAggregateMetadata = serde_json::from_str(&json).unwrap();

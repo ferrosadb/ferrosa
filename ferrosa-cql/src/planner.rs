@@ -88,16 +88,20 @@ pub fn plan(
     pk_columns: &[String],
     indexes: &[(String, Vec<String>)],
 ) -> ScanPlan {
-    if pk_columns_satisfied(where_clauses, pk_columns) {
+    // Exclude token() predicates — they represent token-range scans,
+    // not column-level filters.
+    let non_token: Vec<&WhereClause> = where_clauses.iter().filter(|wc| !wc.token_fn).collect();
+
+    if pk_columns_satisfied(&non_token, pk_columns) {
         return ScanPlan::PartitionKeyLookup;
     }
 
-    if where_clauses.is_empty() {
+    if non_token.is_empty() {
         return ScanPlan::FullScan;
     }
 
     // Collect all WHERE columns with Eq that have a matching single-column index.
-    let matched: Vec<(String, String)> = where_clauses
+    let matched: Vec<(String, String)> = non_token
         .iter()
         .filter(|wc| wc.op == ComparisonOp::Eq)
         .filter_map(|wc| {
@@ -113,7 +117,7 @@ pub fn plan(
         1 => {
             let (index_name, index_column) = matched.into_iter().next().unwrap();
             // Collect WHERE columns not covered by any index.
-            let filter_columns: Vec<String> = where_clauses
+            let filter_columns: Vec<String> = non_token
                 .iter()
                 .filter(|wc| wc.column != index_column)
                 .filter(|wc| {
@@ -140,7 +144,7 @@ pub fn plan(
     }
 }
 
-fn pk_columns_satisfied(where_clauses: &[WhereClause], pk_columns: &[String]) -> bool {
+fn pk_columns_satisfied(where_clauses: &[&WhereClause], pk_columns: &[String]) -> bool {
     pk_columns.iter().all(|pk_col| {
         where_clauses
             .iter()
@@ -158,6 +162,7 @@ mod tests {
             column: col.to_string(),
             op,
             value: Term::StringLiteral("dummy".to_string()),
+            token_fn: false,
         }
     }
 

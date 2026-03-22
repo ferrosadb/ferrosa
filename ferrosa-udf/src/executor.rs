@@ -1,8 +1,14 @@
-//! WASM function executor with compilation cache.
+//! WASM function executor with SlotMap-backed function registry and instance pooling.
 //!
 //! Provides real Wasmtime Component Model compilation and invocation for
 //! CQL User-Defined Functions. The executor validates WASM at compile time
 //! and invokes the `invoke` export at call time with fuel-based metering.
+//!
+//! Instance pooling amortises the per-call instantiation overhead: a pool
+//! of pre-instantiated `(Store, Instance)` pairs is kept per function key.
+//! On `call()` the executor tries the pool first; on miss it falls back to
+//! fresh instantiation. After a call the instance is returned to the pool
+//! (if the pool is not full).
 //!
 //! The WIT `cql-value` variant is a recursive type (list/set/map/tuple/udt
 //! variants contain `cql-value`), which prevents use of `wasmtime::component::bindgen!`
@@ -10,33 +16,125 @@
 //! Instead, we use the dynamic `Val` API with `Val::Variant` to correctly encode
 //! the `cql-value` discriminant names and payloads matching the WIT contract.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 
 use ferrosa_common::{CqlType, CqlValue};
-use wasmtime::component::{Component, Linker, Val};
+use slotmap::{DefaultKey, SlotMap};
+use wasmtime::component::{Component, Instance, Linker, Val};
 use wasmtime::{Engine, Store};
 
 use crate::convert::{cql_to_wit, wit_to_cql, WitCqlValue};
 use crate::error::UdfError;
 use crate::sandbox::SandboxConfig;
 
+/// Opaque handle to a compiled function. O(1) array-index lookup on hot path.
+/// Ephemeral: per-process only, never serialized or sent over the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FunctionKey(DefaultKey);
+
+// Maximum number of pooled instances kept per function.
+// Using a fixed constant avoids a `num_cpus` dependency.
+const POOL_MAX_PER_FUNCTION: usize = 8;
+
 /// Compiled WASM component ready for instantiation.
 struct CompiledFunction {
     component: Component,
 }
 
+/// Registry mapping (keyspace, name) -> compiled function via SlotMap.
+///
+/// The `slots` SlotMap provides O(1) generational-index lookup on the hot path.
+/// The `index` HashMap maps the logical function name to its SlotMap key.
+struct FunctionRegistry {
+    slots: SlotMap<DefaultKey, Arc<CompiledFunction>>,
+    index: HashMap<(String, String), FunctionKey>,
+}
+
+impl FunctionRegistry {
+    fn new() -> Self {
+        Self {
+            slots: SlotMap::new(),
+            index: HashMap::new(),
+        }
+    }
+}
+
+/// A pre-instantiated WASM component instance with its associated store.
+struct PooledInstance {
+    store: Store<()>,
+    instance: Instance,
+}
+
+/// Per-function pool of warm `(Store, Instance)` pairs.
+///
+/// Each function key maps to a `Mutex<Vec<PooledInstance>>`. Acquire pops
+/// from the vec; release pushes back (up to `max_per_function`).
+struct InstancePool {
+    pools: HashMap<(String, String), Mutex<Vec<PooledInstance>>>,
+    max_per_function: usize,
+}
+
+impl InstancePool {
+    fn new(max_per_function: usize) -> Self {
+        Self {
+            pools: HashMap::new(),
+            max_per_function,
+        }
+    }
+
+    /// Ensure a pool entry exists for `key`. No-op if already present.
+    fn ensure_pool(&mut self, key: (String, String)) {
+        self.pools
+            .entry(key)
+            .or_insert_with(|| Mutex::new(Vec::new()));
+    }
+
+    /// Try to take a warm instance from the pool. Returns `None` on miss.
+    fn acquire(&self, key: &(String, String)) -> Option<PooledInstance> {
+        let pool = self.pools.get(key)?;
+        let mut guard = pool.lock().ok()?;
+        guard.pop()
+    }
+
+    /// Return an instance to the pool. Drops the instance if the pool is full.
+    fn release(&self, key: &(String, String), instance: PooledInstance) {
+        if let Some(pool) = self.pools.get(key) {
+            if let Ok(mut guard) = pool.lock() {
+                if guard.len() < self.max_per_function {
+                    guard.push(instance);
+                }
+            }
+        }
+    }
+
+    /// Remove and drop all pooled instances for `key` (called on invalidate).
+    fn drain(&self, key: &(String, String)) {
+        if let Some(pool) = self.pools.get(key) {
+            if let Ok(mut guard) = pool.lock() {
+                guard.clear();
+            }
+        }
+    }
+}
+
 /// Executor for WASM-based User-Defined Functions.
 ///
-/// Manages the Wasmtime engine, compilation cache, and sandbox policy.
-/// Thread-safe — can be shared across async tasks via `Arc`.
+/// Manages the Wasmtime engine, function registry, instance pool, and sandbox
+/// policy. Thread-safe — can be shared across async tasks via `Arc`.
 pub struct UdfExecutor {
     engine: Engine,
     config: SandboxConfig,
-    cache: moka::sync::Cache<(String, String), Arc<CompiledFunction>>,
+    registry: RwLock<FunctionRegistry>,
+    pool: RwLock<InstancePool>,
 }
 
 impl UdfExecutor {
     /// Create a new executor with the given sandbox configuration.
+    ///
+    /// Spawns a background thread (`udf-epoch-ticker`) that increments the
+    /// engine epoch once per `config.max_execution_time` interval. This is
+    /// required for epoch-based interruption to trigger correctly.
     pub fn new(config: SandboxConfig) -> Result<Self, UdfError> {
         let mut engine_config = wasmtime::Config::new();
         engine_config.consume_fuel(true);
@@ -46,21 +144,35 @@ impl UdfExecutor {
         let engine = Engine::new(&engine_config)
             .map_err(|e| UdfError::CompilationFailed(format!("engine creation failed: {e}")))?;
 
-        let cache = moka::sync::Cache::builder()
-            .max_capacity(config.cache_capacity)
-            .build();
+        // Spawn the epoch ticker thread so epoch interruption actually fires.
+        let engine_for_ticker = engine.clone();
+        let tick_interval = config.max_execution_time;
+        std::thread::Builder::new()
+            .name("udf-epoch-ticker".into())
+            .spawn(move || loop {
+                std::thread::sleep(tick_interval);
+                engine_for_ticker.increment_epoch();
+            })
+            .map_err(|e| {
+                UdfError::CompilationFailed(format!("failed to spawn epoch ticker: {e}"))
+            })?;
+
+        let pool = RwLock::new(InstancePool::new(POOL_MAX_PER_FUNCTION));
 
         Ok(Self {
             engine,
             config,
-            cache,
+            registry: RwLock::new(FunctionRegistry::new()),
+            pool,
         })
     }
 
     /// Pre-compile a WASM binary. Called on INSERT into wasm_binaries.
     ///
     /// Validates the WASM component bytes using the Wasmtime compiler.
-    /// The compiled component is cached for later invocation.
+    /// The compiled component is registered for later invocation and a pool
+    /// slot is pre-allocated for the function key.
+    /// If an entry already exists for (keyspace, name) it is replaced (CREATE OR REPLACE).
     pub fn compile(&self, keyspace: &str, name: &str, wasm_bytes: &[u8]) -> Result<(), UdfError> {
         if wasm_bytes.len() > self.config.max_wasm_size {
             return Err(UdfError::BinaryTooLarge {
@@ -79,24 +191,83 @@ impl UdfExecutor {
             "compiled WASM function"
         );
 
-        self.cache.insert(
-            (keyspace.to_string(), name.to_string()),
-            Arc::new(CompiledFunction { component }),
-        );
+        let key = (keyspace.to_string(), name.to_string());
+        let compiled = Arc::new(CompiledFunction { component });
+
+        let mut reg = self.registry.write().expect("registry lock poisoned");
+        // Remove old slot if replacing an existing entry.
+        if let Some(existing) = reg.index.remove(&key) {
+            reg.slots.remove(existing.0);
+        }
+        let slot_key = reg.slots.insert(compiled);
+        reg.index.insert(key.clone(), FunctionKey(slot_key));
+        drop(reg);
+
+        // Ensure the pool has an entry for this key.
+        if let Ok(mut pool) = self.pool.write() {
+            pool.ensure_pool(key);
+        }
+
         Ok(())
     }
 
-    /// Invalidate cached compilation (on CREATE OR REPLACE).
+    /// Invalidate a registered function (on DROP or CREATE OR REPLACE pre-clear).
+    ///
+    /// Removes the compiled function from the registry and drains any pooled
+    /// instances so stale code is not reused.
     pub fn invalidate(&self, keyspace: &str, name: &str) {
-        self.cache
-            .invalidate(&(keyspace.to_string(), name.to_string()));
+        let key = (keyspace.to_string(), name.to_string());
+        let mut reg = self.registry.write().expect("registry lock poisoned");
+        if let Some(fk) = reg.index.remove(&key) {
+            reg.slots.remove(fk.0);
+        }
+        drop(reg);
+        if let Ok(pool) = self.pool.read() {
+            pool.drain(&key);
+        }
+    }
+
+    /// Resolve a function name to its opaque key and kind for query planning.
+    ///
+    /// Acquires a read lock and returns immediately. The returned `FunctionKey`
+    /// can be passed to `call_by_key` on the hot path without another name lookup.
+    pub fn resolve(
+        &self,
+        keyspace: &str,
+        name: &str,
+    ) -> Result<(FunctionKey, FunctionKind), UdfError> {
+        let reg = self.registry.read().expect("registry lock poisoned");
+        let fk = *reg
+            .index
+            .get(&(keyspace.to_string(), name.to_string()))
+            .ok_or_else(|| UdfError::NotFound {
+                keyspace: keyspace.to_string(),
+                name: name.to_string(),
+            })?;
+        // All functions registered via compile() are scalar UDFs.
+        // UDA support will extend this when UDA metadata is tracked.
+        Ok((fk, FunctionKind::Scalar))
+    }
+
+    /// Look up the kind of a compiled function by name.
+    ///
+    /// Returns `NotFound` if the function has not been compiled.
+    pub fn get_kind(&self, keyspace: &str, name: &str) -> Result<FunctionKind, UdfError> {
+        let reg = self.registry.read().expect("registry lock poisoned");
+        reg.index
+            .get(&(keyspace.to_string(), name.to_string()))
+            .map(|_| FunctionKind::Scalar)
+            .ok_or_else(|| UdfError::NotFound {
+                keyspace: keyspace.to_string(),
+                name: name.to_string(),
+            })
     }
 
     /// Invoke a UDF. Returns the function's result.
     ///
-    /// Creates a fresh `Store` with fuel limits, instantiates the cached
-    /// component, converts CQL arguments to WIT variant values, calls the
-    /// `invoke` export, and converts the result back to `CqlValue`.
+    /// Tries to acquire a warm `(Store, Instance)` from the instance pool.
+    /// On a pool miss a fresh store and instance are created. After the call
+    /// the instance is returned to the pool for reuse.
     ///
     /// The conversion chain is:
     /// 1. `CqlValue` -> `WitCqlValue` via `cql_to_wit` (preserves all 26 types)
@@ -113,26 +284,41 @@ impl UdfExecutor {
         return_type: &CqlType,
     ) -> Result<CqlValue, UdfError> {
         let key = (keyspace.to_string(), func_name.to_string());
-        let compiled = self.cache.get(&key).ok_or_else(|| UdfError::NotFound {
-            keyspace: keyspace.to_string(),
-            name: func_name.to_string(),
-        })?;
 
-        // Create a store with fuel metering
-        let mut store = Store::new(&self.engine, ());
-        store
-            .set_fuel(self.config.max_fuel)
-            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+        let compiled = {
+            let reg = self.registry.read().expect("registry lock poisoned");
+            let fk = reg.index.get(&key).ok_or_else(|| UdfError::NotFound {
+                keyspace: keyspace.to_string(),
+                name: func_name.to_string(),
+            })?;
+            Arc::clone(reg.slots.get(fk.0).expect("index/slots out of sync"))
+        };
 
-        // Epoch-based interruption for wall-clock timeout
-        store.epoch_deadline_trap();
-        store.set_epoch_deadline(1);
+        // Try to acquire a warm instance from the pool.
+        let pooled = self.pool.read().ok().and_then(|p| p.acquire(&key));
 
-        // Instantiate the component
-        let linker = Linker::<()>::new(&self.engine);
-        let instance = linker
-            .instantiate(&mut store, &compiled.component)
-            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+        let (mut store, instance) = if let Some(warm) = pooled {
+            // Reset resource limits on the warm store before reuse.
+            let mut s = warm.store;
+            s.set_fuel(self.config.max_fuel)
+                .map_err(|e| UdfError::ExecutionFailed(format!("failed to reset fuel: {e}")))?;
+            s.epoch_deadline_trap();
+            s.set_epoch_deadline(1);
+            (s, warm.instance)
+        } else {
+            // Pool miss — create a fresh store and instantiate.
+            let mut s = Store::new(&self.engine, ());
+            s.set_fuel(self.config.max_fuel)
+                .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+            s.epoch_deadline_trap();
+            s.set_epoch_deadline(1);
+
+            let linker = Linker::<()>::new(&self.engine);
+            let inst = linker
+                .instantiate(&mut s, &compiled.component)
+                .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+            (s, inst)
+        };
 
         // Look up the "invoke" export
         let invoke_func = instance.get_func(&mut store, "invoke").ok_or_else(|| {
@@ -145,6 +331,83 @@ impl UdfExecutor {
 
         // Call the function with dynamic args/results
         let mut results = vec![Val::Bool(false)]; // placeholder for result slot
+        let call_result = invoke_func
+            .call(&mut store, &[args_val], &mut results)
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("fuel") {
+                    UdfError::ResourceExhausted(format!("out of fuel: {msg}"))
+                } else if msg.contains("epoch") {
+                    UdfError::ResourceExhausted(format!("execution timeout: {msg}"))
+                } else {
+                    UdfError::ExecutionFailed(msg)
+                }
+            });
+
+        // Propagate call errors without returning the instance to the pool.
+        call_result?;
+
+        // Post-call cleanup required by wasmtime component model
+        invoke_func
+            .post_return(&mut store)
+            .map_err(|e| UdfError::ExecutionFailed(format!("post_return failed: {e}")))?;
+
+        // Convert result Val back to CqlValue before returning the instance.
+        let result_val = results
+            .into_iter()
+            .next()
+            .ok_or_else(|| UdfError::ExecutionFailed("invoke returned no result".into()))?;
+
+        let cql_result = val_to_cql_result(&result_val, return_type);
+
+        // Return the instance to the pool (only on success; discard on error).
+        if cql_result.is_ok() {
+            if let Ok(pool) = self.pool.read() {
+                pool.release(&key, PooledInstance { store, instance });
+            }
+        }
+
+        cql_result
+    }
+
+    /// Invoke a UDF by opaque key (hot path — O(1) SlotMap lookup).
+    ///
+    /// The caller must have obtained `key` from `resolve()` at query-plan time.
+    /// Acquires a read lock, clones the `Arc`, releases the lock, then proceeds
+    /// identically to `call()`.
+    pub fn call_by_key(
+        &self,
+        key: FunctionKey,
+        args: Vec<CqlValue>,
+        _arg_types: &[CqlType],
+        return_type: &CqlType,
+    ) -> Result<CqlValue, UdfError> {
+        let compiled = {
+            let reg = self.registry.read().expect("registry lock poisoned");
+            Arc::clone(reg.slots.get(key.0).ok_or(UdfError::KeyInvalid)?)
+        };
+
+        let mut store = Store::new(&self.engine, ());
+        store
+            .set_fuel(self.config.max_fuel)
+            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+
+        store.epoch_deadline_trap();
+        store.set_epoch_deadline(1);
+
+        let linker = Linker::<()>::new(&self.engine);
+        let instance = linker
+            .instantiate(&mut store, &compiled.component)
+            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+
+        let invoke_func = instance.get_func(&mut store, "invoke").ok_or_else(|| {
+            UdfError::ExecutionFailed("component does not export 'invoke' function".into())
+        })?;
+
+        let wit_args: Vec<WitCqlValue> = args.iter().map(cql_to_wit).collect();
+        let args_val = wit_cql_list_to_val(&wit_args);
+
+        let mut results = vec![Val::Bool(false)];
         invoke_func
             .call(&mut store, &[args_val], &mut results)
             .map_err(|e| {
@@ -158,13 +421,10 @@ impl UdfExecutor {
                 }
             })?;
 
-        // Post-call cleanup required by wasmtime component model
         invoke_func
             .post_return(&mut store)
             .map_err(|e| UdfError::ExecutionFailed(format!("post_return failed: {e}")))?;
 
-        // Convert result Val back to CqlValue
-        // The WIT contract returns result<cql-value, string>
         let result_val = results
             .into_iter()
             .next()
@@ -172,6 +432,81 @@ impl UdfExecutor {
 
         val_to_cql_result(&result_val, return_type)
     }
+
+    /// Create a fresh UDA instance by opaque key (hot path — O(1) SlotMap lookup).
+    ///
+    /// Returns a `(Store, Instance)` pair ready for UDA state accumulation.
+    /// The caller must have obtained `key` from `resolve()` at query-plan time.
+    pub fn create_uda_instance_by_key(
+        &self,
+        key: FunctionKey,
+    ) -> Result<(Store<()>, wasmtime::component::Instance), UdfError> {
+        let compiled = {
+            let reg = self.registry.read().expect("registry lock poisoned");
+            Arc::clone(reg.slots.get(key.0).ok_or(UdfError::KeyInvalid)?)
+        };
+
+        let mut store = Store::new(&self.engine, ());
+        store
+            .set_fuel(self.config.max_aggregate_fuel)
+            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+
+        store.epoch_deadline_trap();
+        store.set_epoch_deadline(1);
+
+        let linker = Linker::<()>::new(&self.engine);
+        let instance = linker
+            .instantiate(&mut store, &compiled.component)
+            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+
+        Ok((store, instance))
+    }
+
+    /// Create a fresh UDA instance by name.
+    ///
+    /// Acquires a read lock, clones the `Arc`, releases the lock, then
+    /// creates a `Store` with the aggregate fuel cap and instantiates the component.
+    pub fn create_uda_instance(
+        &self,
+        keyspace: &str,
+        name: &str,
+    ) -> Result<(Store<()>, wasmtime::component::Instance), UdfError> {
+        let compiled = {
+            let reg = self.registry.read().expect("registry lock poisoned");
+            let fk = reg
+                .index
+                .get(&(keyspace.to_string(), name.to_string()))
+                .ok_or_else(|| UdfError::NotFound {
+                    keyspace: keyspace.to_string(),
+                    name: name.to_string(),
+                })?;
+            Arc::clone(reg.slots.get(fk.0).expect("index/slots out of sync"))
+        };
+
+        let mut store = Store::new(&self.engine, ());
+        store
+            .set_fuel(self.config.max_aggregate_fuel)
+            .map_err(|e| UdfError::ExecutionFailed(format!("failed to set fuel: {e}")))?;
+
+        store.epoch_deadline_trap();
+        store.set_epoch_deadline(1);
+
+        let linker = Linker::<()>::new(&self.engine);
+        let instance = linker
+            .instantiate(&mut store, &compiled.component)
+            .map_err(|e| UdfError::ExecutionFailed(format!("instantiation failed: {e}")))?;
+
+        Ok((store, instance))
+    }
+}
+
+/// The kind of a compiled function — scalar UDF or aggregate UDA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionKind {
+    /// User-Defined Function: maps arguments -> return value.
+    Scalar,
+    /// User-Defined Aggregate: accumulates state across rows.
+    Aggregate,
 }
 
 // ---------------------------------------------------------------------------
@@ -728,21 +1063,15 @@ mod tests {
     #[test]
     fn invalidate_removes_cached_function() {
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
-        let key = ("ks".to_string(), "func".to_string());
-        executor.cache.insert(
-            key.clone(),
-            Arc::new(CompiledFunction {
-                component: Component::new(
-                    &executor.engine,
-                    // Minimal valid WASM component (empty)
-                    minimal_component_bytes(),
-                )
-                .unwrap(),
-            }),
-        );
-        assert!(executor.cache.contains_key(&key));
+        // Insert via compile() so the registry is populated.
+        executor
+            .compile("ks", "func", &minimal_component_bytes())
+            .unwrap();
+        // Confirm it is present.
+        assert!(executor.resolve("ks", "func").is_ok());
         executor.invalidate("ks", "func");
-        assert!(!executor.cache.contains_key(&key));
+        // Confirm it is gone.
+        assert!(executor.resolve("ks", "func").is_err());
     }
 
     #[test]
@@ -978,15 +1307,21 @@ mod tests {
     #[test]
     fn compile_valid_component_populates_cache() {
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
-        let key = ("ks".to_string(), "func".to_string());
-        assert!(!executor.cache.contains_key(&key));
+
+        // Before compile: resolve should fail with NotFound.
+        assert!(
+            executor.resolve("ks", "func").is_err(),
+            "resolve should fail before compile()"
+        );
 
         executor
             .compile("ks", "func", &minimal_component_bytes())
             .unwrap();
+
+        // After compile: resolve should succeed.
         assert!(
-            executor.cache.contains_key(&key),
-            "cache should contain compiled function after compile()"
+            executor.resolve("ks", "func").is_ok(),
+            "registry should contain compiled function after compile()"
         );
     }
 
@@ -994,25 +1329,22 @@ mod tests {
     fn compile_same_name_replaces_cached_entry() {
         let executor = UdfExecutor::new(SandboxConfig::default()).unwrap();
 
-        // Compile once
+        // Compile once and capture the FunctionKey.
         executor
             .compile("ks", "func", &minimal_component_bytes())
             .unwrap();
-        let key = ("ks".to_string(), "func".to_string());
-        let first = executor.cache.get(&key).unwrap();
-        let first_ptr = Arc::as_ptr(&first);
+        let (first_key, _) = executor.resolve("ks", "func").unwrap();
 
-        // Compile same (keyspace, name) again
+        // Compile same (keyspace, name) again — old slot is removed, new one inserted.
         executor
             .compile("ks", "func", &minimal_component_bytes())
             .unwrap();
-        let second = executor.cache.get(&key).unwrap();
-        let second_ptr = Arc::as_ptr(&second);
+        let (second_key, _) = executor.resolve("ks", "func").unwrap();
 
-        // The Arc pointers should differ (new CompiledFunction inserted)
+        // The SlotMap keys should differ because the old slot was replaced.
         assert_ne!(
-            first_ptr, second_ptr,
-            "recompiling should insert a new cache entry"
+            first_key, second_key,
+            "recompiling should produce a new FunctionKey (old slot removed)"
         );
     }
 
@@ -1026,15 +1358,25 @@ mod tests {
             .compile("ks2", "func", &minimal_component_bytes())
             .unwrap();
 
-        let key1 = ("ks1".to_string(), "func".to_string());
-        let key2 = ("ks2".to_string(), "func".to_string());
-        assert!(executor.cache.contains_key(&key1));
-        assert!(executor.cache.contains_key(&key2));
+        assert!(
+            executor.resolve("ks1", "func").is_ok(),
+            "ks1/func should be registered"
+        );
+        assert!(
+            executor.resolve("ks2", "func").is_ok(),
+            "ks2/func should be registered"
+        );
 
-        // Invalidating one keyspace should not affect the other
+        // Invalidating one keyspace should not affect the other.
         executor.invalidate("ks1", "func");
-        assert!(!executor.cache.contains_key(&key1));
-        assert!(executor.cache.contains_key(&key2));
+        assert!(
+            executor.resolve("ks1", "func").is_err(),
+            "ks1/func should be gone after invalidate"
+        );
+        assert!(
+            executor.resolve("ks2", "func").is_ok(),
+            "ks2/func should still be registered"
+        );
     }
 
     #[test]

@@ -419,9 +419,54 @@ impl<F: FlushTarget> TableStore<F> {
         limit: usize,
     ) -> Result<Vec<Partition>> {
         let guard = self.view.load();
-        let snapshot = guard.active.snapshot();
 
-        let filtered: Vec<Partition> = snapshot
+        // Collect partitions from all sources: active memtable, flushing
+        // memtable, and SSTables. Merge by partition key.
+        let mut all_partitions: Vec<Partition> = Vec::new();
+
+        // Active memtable
+        let snapshot = guard.active.snapshot();
+        all_partitions.extend(snapshot);
+
+        // Flushing memtable
+        if let Some(ref flushing) = guard.flushing {
+            all_partitions.extend(flushing.snapshot());
+        }
+
+        // SSTables — read all partitions from each
+        for sstable in guard.sstables.iter() {
+            match sstable.read_all_partitions() {
+                Ok(parts) => all_partitions.extend(parts),
+                Err(e) => {
+                    tracing::warn!("read_range: skipping corrupted SSTable: {e}");
+                }
+            }
+        }
+
+        // Deduplicate and merge partitions with the same key
+        all_partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut merged: Vec<Partition> = Vec::new();
+        for p in all_partitions {
+            if let Some(last) = merged.last_mut() {
+                if last.key == p.key {
+                    *last = merge::merge_partitions(vec![last.clone(), p]);
+                    continue;
+                }
+            }
+            merged.push(p);
+        }
+
+        // Apply deletion suppression to all partitions. Partitions that
+        // came from a single source (no multi-source merge above) still
+        // need row-level and partition-level deletions applied because
+        // the memtable's merge-on-write sets deletion markers but does
+        // not suppress the covered cells.
+        for p in &mut merged {
+            merge::apply_deletions(p);
+        }
+
+        // Apply range filter and limit
+        let filtered: Vec<Partition> = merged
             .into_iter()
             .filter(|p| {
                 if let Some(s) = start {

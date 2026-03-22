@@ -1,4 +1,4 @@
-package ferrosa:udf@0.1.0;
+package ferrosa:udf@0.2.0;
 
 interface types {
     variant cql-value {
@@ -34,4 +34,18 @@ interface types {
 world udf {
     use types.{cql-value};
     export invoke: func(args: list<cql-value>) -> result<cql-value, string>;
+}
+
+world uda {
+    use types.{cql-value};
+    /// Initialize accumulator state. Called once per group.
+    export init: func(init-cond: option<cql-value>) -> result<_, string>;
+    /// Accumulate one row's arguments into internal state.
+    export accumulate: func(args: list<cql-value>) -> result<_, string>;
+    /// Merge another instance's serialized state into this one (distributed aggregation).
+    export merge: func(serialized-state: list<u8>) -> result<_, string>;
+    /// Serialize internal state for shipping across nodes.
+    export serialize-state: func() -> list<u8>;
+    /// Produce the final aggregate result. Called once per group.
+    export finalize: func() -> result<cql-value, string>;
 }

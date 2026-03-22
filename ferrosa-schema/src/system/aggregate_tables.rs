@@ -101,6 +101,9 @@ fn cql_type_to_string(ty: &CqlType) -> String {
             let inner: Vec<String> = types.iter().map(cql_type_to_string).collect();
             format!("tuple<{}>", inner.join(", "))
         }
+        CqlType::Vector(elem, dim) => {
+            format!("vector<{}, {}>", cql_type_to_string(elem), dim)
+        }
         CqlType::Udt { keyspace, name, .. } => format!("{keyspace}.{name}"),
     }
 }
@@ -258,6 +261,7 @@ mod tests {
                 Some(CqlValue::Int(0)),
             ])),
             return_type: CqlType::Double,
+            wasm_body: None,
         };
         let snap = snapshot_with_aggregate(agg);
         let table = SystemSchemaAggregatesTable::new(snap);
@@ -297,6 +301,7 @@ mod tests {
             final_func: None,
             init_cond: Some(CqlValue::Int(0)),
             return_type: CqlType::Int,
+            wasm_body: None,
         };
         let snap = snapshot_with_aggregate(agg);
         let table = SystemSchemaAggregatesTable::new(snap);
@@ -331,6 +336,7 @@ mod tests {
             final_func: None,
             init_cond: None,
             return_type: CqlType::Bigint,
+            wasm_body: None,
         };
         let snap = snapshot_with_aggregate(agg);
         let table = SystemSchemaAggregatesTable::new(snap);

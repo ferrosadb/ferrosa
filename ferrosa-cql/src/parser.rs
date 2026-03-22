@@ -106,6 +106,10 @@ impl<'input> Parser<'input> {
     fn parse_select(&mut self) -> Result<SelectStatement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Select))?;
 
+        // Optional DISTINCT — consume and treat as a no-op.
+        // Ferrosa returns deduplicated partition-key rows by default.
+        let _distinct = self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))?;
+
         // Columns: * or comma-separated identifiers
         let columns = self.parse_select_columns()?;
 
@@ -398,12 +402,24 @@ impl<'input> Parser<'input> {
         })
     }
 
-    fn parse_delete_columns(&mut self) -> Result<Vec<String>, CqlError> {
-        let mut cols = vec![self.parse_ident()?];
+    fn parse_delete_columns(&mut self) -> Result<Vec<DeleteTarget>, CqlError> {
+        let mut cols = vec![self.parse_delete_target()?];
         while self.lexer.eat(&TokenKind::Comma)? {
-            cols.push(self.parse_ident()?);
+            cols.push(self.parse_delete_target()?);
         }
         Ok(cols)
+    }
+
+    /// Parse a single delete target: either `col` or `col[key]`.
+    fn parse_delete_target(&mut self) -> Result<DeleteTarget, CqlError> {
+        let col = self.parse_ident()?;
+        if self.lexer.eat(&TokenKind::LBracket)? {
+            let key = self.parse_term()?;
+            self.lexer.expect(&TokenKind::RBracket)?;
+            Ok(DeleteTarget::MapElement { column: col, key })
+        } else {
+            Ok(DeleteTarget::Column(col))
+        }
     }
 
     // ---------------------------------------------------------------
@@ -901,6 +917,10 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Type) => self.parse_drop_type(),
             TokenKind::Keyword(Keyword::Function) => self.parse_drop_function(),
             TokenKind::Keyword(Keyword::Aggregate) => self.parse_drop_aggregate(),
+            TokenKind::Keyword(Keyword::Role) => self.parse_drop_role().map(Statement::DropRole),
+            // Bare identifier after DROP: treat as DROP TABLE (Cassandra shorthand).
+            // e.g., "DROP cycling.race_winners" → DROP TABLE cycling.race_winners
+            TokenKind::Ident(_) => self.parse_drop_table().map(Statement::DropTable),
             _ => Err(CqlError::SyntaxError(format!(
                 "DROP {:?} not yet supported at position {}",
                 tok.kind, tok.pos
@@ -916,8 +936,17 @@ impl<'input> Parser<'input> {
         Ok(DropKeyspaceStatement { name, if_exists })
     }
 
+    fn parse_drop_role(&mut self) -> Result<DropRoleStatement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Role))?;
+        let if_exists = self.parse_if_exists()?;
+        let name = self.parse_ident()?;
+
+        Ok(DropRoleStatement { name, if_exists })
+    }
+
     fn parse_drop_table(&mut self) -> Result<DropTableStatement, CqlError> {
-        self.lexer.expect(&TokenKind::Keyword(Keyword::Table))?;
+        // TABLE keyword is optional (Cassandra accepts "DROP ks.tbl" shorthand)
+        let _ = self.lexer.eat(&TokenKind::Keyword(Keyword::Table))?;
         let if_exists = self.parse_if_exists()?;
         let (keyspace, table) = self.parse_table_ref()?;
 
@@ -1544,6 +1573,18 @@ impl<'input> Parser<'input> {
         let mut clauses = vec![];
         loop {
             let column = self.parse_ident()?;
+
+            // Check for token(column) pattern: `token` followed by `(`.
+            let is_token_fn =
+                column.eq_ignore_ascii_case("token") && self.lexer.eat(&TokenKind::LParen)?;
+            let actual_column = if is_token_fn {
+                let col = self.parse_ident()?;
+                self.lexer.expect(&TokenKind::RParen)?;
+                col
+            } else {
+                column
+            };
+
             let op = self.parse_comparison_op()?;
             let value = if op == ComparisonOp::In {
                 // IN (term, term, ...)
@@ -1554,7 +1595,12 @@ impl<'input> Parser<'input> {
             } else {
                 self.parse_term()?
             };
-            clauses.push(WhereClause { column, op, value });
+            clauses.push(WhereClause {
+                column: actual_column,
+                op,
+                value,
+                token_fn: is_token_fn,
+            });
             if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
                 break;
             }
@@ -1846,6 +1892,33 @@ impl<'input> Parser<'input> {
                 self.exit_nesting();
                 Ok(CqlTypeName::Frozen(Box::new(inner)))
             }
+            "vector" => {
+                self.enter_nesting()?;
+                self.lexer.expect(&TokenKind::Lt)?;
+                let elem_type = self.parse_cql_type_name()?;
+                self.lexer.expect(&TokenKind::Comma)?;
+                // Dimension is an integer literal inside the angle brackets
+                let dim_tok = self.lexer.next_token()?;
+                let dimension = match &dim_tok.kind {
+                    TokenKind::IntegerLiteral(n) => {
+                        if *n <= 0 {
+                            return Err(CqlError::SyntaxError(
+                                "vector dimension must be a positive integer".into(),
+                            ));
+                        }
+                        *n as usize
+                    }
+                    _ => {
+                        return Err(CqlError::SyntaxError(format!(
+                            "expected integer dimension for vector type, got {:?}",
+                            dim_tok.kind
+                        )));
+                    }
+                };
+                self.lexer.expect(&TokenKind::Gt)?;
+                self.exit_nesting();
+                Ok(CqlTypeName::Vector(Box::new(elem_type), dimension))
+            }
             _ => Ok(CqlTypeName::Simple(type_name)),
         }
     }
@@ -2091,6 +2164,7 @@ impl<'input> Parser<'input> {
             Keyword::As => "as",
             Keyword::Contains => "contains",
             Keyword::Explain => "explain",
+            Keyword::Distinct => "distinct",
         }
         .to_string()
     }
@@ -2133,8 +2207,26 @@ impl<'input> Parser<'input> {
     /// Parse IF EXISTS, returning true if present.
     fn parse_if_exists(&mut self) -> Result<bool, CqlError> {
         if self.lexer.eat(&TokenKind::Keyword(Keyword::If))? {
-            self.lexer.expect(&TokenKind::Keyword(Keyword::Exists))?;
-            Ok(true)
+            if self.lexer.eat(&TokenKind::Keyword(Keyword::Exists))? {
+                Ok(true)
+            } else {
+                // IF <condition> (LWT conditional): parse and discard the
+                // condition.  Ferrosa does not enforce LWT conditions yet
+                // but must accept the syntax to avoid parse errors.
+                // Consume tokens until we hit a semicolon, EOF, or USING.
+                loop {
+                    let tok = self.lexer.peek()?;
+                    match tok.kind {
+                        TokenKind::Eof
+                        | TokenKind::Semicolon
+                        | TokenKind::Keyword(Keyword::Using) => break,
+                        _ => {
+                            self.lexer.next_token()?;
+                        }
+                    }
+                }
+                Ok(false)
+            }
         } else {
             Ok(false)
         }
@@ -2272,6 +2364,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_collection_add() {
+        let stmt = parse("UPDATE t SET tags = tags + {'new_tag'} WHERE id = 1").unwrap();
+        match stmt {
+            Statement::Update(s) => {
+                assert_eq!(s.table, "t");
+                assert_eq!(s.assignments.len(), 1);
+                match &s.assignments[0] {
+                    Assignment::Add { column, value } => {
+                        assert_eq!(column, "tags");
+                        assert!(
+                            matches!(value, Term::SetLiteral(elems) if elems.len() == 1),
+                            "expected SetLiteral, got {:?}",
+                            value
+                        );
+                    }
+                    other => panic!("expected Add assignment, got {:?}", other),
+                }
+            }
+            other => panic!("expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_update_collection_sub() {
+        let stmt = parse("UPDATE t SET items = items - ['old'] WHERE id = 1").unwrap();
+        match stmt {
+            Statement::Update(s) => {
+                assert_eq!(s.assignments.len(), 1);
+                match &s.assignments[0] {
+                    Assignment::Sub { column, value } => {
+                        assert_eq!(column, "items");
+                        assert!(
+                            matches!(value, Term::ListLiteral(elems) if elems.len() == 1),
+                            "expected ListLiteral, got {:?}",
+                            value
+                        );
+                    }
+                    other => panic!("expected Sub assignment, got {:?}", other),
+                }
+            }
+            other => panic!("expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_delete() {
         let stmt = parse("DELETE FROM users WHERE id = 1").unwrap();
         match stmt {
@@ -2289,7 +2426,32 @@ mod tests {
         let stmt = parse("DELETE name, email FROM users WHERE id = 1").unwrap();
         match stmt {
             Statement::Delete(s) => {
-                assert_eq!(s.columns, vec!["name".to_string(), "email".to_string()]);
+                assert_eq!(
+                    s.columns,
+                    vec![
+                        DeleteTarget::Column("name".into()),
+                        DeleteTarget::Column("email".into()),
+                    ]
+                );
+            }
+            other => panic!("expected Delete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_delete_map_element() {
+        let stmt = parse("DELETE social_links['twitter'] FROM users WHERE id = 1").unwrap();
+        match stmt {
+            Statement::Delete(s) => {
+                assert_eq!(
+                    s.columns,
+                    vec![DeleteTarget::MapElement {
+                        column: "social_links".into(),
+                        key: Term::StringLiteral("twitter".into()),
+                    }]
+                );
+                assert_eq!(s.table, "users");
+                assert_eq!(s.where_clauses.len(), 1);
             }
             other => panic!("expected Delete, got {:?}", other),
         }
@@ -2551,6 +2713,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_drop_role() {
+        let stmt = parse("DROP ROLE admin").unwrap();
+        match stmt {
+            Statement::DropRole(s) => {
+                assert_eq!(s.name, "admin");
+                assert!(!s.if_exists);
+            }
+            other => panic!("expected DropRole, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_drop_role_if_exists() {
+        let stmt = parse("DROP ROLE IF EXISTS reader").unwrap();
+        match stmt {
+            Statement::DropRole(s) => {
+                assert_eq!(s.name, "reader");
+                assert!(s.if_exists);
+            }
+            other => panic!("expected DropRole, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_use() {
         let stmt = parse("USE my_keyspace").unwrap();
         match stmt {
@@ -2764,6 +2950,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_token_range_where() {
+        let stmt = parse("SELECT * FROM t WHERE token(id) > token(3)").unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.where_clauses.len(), 1);
+                let wc = &s.where_clauses[0];
+                assert!(wc.token_fn, "WHERE clause should be marked as token_fn");
+                assert_eq!(wc.column, "id");
+                assert_eq!(wc.op, ComparisonOp::Gt);
+                // RHS is token(3) parsed as FunctionCall
+                match &wc.value {
+                    Term::FunctionCall { name, args, .. } => {
+                        assert_eq!(name, "token");
+                        assert_eq!(args.len(), 1);
+                    }
+                    other => panic!("expected FunctionCall, got {:?}", other),
+                }
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_map_literal() {
         let stmt = parse("INSERT INTO t (k, m) VALUES (1, {'a': 'b', 'c': 'd'})").unwrap();
         match stmt {
@@ -2846,6 +3055,24 @@ mod tests {
                         Term::IntegerLiteral(3),
                     ])
                 );
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_select_distinct() {
+        let stmt = parse("SELECT DISTINCT group_id, group_name FROM static_cols").unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(
+                    s.columns,
+                    vec![
+                        SelectColumn::Column("group_id".into()),
+                        SelectColumn::Column("group_name".into()),
+                    ]
+                );
+                assert_eq!(s.table, "static_cols");
             }
             other => panic!("expected Select, got {:?}", other),
         }
@@ -3382,6 +3609,59 @@ mod tests {
     #[test]
     fn parse_explain_rejects_non_select() {
         assert!(parse("EXPLAIN INSERT INTO t (a) VALUES (1)").is_err());
+    }
+
+    #[test]
+    fn parse_tojson_with_alias() {
+        let stmt = parse(
+            "SELECT keyspace_name, toJson(replication) AS replication FROM system_schema.keyspaces",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.keyspace, Some("system_schema".into()));
+                assert_eq!(s.table, "keyspaces");
+                assert_eq!(s.columns.len(), 2);
+                assert_eq!(s.columns[0], SelectColumn::Column("keyspace_name".into()));
+                match &s.columns[1] {
+                    SelectColumn::FunctionCall {
+                        name, args, alias, ..
+                    } => {
+                        assert_eq!(name, "tojson");
+                        assert_eq!(args.len(), 1);
+                        // replication is a keyword, parsed as Term::FunctionCall with empty args
+                        match &args[0] {
+                            Term::FunctionCall { name, args, .. } => {
+                                assert_eq!(name, "replication");
+                                assert!(args.is_empty());
+                            }
+                            other => panic!("expected FunctionCall(replication), got {:?}", other),
+                        }
+                        assert_eq!(alias, &Some("replication".into()));
+                    }
+                    other => panic!("expected FunctionCall, got {:?}", other),
+                }
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_tojson_without_alias() {
+        let stmt = parse("SELECT toJson(name) FROM users").unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.columns.len(), 1);
+                match &s.columns[0] {
+                    SelectColumn::FunctionCall { name, alias, .. } => {
+                        assert_eq!(name, "tojson");
+                        assert_eq!(alias, &None);
+                    }
+                    other => panic!("expected FunctionCall, got {:?}", other),
+                }
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
     }
 }
 

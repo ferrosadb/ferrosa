@@ -1,6 +1,6 @@
 # Ferrosa Development Status
 
-> Last updated: 2026-03-20
+> Last updated: 2026-03-22
 > Status: Living document
 
 ## Overview
@@ -14,14 +14,18 @@ with a full query planner pipeline (MemtableIndex, sidecar files, EXPLAIN,
 IndexIntersection, VectorMemtableIndex). Point-in-time recovery is fully implemented:
 commit log archiving to S3, snapshot management, point-in-time restoration with
 timestamp filtering, CLI tooling, and web console integration with Backup & Restore
-dashboard. The graph engine is fully complete.
+dashboard. The graph engine is fully complete. The latest sprint added vector type
+support (`vector<float, N>`), CQL driver compatibility (cdrs-tokio, protocol v4/v5),
+ALLOW FILTERING, toJson(), EXECUTE with positional bind values, INSERT IF NOT EXISTS
+(LWT), counter increment/decrement, collection UPDATE +/-, CONTAINS/CONTAINS KEY
+filtering, and DROP ROLE.
 
 | Metric | Value |
 |--------|-------|
 | Crates | 12 (11 core + ferrosa-udf) |
 | Source files | ~250+ |
-| Source LOC | ~115,000+ |
-| Test functions | ~1,650+ |
+| Source LOC | ~114,000+ |
+| Test functions | ~2,000+ |
 | Integration test files | 30+ |
 
 ## Maturity Assessment
@@ -61,6 +65,7 @@ cluster        ██████   ██████  █████░   █
 - **What's done:** Full BTI read/write. On-disk trie (16 node types, page-aware packing),
   Bloom filter, LZ4/Zstd compression, byte-comparable keys, Cassandra compat tests.
 - **Remaining:**
+  - [x] Sign-bit fix for BTI trie partition index
   - [ ] Big format reader (read-only compat for existing Cassandra SSTables)
   - [ ] Native Ferrosa SSTable format (behind feature flag)
   - [ ] `sstable-dump` / `sstable-import` CLI tools
@@ -94,6 +99,8 @@ cluster        ██████   ██████  █████░   █
   - [x] ~~Snapshot TTL cleanup~~ (PITR Sprint P-4)
   - [x] ~~Sidecar index file persistence (flush, load, merge, tombstone-aware)~~ (Index Sprints I-1/I-3)
   - [x] ~~VectorMemtableIndex for ANN queries~~ (Index Sprint I-4)
+  - [x] read_range includes SSTable data
+  - [x] DELETE merges row-level tombstones
   - [ ] LCS and TWCS compaction strategies
   - [ ] Disk backpressure
   - [ ] `io_uring` I/O backend
@@ -197,6 +204,21 @@ cluster        ██████   ██████  █████░   █
   - [x] ~~UDF execution wiring~~ (CREATE/DROP FUNCTION/AGGREGATE routed through DdlPath)
   - [x] ~~EXPLAIN statement~~ (Index Sprint I-2)
   - [x] ~~Query planner (ScanPlan: PrimaryKey/SingleIndex/IndexIntersection/FullScan)~~ (Index Sprint I-2)
+  - [x] ALLOW FILTERING with full-scan post-filter
+  - [x] token() function in WHERE clauses
+  - [x] toJson() built-in function
+  - [x] SELECT DISTINCT
+  - [x] INSERT IF NOT EXISTS (LWT basic)
+  - [x] Counter increment/decrement
+  - [x] Collection UPDATE +/- operators
+  - [x] CONTAINS / CONTAINS KEY filtering
+  - [x] vector\<float, N\> CQL type (Phase 1+2)
+  - [x] CQL protocol v4 compatibility
+  - [x] PREPARE with pk_count metadata
+  - [x] EXECUTE positional bind values
+  - [x] DELETE map element syntax
+  - [x] DROP without TABLE keyword
+  - [x] DROP ROLE
   - [ ] Logged batch atomicity
   - [ ] Query tracing
 

@@ -327,8 +327,9 @@ impl<'input> Lexer<'input> {
                 }
             }
 
-            // String literal: 'text' with '' escape.
-            b'\'' => self.lex_string(start),
+            // String literal: 'text' with '' escape, or "text" with "" escape.
+            b'\'' => self.lex_string(start, b'\''),
+            b'"' => self.lex_string(start, b'"'),
 
             // Number: integer or float.
             b'0'..=b'9' => self.lex_number(start),
@@ -357,7 +358,7 @@ impl<'input> Lexer<'input> {
         })
     }
 
-    fn lex_string(&mut self, start: usize) -> ParseResult<Token<'input>> {
+    fn lex_string(&mut self, start: usize, quote: u8) -> ParseResult<Token<'input>> {
         self.pos += 1; // skip opening quote
         let mut s = String::new();
         loop {
@@ -371,11 +372,11 @@ impl<'input> Lexer<'input> {
                 ));
             }
             let b = self.bytes[self.pos];
-            if b == b'\'' {
+            if b == quote {
                 self.pos += 1;
-                // Check for escaped quote ('').
-                if self.pos < self.bytes.len() && self.bytes[self.pos] == b'\'' {
-                    s.push('\'');
+                // Check for escaped quote ('' or "").
+                if self.pos < self.bytes.len() && self.bytes[self.pos] == quote {
+                    s.push(quote as char);
                     self.pos += 1;
                 } else {
                     break;

@@ -45,7 +45,9 @@ pub fn routes() -> Router<WebAppState> {
     Router::new()
         .route("/connections", get(get_connections))
         .route("/storage_stats", get(get_storage_stats))
+        .route("/storage", get(get_storage_stats))
         .route("/active_queries", get(get_active_queries))
+        .route("/queries", get(get_active_queries))
         .route("/tables", get(list_tables))
 }
 
@@ -1071,6 +1073,40 @@ mod tests {
                 "{method} {uri} must not return 404 (BUG-019)"
             );
         }
+    }
+
+    /// BUG-2026-0003: `/api/queries` must be routable (alias for `/api/active_queries`).
+    #[tokio::test]
+    async fn api_queries_alias_is_routable() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/queries")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "GET /api/queries must not return 404 (BUG-2026-0003)"
+        );
+    }
+
+    /// BUG-2026-0004: `/api/storage` must be routable (alias for `/api/storage_stats`).
+    #[tokio::test]
+    async fn api_storage_alias_is_routable() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/storage")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "GET /api/storage must not return 404 (BUG-2026-0004)"
+        );
     }
 
     /// Verify the `/metrics` endpoint is reachable through the full router

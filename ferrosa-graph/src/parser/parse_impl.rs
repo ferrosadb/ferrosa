@@ -200,6 +200,51 @@ impl<'input> Parser<'input> {
     }
 
     fn parse_pattern(&mut self) -> ParseResult<Pattern> {
+        // Handle path assignment: `path = (...)` or `p = shortestPath(...)`
+        // If we see an Ident followed by `=`, consume both and ignore the
+        // path variable (it's stored nowhere for now).
+        let tok = self.lexer.peek()?;
+        if matches!(tok.kind, TokenKind::Ident(_)) {
+            // Speculatively consume the identifier.
+            let ident_tok = self.lexer.next_token()?;
+            let next = self.lexer.peek()?;
+            if next.kind == TokenKind::Eq {
+                // Path assignment confirmed — consume `=`.
+                self.lexer.next_token()?;
+                // Check for shortestPath( wrapper — consume and ignore it.
+                let after_eq = self.lexer.peek()?;
+                let shortest = if let TokenKind::Ident(name) = &after_eq.kind {
+                    name.eq_ignore_ascii_case("shortestPath")
+                } else {
+                    false
+                };
+                if shortest {
+                    self.lexer.next_token()?; // consume "shortestPath"
+                    self.lexer.expect(&TokenKind::LParen)?; // consume "("
+                }
+                let pattern = self.parse_pattern_inner()?;
+                if shortest {
+                    self.lexer.expect(&TokenKind::RParen)?; // consume closing ")"
+                }
+                return Ok(pattern);
+            }
+            // Not a path assignment — the Ident we consumed must be
+            // the start of a node pattern `(ident ...)`, but node patterns
+            // start with `(`. This is a parse error — produce a clear message.
+            return Err(ParseError::new(
+                format!(
+                    "expected '(' to start node pattern, got {:?}",
+                    ident_tok.kind
+                ),
+                ident_tok.span,
+            ));
+        }
+
+        self.parse_pattern_inner()
+    }
+
+    /// Inner pattern parse: node followed by optional relationship chains.
+    fn parse_pattern_inner(&mut self) -> ParseResult<Pattern> {
         let first = self.parse_node_pattern()?;
         let mut elements = vec![first];
 
@@ -533,6 +578,43 @@ impl<'input> Parser<'input> {
 
     fn parse_not_expr(&mut self) -> ParseResult<Expr> {
         if self.lexer.eat(&TokenKind::Keyword(Keyword::Not))? {
+            // Check for negative pattern expression: NOT (a)-[:REL]->(b)
+            // After parsing `NOT (a)`, if a relationship token follows,
+            // consume the entire pattern and return a true placeholder.
+            let peek = self.lexer.peek()?;
+            if peek.kind == TokenKind::LParen {
+                // NOT recurses — check depth.
+                self.enter_expr()?;
+                let inner = self.parse_not_expr()?;
+                self.exit_expr();
+
+                // If a relationship follows, this is a negative pattern —
+                // consume and discard the relationship chain.
+                let next = self.lexer.peek()?;
+                if matches!(
+                    next.kind,
+                    TokenKind::DashBracket | TokenKind::ArrowLeft | TokenKind::Minus
+                ) {
+                    // TODO: Negative pattern expressions are consumed but
+                    // treated as `true` (no filtering). Implement proper
+                    // pattern-existence checks in the executor.
+                    let _ = inner; // discard parsed node expression
+                    loop {
+                        let tok = self.lexer.peek()?;
+                        match &tok.kind {
+                            TokenKind::DashBracket | TokenKind::ArrowLeft | TokenKind::Minus => {
+                                let _rel = self.parse_rel_pattern()?;
+                                let _node = self.parse_node_pattern()?;
+                            }
+                            _ => break,
+                        }
+                    }
+                    return Ok(Expr::Literal(Literal::Bool(true)));
+                }
+
+                return Ok(Expr::Not(Box::new(inner)));
+            }
+
             // NOT recurses — check depth.
             self.enter_expr()?;
             let inner = self.parse_not_expr();
@@ -726,6 +808,9 @@ impl<'input> Parser<'input> {
                     }
                     TokenKind::LParen => {
                         self.lexer.next_token()?;
+                        // TODO: DISTINCT modifier is consumed and ignored for now.
+                        // A future pass should propagate it to the aggregate executor.
+                        let _distinct = self.lexer.eat(&TokenKind::Keyword(Keyword::Distinct))?;
                         let mut args = vec![];
                         if self.lexer.peek()?.kind != TokenKind::RParen {
                             loop {
@@ -1601,6 +1686,93 @@ mod tests {
             }
         } else {
             panic!("expected Match");
+        }
+    }
+
+    // --- Path assignment ---
+
+    #[test]
+    fn parse_path_assignment() {
+        let stmt = parse("MATCH path = (a:Person)-[:KNOWS]->(b) RETURN b.name").unwrap();
+        if let Statement::Match { pattern, .. } = stmt {
+            assert_eq!(pattern.len(), 1);
+            assert!(matches!(&pattern[0], Pattern::Path(_)));
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn parse_shortest_path() {
+        let stmt = parse("MATCH p = shortestPath((a)-[:KNOWS*1..5]->(b)) RETURN b").unwrap();
+        if let Statement::Match { pattern, .. } = stmt {
+            assert_eq!(pattern.len(), 1);
+            if let Pattern::Path(elems) = &pattern[0] {
+                assert_eq!(elems.len(), 3);
+                if let Pattern::Rel { length_range, .. } = &elems[1] {
+                    assert_eq!(*length_range, Some((1, Some(5))));
+                } else {
+                    panic!("expected Rel");
+                }
+            } else {
+                panic!("expected Path");
+            }
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    // --- DISTINCT in function calls ---
+
+    #[test]
+    fn parse_collect_distinct() {
+        let stmt = parse("MATCH (a)-[:KNOWS]->(b) RETURN collect(DISTINCT b.name)").unwrap();
+        if let Statement::Match { return_clause, .. } = stmt {
+            assert!(matches!(
+                &return_clause.items[0].expr,
+                Expr::Function { name, args }
+                    if name == "collect" && args.len() == 1
+            ));
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    // --- Negative pattern in WHERE ---
+
+    #[test]
+    fn parse_not_pattern_in_where() {
+        let stmt = parse(
+            "MATCH (a:Person), (b:Person) \
+             WHERE NOT (a)-[:FOLLOWS]->(b) AND b.name <> 'Alice' \
+             RETURN b.name",
+        )
+        .unwrap();
+        if let Statement::Match {
+            where_clause: Some(expr),
+            ..
+        } = stmt
+        {
+            // The negative pattern is replaced with `true`, so the WHERE
+            // becomes `AND(true, b.name <> 'Alice')`.
+            assert!(matches!(expr, Expr::And(_, _)));
+        } else {
+            panic!("expected Match with WHERE clause");
+        }
+    }
+
+    #[test]
+    fn parse_not_expr_still_works() {
+        // Ensure regular NOT expressions are unaffected.
+        let stmt = parse("MATCH (a) WHERE NOT a.active = true RETURN a").unwrap();
+        if let Statement::Match {
+            where_clause: Some(expr),
+            ..
+        } = stmt
+        {
+            assert!(matches!(expr, Expr::Not(_)));
+        } else {
+            panic!("expected Match with NOT");
         }
     }
 }

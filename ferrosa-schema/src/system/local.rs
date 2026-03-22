@@ -107,7 +107,7 @@ pub fn query_local(schema: &Schema, node_config: &NodeConfig) -> LocalInfo {
         data_center: node_config.data_center.clone(),
         rack: node_config.rack.clone(),
         host_id: node_config.host_id,
-        partitioner: "org.apache.cassandra.dht.Murmur3Partitioner".to_string(),
+        partitioner: "com.ferrosadb.dht.FerrosaPartitioner".to_string(),
         native_protocol_version: "5".to_string(),
         cql_version: "3.4.7".to_string(),
         release_version: crate::system::RELEASE_VERSION.to_string(),
@@ -162,10 +162,7 @@ mod tests {
         let info = query_local(&schema, &node_config);
         assert_eq!(info.key, "local");
         assert_eq!(info.cluster_name, "ferrosa");
-        assert_eq!(
-            info.partitioner,
-            "org.apache.cassandra.dht.Murmur3Partitioner"
-        );
+        assert_eq!(info.partitioner, "com.ferrosadb.dht.FerrosaPartitioner");
         assert_eq!(info.native_protocol_version, "5");
         assert_eq!(info.schema_version, schema.snapshot().version);
     }

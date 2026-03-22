@@ -6,6 +6,8 @@
 
 pub mod active_queries;
 pub mod connections;
+pub mod consolidation_status;
 
 pub use active_queries::{ActiveQueriesTable, QueryGuard, QueryTracker};
 pub use connections::{ConnectionInfo, ConnectionTracker, ConnectionsTable};
+pub use consolidation_status::ConsolidationStatusTable;

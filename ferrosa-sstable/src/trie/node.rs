@@ -231,10 +231,21 @@ pub fn encode_signed_bytes(value: i64) -> Vec<u8> {
     if value == 0 {
         return Vec::new();
     }
-    // Determine the number of bytes needed (same as Java's SizedInts.nonZeroSize)
+    // Determine the minimum number of bytes needed to represent this
+    // signed integer so that sign_extend() can reconstruct the original
+    // value. The MSB of the first encoded byte must match the sign.
     let abs = if value < 0 { !value } else { value };
-    let lz = abs.leading_zeros(); // 1..=63 for non-zero, 64 for zero
-    let num_bytes = (64 - lz + 1).div_ceil(8) as usize; // significant bits + 1 sign bit, rounded up
+    let lz = abs.leading_zeros(); // 1..=63 for non-zero
+    let mut num_bytes = (64 - lz + 1).div_ceil(8) as usize;
+
+    // Safety check: verify the MSB of the encoded byte matches the sign.
+    // If value is negative, the first byte's MSB must be 1.
+    // The MSB of the top encoded byte must match the value's sign,
+    // otherwise sign_extend() will reconstruct the wrong value.
+    let top_byte = (value >> ((num_bytes - 1) * 8)) as u8;
+    if (top_byte & 0x80 != 0) != (value < 0) {
+        num_bytes += 1;
+    }
 
     let mut result = Vec::with_capacity(num_bytes);
     for i in (0..num_bytes).rev() {
@@ -677,6 +688,32 @@ mod tests {
         assert_eq!(encode_signed_bytes(-128), vec![0x80]);
         assert_eq!(encode_signed_bytes(-129), vec![0xFF, 0x7F]);
         assert_eq!(encode_signed_bytes(256), vec![0x01, 0x00]);
+    }
+
+    /// Regression: encode_signed_bytes(-134) was producing [0x7A] (1 byte)
+    /// but sign_extend([0x7A]) = +122 (positive!). Must encode as [0xFF, 0x7A]
+    /// so the sign bit is preserved. This caused the BTI trie to store wrong
+    /// data file offsets for partitions at offset >= 128.
+    #[test]
+    fn encode_signed_bytes_negative_134_roundtrip() {
+        let encoded = encode_signed_bytes(-134);
+        assert_eq!(
+            encoded,
+            vec![0xFF, 0x7A],
+            "must use 2 bytes to preserve sign"
+        );
+        let decoded = sign_extend(&encoded);
+        assert_eq!(decoded, -134, "roundtrip must recover -134");
+    }
+
+    /// Roundtrip: every value in the critical range must survive encode→decode.
+    #[test]
+    fn encode_signed_bytes_roundtrip_critical_range() {
+        for v in -256..=256 {
+            let encoded = encode_signed_bytes(v);
+            let decoded = sign_extend(&encoded);
+            assert_eq!(decoded, v, "roundtrip failed for {v}: encoded={encoded:?}");
+        }
     }
 
     // -----------------------------------------------------------------------

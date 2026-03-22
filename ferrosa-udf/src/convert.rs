@@ -99,6 +99,11 @@ pub fn cql_to_wit(value: &CqlValue) -> WitCqlValue {
                 .map(|opt| opt.as_ref().map_or(WitCqlValue::Null, cql_to_wit))
                 .collect(),
         ),
+        CqlValue::Vector(bits) => WitCqlValue::ListVal(
+            bits.iter()
+                .map(|b| WitCqlValue::FloatVal(f32::from_bits(*b)))
+                .collect(),
+        ),
         CqlValue::Udt(fields) => WitCqlValue::UdtVal(
             fields
                 .iter()

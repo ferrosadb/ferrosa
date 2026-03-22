@@ -135,6 +135,9 @@ pub struct WhereClause {
     pub column: String,
     pub op: ComparisonOp,
     pub value: Term,
+    /// When true, this clause represents `token(column) op token(value)`
+    /// and should be evaluated as a token-range predicate.
+    pub token_fn: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -205,11 +208,30 @@ pub struct UpdateStatement {
     pub using_ttl: Option<i32>,
 }
 
+/// A column target in a DELETE statement — either a whole column or a map element.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteTarget {
+    /// Delete entire column: `DELETE col FROM ...`
+    Column(String),
+    /// Delete a single map element: `DELETE col['key'] FROM ...`
+    MapElement { column: String, key: Term },
+}
+
+impl DeleteTarget {
+    /// Returns the column name regardless of variant.
+    pub fn column_name(&self) -> &str {
+        match self {
+            DeleteTarget::Column(name) => name,
+            DeleteTarget::MapElement { column, .. } => column,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteStatement {
     pub keyspace: Option<String>,
     pub table: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<DeleteTarget>,
     pub where_clauses: Vec<WhereClause>,
     pub if_exists: bool,
     pub using_timestamp: Option<i64>,
@@ -238,6 +260,8 @@ pub enum CqlTypeName {
     Map(Box<CqlTypeName>, Box<CqlTypeName>),
     Tuple(Vec<CqlTypeName>),
     Frozen(Box<CqlTypeName>),
+    /// Vector type with element type and fixed dimension: `vector<float, 3>`.
+    Vector(Box<CqlTypeName>, usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

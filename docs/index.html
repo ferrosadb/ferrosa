@@ -998,19 +998,21 @@
       <div class="feature-icon cql">⌨</div>
       <h3>Drop-In CQL Compatibility</h3>
       <p>
-        CQL protocol v5 — the same wire protocol your drivers already speak.
-        Python, Java, Go, Node.js drivers connect without code changes.
-        DDL, DML, prepared statements, batch operations, system keyspaces — all there.
+        CQL protocol v4 and v5 — the same wire protocol your drivers already speak.
+        Python, Java, Go, Rust (cdrs-tokio), and Node.js drivers connect without code changes.
+        DDL, DML, prepared statements, batch operations, system keyspaces, ALLOW FILTERING,
+        toJson(), INSERT IF NOT EXISTS, counter increment/decrement, and collection
+        UPDATE +/- operators — all there.
       </p>
-      <span class="metric">0 driver changes required</span>
+      <span class="metric">protocol v4/v5 · cdrs-tokio · 0 driver changes required</span>
     </div>
 
     <!-- Graph -->
     <div class="feature-card">
       <div class="feature-icon graph">◈</div>
-      <h3>Native Graph Queries</h3>
+      <h3>Graph Engine with Cypher Query Support</h3>
       <p>
-        Cypher queries on your CQL tables. No separate graph database.
+        Full Cypher query engine on your CQL tables. No separate graph database.
         Vertices and edges are normal tables with schema extensions.
         Variable-length paths, aggregations (count, sum, avg), expression evaluation,
         and worst-case optimal joins via leapfrog triejoin for cyclic pattern matching.
@@ -1058,7 +1060,8 @@
           Eight index types behind a single trait: B-tree for range scans, hash for O(1) lookups,
           composite for multi-column queries, phonetic for fuzzy string matching (Soundex,
           Metaphone, Double Metaphone, Caverphone), and two vector index methods for
-          approximate nearest neighbor search.
+          approximate nearest neighbor search. Native <code>vector&lt;float, N&gt;</code> CQL type
+          for embedding storage and ANN search — store and query high-dimensional vectors directly.
         </p>
         <p style="margin-top: 0.75rem;">
           Indexes are storage-attached — built asynchronously after SSTable flush with zero
@@ -1108,13 +1111,14 @@
       <div class="feature-icon observe">📊</div>
       <h3>Built-In Observability</h3>
       <p>
-        Query cluster state through virtual tables in the <code>system_observability</code>
-        keyspace — connections, storage stats, active queries, topology. Native Prometheus
-        <code>/metrics</code> endpoint with no exporter needed. Web console with REST API
-        and WebSocket live updates. <code>ferrosa-ctl</code> CLI with TUI dashboard for
-        real-time monitoring. SUBSCRIBE to any view for streaming updates.
+        Query cluster state through <code>system_observability</code> virtual tables
+        — connections, storage stats, active queries, topology — all queryable via
+        standard CQL SELECT. Native Prometheus <code>/metrics</code> endpoint with no
+        exporter needed. Web console with REST API and WebSocket live updates.
+        <code>ferrosa-ctl</code> CLI with TUI dashboard for real-time monitoring.
+        SUBSCRIBE to any view for streaming updates.
       </p>
-      <span class="metric">virtual tables · /metrics · WebSocket · ferrosa-ctl TUI</span>
+      <span class="metric">system_observability virtual tables · /metrics · WebSocket · ferrosa-ctl TUI</span>
     </div>
 
     <!-- Production Cluster -->
@@ -1378,7 +1382,7 @@ user = session.execute(stmt, [user_id])
         </tr>
         <tr>
           <td>CQL Compatible</td>
-          <td class="ferrosa-col"><span class="check">✓</span> v5</td>
+          <td class="ferrosa-col"><span class="check">✓</span> v4/v5</td>
           <td><span class="check">✓</span></td>
           <td><span class="check">✓</span></td>
           <td><span class="cross">✗</span></td>

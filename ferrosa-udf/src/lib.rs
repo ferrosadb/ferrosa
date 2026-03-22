@@ -5,11 +5,13 @@
 //! internals are encapsulated here — the CQL layer sees only the
 //! `call()` method.
 
+pub mod arena;
 pub mod convert;
 pub mod error;
 pub mod executor;
 pub mod sandbox;
 
+pub use arena::UdfArena;
 pub use error::UdfError;
 pub use executor::UdfExecutor;
 pub use sandbox::SandboxConfig;

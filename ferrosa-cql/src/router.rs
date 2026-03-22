@@ -45,6 +45,40 @@ use crate::virtual_tables::connections::ConnectionTracker;
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
 const MAX_BATCH_STATEMENTS: usize = 500;
 
+// ── UDF/UDA query-time resolution types ──────────────────────────────────
+
+/// A user-defined function (scalar or aggregate) resolved from the schema,
+/// ready for query-time execution.
+#[derive(Debug, Clone)]
+struct ResolvedFunction {
+    /// Keyspace and function name.
+    func_name: String,
+    /// The keyspace in which the function is defined.
+    func_keyspace: String,
+    /// Scalar or aggregate.
+    kind: ResolvedFunctionKind,
+    /// CQL return type of the function.
+    return_type: CqlType,
+    /// Whether the function should be called when any argument is NULL.
+    called_on_null: bool,
+    /// Indices into the full row column list for each argument that references
+    /// a column (non-column literal args use `usize::MAX` as sentinel).
+    arg_indices: Vec<usize>,
+    /// The original `Term` arguments (needed for literal extraction).
+    arg_terms: Vec<Term>,
+    /// The inferred CQL types of each argument.
+    arg_types: Vec<CqlType>,
+    /// Display name (alias or default) for the result column.
+    display_name: String,
+}
+
+/// Whether a resolved function is scalar or aggregate.
+#[derive(Debug, Clone)]
+enum ResolvedFunctionKind {
+    Scalar,
+    Aggregate { init_cond: Option<CqlValue> },
+}
+
 /// Shared state available to all request handlers.
 pub struct SharedState {
     pub engine: Arc<StorageEngine>,
@@ -417,24 +451,39 @@ fn route_select(
         ("system_schema", "keyspaces") => {
             let snap = state.schema.snapshot();
             let ks_rows = query_keyspaces(&snap);
-            let col_names = vec!["keyspace_name".into(), "durable_writes".into()];
-            let col_types = vec![CqlType::Varchar, CqlType::Boolean];
-            let rows: Vec<Vec<Option<CqlValue>>> = ks_rows
+            let all_col_names: Vec<String> = vec![
+                "keyspace_name".into(),
+                "durable_writes".into(),
+                "replication".into(),
+            ];
+            let map_type = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Varchar));
+            let all_col_types = vec![CqlType::Varchar, CqlType::Boolean, map_type];
+            let all_rows: Vec<Vec<Option<CqlValue>>> = ks_rows
                 .iter()
                 .map(|k| {
+                    // Build the replication map as CqlValue::Map
+                    let repl_map: Vec<(CqlValue, CqlValue)> = k
+                        .replication
+                        .iter()
+                        .map(|(key, val)| {
+                            (CqlValue::Text(key.clone()), CqlValue::Text(val.clone()))
+                        })
+                        .collect();
                     vec![
                         Some(CqlValue::Text(k.keyspace_name.clone())),
                         Some(CqlValue::Boolean(k.durable_writes)),
+                        Some(CqlValue::Map(repl_map)),
                     ]
                 })
                 .collect();
-            Ok(result::encode_rows(
-                &col_names,
-                &col_types,
+            apply_system_select(
+                &s.columns,
+                &all_col_names,
+                &all_col_types,
+                &all_rows,
                 "system_schema",
                 "keyspaces",
-                &rows,
-            ))
+            )
         }
         ("system_schema", "tables") => {
             let snap = state.schema.snapshot();
@@ -462,7 +511,7 @@ fn route_select(
         ("system_schema", "columns") => {
             let snap = state.schema.snapshot();
             let col_rows = query_columns(&snap);
-            let col_names = vec![
+            let col_names: Vec<String> = vec![
                 "keyspace_name".into(),
                 "table_name".into(),
                 "column_name".into(),
@@ -480,7 +529,30 @@ fn route_select(
                 CqlType::Varchar,
                 CqlType::Varchar,
             ];
-            let rows: Vec<Vec<Option<CqlValue>>> = col_rows
+            // Apply WHERE equality filters (string columns only).
+            let filtered: Vec<_> = col_rows
+                .iter()
+                .filter(|c| {
+                    s.where_clauses.iter().all(|wc| {
+                        if wc.op != crate::ast::ComparisonOp::Eq {
+                            return true; // skip non-equality ops
+                        }
+                        let val = match &wc.value {
+                            crate::ast::Term::StringLiteral(s) => s.as_str(),
+                            _ => return true,
+                        };
+                        match wc.column.as_str() {
+                            "keyspace_name" => c.keyspace_name == val,
+                            "table_name" => c.table_name == val,
+                            "column_name" => c.column_name == val,
+                            "kind" => c.kind == val,
+                            "clustering_order" => c.clustering_order == val,
+                            _ => true,
+                        }
+                    })
+                })
+                .collect();
+            let rows: Vec<Vec<Option<CqlValue>>> = filtered
                 .iter()
                 .map(|c| {
                     vec![
@@ -494,13 +566,14 @@ fn route_select(
                     ]
                 })
                 .collect();
-            Ok(result::encode_rows(
+            apply_system_select(
+                &s.columns,
                 &col_names,
                 &col_types,
+                &rows,
                 "system_schema",
                 "columns",
-                &rows,
-            ))
+            )
         }
         ("system_auth", "roles") => {
             let snap = state.schema.snapshot();
@@ -713,15 +786,29 @@ fn route_select_user_table(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    // Reject ALLOW FILTERING — Ferrosa requires queries to use indexed columns
-    // or partition keys rather than full-table scans.
-    if s.allow_filtering {
+    // ALLOW FILTERING: permit full-table scans with post-filter when the
+    // client explicitly opts in.  Log a warning so operators can identify
+    // expensive queries, but do not reject.
+    if s.allow_filtering && !where_has_udf_calls(&s.where_clauses) {
+        tracing::warn!(
+            keyspace = ks,
+            table = %s.table,
+            "executing query with ALLOW FILTERING — full table scan with post-filter"
+        );
+    }
+
+    // If WHERE contains UDF calls but ALLOW FILTERING is not set, reject.
+    if where_has_udf_calls(&s.where_clauses) && !s.allow_filtering {
         return Err(CqlError::Invalid(
-            "ALLOW FILTERING is not supported. Ferrosa requires queries to use \
-             indexed columns or partition keys. Create an index on the filtered \
-             column or restructure your query."
-                .into(),
+            "queries with UDFs in WHERE predicates require ALLOW FILTERING".into(),
         ));
+    }
+    if where_has_udf_calls(&s.where_clauses) {
+        tracing::warn!(
+            keyspace = ks,
+            table = %s.table,
+            "executing query with UDF in WHERE — full scan with ALLOW FILTERING"
+        );
     }
 
     // Build column info for result
@@ -770,7 +857,7 @@ fn route_select_user_table(
             .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
             .collect::<Result<Vec<_>, _>>()?;
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-        match state.engine.read(&table_id, &decorated_key)? {
+        let mut pk_rows = match state.engine.read(&table_id, &decorated_key)? {
             Some(partition) => bridge::partition_to_rows(
                 &partition,
                 &all_col_names,
@@ -779,7 +866,45 @@ fn route_select_user_table(
                 &ck_indices,
             ),
             None => vec![],
-        }
+        };
+        // Apply clustering key and other non-PK WHERE predicates.
+        pk_rows.retain(|row| {
+            evaluate_where_predicates(
+                row,
+                &s.where_clauses,
+                &all_col_names,
+                table_meta,
+                ks,
+                &state.schema,
+            )
+        });
+        pk_rows
+    } else if let Some(in_rows) = try_pk_in_lookup(
+        &s.where_clauses,
+        table_meta,
+        ks,
+        &state.schema,
+        &state.engine,
+        &table_id,
+        &all_col_names,
+        &all_col_types,
+        &pk_indices,
+        &ck_indices,
+    )? {
+        // PK IN (...) — multi-partition lookup.
+        // Apply clustering key and other non-PK WHERE predicates.
+        let mut filtered = in_rows;
+        filtered.retain(|row| {
+            evaluate_where_predicates(
+                row,
+                &s.where_clauses,
+                &all_col_names,
+                table_meta,
+                ks,
+                &state.schema,
+            )
+        });
+        filtered
     } else {
         // No PK — use the query planner to decide the access path.
         let planner_indexes: Vec<(String, Vec<String>)> = snap
@@ -797,7 +922,34 @@ fn route_select_user_table(
 
         match scan_plan {
             ScanPlan::PartitionKeyLookup => {
-                unreachable!("PK lookup should have been handled above");
+                // This can happen when extract_pk_values fails (e.g., bind
+                // values that can't be coerced to the PK column type) but
+                // the planner still sees Eq predicates on all PK columns.
+                // Fall through to a full scan rather than panicking.
+                let scan_limit = 10_000;
+                let partitions = state.engine.read_range(&table_id, None, None, scan_limit)?;
+                let mut all_rows = Vec::new();
+                for partition in &partitions {
+                    let mut prows = bridge::partition_to_rows(
+                        partition,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                    );
+                    all_rows.append(&mut prows);
+                }
+                all_rows.retain(|row| {
+                    evaluate_where_predicates(
+                        row,
+                        &s.where_clauses,
+                        &all_col_names,
+                        table_meta,
+                        ks,
+                        &state.schema,
+                    )
+                });
+                all_rows
             }
 
             ScanPlan::SingleIndex {
@@ -810,12 +962,12 @@ fn route_select_user_table(
                 ..
             } => {
                 // IndexScanWithFilter means some WHERE columns are not covered
-                // by any index — reject these queries.
-                if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) {
+                // by any index — require ALLOW FILTERING for these queries.
+                if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) && !s.allow_filtering {
                     return Err(CqlError::Invalid(
                         "Cannot execute this query as it requires filtering on non-indexed \
-                         columns. Create a secondary index on the filtered columns or \
-                         restructure your query to use partition keys."
+                         columns. Use ALLOW FILTERING, create a secondary index on the \
+                         filtered columns, or restructure your query to use partition keys."
                             .into(),
                     ));
                 }
@@ -950,16 +1102,20 @@ fn route_select_user_table(
                     .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
                     .collect();
 
-                let all_where_columns_indexed = s
-                    .where_clauses
+                // Exclude token() predicates — they are range scan hints,
+                // not column filters that require indexing.
+                let non_token_clauses: Vec<&WhereClause> =
+                    s.where_clauses.iter().filter(|wc| !wc.token_fn).collect();
+                let all_where_columns_indexed = non_token_clauses
                     .iter()
                     .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
 
-                if !s.where_clauses.is_empty() && !all_where_columns_indexed {
+                if !non_token_clauses.is_empty() && !all_where_columns_indexed && !s.allow_filtering
+                {
                     return Err(CqlError::Invalid(
                         "Cannot execute this query as it requires filtering on non-indexed \
-                         columns. Create a secondary index on the filtered columns or \
-                         restructure your query to use partition keys."
+                         columns. Use ALLOW FILTERING, create a secondary index on the \
+                         filtered columns, or restructure your query to use partition keys."
                             .into(),
                     ));
                 }
@@ -1027,18 +1183,114 @@ fn route_select_user_table(
         rows
     };
 
-    // Check for aggregate functions (e.g. COUNT(*))
-    let is_aggregate = s.columns.iter().any(|c| {
-        matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+    // Resolve UDFs/UDAs in SELECT columns.
+    let mut resolved_funcs: Vec<(usize, ResolvedFunction)> = Vec::new();
+    for (i, sc) in s.columns.iter().enumerate() {
+        if let SelectColumn::FunctionCall {
+            keyspace: func_ks,
+            name,
+            args,
+            alias,
+        } = sc
+        {
+            let fn_lower = name.to_lowercase();
+            // Skip built-in functions — they are handled inline.
+            if matches!(
+                fn_lower.as_str(),
+                "count"
+                    | "avg"
+                    | "min"
+                    | "max"
+                    | "sum"
+                    | "writetime"
+                    | "ttl"
+                    | "uuid"
+                    | "now"
+                    | "totimestamp"
+                    | "todate"
+            ) {
+                continue;
+            }
+            let resolved = resolve_select_function(
+                ks,
+                func_ks.as_deref(),
+                name,
+                args,
+                alias.as_deref(),
+                &all_col_names,
+                &all_col_types,
+                &state.schema,
+            )?;
+            resolved_funcs.push((i, resolved));
+        }
+    }
+
+    // Check for aggregate functions (builtin COUNT/AVG/MIN/MAX/SUM or UDA).
+    let has_builtin_agg = s.columns.iter().any(|c| {
+        matches!(c, SelectColumn::FunctionCall { name, .. }
+            if name.eq_ignore_ascii_case("count")
+                || name.eq_ignore_ascii_case("avg")
+                || name.eq_ignore_ascii_case("min")
+                || name.eq_ignore_ascii_case("max")
+                || name.eq_ignore_ascii_case("sum"))
     });
+    let has_uda = resolved_funcs
+        .iter()
+        .any(|(_, f)| matches!(f.kind, ResolvedFunctionKind::Aggregate { .. }));
+    let is_aggregate = has_builtin_agg || has_uda;
 
     if is_aggregate {
-        // Build a single result row with aggregate values
-        let mut agg_row: Vec<Option<CqlValue>> = Vec::new();
-        for sc in &s.columns {
+        // Build a single result row with aggregate values.
+        let mut agg_row: Vec<Option<CqlValue>> = Vec::with_capacity(s.columns.len());
+        for (col_idx, sc) in s.columns.iter().enumerate() {
             match sc {
                 SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count") => {
                     agg_row.push(Some(CqlValue::Bigint(rows.len() as i64)));
+                }
+                SelectColumn::FunctionCall { name, args, .. }
+                    if name.eq_ignore_ascii_case("avg")
+                        || name.eq_ignore_ascii_case("min")
+                        || name.eq_ignore_ascii_case("max")
+                        || name.eq_ignore_ascii_case("sum") =>
+                {
+                    let fn_lower = name.to_lowercase();
+                    // Resolve the target column from the first argument.
+                    if let Some(arg) = args.first() {
+                        if let Ok(col_name) = extract_column_name(arg) {
+                            if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name)
+                            {
+                                let col_type = &all_col_types[src_idx];
+                                let result =
+                                    compute_builtin_aggregate(&fn_lower, &rows, src_idx, col_type);
+                                agg_row.push(result);
+                            } else {
+                                return Err(CqlError::Invalid(format!(
+                                    "unknown column in {}(): {}",
+                                    fn_lower, col_name
+                                )));
+                            }
+                        } else {
+                            agg_row.push(Some(CqlValue::Null));
+                        }
+                    } else {
+                        agg_row.push(Some(CqlValue::Null));
+                    }
+                }
+                SelectColumn::FunctionCall { .. } => {
+                    // Check if this column is a resolved UDA.
+                    if let Some((_, ref func)) = resolved_funcs.iter().find(|(i, _)| *i == col_idx)
+                    {
+                        if matches!(func.kind, ResolvedFunctionKind::Aggregate { .. }) {
+                            let result = execute_uda(state, ks, func, &rows)?;
+                            agg_row.push(Some(result));
+                        } else {
+                            // Scalar UDF in an aggregate query — evaluate on
+                            // first row if available, otherwise NULL.
+                            agg_row.push(None);
+                        }
+                    } else {
+                        agg_row.push(None);
+                    }
                 }
                 _ => {
                     agg_row.push(None);
@@ -1053,6 +1305,48 @@ fn route_select_user_table(
 
     // Apply column selection if not Star
     let selected_rows = select_columns(&rows, &all_col_names, &col_names);
+
+    // Evaluate scalar UDFs on each projected row.
+    let selected_rows = if resolved_funcs.is_empty() {
+        selected_rows
+    } else {
+        // We need the full rows to extract UDF args, then replace the UDF
+        // columns in the projected output.
+        let scalar_funcs: Vec<&ResolvedFunction> = resolved_funcs
+            .iter()
+            .filter(|(_, f)| matches!(f.kind, ResolvedFunctionKind::Scalar))
+            .map(|(_, f)| f)
+            .collect();
+
+        if scalar_funcs.is_empty() {
+            selected_rows
+        } else {
+            let mut result_rows = selected_rows;
+            for (full_row, projected_row) in rows.iter().zip(result_rows.iter_mut()) {
+                let udf_results = evaluate_row_udfs(state, full_row, &scalar_funcs)?;
+                // Map UDF results back into the projected row. Each resolved
+                // func knows its column index in the SELECT list.
+                for ((col_idx, _), udf_val) in resolved_funcs.iter().zip(udf_results.iter()) {
+                    // Find the position of col_idx in the projected columns.
+                    if let Some(proj_pos) = col_names.iter().position(|n| {
+                        if let Some((_, ref f)) = resolved_funcs.iter().find(|(i, _)| i == col_idx)
+                        {
+                            *n == f.display_name
+                        } else {
+                            false
+                        }
+                    }) {
+                        projected_row[proj_pos] = udf_val.clone();
+                    }
+                }
+            }
+            result_rows
+        }
+    };
+
+    // Apply toJson() built-in on projected columns.
+    let selected_rows =
+        apply_tojson_projections(&s.columns, &col_names, &all_col_names, &rows, selected_rows);
 
     // Apply LIMIT
     let limited = if let Some(limit) = s.limit {
@@ -1239,10 +1533,9 @@ async fn route_insert(
             ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
             ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
             ColumnKind::Regular | ColumnKind::Static => {
-                let col_idx =
-                    table_meta.columns.get_index_of(col_name).ok_or_else(|| {
-                        CqlError::Invalid(format!("column '{}' not found", col_name))
-                    })? as u16;
+                let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+                    CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+                })?;
                 regular_cells.push((col_idx, value));
             }
         }
@@ -1264,6 +1557,52 @@ async fn route_insert(
     let table_id = TableId::new(ks, &s.table);
     let rf = keyspace_rf(&state.schema, ks);
 
+    // BUG-0016: IF NOT EXISTS — check whether the row already exists before writing.
+    if s.if_not_exists {
+        let exists = if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+            let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+            let all_col_types: Vec<CqlType> = table_meta
+                .columns
+                .values()
+                .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            let pk_indices: Vec<usize> = table_meta
+                .partition_key
+                .iter()
+                .filter_map(|name| table_meta.columns.get_index_of(name))
+                .collect();
+            let ck_indices: Vec<usize> = table_meta
+                .clustering_key
+                .iter()
+                .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
+                .collect();
+            let rows = bridge::partition_to_rows(
+                &partition,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+            );
+            if ck_values.is_empty() {
+                !rows.is_empty()
+            } else {
+                rows.iter().any(|row| {
+                    ck_indices
+                        .iter()
+                        .zip(ck_values.iter())
+                        .all(|(&idx, ck_val)| row.get(idx).and_then(|v| v.as_ref()) == Some(ck_val))
+                })
+            }
+        } else {
+            false
+        };
+
+        if exists {
+            // Row already exists — return [applied] = false
+            return Ok(encode_lwt_applied(false, ks, &s.table));
+        }
+    }
+
     state
         .write_path
         .load()
@@ -1276,7 +1615,25 @@ async fn route_insert(
             rf,
         )
         .await?;
-    Ok(result::encode_void())
+
+    if s.if_not_exists {
+        // Insert was applied — return [applied] = true
+        Ok(encode_lwt_applied(true, ks, &s.table))
+    } else {
+        Ok(result::encode_void())
+    }
+}
+
+/// Encode a lightweight-transaction `[applied]` result.
+///
+/// CQL protocol returns a RESULT Rows frame with a single boolean column
+/// named `[applied]` containing `true` (insert was applied) or `false`
+/// (row already existed, insert skipped).
+fn encode_lwt_applied(applied: bool, keyspace: &str, table: &str) -> BytesMut {
+    let col_names = vec!["[applied]".to_string()];
+    let col_types = vec![CqlType::Boolean];
+    let rows = vec![vec![Some(CqlValue::Boolean(applied))]];
+    result::encode_rows(&col_names, &col_types, keyspace, table, &rows)
 }
 
 // ── UPDATE ───────────────────────────────────────────────────────────────
@@ -1342,6 +1699,60 @@ async fn route_update(
         }
     }
 
+    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    let table_id = TableId::new(ks, &s.table);
+
+    // Check if any assignments require a read-modify-write (collection +/- or counter)
+    let needs_read = s
+        .assignments
+        .iter()
+        .any(|a| matches!(a, Assignment::Add { .. } | Assignment::Sub { .. }));
+
+    // Lazily read existing row for collection Add/Sub merge
+    let existing_row: Option<Vec<Option<CqlValue>>> = if needs_read {
+        let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+        let all_col_types: Vec<CqlType> = table_meta
+            .columns
+            .values()
+            .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pk_indices: Vec<usize> = table_meta
+            .partition_key
+            .iter()
+            .filter_map(|name| table_meta.columns.get_index_of(name))
+            .collect();
+        let ck_indices: Vec<usize> = table_meta
+            .clustering_key
+            .iter()
+            .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
+            .collect();
+
+        if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+            let rows = bridge::partition_to_rows(
+                &partition,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+            );
+            // Find the row matching our CK values
+            if ck_values.is_empty() {
+                rows.into_iter().next()
+            } else {
+                rows.into_iter().find(|row| {
+                    ck_indices
+                        .iter()
+                        .zip(ck_values.iter())
+                        .all(|(&idx, ck_val)| row.get(idx).and_then(|v| v.as_ref()) == Some(ck_val))
+                })
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Build cells from SET assignments
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
     for assignment in &s.assignments {
@@ -1362,12 +1773,25 @@ async fn route_update(
                     .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
                 let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
 
-                // For counters: increment. For collections: append.
+                // For counters: read-modify-write increment. For collections: append/merge.
                 match &cql_type {
                     CqlType::Counter => {
                         let increment = bridge::term_to_cql_value(value, &CqlType::Bigint)?;
                         if let CqlValue::Bigint(n) = increment {
-                            (column.as_str(), CqlValue::Counter(n))
+                            let col_table_idx = table_meta
+                                .columns
+                                .get_index_of(column)
+                                .expect("column verified above");
+                            let current = existing_row
+                                .as_ref()
+                                .and_then(|row| row.get(col_table_idx))
+                                .and_then(|v| v.as_ref())
+                                .and_then(|v| match v {
+                                    CqlValue::Counter(c) => Some(*c),
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            (column.as_str(), CqlValue::Counter(current + n))
                         } else {
                             return Err(CqlError::Invalid(
                                 "counter increment must be an integer".into(),
@@ -1375,9 +1799,17 @@ async fn route_update(
                         }
                     }
                     _ => {
-                        // Collection append: store the new value (simplified)
-                        let val = bridge::term_to_cql_value(value, &cql_type)?;
-                        (column.as_str(), val)
+                        let new_val = bridge::term_to_cql_value(value, &cql_type)?;
+                        let col_table_idx = table_meta
+                            .columns
+                            .get_index_of(column)
+                            .expect("column verified above");
+                        let existing = existing_row
+                            .as_ref()
+                            .and_then(|row| row.get(col_table_idx))
+                            .and_then(|v| v.as_ref());
+                        let merged = collection_add(existing, &new_val);
+                        (column.as_str(), merged)
                     }
                 }
             }
@@ -1392,7 +1824,20 @@ async fn route_update(
                     CqlType::Counter => {
                         let decrement = bridge::term_to_cql_value(value, &CqlType::Bigint)?;
                         if let CqlValue::Bigint(n) = decrement {
-                            (column.as_str(), CqlValue::Counter(-n))
+                            let col_table_idx = table_meta
+                                .columns
+                                .get_index_of(column)
+                                .expect("column verified above");
+                            let current = existing_row
+                                .as_ref()
+                                .and_then(|row| row.get(col_table_idx))
+                                .and_then(|v| v.as_ref())
+                                .and_then(|v| match v {
+                                    CqlValue::Counter(c) => Some(*c),
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            (column.as_str(), CqlValue::Counter(current - n))
                         } else {
                             return Err(CqlError::Invalid(
                                 "counter decrement must be an integer".into(),
@@ -1401,15 +1846,32 @@ async fn route_update(
                     }
                     CqlType::Map(key_type, _) => {
                         // Map subtraction: RHS is a set of keys to remove.
-                        // Coerce the set literal to Set<K>, not Map<K,V>.
                         let set_of_keys = CqlType::Set(key_type.clone());
-                        let val = bridge::term_to_cql_value(value, &set_of_keys)?;
-                        (column.as_str(), val)
+                        let keys_to_remove = bridge::term_to_cql_value(value, &set_of_keys)?;
+                        let col_table_idx = table_meta
+                            .columns
+                            .get_index_of(column)
+                            .expect("column verified above");
+                        let existing = existing_row
+                            .as_ref()
+                            .and_then(|row| row.get(col_table_idx))
+                            .and_then(|v| v.as_ref());
+                        let merged = collection_sub_map(existing, &keys_to_remove);
+                        (column.as_str(), merged)
                     }
                     _ => {
-                        // Set/list subtraction: RHS is the same collection type.
-                        let val = bridge::term_to_cql_value(value, &cql_type)?;
-                        (column.as_str(), val)
+                        // Set/list subtraction: remove matching elements.
+                        let to_remove = bridge::term_to_cql_value(value, &cql_type)?;
+                        let col_table_idx = table_meta
+                            .columns
+                            .get_index_of(column)
+                            .expect("column verified above");
+                        let existing = existing_row
+                            .as_ref()
+                            .and_then(|row| row.get(col_table_idx))
+                            .and_then(|v| v.as_ref());
+                        let merged = collection_sub(existing, &to_remove);
+                        (column.as_str(), merged)
                     }
                 }
             }
@@ -1433,17 +1895,13 @@ async fn route_update(
                 (column.as_str(), val)
             }
         };
-        let col_idx = table_meta
-            .columns
-            .get_index_of(col_name)
-            .ok_or_else(|| CqlError::Invalid(format!("column '{}' not found", col_name)))?
-            as u16;
+        let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+            CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+        })?;
         regular_cells.push((col_idx, value));
     }
 
-    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
-    let table_id = TableId::new(ks, &s.table);
     let rf = keyspace_rf(&state.schema, ks);
 
     state
@@ -1459,6 +1917,91 @@ async fn route_update(
         )
         .await?;
     Ok(result::encode_void())
+}
+
+/// Merge a new collection value into an existing one (for `col = col + val`).
+///
+/// - List: appends new elements to the end of the existing list.
+/// - Set: merges new elements into the existing set (deduplicating).
+/// - Map: merges new key-value pairs, overwriting existing keys.
+/// - Non-collection: returns the new value as-is.
+fn collection_add(existing: Option<&CqlValue>, new_val: &CqlValue) -> CqlValue {
+    match (existing, new_val) {
+        (Some(CqlValue::List(old)), CqlValue::List(add)) => {
+            let mut merged = old.clone();
+            merged.extend(add.iter().cloned());
+            CqlValue::List(merged)
+        }
+        (Some(CqlValue::Set(old)), CqlValue::Set(add)) => {
+            let mut merged = old.clone();
+            for item in add {
+                if !merged.contains(item) {
+                    merged.push(item.clone());
+                }
+            }
+            CqlValue::Set(merged)
+        }
+        (Some(CqlValue::Map(old)), CqlValue::Map(add)) => {
+            let mut merged = old.clone();
+            for (k, v) in add {
+                if let Some(entry) = merged.iter_mut().find(|(ek, _)| ek == k) {
+                    entry.1 = v.clone();
+                } else {
+                    merged.push((k.clone(), v.clone()));
+                }
+            }
+            CqlValue::Map(merged)
+        }
+        (None, _) => new_val.clone(),
+        _ => new_val.clone(),
+    }
+}
+
+/// Subtract elements from a collection (for `col = col - val` on list/set).
+///
+/// - List: removes all occurrences of each element in `to_remove`.
+/// - Set: removes matching elements.
+/// - Non-collection: returns the existing value or Null.
+fn collection_sub(existing: Option<&CqlValue>, to_remove: &CqlValue) -> CqlValue {
+    match (existing, to_remove) {
+        (Some(CqlValue::List(old)), CqlValue::List(remove)) => {
+            let filtered: Vec<CqlValue> = old
+                .iter()
+                .filter(|item| !remove.contains(item))
+                .cloned()
+                .collect();
+            CqlValue::List(filtered)
+        }
+        (Some(CqlValue::Set(old)), CqlValue::Set(remove)) => {
+            let filtered: Vec<CqlValue> = old
+                .iter()
+                .filter(|item| !remove.contains(item))
+                .cloned()
+                .collect();
+            CqlValue::Set(filtered)
+        }
+        (Some(existing_val), _) => existing_val.clone(),
+        (None, _) => CqlValue::Null,
+    }
+}
+
+/// Remove map entries by key (for `col = col - {key_set}` on maps).
+///
+/// The `keys_to_remove` is a Set of keys. All map entries whose key appears
+/// in the set are removed.
+fn collection_sub_map(existing: Option<&CqlValue>, keys_to_remove: &CqlValue) -> CqlValue {
+    match (existing, keys_to_remove) {
+        (Some(CqlValue::Map(old)), CqlValue::Set(remove_keys)) => {
+            let filtered: Vec<(CqlValue, CqlValue)> = old
+                .iter()
+                .filter(|(k, _)| !remove_keys.contains(k))
+                .cloned()
+                .collect();
+            CqlValue::Map(filtered)
+        }
+        (Some(existing_val), _) => existing_val.clone(),
+        (None, _) => CqlValue::Null,
+    }
 }
 
 // ── DELETE ────────────────────────────────────────────────────────────────
@@ -1524,16 +2067,18 @@ async fn route_delete(
         }
     }
 
-    // Build delete column indices (empty = row-level delete)
+    // Build delete column indices (empty = row-level delete).
+    // MapElement targets are treated as whole-column deletes for now —
+    // the storage layer tombstones the column, which is safe (if broader
+    // than strictly necessary).
     let delete_columns: Vec<u16> = s
         .columns
         .iter()
-        .map(|col_name| {
-            table_meta
-                .columns
-                .get_index_of(col_name)
-                .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))
-                .map(|idx| idx as u16)
+        .map(|target| {
+            let col_name = target.column_name();
+            table_meta.storage_column_index(col_name).ok_or_else(|| {
+                CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1735,10 +2280,9 @@ fn materialize_insert(
             ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
             ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
             ColumnKind::Regular | ColumnKind::Static => {
-                let col_idx =
-                    table_meta.columns.get_index_of(col_name).ok_or_else(|| {
-                        CqlError::Invalid(format!("column '{}' not found", col_name))
-                    })? as u16;
+                let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+                    CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+                })?;
                 regular_cells.push((col_idx, value));
             }
         }
@@ -1842,11 +2386,9 @@ fn materialize_update(
                 continue;
             }
         };
-        let col_idx = table_meta
-            .columns
-            .get_index_of(col_name)
-            .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?
-            as u16;
+        let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+            CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+        })?;
         regular_cells.push((col_idx, value));
     }
 
@@ -1923,12 +2465,11 @@ fn materialize_delete(
     let delete_columns: Vec<u16> = s
         .columns
         .iter()
-        .map(|col_name| {
-            table_meta
-                .columns
-                .get_index_of(col_name)
-                .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))
-                .map(|idx| idx as u16)
+        .map(|target| {
+            let col_name = target.column_name();
+            table_meta.storage_column_index(col_name).ok_or_else(|| {
+                CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -2237,14 +2778,23 @@ async fn route_create_table(
             // Register with storage engine
             let storage_schema = table_meta.to_storage_schema();
             state.engine.register_table(storage_schema)?;
+
+            // Auto-create cascade tables if consolidation.cascade is enabled.
+            create_cascade_tables_if_needed(state, &table_meta)?;
         }
         DdlPath::Pair(coordinator) => {
-            let op = DdlOperation::CreateTable(Box::new(table_meta));
+            let op = DdlOperation::CreateTable(Box::new(table_meta.clone()));
             coordinator.coordinate_ddl(op).await?;
+
+            // Auto-create cascade tables after primary table is created.
+            create_cascade_tables_if_needed(state, &table_meta)?;
         }
         DdlPath::Cluster { .. } => {
-            let op = DdlOperation::CreateTable(Box::new(table_meta));
+            let op = DdlOperation::CreateTable(Box::new(table_meta.clone()));
             ddl.execute(op).await.map_err(CqlError::from)?;
+
+            // Auto-create cascade tables after primary table is created.
+            create_cascade_tables_if_needed(state, &table_meta)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -2258,6 +2808,174 @@ async fn route_create_table(
         "TABLE",
         &[ks, &s.name],
     ))
+}
+
+/// If the table has `consolidation.cascade = true` in its extensions,
+/// auto-create the downstream cascade tables (e.g., sensor_5m, sensor_15m, sensor_1h).
+fn create_cascade_tables_if_needed(
+    state: &SharedState,
+    source: &TableMetadata,
+) -> Result<(), CqlError> {
+    use ferrosa_storage::timeseries::config::{generate_cascade_chain, ConsolidationConfig};
+
+    let config = match ConsolidationConfig::from_extensions(&source.extensions) {
+        Some(Ok(c)) if c.cascade => c,
+        Some(Err(e)) => {
+            tracing::warn!(
+                table = %source.name,
+                "invalid consolidation extensions: {e}"
+            );
+            return Ok(());
+        }
+        _ => return Ok(()), // no consolidation or cascade disabled
+    };
+
+    let chain = generate_cascade_chain(&source.name, &config);
+    if chain.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        table = %source.name,
+        cascade_len = chain.len(),
+        "auto-creating cascade tables"
+    );
+
+    for spec in &chain {
+        // Build columns: same partition key + clustering key as source,
+        // plus output columns (e.g., value_min, value_max, value_avg, value_stddev).
+        let mut columns = IndexMap::new();
+
+        // Copy partition key columns from source.
+        for pk_name in &source.partition_key {
+            if let Some(col) = source.columns.get(pk_name) {
+                columns.insert(pk_name.clone(), col.clone());
+            }
+        }
+
+        // Clustering key: `ts timestamp` (DESC).
+        let ck_name = source
+            .clustering_key
+            .first()
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| "ts".to_string());
+
+        if !columns.contains_key(&ck_name) {
+            columns.insert(
+                ck_name.clone(),
+                ColumnMetadata {
+                    name: ck_name.clone(),
+                    kind: ColumnKind::Clustering,
+                    position: 0,
+                    column_type: "timestamp".to_string(),
+                    clustering_order: SchemaClusteringOrder::Desc,
+                    mask: None,
+                },
+            );
+        }
+
+        // Add output columns (value_min, value_max, value_avg, etc.).
+        for (i, col_name) in spec.output_columns.iter().enumerate() {
+            columns.insert(
+                col_name.clone(),
+                ColumnMetadata {
+                    name: col_name.clone(),
+                    kind: ColumnKind::Regular,
+                    position: i as i32,
+                    column_type: "double".to_string(),
+                    clustering_order: SchemaClusteringOrder::None,
+                    mask: None,
+                },
+            );
+        }
+
+        // Build extensions for this tier's consolidation config.
+        let mut extensions = HashMap::new();
+        if let Some(ref target) = spec.target {
+            extensions.insert("consolidation.target".to_string(), target.clone());
+            extensions.insert(
+                "consolidation.interval".to_string(),
+                format_consolidation_interval(&spec.interval),
+            );
+            // Inherit functions and columns from source config.
+            let fn_str: String = config
+                .functions
+                .iter()
+                .filter_map(|f| consolidation_fn_name(f))
+                .collect::<Vec<_>>()
+                .join(",");
+            extensions.insert("consolidation.functions".to_string(), fn_str);
+            extensions.insert(
+                "consolidation.columns".to_string(),
+                spec.output_columns
+                    .iter()
+                    .filter_map(|c| c.rsplit_once('_').map(|(base, _)| base.to_string()))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+
+        let cascade_table = TableMetadata {
+            keyspace: source.keyspace.clone(),
+            name: spec.table_name.clone(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: source.partition_key.clone(),
+            clustering_key: vec![(ck_name.clone(), SchemaClusteringOrder::Desc)],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions,
+            is_system: false,
+        };
+
+        // Idempotent: silently succeeds if table already exists.
+        state
+            .schema
+            .create_table_internal(cascade_table.clone())
+            .map_err(|e| CqlError::ServerError(format!("cascade table creation failed: {e}")))?;
+
+        let storage_schema = cascade_table.to_storage_schema();
+        // Ignore error if already registered.
+        let _ = state.engine.register_table(storage_schema);
+
+        tracing::info!(
+            cascade_table = %spec.table_name,
+            "created cascade table"
+        );
+    }
+
+    Ok(())
+}
+
+/// Format a Duration as a consolidation interval string (e.g., "5m", "15m", "1h").
+fn format_consolidation_interval(d: &std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// Map a ConsolidationFn to its string name for extension serialization.
+fn consolidation_fn_name(
+    f: &ferrosa_storage::timeseries::consolidation::ConsolidationFn,
+) -> Option<&'static str> {
+    use ferrosa_storage::timeseries::consolidation::ConsolidationFn;
+    match f {
+        ConsolidationFn::Min => Some("min"),
+        ConsolidationFn::Max => Some("max"),
+        ConsolidationFn::Avg => Some("avg"),
+        ConsolidationFn::Median => Some("median"),
+        ConsolidationFn::StdDev => Some("stddev"),
+        ConsolidationFn::Count => Some("count"),
+        ConsolidationFn::Sum => Some("sum"),
+        _ => None,
+    }
 }
 
 async fn route_alter_table(
@@ -2506,10 +3224,12 @@ async fn route_create_index(
         }
     }
 
+    // CQL native protocol: INDEX schema changes use TABLE as the target
+    // so cqlsh refreshes the table metadata (which includes indexes).
     Ok(result::encode_schema_change(
         "CREATED",
-        "INDEX",
-        &[ks, &index_name],
+        "TABLE",
+        &[ks, &s.table],
     ))
 }
 
@@ -2534,7 +3254,7 @@ async fn route_drop_index(
             if s.if_exists {
                 return Ok(result::encode_schema_change(
                     "DROPPED",
-                    "INDEX",
+                    "TABLE",
                     &[ks, &s.name],
                 ));
             }
@@ -2583,10 +3303,11 @@ async fn route_drop_index(
         }
     }
 
+    // Return TABLE event so cqlsh refreshes table metadata (includes indexes).
     Ok(result::encode_schema_change(
         "DROPPED",
-        "INDEX",
-        &[ks, &s.name],
+        "TABLE",
+        &[ks, &table_name],
     ))
 }
 
@@ -2906,15 +3627,74 @@ fn build_column_info(
                 names.push(name.clone());
                 types.push(resolve_col_type(&col.column_type, ks, schema)?);
             }
-            SelectColumn::FunctionCall { name, alias, .. } => {
-                let display_name = alias.clone().unwrap_or_else(|| format!("system.{}", name));
+            SelectColumn::FunctionCall {
+                keyspace: func_ks,
+                name,
+                alias,
+                args,
+            } => {
+                let builtin_display_name = alias.clone().unwrap_or_else(|| {
+                    let prefix = func_ks.as_deref().unwrap_or("system");
+                    format!("{}.{}", prefix, name)
+                });
                 let fn_lower = name.to_lowercase();
-                let cql_type = match fn_lower.as_str() {
-                    "count" => CqlType::Bigint,
-                    "writetime" => CqlType::Bigint,
-                    "ttl" => CqlType::Int,
+                let (display_name, cql_type) = match fn_lower.as_str() {
+                    "count" => (builtin_display_name, CqlType::Bigint),
+                    "writetime" => (builtin_display_name, CqlType::Bigint),
+                    "ttl" => (builtin_display_name, CqlType::Int),
+                    "avg" | "min" | "max" | "sum" => {
+                        // Resolve the argument column type.
+                        let t = if let Some(arg) = args.first() {
+                            if let Ok(col_name) = extract_column_name(arg) {
+                                let col = table_meta.columns.get(&col_name).ok_or_else(|| {
+                                    CqlError::Invalid(format!(
+                                        "unknown column in {}(): {}",
+                                        fn_lower, col_name
+                                    ))
+                                })?;
+                                let arg_type = resolve_col_type(&col.column_type, ks, schema)?;
+                                if fn_lower == "avg" {
+                                    // avg always returns Double (matches Cassandra for
+                                    // non-decimal types; close enough for now).
+                                    match arg_type {
+                                        CqlType::Float => CqlType::Float,
+                                        _ => CqlType::Double,
+                                    }
+                                } else {
+                                    // min, max, sum return the same type as the column.
+                                    arg_type
+                                }
+                            } else {
+                                CqlType::Double
+                            }
+                        } else {
+                            CqlType::Double
+                        };
+                        (builtin_display_name, t)
+                    }
                     _ => {
-                        return Err(CqlError::Invalid(format!("unknown function: {}", name)));
+                        // Try to resolve as UDF/UDA — need table column info.
+                        let all_col_names: Vec<String> =
+                            table_meta.columns.keys().cloned().collect();
+                        let all_col_types: Vec<CqlType> = table_meta
+                            .columns
+                            .values()
+                            .map(|c| resolve_col_type(&c.column_type, ks, schema))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let resolved = resolve_select_function(
+                            ks,
+                            func_ks.as_deref(),
+                            name,
+                            args,
+                            alias.as_deref(),
+                            &all_col_names,
+                            &all_col_types,
+                            schema,
+                        )?;
+                        // Use the resolved display_name so it matches the
+                        // name produced by resolve_select_function during
+                        // UDF evaluation (ensures col_names alignment).
+                        (resolved.display_name, resolved.return_type.clone())
                     }
                 };
                 names.push(display_name);
@@ -2952,6 +3732,125 @@ fn extract_pk_values(
     Ok(values)
 }
 
+/// Try to handle `WHERE partition_key IN (v1, v2, ...)` by performing a
+/// separate PK lookup for each value in the IN list.
+///
+/// Returns `Ok(Some(rows))` if the WHERE clause contains an IN predicate on
+/// all partition key columns (currently supports single-column PK with IN,
+/// or multi-column PK where all but one column are `Eq` and one is `In`).
+/// Returns `Ok(None)` if no IN predicate is found on PK columns, letting
+/// the caller fall through to the planner.
+#[allow(clippy::too_many_arguments)]
+fn try_pk_in_lookup(
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+    engine: &StorageEngine,
+    table_id: &TableId,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    pk_indices: &[usize],
+    ck_indices: &[usize],
+) -> Result<Option<Vec<Vec<Option<CqlValue>>>>, CqlError> {
+    let pk_names = &table_meta.partition_key;
+
+    // Find which PK column (if any) has an IN predicate.
+    let in_col_idx = pk_names.iter().position(|pk_name| {
+        where_clauses
+            .iter()
+            .any(|w| w.column == *pk_name && w.op == ComparisonOp::In)
+    });
+
+    let in_col_idx = match in_col_idx {
+        Some(idx) => idx,
+        None => return Ok(None),
+    };
+
+    // For the IN column, every other PK column must have an Eq predicate.
+    for (i, pk_name) in pk_names.iter().enumerate() {
+        if i == in_col_idx {
+            continue;
+        }
+        let has_eq = where_clauses
+            .iter()
+            .any(|w| w.column == *pk_name && w.op == ComparisonOp::Eq);
+        if !has_eq {
+            return Ok(None);
+        }
+    }
+
+    // Extract the IN list values.
+    let in_wc = where_clauses
+        .iter()
+        .find(|w| w.column == pk_names[in_col_idx] && w.op == ComparisonOp::In)
+        .expect("IN predicate verified above");
+
+    let in_terms = match &in_wc.value {
+        Term::InList(terms) => terms,
+        _ => {
+            return Err(CqlError::Invalid(
+                "IN predicate value must be a list".into(),
+            ));
+        }
+    };
+
+    if in_terms.is_empty() {
+        return Ok(Some(vec![]));
+    }
+
+    // Resolve PK column types.
+    let pk_types: Vec<CqlType> = pk_names
+        .iter()
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, schema))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Pre-resolve the Eq values for non-IN PK columns.
+    let mut eq_values: Vec<Option<CqlValue>> = vec![None; pk_names.len()];
+    for (i, pk_name) in pk_names.iter().enumerate() {
+        if i == in_col_idx {
+            continue;
+        }
+        let wc = where_clauses
+            .iter()
+            .find(|w| w.column == *pk_name && w.op == ComparisonOp::Eq)
+            .expect("Eq predicate verified above");
+        eq_values[i] = Some(bridge::term_to_cql_value(&wc.value, &pk_types[i])?);
+    }
+
+    // Iterate over each value in the IN list, build PK, and read.
+    let in_col_type = &pk_types[in_col_idx];
+    let mut all_rows = Vec::new();
+
+    for term in in_terms {
+        let in_value = bridge::term_to_cql_value(term, in_col_type)?;
+
+        // Assemble the full PK values vector in column order.
+        let mut pk_values = Vec::with_capacity(pk_names.len());
+        for (i, _) in pk_names.iter().enumerate() {
+            if i == in_col_idx {
+                pk_values.push(in_value.clone());
+            } else {
+                pk_values.push(eq_values[i].clone().expect("Eq value resolved above"));
+            }
+        }
+
+        let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+        if let Some(partition) = engine.read(table_id, &decorated_key)? {
+            let mut prows = bridge::partition_to_rows(
+                &partition,
+                all_col_names,
+                all_col_types,
+                pk_indices,
+                ck_indices,
+            );
+            all_rows.append(&mut prows);
+        }
+    }
+
+    Ok(Some(all_rows))
+}
+
 /// Convert a WHERE clause `Term` for a given column into an `IndexKey` for
 /// secondary index lookup.
 fn term_to_index_key(
@@ -2981,6 +3880,11 @@ fn evaluate_where_predicates(
     schema: &Schema,
 ) -> bool {
     for wc in where_clauses {
+        // Skip token() predicates — token range filtering is handled by
+        // the scan bounds, not by post-filter row evaluation.
+        if wc.token_fn {
+            continue;
+        }
         let col_idx = match all_col_names.iter().position(|n| n == &wc.column) {
             Some(i) => i,
             None => return false,
@@ -2993,13 +3897,77 @@ fn evaluate_where_predicates(
             Ok(t) => t,
             Err(_) => return false,
         };
-        let expected = match bridge::term_to_cql_value(&wc.value, &cql_type) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
         let actual = match &row[col_idx] {
             Some(v) => v,
             None => return false,
+        };
+
+        // IN requires special handling: the term is an InList, not a single
+        // value, so we must check membership before the normal term_to_cql_value
+        // path (which rejects InList terms).
+        if wc.op == ComparisonOp::In {
+            let in_terms = match &wc.value {
+                Term::InList(terms) => terms,
+                _ => return false,
+            };
+            let found = in_terms.iter().any(|t| {
+                if let Ok(v) = bridge::term_to_cql_value(t, &cql_type) {
+                    *actual == v
+                } else {
+                    false
+                }
+            });
+            if !found {
+                return false;
+            }
+            continue;
+        }
+
+        // CONTAINS / CONTAINS KEY require element/key type coercion, not
+        // collection-level coercion, so they are handled before the normal
+        // term_to_cql_value path (same pattern as IN above).
+        if wc.op == ComparisonOp::Contains {
+            let element_type = match &cql_type {
+                CqlType::List(inner) | CqlType::Set(inner) => (**inner).clone(),
+                CqlType::Map(_, val_type) => (**val_type).clone(),
+                _ => return false,
+            };
+            let needle = match bridge::term_to_cql_value(&wc.value, &element_type) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let found = match actual {
+                CqlValue::List(items) | CqlValue::Set(items) => items.contains(&needle),
+                CqlValue::Map(entries) => entries.iter().any(|(_, v)| *v == needle),
+                _ => false,
+            };
+            if !found {
+                return false;
+            }
+            continue;
+        }
+        if wc.op == ComparisonOp::ContainsKey {
+            let key_type = match &cql_type {
+                CqlType::Map(key_type, _) => (**key_type).clone(),
+                _ => return false,
+            };
+            let needle = match bridge::term_to_cql_value(&wc.value, &key_type) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let found = match actual {
+                CqlValue::Map(entries) => entries.iter().any(|(k, _)| *k == needle),
+                _ => false,
+            };
+            if !found {
+                return false;
+            }
+            continue;
+        }
+
+        let expected = match bridge::term_to_cql_value(&wc.value, &cql_type) {
+            Ok(v) => v,
+            Err(_) => return false,
         };
         let matches = match wc.op {
             ComparisonOp::Eq => *actual == expected,
@@ -3008,15 +3976,9 @@ fn evaluate_where_predicates(
             ComparisonOp::Lt => *actual < expected,
             ComparisonOp::Ge => *actual >= expected,
             ComparisonOp::Le => *actual <= expected,
-            ComparisonOp::In => {
-                // IN comparison: check if actual is in the expected list.
-                // For now, treat as equality (single-value IN).
-                *actual == expected
-            }
+            ComparisonOp::In => unreachable!("IN handled above"),
             ComparisonOp::Contains | ComparisonOp::ContainsKey => {
-                // CONTAINS / CONTAINS KEY: not yet implemented for filtering.
-                // Conservatively exclude the row so we don't return false positives.
-                false
+                unreachable!("CONTAINS/CONTAINS KEY handled above")
             }
         };
         if !matches {
@@ -3026,7 +3988,299 @@ fn evaluate_where_predicates(
     true
 }
 
+/// Apply column selection (with `toJson()` support) to system table query results.
+///
+/// System table handlers build the full set of columns, then this function
+/// projects down to the columns requested in the `SELECT` list. If the
+/// `SELECT` list contains `toJson(col)`, the column value is serialized to
+/// a JSON string using [`bridge::cql_value_to_json`].
+fn apply_system_select(
+    select_columns_ast: &[SelectColumn],
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    all_rows: &[Vec<Option<CqlValue>>],
+    keyspace: &str,
+    table: &str,
+) -> Result<BytesMut, CqlError> {
+    // Star — return everything
+    if select_columns_ast
+        .iter()
+        .any(|c| matches!(c, SelectColumn::Star))
+    {
+        return Ok(result::encode_rows(
+            all_col_names,
+            all_col_types,
+            keyspace,
+            table,
+            all_rows,
+        ));
+    }
+
+    // Build projected column names, types, and transform descriptors.
+    let mut proj_names: Vec<String> = Vec::new();
+    let mut proj_types: Vec<CqlType> = Vec::new();
+    // Each entry: (source column index, apply_tojson)
+    let mut proj_ops: Vec<(usize, bool)> = Vec::new();
+
+    for sc in select_columns_ast {
+        match sc {
+            SelectColumn::Star => unreachable!(),
+            SelectColumn::Column(name) => {
+                let idx = all_col_names
+                    .iter()
+                    .position(|n| n == name)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", name)))?;
+                proj_names.push(name.clone());
+                proj_types.push(all_col_types[idx].clone());
+                proj_ops.push((idx, false));
+            }
+            SelectColumn::FunctionCall {
+                name, args, alias, ..
+            } => {
+                let fn_lower = name.to_lowercase();
+                if fn_lower == "tojson" {
+                    // toJson(column_ref) — single argument expected
+                    if args.len() != 1 {
+                        return Err(CqlError::Invalid(
+                            "toJson() requires exactly one argument".into(),
+                        ));
+                    }
+                    let col_name = extract_column_name(&args[0])?;
+                    let idx = all_col_names
+                        .iter()
+                        .position(|n| *n == col_name)
+                        .ok_or_else(|| {
+                            CqlError::Invalid(format!("unknown column: {}", col_name))
+                        })?;
+                    let display = alias
+                        .clone()
+                        .unwrap_or_else(|| format!("system.tojson({})", col_name));
+                    proj_names.push(display);
+                    proj_types.push(CqlType::Varchar); // toJson returns text
+                    proj_ops.push((idx, true));
+                } else if fn_lower == "count" {
+                    let display = alias.clone().unwrap_or_else(|| "count".to_string());
+                    proj_names.push(display);
+                    proj_types.push(CqlType::Bigint);
+                    // COUNT is handled below as aggregate
+                    proj_ops.push((usize::MAX, false));
+                } else {
+                    return Err(CqlError::Invalid(format!(
+                        "unsupported function in system table query: {}",
+                        name
+                    )));
+                }
+            }
+        }
+    }
+
+    // Check for COUNT(*) aggregate
+    let has_count = select_columns_ast.iter().any(|c| {
+        matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+    });
+
+    if has_count {
+        // Aggregate query — return a single row
+        let mut agg_row: Vec<Option<CqlValue>> = Vec::new();
+        for (i, sc) in select_columns_ast.iter().enumerate() {
+            if matches!(sc, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+            {
+                agg_row.push(Some(CqlValue::Bigint(all_rows.len() as i64)));
+            } else {
+                let (src_idx, apply_tojson) = proj_ops[i];
+                if src_idx < all_col_names.len() {
+                    let val = all_rows
+                        .first()
+                        .and_then(|r| r.get(src_idx))
+                        .cloned()
+                        .flatten();
+                    if apply_tojson {
+                        let json =
+                            bridge::cql_value_to_json(val.as_ref().unwrap_or(&CqlValue::Null));
+                        agg_row.push(Some(CqlValue::Text(json)));
+                    } else {
+                        agg_row.push(val);
+                    }
+                } else {
+                    agg_row.push(None);
+                }
+            }
+        }
+        return Ok(result::encode_rows(
+            &proj_names,
+            &proj_types,
+            keyspace,
+            table,
+            &[agg_row],
+        ));
+    }
+
+    // Non-aggregate: project each row
+    let projected: Vec<Vec<Option<CqlValue>>> = all_rows
+        .iter()
+        .map(|row| {
+            proj_ops
+                .iter()
+                .map(|&(src_idx, apply_tojson)| {
+                    let val = row.get(src_idx).cloned().flatten();
+                    if apply_tojson {
+                        let json =
+                            bridge::cql_value_to_json(val.as_ref().unwrap_or(&CqlValue::Null));
+                        Some(CqlValue::Text(json))
+                    } else {
+                        val
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    Ok(result::encode_rows(
+        &proj_names,
+        &proj_types,
+        keyspace,
+        table,
+        &projected,
+    ))
+}
+
+/// Extract a column name from a `Term` that should reference a column.
+///
+/// In the `parse_term` codepath, bare identifiers in function arguments are
+/// parsed as `Term::FunctionCall { name, args: [] }` (zero-arg function call).
+fn extract_column_name(term: &Term) -> Result<String, CqlError> {
+    match term {
+        Term::FunctionCall { name, args, .. } if args.is_empty() => Ok(name.to_lowercase()),
+        Term::StringLiteral(s) => Ok(s.clone()),
+        _ => Err(CqlError::Invalid(format!(
+            "expected column reference in toJson(), got {:?}",
+            term
+        ))),
+    }
+}
+
+/// Convert a [`CqlValue`] to `f64` for built-in aggregate computation.
+///
+/// Supports all numeric CQL types. Returns `None` for non-numeric values so
+/// that NULL / non-numeric cells are skipped during aggregation.
+fn cql_value_to_f64(val: &CqlValue) -> Option<f64> {
+    match val {
+        CqlValue::Tinyint(v) => Some(f64::from(*v)),
+        CqlValue::Smallint(v) => Some(f64::from(*v)),
+        CqlValue::Int(v) => Some(f64::from(*v)),
+        CqlValue::Bigint(v) => Some(*v as f64),
+        CqlValue::Float(bits) => Some(f64::from(f32::from_bits(*bits))),
+        CqlValue::Double(bits) => Some(f64::from_bits(*bits)),
+        CqlValue::Counter(v) => Some(*v as f64),
+        _ => None,
+    }
+}
+
+/// Build the result [`CqlValue`] for a built-in aggregate (`avg`, `sum`,
+/// `min`, `max`) given the source column type.
+///
+/// `avg` and `sum` on integer types still return `Double` for consistency
+/// with Cassandra semantics (CQL `avg(int)` returns `int`, but returning
+/// `Double` avoids truncation and matches driver expectations for
+/// analytics queries).  If more precise Cassandra-compat semantics are
+/// needed later, this can be refined per-type.
+fn f64_to_cql_aggregate(val: f64, col_type: &CqlType) -> CqlValue {
+    match col_type {
+        CqlType::Tinyint => CqlValue::Tinyint(val as i8),
+        CqlType::Smallint => CqlValue::Smallint(val as i16),
+        CqlType::Int => CqlValue::Int(val as i32),
+        CqlType::Bigint | CqlType::Counter => CqlValue::Bigint(val as i64),
+        CqlType::Float => CqlValue::Float((val as f32).to_bits()),
+        // Default to Double for any other numeric or unknown type.
+        _ => CqlValue::Double(val.to_bits()),
+    }
+}
+
+/// Compute a built-in aggregate (`avg`, `min`, `max`, `sum`) over a column.
+///
+/// `agg_name` must be one of `"avg"`, `"min"`, `"max"`, `"sum"` (lowercase).
+/// The function iterates over `rows`, extracting the value at `col_idx`,
+/// converts to `f64`, and applies the aggregate.  NULL cells are skipped.
+fn compute_builtin_aggregate(
+    agg_name: &str,
+    rows: &[Vec<Option<CqlValue>>],
+    col_idx: usize,
+    col_type: &CqlType,
+) -> Option<CqlValue> {
+    let values: Vec<f64> = rows
+        .iter()
+        .filter_map(|row| row.get(col_idx).and_then(|cell| cell.as_ref()))
+        .filter_map(cql_value_to_f64)
+        .collect();
+
+    if values.is_empty() {
+        return Some(CqlValue::Null);
+    }
+
+    let result = match agg_name {
+        "avg" => values.iter().sum::<f64>() / values.len() as f64,
+        "sum" => values.iter().sum::<f64>(),
+        "min" => values.iter().copied().fold(f64::INFINITY, f64::min),
+        "max" => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        _ => return None,
+    };
+    Some(f64_to_cql_aggregate(result, col_type))
+}
+
+/// Apply `toJson()` transformations to projected rows for user-table SELECT queries.
+///
+/// Scans the SELECT column list for `toJson(col)` calls. For each one, finds the
+/// source column value from the full (unprojected) row and replaces the projected
+/// cell with its JSON representation.
+fn apply_tojson_projections(
+    select_columns_ast: &[SelectColumn],
+    proj_col_names: &[String],
+    all_col_names: &[String],
+    full_rows: &[Vec<Option<CqlValue>>],
+    mut projected_rows: Vec<Vec<Option<CqlValue>>>,
+) -> Vec<Vec<Option<CqlValue>>> {
+    // Find toJson columns: (projected_index, source_column_index)
+    let mut tojson_ops: Vec<(usize, usize)> = Vec::new();
+    for (proj_idx, sc) in select_columns_ast.iter().enumerate() {
+        if let SelectColumn::FunctionCall { name, args, .. } = sc {
+            if name.eq_ignore_ascii_case("tojson") {
+                if let Some(arg) = args.first() {
+                    if let Ok(col_name) = extract_column_name(arg) {
+                        if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name) {
+                            if proj_idx < proj_col_names.len() {
+                                tojson_ops.push((proj_idx, src_idx));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if tojson_ops.is_empty() {
+        return projected_rows;
+    }
+
+    for (full_row, proj_row) in full_rows.iter().zip(projected_rows.iter_mut()) {
+        for &(proj_idx, src_idx) in &tojson_ops {
+            let val = full_row
+                .get(src_idx)
+                .and_then(|v| v.as_ref())
+                .unwrap_or(&CqlValue::Null);
+            let json = bridge::cql_value_to_json(val);
+            proj_row[proj_idx] = Some(CqlValue::Text(json));
+        }
+    }
+
+    projected_rows
+}
+
 /// Project rows to a selected column subset.
+///
+/// Columns that do not match any name in `all_names` (e.g. UDF display
+/// names like `"ks.to_celsius"`) get a `None` placeholder so the
+/// projected row has exactly `selected.len()` cells. The caller can
+/// then overwrite those placeholders with UDF results.
 fn select_columns(
     rows: &[Vec<Option<CqlValue>>],
     all_names: &[String],
@@ -3036,13 +4290,21 @@ fn select_columns(
     if all_names == selected {
         return rows.to_vec();
     }
-    // Build index mapping
-    let indices: Vec<usize> = selected
+    // Build index mapping: Some(idx) for real columns, None for function calls.
+    let indices: Vec<Option<usize>> = selected
         .iter()
-        .filter_map(|name| all_names.iter().position(|n| n == name))
+        .map(|name| all_names.iter().position(|n| n == name))
         .collect();
     rows.iter()
-        .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
+        .map(|row| {
+            indices
+                .iter()
+                .map(|opt_i| match opt_i {
+                    Some(i) => row[*i].clone(),
+                    None => None,
+                })
+                .collect()
+        })
         .collect()
 }
 
@@ -3143,6 +4405,9 @@ fn cql_type_name_to_string(type_name: &CqlTypeName) -> String {
             format!("tuple<{}>", inner.join(", "))
         }
         CqlTypeName::Frozen(inner) => format!("frozen<{}>", cql_type_name_to_string(inner)),
+        CqlTypeName::Vector(inner, dim) => {
+            format!("vector<{}, {}>", cql_type_name_to_string(inner), dim)
+        }
     }
 }
 
@@ -3336,6 +4601,11 @@ async fn route_drop_type(
 
 /// Decode a hex-encoded string to bytes.
 fn hex_decode(hex: &str) -> Result<Vec<u8>, CqlError> {
+    // Strip optional 0x / 0X prefix.
+    let hex = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
     if !hex.len().is_multiple_of(2) {
         return Err(CqlError::Invalid("hex body has odd length".into()));
     }
@@ -3394,6 +4664,13 @@ async fn route_create_function(
     let resolved_return = bridge::resolve_type_name(&return_type, &ks, &state.schema)?;
     let common_return = cql_type_to_common(&resolved_return);
 
+    // Build arg type name strings for the SCHEMA_CHANGE response (CQL protocol
+    // requires a [string list] of argument type names for FUNCTION targets).
+    let arg_type_names: Vec<String> = arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
+
     // Decode hex body to WASM bytes and compile
     let wasm_bytes = hex_decode(&body)?;
     state
@@ -3408,10 +4685,11 @@ async fn route_create_function(
             // Drop the old one first, then create the new one
             state.udf_executor.invalidate(&ks, &name);
         } else if if_not_exists {
-            return Ok(result::encode_schema_change(
+            return Ok(result::encode_schema_change_with_args(
                 "CREATED",
                 "FUNCTION",
                 &[&ks, &name],
+                &arg_type_names,
             ));
         } else {
             return Err(CqlError::Invalid(format!(
@@ -3454,10 +4732,11 @@ async fn route_create_function(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "CREATED",
         "FUNCTION",
         &[&ks, &name],
+        &arg_type_names,
     ))
 }
 
@@ -3500,10 +4779,11 @@ async fn route_drop_function(
             match matching.len() {
                 0 => {
                     if if_exists {
-                        return Ok(result::encode_schema_change(
+                        return Ok(result::encode_schema_change_with_args(
                             "DROPPED",
                             "FUNCTION",
                             &[&ks, &name],
+                            &[],
                         ));
                     }
                     return Err(CqlError::Invalid(format!("function {ks}.{name} not found")));
@@ -3523,6 +4803,12 @@ async fn route_drop_function(
         }
     };
 
+    // Build arg type name strings for the SCHEMA_CHANGE response.
+    let resolved_arg_type_names: Vec<String> = resolved_arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
+
     // IF EXISTS check
     if if_exists
         && state
@@ -3530,10 +4816,11 @@ async fn route_drop_function(
             .get_function(&ks, &name, &resolved_arg_types)
             .is_none()
     {
-        return Ok(result::encode_schema_change(
+        return Ok(result::encode_schema_change_with_args(
             "DROPPED",
             "FUNCTION",
             &[&ks, &name],
+            &resolved_arg_type_names,
         ));
     }
 
@@ -3575,10 +4862,11 @@ async fn route_drop_function(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "DROPPED",
         "FUNCTION",
         &[&ks, &name],
+        &resolved_arg_type_names,
     ))
 }
 
@@ -3613,6 +4901,12 @@ async fn route_create_aggregate(
             Ok(cql_type_to_common(&resolved))
         })
         .collect::<Result<_, CqlError>>()?;
+
+    // Build arg type name strings for the SCHEMA_CHANGE response.
+    let agg_arg_type_names: Vec<String> = arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
 
     // Resolve state type
     let resolved_state_type = bridge::resolve_type_name(&state_type, &ks, &state.schema)?;
@@ -3664,10 +4958,11 @@ async fn route_create_aggregate(
         if or_replace {
             // Will be replaced by the new creation
         } else if if_not_exists {
-            return Ok(result::encode_schema_change(
+            return Ok(result::encode_schema_change_with_args(
                 "CREATED",
                 "AGGREGATE",
                 &[&ks, &name],
+                &agg_arg_type_names,
             ));
         } else {
             return Err(CqlError::Invalid(format!(
@@ -3685,6 +4980,7 @@ async fn route_create_aggregate(
         final_func,
         init_cond: common_init_cond,
         return_type,
+        wasm_body: None,
     };
 
     let ddl_guard = state.ddl_path.load();
@@ -3710,10 +5006,11 @@ async fn route_create_aggregate(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "CREATED",
         "AGGREGATE",
         &[&ks, &name],
+        &agg_arg_type_names,
     ))
 }
 
@@ -3755,10 +5052,11 @@ async fn route_drop_aggregate(
             match matching.len() {
                 0 => {
                     if if_exists {
-                        return Ok(result::encode_schema_change(
+                        return Ok(result::encode_schema_change_with_args(
                             "DROPPED",
                             "AGGREGATE",
                             &[&ks, &name],
+                            &[],
                         ));
                     }
                     return Err(CqlError::Invalid(format!(
@@ -3780,6 +5078,12 @@ async fn route_drop_aggregate(
         }
     };
 
+    // Build arg type name strings for the SCHEMA_CHANGE response.
+    let resolved_agg_arg_type_names: Vec<String> = resolved_arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
+
     // IF EXISTS check
     if if_exists
         && state
@@ -3787,10 +5091,11 @@ async fn route_drop_aggregate(
             .get_aggregate(&ks, &name, &resolved_arg_types)
             .is_none()
     {
-        return Ok(result::encode_schema_change(
+        return Ok(result::encode_schema_change_with_args(
             "DROPPED",
             "AGGREGATE",
             &[&ks, &name],
+            &resolved_agg_arg_type_names,
         ));
     }
 
@@ -3829,10 +5134,11 @@ async fn route_drop_aggregate(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "DROPPED",
         "AGGREGATE",
         &[&ks, &name],
+        &resolved_agg_arg_type_names,
     ))
 }
 
@@ -3849,6 +5155,321 @@ fn cql_type_to_common(cql_type: &CqlType) -> ferrosa_common::CqlType {
 fn cql_value_to_common(val: &CqlValue) -> ferrosa_common::CqlValue {
     // CqlValue in ferrosa-cql IS ferrosa_common::CqlValue — same type, identity conversion.
     val.clone()
+}
+
+// ── UDF/UDA query-time resolution and execution ──────────────────────────
+
+/// Infer the CQL type of a `Term` expression.
+///
+/// For column references (parsed as `Term::FunctionCall { name, args: [] }`),
+/// the column name is looked up in `all_col_names` / `all_col_types` to return
+/// the column's declared type.
+fn infer_term_type(
+    term: &Term,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+) -> Result<CqlType, CqlError> {
+    match term {
+        Term::IntegerLiteral(_) => Ok(CqlType::Int),
+        Term::FloatLiteral(_) => Ok(CqlType::Double),
+        Term::StringLiteral(_) => Ok(CqlType::Varchar),
+        Term::BoolLiteral(_) => Ok(CqlType::Boolean),
+        Term::UuidLiteral(_) => Ok(CqlType::Uuid),
+        Term::BlobLiteral(_) => Ok(CqlType::Blob),
+        Term::Null => Ok(CqlType::Varchar), // default for untyped null
+        Term::FunctionCall { name, args, .. } if args.is_empty() => {
+            // Zero-arg function call may actually be a column reference.
+            if let Some(idx) = all_col_names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(name))
+            {
+                Ok(all_col_types[idx].clone())
+            } else {
+                // Actual zero-arg function — treat return type as Varchar as a
+                // default; the real type will be resolved during function lookup.
+                Ok(CqlType::Varchar)
+            }
+        }
+        _ => Err(CqlError::Invalid(format!(
+            "cannot infer type for term: {:?}",
+            term
+        ))),
+    }
+}
+
+/// Resolve a `SelectColumn::FunctionCall` into a `ResolvedFunction`.
+///
+/// Looks up the function in the schema (trying aggregates first, then scalar
+/// UDFs) and builds the argument index mapping.
+#[allow(clippy::too_many_arguments)]
+fn resolve_select_function(
+    ks: &str,
+    func_keyspace: Option<&str>,
+    func_name: &str,
+    args: &[Term],
+    alias: Option<&str>,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    schema: &Schema,
+) -> Result<ResolvedFunction, CqlError> {
+    let func_ks = func_keyspace.unwrap_or(ks);
+
+    // Infer argument types.
+    let arg_types: Vec<CqlType> = args
+        .iter()
+        .map(|a| infer_term_type(a, all_col_names, all_col_types))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Build arg_indices: for each arg, if it is a column reference, record its
+    // index in the full row; otherwise use usize::MAX as sentinel for literals.
+    let arg_indices: Vec<usize> = args
+        .iter()
+        .map(|a| match a {
+            Term::FunctionCall {
+                name,
+                args: inner_args,
+                ..
+            } if inner_args.is_empty() => all_col_names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(name))
+                .unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        })
+        .collect();
+
+    let display_name = alias
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| format!("{}.{}", func_ks, func_name));
+
+    // Try aggregate first.
+    if let Some(agg_meta) = schema.get_aggregate(func_ks, func_name, &arg_types) {
+        return Ok(ResolvedFunction {
+            func_name: func_name.to_string(),
+            func_keyspace: func_ks.to_string(),
+            kind: ResolvedFunctionKind::Aggregate {
+                init_cond: agg_meta.init_cond.clone(),
+            },
+            return_type: agg_meta.return_type.clone(),
+            called_on_null: false, // aggregates always accumulate
+            arg_indices,
+            arg_terms: args.to_vec(),
+            arg_types,
+            display_name,
+        });
+    }
+
+    // Try scalar UDF.
+    if let Some(func_meta) = schema.get_function(func_ks, func_name, &arg_types) {
+        return Ok(ResolvedFunction {
+            func_name: func_name.to_string(),
+            func_keyspace: func_ks.to_string(),
+            kind: ResolvedFunctionKind::Scalar,
+            return_type: func_meta.return_type.clone(),
+            called_on_null: func_meta.called_on_null,
+            arg_indices,
+            arg_terms: args.to_vec(),
+            arg_types,
+            display_name,
+        });
+    }
+
+    Err(CqlError::Invalid(format!(
+        "unknown function: {}.{}({})",
+        func_ks,
+        func_name,
+        arg_types
+            .iter()
+            .map(bridge::cql_type_display_name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+/// Extract the argument values for a UDF call from a full row.
+///
+/// For each arg: if it references a column (arg_indices[i] != usize::MAX),
+/// extract the column value from the row; otherwise convert the literal Term.
+fn extract_udf_args(
+    row: &[Option<CqlValue>],
+    func: &ResolvedFunction,
+) -> Result<Vec<CqlValue>, CqlError> {
+    let mut values = Vec::with_capacity(func.arg_indices.len());
+    for (i, &idx) in func.arg_indices.iter().enumerate() {
+        if idx != usize::MAX {
+            // Column reference — use row value (or Null).
+            let val = row
+                .get(idx)
+                .and_then(|v| v.clone())
+                .unwrap_or(CqlValue::Null);
+            values.push(val);
+        } else {
+            // Literal — convert the term using the inferred type.
+            let val = bridge::term_to_cql_value(&func.arg_terms[i], &func.arg_types[i])?;
+            values.push(val);
+        }
+    }
+    Ok(values)
+}
+
+/// Evaluate scalar UDFs against a single row, returning the UDF results
+/// in the order of `resolved_funcs`.
+///
+/// Each resolved function is evaluated using the WASM executor. If the function
+/// is not `called_on_null` and any argument is NULL, the result is NULL without
+/// invoking WASM.
+fn evaluate_row_udfs(
+    state: &SharedState,
+    row: &[Option<CqlValue>],
+    resolved_funcs: &[&ResolvedFunction],
+) -> Result<Vec<Option<CqlValue>>, CqlError> {
+    let mut results = Vec::with_capacity(resolved_funcs.len());
+    for func in resolved_funcs {
+        if !matches!(func.kind, ResolvedFunctionKind::Scalar) {
+            // Aggregates are handled separately.
+            results.push(None);
+            continue;
+        }
+        let args = extract_udf_args(row, func)?;
+
+        // Called-on-null short circuit: if any arg is Null and the function is
+        // not marked CALLED ON NULL INPUT, return Null without invoking WASM.
+        if !func.called_on_null && args.iter().any(|v| matches!(v, CqlValue::Null)) {
+            results.push(None);
+            continue;
+        }
+
+        let result = state.udf_executor.call(
+            &func.func_keyspace,
+            &func.func_name,
+            args,
+            &func.arg_types,
+            &func.return_type,
+        )?;
+        results.push(Some(result));
+    }
+    Ok(results)
+}
+
+/// Execute a user-defined aggregate (UDA) over a set of rows.
+///
+/// Runs the state function per row and the optional final function once,
+/// returning the aggregated result.
+fn execute_uda(
+    state: &SharedState,
+    ks: &str,
+    func: &ResolvedFunction,
+    rows: &[Vec<Option<CqlValue>>],
+) -> Result<CqlValue, CqlError> {
+    let init_cond = match &func.kind {
+        ResolvedFunctionKind::Aggregate { init_cond } => init_cond.clone(),
+        _ => {
+            return Err(CqlError::Invalid(
+                "execute_uda called on non-aggregate function".into(),
+            ));
+        }
+    };
+
+    // Look up the aggregate metadata to get state_func, final_func, state_type.
+    let agg_meta = state
+        .schema
+        .get_aggregate(&func.func_keyspace, &func.func_name, &func.arg_types)
+        .ok_or_else(|| {
+            CqlError::Invalid(format!(
+                "aggregate not found: {}.{}",
+                func.func_keyspace, func.func_name
+            ))
+        })?;
+
+    // Initialize accumulator.
+    let mut acc = init_cond.unwrap_or(CqlValue::Null);
+
+    // Look up the state function metadata (needed for called_on_null).
+    let state_func_arg_types: Vec<CqlType> = {
+        let mut types = vec![agg_meta.state_type.clone()];
+        types.extend(func.arg_types.iter().cloned());
+        types
+    };
+
+    let state_func_meta =
+        state
+            .schema
+            .get_function(ks, &agg_meta.state_func, &state_func_arg_types);
+    let state_func_called_on_null = state_func_meta
+        .as_ref()
+        .map(|m| m.called_on_null)
+        .unwrap_or(false);
+
+    // Accumulate: call state_func(acc, row_args...) for each row.
+    for row in rows {
+        let row_args = extract_udf_args(row, func)?;
+
+        // Skip rows with null args if state func is not called on null.
+        if !state_func_called_on_null && row_args.iter().any(|v| matches!(v, CqlValue::Null)) {
+            continue;
+        }
+
+        let mut call_args = vec![acc.clone()];
+        call_args.extend(row_args);
+
+        acc = state.udf_executor.call(
+            ks,
+            &agg_meta.state_func,
+            call_args,
+            &state_func_arg_types,
+            &agg_meta.state_type,
+        )?;
+    }
+
+    // Finalize: if there is a final function, call it on the accumulator.
+    if let Some(ref final_func_name) = agg_meta.final_func {
+        let final_arg_types = vec![agg_meta.state_type.clone()];
+        acc = state.udf_executor.call(
+            ks,
+            final_func_name,
+            vec![acc],
+            &final_arg_types,
+            &func.return_type,
+        )?;
+    }
+
+    Ok(acc)
+}
+
+/// Check if any WHERE clause value contains a non-builtin function call,
+/// indicating a UDF in WHERE that requires ALLOW FILTERING.
+fn where_has_udf_calls(where_clauses: &[WhereClause]) -> bool {
+    for wc in where_clauses {
+        if term_has_udf_call(&wc.value) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a Term contains a non-builtin function call.
+fn term_has_udf_call(term: &Term) -> bool {
+    match term {
+        Term::FunctionCall { name, args, .. } => {
+            let lower = name.to_lowercase();
+            let is_builtin = matches!(
+                lower.as_str(),
+                "uuid" | "now" | "totimestamp" | "todate" | "count" | "writetime" | "ttl" | "token"
+            );
+            if !is_builtin && !args.is_empty() {
+                return true;
+            }
+            // Also check nested args.
+            args.iter().any(term_has_udf_call)
+        }
+        Term::InList(items) | Term::ListLiteral(items) | Term::SetLiteral(items) => {
+            items.iter().any(term_has_udf_call)
+        }
+        Term::TupleLiteral(items) => items.iter().any(term_has_udf_call),
+        Term::MapLiteral(pairs) => pairs
+            .iter()
+            .any(|(k, v)| term_has_udf_call(k) || term_has_udf_call(v)),
+        _ => false,
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -5087,13 +6708,14 @@ mod tests {
         }
     }
 
-    // ── ALLOW FILTERING is always rejected ────────────────────────
+    // ── ALLOW FILTERING executes full scan with post-filter ────────
     //
-    // Ferrosa policy: ALLOW FILTERING is not supported.  Queries must use
-    // partition keys or secondary indexes.
+    // ALLOW FILTERING performs a full table scan and filters rows in
+    // memory.  Queries without ALLOW FILTERING on non-indexed columns
+    // are still rejected.
 
     #[tokio::test]
-    async fn allow_filtering_rejected() {
+    async fn allow_filtering_executes_full_scan() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -5113,20 +6735,16 @@ mod tests {
 
         let stmt =
             crate::parser::parse("SELECT * FROM ks.t WHERE score > 25 ALLOW FILTERING").unwrap();
-        match route(&state, &ctx, stmt).await {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("ALLOW FILTERING"),
-                    "error should mention ALLOW FILTERING: {msg}"
-                );
-            }
-            Ok(_) => panic!("ALLOW FILTERING should be rejected"),
-        }
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALLOW FILTERING should execute full scan, got: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
-    async fn allow_filtering_with_limit_also_rejected() {
+    async fn allow_filtering_with_limit_executes() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -5148,8 +6766,9 @@ mod tests {
                 .unwrap();
         let result = route(&state, &ctx, stmt).await;
         assert!(
-            result.is_err(),
-            "ALLOW FILTERING with LIMIT should also be rejected"
+            result.is_ok(),
+            "ALLOW FILTERING with LIMIT should execute, got: {:?}",
+            result.err()
         );
     }
 
@@ -5224,9 +6843,10 @@ mod tests {
         }
     }
 
-    /// Even with an index on some columns, ALLOW FILTERING is rejected.
+    /// With an index on some columns and ALLOW FILTERING, the query should
+    /// succeed — the index narrows the scan, post-filter handles the rest.
     #[tokio::test]
-    async fn allow_filtering_rejected_even_with_partial_index() {
+    async fn allow_filtering_with_partial_index_succeeds() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -5254,7 +6874,11 @@ mod tests {
         )
         .unwrap();
         let result = route(&state, &ctx, stmt).await;
-        assert!(result.is_err(), "ALLOW FILTERING should be rejected");
+        assert!(
+            result.is_ok(),
+            "ALLOW FILTERING with partial index should succeed: {:?}",
+            result.err()
+        );
     }
 
     /// Querying on a fully-indexed column without ALLOW FILTERING must succeed.

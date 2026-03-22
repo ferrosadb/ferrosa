@@ -1,0 +1,412 @@
+= Advanced Aggregation with User-Defined Functions
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Push custom logic into the database with WebAssembly-powered UDFs and UDAs.
+Compute confidence-weighted averages and temperature histograms across millions of IoT rows without shipping raw data to your application.
+
+NOTE: Complete the <<cluster-setup.adoc#,3-Node Cluster Setup>> tutorial first, or have a running Ferrosa cluster accessible on `localhost:9042`.
+
+== Overview
+
+=== What are UDFs and UDAs?
+
+A *User-Defined Function (UDF)* is a scalar function you register with Ferrosa.
+It takes one or more column values from a single row and returns a single result.
+Every row in a query result can pass through the function before being returned to the client.
+
+A *User-Defined Aggregate (UDA)* folds a set of rows down to a single value.
+Ferrosa calls a *state function* once per row to accumulate running state, then calls a *final function* once to produce the result from that state.
+Standard CQL aggregates like `COUNT`, `SUM`, and `AVG` work this way internally; UDAs let you define your own.
+
+In Ferrosa, both UDFs and UDAs are compiled to *WebAssembly* using the https://component-model.bytecodealliance.org/[WASM Component Model].
+You write your function in Rust, compile it to a `.wasm` binary with `cargo-component`, hex-encode the bytes, and register them with a `CREATE FUNCTION` or `CREATE AGGREGATE` statement.
+The database executes the WASM inside a sandboxed runtime, so custom logic cannot access the host filesystem or network.
+
+=== Why this matters
+
+Without UDFs and UDAs, any aggregation beyond `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` requires pulling raw rows out of the database and computing in application code.
+For an IoT deployment with millions of readings per day, that means transferring megabytes of data over the network for every dashboard refresh.
+
+UDFs and UDAs move the computation to where the data lives.
+Ferrosa runs the logic on each node, aggregates the partial results across partitions, and returns a single compact answer to your client.
+
+This tutorial demonstrates four functions:
+
+[cols="1,1,3"]
+|===
+| Name | Type | What it does
+
+| `to_celsius` | UDF | Converts a Fahrenheit temperature to Celsius
+| `coalesce` | UDF | Returns the first non-null argument; substitutes per-sensor defaults
+| `weighted_avg` | UDA | Confidence-weighted average of temperature readings
+| `histogram` | UDA | Buckets temperatures into 10-degree Fahrenheit bands
+|===
+
+== Prerequisites
+
+You need the following tools installed before building the guest crates.
+
+=== Rust toolchain
+
+Install Rust from https://rustup.rs/[rustup.rs] if you do not have it:
+
+[source,shell]
+----
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup update stable
+----
+
+The WASM target is required:
+
+[source,shell]
+----
+rustup target add wasm32-unknown-unknown
+----
+
+=== cargo-component
+
+`cargo-component` is the build tool for the WASM Component Model.
+Install it from crates.io:
+
+[source,shell]
+----
+cargo install cargo-component
+----
+
+Verify the installation:
+
+[source,shell]
+----
+cargo component --version
+----
+
+== Design the Schema
+
+=== The IoT sensor scenario
+
+You have three sensors reporting temperature readings at hourly intervals.
+Each reading carries:
+
+* A confidence score between 0 and 1, representing the sensor's self-reported measurement quality.
+* An optional `priority` column that may be null when the sensor firmware version predates the priority field.
+* A `default_priority` column that always has a value, used as the fallback.
+
+The goal is to demonstrate UDF and UDA logic against realistic data that has nulls, varying confidence scores, and a range of temperatures that exercises the histogram buckets.
+
+=== Create the keyspace and table
+
+Connect to Ferrosa and run the schema:
+
+[source,sql]
+----
+include::schema.cql[lines=1..15]
+----
+
+The `sensor_id` column is the partition key, so all readings from one sensor are stored together on the same nodes.
+The `ts` clustering column is ordered descending so the most recent reading is always at the top of the partition.
+
+=== Register the UDFs
+
+Before running the examples, you must build the guest crates and register the functions.
+The schema file contains the full `CREATE FUNCTION` statements with a placeholder for the WASM hex bytes.
+
+==== Build the guest crate
+
+From the `examples/advanced-aggregation/` directory:
+
+[source,shell]
+----
+cargo component build --release -p advanced-aggregation-udf
+----
+
+This produces a `.wasm` file under `target/wasm32-unknown-unknown/release/`.
+
+==== Hex-encode the binary
+
+[source,shell]
+----
+xxd -p -c 0 target/wasm32-unknown-unknown/release/advanced_aggregation_udf.wasm \
+    > advanced_aggregation_udf.hex
+----
+
+==== Register `to_celsius`
+
+Replace `0x<hex>` in the statement below with the content of `advanced_aggregation_udf.hex`:
+
+[source,sql]
+----
+CREATE OR REPLACE FUNCTION sensor_analytics.to_celsius(f double)
+    CALLED ON NULL INPUT
+    RETURNS double
+    LANGUAGE wasm
+    AS '0x<hex-encoded wasm bytes>';
+----
+
+`CALLED ON NULL INPUT` means the function runs even when `f` is null.
+The implementation returns null when given null, preserving the null semantics your application expects.
+
+==== Register `coalesce`
+
+[source,sql]
+----
+CREATE OR REPLACE FUNCTION sensor_analytics.coalesce(val int, fallback int)
+    CALLED ON NULL INPUT
+    RETURNS int
+    LANGUAGE wasm
+    AS '0x<hex-encoded wasm bytes>';
+----
+
+==== Register `weighted_avg`
+
+[source,sql]
+----
+CREATE OR REPLACE AGGREGATE sensor_analytics.weighted_avg(double, double)
+    SFUNC weighted_avg_state
+    STYPE tuple<double, double>
+    FINALFUNC weighted_avg_final
+    INITCOND (0.0, 0.0)
+    LANGUAGE wasm
+    AS '0x<hex-encoded wasm bytes>';
+----
+
+The state type is a `tuple<double, double>` holding `(weighted_sum, weight_total)`.
+Each call to `weighted_avg_state` adds `temperature * confidence` to the first element and `confidence` to the second.
+`weighted_avg_final` divides the two to produce the result.
+
+==== Register `histogram`
+
+[source,sql]
+----
+CREATE OR REPLACE AGGREGATE sensor_analytics.histogram(double)
+    SFUNC histogram_state
+    STYPE map<text, int>
+    FINALFUNC histogram_final
+    INITCOND {}
+    LANGUAGE wasm
+    AS '0x<hex-encoded wasm bytes>';
+----
+
+The state type is a `map<text, int>`.
+Each call to `histogram_state` increments the count for the 10-degree band that contains the given temperature.
+
+== Insert Sample Data
+
+Load the sample readings:
+
+[source,sql]
+----
+include::data.cql[]
+----
+
+The data covers three sensors across a single day:
+
+* `sensor-001` — outdoor probe, high confidence (0.95–0.99), priority always set
+* `sensor-002` — indoor HVAC probe, moderate confidence (0.87–0.93), several rows with null priority
+* `sensor-003` — rooftop weather station, lower confidence (0.70–0.78), many rows with null priority
+
+== Run the Queries
+
+=== Scalar UDF: `to_celsius`
+
+[source,sql]
+----
+include::queries.cql[lines=4..6]
+----
+
+Ferrosa calls `to_celsius(temperature)` for every row before returning the result set.
+This is identical to calling a scalar function in a relational database -- one invocation per row, zero additional network round-trips.
+
+Expected output (rows ordered newest-first due to `ts DESC`):
+
+[source]
+----
+ sensor_id  | temperature | sensor_analytics.to_celsius(temperature)
+------------+-------------+-----------------------------------------
+ sensor-001 |        72.9 |                       22.722222222222225
+ sensor-001 |        68.4 |                       20.222222222222225
+ sensor-001 |        63.2 |                       17.333333333333332
+ sensor-001 |        57.8 |                       14.333333333333334
+ sensor-001 |        51.3 |                       10.722222222222223
+ sensor-001 |        44.6 |                        7.000000000000001
+ sensor-001 |        42.1 |                        5.611111111111111
+----
+
+The conversion formula is `(f - 32) * 5 / 9`.
+
+=== Scalar UDF: `coalesce`
+
+[source,sql]
+----
+include::queries.cql[lines=11..13]
+----
+
+For `sensor-001`, priority is never null, so `coalesce` always returns the `priority` column directly.
+This query is more interesting against `sensor-002` or `sensor-003`, where null rows fall back to `default_priority`.
+
+Expected output:
+
+[source]
+----
+ sensor_id  | sensor_analytics.coalesce(priority, default_priority)
+------------+------------------------------------------------------
+ sensor-001 |                                                     3
+ sensor-001 |                                                     2
+ sensor-001 |                                                     2
+ sensor-001 |                                                     1
+ sensor-001 |                                                     1
+ sensor-001 |                                                     2
+ sensor-001 |                                                     2
+----
+
+Run the same query against `sensor-002` to see the fallback in action.
+Rows with a null `priority` will show `2` (the `default_priority`) instead of null.
+
+=== Aggregate UDA: `weighted_avg`
+
+[source,sql]
+----
+include::queries.cql[lines=18..20]
+----
+
+Ferrosa accumulates the state tuple `(weighted_sum, weight_total)` across all seven rows for `sensor-001`, then calls `weighted_avg_final` once to divide.
+
+Expected output:
+
+[source]
+----
+ sensor_analytics.weighted_avg(temperature, confidence)
+--------------------------------------------------------
+                                      57.154411764705884
+----
+
+Compare this to the unweighted average of the same readings:
+`(42.1 + 44.6 + 51.3 + 57.8 + 63.2 + 68.4 + 72.9) / 7 ≈ 57.19`.
+The weighted average is very close here because the confidence scores are all in a narrow band (0.95–0.99); wider variation in confidence would produce a more pronounced difference.
+
+=== Aggregate UDA: `histogram`
+
+[source,sql]
+----
+include::queries.cql[lines=24..27]
+----
+
+This query aggregates across all three sensors (all partitions).
+Ferrosa runs `histogram_state` on every row in the table and merges the partial maps from each partition.
+
+Expected output:
+
+[source]
+----
+ sensor_analytics.histogram(temperature)
+-----------------------------------------
+ {'40-50': 4, '50-60': 3, '60-70': 5, '70-80': 7, '80-90': 1}
+----
+
+Each key is a 10-degree Fahrenheit band.
+Reading the histogram at a glance: most readings landed in the 70–80 F range (7 of 20), with a healthy spread across the 40–70 range and a single outlier above 80 from the rooftop sensor at midday.
+
+== How Each Function Works
+
+=== `to_celsius`
+
+The conversion formula is:
+
+[source]
+----
+celsius = (fahrenheit - 32.0) * 5.0 / 9.0
+----
+
+The WASM function receives a 64-bit float (`f64` in Rust) and returns a 64-bit float.
+When called with `CALLED ON NULL INPUT` and the argument is null, the function receives a sentinel and returns null, preserving null propagation.
+
+=== `coalesce`
+
+The implementation checks whether `val` is null.
+If it is not null, it returns `val`.
+If it is null, it returns `fallback`.
+Because `CALLED ON NULL INPUT` is specified, the function receives the raw null state and makes its own decision rather than short-circuiting before the function body runs.
+
+This is more general than a fixed-column fallback: you can pass any two expressions to `coalesce`, including literals and other function results.
+
+=== `weighted_avg`
+
+The state function signature in Rust looks like:
+
+[source,rust]
+----
+fn weighted_avg_state(state: (f64, f64), temperature: f64, confidence: f64) -> (f64, f64) {
+    let (weighted_sum, weight_total) = state;
+    (weighted_sum + temperature * confidence, weight_total + confidence)
+}
+----
+
+The final function:
+
+[source,rust]
+----
+fn weighted_avg_final(state: (f64, f64)) -> f64 {
+    let (weighted_sum, weight_total) = state;
+    if weight_total == 0.0 { 0.0 } else { weighted_sum / weight_total }
+}
+----
+
+The `INITCOND (0.0, 0.0)` clause seeds the state before the first row is processed, so the state function never receives an uninitialized accumulator.
+
+=== `histogram`
+
+The state function maps each temperature to a bucket label:
+
+[source,rust]
+----
+fn histogram_state(mut state: BTreeMap<String, i32>, temperature: f64) -> BTreeMap<String, i32> {
+    let lower = (temperature / 10.0).floor() as i32 * 10;
+    let upper = lower + 10;
+    let key = format!("{}-{}", lower, upper);
+    *state.entry(key).or_insert(0) += 1;
+    state
+}
+----
+
+The final function returns the map unchanged.
+Because the WASM Component Model serializes the map to a canonical wire format, Ferrosa can merge partial results from multiple nodes when the aggregate spans partitions.
+
+== Real-World Considerations
+
+=== Performance of cross-partition aggregates
+
+The `histogram` query in this tutorial aggregates across all partitions in the table.
+Ferrosa fans the query out to every node that owns a partition, runs `histogram_state` locally on each node's rows, and merges the partial maps in the coordinator.
+For tables with many partitions, this can be expensive.
+
+Prefer per-partition aggregates (with a `WHERE sensor_id = '...'` clause) for latency-sensitive paths, and reserve cross-partition aggregates for background analytics jobs.
+
+=== Updating a registered function
+
+Registered functions are part of the schema and stored in the system keyspace.
+To update a function after rebuilding the WASM binary, use `CREATE OR REPLACE FUNCTION` with the new hex bytes.
+The change propagates to all nodes via schema gossip within a few seconds.
+
+=== Null handling
+
+The `CALLED ON NULL INPUT` vs `RETURNS NULL ON NULL INPUT` choice is significant.
+
+* `RETURNS NULL ON NULL INPUT` — Ferrosa skips calling the function and returns null immediately if any argument is null. Use this for pure mathematical functions where a null input can only produce a null output.
+* `CALLED ON NULL INPUT` — Ferrosa always calls the function, passing a representation of null. Use this for functions like `coalesce` that have meaningful behavior with null inputs.
+
+=== Version pinning for reproducibility
+
+The `AS '0x<hex>'` bytes embedded in `CREATE FUNCTION` are the complete, self-contained WASM binary.
+Because the binary is stored in the schema, the exact function logic is preserved in the cluster even if the source code changes.
+Pin your guest crate to a specific Rust toolchain version in `rust-toolchain.toml` to ensure reproducible builds across environments.
+
+== What You Learned
+
+* *UDFs extend CQL with custom scalar logic.* Write a Rust function, compile it to WASM, and call it from any `SELECT` statement.
+* *UDAs aggregate across rows with custom state.* A state function folds one row at a time; a final function extracts the result. Ferrosa handles partial-aggregate merging across partitions.
+* *WASM provides a safe execution sandbox.* Guest functions cannot access the host filesystem, network, or other keyspaces. Ferrosa enforces resource limits at the runtime level.
+* *Null handling is explicit.* Choose between `CALLED ON NULL INPUT` and `RETURNS NULL ON NULL INPUT` based on whether your function has meaningful behavior for null arguments.
+* *Cross-partition aggregates have a cost.* Ferrosa fans the query to every node; keep latency-sensitive aggregates within a single partition where possible.
+
+Next, try the <<iot-sensor-data.adoc#,IoT Sensor Data>> tutorial to explore the time-series patterns these sensors build on, or jump to the <<time-series-analytics.adoc#,Real-Time Analytics>> tutorial to see pre-computed aggregations for dashboard workloads.

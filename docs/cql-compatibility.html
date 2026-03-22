@@ -211,7 +211,7 @@
   <a href="index.html" class="back-link">&larr; Back to homepage</a>
 
   <h1>CQL <span>Reference</span></h1>
-  <p class="subtitle">Ferrosa implements CQL native protocol v5. This page documents what's supported, what's different, and what Ferrosa adds on top.</p>
+  <p class="subtitle">Ferrosa implements CQL native protocol v4 and v5 with full driver compatibility (including cdrs-tokio). This page documents what's supported, what's different, and what Ferrosa adds on top.</p>
 
   <div class="note">
     <strong>Beta:</strong> Ferrosa is currently in beta. CQL compatibility is under active development.
@@ -237,7 +237,7 @@
   <h2 id="protocol">Protocol</h2>
 
   <h3>Wire protocol</h3>
-  <p>Ferrosa implements CQL native protocol version 5 with the standard 9-byte frame header. All 16 opcodes are handled:</p>
+  <p>Ferrosa implements CQL native protocol versions 4 and 5 with the standard 9-byte frame header. Protocol v4 compatibility enables broad CQL driver support including cdrs-tokio. All 16 opcodes are handled:</p>
 
   <table>
     <thead><tr><th>Opcode</th><th>Name</th><th>Direction</th></tr></thead>
@@ -304,6 +304,7 @@
       <tr><td>frozen&lt;T&gt;</td><td>—</td><td><span class="check">Supported</span></td></tr>
       <tr><td>duration</td><td>0x0015</td><td><span class="check">Supported</span></td></tr>
       <tr><td>UDT</td><td>0x0030</td><td><span class="check">Supported</span></td></tr>
+      <tr><td>vector&lt;float, N&gt;</td><td>0x0033</td><td><span class="check">Supported</span></td></tr>
     </tbody>
   </table>
 
@@ -321,6 +322,7 @@
       <tr><td>DROP TABLE</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
       <tr><td>CREATE INDEX</td><td><span class="check">Supported</span></td><td>USING type, WITH OPTIONS, IF NOT EXISTS — <a href="#indexes">see below</a></td></tr>
       <tr><td>DROP INDEX</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
+      <tr><td>DROP (without TABLE keyword)</td><td><span class="check">Supported</span></td><td>DROP keyspace_name.table_name shorthand</td></tr>
       <tr><td>CREATE MATERIALIZED VIEW</td><td><span class="cross">Not yet</span></td><td>—</td></tr>
       <tr><td>CREATE TYPE (UDT)</td><td><span class="check">Supported</span></td><td>CREATE TYPE, ALTER TYPE, DROP TYPE — full UDT DDL lifecycle</td></tr>
       <tr><td>CREATE FUNCTION / AGGREGATE</td><td><span class="check">Supported</span></td><td>CREATE/DROP FUNCTION (WASM), CREATE/DROP AGGREGATE — full DDL lifecycle with cluster replication</td></tr>
@@ -348,18 +350,30 @@
   <table>
     <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td>SELECT</td><td><span class="check">Supported</span></td><td>WHERE, ORDER BY, LIMIT, bind markers (?), named bind markers (:name), IN clause</td></tr>
-      <tr><td>INSERT</td><td><span class="check">Supported</span></td><td>IF NOT EXISTS, USING TTL, USING TIMESTAMP</td></tr>
-      <tr><td>UPDATE</td><td><span class="check">Supported</span></td><td>SET, WHERE, IF conditions</td></tr>
-      <tr><td>DELETE</td><td><span class="check">Supported</span></td><td>WHERE, IF EXISTS, column-level delete</td></tr>
+      <tr><td>SELECT</td><td><span class="check">Supported</span></td><td>WHERE, ORDER BY, LIMIT, DISTINCT, bind markers (?), named bind markers (:name), IN clause, ALLOW FILTERING, token() function, CONTAINS / CONTAINS KEY</td></tr>
+      <tr><td>INSERT</td><td><span class="check">Supported</span></td><td>IF NOT EXISTS (LWT), USING TTL, USING TIMESTAMP</td></tr>
+      <tr><td>UPDATE</td><td><span class="check">Supported</span></td><td>SET, WHERE, IF conditions, collection +/- operators, counter increment/decrement</td></tr>
+      <tr><td>DELETE</td><td><span class="check">Supported</span></td><td>WHERE, IF EXISTS, column-level delete, map element delete syntax</td></tr>
       <tr><td>BATCH</td><td><span class="check">Supported</span></td><td>BEGIN BATCH ... APPLY BATCH (unlogged)</td></tr>
       <tr><td>TRUNCATE</td><td><span class="check">Supported</span></td><td>—</td></tr>
       <tr><td>USE</td><td><span class="check">Supported</span></td><td>Set default keyspace for session</td></tr>
     </tbody>
   </table>
 
+  <h3>Built-in functions</h3>
+  <table>
+    <thead><tr><th>Function</th><th>Status</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>toJson()</td><td><span class="check">Supported</span></td><td>Serialize any column to JSON string</td></tr>
+      <tr><td>token()</td><td><span class="check">Supported</span></td><td>Token-range queries in WHERE clauses</td></tr>
+      <tr><td>uuid()</td><td><span class="check">Supported</span></td><td>Generate random UUID</td></tr>
+      <tr><td>now()</td><td><span class="check">Supported</span></td><td>Current timeuuid</td></tr>
+      <tr><td>toTimestamp()</td><td><span class="check">Supported</span></td><td>Convert timeuuid to timestamp</td></tr>
+    </tbody>
+  </table>
+
   <h3>Prepared statements</h3>
-  <p>Full PREPARE/EXECUTE support. The prepared statement cache uses moka with W-TinyLFU eviction (64 MB default). Bind markers (<code>?</code>) and named bind markers (<code>:name</code>) are both supported.</p>
+  <p>Full PREPARE/EXECUTE support with positional bind values. PREPARE responses include <code>pk_count</code> metadata for driver routing. The prepared statement cache uses moka with W-TinyLFU eviction (64 MB default). Bind markers (<code>?</code>) and named bind markers (<code>:name</code>) are both supported.</p>
 
   <pre><span class="cm">-- Prepare</span>
 <span class="kw">PREPARE</span> stmt <span class="kw">FROM</span> <span class="str">'SELECT * FROM social.users WHERE user_id = ?'</span>;
@@ -368,7 +382,7 @@
 <span class="kw">EXECUTE</span> stmt <span class="kw">USING</span> <span class="var">550e8400-e29b-41d4-a716-446655440000</span>;</pre>
 
   <h3>Comparison operators</h3>
-  <p>WHERE clauses support: <code>=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>!=</code>, <code>IN</code></p>
+  <p>WHERE clauses support: <code>=</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>!=</code>, <code>IN</code>, <code>CONTAINS</code>, <code>CONTAINS KEY</code></p>
 
   <h3>Consistency levels</h3>
   <p>Ferrosa supports the following consistency levels for reads and writes:</p>
@@ -648,7 +662,7 @@
       <tr><td>Logged batch atomicity</td><td>Planned</td></tr>
       <tr><td>Query tracing</td><td>Planned</td></tr>
       <tr><td>Materialized views</td><td>Planned</td></tr>
-      <tr><td>Lightweight transactions (LWT)</td><td>Planned</td></tr>
+      <tr><td>Lightweight transactions (LWT)</td><td><span class="partial">Partial</span> — INSERT IF NOT EXISTS supported; full LWT (UPDATE IF, compare-and-set) planned</td></tr>
     </tbody>
   </table>
 

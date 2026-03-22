@@ -130,6 +130,10 @@ pub enum PhysicalPlan {
         variables: Vec<String>,
         /// Whether to detach (delete relationships too).
         detach: bool,
+        /// Mapping from variable name to resolved table name so that
+        /// tombstones are written to the correct storage table (e.g.
+        /// "Person") rather than the Cypher variable name (e.g. "n").
+        variable_tables: HashMap<String, String>,
     },
     /// Subscribe to periodic re-execution of a query.
     Subscribe {
@@ -363,10 +367,18 @@ fn plan_delete(
 
     let expand = plan_match(patterns, bindings, filters, return_clause)?;
 
+    // Build variable-to-table mapping so the executor writes tombstones
+    // to the correct storage table (label name, not Cypher variable name).
+    let variable_tables: HashMap<String, String> = variables
+        .iter()
+        .filter_map(|v| bindings.get(v).map(|rt| (v.clone(), rt.table.clone())))
+        .collect();
+
     Ok(PhysicalPlan::DeleteNodes {
         expand: Box::new(expand),
         variables: variables.to_vec(),
         detach,
+        variable_tables,
     })
 }
 
@@ -980,10 +992,16 @@ mod tests {
                 expand,
                 variables,
                 detach,
+                variable_tables,
             } => {
                 assert!(matches!(*expand, PhysicalPlan::Expand { .. }));
                 assert_eq!(variables, vec!["n".to_string()]);
                 assert!(detach);
+                assert_eq!(
+                    variable_tables.get("n").map(String::as_str),
+                    Some("person_v"),
+                    "variable_tables must map variable 'n' to storage table 'person_v'"
+                );
             }
             other => panic!("expected DeleteNodes, got {other:?}"),
         }

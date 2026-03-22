@@ -103,13 +103,18 @@ impl GraphEngine {
             let observer = Arc::new(AdjacencyIndexObserver::new(Arc::clone(&schema), ks.clone()));
             storage.register_observer(observer);
 
-            let handle = spawn_reconciliation(
-                Arc::clone(&schema),
-                Arc::clone(&storage),
-                ks.clone(),
-                reconciliation_interval,
-            );
-            reconciliation_handles.push(handle);
+            // spawn_reconciliation requires a tokio runtime. In test
+            // contexts (e.g., proptest without #[tokio::test]), there may
+            // be no runtime. Check before spawning.
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let handle = spawn_reconciliation(
+                    Arc::clone(&schema),
+                    Arc::clone(&storage),
+                    ks.clone(),
+                    reconciliation_interval,
+                );
+                reconciliation_handles.push(handle);
+            }
         }
 
         Self {
@@ -133,6 +138,7 @@ impl GraphEngine {
             keyspace,
             &self.config,
             Some(self.schema.virtual_tables()),
+            Some(&self.schema),
         )
     }
 
@@ -189,6 +195,7 @@ impl GraphEngine {
             keyspace,
             &self.config,
             Some(self.schema.virtual_tables()),
+            Some(&self.schema),
         )?;
 
         Ok((result, interval, delta))
@@ -321,12 +328,14 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             expand,
             variables,
             detach,
+            variable_tables,
         } => {
             let mut out = String::new();
             out.push_str("DeleteNodes {\n");
             out.push_str(&format!("  expand: {}\n", format_plan(expand)));
             out.push_str(&format!("  variables: {:?}\n", variables));
             out.push_str(&format!("  detach: {}\n", detach));
+            out.push_str(&format!("  variable_tables: {:?}\n", variable_tables));
             out.push('}');
             out
         }

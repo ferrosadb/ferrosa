@@ -314,6 +314,14 @@ fn skip_type_option(cursor: &mut &[u8]) -> Result<(), CqlError> {
                 skip_type_option(cursor)?;
             }
         }
+        // vector (0x0023) — element sub-type + i32 dimension
+        0x0023 => {
+            skip_type_option(cursor)?; // element type (e.g. float)
+            if cursor.len() < 4 {
+                return Err(CqlError::Protocol("truncated vector type".into()));
+            }
+            cursor.advance(4); // dimension (i32)
+        }
         // UDT (0x0030) — keyspace + name + n fields
         0x0030 => {
             skip_short_string(cursor)?; // keyspace

@@ -61,6 +61,7 @@ pub fn query_keyspaces(snap: &SchemaSnapshot) -> Vec<KeyspaceRow> {
         system_keyspace_row("system"),
         system_keyspace_row("system_schema"),
         system_keyspace_row("system_auth"),
+        system_keyspace_row("system_observability"),
     ];
     rows.extend(snap.keyspaces.values().map(|ks| {
         let mut replication = ks.replication.options.clone();
@@ -144,6 +145,13 @@ fn system_table_rows() -> Vec<TableRow> {
         ("system_auth", "roles"),
         ("system_auth", "role_members"),
         ("system_auth", "role_permissions"),
+        ("system_observability", "connections"),
+        ("system_observability", "active_queries"),
+        ("system_observability", "consolidation_status"),
+        ("system_observability", "storage_stats"),
+        ("system_observability", "secondary_indexes"),
+        ("system_observability", "archive_status"),
+        ("system_observability", "snapshots"),
     ];
     tables
         .iter()
@@ -219,6 +227,179 @@ fn system_column_rows() -> Vec<ColumnRow> {
         }
     }
 
+    // system_observability.connections columns
+    let connections_cols: &[(&str, &str, &str, i32)] = &[
+        ("peer_address", "partition_key", "text", 0),
+        ("peer_port", "clustering", "int", 0),
+        ("state", "regular", "text", -1),
+        ("username", "regular", "text", -1),
+        ("idle_seconds", "regular", "int", -1),
+        ("requests_served", "regular", "bigint", -1),
+        ("protocol_version", "regular", "int", -1),
+    ];
+    for (name, kind, cql_type, pos) in connections_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "connections".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: if *kind == "clustering" {
+                "asc".to_string()
+            } else {
+                "none".to_string()
+            },
+        });
+    }
+
+    // system_observability.active_queries columns
+    let active_queries_cols: &[(&str, &str, &str, i32)] = &[
+        ("query_id", "partition_key", "bigint", 0),
+        ("client_address", "regular", "text", -1),
+        ("username", "regular", "text", -1),
+        ("query_text", "regular", "text", -1),
+        ("keyspace", "regular", "text", -1),
+        ("start_time", "regular", "bigint", -1),
+        ("elapsed_ms", "regular", "bigint", -1),
+        ("state", "regular", "text", -1),
+    ];
+    for (name, kind, cql_type, pos) in active_queries_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "active_queries".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: "none".to_string(),
+        });
+    }
+
+    // system_observability.consolidation_status columns
+    let consolidation_cols: &[(&str, &str, &str, i32)] = &[
+        ("keyspace_name", "partition_key", "text", 0),
+        ("table_name", "clustering", "text", 0),
+        ("interval", "regular", "text", -1),
+        ("target_table", "regular", "text", -1),
+        ("functions", "regular", "text", -1),
+        ("status", "regular", "text", -1),
+    ];
+    for (name, kind, cql_type, pos) in consolidation_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "consolidation_status".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: if *kind == "clustering" {
+                "asc".to_string()
+            } else {
+                "none".to_string()
+            },
+        });
+    }
+
+    // system_observability.storage_stats columns
+    let storage_stats_cols: &[(&str, &str, &str, i32)] = &[
+        ("keyspace", "partition_key", "text", 0),
+        ("table_name", "clustering", "text", 0),
+        ("memtable_size_bytes", "regular", "bigint", -1),
+        ("memtable_count", "regular", "int", -1),
+        ("sstable_count", "regular", "int", -1),
+        ("sstable_size_bytes", "regular", "bigint", -1),
+        ("s3_object_count", "regular", "int", -1),
+        ("s3_bytes", "regular", "bigint", -1),
+        ("pending_compactions", "regular", "int", -1),
+    ];
+    for (name, kind, cql_type, pos) in storage_stats_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "storage_stats".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: if *kind == "clustering" {
+                "asc".to_string()
+            } else {
+                "none".to_string()
+            },
+        });
+    }
+
+    // system_observability.secondary_indexes columns
+    let secondary_indexes_cols: &[(&str, &str, &str, i32)] = &[
+        ("keyspace_name", "partition_key", "text", 0),
+        ("table_name", "clustering", "text", 0),
+        ("index_name", "clustering", "text", 1),
+        ("index_type", "regular", "text", -1),
+        ("status", "regular", "text", -1),
+        ("indexed_sstable_count", "regular", "int", -1),
+        ("pending_sstable_count", "regular", "int", -1),
+        ("pending_bytes", "regular", "bigint", -1),
+        ("lag_seconds", "regular", "double", -1),
+        ("last_build_ms", "regular", "bigint", -1),
+        ("total_builds", "regular", "bigint", -1),
+        ("build_errors", "regular", "bigint", -1),
+    ];
+    for (name, kind, cql_type, pos) in secondary_indexes_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "secondary_indexes".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: if *kind == "clustering" {
+                "asc".to_string()
+            } else {
+                "none".to_string()
+            },
+        });
+    }
+
+    // system_observability.archive_status columns
+    let archive_status_cols: &[(&str, &str, &str, i32)] = &[
+        ("unarchived_segments", "partition_key", "bigint", 0),
+        ("oldest_unarchived_age_secs", "regular", "bigint", -1),
+        ("last_archive_success", "regular", "text", -1),
+        ("archive_errors_total", "regular", "bigint", -1),
+    ];
+    for (name, kind, cql_type, pos) in archive_status_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "archive_status".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: "none".to_string(),
+        });
+    }
+
+    // system_observability.snapshots columns
+    let snapshots_cols: &[(&str, &str, &str, i32)] = &[
+        ("name", "partition_key", "text", 0),
+        ("created_at", "regular", "text", -1),
+        ("expires_at", "regular", "text", -1),
+        ("commit_log_segment", "regular", "bigint", -1),
+        ("commit_log_offset", "regular", "bigint", -1),
+        ("node_id", "regular", "text", -1),
+    ];
+    for (name, kind, cql_type, pos) in snapshots_cols {
+        rows.push(ColumnRow {
+            keyspace_name: "system_observability".to_string(),
+            table_name: "snapshots".to_string(),
+            column_name: name.to_string(),
+            kind: kind.to_string(),
+            position: *pos,
+            column_type: cql_type.to_string(),
+            clustering_order: "none".to_string(),
+        });
+    }
+
     rows
 }
 
@@ -277,8 +458,9 @@ mod tests {
         snap.keyspaces
             .insert("ks1".to_string(), test_keyspace_meta("ks1"));
         let rows = query_keyspaces(&snap);
-        // System keyspaces (system, system_schema, system_auth) + user keyspace
-        assert_eq!(rows.len(), 4);
+        // System keyspaces (system, system_schema, system_auth,
+        // system_observability) + user keyspace
+        assert_eq!(rows.len(), 5);
         let user_rows: Vec<_> = rows.iter().filter(|r| r.keyspace_name == "ks1").collect();
         assert_eq!(user_rows.len(), 1);
         assert!(user_rows[0].durable_writes);

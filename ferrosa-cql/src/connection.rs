@@ -24,7 +24,7 @@ use crate::auth::{
     encode_auth_success, encode_authenticate_response, parse_sasl_plain, MAX_AUTH_ATTEMPTS,
 };
 use crate::error::CqlError;
-use crate::frame::{Compression, CqlCodec, CqlFrame, FrameHeader, Opcode, VERSION_RESPONSE};
+use crate::frame::{Compression, CqlCodec, CqlFrame, FrameHeader, Opcode};
 use crate::parser;
 use crate::prepared::{PreparedCache, PreparedPlan};
 use crate::result;
@@ -111,6 +111,10 @@ pub async fn handle_connection<S>(
     let mut current_keyspace: Option<String> = None;
     let mut subscription_state = SubscriptionState::new(8);
     let mut pending_compression: Option<Compression> = None;
+    // Track the client's negotiated protocol version. Response frames
+    // MUST use the same version byte (0x80 | client_version).
+    // Default to v5; overwritten when we see the first request frame.
+    let mut client_version: u8 = 5;
 
     // Channel for subscription tasks to push streaming frames.
     let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<crate::subscribe::SubscriptionPush>(64);
@@ -157,6 +161,12 @@ pub async fn handle_connection<S>(
             }
             FrameOrPush::ClientFrame(maybe_frame) => {
                 let stream_id = maybe_frame.header.stream_id;
+                // Capture the client's protocol version from the request frame.
+                // Response version = 0x80 | request version.
+                let req_version = maybe_frame.header.version & 0x7F;
+                if (3..=5).contains(&req_version) {
+                    client_version = req_version;
+                }
 
                 // Check in-flight limit for request opcodes (QUERY, EXECUTE, BATCH).
                 let is_request = matches!(
@@ -172,7 +182,7 @@ pub async fn handle_connection<S>(
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {
-                                    version: VERSION_RESPONSE,
+                                    version: 0x80 | client_version,
                                     flags: 0,
                                     stream_id,
                                     opcode: Opcode::Error,
@@ -224,7 +234,7 @@ pub async fn handle_connection<S>(
                         let body_bytes = body.freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: 0x80 | client_version,
                                 flags: 0,
                                 stream_id,
                                 opcode,
@@ -264,7 +274,7 @@ pub async fn handle_connection<S>(
                                 let body = err.encode_body().freeze();
                                 let frame = CqlFrame {
                                     header: FrameHeader {
-                                        version: VERSION_RESPONSE,
+                                        version: 0x80 | client_version,
                                         flags: 0,
                                         stream_id,
                                         opcode: Opcode::Error,
@@ -290,7 +300,7 @@ pub async fn handle_connection<S>(
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {
-                                    version: VERSION_RESPONSE,
+                                    version: 0x80 | client_version,
                                     flags: 0,
                                     stream_id,
                                     opcode: Opcode::Error,
@@ -308,7 +318,7 @@ pub async fn handle_connection<S>(
                         let ack_body = crate::result::encode_void().freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: 0x80 | client_version,
                                 flags: 0,
                                 stream_id,
                                 opcode: Opcode::Result,
@@ -348,7 +358,7 @@ pub async fn handle_connection<S>(
                         let body = crate::result::encode_void().freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: 0x80 | client_version,
                                 flags: 0,
                                 stream_id,
                                 opcode: Opcode::Result,
@@ -364,7 +374,7 @@ pub async fn handle_connection<S>(
                         let body_bytes = body.freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: 0x80 | client_version,
                                 flags: 0,
                                 stream_id,
                                 opcode,
@@ -747,11 +757,46 @@ fn handle_prepare(
     // Determine keyspace and table from the statement for the prepared metadata.
     let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
 
-    // Build bound_columns from the statement (simplified — no full type inference).
-    let bound_columns: Vec<(String, CqlType)> = Vec::new();
+    // Build bound_columns: resolve bind marker column names to their CQL types
+    // from the table schema. If any column can't be resolved, fall back to empty
+    // metadata (columns_count=0) which drivers handle gracefully.
+    let bind_col_names = extract_bind_column_names(&stmt);
+    let bound_columns: Vec<(String, CqlType)> = {
+        let snapshot = state.schema.snapshot();
+        let key = (table_ks.clone(), table_name.clone());
+        match snapshot.tables.get(&key) {
+            Some(table_meta) => {
+                let mut cols = Vec::with_capacity(bind_col_names.len());
+                let mut all_resolved = true;
+                for col_name in &bind_col_names {
+                    if let Some(cm) = table_meta.columns.get(col_name) {
+                        cols.push((col_name.clone(), col_type_str_to_cql_type(&cm.column_type)));
+                    } else {
+                        // Column not found in schema — can't build reliable metadata.
+                        all_resolved = false;
+                        break;
+                    }
+                }
+                if all_resolved {
+                    cols
+                } else {
+                    Vec::new()
+                }
+            }
+            None => Vec::new(),
+        }
+    };
 
-    // Build result_columns (simplified — empty for non-SELECT).
+    // Build result_columns for SELECT statements.
     let result_columns: Vec<(String, CqlType)> = Vec::new();
+
+    // Compute pk_indexes: map each partition key column to its position in the
+    // bind variable list. If any PK column is not bound, pass empty (pk_count=0).
+    let pk_indexes = if bound_columns.is_empty() {
+        Vec::new() // No bind metadata — pk_indexes must also be empty
+    } else {
+        compute_pk_indexes(&stmt, state, &table_ks, &table_name)
+    };
 
     let plan = PreparedPlan {
         id,
@@ -779,6 +824,7 @@ fn handle_prepare(
         &result_types,
         &table_ks,
         &table_name,
+        &pk_indexes,
     );
 
     HandleResult::Reply(Opcode::Result, result_body)
@@ -827,10 +873,64 @@ async fn handle_execute(
         }
     };
 
-    // Re-route the stored statement (simplified: no bound value substitution).
+    // Parse flags and positional bind values from the EXECUTE body.
+    // CQL v4 format after consistency: [byte flags][short n_values][bytes value]*
+    let mut stmt = plan.statement.clone();
+    if cursor.remaining() >= 1 {
+        let flags = cursor.get_u8();
+        let _has_values = flags & 0x01 != 0;
+        let has_names = flags & 0x40 != 0;
+
+        if _has_values && cursor.remaining() >= 2 {
+            let n_values = cursor.get_u16() as usize;
+            let bind_col_names = extract_bind_column_names(&stmt);
+            let mut values: Vec<(String, Vec<u8>)> = Vec::with_capacity(n_values);
+
+            for i in 0..n_values {
+                let name = if has_names && cursor.remaining() >= 2 {
+                    let name_len = cursor.get_u16() as usize;
+                    if cursor.remaining() >= name_len {
+                        let n = std::str::from_utf8(&cursor[..name_len])
+                            .unwrap_or("")
+                            .to_string();
+                        cursor.advance(name_len);
+                        n
+                    } else {
+                        break;
+                    }
+                } else {
+                    // Positional: use the column name from the prepared statement
+                    bind_col_names.get(i).cloned().unwrap_or_default()
+                };
+
+                if cursor.remaining() >= 4 {
+                    let val_len = cursor.get_i32();
+                    if val_len < 0 {
+                        // NULL value
+                        values.push((name, Vec::new()));
+                    } else {
+                        let val_len = val_len as usize;
+                        if cursor.remaining() >= val_len {
+                            let val_bytes = cursor[..val_len].to_vec();
+                            cursor.advance(val_len);
+                            values.push((name, val_bytes));
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Substitute bind markers in the statement with actual values.
+            substitute_bind_values(&mut stmt, &values, &plan.bound_columns);
+        }
+    }
+
     let ctx = build_request_context(auth_context, current_keyspace, cl);
 
-    match crate::router::route(state, &ctx, plan.statement.clone()).await {
+    match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
         Ok(RouteResult::SetKeyspace(ks, body)) => {
             *current_keyspace = Some(ks);
@@ -1002,6 +1102,281 @@ fn build_request_context<'a>(
         auth: auth_context.as_ref().unwrap(),
         current_keyspace,
         consistency,
+    }
+}
+
+/// Compute partition-key bind-variable indexes for a prepared statement.
+///
+/// Looks up the table's partition key columns in the schema, then finds each
+/// PK column's position in the statement's bind variable list. Returns the
+/// indexes in partition key order. If the table is not found in the schema or
+/// any PK column does not appear as a bind variable, returns an empty vec
+/// (which writes `pk_count=0`, disabling token-aware routing in drivers).
+fn compute_pk_indexes(
+    stmt: &crate::ast::Statement,
+    state: &SharedState,
+    table_ks: &str,
+    table_name: &str,
+) -> Vec<u16> {
+    if table_ks.is_empty() || table_name.is_empty() {
+        return Vec::new();
+    }
+
+    // Look up the table in the schema to get partition key column names.
+    let snapshot = state.schema.snapshot();
+    let key = (table_ks.to_string(), table_name.to_string());
+    let table_meta = match snapshot.tables.get(&key) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    if table_meta.partition_key.is_empty() {
+        return Vec::new();
+    }
+
+    // Extract the ordered list of column names that have bind markers.
+    let bind_columns = extract_bind_column_names(stmt);
+
+    // For each PK column (in partition key order), find its index in bind_columns.
+    let mut pk_indexes = Vec::with_capacity(table_meta.partition_key.len());
+    for pk_col in &table_meta.partition_key {
+        match bind_columns.iter().position(|name| name == pk_col) {
+            Some(idx) => pk_indexes.push(idx as u16),
+            None => return Vec::new(), // PK column not bound — disable routing
+        }
+    }
+
+    pk_indexes
+}
+
+/// Extract the ordered list of column names that have bind markers in a statement.
+///
+/// The returned order matches the bind variable order in the CQL protocol:
+/// - INSERT: columns whose corresponding value is a `BindMarker`, in column order
+/// - SELECT/UPDATE/DELETE: `WHERE` clause columns with bind markers, in clause order
+/// - UPDATE: assignments with bind markers come before WHERE bind markers
+fn extract_bind_column_names(stmt: &crate::ast::Statement) -> Vec<String> {
+    use crate::ast::{Assignment, Statement, Term};
+
+    match stmt {
+        Statement::Insert(ins) => {
+            let mut names = Vec::new();
+            for (col, val) in ins.columns.iter().zip(ins.values.iter()) {
+                if matches!(val, Term::BindMarker(_)) {
+                    names.push(col.clone());
+                }
+            }
+            names
+        }
+        Statement::Select(sel) => {
+            let mut names = Vec::new();
+            for wc in &sel.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    names.push(wc.column.clone());
+                }
+            }
+            names
+        }
+        Statement::Update(upd) => {
+            let mut names = Vec::new();
+            // SET assignments first (bind variables in assignment order)
+            for assign in &upd.assignments {
+                match assign {
+                    Assignment::Simple {
+                        column,
+                        value: Term::BindMarker(_),
+                    }
+                    | Assignment::Add {
+                        column,
+                        value: Term::BindMarker(_),
+                    }
+                    | Assignment::Sub {
+                        column,
+                        value: Term::BindMarker(_),
+                    } => {
+                        names.push(column.clone());
+                    }
+                    Assignment::Element { column, key, value } => {
+                        if matches!(key, Term::BindMarker(_)) {
+                            names.push(column.clone());
+                        }
+                        if matches!(value, Term::BindMarker(_)) {
+                            names.push(column.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // WHERE clauses after assignments
+            for wc in &upd.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    names.push(wc.column.clone());
+                }
+            }
+            names
+        }
+        Statement::Delete(del) => {
+            let mut names = Vec::new();
+            for wc in &del.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    names.push(wc.column.clone());
+                }
+            }
+            names
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Substitute bind markers in a statement with actual values from EXECUTE.
+///
+/// Matches positional values to bind markers in the order they appear.
+/// Uses the column type from `bound_columns` to decode raw bytes into
+/// the appropriate `Term` variant.
+fn substitute_bind_values(
+    stmt: &mut crate::ast::Statement,
+    values: &[(String, Vec<u8>)],
+    bound_columns: &[(String, CqlType)],
+) {
+    use crate::ast::{Assignment, Statement, Term};
+
+    // Build a map of column_name -> Term from the raw values.
+    let mut value_map: std::collections::HashMap<String, Term> = std::collections::HashMap::new();
+    for (i, (name, bytes)) in values.iter().enumerate() {
+        let cql_type = bound_columns
+            .get(i)
+            .map(|(_, t)| t.clone())
+            .unwrap_or(CqlType::Blob);
+
+        let term = if bytes.is_empty() {
+            Term::Null
+        } else {
+            raw_bytes_to_term(bytes, &cql_type)
+        };
+        value_map.insert(name.clone(), term);
+    }
+
+    // Replace BindMarker terms in the statement with resolved values.
+    match stmt {
+        Statement::Insert(ins) => {
+            for (col, val) in ins.columns.iter().zip(ins.values.iter_mut()) {
+                if matches!(val, Term::BindMarker(_)) {
+                    if let Some(resolved) = value_map.get(col) {
+                        *val = resolved.clone();
+                    }
+                }
+            }
+        }
+        Statement::Select(sel) => {
+            for wc in &mut sel.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    if let Some(resolved) = value_map.get(&wc.column) {
+                        wc.value = resolved.clone();
+                    }
+                }
+            }
+        }
+        Statement::Update(upd) => {
+            for assign in &mut upd.assignments {
+                match assign {
+                    Assignment::Simple { column, value }
+                        if matches!(value, Term::BindMarker(_)) =>
+                    {
+                        if let Some(resolved) = value_map.get(column) {
+                            *value = resolved.clone();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for wc in &mut upd.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    if let Some(resolved) = value_map.get(&wc.column) {
+                        wc.value = resolved.clone();
+                    }
+                }
+            }
+        }
+        Statement::Delete(del) => {
+            for wc in &mut del.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    if let Some(resolved) = value_map.get(&wc.column) {
+                        wc.value = resolved.clone();
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert raw CQL wire bytes to a Term based on the column type.
+fn raw_bytes_to_term(bytes: &[u8], cql_type: &CqlType) -> crate::ast::Term {
+    use crate::ast::Term;
+
+    match cql_type {
+        CqlType::Int if bytes.len() == 4 => {
+            Term::IntegerLiteral(i32::from_be_bytes(bytes.try_into().unwrap()) as i64)
+        }
+        CqlType::Bigint | CqlType::Counter | CqlType::Timestamp if bytes.len() == 8 => {
+            Term::IntegerLiteral(i64::from_be_bytes(bytes.try_into().unwrap()))
+        }
+        CqlType::Smallint if bytes.len() == 2 => {
+            Term::IntegerLiteral(i16::from_be_bytes(bytes.try_into().unwrap()) as i64)
+        }
+        CqlType::Tinyint if bytes.len() == 1 => Term::IntegerLiteral(bytes[0] as i8 as i64),
+        CqlType::Float if bytes.len() == 4 => {
+            Term::FloatLiteral(f32::from_be_bytes(bytes.try_into().unwrap()) as f64)
+        }
+        CqlType::Double if bytes.len() == 8 => {
+            Term::FloatLiteral(f64::from_be_bytes(bytes.try_into().unwrap()))
+        }
+        CqlType::Boolean if bytes.len() == 1 => Term::BoolLiteral(bytes[0] != 0),
+        CqlType::Varchar | CqlType::Ascii => {
+            Term::StringLiteral(String::from_utf8_lossy(bytes).to_string())
+        }
+        CqlType::Uuid | CqlType::Timeuuid if bytes.len() == 16 => {
+            let uuid = uuid::Uuid::from_bytes(bytes.try_into().unwrap());
+            Term::UuidLiteral(uuid)
+        }
+        _ => {
+            // Fallback: treat as blob
+            Term::BlobLiteral(bytes.to_vec())
+        }
+    }
+}
+
+/// Map a column type string (from schema metadata) to the CQL wire type.
+fn col_type_str_to_cql_type(type_str: &str) -> CqlType {
+    let lower = type_str.to_lowercase();
+    match lower.as_str() {
+        "ascii" => CqlType::Ascii,
+        "bigint" => CqlType::Bigint,
+        "blob" => CqlType::Blob,
+        "boolean" => CqlType::Boolean,
+        "counter" => CqlType::Counter,
+        "decimal" => CqlType::Decimal,
+        "double" => CqlType::Double,
+        "float" => CqlType::Float,
+        "int" => CqlType::Int,
+        "timestamp" => CqlType::Timestamp,
+        "uuid" => CqlType::Uuid,
+        "varchar" | "text" => CqlType::Varchar,
+        "varint" => CqlType::Varint,
+        "timeuuid" => CqlType::Timeuuid,
+        "inet" => CqlType::Inet,
+        "date" => CqlType::Date,
+        "time" => CqlType::Time,
+        "smallint" => CqlType::Smallint,
+        "tinyint" => CqlType::Tinyint,
+        "duration" => CqlType::Duration,
+        _ => {
+            // Try parsing complex types (vector<float, N>, list<...>, etc.)
+            if let Ok(parsed) = crate::bridge::parse_cql_type(&lower) {
+                return parsed;
+            }
+            CqlType::Blob // fallback for unknown types
+        }
     }
 }
 
