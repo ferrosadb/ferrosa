@@ -35,5 +35,6 @@ pub mod server;
 pub mod session;
 pub mod subscribe;
 pub mod transaction_keys;
+pub mod transaction_limits;
 pub mod types;
 pub mod virtual_tables;
