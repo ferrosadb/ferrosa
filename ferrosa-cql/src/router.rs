@@ -3716,7 +3716,7 @@ fn apply_system_select(
                     proj_types.push(CqlType::Varchar); // toJson returns text
                     proj_ops.push((idx, true));
                 } else if fn_lower == "count" {
-                    let display = alias.clone().unwrap_or_else(|| "system.count".to_string());
+                    let display = alias.clone().unwrap_or_else(|| "count".to_string());
                     proj_names.push(display);
                     proj_types.push(CqlType::Bigint);
                     // COUNT is handled below as aggregate
