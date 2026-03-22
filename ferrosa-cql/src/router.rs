@@ -1150,9 +1150,14 @@ fn route_select_user_table(
         }
     }
 
-    // Check for aggregate functions (builtin COUNT(*) or UDA).
+    // Check for aggregate functions (builtin COUNT/AVG/MIN/MAX/SUM or UDA).
     let has_builtin_agg = s.columns.iter().any(|c| {
-        matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+        matches!(c, SelectColumn::FunctionCall { name, .. }
+            if name.eq_ignore_ascii_case("count")
+                || name.eq_ignore_ascii_case("avg")
+                || name.eq_ignore_ascii_case("min")
+                || name.eq_ignore_ascii_case("max")
+                || name.eq_ignore_ascii_case("sum"))
     });
     let has_uda = resolved_funcs
         .iter()
@@ -1166,6 +1171,35 @@ fn route_select_user_table(
             match sc {
                 SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count") => {
                     agg_row.push(Some(CqlValue::Bigint(rows.len() as i64)));
+                }
+                SelectColumn::FunctionCall { name, args, .. }
+                    if name.eq_ignore_ascii_case("avg")
+                        || name.eq_ignore_ascii_case("min")
+                        || name.eq_ignore_ascii_case("max")
+                        || name.eq_ignore_ascii_case("sum") =>
+                {
+                    let fn_lower = name.to_lowercase();
+                    // Resolve the target column from the first argument.
+                    if let Some(arg) = args.first() {
+                        if let Ok(col_name) = extract_column_name(arg) {
+                            if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name)
+                            {
+                                let col_type = &all_col_types[src_idx];
+                                let result =
+                                    compute_builtin_aggregate(&fn_lower, &rows, src_idx, col_type);
+                                agg_row.push(result);
+                            } else {
+                                return Err(CqlError::Invalid(format!(
+                                    "unknown column in {}(): {}",
+                                    fn_lower, col_name
+                                )));
+                            }
+                        } else {
+                            agg_row.push(Some(CqlValue::Null));
+                        }
+                    } else {
+                        agg_row.push(Some(CqlValue::Null));
+                    }
                 }
                 SelectColumn::FunctionCall { .. } => {
                     // Check if this column is a resolved UDA.
@@ -3738,6 +3772,74 @@ fn extract_column_name(term: &Term) -> Result<String, CqlError> {
             term
         ))),
     }
+}
+
+/// Convert a [`CqlValue`] to `f64` for built-in aggregate computation.
+///
+/// Supports all numeric CQL types. Returns `None` for non-numeric values so
+/// that NULL / non-numeric cells are skipped during aggregation.
+fn cql_value_to_f64(val: &CqlValue) -> Option<f64> {
+    match val {
+        CqlValue::Tinyint(v) => Some(f64::from(*v)),
+        CqlValue::Smallint(v) => Some(f64::from(*v)),
+        CqlValue::Int(v) => Some(f64::from(*v)),
+        CqlValue::Bigint(v) => Some(*v as f64),
+        CqlValue::Float(bits) => Some(f64::from(f32::from_bits(*bits))),
+        CqlValue::Double(bits) => Some(f64::from_bits(*bits)),
+        CqlValue::Counter(v) => Some(*v as f64),
+        _ => None,
+    }
+}
+
+/// Build the result [`CqlValue`] for a built-in aggregate (`avg`, `sum`,
+/// `min`, `max`) given the source column type.
+///
+/// `avg` and `sum` on integer types still return `Double` for consistency
+/// with Cassandra semantics (CQL `avg(int)` returns `int`, but returning
+/// `Double` avoids truncation and matches driver expectations for
+/// analytics queries).  If more precise Cassandra-compat semantics are
+/// needed later, this can be refined per-type.
+fn f64_to_cql_aggregate(val: f64, col_type: &CqlType) -> CqlValue {
+    match col_type {
+        CqlType::Tinyint => CqlValue::Tinyint(val as i8),
+        CqlType::Smallint => CqlValue::Smallint(val as i16),
+        CqlType::Int => CqlValue::Int(val as i32),
+        CqlType::Bigint | CqlType::Counter => CqlValue::Bigint(val as i64),
+        CqlType::Float => CqlValue::Float((val as f32).to_bits()),
+        // Default to Double for any other numeric or unknown type.
+        _ => CqlValue::Double(val.to_bits()),
+    }
+}
+
+/// Compute a built-in aggregate (`avg`, `min`, `max`, `sum`) over a column.
+///
+/// `agg_name` must be one of `"avg"`, `"min"`, `"max"`, `"sum"` (lowercase).
+/// The function iterates over `rows`, extracting the value at `col_idx`,
+/// converts to `f64`, and applies the aggregate.  NULL cells are skipped.
+fn compute_builtin_aggregate(
+    agg_name: &str,
+    rows: &[Vec<Option<CqlValue>>],
+    col_idx: usize,
+    col_type: &CqlType,
+) -> Option<CqlValue> {
+    let values: Vec<f64> = rows
+        .iter()
+        .filter_map(|row| row.get(col_idx).and_then(|cell| cell.as_ref()))
+        .filter_map(cql_value_to_f64)
+        .collect();
+
+    if values.is_empty() {
+        return Some(CqlValue::Null);
+    }
+
+    let result = match agg_name {
+        "avg" => values.iter().sum::<f64>() / values.len() as f64,
+        "sum" => values.iter().sum::<f64>(),
+        "min" => values.iter().copied().fold(f64::INFINITY, f64::min),
+        "max" => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        _ => return None,
+    };
+    Some(f64_to_cql_aggregate(result, col_type))
 }
 
 /// Apply `toJson()` transformations to projected rows for user-table SELECT queries.
