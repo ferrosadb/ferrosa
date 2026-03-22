@@ -300,8 +300,16 @@ fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
             }
         }
         CqlType::Vector(elem, dim) => {
-            encode_type(buf, elem);
-            buf.put_i32(*dim as i32);
+            // Cassandra 5.0 encodes vectors as Custom type (0x0000) with
+            // the class name string. The type_id is already 0x0000.
+            let elem_class = match elem.as_ref() {
+                CqlType::Float => "org.apache.cassandra.db.marshal.FloatType",
+                CqlType::Double => "org.apache.cassandra.db.marshal.DoubleType",
+                _ => "org.apache.cassandra.db.marshal.FloatType",
+            };
+            let class_name =
+                format!("org.apache.cassandra.db.marshal.VectorType({elem_class}, {dim})");
+            encode_string(buf, &class_name);
         }
         CqlType::Udt {
             keyspace,

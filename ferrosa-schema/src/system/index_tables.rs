@@ -67,6 +67,7 @@ fn index_type_kind(index_type: &IndexType) -> &'static str {
         IndexType::Composite => "composite",
         IndexType::Phonetic => "phonetic",
         IndexType::Filtered => "filtered",
+        IndexType::Vector => "vector",
     }
 }
 

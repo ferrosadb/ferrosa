@@ -74,7 +74,7 @@ impl CqlType {
             Self::List(_) => 0x0020,
             Self::Map(_, _) => 0x0021,
             Self::Set(_) => 0x0022,
-            Self::Vector(_, _) => 0x0023,
+            Self::Vector(_, _) => 0x0000, // Custom — Cassandra encodes vectors as Custom type
             Self::Udt { .. } => 0x0030,
             Self::Tuple(_) => 0x0031,
         }

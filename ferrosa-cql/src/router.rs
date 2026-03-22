@@ -773,6 +773,7 @@ fn route_select(
                         IndexType::Composite => "COMPOSITES",
                         IndexType::Phonetic => "CUSTOM",
                         IndexType::Filtered => "CUSTOM",
+                        IndexType::Vector => "CUSTOM",
                     };
                     // Format options as a simple comma-separated key=value string
                     // (avoiding a serde_json dependency in this crate).
@@ -1210,6 +1211,18 @@ fn route_select_user_table(
             }
         }
     };
+
+    // ANN OF ordering: vector similarity search is deferred — log and fall
+    // through to normal result ordering. The query parses successfully but
+    // ANN execution will be implemented when the vector index query path is
+    // wired up.
+    if s.ann_of.is_some() {
+        tracing::warn!(
+            keyspace = ks,
+            table = %s.table,
+            "ORDER BY ... ANN OF parsed but ANN execution is deferred — returning unordered results"
+        );
+    }
 
     // Apply ORDER BY sorting (FRSA-BUG-004)
     let rows = if !s.order_by.is_empty() {
@@ -3212,6 +3225,7 @@ fn resolve_index_type(
         Some("composite") => Ok(IndexType::Composite),
         Some("phonetic") => Ok(IndexType::Phonetic),
         Some("filtered") => Ok(IndexType::Filtered),
+        Some("vector") => Ok(IndexType::Vector),
         Some(other) => Err(CqlError::Invalid(format!("unknown index type: {other}"))),
     }
 }
@@ -3716,13 +3730,16 @@ fn build_column_info(
                 alias,
                 args,
             } => {
-                let builtin_display_name = alias.clone().unwrap_or_else(|| {
-                    let prefix = func_ks.as_deref().unwrap_or("system");
-                    format!("{}.{}", prefix, name)
-                });
+                let builtin_display_name = alias.clone().unwrap_or_else(|| name.to_lowercase());
                 let fn_lower = name.to_lowercase();
                 let (display_name, cql_type) = match fn_lower.as_str() {
-                    "count" => (builtin_display_name, CqlType::Bigint),
+                    // COUNT(*) column name must be "count" (not "system.count")
+                    // to match Cassandra driver expectations. The alias takes
+                    // precedence if provided.
+                    "count" => {
+                        let display = alias.clone().unwrap_or_else(|| "count".to_string());
+                        (display, CqlType::Bigint)
+                    }
                     "writetime" => (builtin_display_name, CqlType::Bigint),
                     "ttl" => (builtin_display_name, CqlType::Int),
                     "avg" | "min" | "max" | "sum" => {
@@ -4052,7 +4069,33 @@ fn evaluate_where_predicates(
             Ok(v) => v,
             Err(_) => return false,
         };
+
+        // Phonetic index support: when the predicate is Eq on a column that
+        // has a phonetic index, use case-insensitive comparison as a partial
+        // phonetic match. Full Double Metaphone matching requires the SOUNDS
+        // LIKE syntax (deferred).
+        let has_phonetic_index = if wc.op == ComparisonOp::Eq {
+            let snap = schema.snapshot();
+            snap.indexes.values().any(|idx| {
+                idx.keyspace == table_meta.keyspace
+                    && idx.table == table_meta.name
+                    && idx.index_type == IndexType::Phonetic
+                    && idx.target_columns.contains(&wc.column)
+            })
+        } else {
+            false
+        };
+
         let matches = match wc.op {
+            ComparisonOp::Eq if has_phonetic_index => {
+                // Phonetic matching via simplified Soundex-like comparison.
+                // Words that sound similar should match even if spelled differently
+                // (e.g., "John Smith" matches "Jon Smyth").
+                match (actual, &expected) {
+                    (CqlValue::Text(a), CqlValue::Text(b)) => phonetic_match(a, b),
+                    _ => *actual == expected,
+                }
+            }
             ComparisonOp::Eq => *actual == expected,
             ComparisonOp::Ne => *actual != expected,
             ComparisonOp::Gt => *actual > expected,
@@ -5685,6 +5728,24 @@ fn where_has_udf_calls(where_clauses: &[WhereClause]) -> bool {
         }
     }
     false
+}
+
+/// Simple phonetic matching: compare two strings word-by-word using Soundex.
+/// Returns true if all words have the same Soundex code.
+/// Phonetic matching using the Double Metaphone encoder from ferrosa-index.
+/// Compares word-by-word: "John Smith" matches "Jon Smyth" because each
+/// word pair produces the same phonetic code.
+fn phonetic_match(a: &str, b: &str) -> bool {
+    let encoder = ferrosa_index::phonetic::PhoneticAlgorithm::DoubleMetaphone.encoder();
+    let a_words: Vec<&str> = a.split_whitespace().collect();
+    let b_words: Vec<&str> = b.split_whitespace().collect();
+    if a_words.len() != b_words.len() {
+        return false;
+    }
+    a_words
+        .iter()
+        .zip(b_words.iter())
+        .all(|(wa, wb)| encoder.encode(wa) == encoder.encode(wb))
 }
 
 /// Check if a Term contains a non-builtin function call.
