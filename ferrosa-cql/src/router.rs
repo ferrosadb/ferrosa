@@ -833,7 +833,7 @@ fn route_select_user_table(
             .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
             .collect::<Result<Vec<_>, _>>()?;
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-        match state.engine.read(&table_id, &decorated_key)? {
+        let mut pk_rows = match state.engine.read(&table_id, &decorated_key)? {
             Some(partition) => bridge::partition_to_rows(
                 &partition,
                 &all_col_names,
@@ -842,7 +842,19 @@ fn route_select_user_table(
                 &ck_indices,
             ),
             None => vec![],
-        }
+        };
+        // Apply clustering key and other non-PK WHERE predicates.
+        pk_rows.retain(|row| {
+            evaluate_where_predicates(
+                row,
+                &s.where_clauses,
+                &all_col_names,
+                table_meta,
+                ks,
+                &state.schema,
+            )
+        });
+        pk_rows
     } else if let Some(in_rows) = try_pk_in_lookup(
         &s.where_clauses,
         table_meta,
@@ -855,8 +867,20 @@ fn route_select_user_table(
         &pk_indices,
         &ck_indices,
     )? {
-        // PK IN (...) — multi-partition lookup
-        in_rows
+        // PK IN (...) — multi-partition lookup.
+        // Apply clustering key and other non-PK WHERE predicates.
+        let mut filtered = in_rows;
+        filtered.retain(|row| {
+            evaluate_where_predicates(
+                row,
+                &s.where_clauses,
+                &all_col_names,
+                table_meta,
+                ks,
+                &state.schema,
+            )
+        });
+        filtered
     } else {
         // No PK — use the query planner to decide the access path.
         let planner_indexes: Vec<(String, Vec<String>)> = snap
@@ -3570,13 +3594,35 @@ fn evaluate_where_predicates(
             Ok(t) => t,
             Err(_) => return false,
         };
-        let expected = match bridge::term_to_cql_value(&wc.value, &cql_type) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
         let actual = match &row[col_idx] {
             Some(v) => v,
             None => return false,
+        };
+
+        // IN requires special handling: the term is an InList, not a single
+        // value, so we must check membership before the normal term_to_cql_value
+        // path (which rejects InList terms).
+        if wc.op == ComparisonOp::In {
+            let in_terms = match &wc.value {
+                Term::InList(terms) => terms,
+                _ => return false,
+            };
+            let found = in_terms.iter().any(|t| {
+                if let Ok(v) = bridge::term_to_cql_value(t, &cql_type) {
+                    *actual == v
+                } else {
+                    false
+                }
+            });
+            if !found {
+                return false;
+            }
+            continue;
+        }
+
+        let expected = match bridge::term_to_cql_value(&wc.value, &cql_type) {
+            Ok(v) => v,
+            Err(_) => return false,
         };
         let matches = match wc.op {
             ComparisonOp::Eq => *actual == expected,
@@ -3585,11 +3631,7 @@ fn evaluate_where_predicates(
             ComparisonOp::Lt => *actual < expected,
             ComparisonOp::Ge => *actual >= expected,
             ComparisonOp::Le => *actual <= expected,
-            ComparisonOp::In => {
-                // IN comparison: check if actual is in the expected list.
-                // For now, treat as equality (single-value IN).
-                *actual == expected
-            }
+            ComparisonOp::In => unreachable!("IN handled above"),
             ComparisonOp::Contains | ComparisonOp::ContainsKey => {
                 // CONTAINS / CONTAINS KEY: not yet implemented for filtering.
                 // Conservatively exclude the row so we don't return false positives.

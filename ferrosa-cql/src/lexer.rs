@@ -823,13 +823,25 @@ impl<'input> Lexer<'input> {
             })
         } else {
             let text = &self.input[start..self.pos];
-            let value: i64 = text
-                .parse()
-                .map_err(|_| CqlError::SyntaxError(format!("invalid integer literal: {}", text)))?;
-            Ok(Token {
-                kind: TokenKind::IntegerLiteral(value),
-                pos: start,
-            })
+            if let Ok(value) = text.parse::<i64>() {
+                Ok(Token {
+                    kind: TokenKind::IntegerLiteral(value),
+                    pos: start,
+                })
+            } else if let Ok(value) = text.parse::<f64>() {
+                // Large integers that overflow i64 can still be valid as float/double
+                // literals (e.g. proptest-generated doubles like "33092290000000000000000000000000").
+                // CQL allows integer-shaped literals for float/double columns.
+                Ok(Token {
+                    kind: TokenKind::FloatLiteral(value),
+                    pos: start,
+                })
+            } else {
+                Err(CqlError::SyntaxError(format!(
+                    "invalid numeric literal: {}",
+                    text
+                )))
+            }
         }
     }
 

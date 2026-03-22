@@ -38,44 +38,93 @@ pub fn build_serialization_header(
     let mut min_local_deletion_time = NO_DELETION_TIME;
     let mut min_ttl = NO_TTL;
 
+    /// Update `min_timestamp` if `ts` is a real timestamp (not sentinel).
+    #[inline]
+    fn update_min_ts(min_ts: &mut i64, ts: i64) {
+        if ts != NO_TIMESTAMP && (*min_ts == NO_TIMESTAMP || ts < *min_ts) {
+            *min_ts = ts;
+        }
+    }
+
+    /// Update `min_local_deletion_time` if `ldt` is a real value (not sentinel).
+    #[inline]
+    fn update_min_ldt(min_ldt: &mut i32, ldt: i32) {
+        if ldt != NO_DELETION_TIME && (*min_ldt == NO_DELETION_TIME || ldt < *min_ldt) {
+            *min_ldt = ldt;
+        }
+    }
+
+    /// Update `min_ttl` if `ttl` is a real value (not sentinel).
+    #[inline]
+    fn update_min_ttl(min_ttl_val: &mut i32, ttl: i32) {
+        if ttl != NO_TTL && (*min_ttl_val == NO_TTL || ttl < *min_ttl_val) {
+            *min_ttl_val = ttl;
+        }
+    }
+
+    /// Scan a row's liveness info and deletion time for min values.
+    /// The SSTable writer delta-encodes these against the header minimums,
+    /// so we must account for them to prevent subtraction overflow.
+    #[inline]
+    fn scan_row_metadata(
+        row: &ferrosa_sstable::types::Row,
+        min_ts: &mut i64,
+        min_ldt: &mut i32,
+        min_ttl_val: &mut i32,
+    ) {
+        // Primary key liveness: timestamp, ttl, and local_deletion_time
+        // are delta-encoded in the writer.
+        if row.primary_key_liveness.has_timestamp() {
+            update_min_ts(min_ts, row.primary_key_liveness.timestamp);
+        }
+        if row.primary_key_liveness.has_ttl() {
+            update_min_ttl(min_ttl_val, row.primary_key_liveness.ttl);
+            update_min_ldt(min_ldt, row.primary_key_liveness.local_deletion_time);
+        }
+
+        // Row-level deletion: marked_for_delete_at and local_deletion_time
+        // are delta-encoded in the writer.
+        if !row.deletion.is_live() {
+            update_min_ts(min_ts, row.deletion.marked_for_delete_at);
+            // DeletionTime.local_deletion_time is u32; cast to i32 for comparison
+            // with the header field (i32). Values > i32::MAX are sentinel-like and
+            // should not lower the minimum.
+            let ldt = row.deletion.local_deletion_time;
+            if ldt != u32::MAX {
+                let ldt_i32 = ldt as i32;
+                update_min_ldt(min_ldt, ldt_i32);
+            }
+        }
+    }
+
     for partition in partitions {
         // Scan static row cells if present
         if let Some(ref static_row) = partition.static_row {
+            scan_row_metadata(
+                static_row,
+                &mut min_timestamp,
+                &mut min_local_deletion_time,
+                &mut min_ttl,
+            );
             for (_, cell) in &static_row.cells {
-                if cell.timestamp != NO_TIMESTAMP
-                    && (min_timestamp == NO_TIMESTAMP || cell.timestamp < min_timestamp)
-                {
-                    min_timestamp = cell.timestamp;
-                }
-                if cell.local_deletion_time != NO_DELETION_TIME
-                    && (min_local_deletion_time == NO_DELETION_TIME
-                        || cell.local_deletion_time < min_local_deletion_time)
-                {
-                    min_local_deletion_time = cell.local_deletion_time;
-                }
-                if cell.ttl != NO_TTL && (min_ttl == NO_TTL || cell.ttl < min_ttl) {
-                    min_ttl = cell.ttl;
-                }
+                update_min_ts(&mut min_timestamp, cell.timestamp);
+                update_min_ldt(&mut min_local_deletion_time, cell.local_deletion_time);
+                update_min_ttl(&mut min_ttl, cell.ttl);
             }
         }
 
-        // Scan clustered row cells
+        // Scan clustered rows: metadata and cells
         for row in &partition.rows {
+            scan_row_metadata(
+                row,
+                &mut min_timestamp,
+                &mut min_local_deletion_time,
+                &mut min_ttl,
+            );
             for (_, cell) in &row.cells {
-                if cell.timestamp != NO_TIMESTAMP
-                    && (min_timestamp == NO_TIMESTAMP || cell.timestamp < min_timestamp)
-                {
-                    min_timestamp = cell.timestamp;
-                }
-                if cell.local_deletion_time != NO_DELETION_TIME
-                    && (min_local_deletion_time == NO_DELETION_TIME
-                        || cell.local_deletion_time < min_local_deletion_time)
-                {
-                    min_local_deletion_time = cell.local_deletion_time;
-                }
-                if cell.ttl != NO_TTL && (min_ttl == NO_TTL || cell.ttl < min_ttl) {
-                    min_ttl = cell.ttl;
-                }
+                update_min_ts(&mut min_timestamp, cell.timestamp);
+                update_min_ldt(&mut min_local_deletion_time, cell.local_deletion_time);
+                update_min_ttl(&mut min_ttl, cell.ttl);
             }
         }
     }

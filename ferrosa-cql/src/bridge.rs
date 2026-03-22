@@ -51,6 +51,14 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             }
             CqlType::Timestamp => Ok(CqlValue::Timestamp(*n)),
             CqlType::Counter => Ok(CqlValue::Counter(*n)),
+            CqlType::Float => {
+                // CQL allows integer literals for float columns (e.g. INSERT ... VALUES (42))
+                Ok(CqlValue::Float((*n as f32).to_bits()))
+            }
+            CqlType::Double => {
+                // CQL allows integer literals for double columns (e.g. INSERT ... VALUES (42))
+                Ok(CqlValue::Double((*n as f64).to_bits()))
+            }
             CqlType::Varint => Ok(CqlValue::Varint(BigInt::from(*n))),
             CqlType::Decimal => {
                 // Integer literal as decimal: scale 0, unscaled = the integer value
@@ -894,9 +902,17 @@ pub fn partition_to_rows(
     let pk_values = decode_pk(&partition.key, pk_columns.len());
 
     for row in &partition.rows {
-        // Skip tombstone rows
+        // Skip tombstone rows — but only if no newer mutation supersedes the
+        // tombstone. In Cassandra semantics, an UPDATE or INSERT after a
+        // DELETE resurrects the row: the primary_key_liveness timestamp or
+        // cell timestamps may be newer than the row-level deletion.
         if !row.deletion.is_live() {
-            continue;
+            let del_ts = row.deletion.marked_for_delete_at;
+            let liveness_supersedes = row.primary_key_liveness.timestamp > del_ts;
+            let any_cell_supersedes = row.cells.iter().any(|(_, cell)| cell.timestamp > del_ts);
+            if !liveness_supersedes && !any_cell_supersedes {
+                continue;
+            }
         }
 
         let mut output_row: Vec<Option<CqlValue>> = vec![None; column_names.len()];
