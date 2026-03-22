@@ -1,6 +1,6 @@
 # CQL Protocol Specification
 
-> Last updated: 2026-03-22 (vector type, LWT, counters, protocol v4 compat)
+> Last updated: 2026-03-22 (vector type, LWT, counters, protocol v4 compat, Accord transactions, pagination)
 > Status: Approved
 
 ## Overview
@@ -173,7 +173,7 @@ Input: &str → Lexer (Token stream) → Parser (AST) → Statement enum
 
 - **Lexer**: Single-pass, zero-allocation tokenizer, `Token<'input>` borrows from source. Keywords via `phf` perfect-hash map.
 - **Parser**: One function per grammar rule. LL(2) — no backtracking. Returns `Result<Statement>` with span info.
-- **AST**: `Statement` enum with variants: `Select` (with ALLOW FILTERING, DISTINCT, ANN ORDER BY), `Insert` (with IF NOT EXISTS), `Update` (counter ops, collection +/-), `Delete` (map element), `CreateKeyspace`, `CreateTable`, `AlterTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateRole`, `AlterRole`, `DropRole`, `Grant`, `Revoke`, `Use`, `Batch`, etc.
+- **AST**: `Statement` enum with variants: `Select` (with ALLOW FILTERING, DISTINCT, ANN ORDER BY), `Insert` (with IF NOT EXISTS, IF conditions), `Update` (counter ops, collection +/-, IF conditions), `Delete` (map element, IF conditions), `CreateKeyspace`, `CreateTable`, `AlterTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateRole`, `AlterRole`, `DropRole`, `Grant`, `Revoke`, `Use`, `Batch` (with CAS), `BeginTransaction`, `Commit`, `Rollback`, etc.
 
 ### Secondary Index DDL
 
@@ -238,10 +238,23 @@ Enables full-table scan with post-filter evaluation of WHERE predicates. When a 
 **Lightweight Transactions (LWT):**
 
 ```sql
+-- INSERT IF NOT EXISTS
 INSERT INTO users (id, name) VALUES (1, 'alice') IF NOT EXISTS;
+
+-- UPDATE with IF condition
+UPDATE users SET name = 'bob' WHERE id = 1 IF name = 'alice';
+
+-- DELETE with IF condition
+DELETE FROM users WHERE id = 1 IF name = 'bob';
+
+-- Batch CAS
+BEGIN BATCH
+  INSERT INTO users (id, name) VALUES (1, 'alice') IF NOT EXISTS;
+  INSERT INTO profiles (id, bio) VALUES (1, 'hello') IF NOT EXISTS;
+APPLY BATCH;
 ```
 
-Basic INSERT IF NOT EXISTS support. Returns a `[applied]` boolean column indicating whether the insert was performed. Full LWT with IF conditions on UPDATE/DELETE is deferred.
+Full LWT support via the Accord consensus protocol. INSERT IF NOT EXISTS, IF conditions on UPDATE/DELETE, and Batch CAS are all routed through `AccordCoordinator` when `SERIAL` or `LOCAL_SERIAL` consistency is requested. Returns a `[applied]` boolean column indicating whether the operation was performed.
 
 **Counter Operations:**
 
@@ -294,6 +307,56 @@ Token-range queries for partition scanning, used by drivers for parallel full-ta
 DROP ROLE [IF EXISTS] role_name;
 ```
 
+**Multi-Statement Transactions:**
+
+```sql
+BEGIN TRANSACTION;
+  SELECT balance FROM accounts WHERE id = 1;
+  UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+  UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+
+-- Or abort
+BEGIN TRANSACTION;
+  SELECT balance FROM accounts WHERE id = 1;
+ROLLBACK;
+```
+
+Multi-statement transactions provide serializable isolation via the Accord consensus protocol. The parser extracts read-set and write-set from the transaction body. Transaction limits prevent unbounded resource usage (max statements, max keys, timeout). Client retry handles Accord contention automatically.
+
+**Consistency Levels (SERIAL):**
+
+```sql
+-- Global serializable via Accord
+SELECT * FROM users WHERE id = 1 USING CONSISTENCY SERIAL;
+
+-- DC-local serializable via Accord
+INSERT INTO users (id, name) VALUES (1, 'alice') IF NOT EXISTS
+    USING CONSISTENCY LOCAL_SERIAL;
+```
+
+| Level | Behavior |
+|-------|----------|
+| `SERIAL` | Global serializable via Accord consensus |
+| `LOCAL_SERIAL` | DC-local serializable via Accord consensus |
+
+**Pagination:**
+
+Result set paging is supported via the standard CQL paging protocol:
+
+- QUERY and EXECUTE requests include an optional page size
+- Results larger than the page size return a `paging_state` token
+- Subsequent requests include the `paging_state` to fetch the next page
+- Compatible with standard CQL driver auto-paging
+
+**Additional Built-in Functions:**
+
+| Function | Description |
+|----------|-------------|
+| `now()` | Returns the current timestamp as a timeuuid |
+| `toTimestamp(timeuuid)` | Converts a timeuuid to a timestamp |
+| `TTL(column)` | Returns the remaining TTL in seconds for a column value |
+
 **PREPARE with pk_count:**
 
 PREPARE responses include `pk_count` metadata indicating the number of partition key bind markers, enabling drivers to compute routing keys for token-aware load balancing.
@@ -305,13 +368,17 @@ EXECUTE requests support positional bind values (in addition to named), matching
 ## Query Routing
 
 ```
-Statement → DDL        → ferrosa-schema::Schema
+Statement → DDL        → ferrosa-schema::Schema (via DdlDrain when Accord active)
           → DML reads  → ferrosa-storage::StorageEngine::read()
           → DML writes → ferrosa-storage::StorageEngine::write()
+          → LWT (IF)   → ferrosa-cluster::AccordCoordinator → storage
+          → TRANSACTION → ferrosa-cluster::AccordCoordinator → storage
           → USE        → connection-local state
           → PREPARE    → parse + validate + cache
           → EXECUTE    → lookup cached plan, bind, re-enter router
 ```
+
+LWT statements (IF NOT EXISTS, IF conditions) and multi-statement transactions (BEGIN TRANSACTION) are routed through the `AccordCoordinator` in `ferrosa-cluster`, which runs the Accord consensus protocol before applying writes to storage.
 
 ## Authentication
 
@@ -684,4 +751,5 @@ ferrosa-cql/
 - [Overview](overview.md) — system overview
 - [Components](components.md) — crate architecture
 - [Storage](storage.md) — storage engine (StorageStatsProvider, SubscriptionObserver)
+- [Accord](accord.md) — Accord consensus protocol (LWT and transaction routing)
 - [ADR-006](decisions/006-cql-architecture.md) — CQL architectural decisions

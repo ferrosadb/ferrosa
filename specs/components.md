@@ -59,7 +59,7 @@ graph BT
 - **Purpose**: Shared low-level types used across all crates
 - **Location**: `ferrosa-common/`
 - **Dependencies**: None (leaf crate)
-- **Key types**: `Token` (i64, Murmur3), `PartitionKey`, `DecoratedKey`, `CellValue` (bytes + timestamp + TTL), `Timestamp`, error types (`Error`, `Result`)
+- **Key types**: `Token` (i64, Murmur3), `PartitionKey`, `DecoratedKey`, `CellValue` (bytes + timestamp + TTL), `Timestamp`, error types (`Error`, `Result`). **Accord types**: `accord::Timestamp` (HLC hybrid logical clock), `TxnId` (transaction identifier with node + sequence + HLC), `Ballot` (ballot numbers for consensus voting rounds).
 - **Boundary**: CQL-level type definitions (text, int, collections, UDTs) live in `ferrosa-cql`, not here
 
 ### ferrosa-sstable
@@ -120,7 +120,7 @@ graph BT
 - **Purpose**: Storage engine with S3 write-behind
 - **Location**: `ferrosa-storage/`
 - **Dependencies**: `ferrosa-common`, `ferrosa-sstable`, `arc-swap`, `parking_lot`, `crc32fast`, `object_store` (S3), `tokio`, `serde`, `serde_json`, `bytes`, `crossbeam-skiplist` (optional)
-- **Status**: Parts A/B/C implemented + PITR (archiver, snapshots, restore) + sidecar index persistence
+- **Status**: Parts A/B/C implemented + PITR (archiver, snapshots, restore) + sidecar index persistence + Accord storage module
 - **Modules**:
   - `memtable/` — `Memtable` trait with two implementations: `ShardedBTreeMemtable` (64-shard `BTreeMap` with `parking_lot::RwLock`), `SkipListMemtable` (lock-free, behind `skiplist-memtable` feature flag)
   - `flush.rs` — `FlushTarget` trait, `FileFlushTarget` (disk), `InMemoryFlushTarget` (testing)
@@ -142,6 +142,10 @@ graph BT
   - `snapshot.rs` — `SnapshotManager` (atomic snapshot creation: flush + manifest + schema copy, `SnapshotMetadata` with serde, list/delete, TTL cleanup)
   - `restore.rs` — `RestoreManager` (full restore workflow: snapshot download, segment continuity validation, timestamp-filtered replay, node-id validation, schema validation)
   - `sidecar.rs` — Sidecar index file I/O: header (magic/version/count/CRC32) + sorted entries, read/write roundtrip
+  - `accord/sync_writer.rs` — `SyncWriter` for durable write-ahead of Accord transaction commits
+  - `accord/write_gate.rs` — `WriteGate` DDL drain-and-block gate, pauses Accord writes during schema changes
+  - `accord/reorder_buffer.rs` — `ReorderBuffer` for dependency-ordered transaction apply
+  - `accord/sidecar.rs` — `.accord` sidecar files for crash recovery replay of in-flight transactions
 - **Concurrency**:
   - *Memtable writes*: 64-shard `BTreeMap` — different partitions write in parallel; same-shard writes serialize on a per-shard `RwLock`. Alternative: `SkipListMemtable` (lock-free, `crossbeam-skiplist`, behind feature flag).
   - *Memtable flush*: Atomic swap via `arc-swap` — current memtable replaced with a fresh one; old memtable flushed to SSTable. Reads check both active and flushing memtable.
@@ -180,7 +184,7 @@ graph BT
 - **Purpose**: CQL native protocol v4/v5 and query execution
 - **Location**: `ferrosa-cql/`
 - **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `tokio`, `tokio-util`, `bytes`, `futures`, `arc-swap`, `uuid`, `num-bigint`, `phf`, `md-5`, `moka`, `tracing`
-- **Status**: Parts A-D implemented — protocol framing, CQL type system (including `vector<float, N>` via Custom wire type 0x0000), TCP server, SASL PLAIN auth, recursive descent parser, full query routing (SELECT/INSERT/UPDATE/DELETE/BATCH/DDL), prepared statement cache (moka W-TinyLFU), connection state machine with security hardening, protocol v4/v5 negotiation
+- **Status**: Parts A-D implemented + Accord integration — protocol framing, CQL type system (including `vector<float, N>` via Custom wire type 0x0000), TCP server, SASL PLAIN auth, recursive descent parser, full query routing (SELECT/INSERT/UPDATE/DELETE/BATCH/DDL), prepared statement cache (moka W-TinyLFU), connection state machine with security hardening, protocol v4/v5 negotiation, LWT (IF NOT EXISTS, IF conditions), BEGIN TRANSACTION/COMMIT/ROLLBACK, SERIAL/LOCAL_SERIAL consistency levels, pagination
 - **Modules**:
   - `frame.rs` — CQL v5 binary framing, `CqlCodec` (Tokio `Encoder`/`Decoder`)
   - `types.rs` — `CqlValue` enum with encode/decode for all CQL types, including `CqlType::Vector` (`vector<float, N>`) encoded as Custom wire type 0x0000
@@ -203,8 +207,10 @@ graph BT
   - `planner.rs` — `ScanPlan` enum (PrimaryKey/SingleIndex/IndexIntersection/FullScan), `plan()` function resolving indexes by (keyspace, table, column)
 - **Key interfaces**: Full CQL query lifecycle — frame decode → parse → route → execute → encode result
 - **Auth**: SASL PLAIN with `Schema::authenticate()`, rate limiting, connection state machine
-- **Supported operations**: SELECT (with ALLOW FILTERING, CONTAINS, CONTAINS KEY, SELECT DISTINCT, token() in WHERE), INSERT (IF NOT EXISTS / LWT), UPDATE (counter increment/decrement, collection +/- operators), DELETE (map element syntax), BATCH, CREATE/ALTER/DROP KEYSPACE/TABLE, CREATE/DROP INDEX (USING 'btree'/'hash'/'composite'/'phonetic'/'vector'), CREATE/ALTER/DROP ROLE, DROP ROLE, GRANT/REVOKE, TRUNCATE, USE, PREPARE (with pk_count metadata)/EXECUTE (positional bind values), EXPLAIN, system table queries
-- **Built-in functions**: `toJson()`, `token()`, `avg`, `min`, `max`, `sum`
+- **Supported operations**: SELECT (with ALLOW FILTERING, CONTAINS, CONTAINS KEY, SELECT DISTINCT, token() in WHERE), INSERT (IF NOT EXISTS / LWT, IF conditions), UPDATE (counter increment/decrement, collection +/- operators, IF conditions), DELETE (map element syntax, IF conditions), BATCH (CAS), CREATE/ALTER/DROP KEYSPACE/TABLE, CREATE/DROP INDEX (USING 'btree'/'hash'/'composite'/'phonetic'/'vector'), CREATE/ALTER/DROP ROLE, DROP ROLE, GRANT/REVOKE, TRUNCATE, USE, PREPARE (with pk_count metadata)/EXECUTE (positional bind values), EXPLAIN, BEGIN TRANSACTION/COMMIT/ROLLBACK, system table queries
+- **Built-in functions**: `toJson()`, `token()`, `now()`, `toTimestamp()`, `TTL()`, `avg`, `min`, `max`, `sum`
+- **Consistency levels**: ONE, QUORUM, ALL, LOCAL_ONE, LOCAL_QUORUM, SERIAL, LOCAL_SERIAL
+- **Pagination**: Result set paging with page state, configurable page size
 - **ANN ORDER BY**: Parsed for `ORDER BY <column> ANN OF <vector>` syntax; execution deferred pending vector index query path integration
 - **Protocol compatibility**: CQL protocol v4 and v5 negotiation, supporting drivers like cdrs-tokio
 - **Target**: All standard CQL drivers connect without modification
@@ -267,7 +273,7 @@ graph BT
 - **Purpose**: Distributed coordination — Raft consensus, token ring, tunable CL, pair mode, DDL replication, failover
 - **Location**: `ferrosa-cluster/`
 - **Dependencies**: `ferrosa-common`, `ferrosa-net`, `ferrosa-storage`, `ferrosa-schema`, `openraft`, `sled`, `arc-swap`, `async-trait`, `bytes`, `serde`, `serde_json`, `tokio`, `uuid`
-- **Status**: Phase 3 complete — Raft consensus, token ring, coordinator, hinted handoff, node lifecycle (join/decommission/streaming/rebalance), plus Phase 1 pair mode
+- **Status**: Phase 3 complete + Accord transactions (Sprints A1-A7) — Raft consensus, token ring, coordinator, hinted handoff, node lifecycle (join/decommission/streaming/rebalance), plus Phase 1 pair mode, plus full Accord consensus protocol
 - **Modules**:
   - `controller.rs` — `ModeController` (standalone → pair → degraded → cluster transitions), `ClusterStateHolder`, reverse connections, catch-up orchestration, `transition_to_cluster()` (3rd peer triggers Raft group + token ring + coordinator)
   - `write_path.rs` — `WritePath` enum (Direct/Pair/Cluster/Unavailable) for atomic write routing
@@ -289,7 +295,21 @@ graph BT
   - `coordinator/read.rs` — Read fan-out with local-replica optimization
   - `consistency.rs` — `ConsistencyLevel` with `blockFor()` + property tests
   - `config.rs`, `error.rs`, `mode.rs`, `state.rs`
-- **Key interfaces**: `ModeController::force_promote()`, `ModeController::switchover()`, `ModeController::transition_to_cluster()`, `ClusterCoordinator` (write/read fan-out), `TokenRing` (replica selection), REST API (`/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`)
+  - `accord/state_machine.rs` — `AccordStateMachine` (core consensus state machine, 39 tests)
+  - `accord/coordinator.rs` — `AccordCoordinator` (fast path 3/4 quorum, slow path majority, quorum formulas)
+  - `accord/conflict_index.rs` — `ConflictIndex` (key-range conflict detection for concurrent transactions)
+  - `accord/protocol_log.rs` — `ProtocolLog` (durable record of transaction decisions)
+  - `accord/mem_index.rs` — `MemIndex` (BTreeMap-based in-memory conflict index)
+  - `accord/recovery.rs` — `RecoveryCoordinator` (11 recovery scenarios for interrupted transactions)
+  - `accord/dep_wait.rs` — `DepWaitGraph` (dependency-wait with cycle detection)
+  - `accord/ddl_drain.rs` — `DdlDrain` (drain-and-block for DDL during active transactions)
+  - `accord/cross_shard.rs` — Cross-shard conflict detection and execution
+  - `accord/leaseholder.rs` — Leaseholder assignment for linearizable local reads
+  - `accord/durability.rs` — `DurabilityService`, `ExclusiveSyncPoint` for durability guarantees
+  - `accord/electorate.rs` — Electorate reconfiguration: epoch propagation, JoinElectorate 4-gate, shrink/resize, epoch transition drain
+  - `accord/metrics.rs` — 9 Accord-specific Prometheus metrics
+  - `accord/jepsen/` — TestCluster, NemesisController, HistoryRecorder, LinearizabilityChecker
+- **Key interfaces**: `ModeController::force_promote()`, `ModeController::switchover()`, `ModeController::transition_to_cluster()`, `ClusterCoordinator` (write/read fan-out), `TokenRing` (replica selection), `AccordCoordinator` (transaction coordination), `AccordStateMachine` (consensus state), REST API (`/api/cluster/status`, `/api/cluster/promote`, `/api/cluster/switchover`)
 - **Remaining**: NetworkTopologyStrategy (multi-DC), read repair (full inline), Quorum Lease / Mencius optimizations
 
 ### ferrosa (binary)
@@ -353,6 +373,7 @@ gantt
 ## Related Specs
 
 - [Overview](overview.md) — system overview and design principles
-- [Data Flow](data-flow.md) — write/read paths
+- [Data Flow](data-flow.md) — write/read paths, Accord transaction flow
 - [Storage](storage.md) — storage engine details
 - [CQL](cql.md) — CQL native protocol v4/v5
+- [Accord](accord.md) — Accord consensus protocol specification

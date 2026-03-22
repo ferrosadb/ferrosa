@@ -1,6 +1,6 @@
 # Testing Strategy
 
-> Last updated: 2026-03-14
+> Last updated: 2026-03-22
 > Status: Approved
 
 ## Overview
@@ -127,6 +127,71 @@ Sprites are ideal — Firecracker VMs with fast spin-up/kill.
 | Smoke — cqlsh | Index creation and system_schema.indexes introspection | `tests/cqlsh_smoke_test.sh` |
 | Smoke — Docker pair mode | Index DDL replication across two nodes, survival after failover | `tests/docker-smoke.sh` |
 
+## Suite 6: Accord Transaction Tests
+
+The Accord consensus implementation includes a comprehensive built-in test infrastructure for verifying linearizability and serializable isolation.
+
+### Jepsen-Style Infrastructure
+
+Ferrosa includes a built-in Jepsen-style testing framework (not the external Jepsen tool) with these components:
+
+| Component | Purpose |
+|-----------|---------|
+| `TestCluster` | In-process multi-node cluster for deterministic testing |
+| `NemesisController` | Fault injection: partitions, node kills, clock skew |
+| `HistoryRecorder` | Records all operations with timestamps for verification |
+| `LinearizabilityChecker` | Verifies linearizability of operation histories |
+
+### Jepsen Test Matrix
+
+| Test | Workloads | Nemesis | Validates |
+|------|-----------|---------|-----------|
+| Register | Read, Write, CAS | Partition, kill, skew | Single-key linearizability |
+| Bank | Transfer | Partition, kill | Balance preservation |
+| Write-skew | Read-then-write | Partition | Serializable isolation |
+
+### Accord Unit Tests
+
+| Category | Tests | Description |
+|----------|-------|-------------|
+| AccordStateMachine | 39 | State transitions, quorum logic, conflict detection |
+| AccordCoordinator | ~50 | Fast/slow path, quorum formulas, timeout handling |
+| ConflictIndex / MemIndex | ~30 | Key-range overlap, concurrent access, BTreeMap lookups |
+| RecoveryCoordinator | ~40 | 11 recovery scenarios at each protocol phase |
+| DepWaitGraph | ~15 | Dependency tracking, cycle detection |
+| DdlDrain / WriteGate | ~15 | Drain timing, gate open/close semantics |
+| CrossShard | ~20 | Multi-shard coordination, partial failure |
+| Electorate reconfiguration | ~30 | Epoch propagation, 4-gate join, shrink/resize |
+| UDF/UDA integration | 18 | WASM functions within Accord transactions |
+
+### Protocol Verification Tests
+
+| Test | Description |
+|------|-------------|
+| 24-step EPaxos test | Full protocol round-trip with dependency tracking and multiple concurrent transactions |
+| 4 property-based tests | Agreement, validity, termination, and serialization invariants via QuickCheck-style generation |
+
+### Chaos / Nemesis Tests
+
+| Scenario | Action | Verify |
+|----------|--------|--------|
+| Network partition | Isolate minority | Transactions in majority complete; minority retries |
+| Minority kill | Kill < quorum nodes | No committed transaction lost |
+| Clock skew | Inject SkewMax offset | HLC ordering remains correct |
+| Coordinator crash (PreAccept) | Kill coordinator mid-phase | RecoveryCoordinator completes transaction |
+| Coordinator crash (Accept) | Kill coordinator mid-phase | RecoveryCoordinator completes transaction |
+| Coordinator crash (Commit) | Kill coordinator mid-phase | Committed state recovered from replicas |
+| Crash recovery replay | Kill + restart node | `.accord` sidecar files restore ProtocolLog |
+
+### Performance Tests
+
+| Test | Metrics | Purpose |
+|------|---------|---------|
+| Baseline throughput | ops/sec, p50/p99 latency | Establish performance floor |
+| Fast path ratio | % fast vs slow path | Verify low-contention fast path dominance |
+| Contention scaling | Throughput under N concurrent txns | Identify contention knee |
+| Regression suite | Automated comparison vs baseline | Prevent performance regressions |
+
 ## Pre-1.0 Test Backlog
 
 Required before declaring production readiness:
@@ -157,5 +222,7 @@ Sprites' small memory footprint naturally triggers memory pressure issues that w
 
 ## Related Specs
 
-- [Data Flow](data-flow.md) — write/read paths and durability mitigations
+- [Data Flow](data-flow.md) — write/read paths, Accord transaction flow, durability mitigations
 - [Components](components.md) — crate architecture
+- [Accord](accord.md) — Accord consensus protocol specification
+- [Accord Project Plan](accord-project-plan.md) — sprint completion details
