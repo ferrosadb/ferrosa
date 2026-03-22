@@ -51,6 +51,11 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [PITR FMEA](pitr-fmea.md) | Failure modes for PITR (16 modes, 21 test cases) | Implemented |
 | [PITR Project Plan](pitr-project-plan.md) | 4-sprint plan: archiving, snapshots, restore, tooling | Complete |
 | [Combined Project Plan](project-plan-combined.md) | Parallel index + PITR workstreams, execution status | Complete |
+| [Accord Transactions](accord.md) | Accord architecture: component diagrams, data flow, integration map, ADRs | Draft |
+| [DSM — Accord](dsm-accord.md) | DSM dependency analysis for Accord integration (fan-in/out, propagation cost) | Draft |
+| [Threat Model — Accord](threat-model-accord.md) | STRIDE for Accord: 30 threats across 6 trust boundaries | Draft |
+| [FMEA — Accord](fmea-accord.md) | Failure modes for Accord (19 modes, 19 test cases, 3 critical) | Draft |
+| [Accord Project Plan](accord-project-plan.md) | 7-sprint plan: foundation, single-key, multi-key, 2i, electorates | Draft |
 | [Nightly Test Infrastructure](../superpowers/specs/2026-03-19-nightly-test-infrastructure-design.md) | Nightly test infrastructure design | Draft |
 | [Cluster Phase 2 Design](../superpowers/specs/2026-03-14-cluster-phase2-design.md) | Raft consensus, token ring, coordinator pattern | Implemented |
 

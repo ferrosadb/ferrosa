@@ -93,6 +93,7 @@ Source under `cassandra/src/java/org/apache/cassandra/`:
 - **Storage**: Write-behind async S3 — local ephemeral disk as cache, S3 as durable store
 - **SSTable**: Read Big+BTI, write BTI, future native format behind feature flag
 - **Protocol**: CQL client compatible, own internode protocol (not Cassandra wire compat)
-- **Consensus**: Raft for metadata (openraft), tunable consistency for data, transactions deferred
+- **Consensus**: Raft for metadata (openraft), Accord for strict-serializable transactions (all writes routed through Accord)
+- **Transactions**: See [specs/accord-project-plan.md](specs/accord-project-plan.md) for the Accord implementation plan (7 sprints, 4 phases)
 - **Partitioner**: Murmur3Partitioner (Cassandra compatible)
 - **Target**: AWS-first, flag any lock-in for S3-compatible portability
