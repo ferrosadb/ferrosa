@@ -880,6 +880,16 @@ pub fn partition_to_rows(
 ) -> Vec<Vec<Option<CqlValue>>> {
     let mut result = Vec::new();
 
+    // Build mapping from storage column index (0-based within static+regular
+    // columns) to full-table column index.  Storage columns are every column
+    // that is NOT a partition key or clustering key, in their original table
+    // order.
+    let pk_set: std::collections::HashSet<usize> = pk_columns.iter().copied().collect();
+    let ck_set: std::collections::HashSet<usize> = ck_columns.iter().copied().collect();
+    let storage_to_table: Vec<usize> = (0..column_names.len())
+        .filter(|i| !pk_set.contains(i) && !ck_set.contains(i))
+        .collect();
+
     // Pre-decode PK values from the partition key
     let pk_values = decode_pk(&partition.key, pk_columns.len());
 
@@ -914,15 +924,23 @@ pub fn partition_to_rows(
             }
         }
 
-        // Fill regular columns from cells
+        // Fill regular/static columns from cells.
+        //
+        // Cell indices are in storage column space (0-based within
+        // static+regular columns).  Translate to full-table column index
+        // via the mapping built above.
         for (col_index, cell) in &row.cells {
-            let idx = *col_index as usize;
-            if idx < column_types.len() {
+            let storage_idx = *col_index as usize;
+            let table_idx = match storage_to_table.get(storage_idx) {
+                Some(&idx) => idx,
+                None => continue, // out-of-range storage index — skip
+            };
+            if table_idx < column_types.len() {
                 if cell.is_tombstone() {
-                    output_row[idx] = None;
+                    output_row[table_idx] = None;
                 } else if let Some(ref value_bytes) = cell.value {
-                    if let Ok(val) = decode_value(&column_types[idx], value_bytes) {
-                        output_row[idx] = Some(val);
+                    if let Ok(val) = decode_value(&column_types[table_idx], value_bytes) {
+                        output_row[table_idx] = Some(val);
                     }
                 }
             }
@@ -1689,9 +1707,11 @@ mod tests {
         let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
 
         let cell_bytes = encode_value(&CqlValue::Text("alice".into()));
+        // Cell index 0 = first storage column (static+regular, 0-based).
+        // For this table: id (PK) is excluded, so "name" is storage index 0.
         let row = Row {
             clustering: vec![],
-            cells: vec![(1, CellValue::live(cell_bytes, 1000))],
+            cells: vec![(0, CellValue::live(cell_bytes, 1000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
@@ -1752,9 +1772,10 @@ mod tests {
         let pk_bytes = encode_value(&CqlValue::Int(1));
         let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
 
+        // Cell index 0 = first storage column ("name", since "id" is PK).
         let row = Row {
             clustering: vec![],
-            cells: vec![(1, CellValue::tombstone(1000, 1700000000))],
+            cells: vec![(0, CellValue::tombstone(1000, 1700000000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };

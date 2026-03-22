@@ -328,12 +328,14 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             expand,
             variables,
             detach,
+            variable_tables,
         } => {
             let mut out = String::new();
             out.push_str("DeleteNodes {\n");
             out.push_str(&format!("  expand: {}\n", format_plan(expand)));
             out.push_str(&format!("  variables: {:?}\n", variables));
             out.push_str(&format!("  detach: {}\n", detach));
+            out.push_str(&format!("  variable_tables: {:?}\n", variable_tables));
             out.push('}');
             out
         }

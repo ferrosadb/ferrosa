@@ -304,17 +304,21 @@ impl SSTableWriter {
         if !is_static {
             push_unsigned_vint_to(&mut self.data_buf, 0); // header: all non-null, non-empty
 
-            // For single clustering column, the entire clustering blob is the value
-            if self.header.clustering_types.len() == 1 {
+            let num_ck = self.header.clustering_types.len();
+            if num_ck == 1 {
+                // Single clustering column: write value directly (fixed-length)
+                // or with a length prefix (variable-length).
                 let type_name = &self.header.clustering_types[0];
                 if crate::marshal::value_length_if_fixed(type_name).is_none() {
                     push_unsigned_vint_to(&mut self.data_buf, row.clustering.len() as u64);
                 }
-            } else {
+                self.data_buf.extend_from_slice(&row.clustering);
+            } else if num_ck > 1 {
                 // Multi-column: treat as single variable-length blob (simplified)
                 push_unsigned_vint_to(&mut self.data_buf, row.clustering.len() as u64);
+                self.data_buf.extend_from_slice(&row.clustering);
             }
-            self.data_buf.extend_from_slice(&row.clustering);
+            // num_ck == 0: no clustering columns — header varint only, no data.
         }
 
         // Serialize the row body to a temporary buffer to compute its size.
@@ -1244,5 +1248,62 @@ mod tests {
         assert_eq!(cell.timestamp, cell_ts);
         assert_eq!(cell.local_deletion_time, ldt);
         assert!(cell.value.is_none());
+    }
+
+    /// Tables with no clustering columns (simple PRIMARY KEY) must roundtrip.
+    /// Regression test for the extra clustering-length varint bug.
+    #[test]
+    fn write_no_clustering_columns_roundtrip() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_types: vec![], // No clustering columns
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let timestamp = 1_000_042i64;
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::new(vec![0x00, 0x00, 0x00, 0x01])),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![], // empty — no clustering columns
+                cells: vec![(0, CellValue::live(b"hello".to_vec(), timestamp))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        };
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        let mut reader = DataReader::new(&output.data, &header, 0);
+        let read_partition = reader
+            .read_partition()
+            .unwrap()
+            .expect("expected partition");
+
+        assert_eq!(read_partition.rows.len(), 1);
+        let row = &read_partition.rows[0];
+        assert!(row.clustering.is_empty());
+        assert_eq!(row.cells.len(), 1);
+        let (_, ref cell) = row.cells[0];
+        assert!(cell.is_live());
+        assert_eq!(cell.value.as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(cell.timestamp, timestamp);
+
+        assert!(reader.read_partition().unwrap().is_none());
     }
 }

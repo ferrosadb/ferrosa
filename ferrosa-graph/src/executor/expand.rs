@@ -106,6 +106,7 @@ pub fn execute(
             expand,
             variables,
             detach,
+            variable_tables,
         } => execute_delete(
             storage,
             *expand,
@@ -116,6 +117,7 @@ pub fn execute(
             virtual_tables,
             start,
             schema,
+            &variable_tables,
         ),
         PhysicalPlan::Aggregate {
             inner,
@@ -220,9 +222,16 @@ fn execute_expand(
         column_names_for_table(schema, &anchor.table.keyspace, &anchor.table.table);
 
     // Apply WHERE filters to anchor partitions using the expression evaluator.
+    // Skip partitions that are fully tombstoned (no live cells in any row
+    // and no live static row) — these represent deleted vertices whose
+    // tombstones have not yet been purged by compaction.
     let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
     let mut current_keys: Vec<DecoratedKey> = Vec::with_capacity(anchor_partitions.len());
     for partition in &anchor_partitions {
+        if is_partition_dead(partition) {
+            continue;
+        }
+
         let hex_id = hex::encode(partition.key.key.as_bytes());
         let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
         let mut bindings = HashMap::new();
@@ -588,6 +597,7 @@ fn execute_delete(
     virtual_tables: Option<&VirtualTableRegistry>,
     start: Instant,
     schema: Option<&Schema>,
+    variable_tables: &HashMap<String, String>,
 ) -> Result<GraphResult> {
     let expand_result = execute(expand, storage, keyspace, config, virtual_tables, schema)?;
     let mut stats = QueryStats::default();
@@ -607,11 +617,31 @@ fn execute_delete(
                 continue;
             }
 
-            if let Some(serde_json::Value::String(hex_id)) = row_values.get(col_idx) {
-                let key_bytes = hex::decode(hex_id)
+            // Extract the hex-encoded vertex ID from the expand result.
+            // The expand returns either:
+            //   - a JSON object with an `_id` field (Expr::Var bindings), or
+            //   - a plain hex string (legacy / property projection).
+            let hex_id = match row_values.get(col_idx) {
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(serde_json::Value::Object(map)) => {
+                    map.get("_id").and_then(|v| v.as_str()).map(String::from)
+                }
+                _ => None,
+            };
+
+            if let Some(hex_id) = hex_id {
+                let key_bytes = hex::decode(&hex_id)
                     .map_err(|e| GraphError::Internal(format!("invalid hex vertex ID: {e}")))?;
                 let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-                let table_id = TableId::new(keyspace, col_name);
+
+                // Use the resolved table name (e.g. "Person") rather than
+                // the Cypher variable name (e.g. "n") so the tombstone is
+                // written to the same table that the vertex lives in.
+                let table_name = variable_tables
+                    .get(col_name)
+                    .map(String::as_str)
+                    .unwrap_or(col_name);
+                let table_id = TableId::new(keyspace, table_name);
 
                 // Write a row-level tombstone.
                 let tombstone_row = Row {
@@ -1066,6 +1096,44 @@ pub fn extract_neighbor_id(clustering: &[u8], expected_label: Option<&str>) -> O
     }
 
     Some(clustering[pos..pos + id_len].to_vec())
+}
+
+/// Returns `true` if a partition has no live data — i.e., it is either
+/// partition-level deleted or every row has been tombstoned (row-level
+/// deletion with no surviving cells and no live static row). Such
+/// partitions represent deleted vertices that have not yet been purged
+/// by compaction and must be skipped during graph traversal.
+fn is_partition_dead(partition: &ferrosa_sstable::types::Partition) -> bool {
+    // Partition-level deletion with no surviving rows.
+    if !partition.deletion.is_live() && partition.rows.is_empty() {
+        return partition
+            .static_row
+            .as_ref()
+            .is_none_or(|sr| sr.cells.is_empty());
+    }
+
+    // If there are no rows at all and no static row, the partition is empty
+    // (but not necessarily deleted — could be a key-only entry). Treat as dead.
+    if partition.rows.is_empty() && partition.static_row.is_none() {
+        return true;
+    }
+
+    // Check whether every row is tombstoned: the row has a deletion marker
+    // and no surviving cells.
+    let all_rows_dead = partition
+        .rows
+        .iter()
+        .all(|row| !row.deletion.is_live() && row.cells.is_empty());
+
+    if !all_rows_dead {
+        return false;
+    }
+
+    // If all rows are dead, also check the static row.
+    partition
+        .static_row
+        .as_ref()
+        .is_none_or(|sr| sr.cells.is_empty())
 }
 
 /// Check whether the query has exceeded its timeout.

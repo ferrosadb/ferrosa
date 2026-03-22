@@ -456,6 +456,15 @@ impl<F: FlushTarget> TableStore<F> {
             merged.push(p);
         }
 
+        // Apply deletion suppression to all partitions. Partitions that
+        // came from a single source (no multi-source merge above) still
+        // need row-level and partition-level deletions applied because
+        // the memtable's merge-on-write sets deletion markers but does
+        // not suppress the covered cells.
+        for p in &mut merged {
+            merge::apply_deletions(p);
+        }
+
         // Apply range filter and limit
         let filtered: Vec<Partition> = merged
             .into_iter()

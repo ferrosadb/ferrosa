@@ -1424,10 +1424,9 @@ async fn route_insert(
             ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
             ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
             ColumnKind::Regular | ColumnKind::Static => {
-                let col_idx =
-                    table_meta.columns.get_index_of(col_name).ok_or_else(|| {
-                        CqlError::Invalid(format!("column '{}' not found", col_name))
-                    })? as u16;
+                let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+                    CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+                })?;
                 regular_cells.push((col_idx, value));
             }
         }
@@ -1618,11 +1617,9 @@ async fn route_update(
                 (column.as_str(), val)
             }
         };
-        let col_idx = table_meta
-            .columns
-            .get_index_of(col_name)
-            .ok_or_else(|| CqlError::Invalid(format!("column '{}' not found", col_name)))?
-            as u16;
+        let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+            CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+        })?;
         regular_cells.push((col_idx, value));
     }
 
@@ -1718,11 +1715,9 @@ async fn route_delete(
         .iter()
         .map(|target| {
             let col_name = target.column_name();
-            table_meta
-                .columns
-                .get_index_of(col_name)
-                .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))
-                .map(|idx| idx as u16)
+            table_meta.storage_column_index(col_name).ok_or_else(|| {
+                CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1924,10 +1919,9 @@ fn materialize_insert(
             ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
             ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
             ColumnKind::Regular | ColumnKind::Static => {
-                let col_idx =
-                    table_meta.columns.get_index_of(col_name).ok_or_else(|| {
-                        CqlError::Invalid(format!("column '{}' not found", col_name))
-                    })? as u16;
+                let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+                    CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+                })?;
                 regular_cells.push((col_idx, value));
             }
         }
@@ -2031,11 +2025,9 @@ fn materialize_update(
                 continue;
             }
         };
-        let col_idx = table_meta
-            .columns
-            .get_index_of(col_name)
-            .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?
-            as u16;
+        let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+            CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+        })?;
         regular_cells.push((col_idx, value));
     }
 
@@ -2114,11 +2106,9 @@ fn materialize_delete(
         .iter()
         .map(|target| {
             let col_name = target.column_name();
-            table_meta
-                .columns
-                .get_index_of(col_name)
-                .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))
-                .map(|idx| idx as u16)
+            table_meta.storage_column_index(col_name).ok_or_else(|| {
+                CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
