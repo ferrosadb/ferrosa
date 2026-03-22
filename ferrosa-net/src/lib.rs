@@ -4,6 +4,7 @@
 //! It is a standalone transport library with no dependency on ferrosa-common.
 //! ferrosa-cluster registers message handlers and reacts to peer events.
 
+pub mod accord_messages;
 pub mod codec;
 pub mod config;
 pub mod discovery;

@@ -138,6 +138,19 @@ pub enum Message {
     // Index build coordination -- opaque payloads
     IndexBuildRequest(Bytes),
     IndexBuildComplete(Bytes),
+
+    // Accord consensus — opaque payloads, ferrosa-cluster interprets
+    AccordPreAccept(Bytes),
+    AccordPreAcceptOK(Bytes),
+    AccordAccept(Bytes),
+    AccordAcceptOK(Bytes),
+    AccordCommit(Bytes),
+    AccordRead(Bytes),
+    AccordReadOK(Bytes),
+    AccordApply(Bytes),
+    AccordApplyOK(Bytes),
+    AccordRecover(Bytes),
+    AccordRecoverOK(Bytes),
 }
 
 impl Message {
@@ -173,6 +186,17 @@ impl Message {
             Self::BatchlogReplay(_) => MsgType::BatchlogReplay,
             Self::IndexBuildRequest(_) => MsgType::IndexBuildRequest,
             Self::IndexBuildComplete(_) => MsgType::IndexBuildComplete,
+            Self::AccordPreAccept(_) => MsgType::AccordPreAccept,
+            Self::AccordPreAcceptOK(_) => MsgType::AccordPreAcceptOK,
+            Self::AccordAccept(_) => MsgType::AccordAccept,
+            Self::AccordAcceptOK(_) => MsgType::AccordAcceptOK,
+            Self::AccordCommit(_) => MsgType::AccordCommit,
+            Self::AccordRead(_) => MsgType::AccordRead,
+            Self::AccordReadOK(_) => MsgType::AccordReadOK,
+            Self::AccordApply(_) => MsgType::AccordApply,
+            Self::AccordApplyOK(_) => MsgType::AccordApplyOK,
+            Self::AccordRecover(_) => MsgType::AccordRecover,
+            Self::AccordRecoverOK(_) => MsgType::AccordRecoverOK,
         }
     }
 
@@ -259,7 +283,18 @@ impl Message {
             | Self::BatchlogDelete(b)
             | Self::BatchlogReplay(b)
             | Self::IndexBuildRequest(b)
-            | Self::IndexBuildComplete(b) => buf.put_slice(b),
+            | Self::IndexBuildComplete(b)
+            | Self::AccordPreAccept(b)
+            | Self::AccordPreAcceptOK(b)
+            | Self::AccordAccept(b)
+            | Self::AccordAcceptOK(b)
+            | Self::AccordCommit(b)
+            | Self::AccordRead(b)
+            | Self::AccordReadOK(b)
+            | Self::AccordApply(b)
+            | Self::AccordApplyOK(b)
+            | Self::AccordRecover(b)
+            | Self::AccordRecoverOK(b) => buf.put_slice(b),
         }
         Ok(())
     }
@@ -377,6 +412,17 @@ impl Message {
             MsgType::IndexBuildComplete => {
                 Self::IndexBuildComplete(body.split_to(body.remaining()))
             }
+            MsgType::AccordPreAccept => Self::AccordPreAccept(body.split_to(body.remaining())),
+            MsgType::AccordPreAcceptOK => Self::AccordPreAcceptOK(body.split_to(body.remaining())),
+            MsgType::AccordAccept => Self::AccordAccept(body.split_to(body.remaining())),
+            MsgType::AccordAcceptOK => Self::AccordAcceptOK(body.split_to(body.remaining())),
+            MsgType::AccordCommit => Self::AccordCommit(body.split_to(body.remaining())),
+            MsgType::AccordRead => Self::AccordRead(body.split_to(body.remaining())),
+            MsgType::AccordReadOK => Self::AccordReadOK(body.split_to(body.remaining())),
+            MsgType::AccordApply => Self::AccordApply(body.split_to(body.remaining())),
+            MsgType::AccordApplyOK => Self::AccordApplyOK(body.split_to(body.remaining())),
+            MsgType::AccordRecover => Self::AccordRecover(body.split_to(body.remaining())),
+            MsgType::AccordRecoverOK => Self::AccordRecoverOK(body.split_to(body.remaining())),
         })
     }
 }
@@ -511,7 +557,7 @@ mod tests {
         fn decode_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
             let bytes = Bytes::from(data);
             // Try decoding as each message type — should return Ok or Err, never panic
-            for msg_type_byte in 0x01..=0x61u8 {
+            for msg_type_byte in 0x01..=0x7Au8 {
                 if let Ok(msg_type) = MsgType::try_from(msg_type_byte) {
                     let _ = Message::decode(msg_type, &mut bytes.clone());
                 }
