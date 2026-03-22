@@ -4,6 +4,7 @@
 //! protocol-level testing of the Accord (EPaxos-family) consensus protocol.
 
 pub mod clock_validation;
+pub mod coordinator;
 pub mod cross_shard;
 pub mod ddl_drain;
 pub mod dep_wait;
@@ -16,6 +17,9 @@ pub mod test_cluster;
 
 pub use clock_validation::{
     validate_timestamp_drift, ClockDriftRejection, DEFAULT_MAX_CLOCK_DRIFT_NS,
+};
+pub use coordinator::{
+    fast_quorum_size, slow_quorum_size, AccordCoordinator, CoordinatorDecision, CoordinatorPhase,
 };
 pub use cross_shard::{CrossShardCoordinator, CrossShardOutcome, ShardId, ShardResult};
 pub use ddl_drain::{DdlDrainGuard, DrainError};
