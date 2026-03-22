@@ -712,6 +712,7 @@ fn route_select(
                         IndexType::Composite => "COMPOSITES",
                         IndexType::Phonetic => "CUSTOM",
                         IndexType::Filtered => "CUSTOM",
+                        IndexType::Vector => "CUSTOM",
                     };
                     // Format options as a simple comma-separated key=value string
                     // (avoiding a serde_json dependency in this crate).
@@ -3129,6 +3130,7 @@ fn resolve_index_type(
         Some("composite") => Ok(IndexType::Composite),
         Some("phonetic") => Ok(IndexType::Phonetic),
         Some("filtered") => Ok(IndexType::Filtered),
+        Some("vector") => Ok(IndexType::Vector),
         Some(other) => Err(CqlError::Invalid(format!("unknown index type: {other}"))),
     }
 }
