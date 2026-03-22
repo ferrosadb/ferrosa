@@ -124,6 +124,7 @@ pub fn spawn_subscription_poll(
                         auth: &auth,
                         current_keyspace: &keyspace,
                         consistency: ferrosa_cluster::consistency::ConsistencyLevel::One,
+                        paging: crate::paging::PagingParams::default(),
                     };
                     match crate::router::route(&state, &ctx, inner.clone()).await {
                         Ok(RouteResult::Result(body)) => {

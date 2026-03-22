@@ -104,6 +104,8 @@ pub struct RequestContext<'a> {
     pub current_keyspace: &'a Option<String>,
     /// Client-requested consistency level parsed from the CQL protocol frame.
     pub consistency: ConsistencyLevel,
+    /// Pagination parameters from the QUERY/EXECUTE frame.
+    pub paging: crate::paging::PagingParams,
 }
 
 /// Result of routing a statement.
@@ -1355,8 +1357,30 @@ fn route_select_user_table(
         &selected_rows
     };
 
-    Ok(result::encode_rows(
-        &col_names, &col_types, ks, &s.table, limited,
+    // Apply pagination: page_size interacts with LIMIT.
+    // If both page_size and LIMIT are set, the effective limit is min(page_size, limit).
+    // Pagination operates on the already-limited result set.
+    let effective_page_size = match (ctx.paging.page_size, s.limit) {
+        (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
+        (Some(ps), None) => Some(ps),
+        (None, _) => None,
+    };
+
+    let paged = crate::paging::apply_pagination(
+        limited.len(),
+        effective_page_size,
+        ctx.paging.paging_state.as_deref(),
+    )?;
+
+    let page_rows = &limited[paged.start..paged.end];
+
+    Ok(result::encode_rows_paged(
+        &col_names,
+        &col_types,
+        ks,
+        &s.table,
+        page_rows,
+        paged.next_paging_state.as_deref(),
     ))
 }
 
@@ -5576,6 +5600,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // CREATE KEYSPACE
@@ -5623,6 +5648,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("USE my_ks").unwrap();
         match route(&state, &ctx, stmt).await.unwrap() {
@@ -5641,6 +5667,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -5670,6 +5697,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -5723,6 +5751,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM users WHERE id = 1").unwrap();
         assert!(route(&state, &ctx, stmt).await.is_err());
@@ -5735,6 +5764,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
         // Build a batch statement with > 500 entries programmatically
         let stmts: Vec<Statement> = (0..501)
@@ -5765,6 +5795,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.peers").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -5781,6 +5812,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system_schema.keyspaces").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -5841,6 +5873,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let _ = route(&state, &ctx, stmt).await;
@@ -5854,6 +5887,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace and table first
@@ -5939,6 +5973,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse("SELECT * FROM test_ks.test_vtable").unwrap();
@@ -6010,6 +6045,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -6062,6 +6098,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + table + hash index
@@ -6110,6 +6147,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace first
@@ -6149,6 +6187,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -6186,6 +6225,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -6216,6 +6256,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -6238,6 +6279,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -6267,6 +6309,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -6297,6 +6340,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &ks,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace first (with explicit ks in statement)
@@ -6322,6 +6366,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // CREATE TYPE without keyspace and no session keyspace
@@ -6337,6 +6382,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -6365,6 +6411,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace but no type
@@ -6392,6 +6439,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6423,6 +6471,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6454,6 +6503,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6486,6 +6536,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6502,6 +6553,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6526,6 +6578,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6550,6 +6603,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6574,6 +6628,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6653,6 +6708,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup: create keyspace and table
@@ -6721,6 +6777,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup
@@ -6750,6 +6807,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6797,6 +6855,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup: table with an index on `email` but NOT on `name`
@@ -6852,6 +6911,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6890,6 +6950,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6933,6 +6994,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup: table with composite key (pk, ck) and a value column
@@ -7074,6 +7136,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system_observability.connections").unwrap();
         let result = route(&state, &ctx, stmt).await;
@@ -7096,6 +7159,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt =
             crate::parser::parse("SELECT * FROM system_observability.active_queries").unwrap();
@@ -7125,6 +7189,7 @@ mod tests {
                 auth: &dev,
                 current_keyspace: &None,
                 consistency: ConsistencyLevel::One,
+                paging: crate::paging::PagingParams::default(),
             },
             use_stmt,
         )
@@ -7144,6 +7209,7 @@ mod tests {
                 auth: &dev,
                 current_keyspace: &Some(new_ks),
                 consistency: ConsistencyLevel::One,
+                paging: crate::paging::PagingParams::default(),
             },
             sel_stmt,
         )
@@ -7184,6 +7250,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -7230,6 +7297,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -7285,6 +7353,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -7319,6 +7388,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -7356,6 +7426,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace and function
@@ -7406,6 +7477,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE cur_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7419,6 +7491,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &cur_ks,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let hex_body = hex_encode(&minimal_wasm_component());
@@ -7450,6 +7523,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -7496,6 +7570,7 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace and table
