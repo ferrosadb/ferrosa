@@ -78,9 +78,15 @@ pub enum Message {
     },
     Ping {
         nonce: u64,
+        /// Sender's wall-clock time in nanoseconds when this Ping was sent.
+        sent_at: u64,
     },
     Pong {
         nonce: u64,
+        /// Wall-clock time (ns) when the Ping was received by the responder.
+        ping_recv_at: u64,
+        /// Wall-clock time (ns) when this Pong was sent by the responder.
+        sent_at: u64,
     },
 
     // Raft — opaque payloads, ferrosa-cluster interprets
@@ -202,7 +208,19 @@ impl Message {
                 buf.put_u8(if *accepted { 1 } else { 0 });
                 put_string(buf, reason)?;
             }
-            Self::Ping { nonce } | Self::Pong { nonce } => buf.put_u64(*nonce),
+            Self::Ping { nonce, sent_at } => {
+                buf.put_u64(*nonce);
+                buf.put_u64(*sent_at);
+            }
+            Self::Pong {
+                nonce,
+                ping_recv_at,
+                sent_at,
+            } => {
+                buf.put_u64(*nonce);
+                buf.put_u64(*ping_recv_at);
+                buf.put_u64(*sent_at);
+            }
             Self::PairCatchUp {
                 last_segment_id,
                 last_offset,
@@ -291,19 +309,22 @@ impl Message {
                 }
             }
             MsgType::Ping => {
-                if body.remaining() < 8 {
+                if body.remaining() < 16 {
                     return Err(NetError::Protocol("truncated ping".into()));
                 }
                 Self::Ping {
                     nonce: body.get_u64(),
+                    sent_at: body.get_u64(),
                 }
             }
             MsgType::Pong => {
-                if body.remaining() < 8 {
+                if body.remaining() < 24 {
                     return Err(NetError::Protocol("truncated pong".into()));
                 }
                 Self::Pong {
                     nonce: body.get_u64(),
+                    ping_recv_at: body.get_u64(),
+                    sent_at: body.get_u64(),
                 }
             }
             MsgType::PairCatchUp => {
@@ -367,11 +388,20 @@ mod tests {
 
     #[test]
     fn ping_roundtrip() {
-        let msg = Message::Ping { nonce: 42 };
+        let msg = Message::Ping {
+            nonce: 42,
+            sent_at: 1_000_000_000,
+        };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
         let decoded = Message::decode(MsgType::Ping, &mut buf.freeze()).unwrap();
-        assert_eq!(decoded, Message::Ping { nonce: 42 });
+        assert_eq!(
+            decoded,
+            Message::Ping {
+                nonce: 42,
+                sent_at: 1_000_000_000
+            }
+        );
     }
 
     #[test]

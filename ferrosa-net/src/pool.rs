@@ -325,7 +325,11 @@ mod tests {
     impl RpcHandler for EchoPingHandler {
         async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
             match msg {
-                Message::Ping { nonce } => Some(Message::Pong { nonce }),
+                Message::Ping { nonce, .. } => Some(Message::Pong {
+                    nonce,
+                    ping_recv_at: 0,
+                    sent_at: 0,
+                }),
                 _ => None,
             }
         }
@@ -351,8 +355,17 @@ mod tests {
             .unwrap();
 
         for lane in [Lane::Raft, Lane::Data, Lane::Bulk] {
-            let resp = pool.send(Message::Ping { nonce: 1 }, lane).await.unwrap();
-            assert!(matches!(resp, Message::Pong { nonce: 1 }));
+            let resp = pool
+                .send(
+                    Message::Ping {
+                        nonce: 1,
+                        sent_at: 0,
+                    },
+                    lane,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(resp, Message::Pong { nonce: 1, .. }));
         }
     }
 

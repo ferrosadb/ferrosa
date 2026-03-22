@@ -14,7 +14,11 @@ struct EchoPingHandler;
 impl RpcHandler for EchoPingHandler {
     async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
         match msg {
-            Message::Ping { nonce } => Some(Message::Pong { nonce }),
+            Message::Ping { nonce, .. } => Some(Message::Pong {
+                nonce,
+                ping_recv_at: 0,
+                sent_at: 0,
+            }),
             _ => None,
         }
     }
@@ -69,10 +73,17 @@ async fn two_peers_handshake_and_exchange_messages() {
 
     // Send Ping on data lane, receive Pong
     let resp = pm
-        .send(server_id, Message::Ping { nonce: 42 }, Lane::Data)
+        .send(
+            server_id,
+            Message::Ping {
+                nonce: 42,
+                sent_at: 0,
+            },
+            Lane::Data,
+        )
         .await
         .unwrap();
-    assert!(matches!(resp, Message::Pong { nonce: 42 }));
+    assert!(matches!(resp, Message::Pong { nonce: 42, .. }));
 }
 
 #[tokio::test]
@@ -99,10 +110,16 @@ async fn two_peers_with_psk_authentication() {
             .unwrap();
 
     let resp = client
-        .send(Message::Ping { nonce: 7 }, Lane::Raft)
+        .send(
+            Message::Ping {
+                nonce: 7,
+                sent_at: 0,
+            },
+            Lane::Raft,
+        )
         .await
         .unwrap();
-    assert!(matches!(resp, Message::Pong { nonce: 7 }));
+    assert!(matches!(resp, Message::Pong { nonce: 7, .. }));
 }
 
 #[tokio::test]

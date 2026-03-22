@@ -255,7 +255,11 @@ mod tests {
     impl RpcHandler for EchoPingHandler {
         async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
             match msg {
-                Message::Ping { nonce } => Some(Message::Pong { nonce }),
+                Message::Ping { nonce, .. } => Some(Message::Pong {
+                    nonce,
+                    ping_recv_at: 0,
+                    sent_at: 0,
+                }),
                 _ => None,
             }
         }
@@ -328,7 +332,10 @@ mod tests {
 
         // Send Ping
         use futures::{SinkExt, StreamExt};
-        let ping = Message::Ping { nonce: 42 };
+        let ping = Message::Ping {
+            nonce: 42,
+            sent_at: 0,
+        };
         let mut body = BytesMut::new();
         ping.encode(&mut body).unwrap();
         let frame = Frame {
@@ -346,7 +353,7 @@ mod tests {
         let resp_frame = framed.next().await.unwrap().unwrap();
         let resp =
             Message::decode(resp_frame.header.msg_type, &mut resp_frame.body.clone()).unwrap();
-        assert!(matches!(resp, Message::Pong { nonce: 42 }));
+        assert!(matches!(resp, Message::Pong { nonce: 42, .. }));
     }
 
     /// After shutdown(), the listener should stop accepting new connections.
@@ -416,7 +423,11 @@ mod tests {
         async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
             tokio::time::sleep(self.delay).await;
             match msg {
-                Message::Ping { nonce } => Some(Message::Pong { nonce }),
+                Message::Ping { nonce, .. } => Some(Message::Pong {
+                    nonce,
+                    ping_recv_at: 0,
+                    sent_at: 0,
+                }),
                 _ => None,
             }
         }
@@ -454,7 +465,10 @@ mod tests {
 
         // Send a Ping which will be processed slowly by SlowHandler.
         use futures::SinkExt;
-        let ping = Message::Ping { nonce: 99 };
+        let ping = Message::Ping {
+            nonce: 99,
+            sent_at: 0,
+        };
         let mut body = BytesMut::new();
         ping.encode(&mut body).unwrap();
         let frame = Frame {
@@ -484,7 +498,7 @@ mod tests {
         let resp =
             Message::decode(resp_frame.header.msg_type, &mut resp_frame.body.clone()).unwrap();
         assert!(
-            matches!(resp, Message::Pong { nonce: 99 }),
+            matches!(resp, Message::Pong { nonce: 99, .. }),
             "expected Pong nonce=99"
         );
 
