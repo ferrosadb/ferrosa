@@ -195,9 +195,33 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
 
         Term::BlobLiteral(b) => match target {
             CqlType::Blob => Ok(CqlValue::Blob(b.clone())),
+            // EXECUTE bind values may arrive as raw bytes (BlobLiteral) when
+            // the prepared statement's bound_columns couldn't be resolved.
+            // Decode them based on the target type rather than rejecting.
+            CqlType::Uuid | CqlType::Timeuuid if b.len() == 16 => {
+                let uuid = uuid::Uuid::from_bytes(b.as_slice().try_into().unwrap());
+                Ok(CqlValue::Uuid(uuid))
+            }
+            CqlType::Int if b.len() == 4 => Ok(CqlValue::Int(i32::from_be_bytes(
+                b.as_slice().try_into().unwrap(),
+            ))),
+            CqlType::Bigint | CqlType::Timestamp if b.len() == 8 => Ok(CqlValue::Bigint(
+                i64::from_be_bytes(b.as_slice().try_into().unwrap()),
+            )),
+            CqlType::Varchar | CqlType::Ascii => {
+                Ok(CqlValue::Text(String::from_utf8_lossy(b).to_string()))
+            }
+            CqlType::Boolean if b.len() == 1 => Ok(CqlValue::Boolean(b[0] != 0)),
+            CqlType::Float if b.len() == 4 => Ok(CqlValue::Float(u32::from_be_bytes(
+                b.as_slice().try_into().unwrap(),
+            ))),
+            CqlType::Double if b.len() == 8 => Ok(CqlValue::Double(u64::from_be_bytes(
+                b.as_slice().try_into().unwrap(),
+            ))),
             _ => Err(CqlError::Invalid(format!(
-                "type mismatch: expected {}, got blob literal",
-                cql_type_name(target)
+                "type mismatch: expected {}, got blob literal ({} bytes)",
+                cql_type_name(target),
+                b.len()
             ))),
         },
 
