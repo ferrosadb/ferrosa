@@ -3,6 +3,7 @@
 > Last updated: 2026-03-21
 > Status: Draft
 > Priority order: ferrosa (core DB) → ferrosa-memory → ferrosa-dbaas → Temporal compatibility
+> Strategy: Accord-first — no throwaway LWT; build CAS semantics on Accord
 
 ## Assumptions
 
@@ -14,9 +15,10 @@
 | A4 | Temporal's LWT usage is single-partition CAS (Paxos), not multi-partition | Validated (all IF conditions on same partition key) |
 | A5 | ferrosa-memory does not require transactions or LWT | Unvalidated — needs verification |
 | A6 | ferrosa-dbaas control plane uses BATCH for denormalized writes, not LWT | Validated (CLAUDE.md design invariants) |
-| A7 | Accord transactions are a superset of LWT but 14 weeks of work | Validated (project plan) |
-| A8 | Single-partition CAS (LWT) can be implemented without full Accord | Validated — Cassandra does this with Paxos |
+| A7 | Accord is a superset of LWT — single-partition CAS is just an Accord txn with a read-before-write in Execute | Validated (spec §4.4) |
+| A8 | LWT semantics (IF NOT EXISTS, IF col = ?) are implemented as Accord transactions, not a separate CAS mechanism | Decision — eliminates throwaway code |
 | A9 | Temporal requires LOCAL_SERIAL consistency level for LWT reads | Validated (research) |
+| A10 | Accord S1-S3 (foundation + state machine) must land before LWT is functional | Validated — LWT needs the Execute phase to do read-before-write |
 
 ## Estimation Methodology
 
@@ -38,15 +40,11 @@ ferrosa-memory ──needs──→ Core CQL (INSERT/SELECT/UPDATE/DELETE)     �
                           SUBSCRIBE                                  ✓ EXISTS
                           BATCH (logged)                             ✓ EXISTS
                           TTL                                        ✓ EXISTS
-                          ─────────────────────────────────────────
-                          BLOCKING GAPS: TBD (need integration test)
 
 ferrosa-dbaas  ──needs──→ Everything ferrosa-memory needs            ✓ EXISTS
                           Multi-node cluster (pair + Raft ring)      ✓ EXISTS
                           SUBSCRIBE DELTA                            ✓ EXISTS
                           Schema replication                         ✓ EXISTS
-                          ─────────────────────────────────────────
-                          BLOCKING GAPS: TBD (need integration test)
 
 Temporal       ──needs──→ Everything above, PLUS:
                           IF NOT EXISTS on INSERT (LWT)              ✗ PARSED, NOT ENFORCED
@@ -54,22 +52,42 @@ Temporal       ──needs──→ Everything above, PLUS:
                           IF column = ? on DELETE (LWT)              ✗ NOT PARSED
                           Batch CAS (logged batch with LWT)          ✗ MISSING
                           Pagination / paging state                  ✗ MISSING
-                          LOCAL_SERIAL consistency level              ✗ MISSING
+                          SERIAL / LOCAL_SERIAL consistency          ✗ MISSING
                           toTimestamp(now()) function                 ✗ MISSING
-                          Clustering ORDER BY DESC                   ? NEEDS CHECK
-                          ─────────────────────────────────────────
-                          BLOCKING GAPS: 7 features, all P0
+                          TTL() function (read remaining TTL)        ✗ MISSING
 ```
+
+## Strategy: Accord-First
+
+Instead of building throwaway single-partition Paxos, we build Accord foundations first,
+then implement LWT as Accord transactions:
+
+```
+IF NOT EXISTS → Accord txn with read_set={PK}, write_set={PK}
+                Execute phase: read row, check existence
+                Apply phase: write if not exists, return [applied]=true/false
+
+IF col = ?   → Accord txn with read_set={PK}, write_set={PK}
+                Execute phase: read row, evaluate conditions
+                Apply phase: write if conditions met, return [applied]=true/false
+
+Batch CAS    → Accord txn with read_set=union(PKs), write_set=union(PKs)
+                Execute phase: read all rows, check all conditions
+                Apply phase: apply all mutations if all conditions pass
+```
+
+This is elegant: LWT is just a pattern on top of Accord, not a separate mechanism.
+Temporal's single-partition CAS benefits from Accord's leaseholder fast path (1 RTT).
 
 ## Risk Register
 
 | Risk | Probability | Impact | Mitigation |
 |------|------------|--------|-----------|
-| ferrosa-memory has undiscovered CQL gaps | Medium | High | Run integration test suite early (Sprint M1) |
-| LWT without Accord is a dead-end | Low | Medium | Design LWT as stepping stone; Accord replaces Paxos-based CAS later |
+| ferrosa-memory has undiscovered CQL gaps | Medium | High | Run integration tests early (Sprint M1) |
+| Accord foundation takes longer than 6 weeks | Medium | High | Accord S1-S2 are well-specified with 302 tests; track velocity against plan |
 | Temporal's gocql driver uses CQL protocol features we haven't implemented | High | High | Run Temporal schema DDL against ferrosa first; instrument rejected queries |
 | Pagination requires significant protocol changes | Medium | Medium | CQL v5 paging is well-specified; implement at frame level |
-| Batch CAS semantics are complex (Scylla got it wrong) | High | High | Study Cassandra source, write property tests before implementation |
+| Batch CAS on Accord is untested pattern | Medium | High | Temporal's batch CAS is always same-partition; this is Accord single-shard fast path |
 
 ---
 
@@ -88,7 +106,7 @@ Temporal       ──needs──→ Everything above, PLUS:
 | M1.3 | Performance baseline: measure ferrosa-memory latency vs Cassandra | S | Latency comparison recorded. No P99 > 100ms for single-key operations. | `ferrosa_memory_latency_baseline` |
 | M1.4 | Document ferrosa + ferrosa-memory deployment in docker-compose | S | `docker-compose up` starts both services, tools work | `docker_compose_smoke` |
 
-**Estimated effort:** 1 sprint (2 weeks). Most work is validation, not implementation.
+**Estimated effort:** 1 sprint (2 weeks). Mostly validation, not implementation.
 
 ---
 
@@ -102,146 +120,150 @@ Temporal       ──needs──→ Everything above, PLUS:
 
 | # | Task | Size | Success Criteria | Tests |
 |---|------|------|-----------------|-------|
-| D1.1 | Run ferrosa-dbaas schema DDL against ferrosa (all 4 keyspaces: control, billing, metrics, audit) | M | All tables, types, indexes created successfully | `dbaas_schema_ddl` |
+| D1.1 | Run ferrosa-dbaas schema DDL against ferrosa (4 keyspaces: control, billing, metrics, audit) | M | All tables, types, indexes created successfully | `dbaas_schema_ddl` |
 | D1.2 | Run ferrosa-dbaas integration tests against ferrosa | M | Tenant CRUD, metering writes, billing reads all pass | `dbaas_integration_smoke` |
-| D1.3 | Test pair mode: provision HA tenant with 2 ferrosa VMs | L | Pair replication works. Write to primary, read from secondary. Failover works. | `dbaas_pair_mode_ha` |
+| D1.3 | Test pair mode: provision HA tenant with 2 ferrosa VMs | L | Pair replication works. Failover works. | `dbaas_pair_mode_ha` |
 | D1.4 | Test ring mode: provision Scale tenant with 3 ferrosa nodes | L | Raft quorum, QUORUM reads/writes, node failure recovery | `dbaas_ring_mode_scale` |
-| D1.5 | Fix any CQL gaps discovered by D1.1-D1.4 | S-L | All dbaas tests pass | Per-gap tests |
+| D1.5 | Fix any CQL gaps discovered | S-L | All dbaas tests pass | Per-gap tests |
 
-**Estimated effort:** 1 sprint (2 weeks). Heavier testing than Stream 1 due to multi-node modes.
-
----
-
-## Stream 3: Temporal Pre-Requisite CQL Features (Weeks 5-10)
-
-**Goal:** All CQL features Temporal requires are implemented and tested.
-
-**Gate:** Temporal schema DDL executes. Temporal's Go integration test suite passes against ferrosa.
-
-This is the largest stream. Temporal needs 7 missing features, ordered by dependency:
-
-### Sprint T1: LWT Foundation — IF NOT EXISTS + IF Conditions (Weeks 5-6)
-
-LWT is Temporal's most critical requirement. Every workflow state mutation uses it.
-
-| # | Task | Size | Success Criteria | Tests |
-|---|------|------|-----------------|-------|
-| T1.1 | Enforce IF NOT EXISTS on INSERT: read-before-write CAS in storage engine. If row exists, return `[applied]=false` with existing row. | L | `INSERT INTO t (id, v) VALUES (1, 'a') IF NOT EXISTS` returns `[applied]=true` first time, `[applied]=false` with existing values second time. | `lwt_insert_if_not_exists`, `lwt_insert_if_not_exists_idempotent` |
-| T1.2 | Parse IF conditions on UPDATE: `UPDATE t SET v = ? WHERE id = ? IF col = ?`. Add `IfCondition { column, operator, value }` to AST. | M | Parser produces `UpdateStatement.if_conditions: Vec<IfCondition>`. Supports `=`, `!=`, `<`, `>`, `<=`, `>=`, `IN`. | `parse_update_if_condition`, `parse_update_if_multi_condition` |
-| T1.3 | Enforce IF conditions on UPDATE: read current row, check conditions, apply or return `[applied]=false`. | L | `UPDATE t SET v = 'b' WHERE id = 1 IF v = 'a'` succeeds when v='a', returns `[applied]=false` with current values when v!='a'. | `lwt_update_if_condition`, `lwt_update_if_condition_false` |
-| T1.4 | Parse and enforce IF conditions on DELETE: `DELETE FROM t WHERE id = ? IF col = ?` | M | Same semantics as UPDATE IF. Returns `[applied]=true/false`. | `lwt_delete_if_condition` |
-| T1.5 | Parse and enforce IF EXISTS on UPDATE/DELETE (simple form, no column condition) | S | `UPDATE t SET v = ? WHERE id = ? IF EXISTS` returns `[applied]=false` if row doesn't exist. | `lwt_update_if_exists`, `lwt_delete_if_exists` |
-| T1.6 | LWT result set format: return `[applied]` boolean column plus existing row values on failure | M | Result set contains `[applied]` as first column. On `[applied]=false`, remaining columns contain the current row values (Temporal reads these). | `lwt_result_set_format` |
-| T1.7 | Single-partition CAS atomicity: LWT operations on same partition key are serialized (mutual exclusion) | L | Two concurrent `INSERT IF NOT EXISTS` on same PK: exactly one gets `[applied]=true`. No lost updates. Use per-partition lock or Paxos-lite. | `lwt_single_partition_serialization` |
-
-### Sprint T2: Batch CAS + Consistency Levels (Weeks 7-8)
-
-Temporal wraps every workflow mutation in a logged batch with CAS conditions.
-
-| # | Task | Size | Success Criteria | Tests |
-|---|------|------|-----------------|-------|
-| T2.1 | Batch CAS: logged batch containing LWT statements executes atomically. All conditions checked, all-or-nothing apply. | XL | Batch with 3 statements (INSERT IF NOT EXISTS + UPDATE IF range_id = ? + INSERT). If any condition fails, entire batch fails with `[applied]=false`. | `batch_cas_all_or_nothing`, `batch_cas_partial_failure` |
-| T2.2 | Batch CAS result format: on failure, return per-statement `[applied]` plus the offending row values | L | Temporal's `MapExecuteBatchCAS` reads per-row results to determine which condition failed. Format must match gocql expectations. | `batch_cas_result_format` |
-| T2.3 | Add SERIAL and LOCAL_SERIAL consistency levels | M | `ConsistencyLevel::Serial` and `LocalSerial` variants. CQL wire codes 0x0008 and 0x0009. Used for LWT reads (serial consistency for the CAS operation). | `consistency_serial_wire_code`, `consistency_local_serial` |
-| T2.4 | Serial consistency in QUERY/EXECUTE frames: parse `serial_consistency` field from CQL v5 frame when `flags & 0x0010` is set | M | Driver sends serial_consistency=LOCAL_SERIAL. Server reads it from the frame and uses it for LWT operations. | `frame_serial_consistency_parse` |
-| T2.5 | LWT read-your-writes: after a successful LWT write at LOCAL_SERIAL, a subsequent read at LOCAL_QUORUM must see the written value | L | Write with IF NOT EXISTS (serial). Read with QUORUM. Assert: read sees the write. No stale reads after LWT. | `lwt_read_your_writes` |
-
-### Sprint T3: Pagination + Built-in Functions (Weeks 9-10)
-
-Temporal paginates over history nodes and task queues.
-
-| # | Task | Size | Success Criteria | Tests |
-|---|------|------|-----------------|-------|
-| T3.1 | Implement result set pagination: `page_size` in QUERY frame, `paging_state` in RESULT frame | L | Query with page_size=100 on a table with 500 rows returns 100 rows + a paging_state token. Second query with same paging_state returns next 100. After 5 pages, paging_state is empty. | `pagination_basic`, `pagination_multi_page`, `pagination_end` |
-| T3.2 | Pagination state encoding: opaque token that encodes the last-seen clustering key position | M | Paging state is a serialized cursor (partition key + clustering key position). Deserializable across different nodes (for driver-level routing). | `pagination_state_roundtrip`, `pagination_cross_node` |
-| T3.3 | Implement `now()` CQL function: returns a Timeuuid (type 1 UUID) | M | `SELECT now() FROM system.local` returns a valid Timeuuid. `INSERT INTO t (id, ts) VALUES (1, now())` stores a Timeuuid. | `cql_function_now` |
-| T3.4 | Implement `toTimestamp(timeuuid)` CQL function: converts Timeuuid to timestamp | S | `SELECT toTimestamp(now()) FROM system.local` returns a timestamp. | `cql_function_to_timestamp` |
-| T3.5 | Implement `TTL(column)` CQL function: returns remaining TTL of a cell | M | `INSERT INTO t (id, v) VALUES (1, 'a') USING TTL 3600`. `SELECT TTL(v) FROM t WHERE id = 1` returns ~3600. | `cql_function_ttl` |
-| T3.6 | Verify clustering ORDER BY DESC works for Temporal's history_node table | S | `CREATE TABLE ... WITH CLUSTERING ORDER BY (txn_id DESC)`. SELECT returns rows in descending txn_id order. | `clustering_order_desc` |
-| T3.7 | Run Temporal schema DDL against ferrosa: all 14 tables, 2 indexes, 1 UDT created successfully | L | `temporal-sql-tool create -plugin cassandra` completes without errors. All tables visible in system_schema. | `temporal_schema_ddl` |
-| T3.8 | Run Temporal Go integration tests against ferrosa | XL | Temporal's persistence test suite (shard store, execution store, history store, metadata store) passes. Identify remaining gaps. | `temporal_integration_suite` |
+**Estimated effort:** 1 sprint (2 weeks).
 
 ---
 
-## Stream 4: Accord Transactions (Weeks 11-24)
+## Stream 3: Accord Foundation + CQL Permanents (Weeks 5-10)
 
-**Goal:** Strict-serializable ACID transactions across partitions.
+**Goal:** Accord state machine operational for single-key writes. LWT-independent CQL
+features (pagination, functions, IF condition parsing) built in parallel.
 
-**Gate:** Jepsen full-nemesis suite passes.
+This stream merges Accord S1-S3 with the permanent CQL work that Temporal needs regardless
+of the transaction mechanism.
 
-Accord is the long-pole. It replaces the single-partition CAS (from Stream 3) with a
-leaderless protocol that also handles multi-partition transactions. The single-partition
-LWT from Stream 3 is NOT throwaway — it becomes the "fast path" in Accord for single-partition
-CAS operations.
+### Sprint A1: Accord Types + CQL Parsing (Weeks 5-6)
 
-### Transition Path: LWT → Accord
+Combines Accord S1 (core types) with Temporal CQL parsing work. Both are foundational,
+no dependencies between them, maximum parallelism.
 
-| Feature | Stream 3 (LWT) | Stream 4 (Accord) |
-|---------|----------------|-------------------|
-| Single-partition IF NOT EXISTS | Per-partition lock/Paxos-lite | Accord fast path (leaseholder, 1 RTT) |
-| Single-partition IF col = ? | Per-partition lock/Paxos-lite | Accord fast path |
-| Batch CAS (same partition) | Per-partition lock | Accord single-shard |
-| Multi-partition transactions | NOT SUPPORTED | Accord multi-shard (2 RTTs) |
-| Serializable reads | LOCAL_SERIAL as CL | Accord linearizable reads via dep-check |
+| # | Task | Size | Success Criteria | Tests | Source |
+|---|------|------|-----------------|-------|--------|
+| A1.1 | Implement `Timestamp` type (epoch, time, seq, node), `HybridLogicalClock`, `TxnId`, `AcceptedBallot`/`PromisedBallot` newtypes | M | Types compile. Ord correct. Ballots are distinct types. HLC monotonic. | 38 tests (Layer 1 test spec) | Accord S1.1-S1.3 |
+| A1.2 | Implement `TxnState` with two ballot fields, phase flags, deps | S | Invariant `accepted_ballot <= max_ballot_seen` enforced. Phase transitions forward-only. | 9 tests (Layer 1.3 test spec) | Accord S1.4 |
+| A1.3 | Implement `ConflictIndex` (HashMap + BTreeMap + indexed_writes) | L | O(1) single-key, O(log n) range. Hard cap. GC after Applied. | 9 tests (Layer 1.4 test spec) | Accord S1.7 |
+| A1.4 | Implement dual-log architecture: protocol log (local-only) + main log | L | Protocol entries never in S3 queue. GC after Applied. Replay on startup. | 7 tests (infrastructure spec) | Accord S1.5 |
+| A1.5 | Implement fsync-before-ack wrapper | S | Persist before reply on all handlers. | 5 tests (infrastructure spec) | Accord S1.6 |
+| A1.6 | Build `TestCluster` deterministic message harness | L | FIFO/out-of-order delivery, drop, drain, no-tokio. | 6 tests (infrastructure spec) | Missing task X1 |
+| A1.7 | Implement 24-step EPaxos correctness test | M | Test passes. Mutation testing proves it catches real bugs. | 1 test, 24 assertions + 5 mutations (Layer 5) | Accord S1.9 |
+| A1.8 | Parse IF conditions on UPDATE/DELETE: `IF col = ?`, `IF col != ?`, `IF col IN ?` | M | Parser produces `if_conditions: Vec<IfCondition>`. Multiple conditions with AND. | `parse_update_if_condition`, `parse_delete_if_condition` | Temporal T1.2 |
+| A1.9 | Implement pagination: `page_size` in QUERY frame, `paging_state` in RESULT frame | L | 500-row table, page_size=100 → 5 pages. Paging state is opaque, cross-node compatible. | `pagination_basic`, `pagination_multi_page`, `pagination_state_roundtrip` | Temporal T3.1-T3.2 |
+| A1.10 | Implement Accord write gate (non-transactional writes check ConflictIndex) | M | Non-txn INSERT to key with in-flight Accord txn is routed through Accord. | 4 tests (infrastructure spec) | Accord S1.8, FM16 |
 
-Stream 3's `T1.7` (per-partition serialization) is the component that gets replaced by
-Accord's AccordStateMachine. The parser work (IF conditions), result format, and pagination
-are permanent.
+### Sprint A2: Accord Protocol + CQL Functions (Weeks 7-8)
 
-### Accord Sprint Plan (from specs/accord-project-plan.md)
+Combines Accord S2 (ReorderBuffer, heartbeat, recovery) with Temporal's CQL function work.
 
-| Sprint | Weeks | Focus | Gate |
-|--------|-------|-------|------|
-| S1 | 11-12 | Core types, ConflictIndex, protocol log, 24-step test | Unit tests pass |
-| S2 | 13-14 | ReorderBuffer, heartbeat, recovery foundation | Phase 0 gate |
-| S3 | 15-16 | AccordStateMachine, coordinator, dep-wait, DDL drain | State machine tests pass |
-| S4 | 17-18 | MemIndex, sidecar files, Jepsen register, perf baseline | Phase 1 gate |
-| S5 | 19-20 | BEGIN/COMMIT/ROLLBACK, cross-shard, Jepsen bank | Phase 2 gate |
-| S6 | 21-22 | Transactional 2i, READ_2I algorithm | Phase 3 gate |
-| S7 | 23-24 | Electorate reconfiguration, full Jepsen + chaos | Phase 4 gate |
+| # | Task | Size | Success Criteria | Tests | Source |
+|---|------|------|-----------------|-------|--------|
+| A2.1 | Extend heartbeat with `sent_at`/`recv_at`, per-link RTT, SkewMax measurement | L | P99.9 skew from heartbeats. Hard ceiling. Outlier rejection. | 7 tests (infrastructure spec) | Accord S2.1-S2.2 |
+| A2.2 | Implement `ReorderBuffer` with TimerWheel | L | Messages in t0 order. Deadline formula correct. Overflow → backpressure. | 5 tests (infrastructure spec) | Accord S2.3 |
+| A2.3 | Add 11 Accord protocol message types to ferrosa-net | M | All roundtrip correctly. Unique type codes. Size bounded. | 4 tests (infrastructure spec) | Accord S2.8 |
+| A2.4 | Implement `RecoveryCoordinator` foundation | L | Selects by `max(accepted_ballot)`. Majority quorum. | Layer 3.4 + Layer 4.3 tests | Accord S2.5 |
+| A2.5 | ConflictIndex GC: respect in-flight deps, evict only applied | M | Dep-waiters never evicted. | 2 tests (infrastructure spec) | Accord S2.4 |
+| A2.6 | `MAX_CLOCK_DRIFT` validation at replica | S | Reject future timestamps. Don't advance HLC. | 2 tests (infrastructure spec) | Accord S2.9 |
+| A2.7 | Implement `now()` → Timeuuid, `toTimestamp(timeuuid)` → timestamp, `TTL(column)` → int | M | `SELECT toTimestamp(now())` works. `SELECT TTL(v)` returns remaining TTL. | `cql_function_now`, `cql_function_to_timestamp`, `cql_function_ttl` | Temporal T3.3-T3.5 |
+| A2.8 | Add SERIAL and LOCAL_SERIAL consistency levels + serial_consistency in QUERY frame | M | Wire codes 0x0008/0x0009. Parsed from frame flags. | `consistency_serial_wire_code`, `frame_serial_consistency_parse` | Temporal T2.3-T2.4 |
+| A2.9 | Late data debouncer Accord timestamp ordering | M | Deterministic across replicas. | 4 tests (UDF integration spec) | Accord S2.6 |
 
-See `specs/accord-project-plan.md` for the full 56-task breakdown with 302 specified tests
-across 7 test spec documents.
+### Sprint A3: AccordStateMachine + LWT on Accord (Weeks 9-10)
+
+The state machine lands, and LWT is implemented as an Accord transaction pattern.
+
+| # | Task | Size | Success Criteria | Tests | Source |
+|---|------|------|-----------------|-------|--------|
+| A3.1 | Implement `AccordStateMachine`: PreAccept, Accept, Commit, Execute, Apply handlers. FireAndForget flag for CL=ONE. | XL | Phase transitions match spec. Persists before reply. Idempotent. Fire-and-forget ACKs after PreAccept. | 8 tests (Layer 2.1) + 7 tests (Layer 2.2) + 20 tests (Layer 3) | Accord S3.1 |
+| A3.2 | Implement `AccordCoordinator`: leaseholder fast path, slow path fallback | L | 1 RTT leaseholder, 2 RTT non-leaseholder. Quorum formula correct. | 5 tests (Layer 4.2) + quorum tests | Accord S3.2 |
+| A3.3 | Wire CQL router to AccordCoordinator for all DML in cluster mode | M | INSERT/UPDATE/DELETE go through Accord. | `cql_route_through_accord` | Accord S3.7 |
+| A3.4 | Implement LWT as Accord transaction: IF NOT EXISTS → Accord txn with read-before-write in Execute | L | `INSERT IF NOT EXISTS` returns `[applied]=true/false`. Correct result set format. Single-partition, 1 RTT via leaseholder. | `lwt_insert_if_not_exists`, `lwt_result_set_format` | Temporal T1.1, T1.6 |
+| A3.5 | Implement LWT: IF conditions on UPDATE/DELETE → Accord txn with condition evaluation in Execute | L | `UPDATE ... IF col = ?` succeeds when condition met, returns `[applied]=false` with current values otherwise. | `lwt_update_if_condition`, `lwt_delete_if_condition` | Temporal T1.3-T1.5 |
+| A3.6 | Implement Batch CAS: logged batch with LWT → single Accord txn, all conditions checked in Execute | XL | Batch with multiple LWT statements: all-or-nothing. Per-row `[applied]` on failure. | `batch_cas_all_or_nothing`, `batch_cas_result_format` | Temporal T2.1-T2.2 |
+| A3.7 | Dep-wait with cycle detection | L | Waits-for graph. Cycle broken by aborting highest t0. Timeout 10s. | 7 tests (integration spec) | Accord S3.3 |
+| A3.8 | DDL drain-and-block | M | Table unavailable during DDL. In-flight complete. | 4 tests (integration spec) | Accord S3.8 |
 
 ---
 
-## Stream 5: Missing Project Plan Tasks (Cross-Cutting)
+## Stream 4: Temporal Validation + Accord Completion (Weeks 11-18)
 
-These items were identified during the test spec audit as having tests but no sprint task.
-They need to be scheduled.
+**Goal:** Temporal runs against ferrosa. Accord gets MemIndex, multi-key, and Jepsen.
 
-| # | Task | Size | Target Sprint | Rationale |
-|---|------|------|--------------|-----------|
-| X1 | Build `TestCluster` deterministic message harness | L | S1 (Accord) | Prerequisite for 24-step test and all Layer 4 scenario tests |
-| X2 | Build Jepsen infrastructure (cluster provisioning, Go/Clojure client, nemesis ops) | XL | T3 or S3 | Prerequisite for S4.5 (Jepsen register) and T3.8 (Temporal integration) |
-| X3 | Implement ExclusiveSyncPoint / DurabilityService | L | S4 (Accord) | Required for sidecar file GC, protocol log GC, ConflictIndex cleanup |
-| X4 | Implement Accord observability metrics (9 Prometheus gauges/counters) | M | S3 (Accord) | Required by threat model for alarm thresholds |
-| X5 | Build performance benchmark harness with CI regression detection | M | T3 or S4 | Required for S4.6 (perf baseline) and S7.9 (perf regression suite) |
+### Sprint A4: Temporal Integration + MemIndex (Weeks 11-12)
+
+| # | Task | Size | Success Criteria | Tests | Source |
+|---|------|------|-----------------|-------|--------|
+| A4.1 | Run Temporal schema DDL against ferrosa (14 tables, 2 indexes, 1 UDT) | L | `temporal-sql-tool create` completes without errors | `temporal_schema_ddl` | Temporal T3.7 |
+| A4.2 | Run Temporal Go integration tests against ferrosa | XL | Shard store, execution store, history store, metadata store tests pass. Identify remaining gaps. | `temporal_integration_suite` | Temporal T3.8 |
+| A4.3 | Fix Temporal integration gaps discovered by A4.2 | L | All Temporal persistence tests pass | Per-gap tests | |
+| A4.4 | Implement `MemIndex` (BTreeMap, atomic with memtable, flush GC) | M | Lookup, update-replaces, delete-removes, flush GC boundary. | 13 tests (memindex spec) | Accord S4.1-S4.3 |
+| A4.5 | Leaseholder assignment with staleness detection | M | Failover updates. Epoch mismatch detected. | 5 tests (integration spec) | Accord S3.4 |
+| A4.6 | Linearizable local read (dep-check against ConflictIndex) | M | Read waits for in-flight txns to Apply. | 4 tests (integration spec) | Accord S3.5 |
+
+### Sprint A5: Jepsen Register + Crash Recovery (Weeks 13-14)
+
+| # | Task | Size | Success Criteria | Tests | Source |
+|---|------|------|-----------------|-------|--------|
+| A5.1 | Build Jepsen infrastructure (cluster provisioning, client, nemesis) | XL | 3-node cluster, CQL client, partition+kill+slow+clock-skew nemesis | 8 tests (system spec) | Missing task X2 |
+| A5.2 | Jepsen register test | L | Knossos linearizability: zero violations with kill + partition nemesis | `jepsen_register_linearizability` | Accord S4.5 |
+| A5.3 | Commit log replay on startup | M | TxnState reconstructed. Applied txns not re-applied. ConflictIndex rebuilt. | 4 tests (integration spec) | Accord S3.6 |
+| A5.4 | Sidecar `.accord` file (write on flush, recovery read, GC) | M | Zero per-row overhead. Recovery reads sidecar. Normal reads ignore it. | 6 tests (memindex spec) | Accord S4.9 |
+| A5.5 | Eager index build on flush | S | Index build at Priority::High after each flush. | 3 tests (memindex spec) | Accord S4.4 |
+| A5.6 | Performance baseline: P50/P99 vs QUORUM baseline | M | P50 within +15%. | `perf_single_key_write_p50/p99` | Accord S4.6 |
+| A5.7 | SUBSCRIBE dual timestamps (accord_ts + apply_ts) | S | Events carry both. Default ordering by accord_ts. | 4 tests (memindex spec) | Accord S4.10 |
+| A5.8 | ExclusiveSyncPoint / DurabilityService | L | GC coordinator for sidecar files, protocol log, ConflictIndex | 7 tests (system spec) | Missing task X3 |
+
+### Sprint A6: Multi-Key Transactions + Jepsen Bank (Weeks 15-16)
+
+| # | Task | Size | Success Criteria | Tests | Source |
+|---|------|------|-----------------|-------|--------|
+| A6.1 | BEGIN TRANSACTION / COMMIT / ROLLBACK parser | M | Multi-statement accumulation in session state. | `parse_begin_commit_rollback` | Accord S5.1 |
+| A6.2 | Read-set / write-set extraction | M | Union sets from accumulated statements. | `readset_writeset_extraction` | Accord S5.2 |
+| A6.3 | Cross-shard Execute with partial failure handling | L | All-or-nothing. Parallel reads. | 5 tests (multikey spec) | Accord S5.3 |
+| A6.4 | Client retry with same TxnId (idempotent) | M | Recovery returns existing result. | 3 tests (multikey spec) | Accord S5.4 |
+| A6.5 | Transaction limits (16 concurrent, 10s timeout, 128 max keys) | S | Overloaded on limit. Auto-abort on timeout. | 4 tests (multikey spec) | Accord S5.8-S5.9 |
+| A6.6 | Jepsen bank test | L | Total balance invariant. Atomicity with nemesis. | `jepsen_bank_atomicity` | Accord S5.6 |
+| A6.7 | Jepsen write-skew test | M | No lost updates under strict serializability. | `jepsen_write_skew` | Accord S5.7 |
+| A6.8 | Accord observability metrics (9 Prometheus gauges/counters) | M | txn_in_flight, recovery_in_progress, fast_path_ratio, etc. | 9 tests (system spec) | Missing task X4 |
+
+### Sprint A7: Transactional 2i + Electorate (Weeks 17-18)
+
+| # | Task | Size | Success Criteria | Tests | Source |
+|---|------|------|-----------------|-------|--------|
+| A7.1 | READ_2I 5-layer algorithm | XL | Layers 1-5 queried. Dep-wait. No phantoms. | 8 tests (memindex spec) | Accord S6.1 |
+| A7.2 | Epoch propagation + mismatch fallback | M | Every message carries epoch. Mismatch → slow path. | 3 tests (multikey spec) | Accord S7.1-S7.2 |
+| A7.3 | JoinElectorate protocol (4 gates) | L | New member waits for all gates. | 3 tests (multikey spec) | Accord S7.3 |
+| A7.4 | Electorate shrink + quorum resize | M | Dynamic quorum. Vote validation. | 3 tests (multikey spec) | Accord S7.4, S7.6 |
+| A7.5 | Epoch transition drain | M | 30s drain. In-flight complete. | 3 tests (multikey spec) | Accord S7.5 |
+| A7.6 | Two-phase DDL | L | DDL pending marker. Dep-wait. | 4 tests (multikey spec) | Accord S7.10 |
+| A7.7 | Jepsen full-nemesis suite + chaos test | XL | All workloads + all nemesis. Zero data loss. | 5 tests (system spec) | Accord S7.7-S7.8 |
+| A7.8 | Performance regression suite | M | All benchmarks pass thresholds. | 7 tests (system spec) | Accord S7.9 |
+| A7.9 | UDF/UDA branch integration (DeleteTarget, token_fn, LWW, pk_indexes) | M | All roundtrips. Deterministic. Idempotent. | 23 tests (UDF integration spec) | UDF branch merge |
 
 ---
 
 ## Unified Timeline
 
 ```
-Week  1-2:  M1 — ferrosa-memory integration validation
-Week  3-4:  D1 — ferrosa-dbaas control plane validation
-Week  5-6:  T1 — LWT: IF NOT EXISTS, IF conditions, single-partition CAS
-Week  7-8:  T2 — Batch CAS, SERIAL/LOCAL_SERIAL consistency
-Week  9-10: T3 — Pagination, built-in functions, Temporal schema + integration
-Week 11-12: S1 — Accord foundation: types, ConflictIndex, 24-step test
-Week 13-14: S2 — Accord: ReorderBuffer, heartbeat, recovery
-Week 15-16: S3 — Accord: state machine, coordinator, dep-wait
-Week 17-18: S4 — Accord: MemIndex, sidecar, Jepsen register
-Week 19-20: S5 — Accord: multi-key transactions, Jepsen bank
-Week 21-22: S6 — Accord: transactional 2i
-Week 23-24: S7 — Accord: electorate, full Jepsen + chaos
+Week  1-2:  M1  — ferrosa-memory integration validation
+Week  3-4:  D1  — ferrosa-dbaas control plane validation
+Week  5-6:  A1  — Accord types + ConflictIndex + 24-step test + pagination + IF parsing
+Week  7-8:  A2  — ReorderBuffer + heartbeat + recovery + CQL functions + SERIAL CL
+Week  9-10: A3  — AccordStateMachine + LWT-on-Accord + Batch CAS + dep-wait
+Week 11-12: A4  — Temporal integration + MemIndex + leaseholder
+Week 13-14: A5  — Jepsen register + crash recovery + sidecar + DurabilityService
+Week 15-16: A6  — Multi-key transactions + Jepsen bank + observability
+Week 17-18: A7  — Transactional 2i + electorate + full Jepsen + chaos
 ```
 
-**Total: 24 weeks (12 sprints)**
+**Total: 18 weeks (9 sprints)**
 
-- Weeks 1-4: Integration validation (ferrosa-memory + ferrosa-dbaas)
-- Weeks 5-10: Temporal CQL compatibility (LWT, batch CAS, pagination)
-- Weeks 11-24: Accord distributed transactions (full protocol)
+Reduced from 24 weeks by eliminating throwaway LWT and merging Accord foundation with
+CQL permanent work.
 
 ## Phase Gates
 
@@ -249,37 +271,39 @@ Week 23-24: S7 — Accord: electorate, full Jepsen + chaos
 |-------|------|------|-------------|
 | Memory | 2 | ferrosa-memory 12 MCP tools work | `cargo test` in ferrosa-memory |
 | DBaaS | 4 | Control plane CRUD + metering + billing work | `cargo test` in ferrosa-dbaas |
-| Temporal CQL | 6 | LWT IF NOT EXISTS + IF conditions pass | Unit + property tests |
-| Temporal CQL | 8 | Batch CAS + serial consistency pass | Batch CAS property tests |
-| Temporal CQL | 10 | Temporal schema DDL + Go integration pass | `temporal-sql-tool create` + Go test suite |
-| Accord Phase 0 | 14 | 24-step EPaxos test + unit tests | CI gate |
-| Accord Phase 1 | 18 | Jepsen register + P50 within 15% | Jepsen + benchmark |
-| Accord Phase 2 | 20 | Jepsen bank + write-skew | Jepsen suite |
-| Accord Phase 3 | 22 | 2i correctness + dep-wait P99 < 5ms | Integration + benchmark |
-| Accord Phase 4 | 24 | Jepsen full nemesis + chaos | Full Jepsen + chaos suite |
-
-## Test Count by Stream
-
-| Stream | Tests | Source |
-|--------|-------|--------|
-| ferrosa-memory (M1) | ~12 | Integration smoke |
-| ferrosa-dbaas (D1) | ~10 | Integration + multi-node |
-| Temporal CQL (T1-T3) | ~30 | LWT, batch CAS, pagination, functions |
-| Accord (S1-S7) | ~302 | 7 test spec documents |
-| **Total** | **~354** | |
+| Accord Phase 0 | 8 | 24-step EPaxos test + foundation unit tests | CI gate (302 tests from 7 spec files) |
+| LWT on Accord | 10 | IF NOT EXISTS + IF conditions + Batch CAS pass | Unit + property tests |
+| Temporal | 12 | Temporal schema DDL + Go persistence tests pass | `temporal-sql-tool create` + Go suite |
+| Accord Phase 1 | 14 | Jepsen register + P50 within 15% baseline | Jepsen + benchmark |
+| Accord Phase 2 | 16 | Jepsen bank + write-skew | Jepsen suite |
+| Accord Phase 4 | 18 | Jepsen full nemesis + chaos + electorate | Full Jepsen + chaos |
 
 ## Critical Path
 
 ```
-ferrosa-memory (M1) ─┐
-                     ├─→ LWT Foundation (T1) ─→ Batch CAS (T2) ─→ Pagination (T3) ─→ Temporal runs
-ferrosa-dbaas (D1) ──┘                                                    │
-                                                                           ↓
-                                          Accord S1 ─→ S2 ─→ S3 ─→ S4 ─→ S5 ─→ S6 ─→ S7
-                                          (can start parallel with T2 if team capacity allows)
+M1 ──┐
+     ├──→ A1 ──→ A2 ──→ A3 ──→ A4 ──→ A5 ──→ A6 ──→ A7
+D1 ──┘    │            │      │
+          │            │      └─ LWT functional (Temporal can start)
+          │            └─ SERIAL CL + functions (Temporal CQL ready)
+          └─ Pagination (Temporal pagination ready)
 ```
 
-M1 and D1 are parallel. T1-T3 are sequential. Accord S1 can start as early as week 7
-if a second developer is available, since Accord foundation types (S1.1-S1.4) don't depend
-on LWT implementation. The critical path is: T1 → T2 → T3 → Temporal runs (week 10).
-Accord is the long pole but not on the critical path for Temporal compatibility.
+All three Temporal prerequisites (LWT, pagination, functions) converge at week 10 (A3).
+Temporal validation runs in A4 (weeks 11-12). The remaining 6 weeks (A5-A7) harden Accord
+with Jepsen, multi-key, 2i, and electorate — none of which Temporal blocks on.
+
+## Test Count by Sprint
+
+| Sprint | New Tests | Cumulative |
+|--------|-----------|-----------|
+| M1 | ~12 | 12 |
+| D1 | ~10 | 22 |
+| A1 | ~82 | 104 |
+| A2 | ~30 | 134 |
+| A3 | ~55 | 189 |
+| A4 | ~30 | 219 |
+| A5 | ~33 | 252 |
+| A6 | ~32 | 284 |
+| A7 | ~70 | 354 |
+| **Total** | **354** | |
