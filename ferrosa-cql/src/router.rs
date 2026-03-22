@@ -1530,6 +1530,52 @@ async fn route_insert(
     let table_id = TableId::new(ks, &s.table);
     let rf = keyspace_rf(&state.schema, ks);
 
+    // BUG-0016: IF NOT EXISTS — check whether the row already exists before writing.
+    if s.if_not_exists {
+        let exists = if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+            let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+            let all_col_types: Vec<CqlType> = table_meta
+                .columns
+                .values()
+                .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            let pk_indices: Vec<usize> = table_meta
+                .partition_key
+                .iter()
+                .filter_map(|name| table_meta.columns.get_index_of(name))
+                .collect();
+            let ck_indices: Vec<usize> = table_meta
+                .clustering_key
+                .iter()
+                .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
+                .collect();
+            let rows = bridge::partition_to_rows(
+                &partition,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+            );
+            if ck_values.is_empty() {
+                !rows.is_empty()
+            } else {
+                rows.iter().any(|row| {
+                    ck_indices
+                        .iter()
+                        .zip(ck_values.iter())
+                        .all(|(&idx, ck_val)| row.get(idx).and_then(|v| v.as_ref()) == Some(ck_val))
+                })
+            }
+        } else {
+            false
+        };
+
+        if exists {
+            // Row already exists — return [applied] = false
+            return Ok(encode_lwt_applied(false, ks, &s.table));
+        }
+    }
+
     state
         .write_path
         .load()
@@ -1542,7 +1588,25 @@ async fn route_insert(
             rf,
         )
         .await?;
-    Ok(result::encode_void())
+
+    if s.if_not_exists {
+        // Insert was applied — return [applied] = true
+        Ok(encode_lwt_applied(true, ks, &s.table))
+    } else {
+        Ok(result::encode_void())
+    }
+}
+
+/// Encode a lightweight-transaction `[applied]` result.
+///
+/// CQL protocol returns a RESULT Rows frame with a single boolean column
+/// named `[applied]` containing `true` (insert was applied) or `false`
+/// (row already existed, insert skipped).
+fn encode_lwt_applied(applied: bool, keyspace: &str, table: &str) -> BytesMut {
+    let col_names = vec!["[applied]".to_string()];
+    let col_types = vec![CqlType::Boolean];
+    let rows = vec![vec![Some(CqlValue::Boolean(applied))]];
+    result::encode_rows(&col_names, &col_types, keyspace, table, &rows)
 }
 
 // ── UPDATE ───────────────────────────────────────────────────────────────
@@ -1611,20 +1675,11 @@ async fn route_update(
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let table_id = TableId::new(ks, &s.table);
 
-    // Check if any assignments require a read-modify-write (collection +/-)
-    let needs_read = s.assignments.iter().any(|a| match a {
-        Assignment::Add { column, .. } | Assignment::Sub { column, .. } => {
-            if let Some(col_meta) = table_meta.columns.get(column) {
-                !matches!(
-                    resolve_col_type(&col_meta.column_type, ks, &state.schema),
-                    Ok(CqlType::Counter)
-                )
-            } else {
-                false
-            }
-        }
-        _ => false,
-    });
+    // Check if any assignments require a read-modify-write (collection +/- or counter)
+    let needs_read = s
+        .assignments
+        .iter()
+        .any(|a| matches!(a, Assignment::Add { .. } | Assignment::Sub { .. }));
 
     // Lazily read existing row for collection Add/Sub merge
     let existing_row: Option<Vec<Option<CqlValue>>> = if needs_read {
@@ -1691,12 +1746,25 @@ async fn route_update(
                     .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
                 let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
 
-                // For counters: increment. For collections: read-modify-write append/merge.
+                // For counters: read-modify-write increment. For collections: append/merge.
                 match &cql_type {
                     CqlType::Counter => {
                         let increment = bridge::term_to_cql_value(value, &CqlType::Bigint)?;
                         if let CqlValue::Bigint(n) = increment {
-                            (column.as_str(), CqlValue::Counter(n))
+                            let col_table_idx = table_meta
+                                .columns
+                                .get_index_of(column)
+                                .expect("column verified above");
+                            let current = existing_row
+                                .as_ref()
+                                .and_then(|row| row.get(col_table_idx))
+                                .and_then(|v| v.as_ref())
+                                .and_then(|v| match v {
+                                    CqlValue::Counter(c) => Some(*c),
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            (column.as_str(), CqlValue::Counter(current + n))
                         } else {
                             return Err(CqlError::Invalid(
                                 "counter increment must be an integer".into(),
@@ -1729,7 +1797,20 @@ async fn route_update(
                     CqlType::Counter => {
                         let decrement = bridge::term_to_cql_value(value, &CqlType::Bigint)?;
                         if let CqlValue::Bigint(n) = decrement {
-                            (column.as_str(), CqlValue::Counter(-n))
+                            let col_table_idx = table_meta
+                                .columns
+                                .get_index_of(column)
+                                .expect("column verified above");
+                            let current = existing_row
+                                .as_ref()
+                                .and_then(|row| row.get(col_table_idx))
+                                .and_then(|v| v.as_ref())
+                                .and_then(|v| match v {
+                                    CqlValue::Counter(c) => Some(*c),
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            (column.as_str(), CqlValue::Counter(current - n))
                         } else {
                             return Err(CqlError::Invalid(
                                 "counter decrement must be an integer".into(),
@@ -3815,6 +3896,48 @@ fn evaluate_where_predicates(
             continue;
         }
 
+        // CONTAINS / CONTAINS KEY require element/key type coercion, not
+        // collection-level coercion, so they are handled before the normal
+        // term_to_cql_value path (same pattern as IN above).
+        if wc.op == ComparisonOp::Contains {
+            let element_type = match &cql_type {
+                CqlType::List(inner) | CqlType::Set(inner) => (**inner).clone(),
+                CqlType::Map(_, val_type) => (**val_type).clone(),
+                _ => return false,
+            };
+            let needle = match bridge::term_to_cql_value(&wc.value, &element_type) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let found = match actual {
+                CqlValue::List(items) | CqlValue::Set(items) => items.contains(&needle),
+                CqlValue::Map(entries) => entries.iter().any(|(_, v)| *v == needle),
+                _ => false,
+            };
+            if !found {
+                return false;
+            }
+            continue;
+        }
+        if wc.op == ComparisonOp::ContainsKey {
+            let key_type = match &cql_type {
+                CqlType::Map(key_type, _) => (**key_type).clone(),
+                _ => return false,
+            };
+            let needle = match bridge::term_to_cql_value(&wc.value, &key_type) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let found = match actual {
+                CqlValue::Map(entries) => entries.iter().any(|(k, _)| *k == needle),
+                _ => false,
+            };
+            if !found {
+                return false;
+            }
+            continue;
+        }
+
         let expected = match bridge::term_to_cql_value(&wc.value, &cql_type) {
             Ok(v) => v,
             Err(_) => return false,
@@ -3828,9 +3951,7 @@ fn evaluate_where_predicates(
             ComparisonOp::Le => *actual <= expected,
             ComparisonOp::In => unreachable!("IN handled above"),
             ComparisonOp::Contains | ComparisonOp::ContainsKey => {
-                // CONTAINS / CONTAINS KEY: not yet implemented for filtering.
-                // Conservatively exclude the row so we don't return false positives.
-                false
+                unreachable!("CONTAINS/CONTAINS KEY handled above")
             }
         };
         if !matches {
