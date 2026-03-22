@@ -635,16 +635,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut flush_interval =
             tokio::time::interval(std::time::Duration::from_secs(flush_interval_secs));
         let mut compact_interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        // Persist schema snapshot to S3 every 60s (catches DDL changes).
-        let mut schema_sync_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        // Persist schema snapshot + flush all memtables to S3 every 30s.
+        let mut schema_sync_interval = tokio::time::interval(std::time::Duration::from_secs(30));
         let mut last_schema_version = uuid::Uuid::nil();
 
         loop {
             tokio::select! {
                 _ = flush_interval.tick() => {
-                    // Flush all non-empty memtables (not just those above
-                    // the size threshold) so small writes reach S3 promptly.
-                    if let Err(e) = maintenance_engine.flush_all() {
+                    if let Err(e) = maintenance_engine.flush_if_needed() {
                         tracing::warn!(%e, "periodic flush failed");
                     }
 

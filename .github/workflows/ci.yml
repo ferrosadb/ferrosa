@@ -45,10 +45,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Run tests with coverage
-        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
-      - name: Run tests with coverage (HTML report)
-        run: cargo llvm-cov --all-features --workspace --html --output-dir coverage-html
+      - name: Run tests with coverage (single instrumented run)
+        run: |
+          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+          cargo llvm-cov report --html --output-dir coverage-html
+          cargo llvm-cov report --summary-only 2>&1 | tee coverage-summary.txt
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
@@ -61,11 +62,9 @@ jobs:
           name: lcov-info
           path: lcov.info
           retention-days: 14
-      - name: Coverage summary
-        run: cargo llvm-cov --all-features --workspace --summary-only
       - name: Check coverage threshold (80% line)
         run: |
-          COVERAGE=$(cargo llvm-cov --all-features --workspace --summary-only 2>&1 | grep 'TOTAL' | awk '{print $10}' | tr -d '%')
+          COVERAGE=$(grep 'TOTAL' coverage-summary.txt | awk '{print $10}' | tr -d '%')
           echo "Total line coverage: ${COVERAGE}%"
           if [ -z "$COVERAGE" ]; then
             echo "::warning::Could not parse coverage percentage — skipping gate"
