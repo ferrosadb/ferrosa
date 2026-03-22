@@ -1690,7 +1690,7 @@ impl crate::virtual_tables::ArchiveStatusProvider for StorageEngine {
 }
 
 /// Snapshot listing requires async S3 access which cannot be called from
-/// the synchronous [`VirtualTable::read`] method. Returns an empty list
+/// the synchronous `VirtualTable::read` method. Returns an empty list
 /// until a background cache is implemented.
 impl crate::virtual_tables::SnapshotInfoProvider for StorageEngine {
     fn snapshot_info(&self) -> Vec<crate::virtual_tables::SnapshotInfoRow> {
