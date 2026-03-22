@@ -1348,7 +1348,8 @@ fn raw_bytes_to_term(bytes: &[u8], cql_type: &CqlType) -> crate::ast::Term {
 
 /// Map a column type string (from schema metadata) to the CQL wire type.
 fn col_type_str_to_cql_type(type_str: &str) -> CqlType {
-    match type_str.to_lowercase().as_str() {
+    let lower = type_str.to_lowercase();
+    match lower.as_str() {
         "ascii" => CqlType::Ascii,
         "bigint" => CqlType::Bigint,
         "blob" => CqlType::Blob,
@@ -1369,7 +1370,13 @@ fn col_type_str_to_cql_type(type_str: &str) -> CqlType {
         "smallint" => CqlType::Smallint,
         "tinyint" => CqlType::Tinyint,
         "duration" => CqlType::Duration,
-        _ => CqlType::Blob, // fallback for complex/unknown types
+        _ => {
+            // Try parsing complex types (vector<float, N>, list<...>, etc.)
+            if let Ok(parsed) = crate::bridge::parse_cql_type(&lower) {
+                return parsed;
+            }
+            CqlType::Blob // fallback for unknown types
+        }
     }
 }
 

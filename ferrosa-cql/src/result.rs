@@ -244,6 +244,10 @@ fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
                 encode_type(buf, t);
             }
         }
+        CqlType::Vector(elem, dim) => {
+            encode_type(buf, elem);
+            buf.put_i32(*dim as i32);
+        }
         CqlType::Udt {
             keyspace,
             name,

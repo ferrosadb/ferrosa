@@ -85,6 +85,9 @@ fn cql_type_to_string(ty: &CqlType) -> String {
             let inner: Vec<String> = types.iter().map(cql_type_to_string).collect();
             format!("tuple<{}>", inner.join(", "))
         }
+        CqlType::Vector(elem, dim) => {
+            format!("vector<{}, {}>", cql_type_to_string(elem), dim)
+        }
         CqlType::Udt { keyspace, name, .. } => format!("{keyspace}.{name}"),
     }
 }

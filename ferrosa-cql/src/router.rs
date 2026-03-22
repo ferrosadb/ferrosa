@@ -511,7 +511,7 @@ fn route_select(
         ("system_schema", "columns") => {
             let snap = state.schema.snapshot();
             let col_rows = query_columns(&snap);
-            let col_names = vec![
+            let col_names: Vec<String> = vec![
                 "keyspace_name".into(),
                 "table_name".into(),
                 "column_name".into(),
@@ -529,7 +529,30 @@ fn route_select(
                 CqlType::Varchar,
                 CqlType::Varchar,
             ];
-            let rows: Vec<Vec<Option<CqlValue>>> = col_rows
+            // Apply WHERE equality filters (string columns only).
+            let filtered: Vec<_> = col_rows
+                .iter()
+                .filter(|c| {
+                    s.where_clauses.iter().all(|wc| {
+                        if wc.op != crate::ast::ComparisonOp::Eq {
+                            return true; // skip non-equality ops
+                        }
+                        let val = match &wc.value {
+                            crate::ast::Term::StringLiteral(s) => s.as_str(),
+                            _ => return true,
+                        };
+                        match wc.column.as_str() {
+                            "keyspace_name" => c.keyspace_name == val,
+                            "table_name" => c.table_name == val,
+                            "column_name" => c.column_name == val,
+                            "kind" => c.kind == val,
+                            "clustering_order" => c.clustering_order == val,
+                            _ => true,
+                        }
+                    })
+                })
+                .collect();
+            let rows: Vec<Vec<Option<CqlValue>>> = filtered
                 .iter()
                 .map(|c| {
                     vec![
@@ -543,13 +566,14 @@ fn route_select(
                     ]
                 })
                 .collect();
-            Ok(result::encode_rows(
+            apply_system_select(
+                &s.columns,
                 &col_names,
                 &col_types,
+                &rows,
                 "system_schema",
                 "columns",
-                &rows,
-            ))
+            )
         }
         ("system_auth", "roles") => {
             let snap = state.schema.snapshot();
@@ -4233,6 +4257,9 @@ fn cql_type_name_to_string(type_name: &CqlTypeName) -> String {
             format!("tuple<{}>", inner.join(", "))
         }
         CqlTypeName::Frozen(inner) => format!("frozen<{}>", cql_type_name_to_string(inner)),
+        CqlTypeName::Vector(inner, dim) => {
+            format!("vector<{}, {}>", cql_type_name_to_string(inner), dim)
+        }
     }
 }
 

@@ -233,6 +233,29 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     .collect();
                 Ok(CqlValue::List(converted?))
             }
+            CqlType::Vector(_, dimension) => {
+                if items.len() != *dimension {
+                    return Err(CqlError::Invalid(format!(
+                        "vector dimension mismatch: expected {}, got {}",
+                        dimension,
+                        items.len()
+                    )));
+                }
+                let mut bits = Vec::with_capacity(*dimension);
+                for item in items {
+                    let f: f32 = match item {
+                        Term::FloatLiteral(f) => *f as f32,
+                        Term::IntegerLiteral(n) => *n as f32,
+                        _ => {
+                            return Err(CqlError::Invalid(
+                                "vector elements must be numeric literals".into(),
+                            ));
+                        }
+                    };
+                    bits.push(f.to_bits());
+                }
+                Ok(CqlValue::Vector(bits))
+            }
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got list literal",
                 cql_type_name(target)
@@ -376,6 +399,7 @@ fn cql_type_name(t: &CqlType) -> &'static str {
         CqlType::Map(_, _) => "map",
         CqlType::Set(_) => "set",
         CqlType::Tuple(_) => "tuple",
+        CqlType::Vector(_, _) => "vector",
         CqlType::Udt { .. } => "udt",
     }
 }
@@ -418,6 +442,9 @@ pub fn cql_type_display_name(t: &CqlType) -> String {
         CqlType::Tuple(types) => {
             let inner: Vec<String> = types.iter().map(cql_type_display_name).collect();
             format!("tuple<{}>", inner.join(", "))
+        }
+        CqlType::Vector(elem, dim) => {
+            format!("vector<{}, {}>", cql_type_display_name(elem), dim)
         }
         CqlType::Udt { keyspace, name, .. } => format!("{keyspace}.{name}"),
     }
@@ -608,6 +635,23 @@ impl<'a> TypeParser<'a> {
                 self.consume(b'>')?;
                 Ok(CqlType::Tuple(types))
             }
+            "vector" => {
+                self.skip_whitespace();
+                self.consume(b'<')?;
+                let elem = self.parse_type()?;
+                self.skip_whitespace();
+                self.consume(b',')?;
+                self.skip_whitespace();
+                let dim_str = self.read_ident()?;
+                let dim: usize = dim_str.parse().map_err(|_| {
+                    CqlError::Invalid(format!(
+                        "expected integer dimension for vector, got '{dim_str}'"
+                    ))
+                })?;
+                self.skip_whitespace();
+                self.consume(b'>')?;
+                Ok(CqlType::Vector(Box::new(elem), dim))
+            }
             "frozen" => {
                 self.skip_whitespace();
                 self.consume(b'<')?;
@@ -717,6 +761,10 @@ pub fn resolve_type_name(
                 .collect();
             Ok(CqlType::Tuple(resolved?))
         }
+        CqlTypeName::Vector(elem, dim) => Ok(CqlType::Vector(
+            Box::new(resolve_type_name(elem, keyspace, schema)?),
+            *dim,
+        )),
     }
 }
 
@@ -1209,6 +1257,15 @@ pub fn cql_value_to_json(value: &CqlValue) -> String {
                 })
                 .collect();
             format!("[{}]", items.join(", "))
+        }
+
+        // Vector — JSON array of floats
+        CqlValue::Vector(bits) => {
+            let elements: Vec<String> = bits
+                .iter()
+                .map(|b| format_json_float_f32(f32::from_bits(*b)))
+                .collect();
+            format!("[{}]", elements.join(", "))
         }
 
         // UDT — JSON object

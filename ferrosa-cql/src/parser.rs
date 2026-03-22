@@ -1892,6 +1892,33 @@ impl<'input> Parser<'input> {
                 self.exit_nesting();
                 Ok(CqlTypeName::Frozen(Box::new(inner)))
             }
+            "vector" => {
+                self.enter_nesting()?;
+                self.lexer.expect(&TokenKind::Lt)?;
+                let elem_type = self.parse_cql_type_name()?;
+                self.lexer.expect(&TokenKind::Comma)?;
+                // Dimension is an integer literal inside the angle brackets
+                let dim_tok = self.lexer.next_token()?;
+                let dimension = match &dim_tok.kind {
+                    TokenKind::IntegerLiteral(n) => {
+                        if *n <= 0 {
+                            return Err(CqlError::SyntaxError(
+                                "vector dimension must be a positive integer".into(),
+                            ));
+                        }
+                        *n as usize
+                    }
+                    _ => {
+                        return Err(CqlError::SyntaxError(format!(
+                            "expected integer dimension for vector type, got {:?}",
+                            dim_tok.kind
+                        )));
+                    }
+                };
+                self.lexer.expect(&TokenKind::Gt)?;
+                self.exit_nesting();
+                Ok(CqlTypeName::Vector(Box::new(elem_type), dimension))
+            }
             _ => Ok(CqlTypeName::Simple(type_name)),
         }
     }

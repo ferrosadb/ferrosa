@@ -260,6 +260,8 @@ pub enum CqlTypeName {
     Map(Box<CqlTypeName>, Box<CqlTypeName>),
     Tuple(Vec<CqlTypeName>),
     Frozen(Box<CqlTypeName>),
+    /// Vector type with element type and fixed dimension: `vector<float, 3>`.
+    Vector(Box<CqlTypeName>, usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
