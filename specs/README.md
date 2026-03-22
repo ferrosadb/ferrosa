@@ -56,6 +56,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [Threat Model — Accord](threat-model-accord.md) | STRIDE for Accord: 30 threats across 6 trust boundaries | Draft |
 | [FMEA — Accord](fmea-accord.md) | Failure modes for Accord (19 modes, 19 test cases, 3 critical) | Draft |
 | [Accord Project Plan](accord-project-plan.md) | 7-sprint plan: foundation, single-key, multi-key, 2i, electorates | Draft |
+| [Accord Test Spec](accord-test-spec.md) | 6-layer test pyramid: 97 tests from unit to 24-step capstone | Draft |
 | [Nightly Test Infrastructure](../superpowers/specs/2026-03-19-nightly-test-infrastructure-design.md) | Nightly test infrastructure design | Draft |
 | [Cluster Phase 2 Design](../superpowers/specs/2026-03-14-cluster-phase2-design.md) | Raft consensus, token ring, coordinator pattern | Implemented |
 
