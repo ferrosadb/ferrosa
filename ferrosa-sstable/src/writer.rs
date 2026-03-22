@@ -824,30 +824,97 @@ mod tests {
         }
     }
 
-    /// Verify that the BTI trie index returns correct data file offsets
-    /// for both partitions when accessed via SSTableReader::get_partition.
+    /// End-to-end: exact production memo_cache scenario through full
+    /// SSTableWriter → SSTableReader::get_partition() cycle.
+    /// Uses composite text PK, UUID clustering, and multiple column types.
     #[test]
-    fn trie_index_offsets_correct_for_two_partitions() {
+    fn e2e_composite_pk_get_partition_exact_production_keys() {
         use crate::reader::{SSTableComponents, SSTableReader};
 
-        let header = test_header();
+        // Header matching memo_cache: CompositeType(UTF8,UTF8) PK, UUID clustering
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UTF8Type,\
+                       org.apache.cassandra.db.marshal.UTF8Type)"
+                .into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.UUIDType".into()],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"result".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"hit_count".to_vec(),
+                    "org.apache.cassandra.db.marshal.LongType".into(),
+                ),
+            ],
+        };
         let options = WriteOptions {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
         };
-
         let ts = 1_000_042i64;
-        // Two partitions with different key sizes
-        let p1 = make_partition(b"short", &[0x00, 0x00, 0x00, 0x01], b"value1", ts);
-        let p2 = make_partition(
-            b"this_is_a_longer_partition_key_that_pushes_offset_past_128",
-            &[0x00, 0x00, 0x00, 0x02],
-            b"value2_with_some_extra_data_to_make_it_bigger",
-            ts,
+
+        // Composite PK encoding: [u16 len][bytes][0x00] per component
+        fn composite(part1: &str, part2: &str) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&(part1.len() as u16).to_be_bytes());
+            buf.extend_from_slice(part1.as_bytes());
+            buf.push(0x00);
+            buf.extend_from_slice(&(part2.len() as u16).to_be_bytes());
+            buf.extend_from_slice(part2.as_bytes());
+            buf.push(0x00);
+            buf
+        }
+
+        // EXACT production keys
+        let pk1_bytes = composite(
+            "4bbe47ee6bb1d0ecaa4d47fce3d99e2044cdfdbfac4dde0c0c083f97e4fad000", // pragma: allowlist secret
+            "test-v1",
+        );
+        let pk2_bytes = composite(
+            "cac0302657b4c1d0dfd5aec98f2754f46a42f117e53c77a9ba384ebf2095633a", // pragma: allowlist secret
+            "claude-opus-4-6",
         );
 
-        // Sort by key (required by writer)
+        let p1 = Partition {
+            key: DecoratedKey::new(PartitionKey::new(pk1_bytes.clone())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![0x11u8; 16], // UUID
+                cells: vec![
+                    (0, CellValue::live(b"4".to_vec(), ts)),
+                    (1, CellValue::live(0i64.to_be_bytes().to_vec(), ts)),
+                ],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+        };
+        let p2 = Partition {
+            key: DecoratedKey::new(PartitionKey::new(pk2_bytes.clone())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![0x22u8; 16], // UUID
+                cells: vec![
+                    (
+                        0,
+                        CellValue::live(b"The capital of France is Paris.".to_vec(), ts),
+                    ),
+                    (1, CellValue::live(0i64.to_be_bytes().to_vec(), ts)),
+                ],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+        };
+
+        // Sort by decorated key (token order)
         let mut partitions = vec![p1, p2];
         partitions.sort_by(|a, b| a.key.cmp(&b.key));
 
@@ -857,10 +924,13 @@ mod tests {
         }
         let output = writer.finish().unwrap();
 
-        eprintln!("Data.db size: {} bytes", output.data.len());
-        eprintln!("Partitions.db size: {} bytes", output.partitions.len());
+        eprintln!(
+            "Data.db: {} bytes, Partitions.db: {} bytes",
+            output.data.len(),
+            output.partitions.len()
+        );
 
-        // Build reader from output
+        // Build SSTableReader from raw bytes
         let components = SSTableComponents {
             data: output.data.as_slice(),
             partitions: output.partitions.as_slice(),
@@ -870,24 +940,41 @@ mod tests {
             statistics: output.statistics.clone(),
         };
         let reader = SSTableReader::open(components).unwrap();
+        assert_eq!(reader.key_count(), 2);
 
-        // Both partitions must be findable via trie index
-        for p in &partitions {
-            let found = reader.get_partition(&p.key).unwrap_or_else(|e| {
-                panic!(
-                    "get_partition for key {:?} failed: {e}",
-                    String::from_utf8_lossy(p.key.key.as_bytes())
-                )
-            });
-            assert!(
-                found.is_some(),
-                "partition {:?} not found via trie lookup",
-                String::from_utf8_lossy(p.key.key.as_bytes())
-            );
-            let found = found.unwrap();
-            assert_eq!(found.rows.len(), 1);
-            assert_eq!(found.rows[0].cells.len(), 1);
-        }
+        // get_partition for BOTH keys must succeed
+        let key1 = DecoratedKey::new(PartitionKey::new(pk1_bytes));
+        let r1 = reader.get_partition(&key1);
+        assert!(r1.is_ok(), "get_partition key1 error: {:?}", r1.err());
+        let r1 = r1.unwrap();
+        assert!(r1.is_some(), "key1 (test-v1) not found via trie");
+        let r1 = r1.unwrap();
+        assert_eq!(r1.rows.len(), 1, "key1 should have 1 row");
+        assert_eq!(
+            r1.rows[0].clustering.len(),
+            16,
+            "UUID clustering = 16 bytes"
+        );
+
+        let key2 = DecoratedKey::new(PartitionKey::new(pk2_bytes));
+        let r2 = reader.get_partition(&key2);
+        assert!(r2.is_ok(), "get_partition key2 error: {:?}", r2.err());
+        let r2 = r2.unwrap();
+        assert!(r2.is_some(), "key2 (claude-opus-4-6) not found via trie");
+        let r2 = r2.unwrap();
+        assert_eq!(r2.rows.len(), 1, "key2 should have 1 row");
+        assert_eq!(
+            r2.rows[0].clustering.len(),
+            16,
+            "UUID clustering = 16 bytes"
+        );
+
+        // Verify cell values round-tripped
+        let r2_result = r2.rows[0].cells[0].1.value.as_deref().unwrap();
+        assert_eq!(
+            r2_result, b"The capital of France is Paris.",
+            "cell value must survive roundtrip"
+        );
     }
 
     #[test]
