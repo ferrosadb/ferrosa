@@ -6,6 +6,7 @@
 pub mod clock_validation;
 pub mod recovery;
 pub mod reorder_buffer;
+pub mod state_machine;
 pub mod test_cluster;
 
 pub use clock_validation::{
@@ -13,4 +14,5 @@ pub use clock_validation::{
 };
 pub use recovery::{RecoverOKResponse, RecoveryCoordinator, RecoveryDecision};
 pub use reorder_buffer::ReorderBuffer;
+pub use state_machine::{AccordStateMachine, SmResponse};
 pub use test_cluster::{TestCluster, TestMessage, TestMessagePayload, TestReplica};
