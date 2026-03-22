@@ -882,7 +882,13 @@ mod tests {
         let handler = ReadRequestHandler::new(storage);
 
         let response = handler
-            .handle(make_peer_id(), Message::Ping { nonce: 1 })
+            .handle(
+                make_peer_id(),
+                Message::Ping {
+                    nonce: 1,
+                    sent_at: 0,
+                },
+            )
             .await;
         assert!(
             response.is_none(),

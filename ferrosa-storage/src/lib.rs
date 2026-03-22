@@ -12,7 +12,9 @@
 //! - **Manifest**: S3 manifest with etag-based CAS (Part C)
 //! - **Cache**: local disk cache with LRU eviction (Part C)
 //! - **Engine**: top-level `StorageEngine` composing all components (Part C)
+//! - **Accord**: per-shard conflict detection for Accord transactions
 
+pub mod accord;
 pub mod batchlog;
 pub mod cache;
 pub mod commitlog;
@@ -45,6 +47,7 @@ pub use compaction::{
 pub use engine::{StorageEngine, StorageEngineConfig};
 pub use flush::{FileFlushTarget, FlushTarget, InMemoryFlushTarget};
 pub use manifest::{load_schema_snapshot, save_schema_snapshot, Manifest};
+pub use memtable::eager_index::{EagerIndexBuilder, FlushCompleteEvent};
 pub use memtable::sharded::ShardedBTreeMemtable;
 #[cfg(feature = "skiplist-memtable")]
 pub use memtable::skiplist::SkipListMemtable;

@@ -314,13 +314,18 @@ fn skip_type_option(cursor: &mut &[u8]) -> Result<(), CqlError> {
                 skip_type_option(cursor)?;
             }
         }
-        // vector (0x0023) — element sub-type + i32 dimension
-        0x0023 => {
-            skip_type_option(cursor)?; // element type (e.g. float)
-            if cursor.len() < 4 {
-                return Err(CqlError::Protocol("truncated vector type".into()));
+        // Custom (0x0000) — string class name (used for vector, etc.)
+        0x0000 => {
+            if cursor.len() < 2 {
+                return Err(CqlError::Protocol("truncated custom type".into()));
             }
-            cursor.advance(4); // dimension (i32)
+            let len = cursor.get_u16() as usize;
+            if cursor.len() < len {
+                return Err(CqlError::Protocol(
+                    "truncated custom type class name".into(),
+                ));
+            }
+            cursor.advance(len);
         }
         // UDT (0x0030) — keyspace + name + n fields
         0x0030 => {

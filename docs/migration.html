@@ -242,7 +242,7 @@
   <a href="index.html" class="back-link">&larr; Back to homepage</a>
 
   <h1>Migration <span>Guide</span></h1>
-  <p class="subtitle">Move from Apache Cassandra to Ferrosa without rewriting application code. Same CQL protocol, same drivers, same consistency model.</p>
+  <p class="subtitle">Move from Apache Cassandra to Ferrosa without rewriting application code. Same CQL protocol, same drivers, same consistency model, same LWT semantics.</p>
 
   <div class="note">
     <strong>Beta:</strong> Ferrosa is currently in beta. We recommend thorough testing with representative workloads before migrating production traffic.
@@ -258,6 +258,7 @@
       <li><a href="#dual-read">Dual-Read Verification</a></li>
       <li><a href="#s3">S3 Storage Setup</a></li>
       <li><a href="#differences">Key Differences</a></li>
+      <li><a href="#lwt-migration">LWT &amp; Transaction Migration</a></li>
       <li><a href="#rollback">Rollback Plan</a></li>
     </ul>
   </div>
@@ -304,7 +305,8 @@
       <tr><td>Secondary indexes</td><td><span class="check">Compatible</span></td><td>8 index types including vector (HNSW, IVFFlat)</td></tr>
       <tr><td>UDTs</td><td><span class="check">Supported</span></td><td>CREATE/ALTER/DROP TYPE fully implemented</td></tr>
       <tr><td>Materialized views</td><td><span class="cross">Not yet</span></td><td>Planned</td></tr>
-      <tr><td>LWT</td><td><span class="cross">Not yet</span></td><td>Planned</td></tr>
+      <tr><td>LWT</td><td><span class="check">Compatible</span></td><td>IF NOT EXISTS, IF conditions, batch CAS — Accord protocol (strict serializable)</td></tr>
+      <tr><td>Transactions</td><td><span class="check">Supported</span></td><td>BEGIN TRANSACTION / COMMIT / ROLLBACK — multi-partition atomic operations</td></tr>
       <tr><td>Gossip protocol</td><td><span class="cross">Replaced</span></td><td>Ferrosa uses Raft for metadata (not wire-compatible)</td></tr>
       <tr><td>Internode protocol</td><td><span class="cross">Replaced</span></td><td>Custom binary protocol (not wire-compatible)</td></tr>
     </tbody>
@@ -324,13 +326,13 @@
     <div class="step-content">
       <h3>Audit your schema</h3>
       <p>Export your Cassandra schema and check for unsupported features.
-        Ferrosa supports all standard CQL types, partition/clustering keys, table options, and UDTs.
-        Check for materialized views or UDFs — these are not yet supported.</p>
+        Ferrosa supports all standard CQL types, partition/clustering keys, table options, UDTs,
+        UDFs (WASM), and lightweight transactions. Check for materialized views — these are not yet supported.</p>
       <pre><span class="cm"># Export schema from Cassandra</span>
 <span class="kw">cqlsh</span> -e <span class="str">"DESCRIBE SCHEMA"</span> > schema.cql
 
 <span class="cm"># Check for unsupported features</span>
-<span class="kw">grep</span> -i <span class="str">"MATERIALIZED VIEW\|CREATE FUNCTION"</span> schema.cql</pre>
+<span class="kw">grep</span> -i <span class="str">"MATERIALIZED VIEW"</span> schema.cql</pre>
     </div>
 
     <div class="step-num">2</div>
@@ -453,6 +455,7 @@ stmt_f = ferro.prepare(query)
     <li>Collection types (list, set, map)</li>
     <li>Prepared statements with bind variables</li>
     <li>Batch operations</li>
+    <li>Lightweight transactions (INSERT IF NOT EXISTS, UPDATE IF)</li>
   </ul>
 
   <!-- ── S3 ── -->
@@ -551,6 +554,11 @@ stmt_f = ferro.prepare(query)
         <td>Cypher via HTTP/JSON on the same tables</td>
       </tr>
       <tr>
+        <td>Transactions</td>
+        <td>LWT via Paxos (Accord in 5.x)</td>
+        <td>LWT via Accord (strict serializable, 1-RTT fast path)</td>
+      </tr>
+      <tr>
         <td>SSTable format</td>
         <td>Big + BTI</td>
         <td>Reads BTI, writes BTI (native format planned)</td>
@@ -562,6 +570,49 @@ stmt_f = ferro.prepare(query)
       </tr>
     </tbody>
   </table>
+
+  <!-- ── LWT Migration ── -->
+  <h2 id="lwt-migration">LWT &amp; Transaction Migration</h2>
+
+  <h3>Lightweight transactions</h3>
+  <p>Ferrosa fully supports Cassandra's lightweight transaction (LWT) syntax. Your existing
+    LWT queries work without modification:</p>
+
+  <ul>
+    <li><code>INSERT ... IF NOT EXISTS</code> — conditional inserts</li>
+    <li><code>UPDATE ... IF condition</code> — compare-and-set updates</li>
+    <li><code>DELETE ... IF EXISTS</code> / <code>DELETE ... IF condition</code> — conditional deletes</li>
+    <li>Batch CAS — <code>BEGIN BATCH</code> with IF conditions across statements</li>
+    <li><code>SERIAL</code> and <code>LOCAL_SERIAL</code> consistency levels</li>
+  </ul>
+
+  <p>Under the hood, Ferrosa uses the Accord consensus protocol instead of Paxos. This is
+    transparent to your application — the CQL syntax and semantics are identical. Accord
+    provides strict serializability with better performance characteristics: 1-RTT fast path
+    via leaseholder, compared to Paxos's minimum 2-RTT.</p>
+
+  <div class="success">
+    <strong>Temporal compatibility:</strong> All LWT patterns used by
+    <a href="https://temporal.io">Temporal</a> are fully implemented. If you run Temporal
+    on Cassandra with LWT-based persistence, Ferrosa is a drop-in replacement — same
+    INSERT IF NOT EXISTS, same conditional UPDATE IF, same batch CAS semantics. No Temporal
+    configuration changes required beyond updating the Cassandra contact points.
+  </div>
+
+  <h3>Beyond LWT: multi-statement transactions</h3>
+  <p>Ferrosa also supports explicit multi-statement transactions for operations that go beyond
+    what LWT can express:</p>
+
+  <pre><span class="cm">-- Atomic multi-partition operation</span>
+<span class="kw">BEGIN TRANSACTION</span>
+  <span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance - <span class="var">100</span>
+    <span class="kw">WHERE</span> id = <span class="str">'acct-1'</span> <span class="kw">IF</span> balance >= <span class="var">100</span>;
+  <span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance + <span class="var">100</span>
+    <span class="kw">WHERE</span> id = <span class="str">'acct-2'</span>;
+<span class="kw">COMMIT TRANSACTION</span>;</pre>
+
+  <p>This is a Ferrosa extension — not available in Apache Cassandra. Use it for new
+    functionality after migration, or to replace application-level two-phase patterns.</p>
 
   <!-- ── Rollback ── -->
   <h2 id="rollback">Rollback Plan</h2>

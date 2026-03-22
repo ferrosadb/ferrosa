@@ -1,6 +1,6 @@
 # Storage Engine
 
-> Last updated: 2026-03-14 (index support additions)
+> Last updated: 2026-03-22 (read_range SSTable merge, DELETE tombstones, commit log oversized entries)
 > Status: Approved
 
 ## Overview
@@ -473,6 +473,26 @@ Implements `VirtualTable` for `system_views.secondary_indexes`, exposing per-ind
 1. Check flushing memtable (if mid-flush) → `Option<Arc<Partition>>`
 1. Check flushed SSTables newest-first — `SSTableReader::get_partition()` handles bloom filter internally
 1. `merge_partitions()` — cell-level LWW across all sources
+
+### Read Range Path (StorageEngine)
+
+`read_range()` returns all partitions within a token range, merging data from both the memtable and flushed SSTables. Previously this was memtable-only; it now includes SSTable data for complete range query results.
+
+1. `ArcSwap::load()` — wait-free snapshot
+1. Scan active memtable for partitions in token range
+1. Scan flushing memtable (if mid-flush) for partitions in token range
+1. Scan flushed SSTables for partitions in token range
+1. `merge_partitions()` — cell-level LWW across all matching sources, grouped by partition key
+
+### DELETE and Tombstone Merge
+
+DELETE operations write row-level tombstones into the memtable. When multiple DELETEs target the same row, tombstones are merged — the newest `DeletionTime` wins. This ensures correct suppression of older cells when the memtable is read or flushed.
+
+Row-level tombstones are merged during `put()` in the memtable, following the same last-write-wins semantics as cell-level data. This avoids accumulating redundant tombstones and ensures consistent read results regardless of write ordering.
+
+### Commit Log Oversized Entry Handling
+
+Mutations that exceed the active segment's remaining capacity are handled gracefully. If a mutation is larger than the entire segment size, the commit log returns a descriptive `EntryTooLarge` error instead of panicking or silently dropping the entry. Normal-sized mutations that don't fit in the current segment trigger a segment rotation as before.
 
 ### Flush Path (StorageEngine)
 

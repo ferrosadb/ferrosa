@@ -1,11 +1,11 @@
 # CQL Protocol Specification
 
-> Last updated: 2026-03-14 (secondary index DDL additions)
+> Last updated: 2026-03-22 (vector type, LWT, counters, protocol v4 compat, Accord transactions, pagination)
 > Status: Approved
 
 ## Overview
 
-`ferrosa-cql` implements CQL native protocol v5 — the client-facing interface to Ferrosa. It handles TCP connections, binary protocol framing, CQL parsing, query execution, prepared statement caching, and SASL PLAIN authentication.
+`ferrosa-cql` implements CQL native protocol v4 and v5 — the client-facing interface to Ferrosa. It handles TCP connections, binary protocol framing, CQL parsing, query execution, prepared statement caching, and SASL PLAIN authentication. Protocol version is negotiated during STARTUP, with v4 supported for compatibility with drivers like cdrs-tokio.
 
 All hot paths are lock-free. The system parallelizes across all cores via Tokio's multi-threaded runtime.
 
@@ -16,7 +16,7 @@ All hot paths are lock-free. The system parallelizes across all cores via Tokio'
 | Concurrency | Lock-free via `ArcSwap` + `moka` | No contention on hot paths; see [ADR-006](decisions/006-cql-architecture.md) |
 | Parser | Hand-written recursive descent | CQL is LL(2); no backtracking needed; see [ADR-006](decisions/006-cql-architecture.md) |
 | Prepared cache | `moka` W-TinyLFU | Lock-free reads, frequency+recency eviction |
-| `ALLOW FILTERING` | Rejected (returns Invalid error) | Full-scan support deferred; secondary index framework is implemented but query path integration pending |
+| `ALLOW FILTERING` | Supported — full-scan with WHERE post-filter | Enables queries without secondary index when explicitly requested |
 | Auth | SASL PLAIN only | Standard CQL driver expectation; pluggable trait for future |
 
 ## Dependencies
@@ -90,7 +90,7 @@ graph TB
 
 | Field | Size | Description |
 |-------|------|-------------|
-| version | 1 byte | Protocol version (`0x05` request, `0x85` response) |
+| version | 1 byte | Protocol version (`0x04`/`0x05` request, `0x84`/`0x85` response) |
 | flags | 1 byte | Compression, tracing, custom payload, warning |
 | stream ID | 2 bytes | Multiplexing identifier (big-endian i16) |
 | opcode | 1 byte | Operation type |
@@ -152,6 +152,7 @@ Single `CqlValue` enum covering all CQL types with `encode`/`decode` methods.
 | `map<K,V>` | `[n][key,val]*n` | `Vec<(CqlValue, CqlValue)>` |
 | `tuple` | concatenated elements | `Vec<Option<CqlValue>>` |
 | `frozen<UDT>` | concatenated named fields | `Vec<(String, Option<CqlValue>)>` |
+| `vector<float, N>` | Custom wire type (0x0000), N * 4-byte IEEE 754 floats | `Vec<f32>` |
 
 ### CqlValue / CellValue Bridge
 
@@ -172,7 +173,7 @@ Input: &str → Lexer (Token stream) → Parser (AST) → Statement enum
 
 - **Lexer**: Single-pass, zero-allocation tokenizer, `Token<'input>` borrows from source. Keywords via `phf` perfect-hash map.
 - **Parser**: One function per grammar rule. LL(2) — no backtracking. Returns `Result<Statement>` with span info.
-- **AST**: `Statement` enum with variants: `Select`, `Insert`, `Update`, `Delete`, `CreateKeyspace`, `CreateTable`, `AlterTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateRole`, `AlterRole`, `DropRole`, `Grant`, `Revoke`, `Use`, `Batch`, etc.
+- **AST**: `Statement` enum with variants: `Select` (with ALLOW FILTERING, DISTINCT, ANN ORDER BY), `Insert` (with IF NOT EXISTS, IF conditions), `Update` (counter ops, collection +/-, IF conditions), `Delete` (map element, IF conditions), `CreateKeyspace`, `CreateTable`, `AlterTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateRole`, `AlterRole`, `DropRole`, `Grant`, `Revoke`, `Use`, `Batch` (with CAS), `BeginTransaction`, `Commit`, `Rollback`, etc.
 
 ### Secondary Index DDL
 
@@ -195,16 +196,189 @@ CREATE INDEX idx_name ON users (last_name) USING 'phonetic'
 
 When `USING` is omitted, the default index type is `btree`. The router's `resolve_index_type()` maps the USING string + options to the `IndexType` enum from `ferrosa-index`. All index DDL routes through `DdlPath` for pair-mode replication.
 
+### Vector Type
+
+```sql
+-- Column definition
+CREATE TABLE docs (
+    id uuid PRIMARY KEY,
+    embedding vector<float, 768>
+);
+
+-- Insert with vector literal
+INSERT INTO docs (id, embedding) VALUES (uuid(), [0.1, 0.2, ...]);
+
+-- ANN ORDER BY (parsed, execution deferred)
+SELECT * FROM docs ORDER BY embedding ANN OF [0.1, 0.2, ...] LIMIT 10;
+```
+
+The `vector<float, N>` type is represented as `CqlType::Vector { dimensions: u16 }` in the AST and encoded on the wire as a Custom type (option ID 0x0000) with the Cassandra-compatible class name `org.apache.cassandra.db.marshal.VectorType(org.apache.cassandra.db.marshal.FloatType,N)`. Values are N consecutive IEEE 754 f32 values with no length prefix per element.
+
+### Additional Query Features
+
+**ALLOW FILTERING:**
+
+```sql
+SELECT * FROM users WHERE age > 25 ALLOW FILTERING;
+```
+
+Enables full-table scan with post-filter evaluation of WHERE predicates. When a secondary index exists on the filtered column, the index is used instead of a full scan.
+
+**Built-in Functions:**
+
+| Function | Description |
+|----------|-------------|
+| `toJson(column)` | Converts a column value to its JSON string representation |
+| `token(pk_columns...)` | Returns the Murmur3 token for the given partition key |
+| `avg(column)` | Aggregate: arithmetic mean |
+| `min(column)` | Aggregate: minimum value |
+| `max(column)` | Aggregate: maximum value |
+| `sum(column)` | Aggregate: sum |
+
+**Lightweight Transactions (LWT):**
+
+```sql
+-- INSERT IF NOT EXISTS
+INSERT INTO users (id, name) VALUES (1, 'alice') IF NOT EXISTS;
+
+-- UPDATE with IF condition
+UPDATE users SET name = 'bob' WHERE id = 1 IF name = 'alice';
+
+-- DELETE with IF condition
+DELETE FROM users WHERE id = 1 IF name = 'bob';
+
+-- Batch CAS
+BEGIN BATCH
+  INSERT INTO users (id, name) VALUES (1, 'alice') IF NOT EXISTS;
+  INSERT INTO profiles (id, bio) VALUES (1, 'hello') IF NOT EXISTS;
+APPLY BATCH;
+```
+
+Full LWT support via the Accord consensus protocol. INSERT IF NOT EXISTS, IF conditions on UPDATE/DELETE, and Batch CAS are all routed through `AccordCoordinator` when `SERIAL` or `LOCAL_SERIAL` consistency is requested. Returns a `[applied]` boolean column indicating whether the operation was performed.
+
+**Counter Operations:**
+
+```sql
+UPDATE counters SET page_views = page_views + 1 WHERE url = '/home';
+UPDATE counters SET page_views = page_views - 5 WHERE url = '/home';
+```
+
+Counter increment and decrement via `column = column + N` and `column = column - N` syntax. Counter columns use `bigint` (i64) storage.
+
+**Collection Mutations:**
+
+```sql
+UPDATE users SET tags = tags + {'new_tag'} WHERE id = 1;
+UPDATE users SET tags = tags - {'old_tag'} WHERE id = 1;
+UPDATE users SET props = props + {'key': 'value'} WHERE id = 1;
+```
+
+Collection append (`+`) and remove (`-`) operators for sets, lists, and maps.
+
+**CONTAINS / CONTAINS KEY:**
+
+```sql
+SELECT * FROM users WHERE tags CONTAINS 'admin';
+SELECT * FROM users WHERE props CONTAINS KEY 'role';
+```
+
+Collection element filtering operators for use in WHERE clauses (requires ALLOW FILTERING or a secondary index).
+
+**SELECT DISTINCT:**
+
+```sql
+SELECT DISTINCT partition_key FROM table_name;
+```
+
+Returns unique partition key values only, without scanning row data.
+
+**token() in WHERE:**
+
+```sql
+SELECT * FROM users WHERE token(id) > -9223372036854775808
+                      AND token(id) < 9223372036854775807;
+```
+
+Token-range queries for partition scanning, used by drivers for parallel full-table reads.
+
+**DROP ROLE:**
+
+```sql
+DROP ROLE [IF EXISTS] role_name;
+```
+
+**Multi-Statement Transactions:**
+
+```sql
+BEGIN TRANSACTION;
+  SELECT balance FROM accounts WHERE id = 1;
+  UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+  UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+
+-- Or abort
+BEGIN TRANSACTION;
+  SELECT balance FROM accounts WHERE id = 1;
+ROLLBACK;
+```
+
+Multi-statement transactions provide serializable isolation via the Accord consensus protocol. The parser extracts read-set and write-set from the transaction body. Transaction limits prevent unbounded resource usage (max statements, max keys, timeout). Client retry handles Accord contention automatically.
+
+**Consistency Levels (SERIAL):**
+
+```sql
+-- Global serializable via Accord
+SELECT * FROM users WHERE id = 1 USING CONSISTENCY SERIAL;
+
+-- DC-local serializable via Accord
+INSERT INTO users (id, name) VALUES (1, 'alice') IF NOT EXISTS
+    USING CONSISTENCY LOCAL_SERIAL;
+```
+
+| Level | Behavior |
+|-------|----------|
+| `SERIAL` | Global serializable via Accord consensus |
+| `LOCAL_SERIAL` | DC-local serializable via Accord consensus |
+
+**Pagination:**
+
+Result set paging is supported via the standard CQL paging protocol:
+
+- QUERY and EXECUTE requests include an optional page size
+- Results larger than the page size return a `paging_state` token
+- Subsequent requests include the `paging_state` to fetch the next page
+- Compatible with standard CQL driver auto-paging
+
+**Additional Built-in Functions:**
+
+| Function | Description |
+|----------|-------------|
+| `now()` | Returns the current timestamp as a timeuuid |
+| `toTimestamp(timeuuid)` | Converts a timeuuid to a timestamp |
+| `TTL(column)` | Returns the remaining TTL in seconds for a column value |
+
+**PREPARE with pk_count:**
+
+PREPARE responses include `pk_count` metadata indicating the number of partition key bind markers, enabling drivers to compute routing keys for token-aware load balancing.
+
+**EXECUTE with positional bind values:**
+
+EXECUTE requests support positional bind values (in addition to named), matching the standard CQL protocol wire format. Values are bound in order of their appearance in the prepared statement.
+
 ## Query Routing
 
 ```
-Statement → DDL        → ferrosa-schema::Schema
+Statement → DDL        → ferrosa-schema::Schema (via DdlDrain when Accord active)
           → DML reads  → ferrosa-storage::StorageEngine::read()
           → DML writes → ferrosa-storage::StorageEngine::write()
+          → LWT (IF)   → ferrosa-cluster::AccordCoordinator → storage
+          → TRANSACTION → ferrosa-cluster::AccordCoordinator → storage
           → USE        → connection-local state
           → PREPARE    → parse + validate + cache
           → EXECUTE    → lookup cached plan, bind, re-enter router
 ```
+
+LWT statements (IF NOT EXISTS, IF conditions) and multi-statement transactions (BEGIN TRANSACTION) are routed through the `AccordCoordinator` in `ferrosa-cluster`, which runs the Accord consensus protocol before applying writes to storage.
 
 ## Authentication
 
@@ -577,4 +751,5 @@ ferrosa-cql/
 - [Overview](overview.md) — system overview
 - [Components](components.md) — crate architecture
 - [Storage](storage.md) — storage engine (StorageStatsProvider, SubscriptionObserver)
+- [Accord](accord.md) — Accord consensus protocol (LWT and transaction routing)
 - [ADR-006](decisions/006-cql-architecture.md) — CQL architectural decisions

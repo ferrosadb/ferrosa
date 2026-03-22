@@ -4,7 +4,9 @@
 //! enabling a future lock-free upgrade (crossbeam-skiplist, Okasaki-style
 //! persistent structures) without changing any consumer code.
 
+pub mod eager_index;
 pub mod index;
+pub mod mem_index;
 pub mod sharded;
 #[cfg(feature = "skiplist-memtable")]
 pub mod skiplist;

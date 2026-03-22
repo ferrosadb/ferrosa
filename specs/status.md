@@ -6,27 +6,30 @@
 ## Overview
 
 Ferrosa is a **distributed CQL-compatible database** with graph
-query support, built-in observability, and S3-backed storage. The production cluster
-sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff,
-node lifecycle (join/decommission/rebalance), reconnection, and integration tests.
-UDT/UDF with WASM sandboxing is complete. Secondary and vector indexes are consolidated
-with a full query planner pipeline (MemtableIndex, sidecar files, EXPLAIN,
-IndexIntersection, VectorMemtableIndex). Point-in-time recovery is fully implemented:
-commit log archiving to S3, snapshot management, point-in-time restoration with
-timestamp filtering, CLI tooling, and web console integration with Backup & Restore
-dashboard. The graph engine is fully complete. The latest sprint added vector type
-support (`vector<float, N>`), CQL driver compatibility (cdrs-tokio, protocol v4/v5),
-ALLOW FILTERING, toJson(), EXECUTE with positional bind values, INSERT IF NOT EXISTS
-(LWT), counter increment/decrement, collection UPDATE +/-, CONTAINS/CONTAINS KEY
-filtering, and DROP ROLE.
+query support, built-in observability, Accord consensus transactions, and S3-backed
+storage. The production cluster sprint is complete with Raft consensus, coordinated
+reads/writes, hinted handoff, node lifecycle (join/decommission/rebalance),
+reconnection, and integration tests. **Accord transactions** are fully implemented
+across 7 sprints (A1-A7): core consensus protocol (PreAccept/Accept/Commit/Execute),
+AccordStateMachine, AccordCoordinator (fast/slow path), LWT (INSERT IF NOT EXISTS, IF
+conditions on UPDATE/DELETE), BEGIN TRANSACTION/COMMIT/ROLLBACK, cross-shard conflict
+detection, Jepsen-style linearizability testing, electorate reconfiguration, crash
+recovery with `.accord` sidecar files, DurabilityService/ExclusiveSyncPoint, and 9
+observability metrics. UDT/UDF with WASM sandboxing is complete and integrated with
+Accord. Secondary and vector indexes are consolidated with a full query planner
+pipeline (MemtableIndex, sidecar files, EXPLAIN, IndexIntersection,
+VectorMemtableIndex). Point-in-time recovery is fully implemented: commit log archiving
+to S3, snapshot management, point-in-time restoration with timestamp filtering, CLI
+tooling, and web console integration with Backup & Restore dashboard. The graph engine
+is fully complete.
 
 | Metric | Value |
 |--------|-------|
 | Crates | 12 (11 core + ferrosa-udf) |
-| Source files | ~250+ |
-| Source LOC | ~114,000+ |
-| Test functions | ~2,000+ |
-| Integration test files | 30+ |
+| Source files | ~300+ |
+| Source LOC | ~130,000+ |
+| Test functions | ~2,808 |
+| Integration test files | 35+ |
 
 ## Maturity Assessment
 
@@ -43,17 +46,19 @@ graph          ██████   ██████  ██████   █
 ctl            ██████   ██████  ████░░   ████░░
 binary         ██████   ██████  ████░░   ████░░
 net            ██████   ██████  █████░   ███░░░
-cluster        ██████   ██████  █████░   ███░░░
+cluster+accord ██████   ██████  ██████   ████░░
 ```
 
 ## Crate Status
 
 ### ferrosa-common — Complete
 
-- **LOC:** 1,133 (9 files) | **Tests:** 36
-- **Modules:** `cell`, `data_type`, `error`, `key`, `murmur3`, `schema`, `token`
+- **LOC:** 1,500+ (12 files) | **Tests:** 50+
+- **Modules:** `cell`, `data_type`, `error`, `key`, `murmur3`, `schema`, `token`, `accord`
 - **What's done:** Token, PartitionKey, DecoratedKey, CellValue, Murmur3 partitioner.
-  Property tests via optional `test-generators` feature.
+  Property tests via optional `test-generators` feature. **Accord types:** `Timestamp`
+  (HLC hybrid logical clock), `TxnId` (transaction identifier), `Ballot` (ballot numbers
+  for consensus rounds).
 - **Remaining:** More property tests for edge cases.
 
 ### ferrosa-sstable — Complete (BTI format)
@@ -70,18 +75,23 @@ cluster        ██████   ██████  █████░   █
   - [ ] Native Ferrosa SSTable format (behind feature flag)
   - [ ] `sstable-dump` / `sstable-import` CLI tools
 
-### ferrosa-storage — Mostly Complete (Parts A/B/C)
+### ferrosa-storage — Mostly Complete (Parts A/B/C + Accord)
 
-- **LOC:** ~10,500 (32 files) | **Tests:** ~230
+- **LOC:** ~12,000 (38 files) | **Tests:** ~280
 - **Modules:** `cache`, `commitlog` (7 submodules), `compaction` (3 submodules),
   `engine`, `flush`, `index` (tracker, scheduler, virtual_table), `manifest`,
   `memtable` (2 impls), `merge`, `observer`, `store`, `subscription_observer`,
-  `upload`, `virtual_tables`
+  `upload`, `virtual_tables`, `accord` (sync_writer, write_gate, reorder_buffer,
+  sidecar)
 - **What's done:** Memtable (sharded BTree + skiplist), commit log (CAS-allocated
   segments, 3 sync modes, CDC, `force_sync` for catch-up), flush, merge, compaction
   (STCS strategy), S3 upload manager, manifest with etag CAS, local LRU cache,
   WriteObserver trait, SubscriptionObserver. Index support: `IndexStateTracker`,
   `IndexBuildScheduler`, index virtual table, `UploadTask::IndexFiles` variant.
+  **Accord module:** `SyncWriter` (durable write-ahead for Accord commits),
+  `WriteGate` (DDL drain-and-block gate), `ReorderBuffer` (dependency-ordered apply),
+  `.accord` sidecar files (crash recovery replay), `DurabilityService` with
+  `ExclusiveSyncPoint`.
 - **Remaining:**
   - [x] ~~Commit log replay integration~~ (merged PR #38)
   - [x] ~~Compaction execution merge I/O~~ (merged PR #38)
@@ -177,12 +187,13 @@ cluster        ██████   ██████  █████░   █
   - [ ] GRANT/REVOKE on function resources
   - [ ] Aggregate state/final function orchestration in query path
 
-### ferrosa-cql — Complete (Parts A-D + Compression)
+### ferrosa-cql — Complete (Parts A-D + Compression + Accord)
 
-- **LOC:** ~12,200 (20 files) | **Tests:** ~248 | **Largest crate**
+- **LOC:** ~14,000 (24 files) | **Tests:** ~320 | **Largest crate**
 - **Modules:** `ast`, `auth`, `bridge`, `client`, `connection`, `error`, `frame`,
   `lexer`, `parser`, `prepared`, `prometheus`, `result`, `router`, `server`,
-  `subscribe`, `types`, `virtual_tables` (connections + active_queries)
+  `subscribe`, `types`, `virtual_tables` (connections + active_queries), `pagination`,
+  `transaction`
 - **What's done:** CQL v5 framing (16 opcodes), full type system, SASL PLAIN auth,
   LL(2) recursive-descent parser, query routing (DDL to schema, DML to storage),
   prepared statement cache (moka W-TinyLFU), ConnectionTracker/QueryTracker virtual
@@ -190,6 +201,11 @@ cluster        ██████   ██████  █████░   █
   LZ4 and Snappy frame compression with negotiation. DDL routes through `DdlPath`
   for pair mode replication. `CREATE INDEX` / `DROP INDEX` parser support and router
   integration, `resolve_index_type()` for mapping index USING clause to index factory.
+  **Accord/LWT:** LWT INSERT IF NOT EXISTS, IF conditions on UPDATE/DELETE, Batch CAS,
+  SERIAL/LOCAL_SERIAL consistency levels, `BEGIN TRANSACTION`/`COMMIT`/`ROLLBACK`
+  parser and router support, read-set/write-set extraction, transaction limits,
+  client retry on Accord contention. **Pagination:** Result set paging with page state.
+  **Built-in functions:** `now()`, `toTimestamp()`, `TTL()`.
 - **Remaining:**
   - [x] ~~CQL TLS via rustls~~ (ring crypto provider, 10s handshake timeout)
   - [x] ~~Per-IP rate limiting~~ (IpConnectionTracker, default 64 per IP)
@@ -219,6 +235,14 @@ cluster        ██████   ██████  █████░   █
   - [x] DELETE map element syntax
   - [x] DROP without TABLE keyword
   - [x] DROP ROLE
+  - [x] LWT INSERT IF NOT EXISTS
+  - [x] LWT IF conditions on UPDATE/DELETE
+  - [x] Batch CAS
+  - [x] SERIAL/LOCAL_SERIAL consistency levels
+  - [x] BEGIN TRANSACTION/COMMIT/ROLLBACK parsing
+  - [x] Pagination (result set paging with page state)
+  - [x] now(), toTimestamp(), TTL() built-in functions
+  - [x] SUBSCRIBE dual timestamps
   - [ ] Logged batch atomicity
   - [ ] Query tracing
 
@@ -313,14 +337,17 @@ cluster        ██████   ██████  █████░   █
 - **Spec:** [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 - **Threat Model:** [Net/Cluster Threats](threat-model-net-cluster.md)
 
-### ferrosa-cluster — Phase 3 Complete (Production Cluster)
+### ferrosa-cluster — Phase 3 Complete + Accord Transactions
 
-- **LOC:** ~14,500 (45+ files) | **Tests:** ~280 (unit + integration)
+- **LOC:** ~22,000 (65+ files) | **Tests:** ~580 (unit + integration + Jepsen)
 - **Modules:** `config`, `consistency`, `controller`, `ddl_path`, `error`, `mode`,
   `pair` (catchup, coordinator, ddl, handler, node, switchover), `state`, `write_path`,
   `raft` (mod, log_store, state_machine, network), `ring` (mod, strategy),
   `coordinator` (mod, write, read), `hint` (segment, store, delivery),
-  `lifecycle` (join, decommission, streaming, rebalance)
+  `lifecycle` (join, decommission, streaming, rebalance),
+  `accord` (state_machine, coordinator, conflict_index, protocol_log, recovery,
+  dep_wait, ddl_drain, cross_shard, leaseholder, durability, mem_index, electorate,
+  jepsen, metrics)
 - **What's done:**
   - **Phase 1 (Pair mode):** `PairCoordinator` (write forwarding + replication),
     `DdlCoordinator` + `DdlPath` (DDL forwarding through primary),
@@ -359,11 +386,40 @@ cluster        ██████   ██████  █████░   █
   - [x] ~~Node lifecycle (join, decommission, streaming, rebalance)~~
   - [x] ~~Read repair~~ (deferred — digest reads included)
   - [x] ~~UDF/UDA DDL replication~~ (CreateFunction/DropFunction/CreateAggregate/DropAggregate RaftCommand variants)
+  - **Accord Transactions (Sprints A1-A7):**
+  - [x] Core types: HLC Timestamp, TxnId, Ballot, ConflictIndex, ProtocolLog
+  - [x] AccordStateMachine (39 tests) — consensus state machine
+  - [x] AccordCoordinator — fast path (3/4 quorum), slow path (majority), quorum formulas
+  - [x] CQL Router → Accord integration for LWT and transactions
+  - [x] LWT: INSERT IF NOT EXISTS, IF conditions on UPDATE/DELETE, Batch CAS
+  - [x] Dependency-wait with cycle detection (DepWaitGraph)
+  - [x] DDL drain-and-block (DdlDrain) — pauses Accord during schema changes
+  - [x] 11 recovery scenarios, RecoveryCoordinator
+  - [x] 4 property-based tests, 24-step EPaxos test
+  - [x] MemIndex (BTreeMap-based conflict index)
+  - [x] Leaseholder assignment — linearizable local reads
+  - [x] Jepsen infrastructure: TestCluster, NemesisController, HistoryRecorder, LinearizabilityChecker
+  - [x] Jepsen register test (3 workloads), bank test, write-skew test
+  - [x] Crash recovery replay via `.accord` sidecar files
+  - [x] DurabilityService / ExclusiveSyncPoint
+  - [x] Performance baseline and regression suite
+  - [x] BEGIN TRANSACTION/COMMIT/ROLLBACK — read-set/write-set extraction, transaction limits
+  - [x] Cross-shard conflict detection and execution
+  - [x] Client retry on Accord contention
+  - [x] Electorate reconfiguration: epoch propagation, JoinElectorate 4-gate, shrink/resize, epoch transition drain
+  - [x] Two-phase DDL with Accord coordination
+  - [x] Full Jepsen nemesis suite, chaos minority kill
+  - [x] 9 Accord observability metrics
+  - [x] UDF/UDA integration with Accord (18 tests)
+  - [x] Transactional secondary index reads (READ_2I, 5-layer merge)
+  - [x] SUBSCRIBE dual timestamps for Accord ordering
 - **Remaining:**
   - [ ] NetworkTopologyStrategy (multi-DC)
   - [ ] Read repair (full inline repair)
   - [ ] Quorum Lease / Mencius optimizations (Paxos-Raft paper)
 - **Spec:** [Cluster Phase 2 Design](../superpowers/specs/2026-03-14-cluster-phase2-design.md)
+- **Accord Spec:** [Accord Transactions](accord.md)
+- **Accord Plan:** [Accord Project Plan](accord-project-plan.md)
 - **Phase 1 Spec:** [Net/Cluster Design](../superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md)
 - **Schema Replication Spec:** [Schema Replication](../superpowers/specs/2026-03-14-schema-replication-design.md)
 - **Threat Models:** [Net/Cluster](threat-model-net-cluster.md), [Schema Replication](threat-model-schema-replication.md)
@@ -382,6 +438,7 @@ cluster        ██████   ██████  █████░   █
 | ~~Beta release v1.0.0-beta.3~~ | — | Released |
 | ~~Secondary index pipeline (Sprints I-1 to I-4)~~ | — | Done (feature branch) |
 | ~~PITR (Sprints P-1 to P-5)~~ | — | Done (feature branch) |
+| ~~Accord Transactions (Sprints A1-A7)~~ | — | Done (feature branch, 2,808 tests) |
 | Beta release v1.0.0-beta.4 | — | Sprints complete |
 | NetworkTopologyStrategy (multi-DC) | — | Planned |
 
@@ -399,10 +456,79 @@ The critical path from single-node to multi-node:
 1. **ferrosa-cluster:** NetworkTopologyStrategy (multi-DC)
 1. **Beta release**
 
+## Accord Transactions
+
+Ferrosa implements the Accord consensus protocol (based on the Accord paper from
+Cassandra 5.x) for distributed transactions. The implementation spans 7 sprints
+(A1-A7) with 2,808 passing tests.
+
+### Protocol Overview
+
+Accord provides serializable transactions without a dedicated coordinator:
+
+1. **PreAccept** — propose transaction to electorate, collect dependency sets
+2. **Accept** — resolve conflicts via slow path if fast path quorum not met
+3. **Commit** — record committed transaction in ProtocolLog
+4. **Execute** — apply transaction after all dependencies are satisfied
+5. **Apply** — write results to storage via SyncWriter
+
+### Key Components
+
+| Component | Purpose |
+|-----------|---------|
+| `AccordStateMachine` | Core consensus state machine (39 tests) |
+| `AccordCoordinator` | Fast/slow path coordination with quorum formulas |
+| `ConflictIndex` | Key-range conflict detection for concurrent transactions |
+| `ProtocolLog` | Durable record of transaction decisions |
+| `MemIndex` | BTreeMap-based in-memory conflict index |
+| `RecoveryCoordinator` | 11 recovery scenarios for interrupted transactions |
+| `DepWaitGraph` | Dependency-wait with cycle detection |
+| `DdlDrain` | Drain-and-block gate for DDL during transactions |
+| `CrossShard` | Cross-shard conflict detection and execution |
+| `Leaseholder` | Leaseholder assignment for linearizable local reads |
+| `DurabilityService` | ExclusiveSyncPoint for durability guarantees |
+| `ReorderBuffer` | Dependency-ordered apply buffer |
+| `WriteGate` | DDL drain-and-block gate |
+| `SyncWriter` | Durable write-ahead for Accord commits |
+
+### Testing Infrastructure
+
+| Category | Tests | Description |
+|----------|-------|-------------|
+| Unit tests | ~400 | AccordStateMachine, coordinator, conflict index, protocol log |
+| 24-step EPaxos test | 1 | Full protocol round-trip with dependency tracking |
+| Property-based | 4 | QuickCheck-style tests for consensus invariants |
+| Recovery scenarios | 11 | Interrupted transactions at each protocol phase |
+| Jepsen register | 3 workloads | Read/write/CAS linearizability |
+| Jepsen bank | 1 | Balance preservation under concurrent transfers |
+| Jepsen write-skew | 1 | Serializable isolation verification |
+| Chaos nemesis | Full suite | Network partition, minority kill, clock skew |
+| UDF/UDA integration | 18 | WASM UDFs within Accord transactions |
+| Performance regression | Suite | Baseline + automated regression detection |
+
+### Observability
+
+9 Accord-specific metrics exposed via the existing Prometheus endpoint:
+
+- `ferrosa_accord_transactions_total` — total transactions processed
+- `ferrosa_accord_fast_path_total` — transactions completing on fast path
+- `ferrosa_accord_slow_path_total` — transactions requiring slow path
+- `ferrosa_accord_contention_total` — contention events requiring retry
+- `ferrosa_accord_recovery_total` — recovery coordinator invocations
+- `ferrosa_accord_dep_wait_cycles` — dependency cycles detected
+- `ferrosa_accord_cross_shard_total` — cross-shard transactions
+- `ferrosa_accord_electorate_reconfig_total` — electorate reconfigurations
+- `ferrosa_accord_apply_latency_seconds` — transaction apply latency histogram
+
+See [Accord Specification](accord.md) and [Accord Project Plan](accord-project-plan.md)
+for full details.
+
 ## Related Documents
 
 - [Components](components.md) — crate dependency graph
 - [Overview](overview.md) — system architecture
+- [Accord Transactions](accord.md) — Accord consensus protocol specification
+- [Accord Project Plan](accord-project-plan.md) — sprint completion status
 - [Architecture Design](../superpowers/specs/2026-03-11-ferrosa-architecture-design.md) — full design spec
 - [Schema Replication Design](../superpowers/specs/2026-03-14-schema-replication-design.md) — DDL replication spec
 - [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md) — pluggable index framework spec

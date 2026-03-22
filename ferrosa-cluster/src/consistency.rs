@@ -14,6 +14,12 @@ pub enum ConsistencyLevel {
     LocalOne,
     LocalQuorum,
     EachQuorum,
+    /// Serial consistency for lightweight transactions (LWT read phase).
+    /// Wire code: 0x0008.
+    Serial,
+    /// Data-center-local serial consistency for lightweight transactions.
+    /// Wire code: 0x0009.
+    LocalSerial,
 }
 
 impl ConsistencyLevel {
@@ -21,13 +27,14 @@ impl ConsistencyLevel {
     ///
     /// # Panics
     ///
-    /// Panics if called with `EachQuorum` — use `block_for_dc` instead.
+    /// Panics if called with `EachQuorum` -- use `block_for_dc` instead.
     pub fn block_for(&self, rf: usize) -> usize {
         match self {
             Self::One | Self::LocalOne => 1,
             Self::Two => 2.min(rf),
             Self::Three => 3.min(rf),
-            Self::Quorum | Self::LocalQuorum => rf / 2 + 1,
+            Self::Quorum | Self::LocalQuorum | Self::Serial => rf / 2 + 1,
+            Self::LocalSerial => rf / 2 + 1,
             Self::All => rf,
             Self::EachQuorum => {
                 panic!("use block_for_dc() for EACH_QUORUM");
@@ -38,14 +45,14 @@ impl ConsistencyLevel {
     /// Number of replicas per data center that must acknowledge.
     pub fn block_for_dc(&self, dc_rf: usize) -> usize {
         match self {
-            Self::EachQuorum | Self::LocalQuorum => dc_rf / 2 + 1,
+            Self::EachQuorum | Self::LocalQuorum | Self::LocalSerial => dc_rf / 2 + 1,
             _ => self.block_for(dc_rf),
         }
     }
 
     /// Decode from the CQL native protocol wire format (u16).
     ///
-    /// See CQL native protocol v5 §2.2 for the consistency enum values.
+    /// See CQL native protocol v5 section 2.2 for the consistency enum values.
     pub fn from_wire(code: u16) -> Option<Self> {
         match code {
             0x0001 => Some(Self::One),
@@ -55,6 +62,8 @@ impl ConsistencyLevel {
             0x0005 => Some(Self::All),
             0x0006 => Some(Self::LocalQuorum),
             0x0007 => Some(Self::EachQuorum),
+            0x0008 => Some(Self::Serial),
+            0x0009 => Some(Self::LocalSerial),
             0x000A => Some(Self::LocalOne),
             _ => None,
         }
@@ -72,7 +81,25 @@ impl ConsistencyLevel {
             "LOCAL_ONE" => Some(Self::LocalOne),
             "LOCAL_QUORUM" => Some(Self::LocalQuorum),
             "EACH_QUORUM" => Some(Self::EachQuorum),
+            "SERIAL" => Some(Self::Serial),
+            "LOCAL_SERIAL" => Some(Self::LocalSerial),
             _ => None,
+        }
+    }
+
+    /// Encode to the CQL native protocol wire format (u16).
+    pub fn to_wire(&self) -> u16 {
+        match self {
+            Self::One => 0x0001,
+            Self::Two => 0x0002,
+            Self::Three => 0x0003,
+            Self::Quorum => 0x0004,
+            Self::All => 0x0005,
+            Self::LocalQuorum => 0x0006,
+            Self::EachQuorum => 0x0007,
+            Self::Serial => 0x0008,
+            Self::LocalSerial => 0x0009,
+            Self::LocalOne => 0x000A,
         }
     }
 
@@ -87,6 +114,8 @@ impl ConsistencyLevel {
             Self::LocalOne => "LOCAL_ONE",
             Self::LocalQuorum => "LOCAL_QUORUM",
             Self::EachQuorum => "EACH_QUORUM",
+            Self::Serial => "SERIAL",
+            Self::LocalSerial => "LOCAL_SERIAL",
         }
     }
 }
@@ -144,6 +173,8 @@ mod tests {
             ConsistencyLevel::LocalOne,
             ConsistencyLevel::LocalQuorum,
             ConsistencyLevel::EachQuorum,
+            ConsistencyLevel::Serial,
+            ConsistencyLevel::LocalSerial,
         ] {
             assert_eq!(ConsistencyLevel::from_str(cl.as_str()), Some(*cl));
         }
@@ -152,6 +183,20 @@ mod tests {
     #[test]
     fn from_str_unknown_returns_none() {
         assert_eq!(ConsistencyLevel::from_str("INVALID"), None);
+    }
+
+    #[test]
+    fn consistency_serial_wire_code() {
+        assert_eq!(
+            ConsistencyLevel::from_wire(0x0008),
+            Some(ConsistencyLevel::Serial)
+        );
+        assert_eq!(
+            ConsistencyLevel::from_wire(0x0009),
+            Some(ConsistencyLevel::LocalSerial)
+        );
+        assert_eq!(ConsistencyLevel::Serial.to_wire(), 0x0008);
+        assert_eq!(ConsistencyLevel::LocalSerial.to_wire(), 0x0009);
     }
 
     proptest! {
@@ -165,6 +210,8 @@ mod tests {
                 ConsistencyLevel::All,
                 ConsistencyLevel::LocalOne,
                 ConsistencyLevel::LocalQuorum,
+                ConsistencyLevel::Serial,
+                ConsistencyLevel::LocalSerial,
             ] {
                 let bf = cl.block_for(rf);
                 prop_assert!(bf <= rf, "blockFor({:?}, {}) = {} exceeds RF", cl, rf, bf);
@@ -185,6 +232,8 @@ mod tests {
                 ConsistencyLevel::Three,
                 ConsistencyLevel::Quorum,
                 ConsistencyLevel::All,
+                ConsistencyLevel::Serial,
+                ConsistencyLevel::LocalSerial,
             ] {
                 let bf = cl.block_for(rf);
                 prop_assert!(bf >= 1, "blockFor({:?}, {}) = 0", cl, rf);

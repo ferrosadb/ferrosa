@@ -82,10 +82,34 @@ pub fn encode_rows(
     table: &str,
     rows: &[Vec<Option<CqlValue>>],
 ) -> BytesMut {
+    encode_rows_paged(column_names, column_types, keyspace, table, rows, None)
+}
+
+/// Encode a Rows RESULT body with optional paging state.
+///
+/// When `paging_state` is `Some`, the `Has_more_pages` flag (0x0002) is set
+/// in the result metadata and the opaque paging state bytes are included.
+/// This signals to the client that more rows are available and they should
+/// send the paging_state back in the next QUERY/EXECUTE to continue.
+pub fn encode_rows_paged(
+    column_names: &[String],
+    column_types: &[CqlType],
+    keyspace: &str,
+    table: &str,
+    rows: &[Vec<Option<CqlValue>>],
+    paging_state: Option<&[u8]>,
+) -> BytesMut {
     let mut buf = BytesMut::new();
     buf.put_i32(0x0002); // Rows kind
 
-    encode_rows_metadata(&mut buf, column_names, column_types, keyspace, table);
+    encode_rows_metadata_paged(
+        &mut buf,
+        column_names,
+        column_types,
+        keyspace,
+        table,
+        paging_state,
+    );
 
     // rows_count
     buf.put_i32(rows.len() as i32);
@@ -211,8 +235,39 @@ fn encode_rows_metadata(
     keyspace: &str,
     table: &str,
 ) {
-    buf.put_i32(0x0001); // flags: Global_tables_spec
+    encode_rows_metadata_paged(buf, column_names, column_types, keyspace, table, None);
+}
+
+/// Write column metadata with optional paging state.
+///
+/// When `paging_state` is `Some`, sets the `Has_more_pages` flag (0x0002)
+/// and writes the paging state bytes after the flags and column count.
+///
+/// CQL v5 metadata flags:
+/// - 0x0001: Global_tables_spec
+/// - 0x0002: Has_more_pages
+/// - 0x0004: No_metadata
+fn encode_rows_metadata_paged(
+    buf: &mut BytesMut,
+    column_names: &[String],
+    column_types: &[CqlType],
+    keyspace: &str,
+    table: &str,
+    paging_state: Option<&[u8]>,
+) {
+    let mut flags: i32 = 0x0001; // Global_tables_spec
+    if paging_state.is_some() {
+        flags |= 0x0002; // Has_more_pages
+    }
+    buf.put_i32(flags);
     buf.put_i32(column_names.len() as i32);
+
+    // If Has_more_pages is set, write the paging state bytes.
+    if let Some(state) = paging_state {
+        buf.put_i32(state.len() as i32);
+        buf.put_slice(state);
+    }
+
     encode_string(buf, keyspace);
     encode_string(buf, table);
     for (name, cql_type) in column_names.iter().zip(column_types.iter()) {
@@ -245,8 +300,16 @@ fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
             }
         }
         CqlType::Vector(elem, dim) => {
-            encode_type(buf, elem);
-            buf.put_i32(*dim as i32);
+            // Cassandra 5.0 encodes vectors as Custom type (0x0000) with
+            // the class name string. The type_id is already 0x0000.
+            let elem_class = match elem.as_ref() {
+                CqlType::Float => "org.apache.cassandra.db.marshal.FloatType",
+                CqlType::Double => "org.apache.cassandra.db.marshal.DoubleType",
+                _ => "org.apache.cassandra.db.marshal.FloatType",
+            };
+            let class_name =
+                format!("org.apache.cassandra.db.marshal.VectorType({elem_class}, {dim})");
+            encode_string(buf, &class_name);
         }
         CqlType::Udt {
             keyspace,

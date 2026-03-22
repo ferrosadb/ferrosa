@@ -1,396 +1,336 @@
-# Accord Distributed Transactions
+# Accord Consensus Protocol
 
-> Last updated: 2026-03-21
-> Status: Draft
-> Source: research/SPEC-accord-transactions.md
+> Last updated: 2026-03-22
+> Status: Implemented (Sprints A1-A7 complete)
 
 ## Overview
 
-Accord is a leaderless distributed transaction protocol that provides strict-serializable ACID transactions across multiple CQL tables and partitions. All writes — including single-key INSERTs — are routed through Accord, eliminating the mixing problem where non-Accord writes are invisible to dependency tracking.
+Ferrosa implements the Accord consensus protocol for distributed transactions, providing serializable isolation without a dedicated coordinator. The implementation is based on the Accord protocol from Cassandra 5.x, adapted for Ferrosa's Rust architecture.
 
-### Goals
+Accord enables:
 
-- G1: Single-key writes in 1 RTT at P50 (normal conditions)
-- G2: Multi-key transactions in 1-2 RTTs
-- G3: Strict serializability for all writes regardless of CL setting
-- G4: Linearizable reads with no extra RTT (no-conflict case)
-- G5: Secondary indexes always consistent within a transaction
-- G6: No lost commits or stale reads after node failure + recovery
-- G7: All Jepsen correctness tests pass (bank, long-fork, monotonic, register, write-skew)
-- G8: No regression in P50 write latency vs current QUORUM baseline (+/-15%)
+- **Lightweight Transactions (LWT)**: INSERT IF NOT EXISTS, IF conditions on UPDATE/DELETE
+- **Multi-statement transactions**: BEGIN TRANSACTION / COMMIT / ROLLBACK
+- **Cross-shard transactions**: Transactions spanning multiple token ranges
+- **Serializable isolation**: Linearizable reads via leaseholder optimization
 
-### Non-Goals
-
-- Byzantine fault tolerance
-- Cross-datacenter transactions (initial release)
-- Cassandra LWT (Paxos) API compatibility
-
-## Component Architecture
+## Protocol Phases
 
 ```mermaid
-graph TB
-    subgraph "ferrosa-common (extended)"
-        HLC[HybridLogicalClock]
-        TS[Timestamp<br/>epoch + time + seq + node]
-        TxnId[TxnId]
-        AB[AcceptedBallot<br/>distinct from PromisedBallot]
-    end
+stateDiagram-v2
+    [*] --> PreAccept: Coordinator proposes
+    PreAccept --> Commit: Fast path (3/4 agree)
+    PreAccept --> Accept: Slow path (deps disagree)
+    Accept --> Commit: Majority accepts
+    Commit --> WaitDeps: Record in ProtocolLog
+    WaitDeps --> Execute: All deps satisfied
+    Execute --> Apply: Condition checks pass
+    Apply --> [*]: SyncWriter durably applies
 
-    subgraph "ferrosa-net (extended)"
-        HB[Heartbeat Extension<br/>sent_at + recv_at]
-        AM[Accord Messages<br/>PreAccept, Accept, Commit,<br/>Read, Apply, Recover]
-    end
-
-    subgraph "ferrosa-cluster (new: accord/)"
-        ASM[AccordStateMachine<br/>PreAccept→Accept→Commit→Execute→Apply]
-        AC[AccordCoordinator<br/>Leaseholder + Non-leaseholder paths]
-        ROB[ReorderBuffer<br/>TimerWheel, deadline formula]
-        EC[ElectorateConfig<br/>Epoch, quorum sizing]
-        RC[RecoveryCoordinator<br/>Failure-detector triggered]
-    end
-
-    subgraph "ferrosa-storage (extended)"
-        CI[ConflictIndex<br/>HashMap + BTreeMap + indexed_writes]
-        MI[MemIndex<br/>BTreeMap, atomic with memtable]
-        CL[CommitLog Extensions<br/>AccordPreAccepted, AccordAccepted,<br/>AccordCommitted, AccordApplied]
-    end
-
-    subgraph "ferrosa-cql (extended)"
-        TXP[Transaction Parser<br/>BEGIN / COMMIT / ROLLBACK]
-        QP[2i Query Planner<br/>READ_2I 5-layer algorithm]
-    end
-
-    subgraph "ferrosa-index (extended)"
-        EIB[Eager Index Build<br/>on_flush_complete hook]
-    end
-
-    AC --> ASM
-    AC --> ROB
-    AC --> EC
-    RC --> ASM
-    ASM --> CI
-    ASM --> MI
-    ASM --> CL
-    ASM --> AM
-    ROB --> HB
-    EC --> HLC
-    TXP --> AC
-    QP --> CI
-    QP --> MI
-    EIB --> MI
+    state "Recovery" as Rec {
+        [*] --> Probe: Timeout detected
+        Probe --> ReAccept: Reconstruct state
+        ReAccept --> Commit
+    }
 ```
 
-## Crate Integration Map
+### Phase 1: PreAccept
 
-| Crate | Changes | New Types/Modules |
-|-------|---------|-------------------|
-| ferrosa-common | Extended | `HybridLogicalClock`, `Timestamp{epoch,time,seq,node}`, `TxnId`, `AcceptedBallot`, `PromisedBallot`, `BallotNumber` |
-| ferrosa-storage | Extended | `ConflictIndex`, `MemIndex`, `CommitLogEntry::{AccordPreAccepted, AccordAccepted, AccordCommitted, AccordApplied}` |
-| ferrosa-cluster | New submodule | `accord/` module: `AccordStateMachine`, `AccordCoordinator`, `ReorderBuffer`, `ElectorateConfig`, `RecoveryCoordinator` |
-| ferrosa-net | Extended | `Message::{PreAccept, PreAcceptOK, Accept, AcceptOK, Commit, Read, ReadOK, Apply, ApplyOK, Recover, RecoverOK}`, heartbeat `sent_at`/`recv_at` |
-| ferrosa-cql | Extended | `Statement::BeginTransaction`, `Statement::Commit`, `Statement::Rollback`; `READ_2I` in planner |
-| ferrosa-index | Extended | `on_flush_complete` eager build trigger |
+The coordinator generates a `TxnId` (HLC timestamp + node ID + sequence) and sends `PreAccept` messages to the electorate (replicas responsible for the transaction's key range).
 
-## Data Flow: Write Path with Accord
+Each replica:
 
-```mermaid
-sequenceDiagram
-    participant C as CQL Client
-    participant CQL as ferrosa-cql
-    participant AC as AccordCoordinator
-    participant ROB as ReorderBuffer
-    participant R1 as Replica 1
-    participant R2 as Replica 2
-    participant CI as ConflictIndex
-    participant MT as Memtable
-    participant CLog as CommitLog
+1. Checks `ConflictIndex` for overlapping key ranges with pending transactions
+2. Records the transaction in its `ProtocolLog`
+3. Returns its dependency set (transactions that must execute before this one)
 
-    C->>CQL: INSERT / UPDATE / BEGIN TRANSACTION
-    CQL->>AC: Build AccordTxn (read/write sets)
+### Phase 2a: Fast Path
 
-    alt Leaseholder Path (1 RTT)
-        AC->>CI: Local conflict check
-        AC->>AC: Assign t0 from HLC
-        AC->>R1: PreAccept(txn_id, t0, payload)
-        R1->>ROB: Buffer until deadline
-        ROB->>R1: Release (in t0 order)
-        R1->>CI: max_conflicting_timestamp()
-        R1->>CLog: Persist AccordPreAccepted
-        R1->>AC: PreAcceptOK(t, deps)
-        Note over AC: Fast quorum met (2/3 for RF=3)
-        AC->>MT: Execute locally
-        AC->>R1: Apply(txn_id, t, deps, result)
-        AC->>C: ACK (1 RTT total)
-    else Non-Leaseholder / Slow Path (2 RTTs)
-        AC->>R1: PreAccept
-        AC->>R2: PreAccept
-        R1->>AC: PreAcceptOK(t1, deps1)
-        R2->>AC: PreAcceptOK(t2, deps2)
-        Note over AC: t1 != t2 → slow path
-        AC->>R1: Accept(ballot=0, t=max(t1,t2), deps)
-        AC->>R2: Accept(ballot=0, t=max(t1,t2), deps)
-        R1->>AC: AcceptOK
-        R2->>AC: AcceptOK
-        AC->>R1: Commit
-        AC->>R2: Commit
-        AC->>R1: Read(shard_deps)
-        R1->>AC: ReadOK
-        AC->>R1: Apply
-        AC->>R2: Apply
-        AC->>C: ACK (2 RTTs total)
-    end
+If a 3/4 supermajority of the electorate agrees on the same dependency set, the coordinator skips the Accept phase and proceeds directly to Commit. This is the common case when there is no contention.
+
+### Phase 2b: Slow Path (Accept)
+
+If dependencies disagree (contention detected), the coordinator merges all dependency sets and sends `Accept` messages. A simple majority suffices for the Accept phase.
+
+### Phase 3: Commit
+
+The coordinator sends `Commit` messages to all replicas. Each replica:
+
+1. Records the committed state in `ProtocolLog`
+2. Writes to `.accord` sidecar file for crash recovery
+3. Notifies the `DepWaitGraph` that this transaction is committed
+
+### Phase 4: Execute
+
+The `DepWaitGraph` monitors dependencies. Once all dependencies of a transaction are satisfied (committed and executed), the transaction proceeds to execution:
+
+1. For LWT: evaluate the IF condition against current data
+2. For multi-statement transactions: validate read-set, apply write-set
+3. Apply writes via `SyncWriter` (durable write-ahead)
+
+## Core Components
+
+### AccordStateMachine
+
+The core consensus state machine implementing the Accord protocol. Manages transaction state transitions (PreAccepted → Accepted → Committed → Executed → Applied).
+
+- **39 unit tests** covering all state transitions and edge cases
+- Thread-safe with interior mutability for concurrent access
+
+### AccordCoordinator
+
+Drives the multi-phase consensus protocol:
+
+- **Fast path**: 3/4 supermajority quorum (e.g., 3 of 4 replicas)
+- **Slow path**: Simple majority quorum
+- **Quorum formulas**: Configurable per replication factor
+- Routes CQL LWT and transaction statements through the Accord protocol
+
+### ConflictIndex
+
+Detects conflicts between concurrent transactions by tracking key ranges:
+
+- Key-range overlap detection for partition and clustering keys
+- Thread-safe concurrent access
+- Efficient range-based lookups
+
+### MemIndex
+
+BTreeMap-based in-memory conflict index providing O(log n) lookups for conflict detection. Used by the AccordStateMachine for fast key-range intersection queries.
+
+### ProtocolLog
+
+Durable record of all transaction decisions:
+
+- Records PreAccept, Accept, and Commit decisions
+- Supports recovery queries by TxnId
+- Integrated with `.accord` sidecar files for crash durability
+
+### RecoveryCoordinator
+
+Handles recovery of interrupted transactions (coordinator failure):
+
+- **11 recovery scenarios** covering all protocol phases
+- Probes replicas to reconstruct transaction state
+- Re-drives Accept/Commit as needed
+- Ballot-based leader election prevents concurrent recovery conflicts
+
+### DepWaitGraph
+
+Dependency-wait tracking with cycle detection:
+
+- Tracks which transactions are waiting on which dependencies
+- Detects dependency cycles (which indicate protocol bugs)
+- Notifies waiting transactions when dependencies complete
+
+### DdlDrain
+
+Coordinates DDL operations with active Accord transactions:
+
+- Closes `WriteGate` to block new transactions
+- Waits for all in-flight transactions to complete
+- Enables two-phase DDL with epoch-based transitions
+
+### CrossShard
+
+Handles transactions spanning multiple token ranges:
+
+- Partitions transaction keys by token range into per-shard sets
+- Coordinates PreAccept/Accept/Commit across multiple electorates
+- Merges dependency sets from all shards
+
+### Leaseholder
+
+Optimizes reads for linearizability:
+
+- Assigns leaseholder for each token range
+- Leaseholder can serve reads locally without consensus round-trip
+- Lease renewal via heartbeat protocol
+
+### DurabilityService
+
+Provides durability guarantees via ExclusiveSyncPoint:
+
+- Ensures committed transactions are durable before acknowledging
+- Coordinates with storage SyncWriter for write-ahead logging
+- Supports batch durability for throughput optimization
+
+### Electorate Reconfiguration
+
+Handles topology changes (node join/leave) during active transactions:
+
+- **Epoch propagation**: New epoch numbers coordinate reconfiguration
+- **JoinElectorate 4-gate**: Staged join process (Prepare → Transfer → Activate → Verify)
+- **Shrink/resize**: Safe electorate reduction when nodes decommission
+- **Epoch transition drain**: In-flight transactions at old epoch complete before new epoch activates
+
+## Storage Integration
+
+### SyncWriter
+
+Durable write-ahead for Accord transaction commits. Writes to the commit log before acknowledging transaction completion.
+
+### WriteGate
+
+DDL drain-and-block gate. When a DDL operation starts:
+
+1. Gate closes — new Accord transactions are rejected
+2. In-flight transactions complete
+3. DDL executes
+4. Gate opens — new transactions resume
+
+### ReorderBuffer
+
+Ensures transactions are applied in dependency order. Transactions that arrive out of order are buffered until their dependencies complete.
+
+### Sidecar Files
+
+`.accord` sidecar files store in-flight transaction state for crash recovery:
+
+- Written alongside SSTable data
+- On restart, sidecar files are replayed to reconstruct `ProtocolLog`
+- Enables recovery without re-running full consensus protocol
+
+## CQL Integration
+
+### LWT Statements
+
+```sql
+-- INSERT IF NOT EXISTS
+INSERT INTO users (id, name) VALUES (1, 'alice') IF NOT EXISTS;
+
+-- UPDATE with IF condition
+UPDATE users SET name = 'bob' WHERE id = 1 IF name = 'alice';
+
+-- DELETE with IF condition
+DELETE FROM users WHERE id = 1 IF name = 'bob';
+
+-- Batch CAS
+BEGIN BATCH
+  INSERT INTO users (id, name) VALUES (1, 'alice') IF NOT EXISTS;
+  INSERT INTO profiles (id, bio) VALUES (1, 'hello') IF NOT EXISTS;
+APPLY BATCH;
 ```
 
-## Data Flow: Recovery Protocol
+LWT statements are routed through `AccordCoordinator` when `SERIAL` or `LOCAL_SERIAL` consistency is requested.
 
-```mermaid
-sequenceDiagram
-    participant FD as FailureDetector<br/>(ferrosa-net)
-    participant RC as RecoveryCoordinator
-    participant P1 as Replica p1
-    participant P2 as Replica p2
-    participant P3 as Replica p3
+### Multi-Statement Transactions
 
-    FD->>RC: Coordinator suspected (heartbeat timeout 5s)
-    RC->>RC: fresh_ballot()
-    RC->>P1: Recover(ballot, txn_id, t0)
-    RC->>P2: Recover(ballot, txn_id, t0)
-    RC->>P3: Recover(ballot, txn_id, t0)
-
-    P1->>RC: RecoverOK(state, superseding, wait)
-    P2->>RC: RecoverOK(state, superseding, wait)
-
-    alt Any applied
-        RC->>P1: Apply(result from applied replica)
-        RC->>P2: Apply
-        RC->>P3: Apply
-    else Any committed
-        RC->>RC: goto Execute
-    else Any accepted
-        Note over RC: Select by max(accepted_ballot)<br/>NOT max(max_ballot_seen)
-        RC->>P1: Accept(ballot, t, deps)
-        RC->>P2: Accept(ballot, t, deps)
-    else No accepted state
-        RC->>RC: Determine safe timestamp
-        RC->>P1: Accept(ballot, t, deps)
-        RC->>P2: Accept(ballot, t, deps)
-    end
+```sql
+BEGIN TRANSACTION;
+  SELECT balance FROM accounts WHERE id = 1;
+  UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+  UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
 ```
 
-## Data Flow: Transactional 2i Read
+The parser extracts read-set and write-set from the transaction body. Transaction limits prevent unbounded resource usage:
 
-```mermaid
-sequenceDiagram
-    participant Q as Query Planner
-    participant PI as Persistent Index<br/>(Layer 5: NVMe/S3)
-    participant MI as MemIndex<br/>(Layer 3: RAM)
-    participant CI as ConflictIndex<br/>(Layers 1-2: RAM)
-    participant SS as Unindexed SSTables<br/>(Layer 4: Block Cache)
-    participant AR as Accord Read
+- Maximum statements per transaction
+- Maximum keys per transaction
+- Timeout per transaction
 
-    Q->>PI: lookup(column, value)
-    PI->>Q: base_keys
-    Q->>MI: lookup(column, value, read_ts)
-    MI->>Q: mem_hits
-    Q->>CI: inflight_writing(column, value)
-    CI->>Q: pending_deps + inflight_hits
+### Consistency Levels
 
-    alt pending_deps non-empty
-        Q->>Q: await committed(pending_deps)
-        Q->>Q: re-evaluate with accord_ts
-    end
+| Level | Behavior |
+|-------|----------|
+| `SERIAL` | Global serializable via Accord |
+| `LOCAL_SERIAL` | DC-local serializable via Accord |
+| `QUORUM` | Standard quorum (non-transactional) |
 
-    Q->>SS: scan unindexed SSTables (bloom filter)
-    SS->>Q: sstable_hits
-    Q->>Q: merge all - deletions
-    Q->>AR: accord_read(key, read_ts) for each result
-    AR->>Q: final rows
-```
+## Observability
 
-## Core Data Structures
+9 Accord-specific metrics are exposed via the Prometheus endpoint (`/metrics`):
 
-### Timestamp (ferrosa-common)
+| Metric | Type | Description |
+|--------|------|-------------|
+| `ferrosa_accord_transactions_total` | Counter | Total transactions processed |
+| `ferrosa_accord_fast_path_total` | Counter | Fast path completions |
+| `ferrosa_accord_slow_path_total` | Counter | Slow path completions |
+| `ferrosa_accord_contention_total` | Counter | Contention events (client retry) |
+| `ferrosa_accord_recovery_total` | Counter | Recovery coordinator invocations |
+| `ferrosa_accord_dep_wait_cycles` | Counter | Dependency cycles detected |
+| `ferrosa_accord_cross_shard_total` | Counter | Cross-shard transactions |
+| `ferrosa_accord_electorate_reconfig_total` | Counter | Electorate reconfigurations |
+| `ferrosa_accord_apply_latency_seconds` | Histogram | Transaction apply latency |
 
-```
-Timestamp { epoch: u64, time: u64, seq: u32, node: NodeId }
-```
+## Testing
 
-- **epoch**: Electorate configuration epoch. Transactions in different epochs cannot form fast-path quorums.
-- **time**: Wall-clock nanoseconds from local HLC. Loosely synchronized via NTP/PTP.
-- **seq**: Logical sequence, incremented on conflict bump. Starts at 0.
-- **node**: Assigning node's ID. Ensures global uniqueness.
-- **Ordering**: Fields sorted `epoch > time > seq > node` for `PartialOrd` correctness.
+### Unit Tests
 
-### TxnState (per-replica, per-transaction)
+- **AccordStateMachine**: 39 tests covering state transitions, quorum logic, conflict detection
+- **AccordCoordinator**: Fast path, slow path, quorum formula validation
+- **ConflictIndex**: Overlap detection, concurrent access
+- **ProtocolLog**: Durability, recovery queries
+- **RecoveryCoordinator**: 11 recovery scenarios at each protocol phase
+- **DepWaitGraph**: Dependency tracking, cycle detection
+- **DdlDrain**: Drain timing, gate open/close semantics
+- **CrossShard**: Multi-shard coordination, partial failure handling
 
-Two ballot fields (MANDATORY — see ADR below):
+### Property-Based Tests
 
-- `max_ballot_seen: PromisedBallot` — highest ballot promised (joined)
-- `accepted_ballot: AcceptedBallot` — highest ballot voted in
+4 property-based tests verify consensus invariants:
 
-These are distinct Rust types to prevent confusion at compile time.
+- Agreement: all replicas agree on transaction outcome
+- Validity: only proposed values are committed
+- Termination: all non-faulty transactions eventually complete
+- Serialization: committed transactions have a total order
 
-### ConflictIndex (ferrosa-storage)
+### 24-Step EPaxos Test
 
-Three-tier conflict detection:
+A comprehensive protocol round-trip test with dependency tracking, exercising the full PreAccept → Accept → Commit → Execute → Apply pipeline with multiple concurrent transactions and controlled dependency resolution.
 
-1. **single_key**: `HashMap<PartitionKey, SmallVec<[InFlightWrite; 4]>>` — O(1) for >95% of operations
-2. **range_ops**: `BTreeMap<TokenRange, BTreeSet<(Timestamp, TxnId)>>` — O(log n) for range queries
-3. **indexed_writes**: `HashMap<ColumnId, HashMap<CellValue, Vec<TxnId>>>` — column projections for transactional 2i
+### Jepsen-Style Tests
 
-Bounded size: ~500 entries at 100K TPS x 5ms avg latency.
+Built-in Jepsen infrastructure (`TestCluster`, `NemesisController`, `HistoryRecorder`, `LinearizabilityChecker`):
 
-### ReorderBuffer (ferrosa-cluster)
+| Test | Workloads | Validates |
+|------|-----------|-----------|
+| Register test | 3 (read, write, CAS) | Linearizability of single-key operations |
+| Bank test | 1 (transfer) | Balance preservation under concurrent transfers |
+| Write-skew test | 1 (read-then-write) | Serializable isolation (no write skew anomaly) |
 
-TimerWheel-based buffer (NOT individual tokio::time::sleep calls) that delays PreAccept processing until arrival deadline:
+### Chaos / Nemesis Suite
 
-```
-Deadline(t0, C, P) = wall_clock(t0.time) + SkewMax + max(Latency(C', P)) - Latency(C, P)
-```
+Full nemesis suite for fault injection:
 
-- SkewMax: P99.9 of observed clock offsets (measured via heartbeats, not NTP config)
-- Latency: P99 of one-way message delay (heartbeat RTT / 2)
-- Buffer depth bounded: SkewMax + max_latency x TPS per shard (~100 entries at 1ms, 100K TPS)
-- In-memory only; lost messages re-sent by coordinators after timeout
+- Network partition (split brain)
+- Minority node kill
+- Clock skew injection (SkewMax)
+- Coordinator crash during each protocol phase
+- Crash recovery replay from `.accord` sidecar files
 
-### MemIndex (ferrosa-storage)
+### Performance Tests
 
-```
-BTreeMap<CellValue, BTreeMap<Timestamp, MemIndexEntry>>
-```
+- Performance baseline: latency and throughput under normal operation
+- Regression suite: automated detection of performance degradation
+- Debouncer Accord ordering tests
 
-- Updated atomically with memtable in Apply handler
-- GC'd on flush: `flush_gc(flushed_up_to_ts)` removes entries covered by persistent index
-- Partition reverse lookup: `HashMap<PartitionKey, HashSet<CellValue>>` for DELETE handling
+### UDF/UDA Integration
 
-## Commit Log Architecture
+18 tests validating WASM UDF/UDA execution within Accord transactions:
 
-Accord uses a dual-log architecture:
+- UDF calls in transactional SELECT
+- UDA state accumulation within transactions
+- UDF failure handling (resource exhaustion, timeout) within transactions
 
-**Protocol Log** (local-only, NOT uploaded to S3):
+## Implementation Sprints
 
-| Entry | Persisted Before | GC Condition |
-|-------|-----------------|--------------|
-| `AccordPreAccepted` | Sending `PreAcceptOK` | After `AccordApplied` written to main log |
-| `AccordAccepted` | Sending `AcceptOK` | After `AccordApplied` written to main log |
-| `AccordCommitted` | Setting `committed` flag | After `AccordApplied` written to main log |
-
-**Main Commit Log** (uploaded to S3, existing infrastructure):
-
-| Entry | Persisted Before | GC Condition |
-|-------|-----------------|--------------|
-| `AccordApplied` + data mutation | Setting `applied` flag | After SSTable uploaded to S3 |
-
-Protocol state is ephemeral — GC'd aggressively after Applied, reconstructable from peers on restart. Main commit log stays at ~1x S3 upload volume (no amplification vs today).
-
-## Flexible Electorates
-
-Quorum sizing computed dynamically from electorate size:
-
-| Config | RF=3, f_fast=0 | RF=5, f_fast=1 |
-|--------|----------------|----------------|
-| Fast quorum | 2/3 | 4/5 |
-| Slow quorum | 2/3 (majority) | 3/5 (majority) |
-
-Electorate changes managed by existing openraft metadata group. Epoch field in Timestamp prevents cross-epoch fast-path quorums. New members wait for `JoinElectorate` notifications from prior electorate before participating.
-
-## UDF/UDA Branch Integration Points
-
-The `feature/udf-uda-query-time` branch introduces changes that interact with Accord:
-
-| Component | Change | Accord Impact |
-|-----------|--------|---------------|
-| `LateDataDebouncer` (timeseries) | Local state, not replicated | Must be deterministic or consensus-ordered for re-aggregation |
-| `DeleteTarget` enum (CQL AST) | `Column(String)` + `MapElement{column, key}` | Must serialize correctly in Accord commit log |
-| `WhereClause.token_fn` | Token-range predicates | Accord routing must recognize range scans vs point lookups |
-| Row-level deletion LWW (sharded memtable) | Deletion timestamp comparison | Must be idempotent when replayed from Accord log |
-| Oversized commit log entries | Now returns error instead of panic | Accord error path must handle gracefully |
-| `pk_indexes` in PREPARE | Driver token-aware routing metadata | Must be consistent across all replicas |
-| Built-in aggregates (AVG, MIN, MAX, SUM) | Read-only | No conflict resolution needed |
-
-## Architectural Decision Records
-
-### ADR: Two Ballot Variables (MANDATORY)
-
-**Context:** Sutra (2019) proved that EPaxos's single ballot variable allows replicas to misreport voting history during recovery, producing linearizability violations (24-step counter-example).
-
-**Decision:** `TxnState` maintains two separate ballot fields as distinct Rust types:
-
-- `max_ballot_seen: PromisedBallot` — updated when joining a ballot
-- `accepted_ballot: AcceptedBallot` — updated only when voting
-
-Recovery coordinators select values by `max(accepted_ballot)`, never `max(max_ballot_seen)`.
-
-**Enforcement:** Distinct newtype wrappers prevent compile-time confusion. The 24-step EPaxos correctness test is a mandatory CI gate.
-
-### ADR: All Writes Through Accord (CL=ONE Fire-and-Forget)
-
-**Context:** Mixing Accord and non-Accord writes makes non-Accord writes invisible to dependency tracking, violating strict serializability (FM16, RPN 250). However, CL=ONE workloads (telemetry, IoT, event logs) explicitly opted out of consistency and care about throughput.
-
-**Decision:** All writes route through Accord. CL=ONE uses fire-and-forget mode: enters Accord, gets `t0`, broadcasts PreAccept, returns ACK to client after PreAccept quorum, but skips the Execute/Apply wait. The transaction completes asynchronously in the background. The write is registered in the ConflictIndex, so subsequent Accord transactions see it as a dependency.
-
-**Implementation:** `AccordStateMachine` carries a `FireAndForget` flag that skips the Execute/Read/Apply wait loop. The PreAccept→Commit path completes asynchronously. Client gets ACK after PreAccept quorum (~0.5 RTT added vs bypassing Accord entirely).
-
-**Trade-off:** ~0.5 RTT overhead for CL=ONE vs full bypass, but dependency tracking is preserved. Subsequent Accord transactions are never blind to CL=ONE writes.
-
-### ADR: Superset Dependency Model
-
-**Context:** Caesar's precise dependency tracking causes livelock under contention.
-
-**Decision:** Use Accord's superset dependency model. `deps(tau)` may contain entries beyond the minimum required (adds unnecessary waits, not incorrect waits). Missing a dependency is unsafe; extra dependencies are safe.
-
-### ADR: Timer Wheel for ReorderBuffer
-
-**Context:** One tokio::time::sleep per enqueued message = O(n) timers = unacceptable overhead at high TPS.
-
-**Decision:** Use a timer wheel (hierarchical timing wheel) for O(1) insert/expire. Single thread drives all deadlines for a shard.
-
-### ADR: Eager Index Build
-
-**Context:** Deferred index builds leave a gap (Layer 4 in READ_2I) that grows under write load.
-
-**Decision:** Trigger async secondary index build immediately after each SSTable flush at `Priority::High`. Keeps Layer 4 at 0-1 entries in steady state.
-
-## Implementation Phases
-
-| Phase | Gate | Key Deliverables |
-|-------|------|-----------------|
-| 0: Foundation | Unit tests + 24-step test pass | HLC, Timestamp, TxnId, ConflictIndex, MemIndex, commit log types, ReorderBuffer, heartbeat extension |
-| 1: Single-Key Accord | Jepsen register + P50 within 15% baseline | AccordStateMachine, leaseholder fast path, linearizable reads, recovery, commit log replay, ElectorateConfig |
-| 2: Multi-Key Txns | Jepsen bank + write-skew pass | BEGIN/COMMIT/ROLLBACK parser, cross-shard Execute, client retry |
-| 3: Transactional 2i | 2i correctness + dep-wait P99 < 5ms | MemIndex integration, READ_2I algorithm, CommitIndex projections, eager index build |
-| 4: Electorate Reconfig | Chaos test + Jepsen all-tests with nemesis | Epoch propagation, JoinElectorate, electorate shrink |
-
-### ADR: Schema Changes — Drain-and-Block, Then Two-Phase DDL
-
-**Context:** DDL (ALTER TABLE, CREATE INDEX) must conflict with all DML on the affected table. Modeling DDL as an Accord transaction spanning "all partitions of table X" is conceptually clean but O(num_partitions) in ConflictIndex — impractical for large tables.
-
-**Decision (Phase 1):** Drain-and-block. Stop accepting new Accord transactions for the table, wait for in-flight to complete, apply DDL via Raft, resume. Table is unavailable during DDL (seconds to minutes depending on drain). Simple, correct, DDL is infrequent.
-
-**Decision (Phase 4):** Two-phase DDL. Phase 1 — broadcast "DDL pending" marker via Raft, which causes all new Accord transactions to include the pending DDL in their dep set. Phase 2 — after all pre-marker transactions complete, apply DDL. New transactions that dep-waited on the DDL proceed with the updated schema. Very short unavailability window.
-
-**Transition:** Phase 1's drain logic becomes Phase 4's "wait for pre-marker txns to complete" step. No throwaway work.
-
-### ADR: SUBSCRIBE Dual Timestamps
-
-**Context:** CDC/SUBSCRIBE consumers currently see changes in Apply order (arrival-time-based). With Accord, Apply order becomes deterministic (Accord `t` ordering). This is strictly more correct but is a behavioral change.
-
-**Decision:** Emit both `accord_ts` (commit order) and `apply_ts` (wall-clock apply time) in the SUBSCRIBE change event payload. Default ordering is `accord_ts`. Consumers that need arrival-order semantics can sort by `apply_ts`.
-
-**Wire compatibility:** Additive change — old consumers ignore the new `accord_ts` field. Ordering change is the correct one (strictly more correct than arrival order).
-
-### ADR: Separate Protocol Log
-
-**Context:** Each Accord transaction generates 4 commit log entries (PreAccepted, Accepted, Committed, Applied) vs 1 today. This 4x write amplification increases commit log segment rotation and S3 upload pressure.
-
-**Decision:** Accord protocol state (PreAccepted, Accepted, Committed) goes to a dedicated local-only protocol log that is NOT uploaded to S3. Only `AccordApplied` + the actual data mutation go to the main commit log (which IS uploaded). Protocol state is ephemeral by design — GC'd after Applied, reconstructable from peers on restart.
-
-**Effect:** Main commit log stays at ~1x S3 upload volume. Protocol log uses smaller segments with aggressive local GC. Pairs well with CL=ONE fire-and-forget: fire-and-forget transactions write to the protocol log for dependency tracking but generate zero S3 upload pressure until Applied.
-
-### ADR: Sidecar `.accord` File for Result Persistence
-
-**Context:** `AccordApplied.result` must be durable for recovery. If shard A applied but shard B didn't, recovery re-applies using A's persisted result. This result needs a home in the SSTable format.
-
-**Decision:** When an SSTable is flushed, a companion `.accord` sidecar file is written alongside it containing all `AccordApplied` results for transactions in that SSTable, keyed by `TxnId`. Deleted when all shards confirm Applied (via ExclusiveSyncPoint). Normal reads never touch the sidecar. Recovery reads the sidecar.
-
-**Rationale:** Zero per-row overhead in the SSTable data format. Fits the existing sidecar pattern (sidecar index files). S3 upload pipeline already handles companion files. Results are only needed for recovery (a rare event) — no reason to pollute every row with a hidden column.
+| Sprint | Focus | Status |
+|--------|-------|--------|
+| A1 | Core types, ConflictIndex, ProtocolLog, SyncWriter, WriteGate | Complete |
+| A2 | ReorderBuffer, RecoveryCoordinator, TestCluster, 24-step EPaxos, IF parsing | Complete |
+| A3 | AccordStateMachine, AccordCoordinator, CQL Router, LWT, dep-wait, DDL drain | Complete |
+| A4 | MemIndex, leaseholder, linearizable local reads | Complete |
+| A5 | Jepsen infrastructure, register test, crash recovery, sidecar files, DurabilityService | Complete |
+| A6 | BEGIN TRANSACTION/COMMIT/ROLLBACK, cross-shard, client retry, Jepsen bank/write-skew | Complete |
+| A7 | Transactional 2i, electorate reconfiguration, two-phase DDL, full nemesis suite, UDF/UDA integration | Complete |
+
+## Related Specs
+
+- [Overview](overview.md) — system overview
+- [Components](components.md) — crate architecture (Accord modules listed under ferrosa-cluster)
+- [Data Flow](data-flow.md) — Accord transaction flow diagrams
+- [Accord Project Plan](accord-project-plan.md) — sprint completion details
+- [Testing](testing.md) — test infrastructure
+- [CQL](cql.md) — CQL protocol (LWT syntax, transaction syntax)

@@ -200,7 +200,11 @@ mod tests {
     impl RpcHandler for EchoPingHandler {
         async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
             match msg {
-                Message::Ping { nonce } => Some(Message::Pong { nonce }),
+                Message::Ping { nonce, .. } => Some(Message::Pong {
+                    nonce,
+                    ping_recv_at: 0,
+                    sent_at: 0,
+                }),
                 _ => None,
             }
         }
@@ -243,10 +247,16 @@ mod tests {
             .await
             .unwrap();
         let resp = client
-            .send(Message::Ping { nonce: 99 }, Lane::Raft)
+            .send(
+                Message::Ping {
+                    nonce: 99,
+                    sent_at: 0,
+                },
+                Lane::Raft,
+            )
             .await
             .unwrap();
-        assert!(matches!(resp, Message::Pong { nonce: 99 }));
+        assert!(matches!(resp, Message::Pong { nonce: 99, .. }));
     }
 
     #[tokio::test]
@@ -261,7 +271,13 @@ mod tests {
             .await
             .unwrap();
         client
-            .fire(Message::Ping { nonce: 1 }, Lane::Data)
+            .fire(
+                Message::Ping {
+                    nonce: 1,
+                    sent_at: 0,
+                },
+                Lane::Data,
+            )
             .await
             .unwrap();
     }
@@ -283,7 +299,15 @@ mod tests {
         let client = RpcClient::connect(Arc::new(config), uuid::Uuid::new_v4(), addr)
             .await
             .unwrap();
-        let result = client.send(Message::Ping { nonce: 1 }, Lane::Raft).await;
+        let result = client
+            .send(
+                Message::Ping {
+                    nonce: 1,
+                    sent_at: 0,
+                },
+                Lane::Raft,
+            )
+            .await;
         assert!(matches!(result, Err(NetError::Timeout(_))));
     }
 
