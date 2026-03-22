@@ -1,11 +1,11 @@
 # Data Flow
 
-> Last updated: 2026-03-20
+> Last updated: 2026-03-22
 > Status: Approved
 
 ## Overview
 
-Ferrosa uses a write-behind async S3 storage model. Writes go to local ephemeral storage first, then are asynchronously uploaded to S3. Reads check memtable, local cache, then fall back to S3 on cache miss.
+Ferrosa uses a write-behind async S3 storage model. Writes go to local ephemeral storage first, then are asynchronously uploaded to S3. Reads check memtable, local cache, then fall back to S3 on cache miss. Transactional writes (LWT, BEGIN TRANSACTION) route through the Accord consensus protocol for serializable isolation before reaching the storage engine.
 
 ## Write Path
 
@@ -99,6 +99,166 @@ sequenceDiagram
 **Sidecar files** are per-SSTable companion files written during flush. They contain sorted `(indexed_value, RowPosition)` entries with a CRC32-checksummed header. Missing sidecars trigger a fallback to full scan for that SSTable, with startup rebuild.
 
 **IndexIntersection**: When multiple indexed columns appear in WHERE, the planner collects RowPositions from each index and intersects them before row fetch, reducing I/O.
+
+## Accord Transaction Flow
+
+Accord consensus provides serializable transactions without a dedicated coordinator. The protocol uses a multi-phase approach where the transaction coordinator can be any node.
+
+### LWT (Lightweight Transaction) Flow
+
+```mermaid
+sequenceDiagram
+    participant C as CQL Client
+    participant Coord as Coordinator
+    participant R1 as Replica 1
+    participant R2 as Replica 2
+    participant R3 as Replica 3
+
+    C->>Coord: INSERT ... IF NOT EXISTS (CL=SERIAL)
+    Coord->>Coord: Generate TxnId (HLC timestamp + node)
+
+    Note over Coord,R3: Phase 1: PreAccept
+    Coord->>R1: PreAccept(txn, keys, deps)
+    Coord->>R2: PreAccept(txn, keys, deps)
+    Coord->>R3: PreAccept(txn, keys, deps)
+    R1->>R1: ConflictIndex.check(keys)
+    R2->>R2: ConflictIndex.check(keys)
+    R1->>Coord: PreAcceptOk(deps)
+    R2->>Coord: PreAcceptOk(deps)
+
+    alt Fast Path (3/4 quorum agrees on deps)
+        Note over Coord,R3: Phase 2: Commit (skip Accept)
+        Coord->>R1: Commit(txn, deps)
+        Coord->>R2: Commit(txn, deps)
+        Coord->>R3: Commit(txn, deps)
+    else Slow Path (deps disagree)
+        Note over Coord,R3: Phase 2: Accept
+        Coord->>R1: Accept(txn, merged_deps)
+        Coord->>R2: Accept(txn, merged_deps)
+        R1->>Coord: AcceptOk
+        R2->>Coord: AcceptOk
+        Note over Coord,R3: Phase 3: Commit
+        Coord->>R1: Commit(txn, deps)
+        Coord->>R2: Commit(txn, deps)
+        Coord->>R3: Commit(txn, deps)
+    end
+
+    Note over Coord,R3: Phase 4: Execute
+    Coord->>Coord: Wait for deps via DepWaitGraph
+    Coord->>Coord: Execute IF condition check
+    Coord->>Coord: Apply via SyncWriter
+
+    Coord->>C: RESULT ([applied]=true/false)
+```
+
+### Multi-Statement Transaction Flow
+
+```mermaid
+sequenceDiagram
+    participant C as CQL Client
+    participant Coord as Coordinator
+    participant Accord as AccordCoordinator
+    participant SM as AccordStateMachine
+
+    C->>Coord: BEGIN TRANSACTION
+    Coord->>Coord: Create transaction context
+
+    C->>Coord: SELECT ... (read-set)
+    Coord->>Coord: Buffer read to read-set
+
+    C->>Coord: UPDATE ... (write-set)
+    Coord->>Coord: Buffer write to write-set
+
+    C->>Coord: COMMIT
+    Coord->>Accord: Submit(read-set, write-set)
+    Accord->>SM: PreAccept → Accept → Commit → Execute
+    SM->>SM: DepWaitGraph: wait for dependencies
+    SM->>SM: Execute read-set validation
+    SM->>SM: Apply write-set via SyncWriter
+
+    Accord->>Coord: CommitResult
+    Coord->>C: RESULT (committed)
+```
+
+### Cross-Shard Transaction Flow
+
+```mermaid
+sequenceDiagram
+    participant Coord as Coordinator
+    participant S1 as Shard 1 Electorate
+    participant S2 as Shard 2 Electorate
+
+    Coord->>Coord: Partition keys by token range → shards
+    par PreAccept to both shards
+        Coord->>S1: PreAccept(txn, shard1_keys)
+        Coord->>S2: PreAccept(txn, shard2_keys)
+    end
+    S1->>Coord: PreAcceptOk(deps_1)
+    S2->>Coord: PreAcceptOk(deps_2)
+
+    Coord->>Coord: Merge deps from all shards
+
+    par Commit to both shards
+        Coord->>S1: Commit(txn, merged_deps)
+        Coord->>S2: Commit(txn, merged_deps)
+    end
+
+    par Execute on each shard
+        S1->>S1: Wait deps → apply shard1 writes
+        S2->>S2: Wait deps → apply shard2 writes
+    end
+```
+
+### Accord Recovery Flow
+
+When a coordinator fails mid-transaction, any node can recover the transaction:
+
+```mermaid
+sequenceDiagram
+    participant Rec as RecoveryCoordinator
+    participant R1 as Replica 1
+    participant R2 as Replica 2
+    participant R3 as Replica 3
+
+    Note over Rec: Detect stale transaction via timeout
+    Rec->>R1: Recovery(txn_id, ballot)
+    Rec->>R2: Recovery(txn_id, ballot)
+    Rec->>R3: Recovery(txn_id, ballot)
+
+    R1->>Rec: RecoveryOk(state: PreAccepted, deps)
+    R2->>Rec: RecoveryOk(state: Committed, deps)
+
+    alt Already committed
+        Rec->>Rec: Use committed state
+        Rec->>R1: Commit(txn, deps)
+        Rec->>R3: Commit(txn, deps)
+    else Not yet committed
+        Rec->>R1: Accept(txn, merged_deps)
+        Rec->>R2: Accept(txn, merged_deps)
+        Note over Rec: Then proceed to commit
+    end
+```
+
+### DDL Drain Flow
+
+DDL operations (CREATE TABLE, ALTER TABLE, etc.) must drain active Accord transactions before proceeding:
+
+```mermaid
+sequenceDiagram
+    participant DDL as DDL Request
+    participant Drain as DdlDrain
+    participant Accord as AccordCoordinator
+    participant Gate as WriteGate
+
+    DDL->>Drain: request_drain()
+    Drain->>Gate: close() — block new transactions
+    Drain->>Accord: wait_for_in_flight()
+    Note over Accord: All active transactions complete or timeout
+    Accord->>Drain: drained
+    Drain->>DDL: proceed with DDL
+    DDL->>DDL: Apply schema change
+    DDL->>Gate: open() — resume transactions
+```
 
 ## SSTable Lifecycle in S3
 
@@ -588,4 +748,5 @@ sequenceDiagram
 
 - [Overview](overview.md) — system overview
 - [Components](components.md) — crate architecture
+- [Accord](accord.md) — Accord consensus protocol specification
 - [Testing](testing.md) — data integrity and chaos tests

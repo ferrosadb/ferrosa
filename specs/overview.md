@@ -23,6 +23,7 @@ graph TB
         Graph[ferrosa-graph<br/>Cypher + Bolt v5]
         Schema[ferrosa-schema<br/>DDL, Auth, Audit]
         Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
+        Accord[Accord Consensus<br/>Transactions, LWT]
         Index[ferrosa-index<br/>Secondary + Vector Indexes]
         UDF[ferrosa-udf<br/>WASM Sandbox]
         Storage[ferrosa-storage<br/>Memtable, Cache, Compaction, PITR]
@@ -47,10 +48,13 @@ graph TB
     CQL --> Schema
     CQL --> Storage
     CQL --> Cluster
+    CQL --> Accord
     CQL --> Index
     CQL --> UDF
     Graph --> Schema
     Graph --> Storage
+    Accord --> Cluster
+    Accord --> Storage
     Cluster --> Storage
     Index --> Storage
     Cluster --> Net
@@ -69,6 +73,7 @@ graph TB
 1. **CQL compatibility** — existing drivers and tools work unchanged
 1. **Rust-native** — idiomatic Rust with clean ownership, not a Java transliteration
 1. **Cassandra's consistency model** — tunable CL (ONE, QUORUM, ALL) preserved
+1. **Serializable transactions** — Accord consensus for LWT and multi-statement transactions
 1. **Independent crates** — each subsystem testable and usable on its own
 
 ## Two Parallel Tracks
@@ -103,7 +108,7 @@ graph LR
 
 Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable.
 
-**Current progress**: All 12 crates are implemented and functional. The production cluster sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff, node lifecycle (join/decommission/rebalance), reconnection, and integration tests. The graph engine is fully complete: Cypher parser, expression evaluator, aggregation framework, variable-length paths, SUBSCRIBE/UNSUBSCRIBE with SSE streaming, leapfrog triejoin, and Bolt v5 wire protocol. UDF/UDA with WASM sandboxing is complete (parser, schema, DDL replication, Wasmtime compilation). Secondary and vector indexes are consolidated with a full query planner pipeline (MemtableIndex, sidecar files, EXPLAIN, IndexIntersection). Point-in-time recovery is implemented: commit log archiving to S3, snapshot management, point-in-time restoration, CLI tooling, and web console integration. CQL driver compatibility is verified with cdrs-tokio, supporting protocol v4 and v5 negotiation. The `vector<float, N>` type enables embedding storage for AI/ML workloads. Phonetic indexes with Double Metaphone support fuzzy text search. The `system_observability` virtual tables expose live system state for monitoring. The `ferrosa` binary composes everything into a cluster-mode database with background maintenance, graceful shutdown, per-connection backpressure, PITR archiving, and exponential backoff reconnection. Available as a `.deb` package via GitHub Releases.
+**Current progress**: All 12 crates are implemented and functional. **Accord consensus transactions** are fully implemented (7 sprints, 2,808 tests): AccordStateMachine, AccordCoordinator (fast/slow path), LWT (INSERT IF NOT EXISTS, IF conditions on UPDATE/DELETE), BEGIN TRANSACTION/COMMIT/ROLLBACK, cross-shard conflict detection, Jepsen-style linearizability testing, electorate reconfiguration, crash recovery, and 9 observability metrics. The production cluster sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff, node lifecycle (join/decommission/rebalance), reconnection, and integration tests. The graph engine is fully complete: Cypher parser, expression evaluator, aggregation framework, variable-length paths, SUBSCRIBE/UNSUBSCRIBE with SSE streaming, leapfrog triejoin, and Bolt v5 wire protocol. UDF/UDA with WASM sandboxing is complete and integrated with Accord transactions (18 tests). Secondary and vector indexes are consolidated with a full query planner pipeline, including transactional index reads (READ_2I, 5-layer merge). Point-in-time recovery is implemented: commit log archiving to S3, snapshot management, point-in-time restoration, CLI tooling, and web console integration. CQL driver compatibility is verified with cdrs-tokio, supporting protocol v4 and v5 negotiation. The `vector<float, N>` type enables embedding storage for AI/ML workloads. Phonetic indexes with Double Metaphone support fuzzy text search. The `system_observability` virtual tables expose live system state for monitoring. The `ferrosa` binary composes everything into a cluster-mode database with background maintenance, graceful shutdown, per-connection backpressure, PITR archiving, and exponential backoff reconnection. Available as a `.deb` package via GitHub Releases.
 
 ## Key Architectural Decisions
 
@@ -114,6 +119,7 @@ Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analys
 | SSTable | Phased: BTI read+write first, Big read later | Focus on modern format, migration path preserved |
 | Protocol | CQL client compat, own internode | Apps work unchanged, clean internal design |
 | Consensus | Raft metadata, tunable CL | Proven Rust libs + Cassandra semantics |
+| Transactions | Accord consensus (serializable) | Cassandra 5.x compatible, no dedicated coordinator |
 | Partitioner | Murmur3Partitioner | Cassandra SSTable compatibility |
 | Driver compat | Protocol v4 + v5 negotiation | cdrs-tokio and other standard CQL drivers work out of the box |
 | Embeddings | `vector<float, N>` CQL type | Native vector storage for AI/ML workloads; ANN query support via vector indexes |
@@ -173,8 +179,8 @@ Deferred but tracked for future investigation:
 
 | Area | Options | Status |
 |------|---------|--------|
-| Distributed transactions | Accord, Tempo, Janus, EPaxos | Research — evaluate when core is stable |
-| Clock synchronization | HLC, TrueTime-like | Research — needed for cross-DC consistency |
+| Distributed transactions | Accord consensus | **Implemented** — 7 sprints (A1-A7), 2,808 tests, Jepsen-verified |
+| Clock synchronization | HLC (Hybrid Logical Clock) | **Implemented** — HLC timestamps for Accord transaction ordering |
 | Transport protocol | QUIC (`quinn` crate) | Research — better for multi-DC, built-in multiplexing |
 | Native SSTable format | S3-optimized: larger blocks, content-addressed, embedded metadata | Research — behind feature flag, after BTI is solid |
 | Object store abstraction | `object_store` crate (Apache Arrow) | **Adopted** — used for S3/MinIO/GCS/Azure portability |
@@ -193,5 +199,6 @@ Deferred but tracked for future investigation:
 
 - [Components](components.md) — crate architecture details
 - [SSTable](sstable.md) — BTI format, trie encoding, I/O traits, compression
-- [Data Flow](data-flow.md) — write/read paths and S3 lifecycle
+- [Data Flow](data-flow.md) — write/read paths, Accord transaction flow, and S3 lifecycle
+- [Accord](accord.md) — Accord consensus protocol specification
 - [Testing](testing.md) — test infrastructure and suites
