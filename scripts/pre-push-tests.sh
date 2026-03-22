@@ -62,8 +62,14 @@ else
   done
 
   echo ""
-  echo "=== Running cargo test$CARGO_ARGS ==="
-  cargo test --all-features $CARGO_ARGS
+  if command -v cargo-llvm-cov &> /dev/null; then
+    echo "=== Running cargo llvm-cov$CARGO_ARGS ==="
+    cargo llvm-cov --all-features $CARGO_ARGS --summary-only
+  else
+    echo "=== Running cargo test$CARGO_ARGS ==="
+    echo "(install cargo-llvm-cov for coverage: cargo install cargo-llvm-cov)"
+    cargo test --all-features $CARGO_ARGS
+  fi
 fi
 
 # ── Always run example tests ───────────────────────────────────────────
