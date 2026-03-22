@@ -1,6 +1,6 @@
 # SSTable Format Specification
 
-> Last updated: 2026-03-12
+> Last updated: 2026-03-22 (sign-bit fix, range tombstone skip, overflow fixes)
 > Status: Approved
 
 ## Overview
@@ -744,6 +744,24 @@ Ferrosa must implement the byte-comparable encoding from `ByteComparable.java` (
 ```
 
 **Key constants** (from `ByteSource.java`): `ESCAPE = 0x00`, `NEXT_COMPONENT = 0x40`, `TERMINATOR = 0x38`, `ESCAPED_0_CONT = 0xFE`, `ESCAPED_0_DONE = 0xFF`.
+
+## Robustness Fixes (2026-03-22)
+
+### BTI Trie Sign-Bit Fix (`encode_signed_bytes`)
+
+The `encode_signed_bytes` function in the trie builder had an incorrect sign-bit transformation. For signed integer types (e.g., `i64` tokens), the most significant bit must be flipped to convert from two's complement to an unsigned byte-comparable representation. The fix ensures negative values sort before positive values in the trie's byte ordering, which is critical for correct partition index lookups.
+
+### Range Tombstone Marker Skip
+
+When reading Data.db partitions, encountering a range tombstone marker (flags byte with `IS_MARKER` / 0x02 set) previously returned an error. Range tombstone markers are now gracefully skipped by reading and discarding their serialized bytes (kind, clustering values, marker size, prev_unfiltered_size, and deletion times). This allows reading SSTables that contain range deletions without failing.
+
+### 0-Clustering Column Serialization Fix
+
+Tables with no clustering columns (i.e., only a partition key) could produce incorrect serialization because the clustering batch header was written even when there were zero values. The fix skips clustering key encoding entirely when the schema declares zero clustering columns.
+
+### `i32` Overflow in `local_deletion_time` Delta
+
+The `local_deletion_time` field is decoded as a delta from the serialization header's `minLocalDeletionTime`. When `minLocalDeletionTime` is at or near `i32::MAX` (the "not deleted" sentinel value 2147483647), adding a non-zero delta would overflow. The fix uses wrapping or saturating arithmetic (capped at `i32::MAX`) to prevent panic on overflow, matching Cassandra's behavior where the sentinel value indicates "not deleted."
 
 ## Phasing
 

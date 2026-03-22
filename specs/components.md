@@ -1,6 +1,6 @@
 # Component Architecture
 
-> Last updated: 2026-03-20
+> Last updated: 2026-03-22
 > Status: Approved
 
 ## Overview
@@ -74,9 +74,10 @@ graph BT
   - `SSTableWriter` — write BTI SSTables to in-memory `Vec<u8>` buffers (`WrittenSSTable`), caller provides `SerializationHeader`, `WriteOptions`, and pre-computed byte-comparable keys + Bloom filter hashes
 - **Formats**: Phase 1: BTI (trie-based, Cassandra 5.x default) read + write. Phase 2: Big (legacy) read for migration. Phase 3: native Ferrosa format behind feature flag.
 - **Components handled**: Data.db, Partitions.db (trie partition index), Rows.db (trie row index), Filter.db (Bloom filter), Statistics.db, CompressionInfo.db, TOC.txt
-- **On-disk trie**: 16 node types with page-aware packing (4096-byte pages), bottom-up incremental construction, used by both partition and row indices
+- **On-disk trie**: 16 node types with page-aware packing (4096-byte pages), bottom-up incremental construction, used by both partition and row indices. Sign-bit fix in `encode_signed_bytes` ensures correct byte-comparable ordering for negative values.
 - **Compression**: LZ4 (default, `lz4_flex`), Zstd (`zstd`). Snappy/Deflate deferred to post-1.0.
 - **Bloom filter**: Cassandra-compatible double-hashing using Murmur3 h1 + h2 from ferrosa-common
+- **Robustness fixes**: Range tombstone markers are skipped gracefully (instead of returning an error). 0-clustering column serialization fix for tables with no clustering key. `i32` overflow fix in `local_deletion_time` delta decoding.
 - **Standalone tools** (Phase 2): `ferrosa-sstable-dump`, `ferrosa-sstable-import`
 
 ### ferrosa-index
@@ -96,6 +97,8 @@ graph BT
   - `vector/hnsw.rs` — HNSW graph index (multi-layer navigable small world, beam search)
   - `vector/ivfflat.rs` — IVFFlat index (k-means clustering, inverted list probing)
 - **Key interfaces**: Two trait APIs — secondary indexes use `IndexFactory`/`IndexBuilder`/`IndexReader` with partition/clustering key addressing; vector indexes use their own trait set in `vector::` module with byte-offset `RowPosition` and `nearest(query, k, ef_search)` for ANN queries. Storage-attached design — indexes are per-SSTable companion files built asynchronously after flush.
+- **Vector index type**: `IndexType::Vector` registered in the factory for `CREATE INDEX ... USING 'vector'` DDL.
+- **Phonetic encoder public API**: `PhoneticEncoder` trait and Double Metaphone algorithm are public, usable outside of index builds.
 - **Spec**: [Secondary Indexes Design](../superpowers/specs/2026-03-14-secondary-indexes-design.md)
 
 ### ferrosa-udf
@@ -144,8 +147,12 @@ graph BT
   - *Memtable flush*: Atomic swap via `arc-swap` — current memtable replaced with a fresh one; old memtable flushed to SSTable. Reads check both active and flushing memtable.
   - *SSTable reads during compaction*: `Arc`-based refcounting. Compaction creates new SSTables and atomically swaps the active set via `arc-swap`. In-flight reads hold references to old SSTables, cleaned up when last reference drops.
   - *S3 upload concurrency*: Independent tokio task observes new SSTables via bounded `mpsc` channel (backpressure), uploads without holding storage engine locks. Local files retained until S3 upload confirms.
+- **Read path**: `read_range()` merges data from both memtable and flushed SSTables (previously memtable-only). Range queries now return the full merged view.
+- **DELETE**: Row-level tombstone merge in memtable — DELETE operations merge tombstones at the row level, correctly suppressing older cells across multiple write sources.
+- **Commit log**: Oversized entries (exceeding segment capacity) are handled gracefully with a descriptive error instead of a panic or silent corruption.
+- **Serialization**: 0-clustering column serialization fix for tables with no clustering key.
 - **Compaction strategies**: Size-Tiered (STCS) implemented; Leveled (LCS) and Time-Window (TWCS) are follow-on work
-- **Follow-on work**: Compaction execution wiring (merge I/O), metadata collection from SSTables, S3 upload trigger from flush, manifest CAS loop integration, commit log recovery/replay, commit log S3 shipping, LCS/TWCS strategies, disk backpressure, grace period GC, orphan cleanup
+- **Follow-on work**: LCS/TWCS strategies, disk backpressure, `io_uring` I/O backend
 
 ### ferrosa-schema
 
@@ -170,13 +177,13 @@ graph BT
 
 ### ferrosa-cql
 
-- **Purpose**: CQL native protocol v5 and query execution
+- **Purpose**: CQL native protocol v4/v5 and query execution
 - **Location**: `ferrosa-cql/`
 - **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `tokio`, `tokio-util`, `bytes`, `futures`, `arc-swap`, `uuid`, `num-bigint`, `phf`, `md-5`, `moka`, `tracing`
-- **Status**: Parts A-D implemented — protocol framing, CQL type system, TCP server, SASL PLAIN auth, recursive descent parser, full query routing (SELECT/INSERT/UPDATE/DELETE/BATCH/DDL), prepared statement cache (moka W-TinyLFU), connection state machine with security hardening
+- **Status**: Parts A-D implemented — protocol framing, CQL type system (including `vector<float, N>` via Custom wire type 0x0000), TCP server, SASL PLAIN auth, recursive descent parser, full query routing (SELECT/INSERT/UPDATE/DELETE/BATCH/DDL), prepared statement cache (moka W-TinyLFU), connection state machine with security hardening, protocol v4/v5 negotiation
 - **Modules**:
   - `frame.rs` — CQL v5 binary framing, `CqlCodec` (Tokio `Encoder`/`Decoder`)
-  - `types.rs` — `CqlValue` enum with encode/decode for all CQL types
+  - `types.rs` — `CqlValue` enum with encode/decode for all CQL types, including `CqlType::Vector` (`vector<float, N>`) encoded as Custom wire type 0x0000
   - `server.rs` — TCP listener, per-connection Tokio tasks, max connection limit
   - `connection.rs` — Connection state machine (AwaitingStartup → Authenticating → Ready), idle timeout (300s)
   - `auth.rs` — SASL PLAIN authentication, max 3 attempts per connection
@@ -196,7 +203,10 @@ graph BT
   - `planner.rs` — `ScanPlan` enum (PrimaryKey/SingleIndex/IndexIntersection/FullScan), `plan()` function resolving indexes by (keyspace, table, column)
 - **Key interfaces**: Full CQL query lifecycle — frame decode → parse → route → execute → encode result
 - **Auth**: SASL PLAIN with `Schema::authenticate()`, rate limiting, connection state machine
-- **Supported operations**: SELECT, INSERT, UPDATE, DELETE, BATCH, CREATE/ALTER/DROP KEYSPACE/TABLE, CREATE/DROP INDEX (USING 'btree'/'hash'/'composite'/'phonetic'/'vector'), CREATE/ALTER/DROP ROLE, GRANT/REVOKE, TRUNCATE, USE, PREPARE/EXECUTE, EXPLAIN, system table queries
+- **Supported operations**: SELECT (with ALLOW FILTERING, CONTAINS, CONTAINS KEY, SELECT DISTINCT, token() in WHERE), INSERT (IF NOT EXISTS / LWT), UPDATE (counter increment/decrement, collection +/- operators), DELETE (map element syntax), BATCH, CREATE/ALTER/DROP KEYSPACE/TABLE, CREATE/DROP INDEX (USING 'btree'/'hash'/'composite'/'phonetic'/'vector'), CREATE/ALTER/DROP ROLE, DROP ROLE, GRANT/REVOKE, TRUNCATE, USE, PREPARE (with pk_count metadata)/EXECUTE (positional bind values), EXPLAIN, system table queries
+- **Built-in functions**: `toJson()`, `token()`, `avg`, `min`, `max`, `sum`
+- **ANN ORDER BY**: Parsed for `ORDER BY <column> ANN OF <vector>` syntax; execution deferred pending vector index query path integration
+- **Protocol compatibility**: CQL protocol v4 and v5 negotiation, supporting drivers like cdrs-tokio
 - **Target**: All standard CQL drivers connect without modification
 
 ### ferrosa-graph
@@ -218,6 +228,7 @@ graph BT
   - `engine.rs` — `GraphEngine` composition root: startup wiring, execute/explain/schema APIs, graceful shutdown
   - `http.rs` — Axum routes (POST `/graph/query`, `/graph/explain`, GET `/graph/schema`, `/graph/health`), Basic auth middleware (T2), error sanitization (T8), TLS enforcement (T11), `CatchPanicLayer`, `RequestBodyLimitLayer`
 - **Security mitigations**: T2 (HTTP auth), T3 (per-hop auth), T4 (timeout + fan-out limits), T5 (reconciliation), T6 (extension validation in schema), T7 (system table protection), T8 (error sanitization), T9 (observer backpressure), T10 (audit events), T11 (TLS)
+- **Recent fixes**: Property resolution via schema metadata (not hardcoded), Cypher double-quoted string literals, path assignment syntax (`p = (a)-[r]->(b)`), `COLLECT(DISTINCT ...)` aggregation, `NOT` pattern support in WHERE clauses, `variable_tables` for DELETE operations, tokio runtime check to avoid nested runtime panics.
 - **Design**: Data stored in normal CQL tables with `graph.*` extensions, accessed via system-managed adjacency index per keyspace
 
 ### ferrosa-ctl
@@ -344,4 +355,4 @@ gantt
 - [Overview](overview.md) — system overview and design principles
 - [Data Flow](data-flow.md) — write/read paths
 - [Storage](storage.md) — storage engine details
-- [CQL](cql.md) — CQL native protocol v5
+- [CQL](cql.md) — CQL native protocol v4/v5

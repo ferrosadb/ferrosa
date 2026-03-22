@@ -1,6 +1,6 @@
 # System Overview
 
-> Last updated: 2026-03-20
+> Last updated: 2026-03-22
 > Status: Approved
 
 ## Overview
@@ -19,7 +19,7 @@ graph TB
     end
 
     subgraph "Ferrosa Node"
-        CQL[ferrosa-cql<br/>CQL Protocol v5]
+        CQL[ferrosa-cql<br/>CQL Protocol v4/v5]
         Graph[ferrosa-graph<br/>Cypher + Bolt v5]
         Schema[ferrosa-schema<br/>DDL, Auth, Audit]
         Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
@@ -41,7 +41,7 @@ graph TB
         N3[Node 3]
     end
 
-    D1 & D2 -->|CQL Native Protocol v5| CQL
+    D1 & D2 -->|CQL Native Protocol v4/v5| CQL
     D3 -->|CQL + HTTP| CQL & Web
     D4 -->|Bolt v5 / HTTP| Graph
     CQL --> Schema
@@ -103,7 +103,7 @@ graph LR
 
 Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analysis only, not a deliverable.
 
-**Current progress**: All 12 crates are implemented and functional. The production cluster sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff, node lifecycle (join/decommission/rebalance), reconnection, and integration tests. The graph engine is fully complete: Cypher parser, expression evaluator, aggregation framework, variable-length paths, SUBSCRIBE/UNSUBSCRIBE with SSE streaming, leapfrog triejoin, and Bolt v5 wire protocol. UDF/UDA with WASM sandboxing is complete (parser, schema, DDL replication, Wasmtime compilation). Secondary and vector indexes are consolidated with a full query planner pipeline (MemtableIndex, sidecar files, EXPLAIN, IndexIntersection). Point-in-time recovery is implemented: commit log archiving to S3, snapshot management, point-in-time restoration, CLI tooling, and web console integration. The `ferrosa` binary composes everything into a cluster-mode database with background maintenance, graceful shutdown, per-connection backpressure, PITR archiving, and exponential backoff reconnection. Available as a `.deb` package via GitHub Releases.
+**Current progress**: All 12 crates are implemented and functional. The production cluster sprint is complete with Raft consensus, coordinated reads/writes, hinted handoff, node lifecycle (join/decommission/rebalance), reconnection, and integration tests. The graph engine is fully complete: Cypher parser, expression evaluator, aggregation framework, variable-length paths, SUBSCRIBE/UNSUBSCRIBE with SSE streaming, leapfrog triejoin, and Bolt v5 wire protocol. UDF/UDA with WASM sandboxing is complete (parser, schema, DDL replication, Wasmtime compilation). Secondary and vector indexes are consolidated with a full query planner pipeline (MemtableIndex, sidecar files, EXPLAIN, IndexIntersection). Point-in-time recovery is implemented: commit log archiving to S3, snapshot management, point-in-time restoration, CLI tooling, and web console integration. CQL driver compatibility is verified with cdrs-tokio, supporting protocol v4 and v5 negotiation. The `vector<float, N>` type enables embedding storage for AI/ML workloads. Phonetic indexes with Double Metaphone support fuzzy text search. The `system_observability` virtual tables expose live system state for monitoring. The `ferrosa` binary composes everything into a cluster-mode database with background maintenance, graceful shutdown, per-connection backpressure, PITR archiving, and exponential backoff reconnection. Available as a `.deb` package via GitHub Releases.
 
 ## Key Architectural Decisions
 
@@ -115,6 +115,8 @@ Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analys
 | Protocol | CQL client compat, own internode | Apps work unchanged, clean internal design |
 | Consensus | Raft metadata, tunable CL | Proven Rust libs + Cassandra semantics |
 | Partitioner | Murmur3Partitioner | Cassandra SSTable compatibility |
+| Driver compat | Protocol v4 + v5 negotiation | cdrs-tokio and other standard CQL drivers work out of the box |
+| Embeddings | `vector<float, N>` CQL type | Native vector storage for AI/ML workloads; ANN query support via vector indexes |
 
 ## AWS Lock-in Flags
 
