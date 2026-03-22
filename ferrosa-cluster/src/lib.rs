@@ -1,3 +1,4 @@
+pub mod accord;
 pub mod config;
 pub mod consistency;
 pub mod controller;

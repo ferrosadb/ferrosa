@@ -45,6 +45,18 @@ impl Timestamp {
         }
     }
 
+    /// Create a synthetic timestamp for testing.
+    ///
+    /// Sets `epoch = 0`, `time = micros`, `seq = 0`, `node = 0`.
+    pub fn synthetic(micros: u64) -> Self {
+        Self {
+            epoch: 0,
+            time: micros,
+            seq: 0,
+            node: 0,
+        }
+    }
+
     /// Return a timestamp that is strictly greater than `other`.
     ///
     /// The result copies `other`'s epoch/time but increments `seq`
@@ -66,6 +78,13 @@ impl Timestamp {
 /// Unique transaction identifier — a newtype over [`Timestamp`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct TxnId(pub Timestamp);
+
+impl TxnId {
+    /// Create a new TxnId from a node and a timestamp.
+    pub fn new(node: u64, t0: Timestamp) -> Self {
+        Self(Timestamp { node, ..t0 })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Ballot types
