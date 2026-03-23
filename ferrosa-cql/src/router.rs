@@ -1606,7 +1606,7 @@ async fn route_insert(
 
     // BUG-0016: IF NOT EXISTS — check whether the row already exists before writing.
     if s.if_not_exists {
-        let exists = if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+        let existing_row = if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
             let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
             let all_col_types: Vec<CqlType> = table_meta
                 .columns
@@ -1630,28 +1630,30 @@ async fn route_insert(
                 &pk_indices,
                 &ck_indices,
             );
-            if ck_values.is_empty() {
-                !rows.is_empty()
+            let matching = if ck_values.is_empty() {
+                rows.into_iter().next()
             } else {
-                rows.iter().any(|row| {
+                rows.into_iter().find(|row| {
                     ck_indices
                         .iter()
                         .zip(ck_values.iter())
                         .all(|(&idx, ck_val)| row.get(idx).and_then(|v| v.as_ref()) == Some(ck_val))
                 })
-            }
+            };
+            matching
         } else {
-            false
+            None
         };
 
-        if exists {
-            // Row already exists — return [applied] = false
+        if let Some(ref existing) = existing_row {
+            // Row already exists — return [applied] = false with existing row data
             return Ok(encode_lwt_applied(
                 false,
                 ks,
                 &s.table,
                 table_meta,
                 &state.schema,
+                Some(existing),
             ));
         }
     }
@@ -1677,6 +1679,7 @@ async fn route_insert(
             &s.table,
             table_meta,
             &state.schema,
+            None,
         ))
     } else {
         Ok(result::encode_void())
@@ -1687,25 +1690,27 @@ async fn route_insert(
 ///
 /// CQL protocol returns a RESULT Rows frame with `[applied]` boolean plus
 /// all table columns.  When `applied=true`, the extra columns are NULL.
-/// When `applied=false`, they would contain the existing row (not yet
-/// implemented — NULLs are returned as placeholder).
+/// When `applied=false`, `existing_row` contains the current row values.
+/// When `applied=true`, all table columns are NULL.
 fn encode_lwt_applied(
     applied: bool,
     keyspace: &str,
     table: &str,
     table_meta: &TableMetadata,
     schema: &Schema,
+    existing_row: Option<&[Option<CqlValue>]>,
 ) -> BytesMut {
     let mut col_names = vec!["[applied]".to_string()];
     let mut col_types = vec![CqlType::Boolean];
     let mut row: Vec<Option<CqlValue>> = vec![Some(CqlValue::Boolean(applied))];
 
-    // Add all table columns (NULL values for now)
-    for (name, cm) in &table_meta.columns {
+    for (i, (name, cm)) in table_meta.columns.iter().enumerate() {
         col_names.push(name.clone());
         let cql_type = resolve_col_type(&cm.column_type, keyspace, schema).unwrap_or(CqlType::Blob);
         col_types.push(cql_type);
-        row.push(None);
+        // Use existing row values when not applied, NULL when applied
+        let val = existing_row.and_then(|r| r.get(i)).and_then(|v| v.clone());
+        row.push(val);
     }
 
     result::encode_rows(&col_names, &col_types, keyspace, table, &[row])
