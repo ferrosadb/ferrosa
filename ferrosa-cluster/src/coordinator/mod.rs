@@ -497,7 +497,10 @@ mod tests {
         let handler = super::RepairWriteHandler::new(storage, metrics);
 
         let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
-        let msg = Message::Ping { nonce: 42 };
+        let msg = Message::Ping {
+            nonce: 42,
+            sent_at: 0,
+        };
         let response = handler.handle(peer_id, msg).await;
         assert!(response.is_none());
     }

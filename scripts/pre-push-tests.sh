@@ -62,8 +62,14 @@ else
   done
 
   echo ""
-  echo "=== Running cargo test$CARGO_ARGS ==="
-  cargo test --all-features $CARGO_ARGS
+  if command -v cargo-llvm-cov &> /dev/null; then
+    echo "=== Running cargo llvm-cov$CARGO_ARGS ==="
+    cargo llvm-cov --all-features $CARGO_ARGS --summary-only
+  else
+    echo "=== Running cargo test$CARGO_ARGS ==="
+    echo "(install cargo-llvm-cov for coverage: cargo install cargo-llvm-cov)"
+    cargo test --all-features $CARGO_ARGS
+  fi
 fi
 
 # ── Always run example tests ───────────────────────────────────────────
@@ -168,10 +174,5 @@ echo ""
 echo "Examples: $pass passed, $fail failed"
 if [ ${#failed_examples[@]} -gt 0 ]; then
   echo "Failed: ${failed_examples[*]}"
-  echo "NOTE: Example test failures are advisory — they depend on Docker image freshness."
-  echo "      The CI workflow (test-examples.yml) is the authoritative gate."
+  exit 1
 fi
-
-# Example test failures are advisory; cargo tests above are the hard gate.
-# CI handles example tests with a guaranteed-fresh Docker build.
-exit 0

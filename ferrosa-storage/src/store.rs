@@ -626,6 +626,19 @@ impl<F: FlushTarget> TableStore<F> {
         self.view.load().active.partition_count()
     }
 
+    /// Number of entries in the active MemtableIndex for the given index name.
+    ///
+    /// Returns 0 if the index does not exist. Used to verify that eager
+    /// index builds keep the in-memory index bounded.
+    pub fn memtable_index_entry_count(&self, index_name: &str) -> usize {
+        let guard = self.view.load();
+        guard
+            .indexes
+            .get(index_name)
+            .map(|idx| idx.iter().count())
+            .unwrap_or(0)
+    }
+
     /// Truncate (clear) all data: replaces the memtable with a fresh one
     /// and drops all SSTable references.
     ///

@@ -88,7 +88,9 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Alter) => self.parse_alter(),
             TokenKind::Keyword(Keyword::Drop) => self.parse_drop(),
             TokenKind::Keyword(Keyword::Use) => self.parse_use().map(Statement::Use),
-            TokenKind::Keyword(Keyword::Begin) => self.parse_batch().map(Statement::Batch),
+            TokenKind::Keyword(Keyword::Begin) => self.parse_begin(),
+            TokenKind::Keyword(Keyword::Commit) => self.parse_commit(),
+            TokenKind::Keyword(Keyword::Rollback) => self.parse_rollback(),
             TokenKind::Keyword(Keyword::Truncate) => self.parse_truncate().map(Statement::Truncate),
             TokenKind::Keyword(Keyword::Grant) => self.parse_grant().map(Statement::Grant),
             TokenKind::Keyword(Keyword::Revoke) => self.parse_revoke().map(Statement::Revoke),
@@ -333,17 +335,8 @@ impl<'input> Parser<'input> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Where))?;
         let where_clauses = self.parse_where_clauses()?;
 
-        // Optional IF EXISTS or IF column = value conditions
-        let mut if_exists = false;
-        let mut if_conditions = Vec::new();
-        if self.lexer.eat(&TokenKind::Keyword(Keyword::If))? {
-            if self.lexer.eat(&TokenKind::Keyword(Keyword::Exists))? {
-                if_exists = true;
-            } else {
-                // IF column = value [AND column = value ...]
-                if_conditions = self.parse_where_clauses()?;
-            }
-        }
+        // Optional IF EXISTS / IF <conditions>
+        let (if_exists, if_conditions) = self.parse_if_clause()?;
 
         // Optional USING after WHERE (some syntaxes allow it here too)
         if using_timestamp.is_none() && using_ttl.is_none() {
@@ -435,7 +428,7 @@ impl<'input> Parser<'input> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Where))?;
         let where_clauses = self.parse_where_clauses()?;
 
-        let if_exists = self.parse_if_exists()?;
+        let (if_exists, if_conditions) = self.parse_if_clause()?;
 
         Ok(DeleteStatement {
             keyspace,
@@ -443,6 +436,7 @@ impl<'input> Parser<'input> {
             columns,
             where_clauses,
             if_exists,
+            if_conditions,
             using_timestamp,
         })
     }
@@ -468,12 +462,38 @@ impl<'input> Parser<'input> {
     }
 
     // ---------------------------------------------------------------
+    // BEGIN — disambiguate BATCH vs TRANSACTION
+    // ---------------------------------------------------------------
+
+    fn parse_begin(&mut self) -> Result<Statement, CqlError> {
+        // Consume BEGIN, then peek to decide: TRANSACTION or BATCH
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Begin))?;
+
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::Transaction))? {
+            return Ok(Statement::BeginTransaction);
+        }
+
+        // Otherwise it's a BATCH statement — delegate to parse_batch_body
+        // (BEGIN already consumed)
+        self.parse_batch_body().map(Statement::Batch)
+    }
+
+    fn parse_commit(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Commit))?;
+        Ok(Statement::Commit)
+    }
+
+    fn parse_rollback(&mut self) -> Result<Statement, CqlError> {
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Rollback))?;
+        Ok(Statement::Rollback)
+    }
+
+    // ---------------------------------------------------------------
     // BATCH
     // ---------------------------------------------------------------
 
-    fn parse_batch(&mut self) -> Result<BatchStatement, CqlError> {
-        self.lexer.expect(&TokenKind::Keyword(Keyword::Begin))?;
-
+    /// Parse the body of a BATCH statement (after BEGIN has already been consumed).
+    fn parse_batch_body(&mut self) -> Result<BatchStatement, CqlError> {
         // Optional batch type
         let batch_type = if self.lexer.eat(&TokenKind::Keyword(Keyword::Unlogged))? {
             BatchType::Unlogged
@@ -2241,6 +2261,9 @@ impl<'input> Parser<'input> {
             Keyword::Contains => "contains",
             Keyword::Explain => "explain",
             Keyword::Distinct => "distinct",
+            Keyword::Transaction => "transaction",
+            Keyword::Commit => "commit",
+            Keyword::Rollback => "rollback",
         }
         .to_string()
     }
@@ -2281,30 +2304,73 @@ impl<'input> Parser<'input> {
     }
 
     /// Parse IF EXISTS, returning true if present.
+    ///
+    /// Used by DDL statements (DROP TABLE, etc.) that only support IF EXISTS.
     fn parse_if_exists(&mut self) -> Result<bool, CqlError> {
         if self.lexer.eat(&TokenKind::Keyword(Keyword::If))? {
-            if self.lexer.eat(&TokenKind::Keyword(Keyword::Exists))? {
-                Ok(true)
-            } else {
-                // IF <condition> (LWT conditional): parse and discard the
-                // condition.  Ferrosa does not enforce LWT conditions yet
-                // but must accept the syntax to avoid parse errors.
-                // Consume tokens until we hit a semicolon, EOF, or USING.
-                loop {
-                    let tok = self.lexer.peek()?;
-                    match tok.kind {
-                        TokenKind::Eof
-                        | TokenKind::Semicolon
-                        | TokenKind::Keyword(Keyword::Using) => break,
-                        _ => {
-                            self.lexer.next_token()?;
-                        }
-                    }
-                }
-                Ok(false)
-            }
+            self.lexer.expect(&TokenKind::Keyword(Keyword::Exists))?;
+            Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    /// Parse an IF clause on UPDATE/DELETE: either `IF EXISTS` or
+    /// `IF col op value [AND col op value ...]`.
+    ///
+    /// Returns `(if_exists, if_conditions)`.
+    fn parse_if_clause(&mut self) -> Result<(bool, Vec<IfCondition>), CqlError> {
+        if !self.lexer.eat(&TokenKind::Keyword(Keyword::If))? {
+            return Ok((false, vec![]));
+        }
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::Exists))? {
+            return Ok((true, vec![]));
+        }
+        let conditions = self.parse_if_conditions()?;
+        Ok((false, conditions))
+    }
+
+    /// Parse one or more IF conditions: `col op value [AND col op value ...]`.
+    fn parse_if_conditions(&mut self) -> Result<Vec<IfCondition>, CqlError> {
+        let mut conditions = Vec::new();
+        loop {
+            let column = self.parse_ident()?;
+            let operator = self.parse_if_operator()?;
+            let value = if operator == IfOperator::In {
+                self.lexer.expect(&TokenKind::LParen)?;
+                let terms = self.parse_term_list()?;
+                self.lexer.expect(&TokenKind::RParen)?;
+                Term::InList(terms)
+            } else {
+                self.parse_term()?
+            };
+            conditions.push(IfCondition {
+                column,
+                operator,
+                value,
+            });
+            if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                break;
+            }
+        }
+        Ok(conditions)
+    }
+
+    /// Parse a comparison operator in an IF condition.
+    fn parse_if_operator(&mut self) -> Result<IfOperator, CqlError> {
+        let tok = self.lexer.next_token()?;
+        match tok.kind {
+            TokenKind::Eq => Ok(IfOperator::Eq),
+            TokenKind::NotEq => Ok(IfOperator::NotEq),
+            TokenKind::Lt => Ok(IfOperator::Lt),
+            TokenKind::Gt => Ok(IfOperator::Gt),
+            TokenKind::LtEq => Ok(IfOperator::LtEq),
+            TokenKind::GtEq => Ok(IfOperator::GtEq),
+            TokenKind::Keyword(Keyword::In) => Ok(IfOperator::In),
+            _ => Err(CqlError::SyntaxError(format!(
+                "expected IF condition operator, got {:?} at position {}",
+                tok.kind, tok.pos
+            ))),
         }
     }
 
@@ -3738,6 +3804,278 @@ mod tests {
             }
             other => panic!("expected Select, got {:?}", other),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // IF condition tests (LWT conditional UPDATE/DELETE)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_update_if_single_condition() {
+        let stmt = parse("UPDATE t SET v = 1 WHERE id = 1 IF v = 0").unwrap();
+        match stmt {
+            Statement::Update(s) => {
+                assert!(!s.if_exists);
+                assert_eq!(s.if_conditions.len(), 1);
+                assert_eq!(s.if_conditions[0].column, "v");
+                assert_eq!(s.if_conditions[0].operator, IfOperator::Eq);
+                assert_eq!(s.if_conditions[0].value, Term::IntegerLiteral(0));
+            }
+            other => panic!("expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_update_if_multi_condition() {
+        let stmt = parse("UPDATE t SET v = 1 WHERE id = 1 IF v = 0 AND status = 'active'").unwrap();
+        match stmt {
+            Statement::Update(s) => {
+                assert!(!s.if_exists);
+                assert_eq!(s.if_conditions.len(), 2);
+                assert_eq!(s.if_conditions[0].column, "v");
+                assert_eq!(s.if_conditions[0].operator, IfOperator::Eq);
+                assert_eq!(s.if_conditions[0].value, Term::IntegerLiteral(0));
+                assert_eq!(s.if_conditions[1].column, "status");
+                assert_eq!(s.if_conditions[1].operator, IfOperator::Eq);
+                assert_eq!(
+                    s.if_conditions[1].value,
+                    Term::StringLiteral("active".into())
+                );
+            }
+            other => panic!("expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_update_if_not_eq() {
+        let stmt = parse("UPDATE t SET v = 1 WHERE id = 1 IF v != 0").unwrap();
+        match stmt {
+            Statement::Update(s) => {
+                assert_eq!(s.if_conditions.len(), 1);
+                assert_eq!(s.if_conditions[0].column, "v");
+                assert_eq!(s.if_conditions[0].operator, IfOperator::NotEq);
+                assert_eq!(s.if_conditions[0].value, Term::IntegerLiteral(0));
+            }
+            other => panic!("expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_update_if_comparison_operators() {
+        let cases = [
+            ("IF v < 10", IfOperator::Lt),
+            ("IF v > 10", IfOperator::Gt),
+            ("IF v <= 10", IfOperator::LtEq),
+            ("IF v >= 10", IfOperator::GtEq),
+        ];
+        for (clause, expected_op) in &cases {
+            let sql = format!("UPDATE t SET v = 1 WHERE id = 1 {}", clause);
+            let stmt = parse(&sql).unwrap();
+            match stmt {
+                Statement::Update(s) => {
+                    assert_eq!(s.if_conditions.len(), 1, "clause: {}", clause);
+                    assert_eq!(
+                        s.if_conditions[0].operator, *expected_op,
+                        "clause: {}",
+                        clause
+                    );
+                    assert_eq!(
+                        s.if_conditions[0].value,
+                        Term::IntegerLiteral(10),
+                        "clause: {}",
+                        clause
+                    );
+                }
+                other => panic!("expected Update for {}, got {:?}", clause, other),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_update_if_in() {
+        let stmt = parse("UPDATE t SET v = 1 WHERE id = 1 IF status IN ('a', 'b')").unwrap();
+        match stmt {
+            Statement::Update(s) => {
+                assert_eq!(s.if_conditions.len(), 1);
+                assert_eq!(s.if_conditions[0].column, "status");
+                assert_eq!(s.if_conditions[0].operator, IfOperator::In);
+                assert_eq!(
+                    s.if_conditions[0].value,
+                    Term::InList(vec![
+                        Term::StringLiteral("a".into()),
+                        Term::StringLiteral("b".into()),
+                    ])
+                );
+            }
+            other => panic!("expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_update_if_exists_unchanged() {
+        let stmt = parse("UPDATE t SET v = 1 WHERE id = 1 IF EXISTS").unwrap();
+        match stmt {
+            Statement::Update(s) => {
+                assert!(s.if_exists);
+                assert!(s.if_conditions.is_empty());
+            }
+            other => panic!("expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_update_if_bind_marker() {
+        let stmt = parse("UPDATE t SET v = 1 WHERE id = 1 IF v = ?").unwrap();
+        match stmt {
+            Statement::Update(s) => {
+                assert_eq!(s.if_conditions.len(), 1);
+                assert_eq!(s.if_conditions[0].column, "v");
+                assert_eq!(s.if_conditions[0].operator, IfOperator::Eq);
+                assert_eq!(s.if_conditions[0].value, Term::BindMarker(None));
+            }
+            other => panic!("expected Update, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_delete_if_condition() {
+        let stmt = parse("DELETE FROM t WHERE id = 1 IF v = 'old'").unwrap();
+        match stmt {
+            Statement::Delete(s) => {
+                assert!(!s.if_exists);
+                assert_eq!(s.if_conditions.len(), 1);
+                assert_eq!(s.if_conditions[0].column, "v");
+                assert_eq!(s.if_conditions[0].operator, IfOperator::Eq);
+                assert_eq!(s.if_conditions[0].value, Term::StringLiteral("old".into()));
+            }
+            other => panic!("expected Delete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_delete_if_multi_condition() {
+        let stmt = parse("DELETE FROM t WHERE id = 1 IF v = 'old' AND status = 1").unwrap();
+        match stmt {
+            Statement::Delete(s) => {
+                assert!(!s.if_exists);
+                assert_eq!(s.if_conditions.len(), 2);
+                assert_eq!(s.if_conditions[0].column, "v");
+                assert_eq!(s.if_conditions[0].operator, IfOperator::Eq);
+                assert_eq!(s.if_conditions[0].value, Term::StringLiteral("old".into()));
+                assert_eq!(s.if_conditions[1].column, "status");
+                assert_eq!(s.if_conditions[1].operator, IfOperator::Eq);
+                assert_eq!(s.if_conditions[1].value, Term::IntegerLiteral(1));
+            }
+            other => panic!("expected Delete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_delete_if_exists_unchanged() {
+        let stmt = parse("DELETE FROM t WHERE id = 1 IF EXISTS").unwrap();
+        match stmt {
+            Statement::Delete(s) => {
+                assert!(s.if_exists);
+                assert!(s.if_conditions.is_empty());
+            }
+            other => panic!("expected Delete, got {:?}", other),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Accord transaction tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_begin_commit_rollback() {
+        // BEGIN TRANSACTION
+        let stmt = parse("BEGIN TRANSACTION").unwrap();
+        assert!(
+            matches!(stmt, Statement::BeginTransaction),
+            "expected BeginTransaction, got {:?}",
+            stmt
+        );
+
+        // COMMIT
+        let stmt = parse("COMMIT").unwrap();
+        assert!(
+            matches!(stmt, Statement::Commit),
+            "expected Commit, got {:?}",
+            stmt
+        );
+
+        // ROLLBACK
+        let stmt = parse("ROLLBACK").unwrap();
+        assert!(
+            matches!(stmt, Statement::Rollback),
+            "expected Rollback, got {:?}",
+            stmt
+        );
+    }
+
+    #[test]
+    fn parse_begin_transaction_case_insensitive() {
+        let stmt = parse("begin transaction").unwrap();
+        assert!(matches!(stmt, Statement::BeginTransaction));
+
+        let stmt = parse("Begin Transaction").unwrap();
+        assert!(matches!(stmt, Statement::BeginTransaction));
+    }
+
+    #[test]
+    fn parse_nested_transaction_rejected() {
+        use crate::session::TransactionState;
+        let mut txn_state = TransactionState::new();
+
+        // First BEGIN is accepted.
+        let stmt = parse("BEGIN TRANSACTION").unwrap();
+        txn_state.validate_and_transition(&stmt).unwrap();
+
+        // Second BEGIN inside the transaction must be rejected.
+        let stmt = parse("BEGIN TRANSACTION").unwrap();
+        let err = txn_state.validate_and_transition(&stmt);
+        assert!(err.is_err(), "nested BEGIN TRANSACTION should be rejected");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("nested"),
+            "error should mention 'nested', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_ddl_in_transaction_rejected() {
+        use crate::session::TransactionState;
+        let mut txn_state = TransactionState::new();
+
+        // Start a transaction.
+        let begin = parse("BEGIN TRANSACTION").unwrap();
+        txn_state.validate_and_transition(&begin).unwrap();
+
+        // DDL inside transaction must be rejected.
+        let ddl = parse("CREATE TABLE ks.t (k int PRIMARY KEY)").unwrap();
+        let err = txn_state.validate_and_transition(&ddl);
+        assert!(err.is_err(), "DDL inside transaction should be rejected");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("DDL"),
+            "error should mention 'DDL', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_empty_transaction() {
+        use crate::session::TransactionState;
+        let mut txn_state = TransactionState::new();
+
+        // BEGIN immediately followed by COMMIT is legal.
+        let begin = parse("BEGIN TRANSACTION").unwrap();
+        txn_state.validate_and_transition(&begin).unwrap();
+
+        let commit = parse("COMMIT").unwrap();
+        txn_state.validate_and_transition(&commit).unwrap();
+
+        // After commit, we're back to no-transaction state.
+        assert!(!txn_state.in_transaction());
     }
 }
 

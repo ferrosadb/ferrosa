@@ -227,6 +227,7 @@
       <li><a href="#auth-roles">Auth &amp; Roles</a></li>
       <li><a href="#system">System Keyspaces</a></li>
       <li><a href="#indexes">Secondary Indexes</a></li>
+      <li><a href="#transactions">Transactions (Accord)</a></li>
       <li><a href="#subscribe">SUBSCRIBE Extension</a></li>
       <li><a href="#graph">Graph (Cypher) Extension</a></li>
       <li><a href="#not-yet">Not Yet Supported</a></li>
@@ -352,9 +353,10 @@
     <tbody>
       <tr><td>SELECT</td><td><span class="check">Supported</span></td><td>WHERE, ORDER BY, LIMIT, DISTINCT, bind markers (?), named bind markers (:name), IN clause, ALLOW FILTERING, token() function, CONTAINS / CONTAINS KEY</td></tr>
       <tr><td>INSERT</td><td><span class="check">Supported</span></td><td>IF NOT EXISTS (LWT), USING TTL, USING TIMESTAMP</td></tr>
-      <tr><td>UPDATE</td><td><span class="check">Supported</span></td><td>SET, WHERE, IF conditions, collection +/- operators, counter increment/decrement</td></tr>
-      <tr><td>DELETE</td><td><span class="check">Supported</span></td><td>WHERE, IF EXISTS, column-level delete, map element delete syntax</td></tr>
-      <tr><td>BATCH</td><td><span class="check">Supported</span></td><td>BEGIN BATCH ... APPLY BATCH (unlogged)</td></tr>
+      <tr><td>UPDATE</td><td><span class="check">Supported</span></td><td>SET, WHERE, IF conditions (LWT), collection +/- operators, counter increment/decrement</td></tr>
+      <tr><td>DELETE</td><td><span class="check">Supported</span></td><td>WHERE, IF EXISTS / IF conditions (LWT), column-level delete, map element delete syntax</td></tr>
+      <tr><td>BATCH</td><td><span class="check">Supported</span></td><td>BEGIN BATCH ... APPLY BATCH (unlogged), batch CAS (conditional batch)</td></tr>
+      <tr><td>BEGIN TRANSACTION</td><td><span class="check">Supported</span></td><td>BEGIN TRANSACTION ... COMMIT TRANSACTION / ROLLBACK TRANSACTION (Accord)</td></tr>
       <tr><td>TRUNCATE</td><td><span class="check">Supported</span></td><td>—</td></tr>
       <tr><td>USE</td><td><span class="check">Supported</span></td><td>Set default keyspace for session</td></tr>
     </tbody>
@@ -395,6 +397,8 @@
     <li><code>LOCAL_ONE</code></li>
     <li><code>LOCAL_QUORUM</code></li>
     <li><code>EACH_QUORUM</code></li>
+    <li><code>SERIAL</code> — for lightweight transaction reads (linearizable)</li>
+    <li><code>LOCAL_SERIAL</code> — for lightweight transaction reads (local DC linearizable)</li>
   </ul>
   <p>Set per-query via the standard CQL protocol flags, or configure a default with <code>FERROSA_DEFAULT_CL</code> (default: <code>QUORUM</code>).</p>
 
@@ -566,6 +570,70 @@
   <h3>Multi-node replication</h3>
   <p>All index DDL (CREATE INDEX, DROP INDEX) replicates automatically in pair mode. Each node independently builds indexes for its local SSTables — no cross-node index coordination needed.</p>
 
+  <!-- ── Transactions ── -->
+  <h2 id="transactions">Transactions (Accord)</h2>
+
+  <div class="extension">
+    <strong>Strict Serializable:</strong> Ferrosa implements distributed transactions via the
+    Accord consensus protocol — providing strict serializability without Paxos. All Cassandra
+    lightweight transaction (LWT) patterns are supported, plus multi-statement transactions.
+  </div>
+
+  <h3>Lightweight transactions (LWT)</h3>
+  <p>Full Cassandra LWT compatibility for conditional mutations:</p>
+
+  <table>
+    <thead><tr><th>Pattern</th><th>Status</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>INSERT ... IF NOT EXISTS</td><td><span class="check">Supported</span></td><td>Returns [applied] boolean column</td></tr>
+      <tr><td>UPDATE ... IF condition</td><td><span class="check">Supported</span></td><td>Compare-and-set on any column; supports =, !=, &lt;, &gt;, &lt;=, &gt;=, IN</td></tr>
+      <tr><td>DELETE ... IF EXISTS</td><td><span class="check">Supported</span></td><td>Conditional delete</td></tr>
+      <tr><td>DELETE ... IF condition</td><td><span class="check">Supported</span></td><td>Conditional delete with column checks</td></tr>
+      <tr><td>Batch CAS</td><td><span class="check">Supported</span></td><td>BEGIN BATCH with IF conditions across statements</td></tr>
+    </tbody>
+  </table>
+
+  <pre><span class="cm">-- Insert only if the row doesn't exist</span>
+<span class="kw">INSERT INTO</span> <span class="type">accounts</span> (id, balance, owner)
+<span class="kw">VALUES</span> (<span class="str">'acct-1'</span>, <span class="var">1000</span>, <span class="str">'Alice'</span>)
+<span class="kw">IF NOT EXISTS</span>;
+
+<span class="cm">-- Conditional update (compare-and-set)</span>
+<span class="kw">UPDATE</span> <span class="type">accounts</span> <span class="kw">SET</span> balance = <span class="var">900</span>
+<span class="kw">WHERE</span> id = <span class="str">'acct-1'</span>
+<span class="kw">IF</span> balance = <span class="var">1000</span>;
+
+<span class="cm">-- Conditional delete</span>
+<span class="kw">DELETE FROM</span> <span class="type">accounts</span>
+<span class="kw">WHERE</span> id = <span class="str">'acct-1'</span>
+<span class="kw">IF</span> balance = <span class="var">0</span>;</pre>
+
+  <h3>Multi-statement transactions</h3>
+  <p>Ferrosa extends CQL with explicit transaction blocks for multi-partition atomic operations:</p>
+
+  <pre><span class="cm">-- Atomic transfer across partitions</span>
+<span class="kw">BEGIN TRANSACTION</span>
+  <span class="kw">UPDATE</span> <span class="type">accounts</span> <span class="kw">SET</span> balance = balance - <span class="var">100</span>
+    <span class="kw">WHERE</span> id = <span class="str">'acct-1'</span> <span class="kw">IF</span> balance >= <span class="var">100</span>;
+  <span class="kw">UPDATE</span> <span class="type">accounts</span> <span class="kw">SET</span> balance = balance + <span class="var">100</span>
+    <span class="kw">WHERE</span> id = <span class="str">'acct-2'</span>;
+<span class="kw">COMMIT TRANSACTION</span>;
+
+<span class="cm">-- Rollback on failure</span>
+<span class="kw">ROLLBACK TRANSACTION</span>;</pre>
+
+  <h3>Consistency levels for transactions</h3>
+  <p>LWT operations use <code>SERIAL</code> or <code>LOCAL_SERIAL</code> consistency for the read phase, combined with any standard write consistency level. This matches Cassandra's LWT behavior exactly.</p>
+
+  <h3>How it works</h3>
+  <p>Ferrosa uses the Accord consensus protocol (not Paxos) for transaction coordination:</p>
+  <ul>
+    <li><strong>Fast path (1-RTT):</strong> When a leaseholder can coordinate, transactions commit in a single round trip</li>
+    <li><strong>Slow path (2-RTT):</strong> When coordination is needed across shards, a second round trip resolves conflicts</li>
+    <li><strong>Linearizable reads:</strong> Dependency-checked reads through a conflict index ensure read-after-write consistency</li>
+    <li><strong>Crash recovery:</strong> Protocol log replay and .accord sidecar files ensure no committed transactions are lost</li>
+  </ul>
+
   <!-- ── SUBSCRIBE ── -->
   <h2 id="subscribe">SUBSCRIBE Extension</h2>
 
@@ -662,7 +730,6 @@
       <tr><td>Logged batch atomicity</td><td>Planned</td></tr>
       <tr><td>Query tracing</td><td>Planned</td></tr>
       <tr><td>Materialized views</td><td>Planned</td></tr>
-      <tr><td>Lightweight transactions (LWT)</td><td><span class="partial">Partial</span> — INSERT IF NOT EXISTS supported; full LWT (UPDATE IF, compare-and-set) planned</td></tr>
     </tbody>
   </table>
 

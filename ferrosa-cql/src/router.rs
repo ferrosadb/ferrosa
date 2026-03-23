@@ -45,6 +45,62 @@ use crate::virtual_tables::connections::ConnectionTracker;
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
 const MAX_BATCH_STATEMENTS: usize = 500;
 
+/// UUID epoch offset: 100-nanosecond intervals between 1582-10-15 and 1970-01-01.
+const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
+
+/// Generate a v1 Timeuuid containing the current timestamp.
+///
+/// Returns `CqlValue::Timeuuid` with a version-1 UUID built from the
+/// current system clock. Uses a v4 UUID as entropy source for the
+/// clock sequence and node fields (avoids pulling in `rand` directly).
+fn eval_now() -> CqlValue {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let uuid_ts = now.as_nanos() as u64 / 100 + UUID_EPOCH_OFFSET;
+    let time_low = (uuid_ts & 0xFFFF_FFFF) as u32;
+    let time_mid = ((uuid_ts >> 32) & 0xFFFF) as u16;
+    let time_hi = ((uuid_ts >> 48) & 0x0FFF) as u16 | 0x1000; // version 1
+
+    // Use a v4 UUID as entropy source for clock_seq and node bytes.
+    let entropy = uuid::Uuid::new_v4();
+    let ebytes = entropy.as_bytes();
+    let clock_seq: u16 = u16::from_be_bytes([ebytes[0], ebytes[1]]) & 0x3FFF | 0x8000; // variant 1
+    let node: [u8; 6] = [
+        ebytes[2], ebytes[3], ebytes[4], ebytes[5], ebytes[6], ebytes[7],
+    ];
+
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&time_low.to_be_bytes());
+    bytes[4..6].copy_from_slice(&time_mid.to_be_bytes());
+    bytes[6..8].copy_from_slice(&time_hi.to_be_bytes());
+    bytes[8..10].copy_from_slice(&clock_seq.to_be_bytes());
+    bytes[10..16].copy_from_slice(&node);
+
+    CqlValue::Timeuuid(uuid::Uuid::from_bytes(bytes))
+}
+
+/// Extract the Unix-epoch millisecond timestamp from a Timeuuid.
+///
+/// Converts from 100-nanosecond intervals since 1582-10-15 (UUID epoch) to
+/// milliseconds since 1970-01-01 (Unix epoch).
+fn eval_to_timestamp(timeuuid: &CqlValue) -> Result<CqlValue, CqlError> {
+    match timeuuid {
+        CqlValue::Timeuuid(uuid) => {
+            let bytes = uuid.as_bytes();
+            let time_low = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
+            let time_mid = u16::from_be_bytes([bytes[4], bytes[5]]) as u64;
+            let time_hi = (u16::from_be_bytes([bytes[6], bytes[7]]) & 0x0FFF) as u64;
+            let uuid_ts = time_low | (time_mid << 32) | (time_hi << 48);
+            let millis = (uuid_ts - UUID_EPOCH_OFFSET) / 10_000;
+            Ok(CqlValue::Timestamp(millis as i64))
+        }
+        _ => Err(CqlError::Invalid(
+            "toTimestamp requires a timeuuid argument".into(),
+        )),
+    }
+}
+
 // ── UDF/UDA query-time resolution types ──────────────────────────────────
 
 /// A user-defined function (scalar or aggregate) resolved from the schema,
@@ -104,6 +160,11 @@ pub struct RequestContext<'a> {
     pub current_keyspace: &'a Option<String>,
     /// Client-requested consistency level parsed from the CQL protocol frame.
     pub consistency: ConsistencyLevel,
+    /// Serial consistency level for lightweight transactions (LWT).
+    /// Parsed from the CQL QUERY/EXECUTE frame when flags bit 0x0010 is set.
+    pub serial_consistency: Option<ConsistencyLevel>,
+    /// Pagination parameters from the QUERY/EXECUTE frame.
+    pub paging: crate::paging::PagingParams,
 }
 
 /// Result of routing a statement.
@@ -307,6 +368,11 @@ pub async fn route(
             .await
             .map(RouteResult::Result),
         Statement::Explain(s) => route_explain(state, ctx, *s).map(RouteResult::Result),
+        // Accord transaction control statements are handled at the session/connection
+        // level, not in the router. If they reach here, return a void result.
+        Statement::BeginTransaction | Statement::Commit | Statement::Rollback => {
+            Ok(RouteResult::Result(crate::result::encode_void()))
+        }
     }
 }
 
@@ -1402,8 +1468,30 @@ fn route_select_user_table(
         &selected_rows
     };
 
-    Ok(result::encode_rows(
-        &col_names, &col_types, ks, &s.table, limited,
+    // Apply pagination: page_size interacts with LIMIT.
+    // If both page_size and LIMIT are set, the effective limit is min(page_size, limit).
+    // Pagination operates on the already-limited result set.
+    let effective_page_size = match (ctx.paging.page_size, s.limit) {
+        (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
+        (Some(ps), None) => Some(ps),
+        (None, _) => None,
+    };
+
+    let paged = crate::paging::apply_pagination(
+        limited.len(),
+        effective_page_size,
+        ctx.paging.paging_state.as_deref(),
+    )?;
+
+    let page_rows = &limited[paged.start..paged.end];
+
+    Ok(result::encode_rows_paged(
+        &col_names,
+        &col_types,
+        ks,
+        &s.table,
+        page_rows,
+        paged.next_paging_state.as_deref(),
     ))
 }
 
@@ -4179,6 +4267,20 @@ fn apply_system_select(
                     proj_types.push(CqlType::Bigint);
                     // COUNT is handled below as aggregate
                     proj_ops.push((usize::MAX, false));
+                } else if fn_lower == "now" {
+                    let display = alias.clone().unwrap_or_else(|| "system.now()".to_string());
+                    proj_names.push(display);
+                    proj_types.push(CqlType::Timeuuid);
+                    // Sentinel: usize::MAX - 1 for now()
+                    proj_ops.push((usize::MAX - 1, false));
+                } else if fn_lower == "totimestamp" {
+                    let display = alias
+                        .clone()
+                        .unwrap_or_else(|| "system.totimestamp(system.now())".to_string());
+                    proj_names.push(display);
+                    proj_types.push(CqlType::Timestamp);
+                    // Sentinel: usize::MAX - 2 for toTimestamp(now())
+                    proj_ops.push((usize::MAX - 2, false));
                 } else {
                     return Err(CqlError::Invalid(format!(
                         "unsupported function in system table query: {}",
@@ -4195,7 +4297,7 @@ fn apply_system_select(
     });
 
     if has_count {
-        // Aggregate query — return a single row
+        // Aggregate query -- return a single row
         let mut agg_row: Vec<Option<CqlValue>> = Vec::new();
         for (i, sc) in select_columns_ast.iter().enumerate() {
             if matches!(sc, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
@@ -4203,7 +4305,14 @@ fn apply_system_select(
                 agg_row.push(Some(CqlValue::Bigint(all_rows.len() as i64)));
             } else {
                 let (src_idx, apply_tojson) = proj_ops[i];
-                if src_idx < all_col_names.len() {
+                if src_idx == usize::MAX - 1 {
+                    // now()
+                    agg_row.push(Some(eval_now()));
+                } else if src_idx == usize::MAX - 2 {
+                    // toTimestamp(now())
+                    let timeuuid = eval_now();
+                    agg_row.push(eval_to_timestamp(&timeuuid).ok());
+                } else if src_idx < all_col_names.len() {
                     let val = all_rows
                         .first()
                         .and_then(|r| r.get(src_idx))
@@ -4237,13 +4346,22 @@ fn apply_system_select(
             proj_ops
                 .iter()
                 .map(|&(src_idx, apply_tojson)| {
-                    let val = row.get(src_idx).cloned().flatten();
-                    if apply_tojson {
-                        let json =
-                            bridge::cql_value_to_json(val.as_ref().unwrap_or(&CqlValue::Null));
-                        Some(CqlValue::Text(json))
+                    if src_idx == usize::MAX - 1 {
+                        // now()
+                        Some(eval_now())
+                    } else if src_idx == usize::MAX - 2 {
+                        // toTimestamp(now())
+                        let timeuuid = eval_now();
+                        eval_to_timestamp(&timeuuid).ok()
                     } else {
-                        val
+                        let val = row.get(src_idx).cloned().flatten();
+                        if apply_tojson {
+                            let json =
+                                bridge::cql_value_to_json(val.as_ref().unwrap_or(&CqlValue::Null));
+                            Some(CqlValue::Text(json))
+                        } else {
+                            val
+                        }
                     }
                 })
                 .collect()
@@ -4384,6 +4502,134 @@ fn apply_tojson_projections(
                 .unwrap_or(&CqlValue::Null);
             let json = bridge::cql_value_to_json(val);
             proj_row[proj_idx] = Some(CqlValue::Text(json));
+        }
+    }
+
+    projected_rows
+}
+
+/// Apply `now()`, `toTimestamp()`, `writetime()`, and `TTL()` built-in functions
+/// to projected rows for user-table SELECT queries.
+///
+/// `cell_meta` carries per-column metadata (timestamp, TTL) from storage,
+/// parallel to `full_rows`. For `now()` and `toTimestamp()`, no source data
+/// is needed. For `writetime()` and `TTL()`, the metadata is looked up by
+/// the target column name.
+///
+/// Currently unused — will be wired into route_select when partition reads
+/// integrate cell metadata via partition_to_rows_with_metadata.
+#[allow(dead_code)]
+fn apply_builtin_functions(
+    select_columns_ast: &[SelectColumn],
+    proj_col_names: &[String],
+    all_col_names: &[String],
+    cell_meta: &[Vec<bridge::CellMeta>],
+    mut projected_rows: Vec<Vec<Option<CqlValue>>>,
+) -> Vec<Vec<Option<CqlValue>>> {
+    // Collect operations: (projected_index, kind)
+    enum BuiltinOp {
+        Now,
+        ToTimestamp,
+        Writetime(usize), // source column index in full row
+        Ttl(usize),       // source column index in full row
+    }
+    let mut ops: Vec<(usize, BuiltinOp)> = Vec::new();
+
+    for (proj_idx, sc) in select_columns_ast.iter().enumerate() {
+        if let SelectColumn::FunctionCall { name, args, .. } = sc {
+            let fn_lower = name.to_lowercase();
+            match fn_lower.as_str() {
+                "now" => {
+                    if proj_idx < proj_col_names.len() {
+                        ops.push((proj_idx, BuiltinOp::Now));
+                    }
+                }
+                "totimestamp" => {
+                    if proj_idx < proj_col_names.len() {
+                        ops.push((proj_idx, BuiltinOp::ToTimestamp));
+                    }
+                }
+                "writetime" => {
+                    if let Some(arg) = args.first() {
+                        if let Ok(col_name) = extract_column_name(arg) {
+                            if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name)
+                            {
+                                if proj_idx < proj_col_names.len() {
+                                    ops.push((proj_idx, BuiltinOp::Writetime(src_idx)));
+                                }
+                            }
+                        }
+                    }
+                }
+                "ttl" => {
+                    if let Some(arg) = args.first() {
+                        if let Ok(col_name) = extract_column_name(arg) {
+                            if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name)
+                            {
+                                if proj_idx < proj_col_names.len() {
+                                    ops.push((proj_idx, BuiltinOp::Ttl(src_idx)));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if ops.is_empty() {
+        return projected_rows;
+    }
+
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    for (row_idx, proj_row) in projected_rows.iter_mut().enumerate() {
+        let meta = cell_meta.get(row_idx);
+        for (proj_idx, op) in &ops {
+            match op {
+                BuiltinOp::Now => {
+                    proj_row[*proj_idx] = Some(eval_now());
+                }
+                BuiltinOp::ToTimestamp => {
+                    // toTimestamp(now()) -- generate a timeuuid and convert
+                    let timeuuid = eval_now();
+                    proj_row[*proj_idx] = eval_to_timestamp(&timeuuid).ok();
+                }
+                BuiltinOp::Writetime(src_idx) => {
+                    if let Some(m) = meta.and_then(|m| m.get(*src_idx)) {
+                        if m.timestamp != i64::MIN {
+                            proj_row[*proj_idx] = Some(CqlValue::Bigint(m.timestamp));
+                        } else {
+                            proj_row[*proj_idx] = None;
+                        }
+                    } else {
+                        proj_row[*proj_idx] = None;
+                    }
+                }
+                BuiltinOp::Ttl(src_idx) => {
+                    if let Some(m) = meta.and_then(|m| m.get(*src_idx)) {
+                        if m.ttl > 0 {
+                            // Remaining TTL = ttl - (now_secs - cell_timestamp_secs)
+                            let cell_ts_secs = m.timestamp / 1_000_000;
+                            let elapsed = now_ts - cell_ts_secs;
+                            let remaining = (m.ttl as i64) - elapsed;
+                            if remaining > 0 {
+                                proj_row[*proj_idx] = Some(CqlValue::Int(remaining as i32));
+                            } else {
+                                proj_row[*proj_idx] = None; // expired
+                            }
+                        } else {
+                            proj_row[*proj_idx] = None; // no TTL set
+                        }
+                    } else {
+                        proj_row[*proj_idx] = None;
+                    }
+                }
+            }
         }
     }
 
@@ -5702,6 +5948,16 @@ mod tests {
         }
     }
 
+    fn test_ctx<'a>(auth: &'a AuthContext, ks: &'a Option<String>) -> RequestContext<'a> {
+        RequestContext {
+            auth,
+            current_keyspace: ks,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        }
+    }
+
     #[tokio::test]
     async fn create_keyspace_then_table_then_insert_then_select() {
         let (state, _dir) = setup();
@@ -5709,6 +5965,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // CREATE KEYSPACE
@@ -5756,6 +6014,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("USE my_ks").unwrap();
         match route(&state, &ctx, stmt).await.unwrap() {
@@ -5774,6 +6034,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -5803,6 +6065,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -5856,6 +6120,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM users WHERE id = 1").unwrap();
         assert!(route(&state, &ctx, stmt).await.is_err());
@@ -5868,6 +6134,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         // Build a batch statement with > 500 entries programmatically
         let stmts: Vec<Statement> = (0..501)
@@ -5898,6 +6166,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.peers").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -5914,6 +6184,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system_schema.keyspaces").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -5974,6 +6246,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let _ = route(&state, &ctx, stmt).await;
@@ -5987,6 +6261,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace and table first
@@ -6072,6 +6348,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse("SELECT * FROM test_ks.test_vtable").unwrap();
@@ -6143,6 +6421,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -6195,6 +6475,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + table + hash index
@@ -6243,6 +6525,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace first
@@ -6282,6 +6566,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -6319,6 +6605,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -6349,6 +6637,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -6371,6 +6661,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -6400,6 +6692,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -6430,6 +6724,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &ks,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace first (with explicit ks in statement)
@@ -6455,6 +6751,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // CREATE TYPE without keyspace and no session keyspace
@@ -6470,6 +6768,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -6498,6 +6798,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace but no type
@@ -6525,6 +6827,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6556,6 +6860,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6587,6 +6893,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6619,6 +6927,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6635,6 +6945,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6659,6 +6971,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6683,6 +6997,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6707,6 +7023,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -6838,6 +7156,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt =
             crate::parser::parse("SELECT schema_version FROM system.local WHERE key = 'local'")
@@ -6866,6 +7186,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local WHERE key = 'local'").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -6888,6 +7210,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.peers_v2").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -6912,6 +7236,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt =
             crate::parser::parse("SELECT cluster_name, release_version FROM system.local").unwrap();
@@ -6937,6 +7263,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt =
             crate::parser::parse("SELECT peer, host_id, schema_version FROM system.peers").unwrap();
@@ -6962,6 +7290,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -6972,6 +7302,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("temporal".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE TYPE temporal.serialized_event_batch (encoding_type text, version int, data blob)",
@@ -6992,6 +7324,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7002,6 +7336,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text)").unwrap();
         route(&state, &ctx_ks, stmt).await.unwrap();
@@ -7035,6 +7371,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7045,6 +7383,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt =
             crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text, extra blob)")
@@ -7070,6 +7410,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         // Create keyspace and table
         let stmt = crate::parser::parse(
@@ -7081,6 +7423,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt =
             crate::parser::parse("CREATE TABLE ks.t (k text PRIMARY KEY, v text, n int)").unwrap();
@@ -7172,6 +7516,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7182,6 +7528,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("temporal".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE temporal.t (k int PRIMARY KEY) WITH COMPACTION = { 'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy' }",
@@ -7207,6 +7555,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7217,6 +7567,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("temporal".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create the UDT first
@@ -7244,6 +7596,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7254,6 +7608,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("temporal".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -7283,6 +7639,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace and table with 2 columns
@@ -7295,6 +7653,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt =
             crate::parser::parse("CREATE TABLE ks.cluster_metadata (k int PRIMARY KEY, data blob)")
@@ -7357,6 +7717,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7367,6 +7729,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.meta (p int, name text, data blob, version bigint, PRIMARY KEY (p, name))",
@@ -7418,6 +7782,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7428,6 +7794,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.queue_metadata (queue_type int PRIMARY KEY, cluster_ack_level map<text, bigint>, version bigint)",
@@ -7467,6 +7835,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7477,6 +7847,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
@@ -7503,6 +7875,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7513,6 +7887,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
@@ -7544,6 +7920,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7554,6 +7932,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.coll (k int PRIMARY KEY, ids set<uuid>, events list<text>)",
@@ -7578,6 +7958,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup: create keyspace and table
@@ -7646,6 +8028,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup
@@ -7675,6 +8059,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -7722,6 +8108,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup: table with an index on `email` but NOT on `name`
@@ -7777,6 +8165,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -7815,6 +8205,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -7858,6 +8250,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup: table with composite key (pk, ck) and a value column
@@ -7999,6 +8393,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system_observability.connections").unwrap();
         let result = route(&state, &ctx, stmt).await;
@@ -8021,6 +8417,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt =
             crate::parser::parse("SELECT * FROM system_observability.active_queries").unwrap();
@@ -8050,6 +8448,8 @@ mod tests {
                 auth: &dev,
                 current_keyspace: &None,
                 consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
             },
             use_stmt,
         )
@@ -8069,6 +8469,8 @@ mod tests {
                 auth: &dev,
                 current_keyspace: &Some(new_ks),
                 consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
             },
             sel_stmt,
         )
@@ -8109,6 +8511,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -8155,6 +8559,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -8210,6 +8616,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -8244,6 +8652,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -8281,6 +8691,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace and function
@@ -8331,6 +8743,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE cur_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -8344,6 +8758,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &cur_ks,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let hex_body = hex_encode(&minimal_wasm_component());
@@ -8375,6 +8791,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -8419,6 +8837,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -8473,6 +8893,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -8527,6 +8949,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -8586,6 +9010,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace and table
@@ -8631,6 +9057,45 @@ mod tests {
                 );
             }
             _ => panic!("expected Result"),
+        }
+    }
+
+    // ── CQL built-in function tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn cql_function_now() {
+        // Test eval_now() directly: should produce a v1 UUID.
+        let timeuuid = super::eval_now();
+        match timeuuid {
+            CqlValue::Timeuuid(uuid) => {
+                let bytes = uuid.as_bytes();
+                let version = (bytes[6] >> 4) & 0x0F;
+                assert_eq!(version, 1, "now() should return a v1 UUID, got v{version}");
+            }
+            other => panic!("expected Timeuuid, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn cql_function_to_timestamp() {
+        // Test eval_now() + eval_to_timestamp() directly.
+        let timeuuid = super::eval_now();
+        let ts = super::eval_to_timestamp(&timeuuid).expect("toTimestamp should succeed");
+
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        match ts {
+            CqlValue::Timestamp(millis) => {
+                let diff = (now_millis - millis).abs();
+                assert!(
+                    diff < 5000,
+                    "toTimestamp(now()) should be within 5s of current time, diff={diff}ms"
+                );
+            }
+            other => panic!("expected Timestamp, got {:?}", other),
         }
     }
 }

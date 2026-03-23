@@ -28,6 +28,51 @@ pub struct SubscriptionPush {
     pub body: Bytes,
 }
 
+// ---------------------------------------------------------------------------
+// Dual-timestamp subscription events (A5.7)
+// ---------------------------------------------------------------------------
+
+/// A subscription event that carries both Accord consensus timestamp
+/// (`accord_ts`) and the local apply timestamp (`apply_ts`).
+///
+/// `accord_ts` is the globally agreed execution timestamp from the Accord
+/// protocol. `apply_ts` is the wall-clock time at which the mutation was
+/// applied on this replica. Consumers that need global ordering use
+/// `accord_ts`; consumers that need recency-based display use `apply_ts`.
+///
+/// Old consumers that do not understand these fields simply ignore them
+/// (the base `SubscriptionPush` is still sent unchanged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionEvent {
+    /// The mutation payload bytes (same as SubscriptionPush.body).
+    pub body: Bytes,
+    /// Accord consensus timestamp (globally ordered).
+    pub accord_ts: u64,
+    /// Local apply timestamp — wall-clock nanos when mutation was applied.
+    pub apply_ts: u64,
+}
+
+impl SubscriptionEvent {
+    /// Create a new dual-timestamp event.
+    pub fn new(body: Bytes, accord_ts: u64, apply_ts: u64) -> Self {
+        Self {
+            body,
+            accord_ts,
+            apply_ts,
+        }
+    }
+}
+
+/// Sort a slice of events by their Accord consensus timestamp (ascending).
+pub fn sort_by_accord_ts(events: &mut [SubscriptionEvent]) {
+    events.sort_by_key(|e| e.accord_ts);
+}
+
+/// Sort a slice of events by their apply timestamp (ascending).
+pub fn sort_by_apply_ts(events: &mut [SubscriptionEvent]) {
+    events.sort_by_key(|e| e.apply_ts);
+}
+
 /// A handle to a single active subscription.
 pub struct SubscriptionHandle {
     pub stream_id: u16,
@@ -124,6 +169,8 @@ pub fn spawn_subscription_poll(
                         auth: &auth,
                         current_keyspace: &keyspace,
                         consistency: ferrosa_cluster::consistency::ConsistencyLevel::One,
+                        serial_consistency: None,
+                        paging: crate::paging::PagingParams::default(),
                     };
                     match crate::router::route(&state, &ctx, inner.clone()).await {
                         Ok(RouteResult::Result(body)) => {
@@ -413,5 +460,83 @@ mod tests {
         assert!(!cancel_clone.is_cancelled());
         state.cancel(Some(1));
         assert!(cancel_clone.is_cancelled());
+    }
+
+    // ===================================================================
+    // A5.7 — SUBSCRIBE dual timestamps (4 tests)
+    // ===================================================================
+
+    /// Events carry both accord_ts and apply_ts.
+    #[test]
+    fn subscribe_dual_timestamps() {
+        let event = SubscriptionEvent::new(
+            Bytes::from_static(b"row-data"),
+            1000, // accord_ts
+            2000, // apply_ts
+        );
+
+        assert_eq!(event.accord_ts, 1000);
+        assert_eq!(event.apply_ts, 2000);
+        assert_eq!(event.body, Bytes::from_static(b"row-data"));
+    }
+
+    /// Events are ordered by accord_ts when using sort_by_accord_ts.
+    #[test]
+    fn subscribe_accord_ts_ordering() {
+        let mut events = vec![
+            SubscriptionEvent::new(Bytes::from_static(b"c"), 300, 100),
+            SubscriptionEvent::new(Bytes::from_static(b"a"), 100, 300),
+            SubscriptionEvent::new(Bytes::from_static(b"b"), 200, 200),
+        ];
+
+        sort_by_accord_ts(&mut events);
+
+        assert_eq!(events[0].accord_ts, 100);
+        assert_eq!(events[1].accord_ts, 200);
+        assert_eq!(events[2].accord_ts, 300);
+        // Body order must match the reordering.
+        assert_eq!(events[0].body, Bytes::from_static(b"a"));
+        assert_eq!(events[1].body, Bytes::from_static(b"b"));
+        assert_eq!(events[2].body, Bytes::from_static(b"c"));
+    }
+
+    /// Old consumers that only read SubscriptionPush are unaffected by
+    /// the new dual-timestamp fields — SubscriptionEvent is a separate
+    /// type that does not alter the existing SubscriptionPush layout.
+    #[test]
+    fn subscribe_backward_compat() {
+        // SubscriptionPush still works without timestamps.
+        let push = SubscriptionPush {
+            stream_id: 42,
+            body: Bytes::from_static(b"result-frame"),
+        };
+        assert_eq!(push.stream_id, 42);
+        assert_eq!(push.body, Bytes::from_static(b"result-frame"));
+
+        // SubscriptionEvent is opt-in: creating one does not require
+        // changing any existing SubscriptionPush consumer code.
+        let event = SubscriptionEvent::new(push.body.clone(), 500, 600);
+        assert_eq!(event.accord_ts, 500);
+        assert_eq!(event.apply_ts, 600);
+    }
+
+    /// Events can be sorted by apply_ts as an alternative ordering.
+    #[test]
+    fn subscribe_apply_ts_sort() {
+        let mut events = vec![
+            SubscriptionEvent::new(Bytes::from_static(b"late-apply"), 100, 500),
+            SubscriptionEvent::new(Bytes::from_static(b"early-apply"), 300, 100),
+            SubscriptionEvent::new(Bytes::from_static(b"mid-apply"), 200, 300),
+        ];
+
+        sort_by_apply_ts(&mut events);
+
+        assert_eq!(events[0].apply_ts, 100);
+        assert_eq!(events[1].apply_ts, 300);
+        assert_eq!(events[2].apply_ts, 500);
+        // Body must follow the apply_ts order.
+        assert_eq!(events[0].body, Bytes::from_static(b"early-apply"));
+        assert_eq!(events[1].body, Bytes::from_static(b"mid-apply"));
+        assert_eq!(events[2].body, Bytes::from_static(b"late-apply"));
     }
 }

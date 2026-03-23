@@ -10,6 +10,7 @@
 //! that `ferrosa-udf` can depend on them without pulling in `ferrosa-cql`.
 //! Wire-format encoding/decoding for CQL values remains in `ferrosa-cql`.
 
+pub mod accord;
 pub mod cell;
 pub mod cql_type;
 pub mod data_type;
@@ -22,6 +23,10 @@ pub mod token;
 #[cfg(feature = "test-generators")]
 pub mod test_generators;
 
+pub use accord::{
+    AcceptedBallot, BallotGenerator, BallotNumber, HybridLogicalClock, PromisedBallot,
+    Timestamp as AccordTimestamp, TxnId, TxnPhase, TxnState,
+};
 pub use cell::{CellValue, Timestamp, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
 pub use cql_type::{CqlType, CqlValue};
 pub use data_type::DataType;

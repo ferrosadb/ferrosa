@@ -720,9 +720,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tokio::select! {
                 _ = flush_interval.tick() => {
-                    // Flush all non-empty memtables (not just those above
-                    // the size threshold) so small writes reach S3 promptly.
-                    if let Err(e) = maintenance_engine.flush_all() {
+                    if let Err(e) = maintenance_engine.flush_if_needed() {
                         tracing::warn!(%e, "periodic flush failed");
                     }
 

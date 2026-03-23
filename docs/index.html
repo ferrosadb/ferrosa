@@ -758,6 +758,7 @@
   </h1>
   <p>
     Drop-in CQL compatibility. No GC pauses. Ephemeral nodes that recover in seconds.
+    Strict serializable transactions via Accord — not Paxos.
     Your data lives in S3 — no EBS snapshots, no backup jobs. Point-in-time recovery
     for 10 TB costs $2/month, not $2,250. Start on a single node, scale to a full
     production cluster — same binary, same config, no migration.
@@ -1000,8 +1001,9 @@
       <p>
         CQL protocol v4 and v5 — the same wire protocol your drivers already speak.
         Python, Java, Go, Rust (cdrs-tokio), and Node.js drivers connect without code changes.
-        DDL, DML, prepared statements, batch operations, system keyspaces, ALLOW FILTERING,
-        toJson(), INSERT IF NOT EXISTS, counter increment/decrement, and collection
+        DDL, DML, prepared statements, batch operations, lightweight transactions
+        (IF NOT EXISTS, IF conditions), system keyspaces, ALLOW FILTERING,
+        toJson(), counter increment/decrement, and collection
         UPDATE +/- operators — all there.
       </p>
       <span class="metric">protocol v4/v5 · cdrs-tokio · 0 driver changes required</span>
@@ -1091,6 +1093,46 @@
 <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> documents
   <span class="kw">ORDER BY</span> embedding <span class="kw">ANN OF</span> [<span class="num">0.1</span>, <span class="num">0.2</span>, ...]
   <span class="kw">LIMIT</span> <span class="num">10</span>;</pre>
+      </div>
+    </div>
+
+    <!-- Accord Transactions — full width highlight -->
+    <div class="feature-card highlight">
+      <div>
+        <div class="feature-icon" style="background: rgba(200, 130, 240, 0.12);">⛨</div>
+        <h3>Strict Serializable Transactions</h3>
+        <p>
+          Distributed transactions with strict serializability via the Accord consensus protocol —
+          not Paxos, not 2PC. Multi-partition atomic operations with all-or-nothing semantics.
+          INSERT IF NOT EXISTS, UPDATE/DELETE IF conditions, and batch compare-and-set
+          all work out of the box. Cross-shard transactions coordinate automatically.
+        </p>
+        <p style="margin-top: 0.75rem;">
+          1-RTT fast path through leaseholder for low-latency commits. 2-RTT slow path
+          when coordination is needed. Crash recovery via protocol log replay with
+          .accord sidecar files. Dynamic electorate reconfiguration with a 4-gate join
+          protocol for safe membership changes.
+        </p>
+        <span class="metric">Accord protocol · strict serializable · 1-RTT fast path · Jepsen-verified</span>
+      </div>
+      <div class="code-demo" style="margin: 0; border: none;">
+        <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- Lightweight transactions (Cassandra-compatible)</span>
+<span class="kw">INSERT INTO</span> accounts (id, balance)
+<span class="kw">VALUES</span> (<span class="str">'acct-1'</span>, <span class="num">1000</span>)
+<span class="kw">IF NOT EXISTS</span>;
+
+<span class="cm">-- Conditional update with compare-and-set</span>
+<span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = <span class="num">900</span>
+<span class="kw">WHERE</span> id = <span class="str">'acct-1'</span>
+<span class="kw">IF</span> balance = <span class="num">1000</span>;
+
+<span class="cm">-- Multi-statement transaction</span>
+<span class="kw">BEGIN TRANSACTION</span>
+  <span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance - <span class="num">100</span>
+    <span class="kw">WHERE</span> id = <span class="str">'acct-1'</span> <span class="kw">IF</span> balance >= <span class="num">100</span>;
+  <span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance + <span class="num">100</span>
+    <span class="kw">WHERE</span> id = <span class="str">'acct-2'</span>;
+<span class="kw">COMMIT TRANSACTION</span>;</pre>
       </div>
     </div>
 
@@ -1453,9 +1495,17 @@ user = session.execute(stmt, [user_id])
           <td>Managed</td>
         </tr>
         <tr>
+          <td>Transactions</td>
+          <td class="ferrosa-col"><span class="check">✓</span> Accord (strict serializable)</td>
+          <td>LWT (Paxos)</td>
+          <td>LWT (Paxos)</td>
+          <td>ACID (single-table)</td>
+          <td>LWT (Paxos)</td>
+        </tr>
+        <tr>
           <td>Consensus</td>
-          <td class="ferrosa-col">Raft (openraft)</td>
-          <td>Paxos (Accord)</td>
+          <td class="ferrosa-col">Raft + Accord</td>
+          <td>Paxos (Accord in 5.x)</td>
           <td>Paxos (Pegasus)</td>
           <td>N/A (managed)</td>
           <td>N/A (managed)</td>
@@ -1587,6 +1637,7 @@ user = session.execute(stmt, [user_id])
           <span class="arch-item">ferrosa-cluster</span>
           <span class="arch-item">Single / Pair / Full Cluster</span>
           <span class="arch-item">Raft (openraft)</span>
+          <span class="arch-item">Accord Transactions</span>
           <span class="arch-item">Tunable CL</span>
           <span class="arch-item">Hinted Handoff</span>
           <span class="arch-item">Token Ring</span>

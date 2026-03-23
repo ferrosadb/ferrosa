@@ -1049,6 +1049,114 @@ pub fn partition_to_rows(
 }
 
 // ---------------------------------------------------------------------------
+// Function 7: CellMeta and partition_to_rows_with_metadata
+// ---------------------------------------------------------------------------
+
+/// Cell metadata for `writetime()` and `TTL()` CQL functions.
+///
+/// Each entry corresponds to a column in the output row:
+/// - `timestamp`: cell timestamp in microseconds since epoch (`i64::MIN` for PK/CK/missing).
+/// - `ttl`: TTL in seconds as originally set (0 = no TTL).
+#[derive(Debug, Clone)]
+pub struct CellMeta {
+    pub timestamp: i64,
+    pub ttl: i32,
+}
+
+impl CellMeta {
+    /// Sentinel: no metadata available (PK/CK columns, missing cells).
+    pub const NONE: CellMeta = CellMeta {
+        timestamp: i64::MIN,
+        ttl: 0,
+    };
+}
+
+/// Like [`partition_to_rows`], but also returns per-cell metadata (timestamp, TTL)
+/// needed by `writetime()` and `TTL()` CQL functions.
+///
+/// Returns `(rows, metadata)` where each entry in `metadata` is a
+/// `Vec<CellMeta>` parallel to the corresponding row.
+pub fn partition_to_rows_with_metadata(
+    partition: &ferrosa_sstable::types::Partition,
+    column_names: &[String],
+    column_types: &[CqlType],
+    pk_columns: &[usize],
+    ck_columns: &[usize],
+) -> (Vec<Vec<Option<CqlValue>>>, Vec<Vec<CellMeta>>) {
+    let mut result = Vec::new();
+    let mut meta_result = Vec::new();
+
+    let pk_set: std::collections::HashSet<usize> = pk_columns.iter().copied().collect();
+    let ck_set: std::collections::HashSet<usize> = ck_columns.iter().copied().collect();
+    let storage_to_table: Vec<usize> = (0..column_names.len())
+        .filter(|i| !pk_set.contains(i) && !ck_set.contains(i))
+        .collect();
+
+    let pk_values = decode_pk(&partition.key, pk_columns.len());
+
+    for row in &partition.rows {
+        if !row.deletion.is_live() {
+            let del_ts = row.deletion.marked_for_delete_at;
+            let liveness_supersedes = row.primary_key_liveness.timestamp > del_ts;
+            let any_cell_supersedes = row.cells.iter().any(|(_, cell)| cell.timestamp > del_ts);
+            if !liveness_supersedes && !any_cell_supersedes {
+                continue;
+            }
+        }
+
+        let mut output_row: Vec<Option<CqlValue>> = vec![None; column_names.len()];
+        let mut meta_row: Vec<CellMeta> = vec![CellMeta::NONE; column_names.len()];
+
+        for (i, &col_idx) in pk_columns.iter().enumerate() {
+            if col_idx < column_types.len() {
+                if let Some(bytes) = pk_values.get(i) {
+                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
+                        output_row[col_idx] = Some(val);
+                    }
+                }
+            }
+        }
+
+        let ck_values = decode_clustering(&row.clustering, ck_columns.len());
+        for (i, &col_idx) in ck_columns.iter().enumerate() {
+            if col_idx < column_types.len() {
+                if let Some(bytes) = ck_values.get(i) {
+                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
+                        output_row[col_idx] = Some(val);
+                    }
+                }
+            }
+        }
+
+        for (col_index, cell) in &row.cells {
+            let storage_idx = *col_index as usize;
+            let table_idx = match storage_to_table.get(storage_idx) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+            if table_idx < column_types.len() {
+                meta_row[table_idx] = CellMeta {
+                    timestamp: cell.timestamp,
+                    ttl: cell.ttl,
+                };
+                if cell.is_tombstone() {
+                    output_row[table_idx] = None;
+                } else if let Some(ref value_bytes) = cell.value {
+                    if let Ok(val) = decode_value(&column_types[table_idx], value_bytes) {
+                        output_row[table_idx] = Some(val);
+                    }
+                }
+            }
+        }
+
+        result.push(output_row);
+        meta_result.push(meta_row);
+    }
+
+    (result, meta_result)
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 

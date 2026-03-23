@@ -71,7 +71,11 @@ mod tests {
     impl RpcHandler for EchoPingHandler {
         async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
             match msg {
-                Message::Ping { nonce } => Some(Message::Pong { nonce }),
+                Message::Ping { nonce, .. } => Some(Message::Pong {
+                    nonce,
+                    ping_recv_at: 0,
+                    sent_at: 0,
+                }),
                 _ => None,
             }
         }
@@ -83,16 +87,22 @@ mod tests {
         registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
 
         let peer_id = (uuid::Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
-        let msg = Message::Ping { nonce: 42 };
+        let msg = Message::Ping {
+            nonce: 42,
+            sent_at: 0,
+        };
         let response = registry.dispatch(peer_id, MsgType::Ping, msg).await;
-        assert!(matches!(response, Some(Message::Pong { nonce: 42 })));
+        assert!(matches!(response, Some(Message::Pong { nonce: 42, .. })));
     }
 
     #[tokio::test]
     async fn registry_returns_none_for_unregistered_type() {
         let registry = HandlerRegistry::new();
         let peer_id = (uuid::Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
-        let msg = Message::Ping { nonce: 1 };
+        let msg = Message::Ping {
+            nonce: 1,
+            sent_at: 0,
+        };
         let response = registry.dispatch(peer_id, MsgType::Ping, msg).await;
         assert!(response.is_none());
     }

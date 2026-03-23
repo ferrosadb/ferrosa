@@ -1179,10 +1179,9 @@ impl StorageEngine {
 
         state.store.flush()?;
 
-        // Submit index rebuild for the newly flushed SSTable if needed.
-        // This handles the case where CREATE INDEX was called after data
-        // was already in the memtable -- flush produces the SSTable but
-        // the sidecar may be incomplete, so we rebuild it.
+        // Eager index build: submit high-priority index rebuild for the newly
+        // flushed SSTable. This keeps the MemtableIndex (Layer 4) bounded to
+        // 0-1 entries in steady state by ensuring sidecar indexes are current.
         if let Some(ref scheduler) = self.index_scheduler {
             let gen = state.store.last_flush_generation();
             for (index_name, col_pos) in state.store.indexed_columns() {
@@ -1200,7 +1199,7 @@ impl StorageEngine {
                                 table_id.keyspace().to_string(),
                                 table_id.table().to_string(),
                             ),
-                            priority: crate::index::BuildPriority::Normal,
+                            priority: crate::index::BuildPriority::High,
                             enqueued_at: std::time::Instant::now(),
                             column_position: *col_pos,
                         };
@@ -1282,7 +1281,8 @@ impl StorageEngine {
                     eprintln!("[compaction] swap failed: {e}");
                 }
 
-                // Submit index rebuild jobs for the compacted output.
+                // Eager index build: submit high-priority rebuild for compacted output.
+                // Same as flush — keeps MemtableIndex bounded in steady state.
                 if let Some(ref scheduler) = self.index_scheduler {
                     for (index_name, col_pos) in state.store.indexed_columns() {
                         let job = crate::index::IndexBuildJob {
@@ -1293,7 +1293,7 @@ impl StorageEngine {
                                 table_id.keyspace().to_string(),
                                 table_id.table().to_string(),
                             ),
-                            priority: crate::index::BuildPriority::Normal,
+                            priority: crate::index::BuildPriority::High,
                             enqueued_at: std::time::Instant::now(),
                             column_position: *col_pos,
                         };
