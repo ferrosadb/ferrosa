@@ -850,23 +850,24 @@ pub(crate) fn handle_prepare(
         match snapshot.tables.get(&key) {
             Some(table_meta) => {
                 let mut cols = Vec::with_capacity(bind_col_names.len());
-                let mut all_resolved = true;
                 for col_name in &bind_col_names {
-                    if let Some(cm) = table_meta.columns.get(col_name) {
+                    if col_name == "[ttl]" {
+                        cols.push(("[ttl]".to_string(), CqlType::Int));
+                    } else if col_name == "[timestamp]" {
+                        cols.push(("[timestamp]".to_string(), CqlType::Bigint));
+                    } else if let Some(cm) = table_meta.columns.get(col_name) {
                         cols.push((col_name.clone(), col_type_str_to_cql_type(&cm.column_type)));
                     } else {
-                        // Column not found in schema — can't build reliable metadata.
-                        all_resolved = false;
-                        break;
+                        // Unknown column — use Blob fallback
+                        cols.push((col_name.clone(), CqlType::Blob));
                     }
                 }
-                if all_resolved {
-                    cols
-                } else {
-                    Vec::new()
-                }
+                cols
             }
-            None => Vec::new(),
+            None => bind_col_names
+                .iter()
+                .map(|n| (n.clone(), CqlType::Blob))
+                .collect(),
         }
     };
 
