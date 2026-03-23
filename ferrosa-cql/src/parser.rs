@@ -2047,6 +2047,10 @@ impl<'input> Parser<'input> {
                     let val_tok = self.lexer.next_token()?;
                     match val_tok.kind {
                         TokenKind::IntegerLiteral(n) => timestamp = Some(n),
+                        // Bind marker: USING TIMESTAMP ? — treat as 0 (resolved at execute time)
+                        TokenKind::QuestionMark | TokenKind::NamedBind(_) => {
+                            timestamp = Some(0);
+                        }
                         _ => {
                             return Err(CqlError::SyntaxError(format!(
                                 "expected integer after TIMESTAMP, got {:?} at position {}",
@@ -2064,6 +2068,10 @@ impl<'input> Parser<'input> {
                                 CqlError::SyntaxError(format!("TTL value out of range: {n}"))
                             })?;
                             ttl = Some(n);
+                        }
+                        // Bind marker: USING TTL ? — treat as 0 (resolved at execute time)
+                        TokenKind::QuestionMark | TokenKind::NamedBind(_) => {
+                            ttl = Some(0);
                         }
                         _ => {
                             return Err(CqlError::SyntaxError(format!(
