@@ -273,10 +273,20 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        // SSTables, newest first
+        // SSTables, newest first.
+        // Tolerate I/O errors from individual SSTables — a corrupt or
+        // format-incompatible SSTable should not prevent reading data
+        // that exists in other SSTables or the memtable (FRSA-BUG-026).
         for sstable in guard.sstables.iter() {
-            if let Some(p) = sstable.get_partition(key)? {
-                sources.push(p);
+            match sstable.get_partition(key) {
+                Ok(Some(p)) => sources.push(p),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "skipping corrupt SSTable partition during read — data may be incomplete"
+                    );
+                }
             }
         }
 

@@ -3210,4 +3210,249 @@ mod tests {
             "row should exist in SSTable"
         );
     }
+
+    // ── FMEA: SSTable corruption resilience ─────────────────────────────
+
+    /// FMEA #1: Truncating an SSTable Data.db file should not crash reads.
+    /// The read should return data from the memtable or other SSTables,
+    /// logging a warning about the corrupt SSTable.
+    #[test]
+    fn read_survives_truncated_sstable_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "resilience".into(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "v".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+        let tid = TableId::new("test_ks", "resilience");
+
+        // Write and flush to SSTable
+        let key = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key, row, 1000).unwrap();
+        engine.flush_all().unwrap();
+
+        // Corrupt: truncate the Data.db file to 1 byte
+        let sstable_dir = dir.path().join("sstables/test_ks.resilience");
+        if let Ok(entries) = std::fs::read_dir(&sstable_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.to_string_lossy().ends_with("-Data.db") {
+                    std::fs::write(&path, &[0u8]).unwrap();
+                }
+            }
+        }
+
+        // Read should NOT crash — should return None (data lost but no panic)
+        let result = engine.read(&tid, &key);
+        assert!(
+            result.is_ok(),
+            "read with corrupt SSTable should not crash: {:?}",
+            result.err()
+        );
+        // Data may be lost (from corrupt SSTable) but the operation didn't crash
+    }
+
+    /// FMEA #6: Zero-length Data.db should not crash reads.
+    #[test]
+    fn read_survives_zero_length_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "zero_data".into(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "v".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+        let tid = TableId::new("test_ks", "zero_data");
+
+        let key = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key, row, 1000).unwrap();
+        engine.flush_all().unwrap();
+
+        // Corrupt: zero out the Data.db file
+        let sstable_dir = dir.path().join("sstables/test_ks.zero_data");
+        if let Ok(entries) = std::fs::read_dir(&sstable_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.to_string_lossy().ends_with("-Data.db") {
+                    std::fs::write(&path, &[]).unwrap();
+                }
+            }
+        }
+
+        let result = engine.read(&tid, &key);
+        assert!(
+            result.is_ok(),
+            "read with zero-length SSTable should not crash: {:?}",
+            result.err()
+        );
+    }
+
+    /// FMEA #9: Write data, flush, ALTER TABLE ADD column, write more,
+    /// flush again, read back — old SSTables should still be readable.
+    #[test]
+    fn read_survives_schema_evolution_across_sstables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // Original schema: (k int PK, v text)
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "evolving".into(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "v".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+        let tid = TableId::new("test_ks", "evolving");
+
+        // Write row with 1 column, flush to SSTable
+        let key1 = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+        let row1 = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"old".to_vec(), 1000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key1, row1, 1000).unwrap();
+        engine.flush_all().unwrap();
+
+        // "ALTER TABLE ADD" — write row with 2 columns (cell index 0 and 1)
+        let key2 = DecoratedKey::new(PartitionKey::new(2i32.to_be_bytes().to_vec()));
+        let row2 = Row {
+            clustering: vec![],
+            cells: vec![
+                (0, CellValue::live(b"new_v".to_vec(), 2000)),
+                (1, CellValue::live(b"extra".to_vec(), 2000)),
+            ],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
+        };
+        engine.write(&tid, &key2, row2, 2000).unwrap();
+        engine.flush_all().unwrap();
+
+        // Read both rows — old SSTable should not crash
+        let r1 = engine.read(&tid, &key1);
+        assert!(r1.is_ok(), "old row read failed: {:?}", r1.err());
+        assert!(r1.unwrap().is_some(), "old row should exist");
+
+        let r2 = engine.read(&tid, &key2);
+        assert!(r2.is_ok(), "new row read failed: {:?}", r2.err());
+        assert!(r2.unwrap().is_some(), "new row should exist");
+    }
+
+    /// FMEA #8: Memtable write + new data in memtable should still work
+    /// even if an SSTable is corrupt.
+    #[test]
+    fn memtable_data_survives_corrupt_sstable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "survive".into(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "v".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+        let tid = TableId::new("test_ks", "survive");
+
+        // Write old data and flush
+        let key_old = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"flushed".to_vec(), 1000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key_old, row, 1000).unwrap();
+        engine.flush_all().unwrap();
+
+        // Corrupt the SSTable
+        let sstable_dir = dir.path().join("sstables/test_ks.survive");
+        if let Ok(entries) = std::fs::read_dir(&sstable_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.to_string_lossy().ends_with("-Data.db") {
+                    std::fs::write(&path, &[0xDE, 0xAD]).unwrap();
+                }
+            }
+        }
+
+        // Write new data to memtable
+        let key_new = DecoratedKey::new(PartitionKey::new(2i32.to_be_bytes().to_vec()));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"memtable".to_vec(), 2000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
+        };
+        engine.write(&tid, &key_new, row, 2000).unwrap();
+
+        // Read new data from memtable — should work despite corrupt SSTable
+        let r = engine.read(&tid, &key_new);
+        assert!(r.is_ok(), "memtable read should work: {:?}", r.err());
+        assert!(r.unwrap().is_some(), "memtable row should exist");
+
+        // Read old data — corrupt SSTable, but should not crash
+        let r_old = engine.read(&tid, &key_old);
+        assert!(
+            r_old.is_ok(),
+            "read of corrupt SSTable data should not crash: {:?}",
+            r_old.err()
+        );
+    }
 }
