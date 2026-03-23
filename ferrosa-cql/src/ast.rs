@@ -207,6 +207,8 @@ pub struct UpdateStatement {
     pub assignments: Vec<Assignment>,
     pub where_clauses: Vec<WhereClause>,
     pub if_exists: bool,
+    /// IF column = value conditions (lightweight transactions).
+    pub if_conditions: Vec<WhereClause>,
     pub using_timestamp: Option<i64>,
     pub using_ttl: Option<i32>,
 }
@@ -294,6 +296,8 @@ pub struct AlterTableStatement {
     pub drop_columns: Vec<String>,
     /// Table extensions (e.g. graph metadata: `WITH extensions = {'vertex_label': 'Person'}`).
     pub extensions: Option<Vec<(String, String)>>,
+    /// Generic table options (compaction, compression, comment, etc.).
+    pub table_options: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

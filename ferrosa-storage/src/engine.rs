@@ -123,6 +123,10 @@ pub struct StorageEngine {
     batchlog: Option<crate::batchlog::BatchlogManager>,
     /// Background archiver task handle, if archiving is enabled.
     archiver_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Whether the configured object store supports conditional puts (CAS).
+    /// Set once at startup via `probe_conditional_put_support()`.
+    /// When false, manifest writes use unconditional overwrite.
+    s3_cas_supported: bool,
 }
 
 /// Per-table state: schema + store.
@@ -210,7 +214,22 @@ impl StorageEngine {
                 crate::batchlog::BatchlogConfig::default(),
             )),
             archiver_handle: None,
+            s3_cas_supported: true, // default; call probe_s3_cas() after construction
         })
+    }
+
+    /// Probe the configured object store for conditional put support.
+    /// Call this once after construction when an S3 store is configured.
+    /// Sets `s3_cas_supported` to false if the store (e.g. RustFS) doesn't
+    /// support etag-based conditional writes.
+    pub async fn probe_s3_cas(&mut self) {
+        if let Ok((_, store)) = self.object_store_and_config() {
+            let supported = crate::manifest::probe_conditional_put_support(store.as_ref()).await;
+            if !supported {
+                tracing::info!("object store does not support conditional puts — using unconditional manifest writes");
+            }
+            self.s3_cas_supported = supported;
+        }
     }
 
     /// Creates a storage engine with an explicit archive object store.
@@ -329,6 +348,7 @@ impl StorageEngine {
                 crate::batchlog::BatchlogConfig::default(),
             )),
             archiver_handle,
+            s3_cas_supported: true,
         })
     }
 
@@ -399,6 +419,7 @@ impl StorageEngine {
                 crate::batchlog::BatchlogConfig::default(),
             )),
             archiver_handle: None,
+            s3_cas_supported: true,
         };
 
         Ok((engine, pending_mutations))
@@ -1519,7 +1540,9 @@ impl StorageEngine {
 
         if uploaded > 0 {
             // Save updated manifest.
-            manifest.save_with_retry(store.as_ref(), &prefix).await?;
+            manifest
+                .save_with_retry(store.as_ref(), &prefix, self.s3_cas_supported)
+                .await?;
             eprintln!("[s3-sync] uploaded {uploaded} SSTables, manifest saved");
         }
 
@@ -2653,7 +2676,7 @@ mod tests {
             // Set up: manifest + schema in S3, then create a snapshot.
             let manifest = crate::manifest::Manifest::new();
             manifest
-                .save_with_retry(store.as_ref(), prefix)
+                .save_with_retry(store.as_ref(), prefix, true)
                 .await
                 .unwrap();
             crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
@@ -2709,7 +2732,7 @@ mod tests {
 
             let manifest = crate::manifest::Manifest::new();
             manifest
-                .save_with_retry(store.as_ref(), prefix)
+                .save_with_retry(store.as_ref(), prefix, true)
                 .await
                 .unwrap();
             crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
@@ -2773,7 +2796,7 @@ mod tests {
 
             let manifest = crate::manifest::Manifest::new();
             manifest
-                .save_with_retry(store.as_ref(), prefix)
+                .save_with_retry(store.as_ref(), prefix, true)
                 .await
                 .unwrap();
             crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
@@ -2869,7 +2892,7 @@ mod tests {
             // Save a manifest and schema so snapshot can load them.
             let manifest = crate::manifest::Manifest::new();
             manifest
-                .save_with_retry(store.as_ref(), prefix)
+                .save_with_retry(store.as_ref(), prefix, true)
                 .await
                 .unwrap();
             crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")

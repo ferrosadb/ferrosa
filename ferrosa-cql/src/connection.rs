@@ -20,6 +20,7 @@ use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
 
+use crate::ast::{SelectColumn, Statement};
 use crate::auth::{
     encode_auth_success, encode_authenticate_response, parse_sasl_plain, MAX_AUTH_ATTEMPTS,
 };
@@ -406,7 +407,7 @@ enum FrameOrPush {
 }
 
 /// Outcome of processing a single frame.
-enum HandleResult {
+pub(crate) enum HandleResult {
     /// Send a response and continue reading.
     Reply(Opcode, BytesMut),
     /// Send a response and then close the connection.
@@ -684,12 +685,96 @@ async fn handle_query(
     };
 
     // Parse the CQL statement.
-    let stmt = match parser::parse(query) {
+    let mut stmt = match parser::parse(query) {
         Ok(s) => s,
         Err(e) => {
             return HandleResult::Reply(Opcode::Error, e.encode_body());
         }
     };
+
+    // Parse flags and positional bind values from the QUERY body.
+    // CQL v4/v5 format after consistency: [byte flags][short n_values][bytes value]*
+    if cursor.remaining() >= 1 {
+        let flags = cursor.get_u8();
+        let has_values = flags & 0x01 != 0;
+        let has_names = flags & 0x40 != 0;
+
+        if has_values && cursor.remaining() >= 2 {
+            let n_values = cursor.get_u16() as usize;
+            let bind_col_names = extract_bind_column_names(&stmt);
+
+            // Resolve column types from schema (same logic as PREPARE)
+            let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
+            let bound_columns: Vec<(String, CqlType)> = {
+                let snapshot = state.schema.snapshot();
+                let key = (table_ks, table_name);
+                match snapshot.tables.get(&key) {
+                    Some(table_meta) => {
+                        let mut cols = Vec::with_capacity(bind_col_names.len());
+                        let mut all_resolved = true;
+                        for col_name in &bind_col_names {
+                            if let Some(cm) = table_meta.columns.get(col_name) {
+                                cols.push((
+                                    col_name.clone(),
+                                    col_type_str_to_cql_type(&cm.column_type),
+                                ));
+                            } else {
+                                all_resolved = false;
+                                break;
+                            }
+                        }
+                        if all_resolved {
+                            cols
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    None => Vec::new(),
+                }
+            };
+
+            let mut values: Vec<(String, Vec<u8>)> = Vec::with_capacity(n_values);
+            for i in 0..n_values {
+                let name = if has_names && cursor.remaining() >= 2 {
+                    let name_len = cursor.get_u16() as usize;
+                    if cursor.remaining() >= name_len {
+                        let n = std::str::from_utf8(&cursor[..name_len])
+                            .unwrap_or("")
+                            .to_string();
+                        cursor.advance(name_len);
+                        n
+                    } else {
+                        break;
+                    }
+                } else {
+                    // Positional: use the column name from the parsed statement
+                    bind_col_names.get(i).cloned().unwrap_or_default()
+                };
+
+                if cursor.remaining() >= 4 {
+                    let val_len = cursor.get_i32();
+                    if val_len < 0 {
+                        // NULL value
+                        values.push((name, Vec::new()));
+                    } else {
+                        let val_len = val_len as usize;
+                        if cursor.remaining() >= val_len {
+                            let val_bytes = cursor[..val_len].to_vec();
+                            cursor.advance(val_len);
+                            values.push((name, val_bytes));
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Substitute bind markers in the statement with actual values.
+            substitute_bind_values(&mut stmt, &values, &bound_columns);
+        }
+    }
 
     // Build an auth context for routing (use a default if auth was disabled).
     let ctx = build_request_context(auth_context, current_keyspace, cl);
@@ -718,7 +803,7 @@ async fn handle_query(
 
 // ── PREPARE ──────────────────────────────────────────────────────────────
 
-fn handle_prepare(
+pub(crate) fn handle_prepare(
     _auth_context: &mut Option<AuthContext>,
     current_keyspace: &mut Option<String>,
     state: &SharedState,
@@ -788,7 +873,52 @@ fn handle_prepare(
     };
 
     // Build result_columns for SELECT statements.
-    let result_columns: Vec<(String, CqlType)> = Vec::new();
+    let result_columns: Vec<(String, CqlType)> = if let Statement::Select(ref sel) = stmt {
+        let snapshot = state.schema.snapshot();
+        let key = (table_ks.clone(), table_name.clone());
+        match snapshot.tables.get(&key) {
+            Some(table_meta) => {
+                let is_star = sel.columns.iter().any(|c| matches!(c, SelectColumn::Star));
+                if is_star {
+                    table_meta
+                        .columns
+                        .iter()
+                        .map(|(name, cm)| (name.clone(), col_type_str_to_cql_type(&cm.column_type)))
+                        .collect()
+                } else {
+                    let mut cols = Vec::new();
+                    for sc in &sel.columns {
+                        match sc {
+                            SelectColumn::Column(name) => {
+                                if let Some(cm) = table_meta.columns.get(name) {
+                                    cols.push((
+                                        name.clone(),
+                                        col_type_str_to_cql_type(&cm.column_type),
+                                    ));
+                                }
+                            }
+                            SelectColumn::FunctionCall { alias, name, .. } => {
+                                let display = alias.clone().unwrap_or_else(|| name.to_lowercase());
+                                let fn_lower = name.to_lowercase();
+                                let cql_type = match fn_lower.as_str() {
+                                    "count" => CqlType::Bigint,
+                                    "writetime" => CqlType::Bigint,
+                                    "ttl" => CqlType::Int,
+                                    _ => CqlType::Blob,
+                                };
+                                cols.push((display, cql_type));
+                            }
+                            SelectColumn::Star => {}
+                        }
+                    }
+                    cols
+                }
+            }
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
 
     // Compute pk_indexes: map each partition key column to its position in the
     // bind variable list. If any PK column is not bound, pass empty (pk_count=0).
@@ -1213,6 +1343,12 @@ fn extract_bind_column_names(stmt: &crate::ast::Statement) -> Vec<String> {
                     names.push(wc.column.clone());
                 }
             }
+            // IF condition bind markers (LWT)
+            for wc in &upd.if_conditions {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    names.push(wc.column.clone());
+                }
+            }
             names
         }
         Statement::Delete(del) => {
@@ -1290,6 +1426,14 @@ fn substitute_bind_values(
                 }
             }
             for wc in &mut upd.where_clauses {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    if let Some(resolved) = value_map.get(&wc.column) {
+                        wc.value = resolved.clone();
+                    }
+                }
+            }
+            // IF condition bind markers (LWT)
+            for wc in &mut upd.if_conditions {
                 if matches!(&wc.value, Term::BindMarker(_)) {
                     if let Some(resolved) = value_map.get(&wc.column) {
                         wc.value = resolved.clone();

@@ -257,6 +257,34 @@ impl Schema {
                 .or_insert_with(|| grants.clone());
         }
 
+        for (key, index) in &snapshot.indexes {
+            current
+                .indexes
+                .entry(key.clone())
+                .or_insert_with(|| index.clone());
+        }
+
+        for (key, udt) in &snapshot.types {
+            current
+                .types
+                .entry(key.clone())
+                .or_insert_with(|| udt.clone());
+        }
+
+        for (key, func) in &snapshot.functions {
+            current
+                .functions
+                .entry(key.clone())
+                .or_insert_with(|| func.clone());
+        }
+
+        for (key, agg) in &snapshot.aggregates {
+            current
+                .aggregates
+                .entry(key.clone())
+                .or_insert_with(|| agg.clone());
+        }
+
         self.inner.store(Arc::new(current));
         tracing::info!("applied schema snapshot");
         Ok(())
@@ -2793,6 +2821,64 @@ mod tests {
                     .map(|k| k.name == "system")
                     .unwrap_or(false)
         );
+    }
+
+    #[test]
+    fn apply_snapshot_restores_indexes() {
+        use crate::metadata::index::IndexMetadata;
+        use ferrosa_index::IndexType;
+
+        let schema = test_schema();
+        let mut snapshot = SchemaSnapshot {
+            version: Uuid::new_v4(),
+            keyspaces: HashMap::new(),
+            tables: HashMap::new(),
+            indexes: HashMap::new(),
+            roles: HashMap::new(),
+            grants: HashMap::new(),
+            types: HashMap::new(),
+            functions: HashMap::new(),
+            aggregates: HashMap::new(),
+        };
+
+        snapshot.keyspaces.insert(
+            "test_ks".to_string(),
+            KeyspaceMetadata {
+                name: "test_ks".to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+                },
+            },
+        );
+
+        let idx_key = (
+            "test_ks".to_string(),
+            "my_table".to_string(),
+            "name_idx".to_string(),
+        );
+        snapshot.indexes.insert(
+            idx_key.clone(),
+            IndexMetadata {
+                keyspace: "test_ks".to_string(),
+                table: "my_table".to_string(),
+                name: "name_idx".to_string(),
+                index_type: IndexType::Phonetic,
+                target_columns: vec!["entity_name".to_string()],
+                filter_predicate: None,
+                options: HashMap::new(),
+            },
+        );
+
+        schema.apply_snapshot(snapshot).unwrap();
+
+        let snap = schema.snapshot();
+        assert!(
+            snap.indexes.contains_key(&idx_key),
+            "apply_snapshot must restore indexes"
+        );
+        assert_eq!(snap.indexes[&idx_key].index_type, IndexType::Phonetic);
     }
 
     // ---- Internal method tests (pair mode replication) ----

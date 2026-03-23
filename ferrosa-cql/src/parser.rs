@@ -212,6 +212,15 @@ impl<'input> Parser<'input> {
                     args,
                     alias,
                 });
+            } else if self.lexer.eat(&TokenKind::Keyword(Keyword::As))? {
+                // Column with alias: col AS alias
+                let alias = self.parse_ident()?;
+                cols.push(SelectColumn::FunctionCall {
+                    keyspace: None,
+                    name,
+                    args: vec![],
+                    alias: Some(alias),
+                });
             } else {
                 cols.push(SelectColumn::Column(name));
             }
@@ -324,8 +333,17 @@ impl<'input> Parser<'input> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Where))?;
         let where_clauses = self.parse_where_clauses()?;
 
-        // Optional IF EXISTS
-        let if_exists = self.parse_if_exists()?;
+        // Optional IF EXISTS or IF column = value conditions
+        let mut if_exists = false;
+        let mut if_conditions = Vec::new();
+        if self.lexer.eat(&TokenKind::Keyword(Keyword::If))? {
+            if self.lexer.eat(&TokenKind::Keyword(Keyword::Exists))? {
+                if_exists = true;
+            } else {
+                // IF column = value [AND column = value ...]
+                if_conditions = self.parse_where_clauses()?;
+            }
+        }
 
         // Optional USING after WHERE (some syntaxes allow it here too)
         if using_timestamp.is_none() && using_ttl.is_none() {
@@ -340,6 +358,7 @@ impl<'input> Parser<'input> {
             assignments,
             where_clauses,
             if_exists,
+            if_conditions,
             using_timestamp,
             using_ttl,
         })
@@ -704,6 +723,18 @@ impl<'input> Parser<'input> {
             TokenKind::FloatLiteral(f) => Ok(f.to_string()),
             TokenKind::Keyword(Keyword::True) => Ok("true".to_string()),
             TokenKind::Keyword(Keyword::False) => Ok("false".to_string()),
+            TokenKind::LBrace => {
+                // Map literal: { 'key': 'value', ... }
+                // Consume and stringify — these are table property maps
+                // (COMPACTION, COMPRESSION, etc.) that ferrosa stores but
+                // doesn't interpret.
+                let pairs = self.parse_string_map_inner()?;
+                let inner: Vec<String> = pairs
+                    .iter()
+                    .map(|(k, v)| format!("'{}': '{}'", k, v))
+                    .collect();
+                Ok(format!("{{{}}}", inner.join(", ")))
+            }
             _ => Err(CqlError::SyntaxError(format!(
                 "expected option value, got {:?} at position {}",
                 tok.kind, tok.pos
@@ -756,6 +787,12 @@ impl<'input> Parser<'input> {
     /// Parse a map literal of string keys and string/integer values: {'key': 'value', 'key2': 1, ...}
     fn parse_string_map(&mut self) -> Result<Vec<(String, String)>, CqlError> {
         self.lexer.expect(&TokenKind::LBrace)?;
+        self.parse_string_map_inner()
+    }
+
+    /// Parse the inside of a `{ 'k': 'v', ... }` map literal after the
+    /// opening brace has already been consumed.
+    fn parse_string_map_inner(&mut self) -> Result<Vec<(String, String)>, CqlError> {
         let mut entries = vec![];
 
         if self.lexer.eat(&TokenKind::RBrace)? {
@@ -880,6 +917,7 @@ impl<'input> Parser<'input> {
         let mut add_columns = vec![];
         let mut drop_columns = vec![];
         let mut extensions = None;
+        let mut table_options = vec![];
 
         let tok = self.lexer.peek()?;
         match &tok.kind {
@@ -895,18 +933,20 @@ impl<'input> Parser<'input> {
                 drop_columns.push(col_name);
             }
             TokenKind::Keyword(Keyword::With) => {
-                let with_pos = tok.pos;
                 self.lexer.next_token()?;
-                // Expect `extensions = { ... }`
-                let prop_name = self.parse_ident()?;
-                if prop_name != "extensions" {
-                    return Err(CqlError::SyntaxError(format!(
-                        "expected 'extensions' after WITH in ALTER TABLE, got '{}' at position {}",
-                        prop_name, with_pos
-                    )));
+                loop {
+                    let prop_name = self.parse_ident()?;
+                    self.lexer.expect(&TokenKind::Eq)?;
+                    if prop_name == "extensions" {
+                        extensions = Some(self.parse_string_map()?);
+                    } else {
+                        let val = self.parse_option_value()?;
+                        table_options.push((prop_name, val));
+                    }
+                    if !self.lexer.eat(&TokenKind::Keyword(Keyword::And))? {
+                        break;
+                    }
                 }
-                self.lexer.expect(&TokenKind::Eq)?;
-                extensions = Some(self.parse_string_map()?);
             }
             _ => {
                 let kind = tok.kind.clone();
@@ -924,6 +964,7 @@ impl<'input> Parser<'input> {
             add_columns,
             drop_columns,
             extensions,
+            table_options,
         })
     }
 
