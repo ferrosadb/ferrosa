@@ -870,52 +870,80 @@ pub(crate) fn handle_prepare(
         }
     };
 
-    // Build result_columns for SELECT statements.
-    let result_columns: Vec<(String, CqlType)> = if let Statement::Select(ref sel) = stmt {
-        let snapshot = state.schema.snapshot();
-        let key = (table_ks.clone(), table_name.clone());
-        match snapshot.tables.get(&key) {
-            Some(table_meta) => {
-                let is_star = sel.columns.iter().any(|c| matches!(c, SelectColumn::Star));
-                if is_star {
-                    table_meta
-                        .columns
-                        .iter()
-                        .map(|(name, cm)| (name.clone(), col_type_str_to_cql_type(&cm.column_type)))
-                        .collect()
-                } else {
-                    let mut cols = Vec::new();
-                    for sc in &sel.columns {
-                        match sc {
-                            SelectColumn::Column(name) => {
-                                if let Some(cm) = table_meta.columns.get(name) {
-                                    cols.push((
-                                        name.clone(),
-                                        col_type_str_to_cql_type(&cm.column_type),
-                                    ));
+    // Build result_columns for SELECT and LWT (IF NOT EXISTS / IF condition) statements.
+    let result_columns: Vec<(String, CqlType)> = match &stmt {
+        Statement::Select(ref sel) => {
+            let snapshot = state.schema.snapshot();
+            let key = (table_ks.clone(), table_name.clone());
+            match snapshot.tables.get(&key) {
+                Some(table_meta) => {
+                    let is_star = sel.columns.iter().any(|c| matches!(c, SelectColumn::Star));
+                    if is_star {
+                        table_meta
+                            .columns
+                            .iter()
+                            .map(|(name, cm)| {
+                                (name.clone(), col_type_str_to_cql_type(&cm.column_type))
+                            })
+                            .collect()
+                    } else {
+                        let mut cols = Vec::new();
+                        for sc in &sel.columns {
+                            match sc {
+                                SelectColumn::Column(name) => {
+                                    if let Some(cm) = table_meta.columns.get(name) {
+                                        cols.push((
+                                            name.clone(),
+                                            col_type_str_to_cql_type(&cm.column_type),
+                                        ));
+                                    }
                                 }
+                                SelectColumn::FunctionCall { alias, name, .. } => {
+                                    let display =
+                                        alias.clone().unwrap_or_else(|| name.to_lowercase());
+                                    let fn_lower = name.to_lowercase();
+                                    let cql_type = match fn_lower.as_str() {
+                                        "count" => CqlType::Bigint,
+                                        "writetime" => CqlType::Bigint,
+                                        "ttl" => CqlType::Int,
+                                        _ => CqlType::Blob,
+                                    };
+                                    cols.push((display, cql_type));
+                                }
+                                SelectColumn::Star => {}
                             }
-                            SelectColumn::FunctionCall { alias, name, .. } => {
-                                let display = alias.clone().unwrap_or_else(|| name.to_lowercase());
-                                let fn_lower = name.to_lowercase();
-                                let cql_type = match fn_lower.as_str() {
-                                    "count" => CqlType::Bigint,
-                                    "writetime" => CqlType::Bigint,
-                                    "ttl" => CqlType::Int,
-                                    _ => CqlType::Blob,
-                                };
-                                cols.push((display, cql_type));
-                            }
-                            SelectColumn::Star => {}
                         }
+                        cols
                     }
-                    cols
+                }
+                None => Vec::new(),
+            }
+        }
+        // LWT: INSERT IF NOT EXISTS returns [applied] + all table columns
+        Statement::Insert(ins) if ins.if_not_exists => {
+            let mut cols = vec![("[applied]".to_string(), CqlType::Boolean)];
+            let snapshot = state.schema.snapshot();
+            let key = (table_ks.clone(), table_name.clone());
+            if let Some(table_meta) = snapshot.tables.get(&key) {
+                for (name, cm) in &table_meta.columns {
+                    cols.push((name.clone(), col_type_str_to_cql_type(&cm.column_type)));
                 }
             }
-            None => Vec::new(),
+            cols
         }
-    } else {
-        Vec::new()
+        // LWT: UPDATE IF condition returns [applied] + all table columns
+        Statement::Update(upd) if !upd.if_conditions.is_empty() || upd.if_exists => {
+            let mut cols = vec![("[applied]".to_string(), CqlType::Boolean)];
+            let snapshot = state.schema.snapshot();
+            let key = (table_ks.clone(), table_name.clone());
+            if let Some(table_meta) = snapshot.tables.get(&key) {
+                for (name, cm) in &table_meta.columns {
+                    cols.push((name.clone(), col_type_str_to_cql_type(&cm.column_type)));
+                }
+            }
+            cols
+        }
+        _ => Vec::new(),
     };
 
     // Compute pk_indexes: map each partition key column to its position in the

@@ -7369,6 +7369,56 @@ mod tests {
         }
     }
 
+    // ── FRSA-BUG-026: INSERT IF NOT EXISTS with map column ────────────
+
+    /// Temporal's queue_metadata: INSERT IF NOT EXISTS with a map column
+    /// must not error on the existence check read-back.
+    #[tokio::test]
+    async fn insert_if_not_exists_with_map_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.queue_metadata (queue_type int PRIMARY KEY, cluster_ack_level map<text, bigint>, version bigint)",
+        ).unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // First insert: should succeed (row doesn't exist)
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.queue_metadata (queue_type, cluster_ack_level, version) VALUES (1, {}, 0) IF NOT EXISTS",
+        ).unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "first INSERT IF NOT EXISTS should succeed: {:?}",
+            result.err()
+        );
+
+        // Second insert: should return [applied]=false (row exists)
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.queue_metadata (queue_type, cluster_ack_level, version) VALUES (1, {}, 0) IF NOT EXISTS",
+        ).unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "second INSERT IF NOT EXISTS should succeed (return applied=false): {:?}",
+            result.err()
+        );
+    }
+
     // ── FRSA-BUG-025: collection bind value decoding ──────────────────
 
     /// Empty map bind value must not error with "type mismatch: expected map".

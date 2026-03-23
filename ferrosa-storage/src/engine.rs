@@ -3125,4 +3125,89 @@ mod tests {
         // Second call should not error.
         engine.register_system_tables().unwrap();
     }
+
+    /// FRSA-BUG-026: write a row with a map-typed cell value (CQL binary
+    /// format), flush to SSTable, read back. The read must not error with
+    /// "read_exact_at: wanted 1 bytes, got 0".
+    #[test]
+    fn write_flush_read_map_cell_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // Temporal's queue_metadata: (queue_type int PK, cluster_ack_level map<text,bigint>, version bigint)
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "temporal".into(),
+            table: "queue_metadata".into(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                ferrosa_common::ColumnDefinition {
+                    name: "cluster_ack_level".into(),
+                    type_name: "org.apache.cassandra.db.marshal.MapType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.LongType)".into(),
+                },
+                ferrosa_common::ColumnDefinition {
+                    name: "version".into(),
+                    type_name: "org.apache.cassandra.db.marshal.LongType".into(),
+                },
+            ],
+        };
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new("temporal", "queue_metadata");
+
+        // Write a row: queue_type=1, cluster_ack_level={} (empty map), version=0
+        let pk_bytes = 1i32.to_be_bytes().to_vec();
+        let key = DecoratedKey::new(PartitionKey::new(pk_bytes));
+
+        // Empty map in CQL binary: [i32 count=0] = 4 bytes of zeros
+        let empty_map_bytes = 0i32.to_be_bytes().to_vec();
+        let version_bytes = 0i64.to_be_bytes().to_vec();
+
+        let row = Row {
+            clustering: vec![],
+            cells: vec![
+                (0, CellValue::live(empty_map_bytes, 1000)),
+                (1, CellValue::live(version_bytes, 1000)),
+            ],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key, row, 1000).unwrap();
+
+        // Read from memtable — should work
+        let memtable_result = engine.read(&tid, &key);
+        assert!(
+            memtable_result.is_ok(),
+            "memtable read failed: {:?}",
+            memtable_result.err()
+        );
+        assert!(
+            memtable_result.unwrap().is_some(),
+            "row should exist in memtable"
+        );
+
+        // Flush to SSTable
+        engine.flush_all().unwrap();
+        assert!(
+            engine.sstable_count(&tid) >= 1,
+            "should have flushed to SSTable"
+        );
+
+        // Read from SSTable — this is where FRSA-BUG-026 fails
+        let sstable_result = engine.read(&tid, &key);
+        assert!(
+            sstable_result.is_ok(),
+            "SSTable read after flush failed: {:?}",
+            sstable_result.err()
+        );
+        assert!(
+            sstable_result.unwrap().is_some(),
+            "row should exist in SSTable"
+        );
+    }
 }
