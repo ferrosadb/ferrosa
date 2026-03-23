@@ -317,3 +317,211 @@ mod cell_roundtrip {
         }
     }
 }
+
+// ── SSTable reader fuzz: arbitrary bytes must never panic ────────────────
+//
+// The reader must handle any byte sequence without panicking. It should
+// return Err for malformed data, never crash. This catches:
+// - Capacity overflow from garbage cell lengths
+// - Index out of bounds from truncated headers
+// - Integer overflow from varint decoding
+// - Infinite loops from circular structures
+
+mod reader_fuzz {
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+    use proptest::prelude::*;
+
+    fn default_header() -> SerializationHeader {
+        SerializationHeader {
+            min_timestamp: 0,
+            min_local_deletion_time: 0,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"v".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        }
+    }
+
+    fn header_with_clustering() -> SerializationHeader {
+        SerializationHeader {
+            clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
+            ..default_header()
+        }
+    }
+
+    proptest! {
+        /// Completely random bytes: the reader must return Ok or Err, never panic.
+        #[test]
+        fn random_bytes_never_panic(data in prop::collection::vec(any::<u8>(), 0..1024)) {
+            let header = default_header();
+            let mut reader = DataReader::new(&data, &header, 0);
+            // Read until exhausted — every call must return Ok or Err, not panic
+            loop {
+                match reader.read_partition() {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    Err(_) => break, // errors are fine, panics are not
+                }
+            }
+        }
+
+        /// Random bytes with clustering columns in the header.
+        #[test]
+        fn random_bytes_with_clustering_never_panic(data in prop::collection::vec(any::<u8>(), 0..1024)) {
+            let header = header_with_clustering();
+            let mut reader = DataReader::new(&data, &header, 0);
+            loop {
+                match reader.read_partition() {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        /// Valid SSTable prefix followed by garbage: must not panic.
+        /// This simulates truncated writes (crash during flush).
+        #[test]
+        fn valid_prefix_then_garbage_never_panic(
+            prefix_len in 0usize..50,
+            garbage in prop::collection::vec(any::<u8>(), 0..200),
+        ) {
+            // Start with a valid partition header-like prefix
+            let mut data = Vec::new();
+            // Partition key length (2 bytes) + key bytes
+            let pk = b"test_key";
+            data.extend_from_slice(&(pk.len() as u16).to_be_bytes());
+            data.extend_from_slice(pk);
+            // Truncate to prefix_len then append garbage
+            data.truncate(prefix_len);
+            data.extend_from_slice(&garbage);
+
+            let header = default_header();
+            let mut reader = DataReader::new(&data, &header, 0);
+            loop {
+                match reader.read_partition() {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        /// Write valid SSTable, corrupt random byte, read back: must not panic.
+        /// Errors are expected, panics are bugs.
+        #[test]
+        fn corrupt_single_byte_never_panic(
+            value in prop::collection::vec(any::<u8>(), 1..128),
+            ts in 1_000_000i64..2_000_000i64,
+            corrupt_pos in any::<prop::sample::Index>(),
+            corrupt_val in any::<u8>(),
+        ) {
+            use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+            use ferrosa_sstable::types::*;
+            use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+
+            let header = default_header();
+            let options = WriteOptions {
+                compression: None,
+                bloom_fp_chance: 0.01,
+                chunk_size: 65536,
+            };
+
+            let partition = Partition {
+                key: DecoratedKey::new(PartitionKey::from(b"k".as_slice())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(value, ts))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(ts),
+                }],
+            };
+
+            let mut writer = SSTableWriter::new(options, header.clone());
+            writer.add_partition(&partition).unwrap();
+            let output = writer.finish().unwrap();
+
+            // Corrupt one byte
+            let mut corrupted = output.data.clone();
+            if !corrupted.is_empty() {
+                let idx = corrupt_pos.index(corrupted.len());
+                corrupted[idx] = corrupt_val;
+            }
+
+            // Read the corrupted data — must not panic
+            let mut reader = DataReader::new(&corrupted, &header, 0);
+            loop {
+                match reader.read_partition() {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        /// Write valid SSTable with expiring cell, corrupt random byte: must not panic.
+        #[test]
+        fn corrupt_expiring_cell_never_panic(
+            value in prop::collection::vec(any::<u8>(), 1..64),
+            ts in 1_000_000i64..2_000_000i64,
+            ttl in 1i32..86400i32,
+            ldt in 1_000_000i32..2_000_000i32,
+            corrupt_pos in any::<prop::sample::Index>(),
+            corrupt_val in any::<u8>(),
+        ) {
+            use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+            use ferrosa_sstable::types::*;
+            use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+
+            let header = SerializationHeader {
+                min_timestamp: 1_000_000,
+                min_local_deletion_time: 0,
+                min_ttl: 0,
+                ..default_header()
+            };
+            let options = WriteOptions {
+                compression: None,
+                bloom_fp_chance: 0.01,
+                chunk_size: 65536,
+            };
+
+            let partition = Partition {
+                key: DecoratedKey::new(PartitionKey::from(b"k".as_slice())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::expiring(value, ts, ttl, ldt))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(ts),
+                }],
+            };
+
+            let mut writer = SSTableWriter::new(options, header.clone());
+            writer.add_partition(&partition).unwrap();
+            let output = writer.finish().unwrap();
+
+            let mut corrupted = output.data.clone();
+            if !corrupted.is_empty() {
+                let idx = corrupt_pos.index(corrupted.len());
+                corrupted[idx] = corrupt_val;
+            }
+
+            let mut reader = DataReader::new(&corrupted, &header, 0);
+            loop {
+                match reader.read_partition() {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
