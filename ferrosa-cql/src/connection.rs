@@ -1257,12 +1257,25 @@ async fn handle_batch(
         ferrosa_cluster::consistency::ConsistencyLevel::One
     };
 
-    // Route each statement.
+    // Route each statement. If any statement is an LWT (IF NOT EXISTS / IF
+    // condition), capture its result to return instead of void.
+    let mut lwt_result: Option<BytesMut> = None;
     for stmt in statements {
         let ctx = build_request_context(auth_context, current_keyspace, cl);
         match crate::router::route(state, &ctx, stmt).await {
             Ok(RouteResult::SetKeyspace(ks, _)) => {
                 *current_keyspace = Some(ks);
+            }
+            Ok(RouteResult::Result(body)) => {
+                // Check if this is an LWT result (Rows kind with [applied] column).
+                // LWT results have kind=2 (Rows), non-LWT results have kind=1 (Void).
+                if lwt_result.is_none() && body.len() >= 4 {
+                    let kind = i32::from_be_bytes(body[0..4].try_into().unwrap_or([0; 4]));
+                    if kind == 0x0002 {
+                        // Rows result — this is from an LWT statement
+                        lwt_result = Some(body);
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -1271,8 +1284,9 @@ async fn handle_batch(
         }
     }
 
-    // BATCH returns a void result.
-    HandleResult::Reply(Opcode::Result, result::encode_void())
+    // Return LWT result if any statement was conditional, otherwise void.
+    let result_body = lwt_result.unwrap_or_else(result::encode_void);
+    HandleResult::Reply(Opcode::Result, result_body)
 }
 
 // ── REGISTER ─────────────────────────────────────────────────────────────
