@@ -1380,6 +1380,13 @@ fn extract_bind_column_names(stmt: &crate::ast::Statement) -> Vec<String> {
                     names.push(col.clone());
                 }
             }
+            // USING TTL ?  / USING TIMESTAMP ? — parsed as 0 sentinel
+            if ins.using_ttl == Some(0) {
+                names.push("[ttl]".to_string());
+            }
+            if ins.using_timestamp == Some(0) {
+                names.push("[timestamp]".to_string());
+            }
             names
         }
         Statement::Select(sel) => {
@@ -1432,6 +1439,13 @@ fn extract_bind_column_names(stmt: &crate::ast::Statement) -> Vec<String> {
                 if matches!(&wc.value, Term::BindMarker(_)) {
                     names.push(wc.column.clone());
                 }
+            }
+            // USING TTL ? / USING TIMESTAMP ?
+            if upd.using_ttl == Some(0) {
+                names.push("[ttl]".to_string());
+            }
+            if upd.using_timestamp == Some(0) {
+                names.push("[timestamp]".to_string());
             }
             names
         }
