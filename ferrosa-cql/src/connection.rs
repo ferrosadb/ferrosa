@@ -1504,6 +1504,17 @@ fn substitute_bind_values(
                     }
                 }
             }
+            // Substitute [ttl] and [timestamp] bind values
+            if ins.using_ttl == Some(0) {
+                if let Some(Term::IntegerLiteral(v)) = value_map.get("[ttl]") {
+                    ins.using_ttl = Some(*v as i32);
+                }
+            }
+            if ins.using_timestamp == Some(0) {
+                if let Some(Term::IntegerLiteral(v)) = value_map.get("[timestamp]") {
+                    ins.using_timestamp = Some(*v);
+                }
+            }
         }
         Statement::Select(sel) => {
             for wc in &mut sel.where_clauses {
@@ -1540,6 +1551,17 @@ fn substitute_bind_values(
                     if let Some(resolved) = value_map.get(&wc.column) {
                         wc.value = resolved.clone();
                     }
+                }
+            }
+            // Substitute [ttl] and [timestamp] bind values
+            if upd.using_ttl == Some(0) {
+                if let Some(Term::IntegerLiteral(v)) = value_map.get("[ttl]") {
+                    upd.using_ttl = Some(*v as i32);
+                }
+            }
+            if upd.using_timestamp == Some(0) {
+                if let Some(Term::IntegerLiteral(v)) = value_map.get("[timestamp]") {
+                    upd.using_timestamp = Some(*v);
                 }
             }
         }
