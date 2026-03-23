@@ -907,6 +907,9 @@ pub(crate) fn handle_prepare(
                                         "count" => CqlType::Bigint,
                                         "writetime" => CqlType::Bigint,
                                         "ttl" => CqlType::Int,
+                                        "totimestamp" | "todate" | "now" => CqlType::Timestamp,
+                                        "uuid" | "timeuuid" => CqlType::Uuid,
+                                        "avg" | "sum" | "min" | "max" => CqlType::Blob,
                                         _ => CqlType::Blob,
                                     };
                                     cols.push((display, cql_type));

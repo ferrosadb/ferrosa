@@ -3721,6 +3721,11 @@ fn build_column_info(
                     }
                     "writetime" => (builtin_display_name, CqlType::Bigint),
                     "ttl" => (builtin_display_name, CqlType::Int),
+                    "now" | "totimestamp" | "todate" | "currenttimestamp" => {
+                        (builtin_display_name, CqlType::Timestamp)
+                    }
+                    "uuid" | "timeuuid" => (builtin_display_name, CqlType::Uuid),
+                    "token" => (builtin_display_name, CqlType::Bigint),
                     "avg" | "min" | "max" | "sum" => {
                         // Resolve the argument column type.
                         let t = if let Some(arg) = args.first() {
