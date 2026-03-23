@@ -99,3 +99,221 @@ proptest! {
         prop_assert_eq!(e1.cmp(&e2), t1.cmp(&t2));
     }
 }
+
+// ── SSTable cell write-read roundtrip fuzzing ───────────────────────────
+
+mod cell_roundtrip {
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+    use ferrosa_sstable::types::*;
+    use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+    use proptest::prelude::*;
+
+    fn make_header(min_ts: i64, min_ldt: i32, min_ttl: i32) -> SerializationHeader {
+        SerializationHeader {
+            min_timestamp: min_ts,
+            min_local_deletion_time: min_ldt,
+            min_ttl,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"v".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        }
+    }
+
+    fn write_options() -> WriteOptions {
+        WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        }
+    }
+
+    /// Strategy: generate a live cell with random value and timestamp.
+    fn arb_live_cell() -> impl Strategy<Value = (Vec<u8>, i64)> {
+        (
+            prop::collection::vec(any::<u8>(), 0..256),
+            1_000_000i64..2_000_000i64,
+        )
+    }
+
+    /// Strategy: generate an expiring cell with random value, timestamp, TTL, and LDT.
+    fn arb_expiring_cell() -> impl Strategy<Value = (Vec<u8>, i64, i32, i32)> {
+        (
+            prop::collection::vec(any::<u8>(), 0..256),
+            1_000_000i64..2_000_000i64,
+            1i32..86400i32,             // TTL: 1 second to 1 day
+            1_700_000i32..1_800_000i32, // LDT
+        )
+    }
+
+    proptest! {
+        /// Live cell roundtrip: write any value + timestamp, read back exact match.
+        #[test]
+        fn live_cell_roundtrip(value in prop::collection::vec(any::<u8>(), 0..512), ts in 1_000_000i64..2_000_000i64) {
+            let header = make_header(1_000_000, i32::MAX, 0);
+            let partition = Partition {
+                key: DecoratedKey::new(PartitionKey::from(b"k".as_slice())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(value.clone(), ts))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(ts),
+                }],
+            };
+
+            let mut writer = SSTableWriter::new(write_options(), header.clone());
+            writer.add_partition(&partition).unwrap();
+            let output = writer.finish().unwrap();
+
+            let mut reader = DataReader::new(&output.data, &header, 0);
+            let p = reader.read_partition().unwrap().expect("partition");
+            let cell = &p.rows[0].cells[0].1;
+
+            prop_assert!(!cell.is_tombstone());
+            prop_assert_eq!(cell.timestamp, ts);
+            prop_assert_eq!(cell.value.as_deref(), Some(value.as_slice()));
+            prop_assert_eq!(cell.ttl, ferrosa_common::NO_TTL);
+        }
+
+        /// Tombstone cell roundtrip: write tombstone with any timestamp + LDT.
+        #[test]
+        fn tombstone_cell_roundtrip(ts in 1_000_000i64..2_000_000i64, ldt in 0i32..2_000_000i32) {
+            let header = make_header(1_000_000, 0, 0);
+            let partition = Partition {
+                key: DecoratedKey::new(PartitionKey::from(b"k".as_slice())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::tombstone(ts, ldt))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(ts),
+                }],
+            };
+
+            let mut writer = SSTableWriter::new(write_options(), header.clone());
+            writer.add_partition(&partition).unwrap();
+            let output = writer.finish().unwrap();
+
+            let mut reader = DataReader::new(&output.data, &header, 0);
+            let p = reader.read_partition().unwrap().expect("partition");
+            let cell = &p.rows[0].cells[0].1;
+
+            prop_assert!(cell.is_tombstone());
+            prop_assert_eq!(cell.timestamp, ts);
+            prop_assert_eq!(cell.local_deletion_time, ldt);
+            prop_assert!(cell.value.is_none());
+        }
+
+        /// Expiring cell roundtrip: write cell with TTL, verify TTL + LDT + value survive.
+        #[test]
+        fn expiring_cell_roundtrip(
+            value in prop::collection::vec(any::<u8>(), 0..512),
+            ts in 1_000_000i64..2_000_000i64,
+            ttl in 1i32..86400i32,
+            ldt in 1_000_000i32..2_000_000i32,
+        ) {
+            let header = make_header(1_000_000, 0, 0);
+            let partition = Partition {
+                key: DecoratedKey::new(PartitionKey::from(b"k".as_slice())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::expiring(value.clone(), ts, ttl, ldt))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(ts),
+                }],
+            };
+
+            let mut writer = SSTableWriter::new(write_options(), header.clone());
+            writer.add_partition(&partition).unwrap();
+            let output = writer.finish().unwrap();
+
+            let mut reader = DataReader::new(&output.data, &header, 0);
+            let p = reader.read_partition().unwrap().expect("partition");
+            let cell = &p.rows[0].cells[0].1;
+
+            prop_assert!(!cell.is_tombstone());
+            prop_assert_eq!(cell.timestamp, ts);
+            prop_assert_eq!(cell.ttl, ttl);
+            prop_assert_eq!(cell.local_deletion_time, ldt);
+            prop_assert_eq!(cell.value.as_deref(), Some(value.as_slice()));
+        }
+
+        /// Mixed partition: multiple rows with different cell types in same SSTable.
+        #[test]
+        fn mixed_cell_types_in_one_partition(
+            live_val in prop::collection::vec(any::<u8>(), 1..64),
+            ttl_val in prop::collection::vec(any::<u8>(), 1..64),
+            ts in 1_000_000i64..1_500_000i64,
+            ttl in 1i32..3600i32,
+            ldt in 1_700_000i32..1_800_000i32,
+        ) {
+            let header = make_header(1_000_000, 0, 0);
+            let header_with_ck = SerializationHeader {
+                clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
+                ..header
+            };
+
+            let partition = Partition {
+                key: DecoratedKey::new(PartitionKey::from(b"mixed".as_slice())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![
+                    Row {
+                        clustering: 1i32.to_be_bytes().to_vec(),
+                        cells: vec![(0, CellValue::live(live_val.clone(), ts))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(ts),
+                    },
+                    Row {
+                        clustering: 2i32.to_be_bytes().to_vec(),
+                        cells: vec![(0, CellValue::tombstone(ts + 1, ldt))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(ts + 1),
+                    },
+                    Row {
+                        clustering: 3i32.to_be_bytes().to_vec(),
+                        cells: vec![(0, CellValue::expiring(ttl_val.clone(), ts + 2, ttl, ldt))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(ts + 2),
+                    },
+                ],
+            };
+
+            let mut writer = SSTableWriter::new(write_options(), header_with_ck.clone());
+            writer.add_partition(&partition).unwrap();
+            let output = writer.finish().unwrap();
+
+            let mut reader = DataReader::new(&output.data, &header_with_ck, 0);
+            let p = reader.read_partition().unwrap().expect("partition");
+
+            prop_assert_eq!(p.rows.len(), 3);
+
+            // Row 1: live
+            let c1 = &p.rows[0].cells[0].1;
+            prop_assert!(!c1.is_tombstone());
+            prop_assert_eq!(c1.value.as_deref(), Some(live_val.as_slice()));
+            prop_assert_eq!(c1.ttl, ferrosa_common::NO_TTL);
+
+            // Row 2: tombstone
+            let c2 = &p.rows[1].cells[0].1;
+            prop_assert!(c2.is_tombstone());
+
+            // Row 3: expiring
+            let c3 = &p.rows[2].cells[0].1;
+            prop_assert!(!c3.is_tombstone());
+            prop_assert_eq!(c3.ttl, ttl);
+            prop_assert_eq!(c3.local_deletion_time, ldt);
+            prop_assert_eq!(c3.value.as_deref(), Some(ttl_val.as_slice()));
+        }
+    }
+}

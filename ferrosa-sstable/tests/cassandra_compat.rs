@@ -186,6 +186,129 @@ fn read_statistics_fixture() {
 }
 
 #[test]
+/// Write-read roundtrip: ferrosa writer produces SSTables that ferrosa reader
+/// can parse, for all cell types (normal, tombstone, expiring/TTL).
+/// This validates the wire format matches Cassandra's Cell.Serializer spec.
+fn ferrosa_write_read_roundtrip_all_cell_types() {
+    use ferrosa_common::CellValue;
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+    use ferrosa_sstable::types::*;
+    use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+
+    let header = SerializationHeader {
+        min_timestamp: 1_000_000,
+        min_local_deletion_time: 0,
+        min_ttl: 0,
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
+        static_columns: vec![],
+        regular_columns: vec![(
+            b"val".to_vec(),
+            "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        )],
+    };
+    let options = WriteOptions {
+        compression: None,
+        bloom_fp_chance: 0.01,
+        chunk_size: 65536,
+    };
+
+    let timestamp = 1_000_100i64;
+
+    // Three partitions: normal cell, tombstone cell, expiring cell (TTL)
+    let partitions = vec![
+        // 1. Normal cell
+        Partition {
+            key: DecoratedKey::new(PartitionKey::from(b"normal".as_slice())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![0, 0, 0, 1], // ck = 1
+                cells: vec![(0, CellValue::live(b"hello".to_vec(), timestamp))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        },
+        // 2. Tombstone cell
+        Partition {
+            key: DecoratedKey::new(PartitionKey::from(b"tombstone".as_slice())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![0, 0, 0, 2],
+                cells: vec![(0, CellValue::tombstone(timestamp, 1_700_000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        },
+        // 3. Expiring cell (USING TTL 3600)
+        Partition {
+            key: DecoratedKey::new(PartitionKey::from(b"ttl_cell".as_slice())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![0, 0, 0, 3],
+                cells: vec![(
+                    0,
+                    CellValue::expiring(b"expires".to_vec(), timestamp, 3600, 1_700_000),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        },
+    ];
+
+    let mut writer = SSTableWriter::new(options, header.clone());
+    for p in &partitions {
+        writer.add_partition(p).unwrap();
+    }
+    let output = writer.finish().unwrap();
+
+    // Read back and verify each partition
+    let mut reader = DataReader::new(&output.data, &header, 0);
+
+    // 1. Normal cell
+    let p = reader.read_partition().unwrap().expect("normal partition");
+    assert_eq!(p.key.key.as_bytes(), b"normal");
+    let cell = &p.rows[0].cells[0].1;
+    assert!(!cell.is_tombstone());
+    assert_eq!(
+        cell.ttl,
+        ferrosa_common::NO_TTL,
+        "normal cell should have no TTL"
+    );
+    assert_eq!(cell.value.as_deref(), Some(b"hello".as_slice()));
+
+    // 2. Tombstone cell
+    let p = reader
+        .read_partition()
+        .unwrap()
+        .expect("tombstone partition");
+    assert_eq!(p.key.key.as_bytes(), b"tombstone");
+    let cell = &p.rows[0].cells[0].1;
+    assert!(cell.is_tombstone());
+    assert_eq!(cell.timestamp, timestamp);
+    assert_eq!(cell.local_deletion_time, 1_700_000);
+    assert!(cell.value.is_none());
+
+    // 3. Expiring cell
+    let p = reader.read_partition().unwrap().expect("ttl partition");
+    assert_eq!(p.key.key.as_bytes(), b"ttl_cell");
+    let cell = &p.rows[0].cells[0].1;
+    assert!(!cell.is_tombstone(), "expiring cell is not a tombstone");
+    assert_eq!(cell.ttl, 3600, "TTL must survive roundtrip");
+    assert_eq!(
+        cell.local_deletion_time, 1_700_000,
+        "LDT must survive roundtrip"
+    );
+    assert_eq!(cell.value.as_deref(), Some(b"expires".as_slice()));
+
+    // No more partitions
+    assert!(reader.read_partition().unwrap().is_none());
+}
+
+#[test]
 fn bloom_filter_matches_fixture_keys() {
     let Some(dir) = fixture_dir("multi_partition") else {
         eprintln!("Skipping: bloom filter fixture test not generated");
