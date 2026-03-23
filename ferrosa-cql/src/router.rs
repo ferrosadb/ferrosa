@@ -1646,7 +1646,13 @@ async fn route_insert(
 
         if exists {
             // Row already exists — return [applied] = false
-            return Ok(encode_lwt_applied(false, ks, &s.table));
+            return Ok(encode_lwt_applied(
+                false,
+                ks,
+                &s.table,
+                table_meta,
+                &state.schema,
+            ));
         }
     }
 
@@ -1665,7 +1671,13 @@ async fn route_insert(
 
     if s.if_not_exists {
         // Insert was applied — return [applied] = true
-        Ok(encode_lwt_applied(true, ks, &s.table))
+        Ok(encode_lwt_applied(
+            true,
+            ks,
+            &s.table,
+            table_meta,
+            &state.schema,
+        ))
     } else {
         Ok(result::encode_void())
     }
@@ -1673,14 +1685,30 @@ async fn route_insert(
 
 /// Encode a lightweight-transaction `[applied]` result.
 ///
-/// CQL protocol returns a RESULT Rows frame with a single boolean column
-/// named `[applied]` containing `true` (insert was applied) or `false`
-/// (row already existed, insert skipped).
-fn encode_lwt_applied(applied: bool, keyspace: &str, table: &str) -> BytesMut {
-    let col_names = vec!["[applied]".to_string()];
-    let col_types = vec![CqlType::Boolean];
-    let rows = vec![vec![Some(CqlValue::Boolean(applied))]];
-    result::encode_rows(&col_names, &col_types, keyspace, table, &rows)
+/// CQL protocol returns a RESULT Rows frame with `[applied]` boolean plus
+/// all table columns.  When `applied=true`, the extra columns are NULL.
+/// When `applied=false`, they would contain the existing row (not yet
+/// implemented — NULLs are returned as placeholder).
+fn encode_lwt_applied(
+    applied: bool,
+    keyspace: &str,
+    table: &str,
+    table_meta: &TableMetadata,
+    schema: &Schema,
+) -> BytesMut {
+    let mut col_names = vec!["[applied]".to_string()];
+    let mut col_types = vec![CqlType::Boolean];
+    let mut row: Vec<Option<CqlValue>> = vec![Some(CqlValue::Boolean(applied))];
+
+    // Add all table columns (NULL values for now)
+    for (name, cm) in &table_meta.columns {
+        col_names.push(name.clone());
+        let cql_type = resolve_col_type(&cm.column_type, keyspace, schema).unwrap_or(CqlType::Blob);
+        col_types.push(cql_type);
+        row.push(None);
+    }
+
+    result::encode_rows(&col_names, &col_types, keyspace, table, &[row])
 }
 
 // ── UPDATE ───────────────────────────────────────────────────────────────
