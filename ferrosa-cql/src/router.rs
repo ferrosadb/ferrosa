@@ -7369,6 +7369,118 @@ mod tests {
         }
     }
 
+    // ── FRSA-BUG-025: collection bind value decoding ──────────────────
+
+    /// Empty map bind value must not error with "type mismatch: expected map".
+    #[tokio::test]
+    async fn insert_empty_map_literal() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
+        )
+        .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // Empty map literal
+        let stmt =
+            crate::parser::parse("INSERT INTO ks.qm (qt, ack, ver) VALUES (1, {}, 0)").unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "empty map insert failed: {:?}",
+            result.err()
+        );
+    }
+
+    /// Non-empty map literal roundtrip.
+    #[tokio::test]
+    async fn insert_and_select_map_literal() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
+        )
+        .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("INSERT INTO ks.qm (qt, ack, ver) VALUES (1, {'dc1': 100}, 0)")
+                .unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(result.is_ok(), "map insert failed: {:?}", result.err());
+
+        let sel = crate::parser::parse("SELECT qt, ver FROM ks.qm WHERE qt = 1").unwrap();
+        let result = route(&state, &ctx_ks, sel).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_row_count(b), 1);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Set and list bind values must also decode correctly.
+    #[tokio::test]
+    async fn insert_set_and_list_literals() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.coll (k int PRIMARY KEY, ids set<uuid>, events list<text>)",
+        )
+        .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.coll (k, ids, events) VALUES (1, {550e8400-e29b-41d4-a716-446655440000}, ['login', 'logout'])",
+        )
+        .unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(result.is_ok(), "set/list insert failed: {:?}", result.err());
+    }
+
     // ── BUG-001: TRUNCATE must actually delete data ──────────────────
 
     #[tokio::test]
