@@ -13,6 +13,8 @@ mod cluster;
 mod config;
 mod firecracker;
 mod history;
+mod orchestrator;
+mod report;
 mod ssh;
 mod workload;
 
@@ -148,8 +150,25 @@ async fn main() -> Result<()> {
                 "Starting Jepsen run"
             );
 
-            // TODO: orchestrator::run(config).await?
-            tracing::info!("Orchestrator not yet implemented — scaffold only");
+            let report = orchestrator::run(&config).await?;
+
+            if config.output_json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("\n=== ferrosa-jepsen run: {} ===", config.run_id);
+                println!("  Total:  {}", report.total);
+                println!("  Passed: {}", report.passed);
+                println!("  Failed: {}", report.failed);
+                if !report.all_passed() {
+                    println!("\nFailures:");
+                    for f in report.failures() {
+                        println!(
+                            "  - {} / {}: {:?}",
+                            f.workload, f.nemesis, f.invariant_error
+                        );
+                    }
+                }
+            }
 
             Ok(())
         }
