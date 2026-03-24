@@ -7,7 +7,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod chaos;
 mod checker;
+mod cluster;
 mod config;
 mod firecracker;
 mod history;
