@@ -11,6 +11,7 @@ mod chaos;
 mod checker;
 mod cluster;
 mod config;
+mod driver;
 mod firecracker;
 mod history;
 mod orchestrator;

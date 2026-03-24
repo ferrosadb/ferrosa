@@ -153,3 +153,52 @@ impl RunConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topology_t2_values() {
+        assert_eq!(Topology::T2.node_count(), 5);
+        assert_eq!(Topology::T2.dc_count(), 1);
+        assert_eq!(Topology::T2.quorum_size(), 3);
+        assert!(!Topology::T2.requires_fly());
+    }
+
+    #[test]
+    fn topology_all_values() {
+        assert_eq!(Topology::T1.node_count(), 3);
+        assert_eq!(Topology::T2.node_count(), 5);
+        assert_eq!(Topology::T3.node_count(), 6);
+        assert_eq!(Topology::T4.node_count(), 9);
+    }
+
+    #[test]
+    fn concurrency_values() {
+        assert_eq!(Concurrency::Low.threads(), 4);
+        assert_eq!(Concurrency::Medium.threads(), 16);
+        assert_eq!(Concurrency::High.threads(), 64);
+        assert_eq!(Concurrency::Low.connections(), 16);
+        assert_eq!(Concurrency::High.connections(), 256);
+    }
+
+    #[test]
+    fn run_config_topologies() {
+        let config = RunConfig {
+            tier: Tier::Standard,
+            topology: None,
+            nemesis: None,
+            pattern: None,
+            driver: None,
+            concurrency: None,
+            run_id: "test".into(),
+            output_dir: PathBuf::from("/tmp"),
+            fly_regions: vec![],
+            alert_webhook: None,
+            output_json: false,
+        };
+        let tops = config.topologies();
+        assert_eq!(tops, vec![Topology::T1, Topology::T2]);
+    }
+}
