@@ -105,7 +105,8 @@ fn parse_cassandra_cql_examples() {
         return;
     }
 
-    let mut results: BTreeMap<String, Vec<(String, Result<(), String>)>> = BTreeMap::new();
+    type FileResults = Vec<(String, Result<(), String>)>;
+    let mut results: BTreeMap<String, FileResults> = BTreeMap::new();
     let mut total = 0usize;
     let mut passed = 0usize;
     let mut failed = 0usize;

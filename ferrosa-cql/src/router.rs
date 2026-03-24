@@ -5948,6 +5948,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn test_ctx<'a>(auth: &'a AuthContext, ks: &'a Option<String>) -> RequestContext<'a> {
         RequestContext {
             auth,
@@ -7604,7 +7605,7 @@ mod tests {
         ).unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
-        let ctx_ks = RequestContext {
+        let _ctx_ks = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &Some("temporal".into()),
             consistency: ConsistencyLevel::One,
@@ -7692,7 +7693,7 @@ mod tests {
                 let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
                 let mut off = 6 + id_len;
                 // Bind metadata: [i32 flags][i32 columns_count]
-                let bind_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                let _bind_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
                 off += 4;
                 let bind_col_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
 

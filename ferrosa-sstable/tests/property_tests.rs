@@ -134,6 +134,7 @@ mod cell_roundtrip {
     }
 
     /// Strategy: generate a live cell with random value and timestamp.
+    #[allow(dead_code)]
     fn arb_live_cell() -> impl Strategy<Value = (Vec<u8>, i64)> {
         (
             prop::collection::vec(any::<u8>(), 0..256),
@@ -142,6 +143,7 @@ mod cell_roundtrip {
     }
 
     /// Strategy: generate an expiring cell with random value, timestamp, TTL, and LDT.
+    #[allow(dead_code)]
     fn arb_expiring_cell() -> impl Strategy<Value = (Vec<u8>, i64, i32, i32)> {
         (
             prop::collection::vec(any::<u8>(), 0..256),

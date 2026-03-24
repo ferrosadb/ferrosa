@@ -3256,7 +3256,7 @@ mod tests {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.to_string_lossy().ends_with("-Data.db") {
-                    std::fs::write(&path, &[0u8]).unwrap();
+                    std::fs::write(&path, [0u8]).unwrap();
                 }
             }
         }
@@ -3311,7 +3311,7 @@ mod tests {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.to_string_lossy().ends_with("-Data.db") {
-                    std::fs::write(&path, &[]).unwrap();
+                    std::fs::write(&path, []).unwrap();
                 }
             }
         }
@@ -3427,7 +3427,7 @@ mod tests {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.to_string_lossy().ends_with("-Data.db") {
-                    std::fs::write(&path, &[0xDE, 0xAD]).unwrap();
+                    std::fs::write(&path, [0xDE, 0xAD]).unwrap();
                 }
             }
         }
