@@ -1,4 +1,5 @@
 pub mod clock;
+pub mod disk;
 pub mod network;
 pub mod process;
 
@@ -99,6 +100,27 @@ impl NemesisRegistry {
         reg.register(Box::new(clock::ClockSkewSmall));
         reg
     }
+
+    /// Create a registry with all 16 Phase 2 nemeses pre-registered.
+    pub fn phase2() -> Self {
+        let mut reg = Self::phase1();
+        // Network (5 more)
+        reg.register(Box::new(network::PartitionRing));
+        reg.register(Box::new(network::PartitionOne));
+        reg.register(Box::new(network::SlowNetwork));
+        reg.register(Box::new(network::JitterNetwork));
+        reg.register(Box::new(network::PacketLoss));
+        // Process (2 more)
+        reg.register(Box::new(process::KillMajority));
+        reg.register(Box::new(process::PauseNode));
+        // Clock (2 more)
+        reg.register(Box::new(clock::ClockSkewLarge));
+        reg.register(Box::new(clock::ClockStrobe));
+        // Disk (2)
+        reg.register(Box::new(disk::DiskSlow));
+        reg.register(Box::new(disk::DiskFail));
+        reg
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +135,33 @@ mod tests {
         assert_eq!(
             names,
             vec!["clock-skew-small", "kill-minority", "partition-halves"]
+        );
+    }
+
+    #[test]
+    fn nemesis_registry_phase2() {
+        let reg = NemesisRegistry::phase2();
+        let mut names = reg.names();
+        names.sort();
+        assert_eq!(names.len(), 14);
+        assert_eq!(
+            names,
+            vec![
+                "clock-skew-large",
+                "clock-skew-small",
+                "clock-strobe",
+                "disk-fail",
+                "disk-slow",
+                "jitter-network",
+                "kill-majority",
+                "kill-minority",
+                "packet-loss",
+                "partition-halves",
+                "partition-one",
+                "partition-ring",
+                "pause-node",
+                "slow-network",
+            ]
         );
     }
 
