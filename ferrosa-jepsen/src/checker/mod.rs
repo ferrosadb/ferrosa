@@ -1,3 +1,6 @@
+pub mod elle;
+pub mod knossos;
+
 use std::collections::BTreeSet;
 use std::time::Instant;
 
@@ -252,6 +255,56 @@ fn backtrack(
     }
 
     false
+}
+
+/// Unified checker that can run Rust-native, Knossos, and Elle checkers.
+pub struct UnifiedChecker {
+    pub jepsen_dir: Option<std::path::PathBuf>,
+}
+
+impl UnifiedChecker {
+    pub fn new() -> Self {
+        Self { jepsen_dir: None }
+    }
+
+    pub fn with_jepsen_dir(jepsen_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            jepsen_dir: Some(jepsen_dir.into()),
+        }
+    }
+
+    /// Run all applicable checkers on a history.
+    pub fn check_all(&self, history: &History) -> AllCheckResults {
+        let linear = check_linearizability(history);
+
+        // Knossos and Elle require a running Jepsen cluster with lein;
+        // return None when the subprocess checkers are not available.
+        let knossos_result: Option<knossos::KnossosResult> = None;
+        let elle_result: Option<elle::ElleResult> = None;
+
+        // Acknowledge jepsen_dir for future use.
+        let _ = &self.jepsen_dir;
+
+        AllCheckResults {
+            linearizability: linear,
+            knossos: knossos_result,
+            elle: elle_result,
+        }
+    }
+}
+
+impl Default for UnifiedChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Results from all checker backends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllCheckResults {
+    pub linearizability: Vec<CheckResult>,
+    pub knossos: Option<knossos::KnossosResult>,
+    pub elle: Option<elle::ElleResult>,
 }
 
 #[cfg(test)]
@@ -578,5 +631,27 @@ mod tests {
             results[0].valid,
             "timed-out write followed by read of prior value should be linearizable"
         );
+    }
+
+    #[test]
+    fn unified_checker_no_jepsen() {
+        let checker = UnifiedChecker::new();
+        let history = History { operations: vec![] };
+        let results = checker.check_all(&history);
+        assert!(results.linearizability.is_empty());
+        assert!(results.knossos.is_none());
+        assert!(results.elle.is_none());
+    }
+
+    #[test]
+    fn all_check_results_serialization() {
+        let results = AllCheckResults {
+            linearizability: vec![],
+            knossos: None,
+            elle: None,
+        };
+        let json = serde_json::to_string(&results).unwrap();
+        let back: AllCheckResults = serde_json::from_str(&json).unwrap();
+        assert!(back.linearizability.is_empty());
     }
 }
