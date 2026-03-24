@@ -1,7 +1,9 @@
 pub mod clock;
+pub mod composed;
 pub mod disk;
 pub mod network;
 pub mod process;
+pub mod wan_bridge;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -121,6 +123,24 @@ impl NemesisRegistry {
         reg.register(Box::new(disk::DiskFail));
         reg
     }
+
+    /// Phase 4: all nemeses including WAN and composed.
+    pub fn full() -> Self {
+        let mut reg = Self::phase2();
+        // WAN nemeses (5)
+        reg.register(Box::new(wan_bridge::DcPartition));
+        reg.register(Box::new(wan_bridge::DcSlow));
+        reg.register(Box::new(wan_bridge::DcAsymmetric));
+        reg.register(Box::new(wan_bridge::DcFlap));
+        reg.register(Box::new(wan_bridge::DcLossy));
+        // Composed (5)
+        reg.register(Box::new(composed::partition_and_kill()));
+        reg.register(Box::new(composed::slow_and_clock()));
+        reg.register(Box::new(composed::dc_partition_and_kill()));
+        reg.register(Box::new(composed::dc_slow_and_disk()));
+        reg.register(Box::new(composed::everything()));
+        reg
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +183,15 @@ mod tests {
                 "slow-network",
             ]
         );
+    }
+
+    #[test]
+    fn nemesis_registry_full() {
+        let reg = NemesisRegistry::full();
+        let names = reg.names();
+        assert!(names.len() >= 24); // 14 phase2 + 5 WAN + 5 composed
+        assert!(names.contains(&"dc-partition".to_string()));
+        assert!(names.contains(&"partition+kill".to_string()));
     }
 
     #[test]

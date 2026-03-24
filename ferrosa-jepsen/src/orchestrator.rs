@@ -116,8 +116,8 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
 fn resolve_nemesis_registry(tier: Tier) -> NemesisRegistry {
     match tier {
         Tier::Smoke => NemesisRegistry::phase1(),
-        // Phase 2+: once nemeses are merged, use phase2()
-        _ => NemesisRegistry::phase1(),
+        Tier::Standard => NemesisRegistry::phase2(),
+        Tier::Full | Tier::Endurance => NemesisRegistry::full(),
     }
 }
 
