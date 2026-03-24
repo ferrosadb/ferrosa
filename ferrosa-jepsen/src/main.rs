@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod history;
 
 use config::{Concurrency, RunConfig, Tier, Topology};
 
