@@ -1,3 +1,7 @@
+pub mod anomaly;
+pub mod comparison;
+pub mod timeline;
+
 use std::path::Path;
 
 use anyhow::Result;

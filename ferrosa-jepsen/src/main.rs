@@ -7,11 +7,14 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod alert;
+mod archive;
 mod chaos;
 mod checker;
 mod cluster;
 mod config;
 mod driver;
+mod endurance;
 mod firecracker;
 mod flyio;
 mod history;

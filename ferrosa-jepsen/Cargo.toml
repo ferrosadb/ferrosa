@@ -22,6 +22,7 @@ reqwest = { version = "0.12", features = ["json"] }
 russh = "0.46"
 russh-keys = "0.46"
 rand = "0.8"
+dirs-next = "2"
 
 [dev-dependencies]
 tempfile = "3"
