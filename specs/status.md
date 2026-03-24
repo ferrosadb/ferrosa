@@ -1,6 +1,6 @@
 # Ferrosa Development Status
 
-> Last updated: 2026-03-22
+> Last updated: 2026-03-23
 > Status: Living document
 
 ## Overview
@@ -28,8 +28,10 @@ is fully complete.
 | Crates | 12 (11 core + ferrosa-udf) |
 | Source files | ~300+ |
 | Source LOC | ~130,000+ |
-| Test functions | ~2,808 |
+| Test functions | ~2,900+ |
 | Integration test files | 35+ |
+| CQL parser coverage | 81.8% (707/864 Cassandra doc examples) |
+| SSTable fuzz cases | 9 property-based tests (1000+ inputs each) |
 
 ## Maturity Assessment
 
@@ -61,19 +63,30 @@ cluster+accord ██████   ██████  ██████   █
   for consensus rounds).
 - **Remaining:** More property tests for edge cases.
 
-### ferrosa-sstable — Complete (BTI format)
+### ferrosa-sstable — Complete (BTI format, Cassandra-compatible)
 
-- **LOC:** 8,250 (19 files) | **Tests:** 177
+- **LOC:** 8,500+ (19 files) | **Tests:** 190+
 - **Modules:** `bloom`, `byte_comparable`, `compression`, `data`, `io`, `marshal`,
   `partition_index`, `reader`, `row_index`, `statistics`, `toc`, `trie`, `types`,
   `varint`, `writer`
 - **What's done:** Full BTI read/write. On-disk trie (16 node types, page-aware packing),
   Bloom filter, LZ4/Zstd compression, byte-comparable keys, Cassandra compat tests.
+  Cell serialization matches Cassandra's `Cell.Serializer` exactly for all 3 cell types
+  (live, tombstone, expiring/TTL). Property-based fuzz testing for all cell types.
+  Reader fuzz testing with random bytes, truncated data, and single-byte corruption
+  (never panics). Cell value length guard (256MB) prevents OOM from corrupt data.
+- **Recent fixes (2026-03-23):**
+  - [x] Expiring cell (TTL) serialization — CELL_IS_EXPIRING flag + LDT/TTL deltas
+  - [x] Capacity overflow guard for corrupt cell lengths
+  - [x] Reader resilience — returns Err, never panics on malformed input
+  - [x] Property-based fuzz tests (proptest): live/tombstone/expiring cell roundtrips
+  - [x] Reader fuzz: random bytes, truncated, single-byte corruption
+  - [x] Cassandra CQLSSTableWriter fixture generator (Java, Docker)
 - **Remaining:**
   - [x] Sign-bit fix for BTI trie partition index
   - [ ] Big format reader (read-only compat for existing Cassandra SSTables)
   - [ ] Native Ferrosa SSTable format (behind feature flag)
-  - [ ] `sstable-dump` / `sstable-import` CLI tools
+  - [ ] `sstable-dump` / `sstable-import` CLI tools (migration tooling)
 
 ### ferrosa-storage — Mostly Complete (Parts A/B/C + Accord)
 
@@ -111,6 +124,9 @@ cluster+accord ██████   ██████  ██████   █
   - [x] ~~VectorMemtableIndex for ANN queries~~ (Index Sprint I-4)
   - [x] read_range includes SSTable data
   - [x] DELETE merges row-level tombstones
+  - [x] ~~SSTable read resilience~~ — skip corrupt partitions with warning, never crash
+  - [x] ~~S3 CAS probe~~ — detect stores without conditional put (RustFS/MinIO), fallback to unconditional writes
+  - [x] ~~FMEA corruption resilience tests~~ — truncated/zero/evolved/corrupt Data.db files
   - [ ] LCS and TWCS compaction strategies
   - [ ] Disk backpressure
   - [ ] `io_uring` I/O backend
@@ -187,9 +203,9 @@ cluster+accord ██████   ██████  ██████   █
   - [ ] GRANT/REVOKE on function resources
   - [ ] Aggregate state/final function orchestration in query path
 
-### ferrosa-cql — Complete (Parts A-D + Compression + Accord)
+### ferrosa-cql — Complete (Parts A-D + Compression + Accord + Temporal compat)
 
-- **LOC:** ~14,000 (24 files) | **Tests:** ~320 | **Largest crate**
+- **LOC:** ~16,000 (26 files) | **Tests:** ~550 | **Largest crate**
 - **Modules:** `ast`, `auth`, `bridge`, `client`, `connection`, `error`, `frame`,
   `lexer`, `parser`, `prepared`, `prometheus`, `result`, `router`, `server`,
   `subscribe`, `types`, `virtual_tables` (connections + active_queries), `pagination`,
@@ -243,6 +259,19 @@ cluster+accord ██████   ██████  ██████   █
   - [x] Pagination (result set paging with page state)
   - [x] now(), toTimestamp(), TTL() built-in functions
   - [x] SUBSCRIBE dual timestamps
+  - [x] ~~gocql/Temporal wire compatibility~~ (14 protocol fixes, 2026-03-23)
+  - [x] ~~System table column filtering~~ (SELECT specific columns from system.local/peers)
+  - [x] ~~PREPARE result metadata for SELECT/LWT~~ (column count + types)
+  - [x] ~~EXECUTE bind value substitution for collections~~ (map/list/set wire format decoding)
+  - [x] ~~BATCH bind value substitution~~ (was skipping all bind values)
+  - [x] ~~LWT response with existing row data~~ ([applied]=false includes actual row)
+  - [x] ~~USING TTL ? / USING TIMESTAMP ? bind markers~~ (parse + substitute)
+  - [x] ~~Built-in functions in build_column_info~~ (toTimestamp, now, uuid, token)
+  - [x] ~~CqlCodec EOF handling~~ (healthcheck probes no longer flood logs)
+  - [x] ~~Parser: WITH COMPACTION={map}, ALTER TABLE WITH, SELECT AS, UPDATE IF col=?~~
+  - [x] ~~Murmur3Partitioner name~~ (Cassandra-compatible, not FerrosaPartitioner)
+  - [x] ~~CQL doc examples test~~ (81.8% parser coverage, 204 Cassandra .cql files)
+  - [x] ~~Python wire-level CQL test harness~~
   - [ ] Logged batch atomicity
   - [ ] Query tracing
 
@@ -438,7 +467,12 @@ cluster+accord ██████   ██████  ██████   █
 | ~~Beta release v1.0.0-beta.3~~ | — | Released |
 | ~~Secondary index pipeline (Sprints I-1 to I-4)~~ | — | Done (feature branch) |
 | ~~PITR (Sprints P-1 to P-5)~~ | — | Done (feature branch) |
-| ~~Accord Transactions (Sprints A1-A7)~~ | — | Done (feature branch, 2,808 tests) |
+| ~~Accord Transactions (Sprints A1-A7)~~ | — | Done (merged PR #77, 2,808 tests) |
+| ~~gocql/Temporal wire compatibility~~ | — | Done (18 commits, PR #78) |
+| ~~SSTable expiring cell (TTL) serialization~~ | — | Done (P0 data corruption fix) |
+| ~~SSTable reader fuzz testing~~ | — | Done (proptest, 9 fuzz tests) |
+| ~~Cassandra Murmur3Partitioner compat~~ | — | Done |
+| Temporal v1.31.0 on ferrosa | ferrosa-temporal | Running (shard acquisition WIP) |
 | Beta release v1.0.0-beta.4 | — | Sprints complete |
 | NetworkTopologyStrategy (multi-DC) | — | Planned |
 
@@ -522,6 +556,55 @@ Accord provides serializable transactions without a dedicated coordinator:
 
 See [Accord Specification](accord.md) and [Accord Project Plan](accord-project-plan.md)
 for full details.
+
+## Temporal Integration (2026-03-23)
+
+Temporal v1.31.0 running on ferrosa as a Cassandra-compatible backend. This exposed
+and drove fixes for 14 CQL protocol bugs, 1 P0 SSTable data corruption bug, and
+established comprehensive CQL language and SSTable format testing infrastructure.
+
+### Bugs Fixed
+
+| # | Bug | Severity | Root Cause |
+|---|-----|----------|------------|
+| 1 | System table column filtering | HIGH | SELECT specific columns returned all 16 |
+| 2 | PREPARE result metadata empty | HIGH | SELECT prepared statements reported 0 result columns |
+| 3 | CqlCodec EOF "bytes remaining" | LOW | Healthcheck probes left partial frames |
+| 4 | Table option map literals | MEDIUM | WITH COMPACTION = {map} not parsed |
+| 5 | Collection bind value decoding | HIGH | Map/list/set bind values decoded as blob |
+| 6 | BATCH bind values skipped | HIGH | BATCH handler didn't substitute bind markers |
+| 7 | LWT PREPARE metadata | HIGH | IF NOT EXISTS reported 0 result columns |
+| 8 | LWT response NULLs | HIGH | [applied]=false returned NULLs, not existing row |
+| 9 | BATCH LWT void result | HIGH | BATCH with IF NOT EXISTS returned void |
+| 10 | USING TTL ? not parsed | MEDIUM | Parser rejected bind markers in USING TTL |
+| 11 | TTL bind value not substituted | P0 | EXECUTE didn't update using_ttl from bind values |
+| 12 | [ttl] synthetic column missing | HIGH | PREPARE bind metadata didn't include TTL column |
+| 13 | toTimestamp not in build_column_info | MEDIUM | Built-in function list incomplete |
+| 14 | SSTable expiring cell TTL | P0 | Writer never set CELL_IS_EXPIRING or wrote TTL bytes |
+| 15 | Capacity overflow panic | P0 | Corrupt cell length caused allocation panic |
+| 16 | Partitioner name | LOW | Reported FerrosaPartitioner, gocql needs Murmur3 |
+
+### Test Infrastructure Added
+
+| Test | Type | Coverage |
+|------|------|----------|
+| `cassandra_cql_examples.rs` | Parser doc test | 81.8% (707/864 Cassandra .cql examples) |
+| `test_cassandra_cql_examples.py` | Wire-level driver test | Python DataStax driver vs live ferrosa |
+| SSTable cell roundtrip (proptest) | Property-based fuzz | 4 tests × 256+ random inputs each |
+| SSTable reader fuzz (proptest) | Corruption fuzz | 5 tests × 256+ random inputs each |
+| CassandraSSTableWriter (Java) | Cross-compat fixture | 5 fixture sets via CQLSSTableWriter |
+| FMEA corruption resilience | Integration | 4 tests: truncated/zero/evolved/corrupt Data.db |
+| Docker healthcheck fix | Infrastructure | bash /dev/tcp instead of nc |
+
+### Temporal Status
+
+- Schema migration: **PASS** (all 14 Cassandra versions applied)
+- Server startup: **PASS** (all 4 services: frontend, history, matching, worker)
+- Namespace registration: **PASS** (default namespace via admin-tools)
+- Shard acquisition: **WIP** (retryable errors, LWT existing row data fix needed for UPDATE IF)
+- Visibility: SQLite (Temporal dropped Cassandra visibility in v1.24)
+- UI: **PASS** (<http://host:8233>)
+- API: **PASS** (<http://host:7243/api/v1/system-info> returns v1.31.0)
 
 ## Related Documents
 

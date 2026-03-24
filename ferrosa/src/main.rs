@@ -188,6 +188,45 @@ async fn bootstrap_from_s3(
     Ok(())
 }
 
+/// Persist the current schema snapshot to `{data_dir}/schema.json` for local restart recovery.
+///
+/// This ensures user-created keyspaces/tables survive binary upgrades where the
+/// data directory is preserved but the in-memory schema starts fresh.
+fn persist_schema_locally(data_dir: &Path, schema: &ferrosa_schema::Schema) {
+    let snap = schema.snapshot();
+    match serde_json::to_vec_pretty(&*snap) {
+        Ok(json) => {
+            let schema_path = data_dir.join("schema.json");
+            if let Err(e) = std::fs::write(&schema_path, &json) {
+                tracing::warn!(%e, "failed to persist schema to local disk");
+            }
+        }
+        Err(e) => tracing::warn!(%e, "failed to serialize schema snapshot for local persist"),
+    }
+}
+
+/// Load a schema snapshot from `{data_dir}/schema.json`, if it exists.
+///
+/// Returns `None` if the file doesn't exist or can't be parsed.
+fn load_local_schema(data_dir: &Path) -> Option<ferrosa_schema::SchemaSnapshot> {
+    let schema_path = data_dir.join("schema.json");
+    let data = match std::fs::read(&schema_path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(%e, "failed to read local schema.json");
+            return None;
+        }
+    };
+    match serde_json::from_slice(&data) {
+        Ok(snap) => Some(snap),
+        Err(e) => {
+            tracing::warn!(%e, "failed to parse local schema.json");
+            None
+        }
+    }
+}
+
 /// Persist the current schema snapshot to S3 for cold restart recovery.
 async fn persist_schema_to_s3(
     storage: &ferrosa_storage::StorageEngine,
@@ -243,10 +282,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Create StorageEngine
     let storage_config = ferrosa_storage::StorageEngineConfig::from_env()?;
     let rt = tokio::runtime::Handle::current();
-    let storage = Arc::new(ferrosa_storage::StorageEngine::new(
-        storage_config,
-        Some(&rt),
-    )?);
+    let mut storage = ferrosa_storage::StorageEngine::new(storage_config, Some(&rt))?;
+    // Probe object store for conditional put support (CAS).
+    // RustFS/MinIO don't support etag-based conditional writes, so we
+    // detect this once and fall back to unconditional manifest writes.
+    storage.probe_s3_cas().await;
+    let storage = Arc::new(storage);
 
     // 4. Create Schema
     let schema_config = ferrosa_schema::SchemaConfig {
@@ -260,20 +301,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let schema = Arc::new(ferrosa_schema::Schema::new(schema_config)?);
 
-    // 4b. S3 bootstrap: if S3 is configured and local data is empty,
-    //     try to recover schema + table registrations from S3.
-    if storage.has_s3() {
-        let sstables_dir = Path::new(&data_dir).join("sstables");
-        let local_empty = !sstables_dir.exists()
-            || std::fs::read_dir(&sstables_dir)
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(true);
+    // 4b. Restore schema from local disk or S3.
+    //
+    // Priority:
+    //   1. Local schema.json (survives binary upgrades with same data dir)
+    //   2. S3 schema.json (cold start with empty local data, or local schema lost)
+    //   3. Start fresh (no schema found anywhere)
+    let data_path = Path::new(&data_dir);
+    let mut schema_restored = false;
 
-        if local_empty {
-            tracing::info!("S3 configured, local data empty — attempting S3 bootstrap");
-            if let Err(e) = bootstrap_from_s3(&storage, &schema).await {
-                tracing::warn!("S3 bootstrap failed (non-fatal, starting fresh): {e}");
+    if let Some(snapshot) = load_local_schema(data_path) {
+        let ks_count = snapshot.keyspaces.len();
+        let table_count = snapshot.tables.len();
+        match schema.apply_snapshot(snapshot) {
+            Ok(()) => {
+                tracing::info!(
+                    ks_count,
+                    table_count,
+                    "restored schema from local schema.json"
+                );
+                schema_restored = true;
+
+                // Register existing tables with the storage engine so reads work.
+                let snap = schema.snapshot();
+                for ((_ks, _tbl), table_meta) in &snap.tables {
+                    if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
+                        continue;
+                    }
+                    let storage_schema = table_meta.to_storage_schema();
+                    if let Err(e) = storage.register_table(storage_schema) {
+                        tracing::warn!(
+                            table = %table_meta.name,
+                            ks = %table_meta.keyspace,
+                            "failed to register table from local schema: {e}"
+                        );
+                    }
+                }
             }
+            Err(e) => {
+                tracing::warn!(%e, "failed to apply local schema snapshot, trying S3");
+            }
+        }
+    }
+
+    if !schema_restored && storage.has_s3() {
+        tracing::info!("no local schema — attempting S3 bootstrap");
+        if let Err(e) = bootstrap_from_s3(&storage, &schema).await {
+            tracing::warn!("S3 bootstrap failed (non-fatal, starting fresh): {e}");
+        } else {
+            // Persist the S3 schema locally so future restarts don't need S3
+            persist_schema_locally(data_path, &schema);
         }
     }
 
@@ -630,6 +707,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .unwrap_or(30);
     let maintenance_engine = storage.clone();
     let maintenance_schema = schema.clone();
+    let maintenance_data_dir = data_dir.clone();
     let has_s3 = maintenance_engine.has_s3();
     tokio::spawn(async move {
         let mut flush_interval =
@@ -674,27 +752,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     maintenance_engine.poll_compactions();
                 }
                 _ = schema_sync_interval.tick() => {
-                    if !has_s3 { continue; }
                     let snap = maintenance_schema.snapshot();
                     if snap.version != last_schema_version {
                         // Flush all memtables before persisting schema so SSTables
-                        // in S3 match the schema snapshot (Cassandra SNAPSHOT reason).
+                        // on disk match the schema snapshot.
                         if let Err(e) = maintenance_engine.flush_all() {
                             tracing::warn!(%e, "pre-schema-persist flush failed, skipping schema persist");
                             continue; // Don't persist schema without data — retry next tick
                         }
-                        // Sync flushed SSTables to S3 before saving schema.
-                        match maintenance_engine.sync_sstables_to_s3().await {
-                            Ok(n) if n > 0 => {
-                                tracing::info!(count = n, "pre-schema-persist S3 sync");
+
+                        // Always persist schema locally for restart recovery.
+                        persist_schema_locally(Path::new(&maintenance_data_dir), &maintenance_schema);
+
+                        // Sync to S3 if configured.
+                        if has_s3 {
+                            match maintenance_engine.sync_sstables_to_s3().await {
+                                Ok(n) if n > 0 => {
+                                    tracing::info!(count = n, "pre-schema-persist S3 sync");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%e, "pre-schema-persist S3 sync failed");
+                                }
+                                _ => {}
                             }
-                            Err(e) => {
-                                tracing::warn!(%e, "pre-schema-persist S3 sync failed, skipping schema persist");
-                                continue; // Don't persist schema without data — retry next tick
-                            }
-                            _ => {}
+                            persist_schema_to_s3(&maintenance_engine, &maintenance_schema).await;
                         }
-                        persist_schema_to_s3(&maintenance_engine, &maintenance_schema).await;
+
                         last_schema_version = snap.version;
                     }
                 }
@@ -725,7 +808,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage.shutdown()?;
         tracing::info!("memtables flushed");
 
-        // Sync any new SSTables to S3 and persist schema.
+        // Persist schema locally for restart recovery.
+        persist_schema_locally(Path::new(&data_dir), &schema);
+        tracing::info!("shutdown: schema snapshot persisted locally");
+
+        // Sync any new SSTables to S3 and persist schema there too.
         if storage.has_s3() {
             match storage.sync_sstables_to_s3().await {
                 Ok(n) => tracing::info!(count = n, "shutdown: synced SSTables to S3"),
@@ -895,6 +982,88 @@ mod tests {
         std::fs::write(&path, "this is not [valid toml =").unwrap();
 
         assert!(load_config(path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn persist_schema_locally_writes_schema_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_config = ferrosa_schema::SchemaConfig {
+            hasher: ferrosa_schema::PasswordHasher::default(),
+            password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+            auth_method: ferrosa_schema::AuthMethod::Password,
+            rate_limit: ferrosa_schema::RateLimitConfig::default(),
+            audit_sink: Box::new(ferrosa_schema::LogAuditSink),
+            secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+            mode: ferrosa_schema::DeploymentMode::Development,
+        };
+        let schema = ferrosa_schema::Schema::new(schema_config).unwrap();
+
+        // Add a user keyspace via internal API (bypasses auth check)
+        schema
+            .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
+                name: "test_ks".into(),
+                replication: ferrosa_schema::ReplicationParams {
+                    strategy: "SimpleStrategy".into(),
+                    options: [("replication_factor".into(), "1".into())]
+                        .into_iter()
+                        .collect(),
+                },
+                durable_writes: true,
+            })
+            .unwrap();
+
+        persist_schema_locally(dir.path(), &schema);
+
+        let schema_path = dir.path().join("schema.json");
+        assert!(
+            schema_path.exists(),
+            "schema.json must be written to data_dir"
+        );
+
+        let data = std::fs::read(&schema_path).unwrap();
+        let restored: ferrosa_schema::SchemaSnapshot = serde_json::from_slice(&data).unwrap();
+        assert!(
+            restored.keyspaces.contains_key("test_ks"),
+            "restored snapshot must contain user keyspace"
+        );
+    }
+
+    #[test]
+    fn load_local_schema_returns_snapshot_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a minimal schema.json
+        let mut snap = ferrosa_schema::SchemaSnapshot::new();
+        snap.keyspaces.insert(
+            "my_ks".into(),
+            ferrosa_schema::KeyspaceMetadata {
+                name: "my_ks".into(),
+                replication: ferrosa_schema::ReplicationParams {
+                    strategy: "SimpleStrategy".into(),
+                    options: [("replication_factor".into(), "1".into())]
+                        .into_iter()
+                        .collect(),
+                },
+                durable_writes: true,
+            },
+        );
+        let json = serde_json::to_vec_pretty(&snap).unwrap();
+        std::fs::write(dir.path().join("schema.json"), &json).unwrap();
+
+        let loaded = load_local_schema(dir.path());
+        assert!(loaded.is_some(), "must load schema.json from data_dir");
+        let loaded = loaded.unwrap();
+        assert!(loaded.keyspaces.contains_key("my_ks"));
+    }
+
+    #[test]
+    fn load_local_schema_returns_none_when_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = load_local_schema(dir.path());
+        assert!(
+            loaded.is_none(),
+            "must return None when schema.json is absent"
+        );
     }
 
     #[test]

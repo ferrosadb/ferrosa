@@ -13,6 +13,39 @@ use serde::{Deserialize, Serialize};
 /// Maximum number of CAS retry attempts for manifest saves.
 pub const MAX_CAS_RETRIES: u32 = 3;
 
+/// Probe whether the object store supports conditional puts (CAS).
+///
+/// Writes a small test object with `PutMode::Create`, then tries to
+/// overwrite it with `PutMode::Update`.  If the store rejects the
+/// conditional write with "not implemented" or similar, returns `false`.
+/// The probe object is deleted afterwards.
+pub async fn probe_conditional_put_support(store: &dyn ObjectStore) -> bool {
+    let probe_path = ObjectPath::from("__ferrosa_cas_probe");
+    let payload = PutPayload::from(Bytes::from_static(b"probe"));
+
+    // Step 1: unconditional write to create the object.
+    let create_result = store.put(&probe_path, payload.clone()).await;
+    let e_tag = match create_result {
+        Ok(r) => r.e_tag,
+        Err(_) => return false, // can't even write — assume no CAS
+    };
+
+    // Step 2: conditional overwrite using the etag.
+    let cas_opts = PutOptions {
+        mode: PutMode::Update(UpdateVersion {
+            e_tag,
+            version: None,
+        }),
+        ..Default::default()
+    };
+    let cas_ok = store.put_opts(&probe_path, payload, cas_opts).await.is_ok();
+
+    // Cleanup — best effort.
+    let _ = store.delete(&probe_path).await;
+
+    cas_ok
+}
+
 /// Manifest listing all live SSTables in object storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -77,56 +110,72 @@ impl Manifest {
         }
     }
 
-    /// Saves the manifest with conditional put (etag-based CAS).
+    /// Saves the manifest to the object store.
     ///
-    /// If `version` doesn't match the current version in the store,
-    /// returns an error (concurrent update detected).
+    /// When `cas_supported` is true, uses conditional put (etag-based CAS)
+    /// for safe concurrent writes. When false (e.g. RustFS/MinIO), falls
+    /// back to an unconditional overwrite.
     pub async fn save(
         &self,
         store: &dyn ObjectStore,
         prefix: &str,
         version: Option<UpdateVersion>,
+        cas_supported: bool,
     ) -> ferrosa_common::Result<()> {
         let path = Self::manifest_path(prefix);
         let data = serde_json::to_vec_pretty(self).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to serialize manifest: {e}"))
         })?;
 
-        let opts = match version {
-            Some(v) => PutOptions {
-                mode: PutMode::Update(v),
-                ..Default::default()
-            },
-            None => PutOptions {
-                mode: PutMode::Create,
-                ..Default::default()
-            },
-        };
-
-        store
-            .put_opts(&path, PutPayload::from(Bytes::from(data)), opts)
-            .await
-            .map_err(|e| {
-                ferrosa_common::Error::InvalidFormat(format!("failed to save manifest: {e}"))
-            })?;
+        if cas_supported {
+            let opts = match version {
+                Some(v) => PutOptions {
+                    mode: PutMode::Update(v),
+                    ..Default::default()
+                },
+                None => PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            };
+            store
+                .put_opts(&path, PutPayload::from(Bytes::from(data)), opts)
+                .await
+                .map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!("failed to save manifest: {e}"))
+                })?;
+        } else {
+            // Unconditional overwrite — no CAS protection.
+            store
+                .put(&path, PutPayload::from(Bytes::from(data)))
+                .await
+                .map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!("failed to save manifest: {e}"))
+                })?;
+        }
 
         Ok(())
     }
 
     /// Saves the manifest with automatic CAS retry and exponential backoff.
     ///
-    /// On each attempt, re-loads the latest version from the store, then
-    /// attempts a conditional put. If a CAS conflict occurs (another writer
-    /// updated the manifest concurrently), waits with exponential backoff
-    /// and retries up to [`MAX_CAS_RETRIES`] times.
+    /// When `cas_supported` is true, re-loads the latest version on each
+    /// attempt and uses conditional put. On CAS conflict, retries with
+    /// exponential backoff up to [`MAX_CAS_RETRIES`] times.
+    ///
+    /// When `cas_supported` is false, does a single unconditional write.
     pub async fn save_with_retry(
         &self,
         store: &dyn ObjectStore,
         prefix: &str,
+        cas_supported: bool,
     ) -> ferrosa_common::Result<()> {
+        if !cas_supported {
+            return self.save(store, prefix, None, false).await;
+        }
         for attempt in 0..MAX_CAS_RETRIES {
             let (_, version) = Self::load(store, prefix).await?;
-            match self.save(store, prefix, version).await {
+            match self.save(store, prefix, version, true).await {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < MAX_CAS_RETRIES - 1 => {
                     eprintln!(
@@ -277,7 +326,7 @@ mod tests {
             // Add entries and save.
             manifest.add_sstable("ks.table", sample_entry("sst1"));
             manifest.add_sstable("ks.table", sample_entry("sst2"));
-            manifest.save(&store, "test", version).await.unwrap();
+            manifest.save(&store, "test", version, true).await.unwrap();
 
             // Re-load and verify.
             let (loaded, _) = Manifest::load(&store, "test").await.unwrap();
@@ -314,7 +363,10 @@ mod tests {
         manifest.add_sstable("ks.table", sample_entry("sst1"));
 
         // save_with_retry should work on a fresh store (no conflicts).
-        manifest.save_with_retry(&store, "test").await.unwrap();
+        manifest
+            .save_with_retry(&store, "test", true)
+            .await
+            .unwrap();
 
         // Verify it was actually persisted.
         let (loaded, _) = Manifest::load(&store, "test").await.unwrap();
@@ -330,7 +382,7 @@ mod tests {
 
             let mut manifest = Manifest::new();
             manifest.add_sstable("t", sample_entry("x"));
-            manifest.save(&store, "", None).await.unwrap();
+            manifest.save(&store, "", None, true).await.unwrap();
 
             let (loaded, _) = Manifest::load(&store, "").await.unwrap();
             assert_eq!(loaded.sstables["t"].len(), 1);

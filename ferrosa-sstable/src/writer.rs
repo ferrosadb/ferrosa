@@ -57,12 +57,13 @@ const DELETION_IS_LIVE: u8 = 0x80;
 /// Cell is a tombstone (deleted).
 const CELL_IS_DELETED: u8 = 0x01;
 /// Cell is expiring (has TTL).
-#[allow(dead_code)]
 const CELL_IS_EXPIRING: u8 = 0x02;
 /// Cell has an empty value.
 const CELL_HAS_EMPTY_VALUE: u8 = 0x04;
 /// Cell inherits the row-level timestamp (no per-cell timestamp encoded).
 const CELL_USE_ROW_TIMESTAMP: u8 = 0x08;
+/// Cell inherits the row-level TTL and local deletion time.
+const CELL_USE_ROW_TTL: u8 = 0x10;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -505,19 +506,32 @@ fn serialize_cell(
     header: &SerializationHeader,
 ) {
     let is_tombstone = cell.is_tombstone();
+    let is_expiring = !is_tombstone
+        && cell.ttl != ferrosa_common::NO_TTL
+        && cell.local_deletion_time != ferrosa_common::NO_DELETION_TIME;
     let has_empty_value = cell.value.is_none() || (is_tombstone && cell.value.is_none());
     let use_row_timestamp = row.primary_key_liveness.has_timestamp()
         && cell.timestamp == row.primary_key_liveness.timestamp;
+    let use_row_ttl = is_expiring
+        && row.primary_key_liveness.ttl != ferrosa_common::NO_TTL
+        && cell.ttl == row.primary_key_liveness.ttl
+        && cell.local_deletion_time == row.primary_key_liveness.local_deletion_time;
 
     let mut cell_flags: u8 = 0;
     if is_tombstone {
         cell_flags |= CELL_IS_DELETED;
+    }
+    if is_expiring {
+        cell_flags |= CELL_IS_EXPIRING;
     }
     if has_empty_value {
         cell_flags |= CELL_HAS_EMPTY_VALUE;
     }
     if use_row_timestamp {
         cell_flags |= CELL_USE_ROW_TIMESTAMP;
+    }
+    if use_row_ttl {
+        cell_flags |= CELL_USE_ROW_TTL;
     }
     buf.push(cell_flags);
 
@@ -527,11 +541,17 @@ fn serialize_cell(
         push_unsigned_vint_to(buf, ts_delta);
     }
 
-    // Local deletion time (unsigned varint delta, for tombstones)
-    if is_tombstone {
+    // Local deletion time (unsigned varint delta, for tombstones and expiring cells)
+    if !use_row_ttl && (is_tombstone || is_expiring) {
         let ldt_delta =
             (cell.local_deletion_time as i64 - header.min_local_deletion_time as i64) as u64;
         push_unsigned_vint_to(buf, ldt_delta);
+    }
+
+    // TTL (unsigned varint delta, for expiring cells only)
+    if is_expiring && !use_row_ttl {
+        let ttl_delta = (cell.ttl - header.min_ttl) as u64;
+        push_unsigned_vint_to(buf, ttl_delta);
     }
 
     // Value (absent if HAS_EMPTY_VALUE)
@@ -1305,5 +1325,73 @@ mod tests {
         assert_eq!(cell.timestamp, timestamp);
 
         assert!(reader.read_partition().unwrap().is_none());
+    }
+
+    /// FRSA-BUG-026 root cause: expiring cells (USING TTL) must roundtrip
+    /// through SSTable write + read. The writer must set CELL_IS_EXPIRING
+    /// and write the local_deletion_time + TTL deltas.
+    #[test]
+    fn write_partition_with_expiring_cell_roundtrip() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: 0,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let timestamp = 1_000_100i64;
+        let ttl = 3600i32;
+        let ldt = 1_700_000i32; // local deletion time = now + ttl
+
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::new(42i32.to_be_bytes().to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![],
+                cells: vec![(
+                    0,
+                    CellValue::expiring(b"hello_ttl".to_vec(), timestamp, ttl, ldt),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        };
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        let mut reader = DataReader::new(&output.data, &header, 0);
+        let p = reader.read_partition().unwrap().expect("partition");
+
+        let row = &p.rows[0];
+        let (_, ref cell) = row.cells[0];
+        assert!(
+            !cell.is_tombstone(),
+            "expiring cell should not be a tombstone"
+        );
+        assert_eq!(cell.timestamp, timestamp);
+        assert_eq!(cell.ttl, ttl, "TTL must roundtrip");
+        assert_eq!(
+            cell.local_deletion_time, ldt,
+            "local_deletion_time must roundtrip"
+        );
+        assert_eq!(
+            cell.value.as_deref(),
+            Some(b"hello_ttl".as_slice()),
+            "value must roundtrip"
+        );
     }
 }

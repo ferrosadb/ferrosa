@@ -253,7 +253,7 @@ mod tests {
     ) -> SnapshotMetadata {
         let manifest = Manifest::new();
         manifest
-            .save_with_retry(store.as_ref(), prefix)
+            .save_with_retry(store.as_ref(), prefix, true)
             .await
             .unwrap();
         crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")

@@ -232,6 +232,27 @@ impl Decoder for CqlCodec {
         // but the body we return is already decompressed).
         Ok(Some(CqlFrame { header, body }))
     }
+
+    /// Override default `decode_eof` to silently discard partial frames.
+    ///
+    /// Healthcheck probes (e.g. `echo > /dev/tcp/host/9042`) leave a few
+    /// stray bytes in the buffer when the connection closes.  The default
+    /// tokio_util implementation returns `Err("bytes remaining on stream")`
+    /// for any non-empty buffer on EOF, which floods logs.  Instead, we
+    /// attempt one normal decode and accept `None` (incomplete) as clean EOF.
+    fn decode_eof(
+        &mut self,
+        buf: &mut BytesMut,
+    ) -> std::result::Result<Option<Self::Item>, Self::Error> {
+        match self.decode(buf)? {
+            Some(frame) => Ok(Some(frame)),
+            None => {
+                // Discard any trailing bytes — they're an incomplete frame.
+                buf.clear();
+                Ok(None)
+            }
+        }
+    }
 }
 
 impl Encoder<CqlFrame> for CqlCodec {
@@ -776,5 +797,37 @@ mod tests {
             result.is_err(),
             "should reject compressed frame without negotiation"
         );
+    }
+
+    /// Healthcheck connections (e.g. `echo > /dev/tcp/host/9042`) send a few
+    /// bytes and close.  The default `decode_eof` reports "bytes remaining on
+    /// stream" for partial data — override to silently discard incomplete
+    /// frames on EOF instead of spamming logs with errors.
+    #[test]
+    fn partial_frame_on_eof_returns_none() {
+        let mut decoder = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        // Simulate a healthcheck that sends a newline then closes.
+        let mut buf = BytesMut::from(&b"\n"[..]);
+        // decode_eof is called when the stream hits EOF with data in the buffer.
+        let result = decoder.decode_eof(&mut buf);
+        assert!(
+            result.is_ok(),
+            "partial frame on EOF should not error, got: {:?}",
+            result.err()
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "partial frame on EOF should return None"
+        );
+    }
+
+    /// Empty buffer on EOF should cleanly return None.
+    #[test]
+    fn empty_buffer_on_eof_returns_none() {
+        let mut decoder = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        let mut buf = BytesMut::new();
+        let result = decoder.decode_eof(&mut buf);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }

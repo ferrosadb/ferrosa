@@ -98,7 +98,7 @@ repos:
     rev: v2.3.0
     hooks:
       - id: codespell
-        args: ["-L", "crate,ratatui,rouge,ser,trough,wit"]
+        args: ["-L", "crate,edn,ratatui,rouge,ser,trough,wit"]
         exclude: '(node_modules/|package-lock\.json|\.lock$|cassandra/|docs/examples/)'
 
   # ===========================================================================

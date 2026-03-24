@@ -352,6 +352,8 @@ pub struct AlterTableStatement {
     pub drop_columns: Vec<String>,
     /// Table extensions (e.g. graph metadata: `WITH extensions = {'vertex_label': 'Person'}`).
     pub extensions: Option<Vec<(String, String)>>,
+    /// Generic table options (compaction, compression, comment, etc.).
+    pub table_options: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

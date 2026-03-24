@@ -389,6 +389,36 @@ fn route_select(
         .or(ctx.current_keyspace.as_deref())
         .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
 
+    // Helper: filter system table columns to match the SELECT list.
+    // If the SELECT list is `*`, return everything unchanged.
+    fn filter_system_columns(
+        select_cols: &[SelectColumn],
+        all_names: &[String],
+        all_types: &[CqlType],
+        all_rows: &[Vec<Option<CqlValue>>],
+    ) -> (Vec<String>, Vec<CqlType>, Vec<Vec<Option<CqlValue>>>) {
+        let is_star = select_cols.iter().any(|c| matches!(c, SelectColumn::Star));
+        if is_star || select_cols.is_empty() {
+            return (all_names.to_vec(), all_types.to_vec(), all_rows.to_vec());
+        }
+        // Build index of requested columns by name.
+        let mut indices = Vec::new();
+        for sc in select_cols {
+            if let SelectColumn::Column(name) = sc {
+                if let Some(pos) = all_names.iter().position(|n| n == name) {
+                    indices.push(pos);
+                }
+            }
+        }
+        let names: Vec<String> = indices.iter().map(|&i| all_names[i].clone()).collect();
+        let types: Vec<CqlType> = indices.iter().map(|&i| all_types[i].clone()).collect();
+        let rows: Vec<Vec<Option<CqlValue>>> = all_rows
+            .iter()
+            .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
+            .collect();
+        (names, types, rows)
+    }
+
     // System table dispatch — no permission check needed for system tables.
     match (ks, s.table.as_str()) {
         ("system", "local") => {
@@ -455,12 +485,14 @@ fn route_select(
                 Some(CqlValue::Text(info.bootstrapped)),
                 Some(CqlValue::Set(tokens_set)),
             ];
+            let (filt_names, filt_types, filt_rows) =
+                filter_system_columns(&s.columns, &col_names, &col_types, &[row]);
             Ok(result::encode_rows(
-                &col_names,
-                &col_types,
+                &filt_names,
+                &filt_types,
                 "system",
                 "local",
-                &[row],
+                &filt_rows,
             ))
         }
         ("system", "peers" | "peers_v2") => {
@@ -506,12 +538,14 @@ fn route_select(
                     ]
                 })
                 .collect();
+            let (filt_names, filt_types, filt_rows) =
+                filter_system_columns(&s.columns, &col_names, &col_types, &rows);
             Ok(result::encode_rows(
-                &col_names,
-                &col_types,
+                &filt_names,
+                &filt_types,
                 "system",
                 s.table.as_str(),
-                &rows,
+                &filt_rows,
             ))
         }
         ("system_schema", "keyspaces") => {
@@ -1660,7 +1694,7 @@ async fn route_insert(
 
     // BUG-0016: IF NOT EXISTS — check whether the row already exists before writing.
     if s.if_not_exists {
-        let exists = if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+        let existing_row = if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
             let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
             let all_col_types: Vec<CqlType> = table_meta
                 .columns
@@ -1684,23 +1718,31 @@ async fn route_insert(
                 &pk_indices,
                 &ck_indices,
             );
-            if ck_values.is_empty() {
-                !rows.is_empty()
+            let matching = if ck_values.is_empty() {
+                rows.into_iter().next()
             } else {
-                rows.iter().any(|row| {
+                rows.into_iter().find(|row| {
                     ck_indices
                         .iter()
                         .zip(ck_values.iter())
                         .all(|(&idx, ck_val)| row.get(idx).and_then(|v| v.as_ref()) == Some(ck_val))
                 })
-            }
+            };
+            matching
         } else {
-            false
+            None
         };
 
-        if exists {
-            // Row already exists — return [applied] = false
-            return Ok(encode_lwt_applied(false, ks, &s.table));
+        if let Some(ref existing) = existing_row {
+            // Row already exists — return [applied] = false with existing row data
+            return Ok(encode_lwt_applied(
+                false,
+                ks,
+                &s.table,
+                table_meta,
+                &state.schema,
+                Some(existing),
+            ));
         }
     }
 
@@ -1719,7 +1761,14 @@ async fn route_insert(
 
     if s.if_not_exists {
         // Insert was applied — return [applied] = true
-        Ok(encode_lwt_applied(true, ks, &s.table))
+        Ok(encode_lwt_applied(
+            true,
+            ks,
+            &s.table,
+            table_meta,
+            &state.schema,
+            None,
+        ))
     } else {
         Ok(result::encode_void())
     }
@@ -1727,14 +1776,32 @@ async fn route_insert(
 
 /// Encode a lightweight-transaction `[applied]` result.
 ///
-/// CQL protocol returns a RESULT Rows frame with a single boolean column
-/// named `[applied]` containing `true` (insert was applied) or `false`
-/// (row already existed, insert skipped).
-fn encode_lwt_applied(applied: bool, keyspace: &str, table: &str) -> BytesMut {
-    let col_names = vec!["[applied]".to_string()];
-    let col_types = vec![CqlType::Boolean];
-    let rows = vec![vec![Some(CqlValue::Boolean(applied))]];
-    result::encode_rows(&col_names, &col_types, keyspace, table, &rows)
+/// CQL protocol returns a RESULT Rows frame with `[applied]` boolean plus
+/// all table columns.  When `applied=true`, the extra columns are NULL.
+/// When `applied=false`, `existing_row` contains the current row values.
+/// When `applied=true`, all table columns are NULL.
+fn encode_lwt_applied(
+    applied: bool,
+    keyspace: &str,
+    table: &str,
+    table_meta: &TableMetadata,
+    schema: &Schema,
+    existing_row: Option<&[Option<CqlValue>]>,
+) -> BytesMut {
+    let mut col_names = vec!["[applied]".to_string()];
+    let mut col_types = vec![CqlType::Boolean];
+    let mut row: Vec<Option<CqlValue>> = vec![Some(CqlValue::Boolean(applied))];
+
+    for (i, (name, cm)) in table_meta.columns.iter().enumerate() {
+        col_names.push(name.clone());
+        let cql_type = resolve_col_type(&cm.column_type, keyspace, schema).unwrap_or(CqlType::Blob);
+        col_types.push(cql_type);
+        // Use existing row values when not applied, NULL when applied
+        let val = existing_row.and_then(|r| r.get(i)).and_then(|v| v.clone());
+        row.push(val);
+    }
+
+    result::encode_rows(&col_names, &col_types, keyspace, table, &[row])
 }
 
 // ── UPDATE ───────────────────────────────────────────────────────────────
@@ -3747,6 +3814,11 @@ fn build_column_info(
                     }
                     "writetime" => (builtin_display_name, CqlType::Bigint),
                     "ttl" => (builtin_display_name, CqlType::Int),
+                    "now" | "totimestamp" | "todate" | "currenttimestamp" => {
+                        (builtin_display_name, CqlType::Timestamp)
+                    }
+                    "uuid" | "timeuuid" => (builtin_display_name, CqlType::Uuid),
+                    "token" => (builtin_display_name, CqlType::Bigint),
                     "avg" | "min" | "max" | "sum" => {
                         // Resolve the argument column type.
                         let t = if let Some(arg) = args.first() {
@@ -5876,6 +5948,17 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
+    fn test_ctx<'a>(auth: &'a AuthContext, ks: &'a Option<String>) -> RequestContext<'a> {
+        RequestContext {
+            auth,
+            current_keyspace: ks,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        }
+    }
+
     #[tokio::test]
     async fn create_keyspace_then_table_then_insert_then_select() {
         let (state, _dir) = setup();
@@ -7013,6 +7096,860 @@ mod tests {
         i32::from_be_bytes(buf[off..off + 4].try_into().unwrap())
     }
 
+    /// Extract column names from a Rows result buffer.
+    fn extract_column_names(buf: &[u8]) -> Vec<String> {
+        assert_eq!(
+            &buf[0..4],
+            &0x0002i32.to_be_bytes(),
+            "expected Rows result kind"
+        );
+        let col_count = i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let mut off = 12;
+        // Skip keyspace string
+        let ks_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        // Skip table string
+        let tbl_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+        // Read column names
+        let mut names = Vec::new();
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+            off += 2;
+            let name = std::str::from_utf8(&buf[off..off + name_len])
+                .unwrap()
+                .to_string();
+            names.push(name);
+            off += name_len;
+            let type_id = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2,
+                0x0021 => off += 4,
+                0x0031 => {
+                    let n = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + n * 2;
+                }
+                _ => {}
+            }
+        }
+        names
+    }
+
+    /// Extract the column count from a Rows result buffer.
+    fn extract_column_count(buf: &[u8]) -> usize {
+        assert_eq!(
+            &buf[0..4],
+            &0x0002i32.to_be_bytes(),
+            "expected Rows result kind"
+        );
+        i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize
+    }
+
+    // ── gocql / Temporal compatibility ──────────────────────────────────
+
+    /// gocql schema agreement: SELECT schema_version FROM system.local WHERE key='local'
+    /// Must return exactly 1 column (schema_version), not all 16.
+    #[tokio::test]
+    async fn gocql_select_schema_version_from_system_local() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT schema_version FROM system.local WHERE key = 'local'")
+                .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let col_names = extract_column_names(b);
+                assert_eq!(
+                    col_names,
+                    vec!["schema_version"],
+                    "gocql schema agreement expects exactly 1 column, got: {col_names:?}"
+                );
+                assert_eq!(extract_row_count(b), 1, "system.local must return 1 row");
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// gocql host discovery: SELECT * FROM system.local WHERE key='local'
+    /// Must return all columns and 1 row (WHERE clause must not break it).
+    #[tokio::test]
+    async fn gocql_select_star_from_system_local_where_key() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system.local WHERE key = 'local'").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let col_count = extract_column_count(b);
+                assert_eq!(col_count, 16, "SELECT * should return all 16 columns");
+                assert_eq!(extract_row_count(b), 1);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// gocql peer discovery: SELECT * FROM system.peers_v2 (empty on single node)
+    /// Must succeed with 0 rows, not error.
+    #[tokio::test]
+    async fn gocql_select_star_from_system_peers_v2() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system.peers_v2").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let col_names = extract_column_names(b);
+                assert!(
+                    col_names.contains(&"schema_version".to_string()),
+                    "system.peers_v2 must include schema_version column"
+                );
+                assert_eq!(extract_row_count(b), 0, "single node has no peers");
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Selecting specific columns from system.local must filter the result.
+    #[tokio::test]
+    async fn system_local_column_filtering() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT cluster_name, release_version FROM system.local").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let col_names = extract_column_names(b);
+                assert_eq!(
+                    col_names,
+                    vec!["cluster_name", "release_version"],
+                    "should return only requested columns"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Selecting specific columns from system.peers must filter the result.
+    #[tokio::test]
+    async fn system_peers_column_filtering() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT peer, host_id, schema_version FROM system.peers").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let col_names = extract_column_names(b);
+                assert_eq!(
+                    col_names,
+                    vec!["peer", "host_id", "schema_version"],
+                    "should return only requested columns"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Temporal schema migrations use CREATE TYPE for UDTs.
+    #[tokio::test]
+    async fn create_type_udt() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("temporal".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TYPE temporal.serialized_event_batch (encoding_type text, version int, data blob)",
+        ).unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "CREATE TYPE must succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Temporal schema migrations use ALTER TABLE ADD.
+    #[tokio::test]
+    async fn alter_table_add_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("ALTER TABLE ks.t ADD new_col blob").unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALTER TABLE ADD must succeed, got: {:?}",
+            result.err()
+        );
+
+        // Verify the column exists by inserting into it
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.t (k, v, new_col) VALUES (1, 'hello', 0xdeadbeef)",
+        )
+        .unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "INSERT into added column must succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Temporal schema migrations use ALTER TABLE DROP.
+    #[tokio::test]
+    async fn alter_table_drop_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text, extra blob)")
+                .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("ALTER TABLE ks.t DROP extra").unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALTER TABLE DROP must succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// PREPARE for a SELECT must include result column metadata so gocql's
+    /// Scan() knows how many columns to expect.
+    #[tokio::test]
+    async fn prepare_select_includes_result_columns() {
+        use bytes::{BufMut, BytesMut};
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        // Create keyspace and table
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("CREATE TABLE ks.t (k text PRIMARY KEY, v text, n int)").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // Now test PREPARE — build a PREPARE frame body
+        let query = "SELECT v, n FROM ks.t WHERE k = ?";
+        let query_bytes = query.as_bytes();
+        let mut body = BytesMut::new();
+        body.put_i32(query_bytes.len() as i32);
+        body.put_slice(query_bytes);
+
+        let result = crate::connection::handle_prepare(
+            &mut None,
+            &mut Some("ks".into()),
+            &state,
+            &body.freeze(),
+        );
+        match result {
+            crate::connection::HandleResult::Reply(opcode, body) => {
+                // PREPARED = 0x04 Result opcode
+                assert_eq!(opcode, crate::frame::Opcode::Result);
+                // Result body: [4 kind][id...][bind_metadata...][result_metadata]
+                // kind = 0x0004 (Prepared)
+                assert_eq!(&body[0..4], &0x0004i32.to_be_bytes());
+
+                // Skip past the prepared ID (short_bytes: [u16 len][bytes])
+                let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+                let mut off = 6 + id_len;
+
+                // Bind metadata: [i32 flags][i32 columns_count]
+                let _bind_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+                let bind_col_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+
+                // Skip pk_count if global_tables_spec flag is set
+                if _bind_flags & 0x0001 != 0 {
+                    // pk_count
+                    let pk_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                    off += 4;
+                    // pk indexes
+                    off += pk_count as usize * 2;
+                    // global table spec: ks string + table string
+                    let ks_len =
+                        u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + ks_len;
+                    let tbl_len =
+                        u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + tbl_len;
+                }
+                // Skip bind column specs
+                for _ in 0..bind_col_count {
+                    if _bind_flags & 0x0001 == 0 {
+                        // per-column ks+table
+                        let ks_len =
+                            u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                        off += 2 + ks_len;
+                        let tbl_len =
+                            u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                        off += 2 + tbl_len;
+                    }
+                    let name_len =
+                        u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + name_len;
+                    off += 2; // type_id
+                }
+
+                // Result metadata: [i32 flags][i32 columns_count]
+                let _result_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+                let result_col_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+
+                assert_eq!(
+                    result_col_count, 2,
+                    "PREPARE for SELECT v, n should report 2 result columns, got {result_col_count}"
+                );
+            }
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    /// Temporal's CREATE TABLE uses WITH COMPACTION = { map }.
+    /// Parser must handle map-valued table options.
+    #[tokio::test]
+    async fn create_table_with_compaction_option() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("temporal".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE temporal.t (k int PRIMARY KEY) WITH COMPACTION = { 'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy' }",
+        );
+        assert!(
+            stmt.is_ok(),
+            "CREATE TABLE WITH COMPACTION = {{map}} must parse, got: {:?}",
+            stmt.err()
+        );
+        let result = route(&state, &ctx_ks, stmt.unwrap()).await;
+        assert!(
+            result.is_ok(),
+            "CREATE TABLE WITH COMPACTION must succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Temporal uses frozen<UDT> in collection types.
+    #[tokio::test]
+    async fn create_table_with_frozen_udt_collection() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("temporal".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        // Create the UDT first
+        let stmt = crate::parser::parse(
+            "CREATE TYPE temporal.serialized_event_batch (encoding_type text, version int, data blob)",
+        ).unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // Create table with frozen<UDT> in a list
+        let stmt = crate::parser::parse(
+            "CREATE TABLE temporal.executions (k int PRIMARY KEY, events list<frozen<serialized_event_batch>>)",
+        );
+        assert!(
+            stmt.is_ok(),
+            "frozen<UDT> in list must parse, got: {:?}",
+            stmt.err()
+        );
+    }
+
+    /// Temporal uses CLUSTERING ORDER BY in table definition.
+    #[tokio::test]
+    async fn create_table_with_clustering_order_and_compaction() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let _ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("temporal".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE temporal.history_node (\
+                tree_id uuid, branch_id uuid, node_id bigint, txn_id bigint, \
+                data blob, data_encoding text, \
+                PRIMARY KEY ((tree_id), branch_id, node_id, txn_id)) \
+            WITH CLUSTERING ORDER BY (branch_id ASC, node_id ASC, txn_id DESC) \
+            AND COMPACTION = { 'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy' }",
+        );
+        assert!(
+            stmt.is_ok(),
+            "CLUSTERING ORDER + COMPACTION must parse, got: {:?}",
+            stmt.err()
+        );
+    }
+
+    /// FRSA-BUG-024: PREPARE must see columns added by ALTER TABLE ADD.
+    /// Temporal's SaveClusterMetadata fails because PREPARE only reports
+    /// original table columns, not those added by ALTER TABLE.
+    #[tokio::test]
+    async fn prepare_sees_alter_table_add_columns() {
+        use bytes::{BufMut, BytesMut};
+
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        // Create keyspace and table with 2 columns
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("CREATE TABLE ks.cluster_metadata (k int PRIMARY KEY, data blob)")
+                .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // ALTER TABLE ADD 2 new columns
+        let stmt =
+            crate::parser::parse("ALTER TABLE ks.cluster_metadata ADD encoding text").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+        let stmt =
+            crate::parser::parse("ALTER TABLE ks.cluster_metadata ADD version bigint").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // PREPARE an INSERT with all 4 columns (including the 2 added ones)
+        let query =
+            "INSERT INTO ks.cluster_metadata (k, data, encoding, version) VALUES (?, ?, ?, ?)";
+        let query_bytes = query.as_bytes();
+        let mut body = BytesMut::new();
+        body.put_i32(query_bytes.len() as i32);
+        body.put_slice(query_bytes);
+
+        let result = crate::connection::handle_prepare(
+            &mut None,
+            &mut Some("ks".into()),
+            &state,
+            &body.freeze(),
+        );
+        match result {
+            crate::connection::HandleResult::Reply(opcode, body) => {
+                assert_eq!(opcode, crate::frame::Opcode::Result);
+                // kind = 0x0004 (Prepared)
+                assert_eq!(&body[0..4], &0x0004i32.to_be_bytes());
+                // Skip past prepared ID
+                let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+                let mut off = 6 + id_len;
+                // Bind metadata: [i32 flags][i32 columns_count]
+                let _bind_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+                let bind_col_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+
+                assert_eq!(
+                    bind_col_count, 4,
+                    "PREPARE should see 4 bind columns (k, data, encoding, version) after ALTER TABLE ADD, got {bind_col_count}"
+                );
+            }
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    /// FRSA-BUG-024: PREPARE for UPDATE...IF condition must include the
+    /// condition's bind marker in the bind columns count.
+    /// Temporal's SaveClusterMetadata uses: UPDATE ... SET ... WHERE ... IF version = ?
+    #[tokio::test]
+    async fn prepare_update_if_condition_includes_bind_marker() {
+        use bytes::{BufMut, BytesMut};
+
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.meta (p int, name text, data blob, version bigint, PRIMARY KEY (p, name))",
+        ).unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // PREPARE: UPDATE with IF condition containing a bind marker
+        let query =
+            "UPDATE ks.meta SET data = ?, version = ? WHERE p = ? AND name = ? IF version = ?";
+        let query_bytes = query.as_bytes();
+        let mut body = BytesMut::new();
+        body.put_i32(query_bytes.len() as i32);
+        body.put_slice(query_bytes);
+
+        let result = crate::connection::handle_prepare(
+            &mut None,
+            &mut Some("ks".into()),
+            &state,
+            &body.freeze(),
+        );
+        match result {
+            crate::connection::HandleResult::Reply(opcode, body) => {
+                assert_eq!(opcode, crate::frame::Opcode::Result);
+                assert_eq!(&body[0..4], &0x0004i32.to_be_bytes());
+                let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+                let mut off = 6 + id_len;
+                let _bind_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+                let bind_col_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+
+                // 5 bind markers: data=?, version=? (SET) + p=?, name=? (WHERE) + version=? (IF)
+                assert_eq!(
+                    bind_col_count, 5,
+                    "PREPARE should report 5 bind columns for UPDATE...IF version=?, got {bind_col_count}"
+                );
+            }
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    // ── FRSA-BUG-026: INSERT IF NOT EXISTS with map column ────────────
+
+    /// Temporal's queue_metadata: INSERT IF NOT EXISTS with a map column
+    /// must not error on the existence check read-back.
+    #[tokio::test]
+    async fn insert_if_not_exists_with_map_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.queue_metadata (queue_type int PRIMARY KEY, cluster_ack_level map<text, bigint>, version bigint)",
+        ).unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // First insert: should succeed (row doesn't exist)
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.queue_metadata (queue_type, cluster_ack_level, version) VALUES (1, {}, 0) IF NOT EXISTS",
+        ).unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "first INSERT IF NOT EXISTS should succeed: {:?}",
+            result.err()
+        );
+
+        // Second insert: should return [applied]=false (row exists)
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.queue_metadata (queue_type, cluster_ack_level, version) VALUES (1, {}, 0) IF NOT EXISTS",
+        ).unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "second INSERT IF NOT EXISTS should succeed (return applied=false): {:?}",
+            result.err()
+        );
+    }
+
+    // ── FRSA-BUG-025: collection bind value decoding ──────────────────
+
+    /// Empty map bind value must not error with "type mismatch: expected map".
+    #[tokio::test]
+    async fn insert_empty_map_literal() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
+        )
+        .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // Empty map literal
+        let stmt =
+            crate::parser::parse("INSERT INTO ks.qm (qt, ack, ver) VALUES (1, {}, 0)").unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "empty map insert failed: {:?}",
+            result.err()
+        );
+    }
+
+    /// Non-empty map literal roundtrip.
+    #[tokio::test]
+    async fn insert_and_select_map_literal() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
+        )
+        .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("INSERT INTO ks.qm (qt, ack, ver) VALUES (1, {'dc1': 100}, 0)")
+                .unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(result.is_ok(), "map insert failed: {:?}", result.err());
+
+        let sel = crate::parser::parse("SELECT qt, ver FROM ks.qm WHERE qt = 1").unwrap();
+        let result = route(&state, &ctx_ks, sel).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_row_count(b), 1);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Set and list bind values must also decode correctly.
+    #[tokio::test]
+    async fn insert_set_and_list_literals() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.coll (k int PRIMARY KEY, ids set<uuid>, events list<text>)",
+        )
+        .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.coll (k, ids, events) VALUES (1, {550e8400-e29b-41d4-a716-446655440000}, ['login', 'logout'])",
+        )
+        .unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(result.is_ok(), "set/list insert failed: {:?}", result.err());
+    }
+
     // ── BUG-001: TRUNCATE must actually delete data ──────────────────
 
     #[tokio::test]
@@ -7890,6 +8827,177 @@ mod tests {
         let encoded = hex_encode(&original);
         let decoded = super::hex_decode(&encoded).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    /// Phonetic index: equality on clustering key column with phonetic index matches by
+    /// Double Metaphone code, not exact string. PK lookup + post-filter path.
+    #[tokio::test]
+    async fn phonetic_index_equality_matches_by_metaphone_clustering_key() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE phon_ck WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE phon_ck.entities (tenant_id text, session_id text, entity_name text, data text, PRIMARY KEY ((tenant_id, session_id), entity_name))",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE INDEX phon_ck_idx ON phon_ck.entities (entity_name) USING 'phonetic'",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO phon_ck.entities (tenant_id, session_id, entity_name, data) VALUES ('t1', 's1', 'John Smith', 'some data')",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // SELECT with phonetically equivalent name — must match via post-filter
+        let stmt = crate::parser::parse(
+            "SELECT entity_name, data FROM phon_ck.entities WHERE tenant_id = 't1' AND session_id = 's1' AND entity_name = 'Jon Smyth'",
+        ).unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "phonetic query should not error: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "phonetic index should match 'Jon Smyth' to 'John Smith', got {count} rows"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Phonetic index: equality on regular column (not part of PK) matches
+    /// by Double Metaphone. This exercises the index-based scan path.
+    #[tokio::test]
+    async fn phonetic_index_equality_matches_by_metaphone_regular_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE phon_reg WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // entity_name is a REGULAR column, entity_id is clustering key
+        let stmt = crate::parser::parse(
+            "CREATE TABLE phon_reg.entities (tenant_id text, session_id text, entity_id text, entity_name text, data text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE INDEX phon_reg_idx ON phon_reg.entities (entity_name) USING 'phonetic'",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO phon_reg.entities (tenant_id, session_id, entity_id, entity_name, data) VALUES ('t1', 's1', 'e1', 'John Smith', 'some data')",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Query with phonetically equivalent name on regular column
+        let stmt = crate::parser::parse(
+            "SELECT entity_name, data FROM phon_reg.entities WHERE tenant_id = 't1' AND session_id = 's1' AND entity_name = 'Jon Smyth'",
+        ).unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "phonetic query should not error: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "phonetic index should match 'Jon Smyth' to 'John Smith' on regular column, got {count} rows"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Phonetic index: query WITHOUT partition key — forces index-only scan path.
+    #[tokio::test]
+    async fn phonetic_index_equality_matches_without_pk() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE phon_nopk WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE phon_nopk.entities (id int PRIMARY KEY, entity_name text)",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE INDEX phon_nopk_idx ON phon_nopk.entities (entity_name) USING 'phonetic'",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO phon_nopk.entities (id, entity_name) VALUES (1, 'John Smith')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Query by phonetic equivalent WITHOUT specifying PK — forces index path
+        let stmt = crate::parser::parse(
+            "SELECT id, entity_name FROM phon_nopk.entities WHERE entity_name = 'Jon Smyth'",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "phonetic query without PK should not error: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "phonetic index lookup should match 'Jon Smyth' to 'John Smith', got {count} rows"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
     }
 
     /// `CREATE INDEX` followed by `INSERT` then `SELECT WHERE indexed_col = ?`

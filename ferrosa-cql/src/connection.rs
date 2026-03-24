@@ -20,6 +20,7 @@ use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
 
+use crate::ast::{SelectColumn, Statement};
 use crate::auth::{
     encode_auth_success, encode_authenticate_response, parse_sasl_plain, MAX_AUTH_ATTEMPTS,
 };
@@ -406,7 +407,7 @@ enum FrameOrPush {
 }
 
 /// Outcome of processing a single frame.
-enum HandleResult {
+pub(crate) enum HandleResult {
     /// Send a response and continue reading.
     Reply(Opcode, BytesMut),
     /// Send a response and then close the connection.
@@ -690,12 +691,94 @@ async fn handle_query(
     let (paging, serial_cl) = parse_query_paging_params(&mut cursor);
 
     // Parse the CQL statement.
-    let stmt = match parser::parse(query) {
+    let mut stmt = match parser::parse(query) {
         Ok(s) => s,
         Err(e) => {
             return HandleResult::Reply(Opcode::Error, e.encode_body());
         }
     };
+
+    // Parse flags and positional bind values from the QUERY body.
+    // CQL v4/v5 format after consistency: [byte flags][short n_values][bytes value]*
+    if cursor.remaining() >= 1 {
+        let flags = cursor.get_u8();
+        let has_values = flags & 0x01 != 0;
+        let has_names = flags & 0x40 != 0;
+
+        if has_values && cursor.remaining() >= 2 {
+            let n_values = cursor.get_u16() as usize;
+            let bind_col_names = extract_bind_column_names(&stmt);
+
+            // Resolve column types from schema (same logic as PREPARE)
+            let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
+            let bound_columns: Vec<(String, CqlType)> = {
+                let snapshot = state.schema.snapshot();
+                let key = (table_ks, table_name);
+                match snapshot.tables.get(&key) {
+                    Some(table_meta) => {
+                        let mut cols = Vec::with_capacity(bind_col_names.len());
+                        for col_name in &bind_col_names {
+                            if let Some(cm) = table_meta.columns.get(col_name) {
+                                cols.push((
+                                    col_name.clone(),
+                                    col_type_str_to_cql_type(&cm.column_type),
+                                ));
+                            } else {
+                                // Unknown column — use Blob as fallback type.
+                                cols.push((col_name.clone(), CqlType::Blob));
+                            }
+                        }
+                        cols
+                    }
+                    None => bind_col_names
+                        .iter()
+                        .map(|n| (n.clone(), CqlType::Blob))
+                        .collect(),
+                }
+            };
+
+            let mut values: Vec<(String, Vec<u8>)> = Vec::with_capacity(n_values);
+            for i in 0..n_values {
+                let name = if has_names && cursor.remaining() >= 2 {
+                    let name_len = cursor.get_u16() as usize;
+                    if cursor.remaining() >= name_len {
+                        let n = std::str::from_utf8(&cursor[..name_len])
+                            .unwrap_or("")
+                            .to_string();
+                        cursor.advance(name_len);
+                        n
+                    } else {
+                        break;
+                    }
+                } else {
+                    // Positional: use the column name from the parsed statement
+                    bind_col_names.get(i).cloned().unwrap_or_default()
+                };
+
+                if cursor.remaining() >= 4 {
+                    let val_len = cursor.get_i32();
+                    if val_len < 0 {
+                        // NULL value
+                        values.push((name, Vec::new()));
+                    } else {
+                        let val_len = val_len as usize;
+                        if cursor.remaining() >= val_len {
+                            let val_bytes = cursor[..val_len].to_vec();
+                            cursor.advance(val_len);
+                            values.push((name, val_bytes));
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Substitute bind markers in the statement with actual values.
+            substitute_bind_values(&mut stmt, &values, &bound_columns);
+        }
+    }
 
     // Build an auth context for routing (use a default if auth was disabled).
     let ctx = build_request_context(auth_context, current_keyspace, cl, serial_cl, paging);
@@ -724,7 +807,7 @@ async fn handle_query(
 
 // ── PREPARE ──────────────────────────────────────────────────────────────
 
-fn handle_prepare(
+pub(crate) fn handle_prepare(
     _auth_context: &mut Option<AuthContext>,
     current_keyspace: &mut Option<String>,
     state: &SharedState,
@@ -773,28 +856,105 @@ fn handle_prepare(
         match snapshot.tables.get(&key) {
             Some(table_meta) => {
                 let mut cols = Vec::with_capacity(bind_col_names.len());
-                let mut all_resolved = true;
                 for col_name in &bind_col_names {
-                    if let Some(cm) = table_meta.columns.get(col_name) {
+                    if col_name == "[ttl]" {
+                        cols.push(("[ttl]".to_string(), CqlType::Int));
+                    } else if col_name == "[timestamp]" {
+                        cols.push(("[timestamp]".to_string(), CqlType::Bigint));
+                    } else if let Some(cm) = table_meta.columns.get(col_name) {
                         cols.push((col_name.clone(), col_type_str_to_cql_type(&cm.column_type)));
                     } else {
-                        // Column not found in schema — can't build reliable metadata.
-                        all_resolved = false;
-                        break;
+                        // Unknown column — use Blob fallback
+                        cols.push((col_name.clone(), CqlType::Blob));
                     }
                 }
-                if all_resolved {
-                    cols
-                } else {
-                    Vec::new()
-                }
+                cols
             }
-            None => Vec::new(),
+            None => bind_col_names
+                .iter()
+                .map(|n| (n.clone(), CqlType::Blob))
+                .collect(),
         }
     };
 
-    // Build result_columns for SELECT statements.
-    let result_columns: Vec<(String, CqlType)> = Vec::new();
+    // Build result_columns for SELECT and LWT (IF NOT EXISTS / IF condition) statements.
+    let result_columns: Vec<(String, CqlType)> = match &stmt {
+        Statement::Select(ref sel) => {
+            let snapshot = state.schema.snapshot();
+            let key = (table_ks.clone(), table_name.clone());
+            match snapshot.tables.get(&key) {
+                Some(table_meta) => {
+                    let is_star = sel.columns.iter().any(|c| matches!(c, SelectColumn::Star));
+                    if is_star {
+                        table_meta
+                            .columns
+                            .iter()
+                            .map(|(name, cm)| {
+                                (name.clone(), col_type_str_to_cql_type(&cm.column_type))
+                            })
+                            .collect()
+                    } else {
+                        let mut cols = Vec::new();
+                        for sc in &sel.columns {
+                            match sc {
+                                SelectColumn::Column(name) => {
+                                    if let Some(cm) = table_meta.columns.get(name) {
+                                        cols.push((
+                                            name.clone(),
+                                            col_type_str_to_cql_type(&cm.column_type),
+                                        ));
+                                    }
+                                }
+                                SelectColumn::FunctionCall { alias, name, .. } => {
+                                    let display =
+                                        alias.clone().unwrap_or_else(|| name.to_lowercase());
+                                    let fn_lower = name.to_lowercase();
+                                    let cql_type = match fn_lower.as_str() {
+                                        "count" => CqlType::Bigint,
+                                        "writetime" => CqlType::Bigint,
+                                        "ttl" => CqlType::Int,
+                                        "totimestamp" | "todate" | "now" => CqlType::Timestamp,
+                                        "uuid" | "timeuuid" => CqlType::Uuid,
+                                        "avg" | "sum" | "min" | "max" => CqlType::Blob,
+                                        _ => CqlType::Blob,
+                                    };
+                                    cols.push((display, cql_type));
+                                }
+                                SelectColumn::Star => {}
+                            }
+                        }
+                        cols
+                    }
+                }
+                None => Vec::new(),
+            }
+        }
+        // LWT: INSERT IF NOT EXISTS returns [applied] + all table columns
+        Statement::Insert(ins) if ins.if_not_exists => {
+            let mut cols = vec![("[applied]".to_string(), CqlType::Boolean)];
+            let snapshot = state.schema.snapshot();
+            let key = (table_ks.clone(), table_name.clone());
+            if let Some(table_meta) = snapshot.tables.get(&key) {
+                for (name, cm) in &table_meta.columns {
+                    cols.push((name.clone(), col_type_str_to_cql_type(&cm.column_type)));
+                }
+            }
+            cols
+        }
+        // LWT: UPDATE IF condition returns [applied] + all table columns
+        Statement::Update(upd) if !upd.if_conditions.is_empty() || upd.if_exists => {
+            let mut cols = vec![("[applied]".to_string(), CqlType::Boolean)];
+            let snapshot = state.schema.snapshot();
+            let key = (table_ks.clone(), table_name.clone());
+            if let Some(table_meta) = snapshot.tables.get(&key) {
+                for (name, cm) in &table_meta.columns {
+                    cols.push((name.clone(), col_type_str_to_cql_type(&cm.column_type)));
+                }
+            }
+            cols
+        }
+        _ => Vec::new(),
+    };
 
     // Compute pk_indexes: map each partition key column to its position in the
     // bind variable list. If any PK column is not bound, pass empty (pk_count=0).
@@ -987,7 +1147,7 @@ async fn handle_batch(
         }
         let kind = cursor.get_u8();
 
-        let stmt = if kind == 0 {
+        let mut stmt = if kind == 0 {
             // Inline query string: [int len][bytes query]
             if cursor.remaining() < 4 {
                 let err = CqlError::Protocol("BATCH body truncated".into());
@@ -1040,17 +1200,61 @@ async fn handle_batch(
             return HandleResult::Reply(Opcode::Error, err.encode_body());
         };
 
-        // Skip bound values: [short n_values]([int val_len][bytes val])*
+        // Parse and substitute bound values.
         if cursor.remaining() >= 2 {
             let n_values = cursor.get_u16() as usize;
-            for _ in 0..n_values {
-                if cursor.remaining() < 4 {
-                    break;
+            if n_values > 0 {
+                let bind_col_names = extract_bind_column_names(&stmt);
+
+                let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
+                let bound_columns: Vec<(String, CqlType)> = {
+                    let snapshot = state.schema.snapshot();
+                    let key = (table_ks, table_name);
+                    match snapshot.tables.get(&key) {
+                        Some(table_meta) => {
+                            let mut cols = Vec::with_capacity(bind_col_names.len());
+                            for col_name in &bind_col_names {
+                                if let Some(cm) = table_meta.columns.get(col_name) {
+                                    cols.push((
+                                        col_name.clone(),
+                                        col_type_str_to_cql_type(&cm.column_type),
+                                    ));
+                                } else {
+                                    // Unknown column — use Blob as fallback type.
+                                    cols.push((col_name.clone(), CqlType::Blob));
+                                }
+                            }
+                            cols
+                        }
+                        None => bind_col_names
+                            .iter()
+                            .map(|n| (n.clone(), CqlType::Blob))
+                            .collect(),
+                    }
+                };
+
+                let mut values: Vec<(String, Vec<u8>)> = Vec::with_capacity(n_values);
+                for i in 0..n_values {
+                    let name = bind_col_names.get(i).cloned().unwrap_or_default();
+                    if cursor.remaining() < 4 {
+                        break;
+                    }
+                    let val_len = cursor.get_i32();
+                    if val_len < 0 {
+                        values.push((name, Vec::new())); // NULL
+                    } else {
+                        let val_len = val_len as usize;
+                        if cursor.remaining() >= val_len {
+                            let val_bytes = cursor[..val_len].to_vec();
+                            cursor.advance(val_len);
+                            values.push((name, val_bytes));
+                        } else {
+                            break;
+                        }
+                    }
                 }
-                let val_len = cursor.get_i32();
-                if val_len > 0 && cursor.remaining() >= val_len as usize {
-                    cursor.advance(val_len as usize);
-                }
+
+                substitute_bind_values(&mut stmt, &values, &bound_columns);
             }
         }
 
@@ -1066,7 +1270,9 @@ async fn handle_batch(
         ferrosa_cluster::consistency::ConsistencyLevel::One
     };
 
-    // Route each statement. BATCH does not support pagination.
+    // Route each statement. If any statement is an LWT (IF NOT EXISTS / IF
+    // condition), capture its result to return instead of void.
+    let mut lwt_result: Option<BytesMut> = None;
     for stmt in statements {
         let ctx = build_request_context(
             auth_context,
@@ -1079,6 +1285,17 @@ async fn handle_batch(
             Ok(RouteResult::SetKeyspace(ks, _)) => {
                 *current_keyspace = Some(ks);
             }
+            Ok(RouteResult::Result(body)) => {
+                // Check if this is an LWT result (Rows kind with [applied] column).
+                // LWT results have kind=2 (Rows), non-LWT results have kind=1 (Void).
+                if lwt_result.is_none() && body.len() >= 4 {
+                    let kind = i32::from_be_bytes(body[0..4].try_into().unwrap_or([0; 4]));
+                    if kind == 0x0002 {
+                        // Rows result — this is from an LWT statement
+                        lwt_result = Some(body);
+                    }
+                }
+            }
             Ok(_) => {}
             Err(e) => {
                 return HandleResult::Reply(Opcode::Error, e.encode_body());
@@ -1086,8 +1303,9 @@ async fn handle_batch(
         }
     }
 
-    // BATCH returns a void result.
-    HandleResult::Reply(Opcode::Result, result::encode_void())
+    // Return LWT result if any statement was conditional, otherwise void.
+    let result_body = lwt_result.unwrap_or_else(result::encode_void);
+    HandleResult::Reply(Opcode::Result, result_body)
 }
 
 // ── REGISTER ─────────────────────────────────────────────────────────────
@@ -1293,6 +1511,13 @@ fn extract_bind_column_names(stmt: &crate::ast::Statement) -> Vec<String> {
                     names.push(col.clone());
                 }
             }
+            // USING TTL ?  / USING TIMESTAMP ? — parsed as 0 sentinel
+            if ins.using_ttl == Some(0) {
+                names.push("[ttl]".to_string());
+            }
+            if ins.using_timestamp == Some(0) {
+                names.push("[timestamp]".to_string());
+            }
             names
         }
         Statement::Select(sel) => {
@@ -1339,6 +1564,19 @@ fn extract_bind_column_names(stmt: &crate::ast::Statement) -> Vec<String> {
                 if matches!(&wc.value, Term::BindMarker(_)) {
                     names.push(wc.column.clone());
                 }
+            }
+            // IF condition bind markers (LWT)
+            for wc in &upd.if_conditions {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    names.push(wc.column.clone());
+                }
+            }
+            // USING TTL ? / USING TIMESTAMP ?
+            if upd.using_ttl == Some(0) {
+                names.push("[ttl]".to_string());
+            }
+            if upd.using_timestamp == Some(0) {
+                names.push("[timestamp]".to_string());
             }
             names
         }
@@ -1393,6 +1631,17 @@ fn substitute_bind_values(
                     }
                 }
             }
+            // Substitute [ttl] and [timestamp] bind values
+            if ins.using_ttl == Some(0) {
+                if let Some(Term::IntegerLiteral(v)) = value_map.get("[ttl]") {
+                    ins.using_ttl = Some(*v as i32);
+                }
+            }
+            if ins.using_timestamp == Some(0) {
+                if let Some(Term::IntegerLiteral(v)) = value_map.get("[timestamp]") {
+                    ins.using_timestamp = Some(*v);
+                }
+            }
         }
         Statement::Select(sel) => {
             for wc in &mut sel.where_clauses {
@@ -1421,6 +1670,25 @@ fn substitute_bind_values(
                     if let Some(resolved) = value_map.get(&wc.column) {
                         wc.value = resolved.clone();
                     }
+                }
+            }
+            // IF condition bind markers (LWT)
+            for wc in &mut upd.if_conditions {
+                if matches!(&wc.value, Term::BindMarker(_)) {
+                    if let Some(resolved) = value_map.get(&wc.column) {
+                        wc.value = resolved.clone();
+                    }
+                }
+            }
+            // Substitute [ttl] and [timestamp] bind values
+            if upd.using_ttl == Some(0) {
+                if let Some(Term::IntegerLiteral(v)) = value_map.get("[ttl]") {
+                    upd.using_ttl = Some(*v as i32);
+                }
+            }
+            if upd.using_timestamp == Some(0) {
+                if let Some(Term::IntegerLiteral(v)) = value_map.get("[timestamp]") {
+                    upd.using_timestamp = Some(*v);
                 }
             }
         }
@@ -1466,11 +1734,127 @@ fn raw_bytes_to_term(bytes: &[u8], cql_type: &CqlType) -> crate::ast::Term {
             let uuid = uuid::Uuid::from_bytes(bytes.try_into().unwrap());
             Term::UuidLiteral(uuid)
         }
+        CqlType::Inet if bytes.len() == 4 => {
+            let addr = std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+            Term::StringLiteral(addr.to_string())
+        }
+        CqlType::Inet if bytes.len() == 16 => {
+            let octets: [u8; 16] = bytes.try_into().unwrap();
+            let addr = std::net::Ipv6Addr::from(octets);
+            Term::StringLiteral(addr.to_string())
+        }
+        // Collections: decode from CQL binary wire format.
+        // Format: [i32 count] then count elements (list/set) or key-value pairs (map).
+        // Each element: [i32 len][bytes].
+        CqlType::Map(key_type, val_type) => decode_map_term(bytes, key_type, val_type),
+        CqlType::List(elem_type) => decode_list_term(bytes, elem_type),
+        CqlType::Set(elem_type) => decode_set_term(bytes, elem_type),
+        CqlType::Blob => Term::BlobLiteral(bytes.to_vec()),
+        CqlType::Varint => {
+            // Varint: variable-length signed integer in big-endian.
+            // For bind values, store as blob — the storage engine handles it.
+            Term::BlobLiteral(bytes.to_vec())
+        }
+        CqlType::Decimal => Term::BlobLiteral(bytes.to_vec()),
+        CqlType::Date if bytes.len() == 4 => {
+            // CQL date: days since epoch as u32.
+            Term::IntegerLiteral(u32::from_be_bytes(bytes.try_into().unwrap()) as i64)
+        }
+        CqlType::Time if bytes.len() == 8 => {
+            // CQL time: nanoseconds since midnight as i64.
+            Term::IntegerLiteral(i64::from_be_bytes(bytes.try_into().unwrap()))
+        }
+        CqlType::Duration => Term::BlobLiteral(bytes.to_vec()),
         _ => {
             // Fallback: treat as blob
             Term::BlobLiteral(bytes.to_vec())
         }
     }
+}
+
+/// Decode a CQL binary map into a `Term::MapLiteral`.
+fn decode_map_term(bytes: &[u8], key_type: &CqlType, val_type: &CqlType) -> crate::ast::Term {
+    use crate::ast::Term;
+    if bytes.len() < 4 {
+        return Term::MapLiteral(vec![]);
+    }
+    let count = i32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let mut pairs = Vec::with_capacity(count);
+    let mut off = 4usize;
+    for _ in 0..count {
+        if off + 4 > bytes.len() {
+            break;
+        }
+        let key_len = i32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        if off + key_len > bytes.len() {
+            break;
+        }
+        let key_term = raw_bytes_to_term(&bytes[off..off + key_len], key_type);
+        off += key_len;
+
+        if off + 4 > bytes.len() {
+            break;
+        }
+        let val_len = i32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        if off + val_len > bytes.len() {
+            break;
+        }
+        let val_term = raw_bytes_to_term(&bytes[off..off + val_len], val_type);
+        off += val_len;
+
+        pairs.push((key_term, val_term));
+    }
+    Term::MapLiteral(pairs)
+}
+
+/// Decode a CQL binary list into a `Term::ListLiteral`.
+fn decode_list_term(bytes: &[u8], elem_type: &CqlType) -> crate::ast::Term {
+    use crate::ast::Term;
+    if bytes.len() < 4 {
+        return Term::ListLiteral(vec![]);
+    }
+    let count = i32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let mut items = Vec::with_capacity(count);
+    let mut off = 4usize;
+    for _ in 0..count {
+        if off + 4 > bytes.len() {
+            break;
+        }
+        let item_len = i32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        if off + item_len > bytes.len() {
+            break;
+        }
+        items.push(raw_bytes_to_term(&bytes[off..off + item_len], elem_type));
+        off += item_len;
+    }
+    Term::ListLiteral(items)
+}
+
+/// Decode a CQL binary set into a `Term::SetLiteral`.
+fn decode_set_term(bytes: &[u8], elem_type: &CqlType) -> crate::ast::Term {
+    use crate::ast::Term;
+    if bytes.len() < 4 {
+        return Term::SetLiteral(vec![]);
+    }
+    let count = i32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let mut items = Vec::with_capacity(count);
+    let mut off = 4usize;
+    for _ in 0..count {
+        if off + 4 > bytes.len() {
+            break;
+        }
+        let item_len = i32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        if off + item_len > bytes.len() {
+            break;
+        }
+        items.push(raw_bytes_to_term(&bytes[off..off + item_len], elem_type));
+        off += item_len;
+    }
+    Term::SetLiteral(items)
 }
 
 /// Map a column type string (from schema metadata) to the CQL wire type.
@@ -1687,5 +2071,108 @@ mod tests {
         let result = handle_startup(&mut phase, true, &body.freeze(), &mut pending);
         assert!(matches!(result, HandleResult::Reply(Opcode::Error, _)));
         assert!(pending.is_none());
+    }
+
+    // ── raw_bytes_to_term collection decoding ───────────────────────────
+
+    #[test]
+    fn raw_bytes_to_term_empty_map() {
+        let bytes = 0i32.to_be_bytes();
+        let cql_type = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Bigint));
+        match raw_bytes_to_term(&bytes, &cql_type) {
+            crate::ast::Term::MapLiteral(pairs) => assert!(pairs.is_empty()),
+            other => panic!("expected empty MapLiteral, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_bytes_to_term_map_with_entry() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1i32.to_be_bytes());
+        let key = b"hello";
+        bytes.extend_from_slice(&(key.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&8i32.to_be_bytes());
+        bytes.extend_from_slice(&42i64.to_be_bytes());
+
+        let cql_type = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Bigint));
+        match raw_bytes_to_term(&bytes, &cql_type) {
+            crate::ast::Term::MapLiteral(pairs) => {
+                assert_eq!(pairs.len(), 1);
+                assert!(matches!(&pairs[0].0, crate::ast::Term::StringLiteral(s) if s == "hello"));
+                assert!(matches!(&pairs[0].1, crate::ast::Term::IntegerLiteral(42)));
+            }
+            other => panic!("expected MapLiteral, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_bytes_to_term_empty_list() {
+        let bytes = 0i32.to_be_bytes();
+        let cql_type = CqlType::List(Box::new(CqlType::Varchar));
+        match raw_bytes_to_term(&bytes, &cql_type) {
+            crate::ast::Term::ListLiteral(items) => assert!(items.is_empty()),
+            other => panic!("expected empty ListLiteral, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_bytes_to_term_list_with_items() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2i32.to_be_bytes());
+        for s in &["alpha", "beta"] {
+            bytes.extend_from_slice(&(s.len() as i32).to_be_bytes());
+            bytes.extend_from_slice(s.as_bytes());
+        }
+        let cql_type = CqlType::List(Box::new(CqlType::Varchar));
+        match raw_bytes_to_term(&bytes, &cql_type) {
+            crate::ast::Term::ListLiteral(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(&items[0], crate::ast::Term::StringLiteral(s) if s == "alpha"));
+                assert!(matches!(&items[1], crate::ast::Term::StringLiteral(s) if s == "beta"));
+            }
+            other => panic!("expected ListLiteral, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_bytes_to_term_empty_set() {
+        let bytes = 0i32.to_be_bytes();
+        let cql_type = CqlType::Set(Box::new(CqlType::Int));
+        match raw_bytes_to_term(&bytes, &cql_type) {
+            crate::ast::Term::SetLiteral(items) => assert!(items.is_empty()),
+            other => panic!("expected empty SetLiteral, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_bytes_to_term_set_with_uuids() {
+        let uuid1 = uuid::Uuid::nil();
+        let uuid2 = uuid::Uuid::from_u128(1);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2i32.to_be_bytes());
+        bytes.extend_from_slice(&16i32.to_be_bytes());
+        bytes.extend_from_slice(uuid1.as_bytes());
+        bytes.extend_from_slice(&16i32.to_be_bytes());
+        bytes.extend_from_slice(uuid2.as_bytes());
+
+        let cql_type = CqlType::Set(Box::new(CqlType::Uuid));
+        match raw_bytes_to_term(&bytes, &cql_type) {
+            crate::ast::Term::SetLiteral(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(&items[0], crate::ast::Term::UuidLiteral(u) if *u == uuid1));
+                assert!(matches!(&items[1], crate::ast::Term::UuidLiteral(u) if *u == uuid2));
+            }
+            other => panic!("expected SetLiteral, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_bytes_to_term_inet_v4() {
+        let bytes = [127, 0, 0, 1];
+        match raw_bytes_to_term(&bytes, &CqlType::Inet) {
+            crate::ast::Term::StringLiteral(s) => assert_eq!(s, "127.0.0.1"),
+            other => panic!("expected 127.0.0.1, got {other:?}"),
+        }
     }
 }
