@@ -1,6 +1,7 @@
 # DSM Dependency Analysis: Accord Transaction Integration
 
 **Date:** 2026-03-21
+**Updated:** 2026-03-23
 **Scope:** Impact of Accord distributed transactions on the Ferrosa Rust workspace dependency graph
 **Method:** Design Structure Matrix (DSM) with fan-in/fan-out metrics and propagation cost analysis
 
@@ -77,28 +78,32 @@ Crates ordered by topological depth (leaves first):
 
 ---
 
-## 2. Proposed Changes for Accord
+## 2. Implemented Changes for Accord (A1-A7 Complete)
 
 ### 2.1 Changes Per Crate
+
+All Accord milestones (A1-A7) are implemented. 2,808 tests pass. The following
+summarizes the actual module inventory as of 2026-03-23.
 
 | Crate | Additions | New Deps |
 |-------|-----------|----------|
 | **ferrosa-common** | `HLC`, `Timestamp`, `TxnId`, `AcceptedBallot`, `PromisedBallot`, `Deps` (dependency set type) | _(none)_ |
 | **ferrosa-net** | 11 new `Message` variants (`PreAccept`, `PreAcceptOk`, `Accept`, `AcceptOk`, `Commit`, `Apply`, `Recover`, `RecoverOk`, `Read`, `ReadOk`, `TxnResult`), heartbeat HLC piggyback | + **ferrosa-common** |
-| **ferrosa-storage** | `ConflictIndex`, `MemIndex`, 4 commit log entry types (`CL_PREACCEPT`, `CL_ACCEPT`, `CL_COMMIT`, `CL_APPLY`) | _(no new deps)_ |
-| **ferrosa-cluster** | New `accord/` submodule: `AccordStateMachine`, `AccordCoordinator`, `ReorderBuffer`, `ElectorateConfig`, `RecoveryCoordinator` | _(no new deps -- already has common, net, storage, schema)_ |
-| **ferrosa-cql** | `BEGIN TRANSACTION`/`COMMIT`/`ROLLBACK` parsing, 2i query planner for transactional reads | _(no new deps)_ |
+| **ferrosa-storage** | `accord/` submodule (10 modules): `conflict_index.rs`, `protocol_log.rs`, `sync_writer.rs`, `write_gate.rs`, `entries.rs`, `crash_recovery.rs`, `sidecar.rs`, `read_2i.rs`, `oversized_entry.rs`, `mod.rs` | _(no new deps)_ |
+| **ferrosa-cluster** | `accord/` submodule (26 modules): `state_machine.rs`, `coordinator.rs`, `cross_shard.rs`, `recovery.rs`, `recovery_scenarios.rs`, `dep_wait.rs`, `ddl_drain.rs`, `leaseholder.rs`, `linearizable_read.rs`, `reorder_buffer.rs`, `test_cluster.rs`, `clock_validation.rs`, `durability.rs`, `electorate.rs`, `epoch.rs`, `epoch_drain.rs`, `two_phase_ddl.rs`, `metrics.rs`, `perf.rs`, `perf_regression.rs`, `proptests.rs`, `jepsen_bank.rs`, `jepsen_nemesis.rs`, `chaos_minority_kill.rs`, `uda_integration.rs`, `mod.rs` | _(no new deps -- already has common, net, storage, schema)_ |
+| **ferrosa-cql** | `accord_router.rs`, `session.rs`, `transaction_keys.rs`, `transaction_limits.rs`, `paging.rs`; `BEGIN TRANSACTION`/`COMMIT`/`ROLLBACK` parsing, 2i query planner for transactional reads | _(no new deps)_ |
 | **ferrosa-index** | Eager index build trigger on flush for transactional consistency | _(no new deps)_ |
+| **ferrosa-jepsen** _(planned)_ | Standalone crate for Jepsen-style linearizability testing; will depend on `ferrosa-cluster`, `ferrosa-cql` | _(new crate, not yet created)_ |
 
 ### 2.2 New Dependencies Introduced
 
-Only one new edge:
+Only one new edge (implemented):
 
 | From | To | Reason |
 |------|----|--------|
 | **ferrosa-net** | **ferrosa-common** | Message variants need `TxnId`, `Timestamp`, `AcceptedBallot`, `PromisedBallot`, `Deps` types |
 
-### 2.3 Proposed DSM Matrix
+### 2.3 Current DSM Matrix
 
 Changed cell marked with `*`:
 
@@ -286,12 +291,13 @@ A change to Accord message types flows through:
 
 ```
 ferrosa-common (types) -> ferrosa-net (Message variants)
-                       -> ferrosa-storage (ConflictIndex, commit log)
-                       -> ferrosa-cluster (AccordStateMachine)
-                       -> ferrosa-cql (BEGIN/COMMIT parsing)
+                       -> ferrosa-storage (10 accord modules: conflict_index, protocol_log, ...)
+                       -> ferrosa-cluster (26 accord modules: state_machine, coordinator, ...)
+                       -> ferrosa-cql (5 accord modules: accord_router, session, ...)
+                       -> ferrosa-jepsen (planned: jepsen_bank, jepsen_nemesis, chaos_minority_kill)
 ```
 
-This is a 4-crate chain, depth 3 (common -> storage -> cluster -> cql). No fan-out explosion -- each step adds one downstream consumer.
+This is a 4-crate chain (5 with ferrosa-jepsen), depth 3 (common -> storage -> cluster -> cql). No fan-out explosion -- each step adds one downstream consumer. The total module count across the chain is 41, but changes propagate at the crate level, not the module level.
 
 ---
 
@@ -301,10 +307,10 @@ This is a 4-crate chain, depth 3 (common -> storage -> cluster -> cql). No fan-o
 
 | Crate | Fan-In + Fan-Out | Risk Level | Notes |
 |-------|:----------------:|:----------:|-------|
-| common   | 11 + 0 = 11 | **Low** | High fan-in is expected for a types crate. Zero fan-out keeps it stable. Adding Accord types is within scope. |
-| cql      | 2 + 7 = 9   | **Medium** | Already the highest fan-out crate. Accord adds transaction parsing but no new deps. Monitor for scope creep. |
-| cluster  | 2 + 5 = 7   | **Medium** | Accord's `accord/` submodule adds significant internal complexity. The submodule boundary helps, but this crate is becoming the largest single component. |
-| storage  | 5 + 4 = 9   | **Medium** | ConflictIndex and 4 new commit log entry types add complexity. The storage crate already handles memtable, commit log, flush, compaction, and S3 write-behind. |
+| common   | 11 + 0 = 11 | **Low** | High fan-in is expected for a types crate. Zero fan-out keeps it stable. Accord types are in scope. |
+| cql      | 2 + 7 = 9   | **Medium** | Already the highest fan-out crate. Accord adds 5 modules (`accord_router.rs`, `session.rs`, `transaction_keys.rs`, `transaction_limits.rs`, `paging.rs`) but no new deps. Monitor for scope creep. |
+| cluster  | 2 + 5 = 7   | **High** | The `accord/` submodule now contains **26 modules** including protocol core (state machine, coordinator, recovery), testing infrastructure (test_cluster, jepsen_bank, jepsen_nemesis, chaos_minority_kill, proptests), observability (metrics, perf, perf_regression), and DDL integration (two_phase_ddl, ddl_drain). This is the largest single component in the workspace. The `mod.rs` boundary provides encapsulation, but the module count warrants monitoring for extraction candidates. |
+| storage  | 5 + 4 = 9   | **Medium** | The `accord/` submodule now contains **10 modules**: conflict_index, protocol_log, sync_writer, write_gate, entries, crash_recovery, sidecar, read_2i, oversized_entry. Well-scoped storage-layer concerns. |
 | bin      | 0 + 8 = 8   | **Low** | Composition root. Expected to have high fan-out. |
 
 ### 7.2 Boundary Cleanliness
@@ -313,11 +319,11 @@ This is a 4-crate chain, depth 3 (common -> storage -> cluster -> cql). No fan-o
 
 **ferrosa-net**: Adding `ferrosa-common` as a dependency is the right call. The Message enum already needs to reference `Token`, `PartitionKey`, etc. for existing internode messages. Accord message variants are a natural extension. The alternative (duplicating types in net) would be worse.
 
-**ferrosa-storage**: The ConflictIndex and commit log extensions operate on the same memtable/commit-log abstractions the crate already owns. No boundary violation.
+**ferrosa-storage**: The `accord/` submodule (10 modules) operates on the same memtable/commit-log abstractions the crate already owns. Includes crash recovery, conflict indexing, protocol logging, and a write gate for fsync-before-ack. No boundary violation.
 
-**ferrosa-cluster**: The `accord/` submodule contains the most new code. The boundary question is whether the Accord state machine, coordinator, and recovery logic belong in `cluster` or in a separate `ferrosa-accord` crate. Analysis below.
+**ferrosa-cluster**: The `accord/` submodule now has 26 modules -- the largest single subsystem in the workspace. This includes protocol core (state_machine, coordinator, cross_shard, recovery, recovery_scenarios), consensus infrastructure (dep_wait, electorate, epoch, epoch_drain, durability, leaseholder, linearizable_read, reorder_buffer, clock_validation, two_phase_ddl, ddl_drain), testing (test_cluster, proptests, jepsen_bank, jepsen_nemesis, chaos_minority_kill, uda_integration), and observability (metrics, perf, perf_regression). The `mod.rs` boundary with `pub(crate)` internals provides encapsulation. The planned `ferrosa-jepsen` crate will extract testing modules (jepsen_bank, jepsen_nemesis, chaos_minority_kill), reducing the count. See section 8 analysis for extraction decision.
 
-**ferrosa-cql**: Transaction syntax parsing (`BEGIN`/`COMMIT`/`ROLLBACK`) is squarely within CQL's scope. The 2i query planner changes are modifications to existing code paths, not a new subsystem.
+**ferrosa-cql**: Five Accord-related modules: `accord_router.rs` (transaction routing), `session.rs` (transaction session lifecycle), `transaction_keys.rs` (key extraction), `transaction_limits.rs` (configurable limits enforcement), `paging.rs` (transactional result paging). All squarely within CQL's scope.
 
 **ferrosa-index**: Eager index build on flush is a small hook, not a structural change.
 
@@ -331,7 +337,8 @@ This is a 4-crate chain, depth 3 (common -> storage -> cluster -> cql). No fan-o
 |--------|--------|-----------|
 | Cohesion | Medium | Accord is a self-contained consensus protocol with its own state machine, recovery, and reorder buffer. |
 | Testability | Medium | An isolated crate can be tested against mock storage/net without pulling in the full cluster stack. |
-| Compile time | Low | ~5 new modules is modest. Splitting saves incremental compile time only if Accord changes frequently while cluster does not. |
+| Compile time | **High** | 26 modules is substantial. Splitting saves incremental compile time when Accord changes frequently while cluster does not. |
+| Test isolation | **High** | The testing modules (jepsen_bank, jepsen_nemesis, chaos_minority_kill, proptests, test_cluster) represent ~6 modules that should not be compiled in production builds. |
 | Optional builds | Low | If Accord is feature-gated, a separate crate makes the gate cleaner. |
 
 ### 8.2 Arguments Against Splitting
@@ -340,18 +347,20 @@ This is a 4-crate chain, depth 3 (common -> storage -> cluster -> cql). No fan-o
 |--------|--------|-----------|
 | Integration depth | **High** | AccordStateMachine needs direct access to cluster's Raft metadata, electorate tracking, and schema routing. Splitting creates a wide trait interface or circular dependency risk. |
 | Deployment coupling | **High** | Accord is not optional -- every node runs it. A separate crate adds a dep edge without enabling any independent deployment. |
-| Small surface | Medium | 5 modules (state machine, coordinator, reorder buffer, electorate config, recovery) is well within the scope of a single crate's submodule. |
+| Proven boundary | **High** | The 26-module `accord/` submodule has been implemented and tested with 2,808 passing tests. The `mod.rs` boundary is validated by practice. |
 | Dependency graph | Medium | A `ferrosa-accord` crate would need deps on `common`, `net`, `storage`, and `schema` -- the same deps `cluster` already has. It would also need to be consumed by `cluster`, adding an edge without reducing fan-out. |
 
-### 8.3 Recommendation
+### 8.3 Recommendation (Updated 2026-03-23)
 
-**Do not create `ferrosa-accord` as a separate crate.** Instead:
+**Do not create `ferrosa-accord` as a separate crate.** The integration depth argument remains decisive. However, with 26 modules the submodule is now the largest component in the workspace. Two actions:
 
-1. **Use `ferrosa-cluster/src/accord/` as a module boundary.** The `mod accord` with `pub(crate)` visibility on internals provides encapsulation without the overhead of a crate boundary.
+1. **Use `ferrosa-cluster/src/accord/` as a module boundary.** The `mod accord` with `pub(crate)` visibility on internals provides encapsulation without the overhead of a crate boundary. This has proven effective through A1-A7 implementation.
 
-2. **Extract `ferrosa-accord-types` only if types need to be shared with more than 2 crates.** Currently, Accord types in `ferrosa-common` cover cross-crate needs (`TxnId`, `Timestamp`, `Ballot` types). The Accord-internal types (`CommandStore`, `WaitingQueue`) stay private in the cluster submodule.
+2. **Create `ferrosa-jepsen` as a separate crate (planned).** Extract the Jepsen-style testing modules (`jepsen_bank.rs`, `jepsen_nemesis.rs`, `chaos_minority_kill.rs`) into a dedicated test crate. This reduces `ferrosa-cluster/src/accord/` from 26 to 23 modules and ensures chaos-testing tools are never compiled into production binaries. The `ferrosa-jepsen` crate depends on `ferrosa-cluster` and `ferrosa-cql` -- no new dependency edges from cluster to jepsen.
 
-3. **Feature-gate Accord in `ferrosa-common`.** Place Accord types behind `feature = "accord"` so non-transactional builds (worker, graph) do not pay for the type definitions:
+3. **Extract `ferrosa-accord-types` only if types need to be shared with more than 2 crates.** Currently, Accord types in `ferrosa-common` cover cross-crate needs (`TxnId`, `Timestamp`, `Ballot` types). The Accord-internal types (`CommandStore`, `WaitingQueue`) stay private in the cluster submodule.
+
+4. **Feature-gate Accord in `ferrosa-common`.** Place Accord types behind `feature = "accord"` so non-transactional builds (worker, graph) do not pay for the type definitions:
 
    ```toml
    # ferrosa-common/Cargo.toml
@@ -373,35 +382,40 @@ This is a 4-crate chain, depth 3 (common -> storage -> cluster -> cql). No fan-o
 
 ### 9.1 Structural Impact
 
-| Metric | Before | After | Delta |
-|--------|--------|-------|-------|
-| Total crates | 13 | 13 | 0 |
+| Metric | Before | After Accord (A1-A7) | Delta |
+|--------|--------|----------------------|-------|
+| Total crates | 13 | 13 (+1 planned: ferrosa-jepsen) | 0 (+1 planned) |
 | Total internal edges | 38 | **39** | **+1** |
 | Maximum topological depth | 6 | 6 | 0 |
 | Dependency cycles | 0 | **0** | 0 |
 | Crates modified by Accord | -- | **6** | -- |
-| New crates required | -- | **0** | -- |
+| New modules added | -- | **41** (26 cluster + 10 storage + 5 cql) | -- |
+| Tests passing | -- | **2,808** | -- |
 
 ### 9.2 Risk Assessment
 
 | Risk | Level | Mitigation |
 |------|-------|------------|
 | `ferrosa-common` becomes bloated | Low | Feature-gate Accord types. Accord adds ~6 types to a crate that already defines core DB types. |
-| `ferrosa-cluster` becomes a God crate | **Medium** | Enforce `mod accord` boundary. Keep AccordStateMachine behind a clean trait interface. Limit `pub` exports from the submodule to the coordinator entry point. |
-| `ferrosa-storage` commit log grows complex | **Medium** | The 4 new entry types should share the existing `LogEntry` serialization framework. Add a `TxnEntryKind` enum rather than 4 independent types. |
+| `ferrosa-cluster` becomes a God crate | **High** | The `accord/` submodule now has 26 modules. Enforce `mod accord` boundary with `pub(crate)`. Extract Jepsen testing modules into `ferrosa-jepsen` crate (planned). Monitor for further extraction candidates if module count grows beyond 30. |
+| `ferrosa-storage` accord submodule | **Medium** | 10 modules is manageable. The `mod.rs` boundary keeps concerns well-scoped (conflict indexing, protocol logging, crash recovery, write gating). |
+| `ferrosa-cql` transaction scope | **Low** | 5 new modules are well-defined: routing, sessions, key extraction, limits, paging. No structural risk. |
 | `ferrosa-net` coupling to common | Low | This is a natural dependency. Every other transport crate in the workspace already depends on common. Net was the outlier. |
 | Recompilation cascade from common changes | Low | Accord types are additive. Feature-gating eliminates cascade for unaffected crates. |
+| `ferrosa-jepsen` chaos tools in production | **Medium** | Planned crate must be `#[cfg(test)]` or a dev-dependency only. Must never be compiled into release binaries. See threat model AT-jepsen. |
 
 ### 9.3 Recommendations
 
-1. **Add `ferrosa-common` as a dependency of `ferrosa-net`.** This is the only new edge and it is well-justified. Net was the last crate without access to shared types.
+1. **Add `ferrosa-common` as a dependency of `ferrosa-net`.** This is the only new edge and it is well-justified. Net was the last crate without access to shared types. (Implemented.)
 
 2. **Feature-gate Accord types in `ferrosa-common`.** Use `feature = "accord"` to isolate Accord type definitions from crates that do not need them (`ferrosa-graph`, `ferrosa-worker`, `ferrosa-udf`).
 
-3. **Do not create a `ferrosa-accord` crate.** Use `ferrosa-cluster/src/accord/` as a module boundary. The integration depth with cluster internals (Raft metadata, schema routing, electorate) makes a crate boundary more costly than beneficial.
+3. **Do not create a `ferrosa-accord` crate.** Use `ferrosa-cluster/src/accord/` as a module boundary. The integration depth with cluster internals (Raft metadata, schema routing, electorate) makes a crate boundary more costly than beneficial. Validated by A1-A7 implementation.
 
-4. **Keep `ferrosa-storage` commit log extensions behind a shared `TxnEntryKind` enum** rather than adding 4 separate entry type structs. This keeps the commit log serialization path unified.
+4. **Create `ferrosa-jepsen` as a separate crate.** Extract Jepsen testing modules (`jepsen_bank`, `jepsen_nemesis`, `chaos_minority_kill`) from `ferrosa-cluster/src/accord/`. This reduces the cluster accord module count and prevents chaos tools from being compiled into production. (Planned.)
 
-5. **Monitor `ferrosa-cluster` fan-out.** At 5 dependencies, it is approaching the complexity threshold. If Accord causes `cluster` to grow beyond ~2000 lines of Accord-specific code, reconsider extraction.
+5. **Keep `ferrosa-storage` commit log extensions behind a shared `TxnEntryKind` enum** rather than adding 4 separate entry type structs. This keeps the commit log serialization path unified.
 
-6. **Define the Accord message types in `ferrosa-common::accord`**, not in `ferrosa-net`. Net should reference them by importing from common. This keeps the types in the stable layer and prevents net from becoming a type-definition crate.
+6. **Monitor `ferrosa-cluster` accord module count.** At 26 modules, this is the largest subsystem. If it grows beyond 30, reconsider partial extraction (e.g., observability modules `metrics`, `perf`, `perf_regression` into a shared observability crate).
+
+7. **Define the Accord message types in `ferrosa-common::accord`**, not in `ferrosa-net`. Net should reference them by importing from common. This keeps the types in the stable layer and prevents net from becoming a type-definition crate.
