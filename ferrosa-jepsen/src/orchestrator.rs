@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::chaos::NemesisRegistry;
 use crate::checker::{check_linearizability, CheckResult};
-use crate::config::{RunConfig, Tier, Topology};
+use crate::config::{Concurrency, RunConfig, Tier, Topology};
+use crate::driver::DriverRegistry;
 use crate::history::{HistoryRecorder, Op, OpResult};
 use crate::report::RunReport;
 
@@ -28,14 +29,12 @@ pub struct CombinationResult {
 /// Run the full test suite per the config.
 pub async fn run(config: &RunConfig) -> Result<RunReport> {
     let topologies = config.topologies();
-    let nemesis_reg = NemesisRegistry::phase1();
+    let concurrency_levels = config.concurrency_levels();
 
+    let nemesis_reg = resolve_nemesis_registry(config.tier);
     let nemesis_names: Vec<String> = match &config.nemesis {
         Some(n) => vec![n.clone()],
-        None => match config.tier {
-            Tier::Smoke => nemesis_reg.names(),
-            _ => nemesis_reg.names(), // Phase 2+ will expand
-        },
+        None => nemesis_reg.names(),
     };
 
     let workload_names: Vec<String> = match &config.pattern {
@@ -46,39 +45,56 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
         }
     };
 
+    let driver_reg = resolve_driver_registry(config.tier);
+    let driver_names: Vec<String> = match &config.driver {
+        Some(d) => vec![d.clone()],
+        None => driver_reg.names(),
+    };
+
     let mut results = Vec::new();
 
     for topology in &topologies {
         tracing::info!(?topology, "Provisioning cluster");
 
-        // In real execution, we'd provision here via FerrosCluster::provision.
-        for nemesis_name in &nemesis_names {
-            for workload_name in &workload_names {
-                let result =
-                    run_single_combination(*topology, nemesis_name, workload_name, config).await;
+        for concurrency in &concurrency_levels {
+            for driver_name in &driver_names {
+                for nemesis_name in &nemesis_names {
+                    for workload_name in &workload_names {
+                        let result = run_single_combination(
+                            *topology,
+                            nemesis_name,
+                            workload_name,
+                            driver_name,
+                            *concurrency,
+                            config,
+                        )
+                        .await;
 
-                match result {
-                    Ok(r) => results.push(r),
-                    Err(e) => {
-                        tracing::error!(
-                            workload = workload_name.as_str(),
-                            nemesis = nemesis_name.as_str(),
-                            error = %e,
-                            "Combination failed"
-                        );
-                        results.push(CombinationResult {
-                            workload: workload_name.clone(),
-                            nemesis: nemesis_name.clone(),
-                            topology: format!("{topology:?}"),
-                            concurrency: "low".into(),
-                            driver: "rust".into(),
-                            passed: false,
-                            linearizability: vec![],
-                            invariant_passed: false,
-                            invariant_error: Some(e.to_string()),
-                            duration_secs: 0.0,
-                            op_count: 0,
-                        });
+                        match result {
+                            Ok(r) => results.push(r),
+                            Err(e) => {
+                                tracing::error!(
+                                    workload = workload_name.as_str(),
+                                    nemesis = nemesis_name.as_str(),
+                                    driver = driver_name.as_str(),
+                                    error = %e,
+                                    "Combination failed"
+                                );
+                                results.push(CombinationResult {
+                                    workload: workload_name.clone(),
+                                    nemesis: nemesis_name.clone(),
+                                    topology: format!("{topology:?}"),
+                                    concurrency: format!("{concurrency:?}"),
+                                    driver: driver_name.clone(),
+                                    passed: false,
+                                    linearizability: vec![],
+                                    invariant_passed: false,
+                                    invariant_error: Some(e.to_string()),
+                                    duration_secs: 0.0,
+                                    op_count: 0,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -96,11 +112,30 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
     Ok(report)
 }
 
+/// Resolve nemesis registry based on tier.
+fn resolve_nemesis_registry(tier: Tier) -> NemesisRegistry {
+    match tier {
+        Tier::Smoke => NemesisRegistry::phase1(),
+        // Phase 2+: once nemeses are merged, use phase2()
+        _ => NemesisRegistry::phase1(),
+    }
+}
+
+/// Resolve driver registry based on tier.
+fn resolve_driver_registry(tier: Tier) -> DriverRegistry {
+    match tier {
+        Tier::Smoke => DriverRegistry::phase1(),
+        _ => DriverRegistry::phase1(), // Phase 2: switch to phase2() once drivers are ready
+    }
+}
+
 /// Run a single workload+nemesis combination.
 async fn run_single_combination(
     topology: Topology,
     nemesis_name: &str,
     workload_name: &str,
+    driver_name: &str,
+    concurrency: Concurrency,
     _config: &RunConfig,
 ) -> Result<CombinationResult> {
     let start = Instant::now();
@@ -108,6 +143,8 @@ async fn run_single_combination(
     tracing::info!(
         workload = workload_name,
         nemesis = nemesis_name,
+        driver = driver_name,
+        ?concurrency,
         ?topology,
         "Running combination"
     );
@@ -148,8 +185,8 @@ async fn run_single_combination(
         workload: workload_name.into(),
         nemesis: nemesis_name.into(),
         topology: format!("{topology:?}"),
-        concurrency: "low".into(),
-        driver: "rust".into(),
+        concurrency: format!("{concurrency:?}"),
+        driver: driver_name.into(),
         passed: all_linear && invariant_passed,
         linearizability,
         invariant_passed,
@@ -209,9 +246,16 @@ mod tests {
             output_json: false,
         };
 
-        let result = run_single_combination(Topology::T1, "partition-halves", "register", &config)
-            .await
-            .unwrap();
+        let result = run_single_combination(
+            Topology::T1,
+            "partition-halves",
+            "register",
+            "rust",
+            Concurrency::Low,
+            &config,
+        )
+        .await
+        .unwrap();
 
         assert!(result.passed);
         assert_eq!(result.workload, "register");
