@@ -7,8 +7,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod checker;
 mod config;
+mod firecracker;
 mod history;
+mod ssh;
 
 use config::{Concurrency, RunConfig, Tier, Topology};
 
