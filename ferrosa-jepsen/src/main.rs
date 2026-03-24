@@ -14,6 +14,7 @@ mod config;
 mod firecracker;
 mod history;
 mod ssh;
+mod workload;
 
 use config::{Concurrency, RunConfig, Tier, Topology};
 
