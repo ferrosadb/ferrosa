@@ -310,15 +310,17 @@ async fn handle_send(
             match result {
                 Ok(Ok(response)) => Ok(response),
                 Ok(Err(e)) => {
-                    tracing::warn!(?lane, error = %e, "lane actor: send failed, triggering reconnect");
-                    *state = LaneState::Reconnecting {
-                        attempt: 0,
-                        backoff: ExponentialBackoff::new(
-                            Duration::from_millis(500),
-                            Duration::from_secs(30),
-                        ),
-                    };
-                    ctx.spawn_reconnect();
+                    if matches!(&e, NetError::Io(_) | NetError::Protocol(_)) {
+                        tracing::warn!(?lane, error = %e, "connection error, triggering reconnect");
+                        *state = LaneState::Reconnecting {
+                            attempt: 0,
+                            backoff: ExponentialBackoff::new(
+                                Duration::from_millis(500),
+                                Duration::from_secs(30),
+                            ),
+                        };
+                        ctx.spawn_reconnect();
+                    }
                     Err(e)
                 }
                 Err(_elapsed) => Err(NetError::Timeout(format!("{lane:?} lane send timeout"))),
@@ -343,15 +345,17 @@ async fn handle_fire(
             match result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => {
-                    tracing::warn!(?lane, error = %e, "lane actor: fire failed, triggering reconnect");
-                    *state = LaneState::Reconnecting {
-                        attempt: 0,
-                        backoff: ExponentialBackoff::new(
-                            Duration::from_millis(500),
-                            Duration::from_secs(30),
-                        ),
-                    };
-                    ctx.spawn_reconnect();
+                    if matches!(&e, NetError::Io(_) | NetError::Protocol(_)) {
+                        tracing::warn!(?lane, error = %e, "connection error, triggering reconnect");
+                        *state = LaneState::Reconnecting {
+                            attempt: 0,
+                            backoff: ExponentialBackoff::new(
+                                Duration::from_millis(500),
+                                Duration::from_secs(30),
+                            ),
+                        };
+                        ctx.spawn_reconnect();
+                    }
                     Err(e)
                 }
                 Err(_elapsed) => Err(NetError::Timeout(format!("{lane:?} lane fire timeout"))),
