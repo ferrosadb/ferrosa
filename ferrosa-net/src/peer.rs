@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::codec::Lane;
@@ -88,6 +89,33 @@ impl PeerManager {
             .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
         match &state.pool {
             Some(pool) => pool.send(msg, lane).await,
+            None => Err(crate::error::NetError::Protocol(
+                "no connection pool".into(),
+            )),
+        }
+    }
+
+    /// Send a message to a peer on the specified lane with a custom timeout.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe. The timeout is owned by the lane actor; dropping the returned
+    /// future before it resolves does not leave an in-flight request orphaned on
+    /// the wire — the lane actor will receive the `NetError::Timeout` and discard
+    /// the response slot.
+    pub async fn send_with_timeout(
+        &self,
+        host_id: uuid::Uuid,
+        msg: Message,
+        lane: Lane,
+        timeout: Duration,
+    ) -> crate::error::Result<Message> {
+        let peers = self.peers.read().await;
+        let state = peers
+            .get(&host_id)
+            .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
+        match &state.pool {
+            Some(pool) => pool.send_with_timeout(msg, lane, timeout).await,
             None => Err(crate::error::NetError::Protocol(
                 "no connection pool".into(),
             )),

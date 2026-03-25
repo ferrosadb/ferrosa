@@ -27,24 +27,18 @@ pub async fn initiate_switchover(
         return Err(ClusterError::NotPrimary);
     }
 
-    let resp = tokio::time::timeout(
-        SWITCHOVER_TIMEOUT,
-        peer_manager.send(
+    let resp = peer_manager
+        .send_with_timeout(
             peer_host_id,
             Message::RoleSwap {
                 new_primary: peer_host_id,
                 new_secondary: local_host_id,
             },
             Lane::Raft,
-        ),
-    )
-    .await
-    .map_err(|_| {
-        ClusterError::Net(ferrosa_net::error::NetError::Timeout(
-            "switchover timed out waiting for peer".into(),
-        ))
-    })?
-    .map_err(ClusterError::Net)?;
+            SWITCHOVER_TIMEOUT,
+        )
+        .await
+        .map_err(ClusterError::Net)?;
 
     match resp {
         Message::RoleSwap {
