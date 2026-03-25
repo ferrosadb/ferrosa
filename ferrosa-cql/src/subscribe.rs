@@ -131,9 +131,14 @@ pub fn spawn_subscription_poll(
                                 stream_id,
                                 body: body.freeze(),
                             };
-                            if push_tx.send(push).await.is_err() {
-                                break; // Connection closed
-                            }
+                            let permit = tokio::select! {
+                                p = push_tx.reserve() => match p {
+                                    Ok(permit) => permit,
+                                    Err(_) => break, // channel closed
+                                },
+                                _ = cancel.cancelled() => break,
+                            };
+                            permit.send(push);
                         }
                         Ok(_) => {} // Unexpected result type; skip
                         Err(e) => {
