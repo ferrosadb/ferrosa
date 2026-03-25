@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
+use tokio_util::sync::CancellationToken;
+
 use ferrosa_schema::auth::role::AuthContext;
 use ferrosa_schema::Schema;
 
@@ -445,6 +447,10 @@ fn make_subscribe_stream(
     // Clone the engine for the subscription registry access after task spawn.
     let registry_engine = engine.clone();
 
+    // Create a cancellation token so the registry can stop the task gracefully.
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+
     // Spawn the subscription background task.
     let task = tokio::spawn(async move {
         // Send initial snapshot.
@@ -464,57 +470,66 @@ fn make_subscribe_stream(
         ticker.tick().await; // Consume the immediate first tick.
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {
+                    // Re-execute the query.
+                    let result = engine.execute(&query, &keyspace, &auth);
+                    match result {
+                        Ok(current) => {
+                            if delta {
+                                // Compute delta: rows in current that were not in previous.
+                                let prev = previous_rows.as_ref().unwrap();
+                                let new_rows: Vec<&Vec<serde_json::Value>> = current
+                                    .rows
+                                    .iter()
+                                    .filter(|row| !prev.contains(row))
+                                    .collect();
 
-            // Re-execute the query.
-            let result = engine.execute(&query, &keyspace, &auth);
-            match result {
-                Ok(current) => {
-                    if delta {
-                        // Compute delta: rows in current that were not in previous.
-                        let prev = previous_rows.as_ref().unwrap();
-                        let new_rows: Vec<&Vec<serde_json::Value>> = current
-                            .rows
-                            .iter()
-                            .filter(|row| !prev.contains(row))
-                            .collect();
-
-                        if !new_rows.is_empty() {
-                            let delta_result = serde_json::json!({
-                                "columns": current.columns,
-                                "rows": new_rows,
-                                "stats": current.stats,
-                            });
-                            let json = serde_json::to_string(&delta_result).unwrap_or_default();
-                            let event = Event::default().event("delta").data(json);
-                            if tx.send(Ok(event)).await.is_err() {
-                                break; // Client disconnected.
+                                if !new_rows.is_empty() {
+                                    let delta_result = serde_json::json!({
+                                        "columns": current.columns,
+                                        "rows": new_rows,
+                                        "stats": current.stats,
+                                    });
+                                    let json = serde_json::to_string(&delta_result).unwrap_or_default();
+                                    let event = Event::default().event("delta").data(json);
+                                    if tx.send(Ok(event)).await.is_err() {
+                                        break; // Client disconnected.
+                                    }
+                                }
+                                previous_rows = Some(current.rows);
+                            } else {
+                                let json = serde_json::to_string(&current).unwrap_or_default();
+                                let event = Event::default().event("data").data(json);
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break; // Client disconnected.
+                                }
                             }
                         }
-                        previous_rows = Some(current.rows);
-                    } else {
-                        let json = serde_json::to_string(&current).unwrap_or_default();
-                        let event = Event::default().event("data").data(json);
-                        if tx.send(Ok(event)).await.is_err() {
-                            break; // Client disconnected.
+                        Err(e) => {
+                            tracing::warn!(error = %e, "subscription query re-execution failed");
+                            let event = Event::default()
+                                .event("error")
+                                .data(format!("query error: {e}"));
+                            if tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "subscription query re-execution failed");
-                    let event = Event::default()
-                        .event("error")
-                        .data(format!("query error: {e}"));
-                    if tx.send(Ok(event)).await.is_err() {
-                        break;
-                    }
+                _ = task_cancel.cancelled() => {
+                    tracing::debug!("subscription task shutting down");
+                    break;
                 }
             }
         }
     });
 
     // Register the task in the subscription registry so it can be cancelled.
-    if let Ok(sub_id) = registry_engine.subscription_registry().register(task) {
+    if let Ok(sub_id) = registry_engine
+        .subscription_registry()
+        .register(cancel, task)
+    {
         tracing::info!(subscription_id = sub_id, "subscription registered");
     }
 
