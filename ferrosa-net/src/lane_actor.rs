@@ -8,9 +8,6 @@
 //! across `await` points (network round-trips).  The actor exclusively owns
 //! [`LaneState`], so no mutex is needed.
 
-// TODO(cancel-safety): Remove once pool.rs is refactored to use lane actors (Task 2).
-#![allow(dead_code)]
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,6 +52,7 @@ pub(crate) enum LaneCommand {
         reply: oneshot::Sender<LaneStatusReport>,
     },
     /// Gracefully shut down the actor loop.
+    #[allow(dead_code)] // used in tests; part of actor API
     Shutdown,
 }
 
@@ -88,6 +86,7 @@ pub(crate) struct LaneHandle {
 
 impl LaneHandle {
     /// Which lane this handle targets.
+    #[allow(dead_code)] // used in tests; part of actor API
     pub(crate) fn lane(&self) -> Lane {
         self.lane
     }
@@ -156,6 +155,7 @@ impl LaneHandle {
     }
 
     /// Request a graceful shutdown of the actor loop.
+    #[allow(dead_code)] // used in tests; part of actor API
     pub(crate) async fn shutdown(&self) {
         let _ = self.tx.send(LaneCommand::Shutdown).await;
     }
