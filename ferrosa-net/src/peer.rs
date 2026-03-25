@@ -77,6 +77,13 @@ impl PeerManager {
     }
 
     /// Send a message to a peer on the specified lane.
+    ///
+    /// # Cancel Safety
+    ///
+    /// This method is cancel-safe. It delegates to the lane actor via
+    /// `PriorityPool::send`, which uses `reserve`+`send` for enqueue and a oneshot
+    /// for the response. Dropping the returned future before it resolves does not
+    /// corrupt any shared state.
     pub async fn send(
         &self,
         host_id: uuid::Uuid,
@@ -97,12 +104,11 @@ impl PeerManager {
 
     /// Send a message to a peer on the specified lane with a custom timeout.
     ///
-    /// # Cancel safety
+    /// # Cancel Safety
     ///
-    /// Cancel-safe. The timeout is owned by the lane actor; dropping the returned
-    /// future before it resolves does not leave an in-flight request orphaned on
-    /// the wire — the lane actor will receive the `NetError::Timeout` and discard
-    /// the response slot.
+    /// This method is cancel-safe. The timeout is managed inside the lane actor;
+    /// dropping the returned future before it resolves does not orphan an in-flight
+    /// request — the actor discards the response slot when the timeout fires.
     pub async fn send_with_timeout(
         &self,
         host_id: uuid::Uuid,
