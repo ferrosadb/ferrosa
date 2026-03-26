@@ -110,7 +110,7 @@ pub fn query_local(schema: &Schema, node_config: &NodeConfig) -> LocalInfo {
         rack: node_config.rack.clone(),
         host_id: node_config.host_id,
         partitioner: "org.apache.cassandra.dht.Murmur3Partitioner".to_string(),
-        native_protocol_version: "5".to_string(),
+        native_protocol_version: "4".to_string(),
         cql_version: "3.4.7".to_string(),
         release_version: crate::system::RELEASE_VERSION.to_string(),
         schema_version: snap.version,
@@ -168,7 +168,7 @@ mod tests {
             info.partitioner,
             "org.apache.cassandra.dht.Murmur3Partitioner"
         );
-        assert_eq!(info.native_protocol_version, "5");
+        assert_eq!(info.native_protocol_version, "4");
         assert_eq!(info.schema_version, schema.snapshot().version);
     }
 
