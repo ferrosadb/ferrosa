@@ -472,9 +472,7 @@ impl<F: FlushTarget> TableStore<F> {
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("[read_range] skipping SSTable with read error: {e}");
-                }
+                Err(_e) => {}
             }
         }
 
@@ -484,7 +482,6 @@ impl<F: FlushTarget> TableStore<F> {
             .map(merge::merge_partitions)
             .take(limit)
             .collect();
-
         Ok(merged)
     }
 
