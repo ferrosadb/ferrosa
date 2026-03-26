@@ -49,7 +49,9 @@ impl Default for NodeConfig {
             broadcast_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             broadcast_port: 7000,
             rpc_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            tokens: Vec::new(),
+            // At least one token is required for drivers (Java DataStax, etc.)
+            // to consider this node operational for query routing.
+            tokens: vec!["0".to_string()],
         }
     }
 }
