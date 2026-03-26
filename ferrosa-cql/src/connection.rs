@@ -808,8 +808,8 @@ async fn handle_execute(
     id.copy_from_slice(&cursor[..16]);
     cursor.advance(16);
 
-    // Parse consistency level from EXECUTE frame: after the prepared ID
-    // comes [short consistency][byte flags][...values...].
+    // Parse consistency level: [short consistency]
+    // Note: CQL v4 EXECUTE has no result_metadata_id field.
     let cl = if cursor.remaining() >= 2 {
         let wire_cl = cursor.get_u16();
         ferrosa_cluster::consistency::ConsistencyLevel::from_wire(wire_cl)
@@ -1188,14 +1188,14 @@ fn build_result_columns(
 ///
 /// The cursor should be positioned after the consistency level bytes.
 /// CQL v5 EXECUTE frame layout after consistency:
-///   `[byte flags][short n_values]([int len][bytes value])*`
+///   `[int flags][short n_values]([int len][bytes value])*`
 fn substitute_bound_values(plan: &PreparedPlan, mut cursor: &[u8]) -> Result<Statement, CqlError> {
     // If there are no bound columns, return the statement as-is.
     if plan.bound_columns.is_empty() {
         return Ok(plan.statement.clone());
     }
 
-    // Parse flags byte. Bit 0x01 = Values present.
+    // Parse flags byte (CQL v4: 1 byte). Bit 0x01 = Values present.
     if cursor.remaining() < 1 {
         return Ok(plan.statement.clone());
     }

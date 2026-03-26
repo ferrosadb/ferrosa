@@ -99,12 +99,6 @@ pub fn encode_prepared(
     buf.put_u16(16u16);
     buf.put_slice(id);
 
-    // Result metadata ID (CQL v5): [u16 length][bytes]
-    // Used for result set metadata caching. We use the same ID as the
-    // prepared statement ID for simplicity.
-    buf.put_u16(16u16);
-    buf.put_slice(id);
-
     // Bind-variable metadata (PreparedMetadata format, not RowsMetadata):
     // [i32 flags][i32 columns_count][i32 pk_count][i16 pk_index...][global_table_spec][col_specs]
     encode_prepared_metadata(&mut buf, bound_names, bound_types, keyspace, table);

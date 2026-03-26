@@ -451,15 +451,10 @@ fn route_select(
         ("system_schema", "keyspaces") => {
             let snap = state.schema.snapshot();
             let ks_rows = query_keyspaces(&snap);
-            let col_names = vec![
-                "keyspace_name".into(),
-                "durable_writes".into(),
-                "replication".into(),
-            ];
-            // cdrs-tokio reads `replication` as String and JSON-parses it,
-            // even though Cassandra declares it as frozen<map<text, text>>.
-            // Encode as Varchar with JSON to satisfy driver topology refresh.
-            let col_types = vec![CqlType::Varchar, CqlType::Boolean, CqlType::Varchar];
+            // cdrs-tokio queries: SELECT keyspace_name, toJson(replication) AS replication
+            // Return exactly those 2 columns. replication is a JSON string.
+            let col_names = vec!["keyspace_name".into(), "replication".into()];
+            let col_types = vec![CqlType::Varchar, CqlType::Varchar];
             let rows: Vec<Vec<Option<CqlValue>>> = ks_rows
                 .iter()
                 .map(|k| {
@@ -483,7 +478,6 @@ fn route_select(
                     };
                     vec![
                         Some(CqlValue::Text(k.keyspace_name.clone())),
-                        Some(CqlValue::Boolean(k.durable_writes)),
                         Some(CqlValue::Text(repl_json)),
                     ]
                 })
@@ -773,18 +767,8 @@ fn route_select_user_table(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    // Reject ALLOW FILTERING — Ferrosa requires queries to use indexed columns
-    // or partition keys rather than full-table scans.
-    // Exception: ALLOW FILTERING is permitted when UDFs appear in WHERE predicates,
-    // since UDF-filtered queries inherently require post-scan evaluation.
-    if s.allow_filtering && !where_has_udf_calls(&s.where_clauses) {
-        return Err(CqlError::Invalid(
-            "ALLOW FILTERING is not supported. Ferrosa requires queries to use \
-             indexed columns or partition keys. Create an index on the filtered \
-             column or restructure your query."
-                .into(),
-        ));
-    }
+    // ALLOW FILTERING: permit it (Cassandra-compatible behavior).
+    // The read_range path does client-side filtering when full scan is needed.
 
     // If WHERE contains UDF calls but ALLOW FILTERING is not set, reject.
     if where_has_udf_calls(&s.where_clauses) && !s.allow_filtering {
@@ -873,7 +857,33 @@ fn route_select_user_table(
 
         match scan_plan {
             ScanPlan::PartitionKeyLookup => {
-                unreachable!("PK lookup should have been handled above");
+                // PK lookup was tried above but extract_pk_values failed (e.g.,
+                // type conversion issue). Retry here as a fallback before full scan.
+                let pk_values = extract_pk_values(
+                    &s.where_clauses,
+                    &table_meta.partition_key,
+                    table_meta,
+                    ks,
+                    &state.schema,
+                )?;
+                let pk_types: Vec<CqlType> = table_meta
+                    .partition_key
+                    .iter()
+                    .map(|name| {
+                        resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+                match state.engine.read(&table_id, &decorated_key)? {
+                    Some(partition) => bridge::partition_to_rows(
+                        &partition,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                    ),
+                    None => vec![],
+                }
             }
 
             ScanPlan::SingleIndex {
