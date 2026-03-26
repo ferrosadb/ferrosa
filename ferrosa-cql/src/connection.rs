@@ -1190,11 +1190,6 @@ fn build_result_columns(
 /// CQL v5 EXECUTE frame layout after consistency:
 ///   `[int flags][short n_values]([int len][bytes value])*`
 fn substitute_bound_values(plan: &PreparedPlan, mut cursor: &[u8]) -> Result<Statement, CqlError> {
-    // If there are no bound columns, return the statement as-is.
-    if plan.bound_columns.is_empty() {
-        return Ok(plan.statement.clone());
-    }
-
     // Parse flags byte (CQL v4: 1 byte). Bit 0x01 = Values present.
     if cursor.remaining() < 1 {
         return Ok(plan.statement.clone());

@@ -344,12 +344,16 @@ mod tests {
         assert_eq!(id_len, 16);
         pos += 2 + id_len; // skip id bytes
 
-        // bind metadata: flags
+        // bind metadata (PreparedMetadata): flags + col_count + pk_count
         let bind_flags = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        // bind metadata: col_count
         let bind_col_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
+        // pk_count (V4+)
+        let pk_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        // skip pk_indexes (i16 each)
+        pos += pk_count * 2;
 
         if bind_flags & 0x0001 != 0 {
             // Global_tables_spec: skip ks and table strings
