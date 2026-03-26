@@ -20,9 +20,11 @@ use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
 
+use crate::ast::{Assignment, SelectColumn, Statement, Term};
 use crate::auth::{
     encode_auth_success, encode_authenticate_response, parse_sasl_plain, MAX_AUTH_ATTEMPTS,
 };
+use crate::bridge;
 use crate::error::CqlError;
 use crate::frame::{Compression, CqlCodec, CqlFrame, FrameHeader, Opcode, VERSION_RESPONSE};
 use crate::parser;
@@ -30,7 +32,7 @@ use crate::prepared::{PreparedCache, PreparedPlan};
 use crate::result;
 use crate::router::{RequestContext, RouteResult, SharedState};
 use crate::subscribe::SubscriptionState;
-use crate::types::CqlType;
+use crate::types::{decode_value, CqlType};
 use crate::virtual_tables::connections::{ConnectionInfo, ConnectionTracker};
 
 use ferrosa_schema::AuthContext;
@@ -747,11 +749,9 @@ fn handle_prepare(
     // Determine keyspace and table from the statement for the prepared metadata.
     let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
 
-    // Build bound_columns from the statement (simplified — no full type inference).
-    let bound_columns: Vec<(String, CqlType)> = Vec::new();
-
-    // Build result_columns (simplified — empty for non-SELECT).
-    let result_columns: Vec<(String, CqlType)> = Vec::new();
+    // Build bound_columns and result_columns from the statement + schema metadata.
+    let (bound_columns, result_columns) =
+        analyze_prepared_columns(&stmt, &table_ks, &table_name, state);
 
     let plan = PreparedPlan {
         id,
@@ -827,10 +827,17 @@ async fn handle_execute(
         }
     };
 
-    // Re-route the stored statement (simplified: no bound value substitution).
+    // Parse bound values from the EXECUTE frame and substitute into the AST.
+    let stmt = match substitute_bound_values(&plan, cursor) {
+        Ok(s) => s,
+        Err(e) => {
+            return HandleResult::Reply(Opcode::Error, e.encode_body());
+        }
+    };
+
     let ctx = build_request_context(auth_context, current_keyspace, cl);
 
-    match crate::router::route(state, &ctx, plan.statement.clone()).await {
+    match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
         Ok(RouteResult::SetKeyspace(ks, body)) => {
             *current_keyspace = Some(ks);
@@ -1002,6 +1009,327 @@ fn build_request_context<'a>(
         auth: auth_context.as_ref().unwrap(),
         current_keyspace,
         consistency,
+    }
+}
+
+// ── Bound value analysis and substitution ────────────────────────────────
+
+/// Column spec: ordered list of (column_name, CqlType).
+type ColumnSpec = Vec<(String, CqlType)>;
+
+/// Analyze a prepared statement AST to find columns that have `BindMarker`
+/// values, and resolve their types from the schema. Also builds result
+/// columns for SELECT statements.
+///
+/// Returns `(bound_columns, result_columns)` as ordered lists of
+/// `(column_name, CqlType)`. Falls back to empty vectors if schema
+/// lookup fails (the statement might target a table that doesn't exist yet).
+fn analyze_prepared_columns(
+    stmt: &Statement,
+    table_ks: &str,
+    table_name: &str,
+    state: &SharedState,
+) -> (ColumnSpec, ColumnSpec) {
+    // If keyspace or table is empty, we can't look up metadata.
+    if table_ks.is_empty() || table_name.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let snap = state.schema.snapshot();
+    let table_meta = match snap
+        .tables
+        .get(&(table_ks.to_string(), table_name.to_string()))
+    {
+        Some(tm) => tm,
+        None => return (Vec::new(), Vec::new()),
+    };
+
+    let resolve = |col_name: &str| -> Option<CqlType> {
+        let col = table_meta.columns.get(col_name)?;
+        bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema).ok()
+    };
+
+    let mut bound_columns = Vec::new();
+
+    match stmt {
+        Statement::Select(s) => {
+            // Bind markers in WHERE clauses
+            for wc in &s.where_clauses {
+                if matches!(wc.value, Term::BindMarker(_)) {
+                    if let Some(cql_type) = resolve(&wc.column) {
+                        bound_columns.push((wc.column.clone(), cql_type));
+                    }
+                }
+            }
+
+            // Build result columns from the SELECT column list
+            let result_columns = build_result_columns(&s.columns, table_meta, table_ks, state);
+            return (bound_columns, result_columns);
+        }
+        Statement::Insert(i) => {
+            // Bind markers in VALUES, paired with column names
+            for (idx, val) in i.values.iter().enumerate() {
+                if matches!(val, Term::BindMarker(_)) {
+                    if let Some(col_name) = i.columns.get(idx) {
+                        if let Some(cql_type) = resolve(col_name) {
+                            bound_columns.push((col_name.clone(), cql_type));
+                        }
+                    }
+                }
+            }
+        }
+        Statement::Update(u) => {
+            // Bind markers in SET assignments
+            for assignment in &u.assignments {
+                match assignment {
+                    Assignment::Simple {
+                        column,
+                        value: Term::BindMarker(_),
+                    } => {
+                        if let Some(cql_type) = resolve(column) {
+                            bound_columns.push((column.clone(), cql_type));
+                        }
+                    }
+                    Assignment::Add {
+                        column,
+                        value: Term::BindMarker(_),
+                    } => {
+                        if let Some(cql_type) = resolve(column) {
+                            bound_columns.push((column.clone(), cql_type));
+                        }
+                    }
+                    Assignment::Sub {
+                        column,
+                        value: Term::BindMarker(_),
+                    } => {
+                        if let Some(cql_type) = resolve(column) {
+                            bound_columns.push((column.clone(), cql_type));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Bind markers in WHERE clauses
+            for wc in &u.where_clauses {
+                if matches!(wc.value, Term::BindMarker(_)) {
+                    if let Some(cql_type) = resolve(&wc.column) {
+                        bound_columns.push((wc.column.clone(), cql_type));
+                    }
+                }
+            }
+        }
+        Statement::Delete(d) => {
+            // Bind markers in WHERE clauses
+            for wc in &d.where_clauses {
+                if matches!(wc.value, Term::BindMarker(_)) {
+                    if let Some(cql_type) = resolve(&wc.column) {
+                        bound_columns.push((wc.column.clone(), cql_type));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    (bound_columns, Vec::new())
+}
+
+/// Build result column metadata for SELECT statements.
+fn build_result_columns(
+    select_columns: &[SelectColumn],
+    table_meta: &ferrosa_schema::TableMetadata,
+    table_ks: &str,
+    state: &SharedState,
+) -> Vec<(String, CqlType)> {
+    let resolve = |col_name: &str| -> Option<CqlType> {
+        let col = table_meta.columns.get(col_name)?;
+        bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema).ok()
+    };
+
+    let has_star = select_columns
+        .iter()
+        .any(|c| matches!(c, SelectColumn::Star));
+
+    if has_star {
+        return table_meta
+            .columns
+            .iter()
+            .filter_map(|(name, col)| {
+                bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema)
+                    .ok()
+                    .map(|t| (name.clone(), t))
+            })
+            .collect();
+    }
+
+    let mut result = Vec::new();
+    for sc in select_columns {
+        match sc {
+            SelectColumn::Star => unreachable!(),
+            SelectColumn::Column(name) => {
+                if let Some(cql_type) = resolve(name) {
+                    result.push((name.clone(), cql_type));
+                }
+            }
+            SelectColumn::FunctionCall { alias, name, .. } => {
+                // For function calls, use the alias or function name;
+                // type is unknown without deeper analysis, default to Varchar.
+                let col_name = alias.as_ref().unwrap_or(name).clone();
+                result.push((col_name, CqlType::Varchar));
+            }
+        }
+    }
+    result
+}
+
+/// Parse bound values from the EXECUTE frame cursor and substitute them
+/// into the prepared statement AST, replacing `BindMarker` nodes with
+/// literal `Term` values.
+///
+/// The cursor should be positioned after the consistency level bytes.
+/// CQL v5 EXECUTE frame layout after consistency:
+///   `[byte flags][short n_values]([int len][bytes value])*`
+fn substitute_bound_values(plan: &PreparedPlan, mut cursor: &[u8]) -> Result<Statement, CqlError> {
+    // If there are no bound columns, return the statement as-is.
+    if plan.bound_columns.is_empty() {
+        return Ok(plan.statement.clone());
+    }
+
+    // Parse flags byte. Bit 0x01 = Values present.
+    if cursor.remaining() < 1 {
+        return Ok(plan.statement.clone());
+    }
+    let flags = cursor.get_u8();
+    let has_values = (flags & 0x01) != 0;
+
+    if !has_values {
+        return Ok(plan.statement.clone());
+    }
+
+    // Parse [short n_values]
+    if cursor.remaining() < 2 {
+        return Err(CqlError::Protocol("EXECUTE: truncated values count".into()));
+    }
+    let n_values = cursor.get_u16() as usize;
+
+    // Decode each bound value using the type from bound_columns.
+    let mut bound_terms: Vec<Term> = Vec::with_capacity(n_values);
+    for i in 0..n_values {
+        if cursor.remaining() < 4 {
+            return Err(CqlError::Protocol("EXECUTE: truncated value length".into()));
+        }
+        let val_len = cursor.get_i32();
+        if val_len < 0 {
+            // Null value
+            bound_terms.push(Term::Null);
+        } else {
+            let val_len = val_len as usize;
+            if cursor.remaining() < val_len {
+                return Err(CqlError::Protocol("EXECUTE: truncated value bytes".into()));
+            }
+            let val_bytes = &cursor[..val_len];
+            cursor.advance(val_len);
+
+            // Look up the type for this positional value.
+            let cql_type = if i < plan.bound_columns.len() {
+                &plan.bound_columns[i].1
+            } else {
+                // More values than bound columns — default to blob.
+                &CqlType::Blob
+            };
+
+            let cql_value = decode_value(cql_type, val_bytes)?;
+            bound_terms.push(bridge::cql_value_to_term(&cql_value));
+        }
+    }
+
+    // Walk the statement AST and replace BindMarker nodes in order.
+    let mut substitution_idx = 0usize;
+    Ok(substitute_in_statement(
+        &plan.statement,
+        &bound_terms,
+        &mut substitution_idx,
+    ))
+}
+
+/// Recursively walk a statement and replace `Term::BindMarker` with bound terms.
+fn substitute_in_statement(stmt: &Statement, terms: &[Term], idx: &mut usize) -> Statement {
+    match stmt {
+        Statement::Select(s) => {
+            let mut s = s.clone();
+            for wc in &mut s.where_clauses {
+                substitute_in_term(&mut wc.value, terms, idx);
+            }
+            Statement::Select(s)
+        }
+        Statement::Insert(i) => {
+            let mut i = i.clone();
+            for val in &mut i.values {
+                substitute_in_term(val, terms, idx);
+            }
+            Statement::Insert(i)
+        }
+        Statement::Update(u) => {
+            let mut u = u.clone();
+            for assignment in &mut u.assignments {
+                match assignment {
+                    Assignment::Simple { value, .. } => substitute_in_term(value, terms, idx),
+                    Assignment::Add { value, .. } => substitute_in_term(value, terms, idx),
+                    Assignment::Sub { value, .. } => substitute_in_term(value, terms, idx),
+                    Assignment::Element { key, value, .. } => {
+                        substitute_in_term(key, terms, idx);
+                        substitute_in_term(value, terms, idx);
+                    }
+                }
+            }
+            for wc in &mut u.where_clauses {
+                substitute_in_term(&mut wc.value, terms, idx);
+            }
+            Statement::Update(u)
+        }
+        Statement::Delete(d) => {
+            let mut d = d.clone();
+            for wc in &mut d.where_clauses {
+                substitute_in_term(&mut wc.value, terms, idx);
+            }
+            Statement::Delete(d)
+        }
+        // For other statement types, return as-is.
+        other => other.clone(),
+    }
+}
+
+/// Replace a `Term::BindMarker` with the next bound term from the list.
+/// Recurses into nested terms (lists, maps, sets, tuples).
+fn substitute_in_term(term: &mut Term, terms: &[Term], idx: &mut usize) {
+    match term {
+        Term::BindMarker(_) => {
+            if *idx < terms.len() {
+                *term = terms[*idx].clone();
+                *idx += 1;
+            }
+        }
+        Term::InList(items)
+        | Term::ListLiteral(items)
+        | Term::SetLiteral(items)
+        | Term::TupleLiteral(items) => {
+            for item in items.iter_mut() {
+                substitute_in_term(item, terms, idx);
+            }
+        }
+        Term::MapLiteral(entries) => {
+            for (k, v) in entries.iter_mut() {
+                substitute_in_term(k, terms, idx);
+                substitute_in_term(v, terms, idx);
+            }
+        }
+        Term::FunctionCall { args, .. } => {
+            for arg in args.iter_mut() {
+                substitute_in_term(arg, terms, idx);
+            }
+        }
+        // Literal values — nothing to substitute.
+        _ => {}
     }
 }
 

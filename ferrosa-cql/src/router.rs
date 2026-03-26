@@ -451,14 +451,40 @@ fn route_select(
         ("system_schema", "keyspaces") => {
             let snap = state.schema.snapshot();
             let ks_rows = query_keyspaces(&snap);
-            let col_names = vec!["keyspace_name".into(), "durable_writes".into()];
-            let col_types = vec![CqlType::Varchar, CqlType::Boolean];
+            let col_names = vec![
+                "keyspace_name".into(),
+                "durable_writes".into(),
+                "replication".into(),
+            ];
+            // cdrs-tokio reads `replication` as String and JSON-parses it,
+            // even though Cassandra declares it as frozen<map<text, text>>.
+            // Encode as Varchar with JSON to satisfy driver topology refresh.
+            let col_types = vec![CqlType::Varchar, CqlType::Boolean, CqlType::Varchar];
             let rows: Vec<Vec<Option<CqlValue>>> = ks_rows
                 .iter()
                 .map(|k| {
+                    let repl_json = if let Some(ks_meta) = snap.keyspaces.get(&k.keyspace_name) {
+                        let mut pairs: Vec<String> =
+                            vec![format!("\"class\":\"{}\"", ks_meta.replication.strategy)];
+                        // Always include replication_factor (cdrs-tokio requires it)
+                        if !ks_meta
+                            .replication
+                            .options
+                            .contains_key("replication_factor")
+                        {
+                            pairs.push("\"replication_factor\":\"1\"".to_string());
+                        }
+                        for (rk, rv) in &ks_meta.replication.options {
+                            pairs.push(format!("\"{}\":\"{}\"", rk, rv));
+                        }
+                        format!("{{{}}}", pairs.join(","))
+                    } else {
+                        r#"{"class":"SimpleStrategy","replication_factor":"1"}"#.to_string()
+                    };
                     vec![
                         Some(CqlValue::Text(k.keyspace_name.clone())),
                         Some(CqlValue::Boolean(k.durable_writes)),
+                        Some(CqlValue::Text(repl_json)),
                     ]
                 })
                 .collect();

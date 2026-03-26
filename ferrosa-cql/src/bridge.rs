@@ -386,6 +386,92 @@ pub fn cql_type_display_name(t: &CqlType) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Function 1b: cql_value_to_term
+// ---------------------------------------------------------------------------
+
+/// Convert a wire-level [`CqlValue`] back to a parser-level [`Term`] literal.
+///
+/// Used during EXECUTE to substitute decoded bound values into the prepared
+/// statement AST in place of `BindMarker` nodes.
+pub fn cql_value_to_term(val: &CqlValue) -> Term {
+    match val {
+        CqlValue::Null => Term::Null,
+        CqlValue::Ascii(s) | CqlValue::Text(s) => Term::StringLiteral(s.clone()),
+        CqlValue::Bigint(n) | CqlValue::Counter(n) | CqlValue::Timestamp(n) | CqlValue::Time(n) => {
+            Term::IntegerLiteral(*n)
+        }
+        CqlValue::Int(n) => Term::IntegerLiteral(*n as i64),
+        CqlValue::Smallint(n) => Term::IntegerLiteral(*n as i64),
+        CqlValue::Tinyint(n) => Term::IntegerLiteral(*n as i64),
+        CqlValue::Boolean(b) => Term::BoolLiteral(*b),
+        CqlValue::Float(bits) => Term::FloatLiteral(f32::from_bits(*bits) as f64),
+        CqlValue::Double(bits) => Term::FloatLiteral(f64::from_bits(*bits)),
+        CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => Term::UuidLiteral(*u),
+        CqlValue::Blob(b) => Term::BlobLiteral(b.clone()),
+        CqlValue::Inet(addr) => Term::StringLiteral(addr.to_string()),
+        CqlValue::Date(d) => Term::IntegerLiteral(*d as i64),
+        CqlValue::Varint(n) => {
+            // Try to fit into i64 via signed bytes; fall back to string.
+            let bytes = n.to_signed_bytes_be();
+            if bytes.len() <= 8 {
+                // Fits in i64 — sign-extend to 8 bytes and decode
+                let mut buf = if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+                    [0xFF_u8; 8]
+                } else {
+                    [0u8; 8]
+                };
+                let start = 8 - bytes.len();
+                buf[start..].copy_from_slice(&bytes);
+                Term::IntegerLiteral(i64::from_be_bytes(buf))
+            } else {
+                Term::StringLiteral(n.to_string())
+            }
+        }
+        CqlValue::Decimal { .. } => {
+            // Decimal doesn't have a direct Term representation; use string
+            Term::StringLiteral(format!("{:?}", val))
+        }
+        CqlValue::Duration { .. } => {
+            // Duration doesn't have a direct Term representation; use string
+            Term::StringLiteral(format!("{:?}", val))
+        }
+        CqlValue::List(items) => Term::ListLiteral(items.iter().map(cql_value_to_term).collect()),
+        CqlValue::Set(items) => Term::SetLiteral(items.iter().map(cql_value_to_term).collect()),
+        CqlValue::Map(entries) => Term::MapLiteral(
+            entries
+                .iter()
+                .map(|(k, v)| (cql_value_to_term(k), cql_value_to_term(v)))
+                .collect(),
+        ),
+        CqlValue::Tuple(elements) => Term::TupleLiteral(
+            elements
+                .iter()
+                .map(|e| match e {
+                    Some(v) => cql_value_to_term(v),
+                    None => Term::Null,
+                })
+                .collect(),
+        ),
+        CqlValue::Udt(fields) => {
+            // UDT doesn't have a direct Term mapping; use a map-like representation
+            Term::MapLiteral(
+                fields
+                    .iter()
+                    .map(|(name, v)| {
+                        let key = Term::StringLiteral(name.clone());
+                        let val = match v {
+                            Some(cv) => cql_value_to_term(cv),
+                            None => Term::Null,
+                        };
+                        (key, val)
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Function 2: parse_cql_type
 // ---------------------------------------------------------------------------
 
