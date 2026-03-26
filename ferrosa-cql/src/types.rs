@@ -106,6 +106,13 @@ pub fn encode_value(value: &CqlValue) -> Vec<u8> {
             }
             buf
         }
+        CqlValue::Vector(bits) => {
+            let mut buf = Vec::with_capacity(bits.len() * 4);
+            for b in bits {
+                buf.extend_from_slice(&f32::from_bits(*b).to_be_bytes());
+            }
+            buf
+        }
         CqlValue::Null => vec![],
     }
 }
@@ -322,15 +329,23 @@ pub fn decode_value(cql_type: &CqlType, bytes: &[u8]) -> Result<CqlValue, CqlErr
             }
             Ok(CqlValue::Udt(result_fields))
         }
-        CqlType::Vector(elem_type, _dim) => {
-            let (count, mut pos) = read_collection_header(bytes)?;
-            let mut items = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                let (val, next_pos) = read_collection_element(bytes, pos, elem_type)?;
-                items.push(val);
-                pos = next_pos;
+        CqlType::Vector(_, dim) => {
+            let expected = *dim * 4;
+            if bytes.len() != expected {
+                return Err(CqlError::Invalid(format!(
+                    "vector<float, {}> requires {} bytes, got {}",
+                    dim,
+                    expected,
+                    bytes.len()
+                )));
             }
-            Ok(CqlValue::List(items))
+            let mut bits = Vec::with_capacity(*dim);
+            for i in 0..*dim {
+                let offset = i * 4;
+                let arr: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+                bits.push(f32::from_be_bytes(arr).to_bits());
+            }
+            Ok(CqlValue::Vector(bits))
         }
     }
 }

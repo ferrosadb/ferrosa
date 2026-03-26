@@ -43,7 +43,7 @@ pub enum CqlType {
         fields: Vec<(String, CqlType)>,
     },
     /// Vector type (CQL v5): `vector<element_type, dimension>`.
-    Vector(Box<CqlType>, u32), // 0x0032
+    Vector(Box<CqlType>, usize), // 0x0000 (Custom)
 }
 
 impl CqlType {
@@ -75,7 +75,7 @@ impl CqlType {
             Self::Set(_) => 0x0022,
             Self::Udt { .. } => 0x0030,
             Self::Tuple(_) => 0x0031,
-            Self::Vector(_, _) => 0x0032,
+            Self::Vector(_, _) => 0x0000, // Custom — Cassandra encodes vectors as Custom type
         }
     }
 }
@@ -136,6 +136,9 @@ pub enum CqlValue {
     Map(Vec<(CqlValue, CqlValue)>),
     /// Tuple -- fixed number of typed elements, some potentially null.
     Tuple(Vec<Option<CqlValue>>),
+    /// Vector of f32 values (Cassandra 5.0 vector<float, N>).
+    /// Stored as u32 bit patterns (like Float) so Eq can be derived.
+    Vector(Vec<u32>),
     /// User-Defined Type -- named fields, some potentially null.
     Udt(Vec<(String, Option<CqlValue>)>),
 }
@@ -197,6 +200,15 @@ impl Ord for CqlValue {
             (Self::List(a), Self::List(b)) | (Self::Set(a), Self::Set(b)) => a.cmp(b),
             (Self::Map(a), Self::Map(b)) => a.cmp(b),
             (Self::Tuple(a), Self::Tuple(b)) => a.cmp(b),
+            (Self::Vector(a), Self::Vector(b)) => {
+                for (ba, bb) in a.iter().zip(b.iter()) {
+                    let ord = f32::from_bits(*ba).total_cmp(&f32::from_bits(*bb));
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                a.len().cmp(&b.len())
+            }
             (Self::Udt(a), Self::Udt(b)) => a.cmp(b),
             _ => Ordering::Equal, // same discriminant, unreachable
         }
@@ -232,7 +244,8 @@ impl CqlValue {
             Self::Set(_) => 22,
             Self::Map(_) => 23,
             Self::Tuple(_) => 24,
-            Self::Udt(_) => 25,
+            Self::Vector(_) => 25,
+            Self::Udt(_) => 26,
         }
     }
 }

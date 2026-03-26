@@ -452,6 +452,11 @@ pub fn cql_value_to_term(val: &CqlValue) -> Term {
                 })
                 .collect(),
         ),
+        CqlValue::Vector(bits) => Term::ListLiteral(
+            bits.iter()
+                .map(|b| Term::FloatLiteral(f32::from_bits(*b) as f64))
+                .collect(),
+        ),
         CqlValue::Udt(fields) => {
             // UDT doesn't have a direct Term mapping; use a map-like representation
             Term::MapLiteral(
@@ -664,7 +669,7 @@ impl<'a> TypeParser<'a> {
                 self.consume(b',')?;
                 self.skip_whitespace();
                 let dim_str = self.read_ident()?;
-                let dimension: u32 = dim_str.parse().map_err(|_| {
+                let dimension: usize = dim_str.parse().map_err(|_| {
                     CqlError::Invalid(format!("invalid vector dimension: '{dim_str}'"))
                 })?;
                 self.skip_whitespace();
