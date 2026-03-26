@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{GraphError, Result};
 
@@ -13,6 +14,8 @@ use crate::error::{GraphError, Result};
 pub struct SubscriptionHandle {
     /// Unique subscription ID within a connection.
     pub id: u16,
+    /// Cancellation token — signal the task to stop gracefully.
+    pub cancel: CancellationToken,
     /// Background task that periodically re-executes the query.
     pub task: tokio::task::JoinHandle<()>,
 }
@@ -39,11 +42,15 @@ impl SubscriptionRegistry {
 
     /// Register a new subscription. Returns the assigned ID or an error if
     /// the per-connection limit has been reached (FMEA F5).
-    pub fn register(&self, task: tokio::task::JoinHandle<()>) -> Result<u16> {
+    pub fn register(
+        &self,
+        cancel: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Result<u16> {
         let mut subs = self.subscriptions.lock();
         if subs.len() >= self.max_per_connection {
-            // Abort the task since we can't track it.
-            task.abort();
+            // Cancel the task gracefully since we can't track it.
+            cancel.cancel();
             return Err(GraphError::ResourceLimit(format!(
                 "subscription limit reached ({} max per connection)",
                 self.max_per_connection
@@ -59,7 +66,7 @@ impl SubscriptionRegistry {
         }
         drop(next);
 
-        subs.insert(id, SubscriptionHandle { id, task });
+        subs.insert(id, SubscriptionHandle { id, cancel, task });
         Ok(id)
     }
 
@@ -68,7 +75,7 @@ impl SubscriptionRegistry {
     pub fn cancel(&self, id: u16) -> bool {
         let mut subs = self.subscriptions.lock();
         if let Some(handle) = subs.remove(&id) {
-            handle.task.abort();
+            handle.cancel.cancel();
             true
         } else {
             false
@@ -79,7 +86,7 @@ impl SubscriptionRegistry {
     pub fn cancel_all(&self) {
         let mut subs = self.subscriptions.lock();
         for (_, handle) in subs.drain() {
-            handle.task.abort();
+            handle.cancel.cancel();
         }
     }
 
@@ -99,19 +106,22 @@ impl Drop for SubscriptionRegistry {
 mod tests {
     use super::*;
 
-    /// Create a dummy JoinHandle for testing by spawning a no-op task.
-    fn dummy_task() -> tokio::task::JoinHandle<()> {
-        tokio::task::spawn(async {
-            // Sleep forever — will be aborted by cancel.
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        })
+    /// Create a dummy task for testing — exits when the token is cancelled.
+    fn dummy_task() -> (CancellationToken, tokio::task::JoinHandle<()>) {
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let task = tokio::task::spawn(async move {
+            token.cancelled().await;
+        });
+        (cancel, task)
     }
 
     #[tokio::test]
     async fn registry_register_and_cancel() {
         let registry = SubscriptionRegistry::new(8);
 
-        let id = registry.register(dummy_task()).unwrap();
+        let (cancel, task) = dummy_task();
+        let id = registry.register(cancel, task).unwrap();
         assert_eq!(registry.count(), 1);
 
         let cancelled = registry.cancel(id);
@@ -130,13 +140,15 @@ mod tests {
         // Register 8 subscriptions.
         let mut ids = Vec::new();
         for _ in 0..8 {
-            let id = registry.register(dummy_task()).unwrap();
+            let (cancel, task) = dummy_task();
+            let id = registry.register(cancel, task).unwrap();
             ids.push(id);
         }
         assert_eq!(registry.count(), 8);
 
         // 9th should fail (FMEA F5).
-        let result = registry.register(dummy_task());
+        let (cancel, task) = dummy_task();
+        let result = registry.register(cancel, task);
         assert!(result.is_err());
         match result.unwrap_err() {
             GraphError::ResourceLimit(msg) => {
@@ -157,7 +169,8 @@ mod tests {
         let registry = SubscriptionRegistry::new(8);
 
         for _ in 0..5 {
-            registry.register(dummy_task()).unwrap();
+            let (cancel, task) = dummy_task();
+            registry.register(cancel, task).unwrap();
         }
         assert_eq!(registry.count(), 5);
 
