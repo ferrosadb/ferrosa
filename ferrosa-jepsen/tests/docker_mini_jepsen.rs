@@ -83,11 +83,10 @@ fn write_test_entity(port: u16, name: &str) -> Result<Uuid, String> {
 
 /// Verify an entity exists by entity_name.
 fn verify_entity_exists(port: u16, name: &str) -> bool {
-    let query = format!(
-        "SELECT entity_name FROM agent_memory.entity_store \
+    let query = "SELECT entity_name FROM agent_memory.entity_store \
          WHERE tenant_id = 00000000-0000-0000-0000-000000000001 \
          AND session_id = 86da7931-7c87-54fe-8a49-eabc21c025aa"
-    );
+        .to_string();
     match cqlsh(port, &query) {
         Ok(output) => output.contains(name),
         Err(_) => false,
