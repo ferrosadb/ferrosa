@@ -32,8 +32,8 @@ pub enum LaneOutcome {
 ///
 /// If a lane's TCP connection drops, the actor's alive watcher triggers a
 /// background reconnect task.  While reconnecting, `send`/`fire` return
-/// [`NetError::Reconnecting`].  After all attempts are exhausted the lane
-/// moves to `Failed` and callers receive [`NetError::LaneFailed`].
+/// [`crate::error::NetError::Reconnecting`].  After all attempts are exhausted the lane
+/// moves to `Failed` and callers receive [`crate::error::NetError::LaneFailed`].
 pub struct PriorityPool {
     peer_host_id: Uuid,
     raft: LaneHandle,
