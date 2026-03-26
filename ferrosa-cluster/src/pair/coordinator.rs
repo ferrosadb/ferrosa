@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -74,10 +75,11 @@ impl PairCoordinator {
         let body = encode_mutation(mutation);
         let resp = self
             .peer_manager
-            .send(
+            .send_with_timeout(
                 self.peer_host_id,
                 Message::PairWriteForward(body),
                 Lane::Data,
+                Duration::from_secs(5),
             )
             .await
             .map_err(ClusterError::Net)?;
@@ -96,10 +98,11 @@ impl PairCoordinator {
         let body = encode_mutation(mutation);
         let resp = self
             .peer_manager
-            .send(
+            .send_with_timeout(
                 self.peer_host_id,
                 Message::PairWriteForward(body),
                 Lane::Data,
+                Duration::from_secs(5),
             )
             .await
             .map_err(ClusterError::Net)?;
