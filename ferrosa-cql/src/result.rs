@@ -99,10 +99,17 @@ pub fn encode_prepared(
     buf.put_u16(16u16);
     buf.put_slice(id);
 
-    // Bind-variable metadata
-    encode_rows_metadata(&mut buf, bound_names, bound_types, keyspace, table);
+    // Result metadata ID (CQL v5): [u16 length][bytes]
+    // Used for result set metadata caching. We use the same ID as the
+    // prepared statement ID for simplicity.
+    buf.put_u16(16u16);
+    buf.put_slice(id);
 
-    // Result-column metadata
+    // Bind-variable metadata (PreparedMetadata format, not RowsMetadata):
+    // [i32 flags][i32 columns_count][i32 pk_count][i16 pk_index...][global_table_spec][col_specs]
+    encode_prepared_metadata(&mut buf, bound_names, bound_types, keyspace, table);
+
+    // Result-column metadata (RowsMetadata format)
     if result_column_names.is_empty() {
         // No result columns (INSERT/UPDATE/DELETE) — use No_metadata flag
         // per CQL native protocol v5 spec section 4.2.5.4
@@ -119,6 +126,32 @@ pub fn encode_prepared(
     }
 
     buf
+}
+
+/// Encode PreparedMetadata: like RowsMetadata but with pk_count + pk_indexes.
+fn encode_prepared_metadata(
+    buf: &mut BytesMut,
+    column_names: &[String],
+    column_types: &[CqlType],
+    keyspace: &str,
+    table: &str,
+) {
+    buf.put_i32(0x0001); // flags: Global_tables_spec
+    buf.put_i32(column_names.len() as i32);
+
+    // pk_count: number of partition key column indexes (0 for simplicity —
+    // the driver uses this for token-aware routing, not correctness).
+    buf.put_i32(0);
+
+    // Global table spec
+    encode_string(buf, keyspace);
+    encode_string(buf, table);
+
+    // Column specs
+    for (name, cql_type) in column_names.iter().zip(column_types.iter()) {
+        encode_string(buf, name);
+        encode_type(buf, cql_type);
+    }
 }
 
 // ── Private helpers ────────────────────────────────────────────────────────
