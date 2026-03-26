@@ -676,12 +676,38 @@ async fn handle_query(
     };
 
     // Parse the CQL statement.
-    let stmt = match parser::parse(query) {
+    let mut stmt = match parser::parse(query) {
         Ok(s) => s,
         Err(e) => {
             return HandleResult::Reply(Opcode::Error, e.encode_body());
         }
     };
+
+    // Parse bound values from the QUERY frame (if present) and substitute
+    // into the statement. cdrs-tokio sends query_with_values which includes
+    // values in the QUERY frame alongside bind markers in the query text.
+    if cursor.remaining() > 0 {
+        let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
+        let (bound_columns, _result_columns) =
+            analyze_prepared_columns(&stmt, &table_ks, &table_name, state);
+        // Build a temporary plan for substitution.
+        let temp_plan = PreparedPlan {
+            id: [0u8; 16],
+            query: query.to_string(),
+            statement: stmt,
+            keyspace: current_keyspace.clone(),
+            result_columns: Vec::new(),
+            bound_columns,
+            table_keyspace: table_ks,
+            table_name,
+        };
+        stmt = match substitute_bound_values(&temp_plan, cursor) {
+            Ok(s) => s,
+            Err(e) => {
+                return HandleResult::Reply(Opcode::Error, e.encode_body());
+            }
+        };
+    }
 
     // Build an auth context for routing (use a default if auth was disabled).
     let ctx = build_request_context(auth_context, current_keyspace, cl);
