@@ -1228,6 +1228,8 @@ fn substitute_bound_values(plan: &PreparedPlan, mut cursor: &[u8]) -> Result<Sta
     }
 
     // Parse [short n_values]
+    // Per CQL v4 spec 4.1.4, values come first after flags, before
+    // optional fields (page_size, paging_state, etc.).
     if cursor.remaining() < 2 {
         return Err(CqlError::Protocol("EXECUTE: truncated values count".into()));
     }
