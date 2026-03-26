@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use ferrosa_schema::{SubscriptionMode, VirtualTableRegistry};
 
@@ -60,14 +61,21 @@ struct ClientMessage {
     table: Option<String>,
 }
 
+/// Tracks an active subscription: cancellation token + background task.
+struct WsSubscription {
+    cancel: CancellationToken,
+    #[allow(dead_code)]
+    task: JoinHandle<()>,
+}
+
 /// Main WebSocket loop.
 ///
 /// 1. Splits the socket into sender / receiver halves.
 /// 2. Creates a bounded `mpsc` channel for outbound messages.
 /// 3. Spawns a sender task that forwards channel messages to the WebSocket.
-/// 4. Tracks active subscriptions in a `HashMap<String, JoinHandle<()>>`.
+/// 4. Tracks active subscriptions in a `HashMap<String, WsSubscription>`.
 /// 5. Loops on inbound messages and dispatches subscribe / unsubscribe.
-/// 6. On exit, aborts all subscription tasks and awaits the sender task.
+/// 6. On exit, cancels all subscription tasks and awaits the sender task.
 async fn handle_socket(socket: WebSocket, registry: Arc<VirtualTableRegistry>) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
@@ -81,7 +89,7 @@ async fn handle_socket(socket: WebSocket, registry: Arc<VirtualTableRegistry>) {
         }
     });
 
-    let mut subscriptions: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let mut subscriptions: HashMap<String, WsSubscription> = HashMap::new();
 
     while let Some(Ok(msg)) = ws_receiver.next().await {
         match msg {
@@ -121,8 +129,8 @@ async fn handle_socket(socket: WebSocket, registry: Arc<VirtualTableRegistry>) {
                         let mode = table.subscription_mode();
 
                         // Cancel any existing subscription for this table.
-                        if let Some(handle) = subscriptions.remove(&table_name) {
-                            handle.abort();
+                        if let Some(sub) = subscriptions.remove(&table_name) {
+                            sub.cancel.cancel();
                         }
 
                         match mode {
@@ -146,35 +154,50 @@ async fn handle_socket(socket: WebSocket, registry: Arc<VirtualTableRegistry>) {
                                 let poll_registry = registry.clone();
                                 let poll_table_name = table_name.clone();
 
-                                let handle = tokio::spawn(async move {
+                                let cancel = CancellationToken::new();
+                                let task_cancel = cancel.clone();
+
+                                let task = tokio::spawn(async move {
                                     let mut ticker = tokio::time::interval(interval);
                                     loop {
-                                        ticker.tick().await;
-                                        let rows =
-                                            virtual_table_to_json(&poll_registry, &poll_table_name);
-                                        let data = json!({
-                                            "type": "data",
-                                            "table": &poll_table_name,
-                                            "rows": rows,
-                                        })
-                                        .to_string();
-                                        if poll_tx.try_send(data).is_err() {
-                                            tracing::warn!(
-                                                table = %poll_table_name,
-                                                "outbound channel full, dropping message"
-                                            );
+                                        tokio::select! {
+                                            _ = ticker.tick() => {
+                                                let rows = virtual_table_to_json(
+                                                    &poll_registry,
+                                                    &poll_table_name,
+                                                );
+                                                let data = json!({
+                                                    "type": "data",
+                                                    "table": &poll_table_name,
+                                                    "rows": rows,
+                                                })
+                                                .to_string();
+                                                if poll_tx.try_send(data).is_err() {
+                                                    tracing::warn!(
+                                                        table = %poll_table_name,
+                                                        "outbound channel full, dropping message"
+                                                    );
+                                                }
+                                            }
+                                            _ = task_cancel.cancelled() => {
+                                                tracing::debug!(
+                                                    table = %poll_table_name,
+                                                    "subscription poll task shutting down"
+                                                );
+                                                break;
+                                            }
                                         }
                                     }
                                 });
 
-                                subscriptions.insert(table_name, handle);
+                                subscriptions.insert(table_name, WsSubscription { cancel, task });
                             }
                         }
                     }
                     "unsubscribe" => {
                         if let Some(table_name) = parsed.table {
-                            if let Some(handle) = subscriptions.remove(&table_name) {
-                                handle.abort();
+                            if let Some(sub) = subscriptions.remove(&table_name) {
+                                sub.cancel.cancel();
                             }
                         }
                     }
@@ -194,9 +217,9 @@ async fn handle_socket(socket: WebSocket, registry: Arc<VirtualTableRegistry>) {
         }
     }
 
-    // Cleanup: abort all subscription tasks.
-    for (_, handle) in subscriptions {
-        handle.abort();
+    // Cleanup: cancel all subscription tasks.
+    for (_, sub) in subscriptions {
+        sub.cancel.cancel();
     }
     drop(tx);
     let _ = sender_task.await;

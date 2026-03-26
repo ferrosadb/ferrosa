@@ -80,7 +80,7 @@ public class CqlSmokeTest {
         try {
             session = CqlSession.builder()
                     .addContactPoint(new InetSocketAddress(ferrosaHost(), ferrosaPort()))
-                    .withLocalDatacenter("datacenter1")
+                    .withLocalDatacenter("dc1")
                     .build();
             System.out.println("  PASS  connect");
             passed++;

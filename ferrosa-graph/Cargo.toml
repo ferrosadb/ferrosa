@@ -22,6 +22,7 @@ futures = "0.3"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 tower-http = { version = "0.6", features = ["catch-panic", "limit"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }

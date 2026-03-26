@@ -49,7 +49,9 @@ impl Default for NodeConfig {
             broadcast_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             broadcast_port: 7000,
             rpc_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            tokens: Vec::new(),
+            // At least one token is required for drivers (Java DataStax, etc.)
+            // to consider this node operational for query routing.
+            tokens: vec!["0".to_string()],
         }
     }
 }
@@ -108,7 +110,7 @@ pub fn query_local(schema: &Schema, node_config: &NodeConfig) -> LocalInfo {
         rack: node_config.rack.clone(),
         host_id: node_config.host_id,
         partitioner: "org.apache.cassandra.dht.Murmur3Partitioner".to_string(),
-        native_protocol_version: "5".to_string(),
+        native_protocol_version: "4".to_string(),
         cql_version: "3.4.7".to_string(),
         release_version: crate::system::RELEASE_VERSION.to_string(),
         schema_version: snap.version,
@@ -166,7 +168,7 @@ mod tests {
             info.partitioner,
             "org.apache.cassandra.dht.Murmur3Partitioner"
         );
-        assert_eq!(info.native_protocol_version, "5");
+        assert_eq!(info.native_protocol_version, "4");
         assert_eq!(info.schema_version, schema.snapshot().version);
     }
 

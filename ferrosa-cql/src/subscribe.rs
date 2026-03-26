@@ -143,6 +143,14 @@ impl SubscriptionState {
 /// Re-executes the inner SELECT every `interval` and sends result frames
 /// through `push_tx`. Runs until the `cancel` token fires or the channel
 /// closes (connection dropped).
+///
+/// # Cancel Safety
+///
+/// This function is cancel-safe. The spawned task uses `reserve`+`send` for
+/// channel writes and a `CancellationToken` for shutdown. Dropping the handle
+/// returned by `tokio::spawn` (or the caller's future) does not leave the task
+/// in a partially-sent state — the `permit` is only committed after the full
+/// result is available.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_subscription_poll(
     stream_id: i16,
@@ -178,9 +186,14 @@ pub fn spawn_subscription_poll(
                                 stream_id,
                                 body: body.freeze(),
                             };
-                            if push_tx.send(push).await.is_err() {
-                                break; // Connection closed
-                            }
+                            let permit = tokio::select! {
+                                p = push_tx.reserve() => match p {
+                                    Ok(permit) => permit,
+                                    Err(_) => break, // channel closed
+                                },
+                                _ = cancel.cancelled() => break,
+                            };
+                            permit.send(push);
                         }
                         Ok(_) => {} // Unexpected result type; skip
                         Err(e) => {

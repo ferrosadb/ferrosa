@@ -140,6 +140,15 @@ impl RpcClient {
         })
     }
 
+    /// Send a request on the given lane and await the response.
+    ///
+    /// # Cancel Safety
+    ///
+    /// This method is **not** cancel-safe. It inserts a pending-response slot into
+    /// the shared map before the frame is written to the wire. If the future is
+    /// dropped after insertion but before the send completes, the slot is leaked and
+    /// the stream ID will never be reclaimed. Only call this from actor loops that
+    /// guarantee the future runs to completion.
     pub async fn send(&self, msg: Message, lane: Lane) -> Result<Message> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let (resp_tx, resp_rx) = oneshot::channel();

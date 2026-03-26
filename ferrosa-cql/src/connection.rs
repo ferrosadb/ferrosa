@@ -20,18 +20,19 @@ use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
 
-use crate::ast::{SelectColumn, Statement};
+use crate::ast::{Assignment, SelectColumn, Statement, Term};
 use crate::auth::{
     encode_auth_success, encode_authenticate_response, parse_sasl_plain, MAX_AUTH_ATTEMPTS,
 };
+use crate::bridge;
 use crate::error::CqlError;
-use crate::frame::{Compression, CqlCodec, CqlFrame, FrameHeader, Opcode};
+use crate::frame::{Compression, CqlCodec, CqlFrame, FrameHeader, Opcode, VERSION_RESPONSE};
 use crate::parser;
 use crate::prepared::{PreparedCache, PreparedPlan};
 use crate::result;
 use crate::router::{RequestContext, RouteResult, SharedState};
 use crate::subscribe::SubscriptionState;
-use crate::types::CqlType;
+use crate::types::{decode_value, CqlType, CqlValue};
 use crate::virtual_tables::connections::{ConnectionInfo, ConnectionTracker};
 
 use ferrosa_schema::AuthContext;
@@ -112,10 +113,6 @@ pub async fn handle_connection<S>(
     let mut current_keyspace: Option<String> = None;
     let mut subscription_state = SubscriptionState::new(8);
     let mut pending_compression: Option<Compression> = None;
-    // Track the client's negotiated protocol version. Response frames
-    // MUST use the same version byte (0x80 | client_version).
-    // Default to v5; overwritten when we see the first request frame.
-    let mut client_version: u8 = 5;
 
     // Channel for subscription tasks to push streaming frames.
     let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<crate::subscribe::SubscriptionPush>(64);
@@ -162,12 +159,6 @@ pub async fn handle_connection<S>(
             }
             FrameOrPush::ClientFrame(maybe_frame) => {
                 let stream_id = maybe_frame.header.stream_id;
-                // Capture the client's protocol version from the request frame.
-                // Response version = 0x80 | request version.
-                let req_version = maybe_frame.header.version & 0x7F;
-                if (3..=5).contains(&req_version) {
-                    client_version = req_version;
-                }
 
                 // Check in-flight limit for request opcodes (QUERY, EXECUTE, BATCH).
                 let is_request = matches!(
@@ -183,7 +174,7 @@ pub async fn handle_connection<S>(
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {
-                                    version: 0x80 | client_version,
+                                    version: VERSION_RESPONSE,
                                     flags: 0,
                                     stream_id,
                                     opcode: Opcode::Error,
@@ -235,7 +226,7 @@ pub async fn handle_connection<S>(
                         let body_bytes = body.freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: 0x80 | client_version,
+                                version: VERSION_RESPONSE,
                                 flags: 0,
                                 stream_id,
                                 opcode,
@@ -275,7 +266,7 @@ pub async fn handle_connection<S>(
                                 let body = err.encode_body().freeze();
                                 let frame = CqlFrame {
                                     header: FrameHeader {
-                                        version: 0x80 | client_version,
+                                        version: VERSION_RESPONSE,
                                         flags: 0,
                                         stream_id,
                                         opcode: Opcode::Error,
@@ -301,7 +292,7 @@ pub async fn handle_connection<S>(
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {
-                                    version: 0x80 | client_version,
+                                    version: VERSION_RESPONSE,
                                     flags: 0,
                                     stream_id,
                                     opcode: Opcode::Error,
@@ -319,7 +310,7 @@ pub async fn handle_connection<S>(
                         let ack_body = crate::result::encode_void().freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: 0x80 | client_version,
+                                version: VERSION_RESPONSE,
                                 flags: 0,
                                 stream_id,
                                 opcode: Opcode::Result,
@@ -359,7 +350,7 @@ pub async fn handle_connection<S>(
                         let body = crate::result::encode_void().freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: 0x80 | client_version,
+                                version: VERSION_RESPONSE,
                                 flags: 0,
                                 stream_id,
                                 opcode: Opcode::Result,
@@ -375,7 +366,7 @@ pub async fn handle_connection<S>(
                         let body_bytes = body.freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: 0x80 | client_version,
+                                version: VERSION_RESPONSE,
                                 flags: 0,
                                 stream_id,
                                 opcode,
@@ -684,12 +675,6 @@ async fn handle_query(
         ferrosa_cluster::consistency::ConsistencyLevel::One
     };
 
-    // Parse query flags and extract page_size / paging_state / serial_consistency.
-    // CQL v5 QUERY frame after consistency: [byte flags][...]
-    // Flag bits: 0x01 = values, 0x04 = page_size, 0x08 = paging_state,
-    //            0x10 = serial_consistency, 0x20 = default_timestamp
-    let (paging, serial_cl) = parse_query_paging_params(&mut cursor);
-
     // Parse the CQL statement.
     let mut stmt = match parser::parse(query) {
         Ok(s) => s,
@@ -698,90 +683,34 @@ async fn handle_query(
         }
     };
 
-    // Parse flags and positional bind values from the QUERY body.
-    // CQL v4/v5 format after consistency: [byte flags][short n_values][bytes value]*
-    if cursor.remaining() >= 1 {
-        let flags = cursor.get_u8();
-        let has_values = flags & 0x01 != 0;
-        let has_names = flags & 0x40 != 0;
-
-        if has_values && cursor.remaining() >= 2 {
-            let n_values = cursor.get_u16() as usize;
-            let bind_col_names = extract_bind_column_names(&stmt);
-
-            // Resolve column types from schema (same logic as PREPARE)
-            let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
-            let bound_columns: Vec<(String, CqlType)> = {
-                let snapshot = state.schema.snapshot();
-                let key = (table_ks, table_name);
-                match snapshot.tables.get(&key) {
-                    Some(table_meta) => {
-                        let mut cols = Vec::with_capacity(bind_col_names.len());
-                        for col_name in &bind_col_names {
-                            if let Some(cm) = table_meta.columns.get(col_name) {
-                                cols.push((
-                                    col_name.clone(),
-                                    col_type_str_to_cql_type(&cm.column_type),
-                                ));
-                            } else {
-                                // Unknown column — use Blob as fallback type.
-                                cols.push((col_name.clone(), CqlType::Blob));
-                            }
-                        }
-                        cols
-                    }
-                    None => bind_col_names
-                        .iter()
-                        .map(|n| (n.clone(), CqlType::Blob))
-                        .collect(),
-                }
-            };
-
-            let mut values: Vec<(String, Vec<u8>)> = Vec::with_capacity(n_values);
-            for i in 0..n_values {
-                let name = if has_names && cursor.remaining() >= 2 {
-                    let name_len = cursor.get_u16() as usize;
-                    if cursor.remaining() >= name_len {
-                        let n = std::str::from_utf8(&cursor[..name_len])
-                            .unwrap_or("")
-                            .to_string();
-                        cursor.advance(name_len);
-                        n
-                    } else {
-                        break;
-                    }
-                } else {
-                    // Positional: use the column name from the parsed statement
-                    bind_col_names.get(i).cloned().unwrap_or_default()
-                };
-
-                if cursor.remaining() >= 4 {
-                    let val_len = cursor.get_i32();
-                    if val_len < 0 {
-                        // NULL value
-                        values.push((name, Vec::new()));
-                    } else {
-                        let val_len = val_len as usize;
-                        if cursor.remaining() >= val_len {
-                            let val_bytes = cursor[..val_len].to_vec();
-                            cursor.advance(val_len);
-                            values.push((name, val_bytes));
-                        } else {
-                            break;
-                        }
-                    }
-                } else {
-                    break;
-                }
+    // Parse bound values from the QUERY frame (if present) and substitute
+    // into the statement. cdrs-tokio sends query_with_values which includes
+    // values in the QUERY frame alongside bind markers in the query text.
+    if cursor.remaining() > 0 {
+        let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
+        let (bound_columns, _result_columns) =
+            analyze_prepared_columns(&stmt, &table_ks, &table_name, state);
+        // Build a temporary plan for substitution.
+        let temp_plan = PreparedPlan {
+            id: [0u8; 16],
+            query: query.to_string(),
+            statement: stmt,
+            keyspace: current_keyspace.clone(),
+            result_columns: Vec::new(),
+            bound_columns,
+            table_keyspace: table_ks,
+            table_name,
+        };
+        stmt = match substitute_bound_values(&temp_plan, cursor) {
+            Ok(s) => s,
+            Err(e) => {
+                return HandleResult::Reply(Opcode::Error, e.encode_body());
             }
-
-            // Substitute bind markers in the statement with actual values.
-            substitute_bind_values(&mut stmt, &values, &bound_columns);
-        }
+        };
     }
 
     // Build an auth context for routing (use a default if auth was disabled).
-    let ctx = build_request_context(auth_context, current_keyspace, cl, serial_cl, paging);
+    let ctx = build_request_context(auth_context, current_keyspace, cl);
 
     match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
@@ -846,123 +775,9 @@ pub(crate) fn handle_prepare(
     // Determine keyspace and table from the statement for the prepared metadata.
     let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
 
-    // Build bound_columns: resolve bind marker column names to their CQL types
-    // from the table schema. If any column can't be resolved, fall back to empty
-    // metadata (columns_count=0) which drivers handle gracefully.
-    let bind_col_names = extract_bind_column_names(&stmt);
-    let bound_columns: Vec<(String, CqlType)> = {
-        let snapshot = state.schema.snapshot();
-        let key = (table_ks.clone(), table_name.clone());
-        match snapshot.tables.get(&key) {
-            Some(table_meta) => {
-                let mut cols = Vec::with_capacity(bind_col_names.len());
-                for col_name in &bind_col_names {
-                    if col_name == "[ttl]" {
-                        cols.push(("[ttl]".to_string(), CqlType::Int));
-                    } else if col_name == "[timestamp]" {
-                        cols.push(("[timestamp]".to_string(), CqlType::Bigint));
-                    } else if let Some(cm) = table_meta.columns.get(col_name) {
-                        cols.push((col_name.clone(), col_type_str_to_cql_type(&cm.column_type)));
-                    } else {
-                        // Unknown column — use Blob fallback
-                        cols.push((col_name.clone(), CqlType::Blob));
-                    }
-                }
-                cols
-            }
-            None => bind_col_names
-                .iter()
-                .map(|n| (n.clone(), CqlType::Blob))
-                .collect(),
-        }
-    };
-
-    // Build result_columns for SELECT and LWT (IF NOT EXISTS / IF condition) statements.
-    let result_columns: Vec<(String, CqlType)> = match &stmt {
-        Statement::Select(ref sel) => {
-            let snapshot = state.schema.snapshot();
-            let key = (table_ks.clone(), table_name.clone());
-            match snapshot.tables.get(&key) {
-                Some(table_meta) => {
-                    let is_star = sel.columns.iter().any(|c| matches!(c, SelectColumn::Star));
-                    if is_star {
-                        table_meta
-                            .columns
-                            .iter()
-                            .map(|(name, cm)| {
-                                (name.clone(), col_type_str_to_cql_type(&cm.column_type))
-                            })
-                            .collect()
-                    } else {
-                        let mut cols = Vec::new();
-                        for sc in &sel.columns {
-                            match sc {
-                                SelectColumn::Column(name) => {
-                                    if let Some(cm) = table_meta.columns.get(name) {
-                                        cols.push((
-                                            name.clone(),
-                                            col_type_str_to_cql_type(&cm.column_type),
-                                        ));
-                                    }
-                                }
-                                SelectColumn::FunctionCall { alias, name, .. } => {
-                                    let display =
-                                        alias.clone().unwrap_or_else(|| name.to_lowercase());
-                                    let fn_lower = name.to_lowercase();
-                                    let cql_type = match fn_lower.as_str() {
-                                        "count" => CqlType::Bigint,
-                                        "writetime" => CqlType::Bigint,
-                                        "ttl" => CqlType::Int,
-                                        "totimestamp" | "todate" | "now" => CqlType::Timestamp,
-                                        "uuid" | "timeuuid" => CqlType::Uuid,
-                                        "avg" | "sum" | "min" | "max" => CqlType::Blob,
-                                        _ => CqlType::Blob,
-                                    };
-                                    cols.push((display, cql_type));
-                                }
-                                SelectColumn::Star => {}
-                            }
-                        }
-                        cols
-                    }
-                }
-                None => Vec::new(),
-            }
-        }
-        // LWT: INSERT IF NOT EXISTS returns [applied] + all table columns
-        Statement::Insert(ins) if ins.if_not_exists => {
-            let mut cols = vec![("[applied]".to_string(), CqlType::Boolean)];
-            let snapshot = state.schema.snapshot();
-            let key = (table_ks.clone(), table_name.clone());
-            if let Some(table_meta) = snapshot.tables.get(&key) {
-                for (name, cm) in &table_meta.columns {
-                    cols.push((name.clone(), col_type_str_to_cql_type(&cm.column_type)));
-                }
-            }
-            cols
-        }
-        // LWT: UPDATE IF condition returns [applied] + all table columns
-        Statement::Update(upd) if !upd.if_conditions.is_empty() || upd.if_exists => {
-            let mut cols = vec![("[applied]".to_string(), CqlType::Boolean)];
-            let snapshot = state.schema.snapshot();
-            let key = (table_ks.clone(), table_name.clone());
-            if let Some(table_meta) = snapshot.tables.get(&key) {
-                for (name, cm) in &table_meta.columns {
-                    cols.push((name.clone(), col_type_str_to_cql_type(&cm.column_type)));
-                }
-            }
-            cols
-        }
-        _ => Vec::new(),
-    };
-
-    // Compute pk_indexes: map each partition key column to its position in the
-    // bind variable list. If any PK column is not bound, pass empty (pk_count=0).
-    let pk_indexes = if bound_columns.is_empty() {
-        Vec::new() // No bind metadata — pk_indexes must also be empty
-    } else {
-        compute_pk_indexes(&stmt, state, &table_ks, &table_name)
-    };
+    // Build bound_columns and result_columns from the statement + schema metadata.
+    let (bound_columns, result_columns) =
+        analyze_prepared_columns(&stmt, &table_ks, &table_name, state);
 
     let plan = PreparedPlan {
         id,
@@ -990,7 +805,7 @@ pub(crate) fn handle_prepare(
         &result_types,
         &table_ks,
         &table_name,
-        &pk_indexes,
+        &[],
     );
 
     HandleResult::Reply(Opcode::Result, result_body)
@@ -1020,8 +835,8 @@ async fn handle_execute(
     id.copy_from_slice(&cursor[..16]);
     cursor.advance(16);
 
-    // Parse consistency level from EXECUTE frame: after the prepared ID
-    // comes [short consistency][byte flags][...values...].
+    // Parse consistency level: [short consistency]
+    // Note: CQL v4 EXECUTE has no result_metadata_id field.
     let cl = if cursor.remaining() >= 2 {
         let wire_cl = cursor.get_u16();
         ferrosa_cluster::consistency::ConsistencyLevel::from_wire(wire_cl)
@@ -1039,65 +854,15 @@ async fn handle_execute(
         }
     };
 
-    // Parse flags and positional bind values from the EXECUTE body.
-    // CQL v4 format after consistency: [byte flags][short n_values][bytes value]*
-    let mut stmt = plan.statement.clone();
-    if cursor.remaining() >= 1 {
-        let flags = cursor.get_u8();
-        let _has_values = flags & 0x01 != 0;
-        let has_names = flags & 0x40 != 0;
-
-        if _has_values && cursor.remaining() >= 2 {
-            let n_values = cursor.get_u16() as usize;
-            let bind_col_names = extract_bind_column_names(&stmt);
-            let mut values: Vec<(String, Vec<u8>)> = Vec::with_capacity(n_values);
-
-            for i in 0..n_values {
-                let name = if has_names && cursor.remaining() >= 2 {
-                    let name_len = cursor.get_u16() as usize;
-                    if cursor.remaining() >= name_len {
-                        let n = std::str::from_utf8(&cursor[..name_len])
-                            .unwrap_or("")
-                            .to_string();
-                        cursor.advance(name_len);
-                        n
-                    } else {
-                        break;
-                    }
-                } else {
-                    // Positional: use the column name from the prepared statement
-                    bind_col_names.get(i).cloned().unwrap_or_default()
-                };
-
-                if cursor.remaining() >= 4 {
-                    let val_len = cursor.get_i32();
-                    if val_len < 0 {
-                        // NULL value
-                        values.push((name, Vec::new()));
-                    } else {
-                        let val_len = val_len as usize;
-                        if cursor.remaining() >= val_len {
-                            let val_bytes = cursor[..val_len].to_vec();
-                            cursor.advance(val_len);
-                            values.push((name, val_bytes));
-                        } else {
-                            break;
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            // Substitute bind markers in the statement with actual values.
-            substitute_bind_values(&mut stmt, &values, &plan.bound_columns);
+    // Parse bound values from the EXECUTE frame and substitute into the AST.
+    let stmt = match substitute_bound_values(&plan, cursor) {
+        Ok(s) => s,
+        Err(e) => {
+            return HandleResult::Reply(Opcode::Error, e.encode_body());
         }
-    }
+    };
 
-    // Parse paging params for EXECUTE (same format as QUERY after values).
-    let paging = parse_execute_paging_params(cursor);
-
-    let ctx = build_request_context(auth_context, current_keyspace, cl, None, paging);
+    let ctx = build_request_context(auth_context, current_keyspace, cl);
 
     match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
@@ -1147,7 +912,7 @@ async fn handle_batch(
         }
         let kind = cursor.get_u8();
 
-        let mut stmt = if kind == 0 {
+        let stmt = if kind == 0 {
             // Inline query string: [int len][bytes query]
             if cursor.remaining() < 4 {
                 let err = CqlError::Protocol("BATCH body truncated".into());
@@ -1200,61 +965,17 @@ async fn handle_batch(
             return HandleResult::Reply(Opcode::Error, err.encode_body());
         };
 
-        // Parse and substitute bound values.
+        // Skip bound values: [short n_values]([int val_len][bytes val])*
         if cursor.remaining() >= 2 {
             let n_values = cursor.get_u16() as usize;
-            if n_values > 0 {
-                let bind_col_names = extract_bind_column_names(&stmt);
-
-                let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
-                let bound_columns: Vec<(String, CqlType)> = {
-                    let snapshot = state.schema.snapshot();
-                    let key = (table_ks, table_name);
-                    match snapshot.tables.get(&key) {
-                        Some(table_meta) => {
-                            let mut cols = Vec::with_capacity(bind_col_names.len());
-                            for col_name in &bind_col_names {
-                                if let Some(cm) = table_meta.columns.get(col_name) {
-                                    cols.push((
-                                        col_name.clone(),
-                                        col_type_str_to_cql_type(&cm.column_type),
-                                    ));
-                                } else {
-                                    // Unknown column — use Blob as fallback type.
-                                    cols.push((col_name.clone(), CqlType::Blob));
-                                }
-                            }
-                            cols
-                        }
-                        None => bind_col_names
-                            .iter()
-                            .map(|n| (n.clone(), CqlType::Blob))
-                            .collect(),
-                    }
-                };
-
-                let mut values: Vec<(String, Vec<u8>)> = Vec::with_capacity(n_values);
-                for i in 0..n_values {
-                    let name = bind_col_names.get(i).cloned().unwrap_or_default();
-                    if cursor.remaining() < 4 {
-                        break;
-                    }
-                    let val_len = cursor.get_i32();
-                    if val_len < 0 {
-                        values.push((name, Vec::new())); // NULL
-                    } else {
-                        let val_len = val_len as usize;
-                        if cursor.remaining() >= val_len {
-                            let val_bytes = cursor[..val_len].to_vec();
-                            cursor.advance(val_len);
-                            values.push((name, val_bytes));
-                        } else {
-                            break;
-                        }
-                    }
+            for _ in 0..n_values {
+                if cursor.remaining() < 4 {
+                    break;
                 }
-
-                substitute_bind_values(&mut stmt, &values, &bound_columns);
+                let val_len = cursor.get_i32();
+                if val_len > 0 && cursor.remaining() >= val_len as usize {
+                    cursor.advance(val_len as usize);
+                }
             }
         }
 
@@ -1270,31 +991,12 @@ async fn handle_batch(
         ferrosa_cluster::consistency::ConsistencyLevel::One
     };
 
-    // Route each statement. If any statement is an LWT (IF NOT EXISTS / IF
-    // condition), capture its result to return instead of void.
-    let mut lwt_result: Option<BytesMut> = None;
+    // Route each statement.
     for stmt in statements {
-        let ctx = build_request_context(
-            auth_context,
-            current_keyspace,
-            cl,
-            None,
-            crate::paging::PagingParams::default(),
-        );
+        let ctx = build_request_context(auth_context, current_keyspace, cl);
         match crate::router::route(state, &ctx, stmt).await {
             Ok(RouteResult::SetKeyspace(ks, _)) => {
                 *current_keyspace = Some(ks);
-            }
-            Ok(RouteResult::Result(body)) => {
-                // Check if this is an LWT result (Rows kind with [applied] column).
-                // LWT results have kind=2 (Rows), non-LWT results have kind=1 (Void).
-                if lwt_result.is_none() && body.len() >= 4 {
-                    let kind = i32::from_be_bytes(body[0..4].try_into().unwrap_or([0; 4]));
-                    if kind == 0x0002 {
-                        // Rows result — this is from an LWT statement
-                        lwt_result = Some(body);
-                    }
-                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -1303,9 +1005,8 @@ async fn handle_batch(
         }
     }
 
-    // Return LWT result if any statement was conditional, otherwise void.
-    let result_body = lwt_result.unwrap_or_else(result::encode_void);
-    HandleResult::Reply(Opcode::Result, result_body)
+    // BATCH returns a void result.
+    HandleResult::Reply(Opcode::Result, result::encode_void())
 }
 
 // ── REGISTER ─────────────────────────────────────────────────────────────
@@ -1315,114 +1016,6 @@ fn handle_register() -> HandleResult {
     HandleResult::Reply(Opcode::Ready, BytesMut::new())
 }
 
-// ── Pagination helpers ───────────────────────────────────────────────────
-
-/// Parse page_size and paging_state from the QUERY frame flags.
-///
-/// CQL v5 QUERY frame after consistency level:
-/// ```text
-/// [byte flags]
-///   0x01 = values present
-///   0x04 = page_size present (i32 follows)
-///   0x08 = paging_state present ([int len][bytes] follows)
-///   0x10 = serial_consistency
-///   0x20 = default_timestamp
-///   0x40 = names for values
-/// [values if flag 0x01]
-/// [i32 page_size if flag 0x04]
-/// [int len][bytes paging_state if flag 0x08]
-/// ```
-fn parse_query_paging_params(
-    cursor: &mut &[u8],
-) -> (
-    crate::paging::PagingParams,
-    Option<ferrosa_cluster::consistency::ConsistencyLevel>,
-) {
-    let mut params = crate::paging::PagingParams::default();
-    let mut serial_cl = None;
-
-    if cursor.remaining() < 1 {
-        return (params, serial_cl);
-    }
-    let flags = cursor.get_u8();
-
-    // Skip values if present (flag 0x01)
-    if flags & 0x01 != 0 && cursor.remaining() >= 2 {
-        let n_values = cursor.get_u16() as usize;
-        for _ in 0..n_values {
-            // Skip value name if names flag (0x40) is set
-            if flags & 0x40 != 0 && cursor.remaining() >= 2 {
-                let name_len = cursor.get_u16() as usize;
-                if cursor.remaining() >= name_len {
-                    cursor.advance(name_len);
-                } else {
-                    return (params, serial_cl);
-                }
-            }
-            // Skip value bytes
-            if cursor.remaining() >= 4 {
-                let val_len = cursor.get_i32();
-                if val_len > 0 {
-                    let val_len = val_len as usize;
-                    if cursor.remaining() >= val_len {
-                        cursor.advance(val_len);
-                    } else {
-                        return (params, serial_cl);
-                    }
-                }
-            } else {
-                return (params, serial_cl);
-            }
-        }
-    }
-
-    // page_size (flag 0x04)
-    if flags & 0x04 != 0 {
-        if cursor.remaining() >= 4 {
-            params.page_size = Some(cursor.get_i32());
-        } else {
-            return (params, serial_cl);
-        }
-    }
-
-    // paging_state (flag 0x08)
-    if flags & 0x08 != 0 && cursor.remaining() >= 4 {
-        let state_len = cursor.get_i32();
-        if state_len > 0 {
-            let state_len = state_len as usize;
-            if cursor.remaining() >= state_len {
-                params.paging_state = Some(cursor[..state_len].to_vec());
-                cursor.advance(state_len);
-            }
-        }
-    }
-
-    // serial_consistency (flag 0x10)
-    if flags & 0x10 != 0 && cursor.remaining() >= 2 {
-        let wire_scl = cursor.get_u16();
-        serial_cl = ferrosa_cluster::consistency::ConsistencyLevel::from_wire(wire_scl);
-    }
-
-    (params, serial_cl)
-}
-
-/// Parse paging params from EXECUTE frame after bind values.
-///
-/// In practice, the EXECUTE frame has the same flags structure as QUERY
-/// after the consistency+flags+values section. Since the caller has already
-/// consumed values, we look for page_size/paging_state in the remaining bytes.
-fn parse_execute_paging_params(cursor: &[u8]) -> crate::paging::PagingParams {
-    // The EXECUTE parser in handle_execute already consumed the flags byte and
-    // values. For simplicity, we parse what remains. However, the flags were
-    // already read, so we cannot know if page_size/paging_state were flagged.
-    // Instead, use a heuristic: if the cursor has remaining bytes and the
-    // original flags indicated paging, they would have been parsed.
-    // For now, return defaults (no pagination for EXECUTE).
-    // TODO: Thread the flags byte through to parse EXECUTE paging.
-    let _ = cursor;
-    crate::paging::PagingParams::default()
-}
-
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// Build a `RequestContext` from the current auth context and keyspace.
@@ -1430,8 +1023,6 @@ fn build_request_context<'a>(
     auth_context: &'a mut Option<AuthContext>,
     current_keyspace: &'a Option<String>,
     consistency: ferrosa_cluster::consistency::ConsistencyLevel,
-    serial_consistency: Option<ferrosa_cluster::consistency::ConsistencyLevel>,
-    paging: crate::paging::PagingParams,
 ) -> RequestContext<'a> {
     // If auth was disabled, we need a default auth context.
     if auth_context.is_none() {
@@ -1445,449 +1036,395 @@ fn build_request_context<'a>(
         auth: auth_context.as_ref().unwrap(),
         current_keyspace,
         consistency,
-        serial_consistency,
-        paging,
+        serial_consistency: None,
+        paging: crate::paging::PagingParams::default(),
     }
 }
 
-/// Compute partition-key bind-variable indexes for a prepared statement.
+// ── Bound value analysis and substitution ────────────────────────────────
+
+/// Column spec: ordered list of (column_name, CqlType).
+type ColumnSpec = Vec<(String, CqlType)>;
+
+/// Analyze a prepared statement AST to find columns that have `BindMarker`
+/// values, and resolve their types from the schema. Also builds result
+/// columns for SELECT statements.
 ///
-/// Looks up the table's partition key columns in the schema, then finds each
-/// PK column's position in the statement's bind variable list. Returns the
-/// indexes in partition key order. If the table is not found in the schema or
-/// any PK column does not appear as a bind variable, returns an empty vec
-/// (which writes `pk_count=0`, disabling token-aware routing in drivers).
-fn compute_pk_indexes(
-    stmt: &crate::ast::Statement,
-    state: &SharedState,
+/// Returns `(bound_columns, result_columns)` as ordered lists of
+/// `(column_name, CqlType)`. Falls back to empty vectors if schema
+/// lookup fails (the statement might target a table that doesn't exist yet).
+fn analyze_prepared_columns(
+    stmt: &Statement,
     table_ks: &str,
     table_name: &str,
-) -> Vec<u16> {
+    state: &SharedState,
+) -> (ColumnSpec, ColumnSpec) {
+    // If keyspace or table is empty, we can't look up metadata.
     if table_ks.is_empty() || table_name.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
-    // Look up the table in the schema to get partition key column names.
-    let snapshot = state.schema.snapshot();
-    let key = (table_ks.to_string(), table_name.to_string());
-    let table_meta = match snapshot.tables.get(&key) {
-        Some(t) => t,
-        None => return Vec::new(),
+    let snap = state.schema.snapshot();
+    let table_meta = match snap
+        .tables
+        .get(&(table_ks.to_string(), table_name.to_string()))
+    {
+        Some(tm) => tm,
+        None => return (Vec::new(), Vec::new()),
     };
 
-    if table_meta.partition_key.is_empty() {
-        return Vec::new();
-    }
+    let resolve = |col_name: &str| -> Option<CqlType> {
+        let col = table_meta.columns.get(col_name)?;
+        bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema).ok()
+    };
 
-    // Extract the ordered list of column names that have bind markers.
-    let bind_columns = extract_bind_column_names(stmt);
-
-    // For each PK column (in partition key order), find its index in bind_columns.
-    let mut pk_indexes = Vec::with_capacity(table_meta.partition_key.len());
-    for pk_col in &table_meta.partition_key {
-        match bind_columns.iter().position(|name| name == pk_col) {
-            Some(idx) => pk_indexes.push(idx as u16),
-            None => return Vec::new(), // PK column not bound — disable routing
-        }
-    }
-
-    pk_indexes
-}
-
-/// Extract the ordered list of column names that have bind markers in a statement.
-///
-/// The returned order matches the bind variable order in the CQL protocol:
-/// - INSERT: columns whose corresponding value is a `BindMarker`, in column order
-/// - SELECT/UPDATE/DELETE: `WHERE` clause columns with bind markers, in clause order
-/// - UPDATE: assignments with bind markers come before WHERE bind markers
-fn extract_bind_column_names(stmt: &crate::ast::Statement) -> Vec<String> {
-    use crate::ast::{Assignment, Statement, Term};
+    let mut bound_columns = Vec::new();
 
     match stmt {
-        Statement::Insert(ins) => {
-            let mut names = Vec::new();
-            for (col, val) in ins.columns.iter().zip(ins.values.iter()) {
+        Statement::Select(s) => {
+            // Bind markers in WHERE clauses
+            for wc in &s.where_clauses {
+                if matches!(wc.value, Term::BindMarker(_)) {
+                    if let Some(cql_type) = resolve(&wc.column) {
+                        bound_columns.push((wc.column.clone(), cql_type));
+                    }
+                }
+            }
+
+            // Build result columns from the SELECT column list
+            let result_columns = build_result_columns(&s.columns, table_meta, table_ks, state);
+            return (bound_columns, result_columns);
+        }
+        Statement::Insert(i) => {
+            // Bind markers in VALUES, paired with column names
+            for (idx, val) in i.values.iter().enumerate() {
                 if matches!(val, Term::BindMarker(_)) {
-                    names.push(col.clone());
+                    if let Some(col_name) = i.columns.get(idx) {
+                        if let Some(cql_type) = resolve(col_name) {
+                            bound_columns.push((col_name.clone(), cql_type));
+                        }
+                    }
                 }
             }
-            // USING TTL ?  / USING TIMESTAMP ? — parsed as 0 sentinel
-            if ins.using_ttl == Some(0) {
-                names.push("[ttl]".to_string());
-            }
-            if ins.using_timestamp == Some(0) {
-                names.push("[timestamp]".to_string());
-            }
-            names
         }
-        Statement::Select(sel) => {
-            let mut names = Vec::new();
-            for wc in &sel.where_clauses {
-                if matches!(&wc.value, Term::BindMarker(_)) {
-                    names.push(wc.column.clone());
-                }
-            }
-            names
-        }
-        Statement::Update(upd) => {
-            let mut names = Vec::new();
-            // SET assignments first (bind variables in assignment order)
-            for assign in &upd.assignments {
-                match assign {
+        Statement::Update(u) => {
+            // Bind markers in SET assignments
+            for assignment in &u.assignments {
+                match assignment {
                     Assignment::Simple {
                         column,
                         value: Term::BindMarker(_),
+                    } => {
+                        if let Some(cql_type) = resolve(column) {
+                            bound_columns.push((column.clone(), cql_type));
+                        }
                     }
-                    | Assignment::Add {
-                        column,
-                        value: Term::BindMarker(_),
-                    }
-                    | Assignment::Sub {
+                    Assignment::Add {
                         column,
                         value: Term::BindMarker(_),
                     } => {
-                        names.push(column.clone());
-                    }
-                    Assignment::Element { column, key, value } => {
-                        if matches!(key, Term::BindMarker(_)) {
-                            names.push(column.clone());
-                        }
-                        if matches!(value, Term::BindMarker(_)) {
-                            names.push(column.clone());
+                        if let Some(cql_type) = resolve(column) {
+                            bound_columns.push((column.clone(), cql_type));
                         }
                     }
-                    _ => {}
-                }
-            }
-            // WHERE clauses after assignments
-            for wc in &upd.where_clauses {
-                if matches!(&wc.value, Term::BindMarker(_)) {
-                    names.push(wc.column.clone());
-                }
-            }
-            // IF condition bind markers (LWT)
-            for wc in &upd.if_conditions {
-                if matches!(&wc.value, Term::BindMarker(_)) {
-                    names.push(wc.column.clone());
-                }
-            }
-            // USING TTL ? / USING TIMESTAMP ?
-            if upd.using_ttl == Some(0) {
-                names.push("[ttl]".to_string());
-            }
-            if upd.using_timestamp == Some(0) {
-                names.push("[timestamp]".to_string());
-            }
-            names
-        }
-        Statement::Delete(del) => {
-            let mut names = Vec::new();
-            for wc in &del.where_clauses {
-                if matches!(&wc.value, Term::BindMarker(_)) {
-                    names.push(wc.column.clone());
-                }
-            }
-            names
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Substitute bind markers in a statement with actual values from EXECUTE.
-///
-/// Matches positional values to bind markers in the order they appear.
-/// Uses the column type from `bound_columns` to decode raw bytes into
-/// the appropriate `Term` variant.
-fn substitute_bind_values(
-    stmt: &mut crate::ast::Statement,
-    values: &[(String, Vec<u8>)],
-    bound_columns: &[(String, CqlType)],
-) {
-    use crate::ast::{Assignment, Statement, Term};
-
-    // Build a map of column_name -> Term from the raw values.
-    let mut value_map: std::collections::HashMap<String, Term> = std::collections::HashMap::new();
-    for (i, (name, bytes)) in values.iter().enumerate() {
-        let cql_type = bound_columns
-            .get(i)
-            .map(|(_, t)| t.clone())
-            .unwrap_or(CqlType::Blob);
-
-        let term = if bytes.is_empty() {
-            Term::Null
-        } else {
-            raw_bytes_to_term(bytes, &cql_type)
-        };
-        value_map.insert(name.clone(), term);
-    }
-
-    // Replace BindMarker terms in the statement with resolved values.
-    match stmt {
-        Statement::Insert(ins) => {
-            for (col, val) in ins.columns.iter().zip(ins.values.iter_mut()) {
-                if matches!(val, Term::BindMarker(_)) {
-                    if let Some(resolved) = value_map.get(col) {
-                        *val = resolved.clone();
-                    }
-                }
-            }
-            // Substitute [ttl] and [timestamp] bind values
-            if ins.using_ttl == Some(0) {
-                if let Some(Term::IntegerLiteral(v)) = value_map.get("[ttl]") {
-                    ins.using_ttl = Some(*v as i32);
-                }
-            }
-            if ins.using_timestamp == Some(0) {
-                if let Some(Term::IntegerLiteral(v)) = value_map.get("[timestamp]") {
-                    ins.using_timestamp = Some(*v);
-                }
-            }
-        }
-        Statement::Select(sel) => {
-            for wc in &mut sel.where_clauses {
-                if matches!(&wc.value, Term::BindMarker(_)) {
-                    if let Some(resolved) = value_map.get(&wc.column) {
-                        wc.value = resolved.clone();
-                    }
-                }
-            }
-        }
-        Statement::Update(upd) => {
-            for assign in &mut upd.assignments {
-                match assign {
-                    Assignment::Simple { column, value }
-                        if matches!(value, Term::BindMarker(_)) =>
-                    {
-                        if let Some(resolved) = value_map.get(column) {
-                            *value = resolved.clone();
+                    Assignment::Sub {
+                        column,
+                        value: Term::BindMarker(_),
+                    } => {
+                        if let Some(cql_type) = resolve(column) {
+                            bound_columns.push((column.clone(), cql_type));
                         }
                     }
                     _ => {}
                 }
             }
-            for wc in &mut upd.where_clauses {
-                if matches!(&wc.value, Term::BindMarker(_)) {
-                    if let Some(resolved) = value_map.get(&wc.column) {
-                        wc.value = resolved.clone();
+            // Bind markers in WHERE clauses
+            for wc in &u.where_clauses {
+                if matches!(wc.value, Term::BindMarker(_)) {
+                    if let Some(cql_type) = resolve(&wc.column) {
+                        bound_columns.push((wc.column.clone(), cql_type));
                     }
                 }
             }
-            // IF condition bind markers (LWT)
-            for wc in &mut upd.if_conditions {
-                if matches!(&wc.value, Term::BindMarker(_)) {
-                    if let Some(resolved) = value_map.get(&wc.column) {
-                        wc.value = resolved.clone();
+            // Bind markers in IF conditions (LWT)
+            for cond in &u.if_conditions {
+                if matches!(cond.value, Term::BindMarker(_)) {
+                    if let Some(cql_type) = resolve(&cond.column) {
+                        bound_columns.push((cond.column.clone(), cql_type));
                     }
-                }
-            }
-            // Substitute [ttl] and [timestamp] bind values
-            if upd.using_ttl == Some(0) {
-                if let Some(Term::IntegerLiteral(v)) = value_map.get("[ttl]") {
-                    upd.using_ttl = Some(*v as i32);
-                }
-            }
-            if upd.using_timestamp == Some(0) {
-                if let Some(Term::IntegerLiteral(v)) = value_map.get("[timestamp]") {
-                    upd.using_timestamp = Some(*v);
                 }
             }
         }
-        Statement::Delete(del) => {
-            for wc in &mut del.where_clauses {
-                if matches!(&wc.value, Term::BindMarker(_)) {
-                    if let Some(resolved) = value_map.get(&wc.column) {
-                        wc.value = resolved.clone();
+        Statement::Delete(d) => {
+            // Bind markers in WHERE clauses
+            for wc in &d.where_clauses {
+                if matches!(wc.value, Term::BindMarker(_)) {
+                    if let Some(cql_type) = resolve(&wc.column) {
+                        bound_columns.push((wc.column.clone(), cql_type));
                     }
                 }
             }
         }
         _ => {}
     }
+
+    (bound_columns, Vec::new())
 }
 
-/// Convert raw CQL wire bytes to a Term based on the column type.
-fn raw_bytes_to_term(bytes: &[u8], cql_type: &CqlType) -> crate::ast::Term {
-    use crate::ast::Term;
+/// Build result column metadata for SELECT statements.
+fn build_result_columns(
+    select_columns: &[SelectColumn],
+    table_meta: &ferrosa_schema::TableMetadata,
+    table_ks: &str,
+    state: &SharedState,
+) -> Vec<(String, CqlType)> {
+    let resolve = |col_name: &str| -> Option<CqlType> {
+        let col = table_meta.columns.get(col_name)?;
+        bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema).ok()
+    };
 
-    match cql_type {
-        CqlType::Int if bytes.len() == 4 => {
-            Term::IntegerLiteral(i32::from_be_bytes(bytes.try_into().unwrap()) as i64)
-        }
-        CqlType::Bigint | CqlType::Counter | CqlType::Timestamp if bytes.len() == 8 => {
-            Term::IntegerLiteral(i64::from_be_bytes(bytes.try_into().unwrap()))
-        }
-        CqlType::Smallint if bytes.len() == 2 => {
-            Term::IntegerLiteral(i16::from_be_bytes(bytes.try_into().unwrap()) as i64)
-        }
-        CqlType::Tinyint if bytes.len() == 1 => Term::IntegerLiteral(bytes[0] as i8 as i64),
-        CqlType::Float if bytes.len() == 4 => {
-            Term::FloatLiteral(f32::from_be_bytes(bytes.try_into().unwrap()) as f64)
-        }
-        CqlType::Double if bytes.len() == 8 => {
-            Term::FloatLiteral(f64::from_be_bytes(bytes.try_into().unwrap()))
-        }
-        CqlType::Boolean if bytes.len() == 1 => Term::BoolLiteral(bytes[0] != 0),
-        CqlType::Varchar | CqlType::Ascii => {
-            Term::StringLiteral(String::from_utf8_lossy(bytes).to_string())
-        }
-        CqlType::Uuid | CqlType::Timeuuid if bytes.len() == 16 => {
-            let uuid = uuid::Uuid::from_bytes(bytes.try_into().unwrap());
-            Term::UuidLiteral(uuid)
-        }
-        CqlType::Inet if bytes.len() == 4 => {
-            let addr = std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
-            Term::StringLiteral(addr.to_string())
-        }
-        CqlType::Inet if bytes.len() == 16 => {
-            let octets: [u8; 16] = bytes.try_into().unwrap();
-            let addr = std::net::Ipv6Addr::from(octets);
-            Term::StringLiteral(addr.to_string())
-        }
-        // Collections: decode from CQL binary wire format.
-        // Format: [i32 count] then count elements (list/set) or key-value pairs (map).
-        // Each element: [i32 len][bytes].
-        CqlType::Map(key_type, val_type) => decode_map_term(bytes, key_type, val_type),
-        CqlType::List(elem_type) => decode_list_term(bytes, elem_type),
-        CqlType::Set(elem_type) => decode_set_term(bytes, elem_type),
-        CqlType::Blob => Term::BlobLiteral(bytes.to_vec()),
-        CqlType::Varint => {
-            // Varint: variable-length signed integer in big-endian.
-            // For bind values, store as blob — the storage engine handles it.
-            Term::BlobLiteral(bytes.to_vec())
-        }
-        CqlType::Decimal => Term::BlobLiteral(bytes.to_vec()),
-        CqlType::Date if bytes.len() == 4 => {
-            // CQL date: days since epoch as u32.
-            Term::IntegerLiteral(u32::from_be_bytes(bytes.try_into().unwrap()) as i64)
-        }
-        CqlType::Time if bytes.len() == 8 => {
-            // CQL time: nanoseconds since midnight as i64.
-            Term::IntegerLiteral(i64::from_be_bytes(bytes.try_into().unwrap()))
-        }
-        CqlType::Duration => Term::BlobLiteral(bytes.to_vec()),
-        _ => {
-            // Fallback: treat as blob
-            Term::BlobLiteral(bytes.to_vec())
-        }
-    }
-}
+    let has_star = select_columns
+        .iter()
+        .any(|c| matches!(c, SelectColumn::Star));
 
-/// Decode a CQL binary map into a `Term::MapLiteral`.
-fn decode_map_term(bytes: &[u8], key_type: &CqlType, val_type: &CqlType) -> crate::ast::Term {
-    use crate::ast::Term;
-    if bytes.len() < 4 {
-        return Term::MapLiteral(vec![]);
+    if has_star {
+        return table_meta
+            .columns
+            .iter()
+            .filter_map(|(name, col)| {
+                bridge::parse_cql_type_in_keyspace(&col.column_type, table_ks, &state.schema)
+                    .ok()
+                    .map(|t| (name.clone(), t))
+            })
+            .collect();
     }
-    let count = i32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let mut pairs = Vec::with_capacity(count);
-    let mut off = 4usize;
-    for _ in 0..count {
-        if off + 4 > bytes.len() {
-            break;
-        }
-        let key_len = i32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
-        off += 4;
-        if off + key_len > bytes.len() {
-            break;
-        }
-        let key_term = raw_bytes_to_term(&bytes[off..off + key_len], key_type);
-        off += key_len;
 
-        if off + 4 > bytes.len() {
-            break;
-        }
-        let val_len = i32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
-        off += 4;
-        if off + val_len > bytes.len() {
-            break;
-        }
-        let val_term = raw_bytes_to_term(&bytes[off..off + val_len], val_type);
-        off += val_len;
-
-        pairs.push((key_term, val_term));
-    }
-    Term::MapLiteral(pairs)
-}
-
-/// Decode a CQL binary list into a `Term::ListLiteral`.
-fn decode_list_term(bytes: &[u8], elem_type: &CqlType) -> crate::ast::Term {
-    use crate::ast::Term;
-    if bytes.len() < 4 {
-        return Term::ListLiteral(vec![]);
-    }
-    let count = i32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let mut items = Vec::with_capacity(count);
-    let mut off = 4usize;
-    for _ in 0..count {
-        if off + 4 > bytes.len() {
-            break;
-        }
-        let item_len = i32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
-        off += 4;
-        if off + item_len > bytes.len() {
-            break;
-        }
-        items.push(raw_bytes_to_term(&bytes[off..off + item_len], elem_type));
-        off += item_len;
-    }
-    Term::ListLiteral(items)
-}
-
-/// Decode a CQL binary set into a `Term::SetLiteral`.
-fn decode_set_term(bytes: &[u8], elem_type: &CqlType) -> crate::ast::Term {
-    use crate::ast::Term;
-    if bytes.len() < 4 {
-        return Term::SetLiteral(vec![]);
-    }
-    let count = i32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let mut items = Vec::with_capacity(count);
-    let mut off = 4usize;
-    for _ in 0..count {
-        if off + 4 > bytes.len() {
-            break;
-        }
-        let item_len = i32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
-        off += 4;
-        if off + item_len > bytes.len() {
-            break;
-        }
-        items.push(raw_bytes_to_term(&bytes[off..off + item_len], elem_type));
-        off += item_len;
-    }
-    Term::SetLiteral(items)
-}
-
-/// Map a column type string (from schema metadata) to the CQL wire type.
-fn col_type_str_to_cql_type(type_str: &str) -> CqlType {
-    let lower = type_str.to_lowercase();
-    match lower.as_str() {
-        "ascii" => CqlType::Ascii,
-        "bigint" => CqlType::Bigint,
-        "blob" => CqlType::Blob,
-        "boolean" => CqlType::Boolean,
-        "counter" => CqlType::Counter,
-        "decimal" => CqlType::Decimal,
-        "double" => CqlType::Double,
-        "float" => CqlType::Float,
-        "int" => CqlType::Int,
-        "timestamp" => CqlType::Timestamp,
-        "uuid" => CqlType::Uuid,
-        "varchar" | "text" => CqlType::Varchar,
-        "varint" => CqlType::Varint,
-        "timeuuid" => CqlType::Timeuuid,
-        "inet" => CqlType::Inet,
-        "date" => CqlType::Date,
-        "time" => CqlType::Time,
-        "smallint" => CqlType::Smallint,
-        "tinyint" => CqlType::Tinyint,
-        "duration" => CqlType::Duration,
-        _ => {
-            // Try parsing complex types (vector<float, N>, list<...>, etc.)
-            if let Ok(parsed) = crate::bridge::parse_cql_type(&lower) {
-                return parsed;
+    let mut result = Vec::new();
+    for sc in select_columns {
+        match sc {
+            SelectColumn::Star => unreachable!(),
+            SelectColumn::Column(name) => {
+                if let Some(cql_type) = resolve(name) {
+                    result.push((name.clone(), cql_type));
+                }
             }
-            CqlType::Blob // fallback for unknown types
+            SelectColumn::FunctionCall { alias, name, .. } => {
+                // For function calls, use the alias or function name;
+                // type is unknown without deeper analysis, default to Varchar.
+                let col_name = alias.as_ref().unwrap_or(name).clone();
+                result.push((col_name, CqlType::Varchar));
+            }
         }
+    }
+    result
+}
+
+/// Convert a decoded `CqlValue` back into a parser-level `Term` for AST substitution.
+///
+/// This is the reverse of `bridge::term_to_cql_value`. We only need to cover the
+/// scalar types that appear as bind-variable values; collections and UDTs are
+/// passed through as blob literals (the router will re-decode them).
+fn cql_value_to_term(v: &CqlValue) -> Term {
+    match v {
+        CqlValue::Null => Term::Null,
+        CqlValue::Int(n) => Term::IntegerLiteral(*n as i64),
+        CqlValue::Bigint(n) | CqlValue::Counter(n) | CqlValue::Timestamp(n) => {
+            Term::IntegerLiteral(*n)
+        }
+        CqlValue::Smallint(n) => Term::IntegerLiteral(*n as i64),
+        CqlValue::Tinyint(n) => Term::IntegerLiteral(*n as i64),
+        CqlValue::Float(bits) => Term::FloatLiteral(f32::from_bits(*bits) as f64),
+        CqlValue::Double(bits) => Term::FloatLiteral(f64::from_bits(*bits)),
+        CqlValue::Text(s) | CqlValue::Ascii(s) => Term::StringLiteral(s.clone()),
+        CqlValue::Boolean(b) => Term::BoolLiteral(*b),
+        CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => Term::UuidLiteral(*u),
+        CqlValue::Blob(b) => Term::BlobLiteral(b.clone()),
+        CqlValue::Inet(addr) => Term::StringLiteral(addr.to_string()),
+        CqlValue::Date(d) => Term::IntegerLiteral(*d as i64),
+        CqlValue::Time(t) => Term::IntegerLiteral(*t),
+        CqlValue::Varint(big) => {
+            // Best-effort: try to fit into i64, otherwise render as string.
+            match i64::try_from(big) {
+                Ok(n) => Term::IntegerLiteral(n),
+                Err(_) => Term::StringLiteral(big.to_string()),
+            }
+        }
+        CqlValue::Decimal { .. } => {
+            // Decimals don't have a direct Term representation; use string.
+            Term::StringLiteral(format!("{v:?}"))
+        }
+        CqlValue::Duration { .. } => Term::StringLiteral(format!("{v:?}")),
+        // Collections: encode back to blob bytes so the router re-decodes them.
+        CqlValue::List(items) => Term::ListLiteral(items.iter().map(cql_value_to_term).collect()),
+        CqlValue::Set(items) => Term::SetLiteral(items.iter().map(cql_value_to_term).collect()),
+        CqlValue::Map(pairs) => Term::MapLiteral(
+            pairs
+                .iter()
+                .map(|(k, v)| (cql_value_to_term(k), cql_value_to_term(v)))
+                .collect(),
+        ),
+        CqlValue::Tuple(elems) => Term::TupleLiteral(
+            elems
+                .iter()
+                .map(|e| match e {
+                    Some(v) => cql_value_to_term(v),
+                    None => Term::Null,
+                })
+                .collect(),
+        ),
+        CqlValue::Vector(_) | CqlValue::Udt(_) => {
+            // Opaque types: pass as debug string. The router handles these
+            // through the typed path, not AST substitution.
+            Term::StringLiteral(format!("{v:?}"))
+        }
+    }
+}
+
+/// Parse bound values from the EXECUTE frame cursor and substitute them
+/// into the prepared statement AST, replacing `BindMarker` nodes with
+/// literal `Term` values.
+///
+/// The cursor should be positioned after the consistency level bytes.
+/// CQL v5 EXECUTE frame layout after consistency:
+///   `[int flags][short n_values]([int len][bytes value])*`
+fn substitute_bound_values(plan: &PreparedPlan, mut cursor: &[u8]) -> Result<Statement, CqlError> {
+    // Parse flags byte (CQL v4: 1 byte). Bit 0x01 = Values present.
+    if cursor.remaining() < 1 {
+        return Ok(plan.statement.clone());
+    }
+    let flags = cursor.get_u8();
+    let has_values = (flags & 0x01) != 0;
+
+    if !has_values {
+        return Ok(plan.statement.clone());
+    }
+
+    // Parse [short n_values]
+    // Per CQL v4 spec 4.1.4, values come first after flags, before
+    // optional fields (page_size, paging_state, etc.).
+    if cursor.remaining() < 2 {
+        return Err(CqlError::Protocol("EXECUTE: truncated values count".into()));
+    }
+    let n_values = cursor.get_u16() as usize;
+
+    // Decode each bound value using the type from bound_columns.
+    let mut bound_terms: Vec<Term> = Vec::with_capacity(n_values);
+    for i in 0..n_values {
+        if cursor.remaining() < 4 {
+            return Err(CqlError::Protocol("EXECUTE: truncated value length".into()));
+        }
+        let val_len = cursor.get_i32();
+        if val_len < 0 {
+            // Null value
+            bound_terms.push(Term::Null);
+        } else {
+            let val_len = val_len as usize;
+            if cursor.remaining() < val_len {
+                return Err(CqlError::Protocol("EXECUTE: truncated value bytes".into()));
+            }
+            let val_bytes = &cursor[..val_len];
+            cursor.advance(val_len);
+
+            // Look up the type for this positional value.
+            let cql_type = if i < plan.bound_columns.len() {
+                &plan.bound_columns[i].1
+            } else {
+                // More values than bound columns — default to blob.
+                &CqlType::Blob
+            };
+
+            let cql_value = decode_value(cql_type, val_bytes)?;
+            bound_terms.push(cql_value_to_term(&cql_value));
+        }
+    }
+
+    // Walk the statement AST and replace BindMarker nodes in order.
+    let mut substitution_idx = 0usize;
+    Ok(substitute_in_statement(
+        &plan.statement,
+        &bound_terms,
+        &mut substitution_idx,
+    ))
+}
+
+/// Recursively walk a statement and replace `Term::BindMarker` with bound terms.
+fn substitute_in_statement(stmt: &Statement, terms: &[Term], idx: &mut usize) -> Statement {
+    match stmt {
+        Statement::Select(s) => {
+            let mut s = s.clone();
+            for wc in &mut s.where_clauses {
+                substitute_in_term(&mut wc.value, terms, idx);
+            }
+            Statement::Select(s)
+        }
+        Statement::Insert(i) => {
+            let mut i = i.clone();
+            for val in &mut i.values {
+                substitute_in_term(val, terms, idx);
+            }
+            Statement::Insert(i)
+        }
+        Statement::Update(u) => {
+            let mut u = u.clone();
+            for assignment in &mut u.assignments {
+                match assignment {
+                    Assignment::Simple { value, .. } => substitute_in_term(value, terms, idx),
+                    Assignment::Add { value, .. } => substitute_in_term(value, terms, idx),
+                    Assignment::Sub { value, .. } => substitute_in_term(value, terms, idx),
+                    Assignment::Element { key, value, .. } => {
+                        substitute_in_term(key, terms, idx);
+                        substitute_in_term(value, terms, idx);
+                    }
+                }
+            }
+            for wc in &mut u.where_clauses {
+                substitute_in_term(&mut wc.value, terms, idx);
+            }
+            Statement::Update(u)
+        }
+        Statement::Delete(d) => {
+            let mut d = d.clone();
+            for wc in &mut d.where_clauses {
+                substitute_in_term(&mut wc.value, terms, idx);
+            }
+            Statement::Delete(d)
+        }
+        // For other statement types, return as-is.
+        other => other.clone(),
+    }
+}
+
+/// Replace a `Term::BindMarker` with the next bound term from the list.
+/// Recurses into nested terms (lists, maps, sets, tuples).
+fn substitute_in_term(term: &mut Term, terms: &[Term], idx: &mut usize) {
+    match term {
+        Term::BindMarker(_) => {
+            if *idx < terms.len() {
+                *term = terms[*idx].clone();
+                *idx += 1;
+            }
+        }
+        Term::InList(items)
+        | Term::ListLiteral(items)
+        | Term::SetLiteral(items)
+        | Term::TupleLiteral(items) => {
+            for item in items.iter_mut() {
+                substitute_in_term(item, terms, idx);
+            }
+        }
+        Term::MapLiteral(entries) => {
+            for (k, v) in entries.iter_mut() {
+                substitute_in_term(k, terms, idx);
+                substitute_in_term(v, terms, idx);
+            }
+        }
+        Term::FunctionCall { args, .. } => {
+            for arg in args.iter_mut() {
+                substitute_in_term(arg, terms, idx);
+            }
+        }
+        // Literal values — nothing to substitute.
+        _ => {}
     }
 }
 
@@ -2073,106 +1610,187 @@ mod tests {
         assert!(pending.is_none());
     }
 
-    // ── raw_bytes_to_term collection decoding ───────────────────────────
+    // -----------------------------------------------------------------------
+    // substitute_bound_values tests
+    // -----------------------------------------------------------------------
+
+    fn make_plan(query: &str, bound_cols: Vec<(&str, CqlType)>) -> PreparedPlan {
+        let stmt = parser::parse(query).unwrap();
+        let (table_ks, table_name) = match &stmt {
+            Statement::Select(s) => (s.keyspace.clone().unwrap_or_default(), s.table.clone()),
+            Statement::Insert(i) => (i.keyspace.clone().unwrap_or_default(), i.table.clone()),
+            _ => (String::new(), String::new()),
+        };
+        PreparedPlan {
+            id: [0u8; 16],
+            query: query.to_string(),
+            statement: stmt,
+            keyspace: None,
+            result_columns: Vec::new(),
+            bound_columns: bound_cols
+                .into_iter()
+                .map(|(n, t)| (n.to_string(), t))
+                .collect(),
+            table_keyspace: table_ks,
+            table_name,
+        }
+    }
+
+    /// Build a V4 EXECUTE-style value payload: [byte flags][short n_values][values...]
+    fn encode_values(values: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(0x01); // flags: Values present
+        buf.extend_from_slice(&(values.len() as u16).to_be_bytes()); // n_values
+        for val in values {
+            buf.extend_from_slice(&(val.len() as i32).to_be_bytes()); // value length
+            buf.extend_from_slice(val); // value bytes
+        }
+        buf
+    }
 
     #[test]
-    fn raw_bytes_to_term_empty_map() {
-        let bytes = 0i32.to_be_bytes();
-        let cql_type = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Bigint));
-        match raw_bytes_to_term(&bytes, &cql_type) {
-            crate::ast::Term::MapLiteral(pairs) => assert!(pairs.is_empty()),
-            other => panic!("expected empty MapLiteral, got {other:?}"),
+    fn substitute_uuid_values_in_select() {
+        // Given: a SELECT with 2 UUID bind markers
+        let plan = make_plan(
+            "SELECT entity_id FROM ks.t WHERE tenant_id = ? AND session_id = ?",
+            vec![("tenant_id", CqlType::Uuid), ("session_id", CqlType::Uuid)],
+        );
+
+        // When: we substitute 2 UUID values
+        let uuid1 = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let uuid2 = uuid::Uuid::parse_str("86da7931-7c87-54fe-8a49-eabc21c025aa").unwrap();
+        let payload = encode_values(&[uuid1.as_bytes(), uuid2.as_bytes()]);
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+
+        // Then: the WHERE clause values should be UuidLiterals, not BindMarkers
+        if let Statement::Select(s) = &result {
+            assert_eq!(s.where_clauses.len(), 2);
+            assert!(
+                matches!(&s.where_clauses[0].value, Term::UuidLiteral(u) if *u == uuid1),
+                "first WHERE value should be UUID1, got {:?}",
+                s.where_clauses[0].value
+            );
+            assert!(
+                matches!(&s.where_clauses[1].value, Term::UuidLiteral(u) if *u == uuid2),
+                "second WHERE value should be UUID2, got {:?}",
+                s.where_clauses[1].value
+            );
+        } else {
+            panic!("expected Select statement");
         }
     }
 
     #[test]
-    fn raw_bytes_to_term_map_with_entry() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1i32.to_be_bytes());
-        let key = b"hello";
-        bytes.extend_from_slice(&(key.len() as i32).to_be_bytes());
-        bytes.extend_from_slice(key);
-        bytes.extend_from_slice(&8i32.to_be_bytes());
-        bytes.extend_from_slice(&42i64.to_be_bytes());
+    fn substitute_no_values_flag_returns_unchanged() {
+        // Given: a SELECT with bind markers
+        let plan = make_plan(
+            "SELECT id FROM ks.t WHERE pk = ?",
+            vec![("pk", CqlType::Int)],
+        );
 
-        let cql_type = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Bigint));
-        match raw_bytes_to_term(&bytes, &cql_type) {
-            crate::ast::Term::MapLiteral(pairs) => {
-                assert_eq!(pairs.len(), 1);
-                assert!(matches!(&pairs[0].0, crate::ast::Term::StringLiteral(s) if s == "hello"));
-                assert!(matches!(&pairs[0].1, crate::ast::Term::IntegerLiteral(42)));
-            }
-            other => panic!("expected MapLiteral, got {other:?}"),
+        // When: the frame has no values (flags = 0)
+        let payload = vec![0x00u8]; // flags: no values
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+
+        // Then: bind markers remain
+        if let Statement::Select(s) = &result {
+            assert!(matches!(&s.where_clauses[0].value, Term::BindMarker(_)));
+        } else {
+            panic!("expected Select");
         }
     }
 
     #[test]
-    fn raw_bytes_to_term_empty_list() {
-        let bytes = 0i32.to_be_bytes();
-        let cql_type = CqlType::List(Box::new(CqlType::Varchar));
-        match raw_bytes_to_term(&bytes, &cql_type) {
-            crate::ast::Term::ListLiteral(items) => assert!(items.is_empty()),
-            other => panic!("expected empty ListLiteral, got {other:?}"),
+    fn substitute_null_value_becomes_term_null() {
+        let plan = make_plan(
+            "SELECT id FROM ks.t WHERE pk = ?",
+            vec![("pk", CqlType::Int)],
+        );
+
+        // Null value: length = -1
+        let mut payload = Vec::new();
+        payload.push(0x01); // flags: Values
+        payload.extend_from_slice(&1u16.to_be_bytes()); // 1 value
+        payload.extend_from_slice(&(-1i32).to_be_bytes()); // null
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+        if let Statement::Select(s) = &result {
+            assert!(
+                matches!(&s.where_clauses[0].value, Term::Null),
+                "null value should become Term::Null"
+            );
+        } else {
+            panic!("expected Select");
         }
     }
 
     #[test]
-    fn raw_bytes_to_term_list_with_items() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&2i32.to_be_bytes());
-        for s in &["alpha", "beta"] {
-            bytes.extend_from_slice(&(s.len() as i32).to_be_bytes());
-            bytes.extend_from_slice(s.as_bytes());
-        }
-        let cql_type = CqlType::List(Box::new(CqlType::Varchar));
-        match raw_bytes_to_term(&bytes, &cql_type) {
-            crate::ast::Term::ListLiteral(items) => {
-                assert_eq!(items.len(), 2);
-                assert!(matches!(&items[0], crate::ast::Term::StringLiteral(s) if s == "alpha"));
-                assert!(matches!(&items[1], crate::ast::Term::StringLiteral(s) if s == "beta"));
-            }
-            other => panic!("expected ListLiteral, got {other:?}"),
-        }
-    }
+    fn substitute_insert_with_mixed_types() {
+        let plan = make_plan(
+            "INSERT INTO ks.t (id, name, score) VALUES (?, ?, ?)",
+            vec![
+                ("id", CqlType::Uuid),
+                ("name", CqlType::Varchar),
+                ("score", CqlType::Int),
+            ],
+        );
 
-    #[test]
-    fn raw_bytes_to_term_empty_set() {
-        let bytes = 0i32.to_be_bytes();
-        let cql_type = CqlType::Set(Box::new(CqlType::Int));
-        match raw_bytes_to_term(&bytes, &cql_type) {
-            crate::ast::Term::SetLiteral(items) => assert!(items.is_empty()),
-            other => panic!("expected empty SetLiteral, got {other:?}"),
+        let uuid = uuid::Uuid::new_v4();
+        let name = b"test_entity";
+        let score = 42i32.to_be_bytes();
+        let payload = encode_values(&[uuid.as_bytes(), name, &score]);
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+        if let Statement::Insert(i) = &result {
+            assert_eq!(i.values.len(), 3);
+            assert!(matches!(&i.values[0], Term::UuidLiteral(_)));
+            assert!(matches!(&i.values[1], Term::StringLiteral(s) if s == "test_entity"));
+            assert!(matches!(&i.values[2], Term::IntegerLiteral(42)));
+        } else {
+            panic!("expected Insert");
         }
     }
 
     #[test]
-    fn raw_bytes_to_term_set_with_uuids() {
-        let uuid1 = uuid::Uuid::nil();
-        let uuid2 = uuid::Uuid::from_u128(1);
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&2i32.to_be_bytes());
-        bytes.extend_from_slice(&16i32.to_be_bytes());
-        bytes.extend_from_slice(uuid1.as_bytes());
-        bytes.extend_from_slice(&16i32.to_be_bytes());
-        bytes.extend_from_slice(uuid2.as_bytes());
+    fn substitute_empty_cursor_returns_unchanged() {
+        let plan = make_plan(
+            "SELECT id FROM ks.t WHERE pk = ?",
+            vec![("pk", CqlType::Int)],
+        );
 
-        let cql_type = CqlType::Set(Box::new(CqlType::Uuid));
-        match raw_bytes_to_term(&bytes, &cql_type) {
-            crate::ast::Term::SetLiteral(items) => {
-                assert_eq!(items.len(), 2);
-                assert!(matches!(&items[0], crate::ast::Term::UuidLiteral(u) if *u == uuid1));
-                assert!(matches!(&items[1], crate::ast::Term::UuidLiteral(u) if *u == uuid2));
-            }
-            other => panic!("expected SetLiteral, got {other:?}"),
+        let result = substitute_bound_values(&plan, &[]).unwrap();
+        if let Statement::Select(s) = &result {
+            assert!(matches!(&s.where_clauses[0].value, Term::BindMarker(_)));
+        } else {
+            panic!("expected Select");
         }
     }
 
     #[test]
-    fn raw_bytes_to_term_inet_v4() {
-        let bytes = [127, 0, 0, 1];
-        match raw_bytes_to_term(&bytes, &CqlType::Inet) {
-            crate::ast::Term::StringLiteral(s) => assert_eq!(s, "127.0.0.1"),
-            other => panic!("expected 127.0.0.1, got {other:?}"),
+    fn substitute_more_values_than_bound_cols_uses_blob() {
+        // Only 1 bound column known, but 2 values sent
+        let plan = make_plan(
+            "SELECT id FROM ks.t WHERE pk = ? AND extra = ?",
+            vec![("pk", CqlType::Int)],
+        );
+
+        let v1 = 42i32.to_be_bytes();
+        let v2 = b"unknown";
+        let payload = encode_values(&[&v1, v2]);
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+        if let Statement::Select(s) = &result {
+            assert!(
+                matches!(&s.where_clauses[0].value, Term::IntegerLiteral(42)),
+                "first value should be Int"
+            );
+            assert!(
+                matches!(&s.where_clauses[1].value, Term::BlobLiteral(_)),
+                "second value should fall back to Blob, got {:?}",
+                s.where_clauses[1].value
+            );
+        } else {
+            panic!("expected Select");
         }
     }
 }

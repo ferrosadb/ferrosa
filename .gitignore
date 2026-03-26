@@ -1,6 +1,7 @@
 .superpowers/
 .fastembed_cache/
 /target/
+**/target/
 /releases/
 Cargo.lock
 

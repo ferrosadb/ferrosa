@@ -1,0 +1,28 @@
+[package]
+name = "ferrosa-jepsen"
+version.workspace = true
+edition = "2021"
+
+[[bin]]
+name = "ferrosa-jepsen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json"] }
+russh = "0.46"
+russh-keys = "0.46"
+rand = "0.8"
+dirs-next = "2"
+
+[dev-dependencies]
+tempfile = "3"

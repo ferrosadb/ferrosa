@@ -10,8 +10,9 @@ use crate::error::CqlError;
 
 /// CQL native protocol v5 version byte for requests.
 pub const VERSION_REQUEST: u8 = 0x05;
-/// CQL native protocol v5 version byte for responses.
-pub const VERSION_RESPONSE: u8 = 0x85;
+/// CQL native protocol v4 version byte for responses.
+/// Most Rust drivers (cdrs-tokio, scylla-rust-driver) negotiate v4.
+pub const VERSION_RESPONSE: u8 = 0x84;
 /// Size of the frame header in bytes.
 pub const HEADER_SIZE: usize = 9;
 /// Default maximum frame body size: 256 MiB.
@@ -772,6 +773,11 @@ mod tests {
         decoder.set_compression(Compression::Lz4);
         let decoded = decoder.decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.body.as_ref(), &body_data[..]);
+    }
+
+    #[test]
+    fn version_response_is_v4() {
+        assert_eq!(VERSION_RESPONSE, 0x84);
     }
 
     #[test]

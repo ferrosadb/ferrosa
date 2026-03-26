@@ -7,6 +7,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_schema::Schema;
 use ferrosa_sstable::types::DeletionTime;
@@ -326,22 +328,30 @@ pub fn spawn_reconciliation(
     storage: Arc<StorageEngine>,
     keyspace: String,
     interval: Duration,
+    cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         loop {
-            ticker.tick().await;
-            let metrics = reconcile_once(&schema, &storage, &keyspace);
-            if metrics.entries_repaired > 0 || metrics.orphans_removed > 0 {
-                tracing::info!(
-                    keyspace = %keyspace,
-                    checked = metrics.entries_checked,
-                    repaired = metrics.entries_repaired,
-                    orphans = metrics.orphans_removed,
-                    "adjacency reconciliation complete"
-                );
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let metrics = reconcile_once(&schema, &storage, &keyspace);
+                    if metrics.entries_repaired > 0 || metrics.orphans_removed > 0 {
+                        tracing::info!(
+                            keyspace = %keyspace,
+                            checked = metrics.entries_checked,
+                            repaired = metrics.entries_repaired,
+                            orphans = metrics.orphans_removed,
+                            "adjacency reconciliation complete"
+                        );
+                    }
+                    tokio::task::yield_now().await;
+                }
+                _ = cancel.cancelled() => {
+                    tracing::info!(keyspace = %keyspace, "reconciliation loop shutting down");
+                    break;
+                }
             }
-            tokio::task::yield_now().await;
         }
     })
 }

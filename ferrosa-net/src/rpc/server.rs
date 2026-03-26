@@ -60,6 +60,12 @@ impl RpcServer {
     /// Signal the server to stop accepting new connections and wait for in-flight
     /// connections to drain, up to `drain_timeout`. Any connections still active after
     /// the timeout are abandoned (the OS will close the socket).
+    ///
+    /// # Cancel Safety
+    ///
+    /// This method is cancel-safe. Shutdown is signalled via `CancellationToken::cancel`,
+    /// which is an instantaneous, idempotent operation. In-flight connections run to
+    /// completion within the drain window regardless of whether this future is dropped.
     pub async fn shutdown(&self, drain_timeout: Duration) {
         self.cancel.cancel();
         tokio::time::timeout(drain_timeout, self.wait_for_connections())

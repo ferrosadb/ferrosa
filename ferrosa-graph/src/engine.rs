@@ -13,6 +13,8 @@ use ferrosa_schema::auth::role::AuthContext;
 use ferrosa_schema::Schema;
 use ferrosa_storage::StorageEngine;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::adjacency::observer::AdjacencyIndexObserver;
 use crate::adjacency::reconcile::spawn_reconciliation;
 use crate::error::{GraphError, Result};
@@ -51,6 +53,7 @@ pub struct GraphEngine {
     storage: Arc<StorageEngine>,
     config: GraphEngineConfig,
     reconciliation_handles: Vec<tokio::task::JoinHandle<()>>,
+    reconciliation_cancel: CancellationToken,
     subscription_registry: Arc<SubscriptionRegistry>,
 }
 
@@ -99,6 +102,7 @@ impl GraphEngine {
 
         // Register an adjacency observer and start reconciliation for each keyspace.
         let mut reconciliation_handles = Vec::new();
+        let reconciliation_cancel = CancellationToken::new();
         for ks in &edge_keyspaces {
             let observer = Arc::new(AdjacencyIndexObserver::new(Arc::clone(&schema), ks.clone()));
             storage.register_observer(observer);
@@ -112,6 +116,7 @@ impl GraphEngine {
                     Arc::clone(&storage),
                     ks.clone(),
                     reconciliation_interval,
+                    reconciliation_cancel.child_token(),
                 );
                 reconciliation_handles.push(handle);
             }
@@ -122,6 +127,7 @@ impl GraphEngine {
             storage,
             config,
             reconciliation_handles,
+            reconciliation_cancel,
             subscription_registry: Arc::new(SubscriptionRegistry::new(DEFAULT_MAX_SUBSCRIPTIONS)),
         }
     }
@@ -250,8 +256,9 @@ impl GraphEngine {
         Ok(GraphSchema { vertices, edges })
     }
 
-    /// Abort reconciliation tasks (for graceful shutdown).
+    /// Cancel and abort reconciliation tasks (for graceful shutdown).
     pub fn shutdown(&mut self) {
+        self.reconciliation_cancel.cancel();
         for handle in self.reconciliation_handles.drain(..) {
             handle.abort();
         }

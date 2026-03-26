@@ -300,7 +300,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         if flags & HAS_TIMESTAMP != 0 {
             let (delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            liveness.timestamp = self.header.min_timestamp + delta as i64;
+            liveness.timestamp = self.header.min_timestamp.wrapping_add(delta as i64);
 
             if flags & HAS_TTL != 0 {
                 let (ttl_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -325,7 +325,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
 
             let marked_for_delete_at = self.header.min_timestamp + ts_delta as i64;
             let local_deletion_time =
-                (self.header.min_local_deletion_time as i64 + ldt_delta as i64) as u32;
+                (self.header.min_local_deletion_time as i64).wrapping_add(ldt_delta as i64) as u32;
             DeletionTime::new(marked_for_delete_at, local_deletion_time)
         } else {
             DeletionTime::LIVE
@@ -399,7 +399,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         } else {
             let (delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            self.header.min_timestamp + delta as i64
+            self.header.min_timestamp.wrapping_add(delta as i64)
         };
 
         // Local deletion time (for tombstones and expiring cells)
@@ -986,6 +986,34 @@ mod tests {
 
         let _ = reader.read_partition().unwrap();
         assert_eq!(reader.position(), data_len);
+    }
+
+    /// Verify that delta decoding with wrapping_add does not panic when
+    /// min_local_deletion_time is near i32::MAX and delta causes overflow.
+    #[test]
+    fn delta_decode_i32_near_max_does_not_panic() {
+        // Simulate the wrapping_add arithmetic used in row reading:
+        //   liveness.local_deletion_time = min_local_deletion_time.wrapping_add(delta as i32)
+        let min_local_deletion_time: i32 = i32::MAX - 10;
+        let delta: u64 = 20;
+        // This would panic with checked add; wrapping_add should not panic.
+        let result = min_local_deletion_time.wrapping_add(delta as i32);
+        // The result wraps around: (i32::MAX - 10) + 20 = i32::MIN + 9
+        assert_eq!(result, i32::MIN + 9);
+    }
+
+    /// Verify that delta decoding with wrapping_add does not panic when
+    /// min_timestamp is near i64::MAX and delta causes overflow.
+    #[test]
+    fn delta_decode_i64_near_max_does_not_panic() {
+        // Simulate the wrapping_add arithmetic used in row/cell reading:
+        //   liveness.timestamp = min_timestamp.wrapping_add(delta as i64)
+        let min_timestamp: i64 = i64::MAX - 10;
+        let delta: u64 = 20;
+        // This would panic with checked add; wrapping_add should not panic.
+        let result = min_timestamp.wrapping_add(delta as i64);
+        // The result wraps around: (i64::MAX - 10) + 20 = i64::MIN + 9
+        assert_eq!(result, i64::MIN + 9);
     }
 
     #[test]

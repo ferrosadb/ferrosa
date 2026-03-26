@@ -36,15 +36,15 @@ pub enum CqlType {
     Map(Box<CqlType>, Box<CqlType>), // 0x0021
     Set(Box<CqlType>),               // 0x0022
     Tuple(Vec<CqlType>),             // 0x0031
-    /// Vector type (0x0023): element type + fixed dimension.
-    /// Cassandra 5.0 uses `vector<float, N>` for embedding columns.
-    Vector(Box<CqlType>, usize),
     /// User-Defined Type (0x0030).
     Udt {
         keyspace: String,
         name: String,
         fields: Vec<(String, CqlType)>,
     },
+    /// Vector type: element type + fixed dimension.
+    /// Cassandra encodes vectors as Custom type (0x0000) on the wire.
+    Vector(Box<CqlType>, usize),
 }
 
 impl CqlType {
@@ -74,9 +74,9 @@ impl CqlType {
             Self::List(_) => 0x0020,
             Self::Map(_, _) => 0x0021,
             Self::Set(_) => 0x0022,
-            Self::Vector(_, _) => 0x0000, // Custom — Cassandra encodes vectors as Custom type
             Self::Udt { .. } => 0x0030,
             Self::Tuple(_) => 0x0031,
+            Self::Vector(_, _) => 0x0000, // Custom — Cassandra encodes vectors as Custom type
         }
     }
 }

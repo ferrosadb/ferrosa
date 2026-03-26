@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::codec::Lane;
@@ -76,6 +77,13 @@ impl PeerManager {
     }
 
     /// Send a message to a peer on the specified lane.
+    ///
+    /// # Cancel Safety
+    ///
+    /// This method is cancel-safe. It delegates to the lane actor via
+    /// `PriorityPool::send`, which uses `reserve`+`send` for enqueue and a oneshot
+    /// for the response. Dropping the returned future before it resolves does not
+    /// corrupt any shared state.
     pub async fn send(
         &self,
         host_id: uuid::Uuid,
@@ -88,6 +96,32 @@ impl PeerManager {
             .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
         match &state.pool {
             Some(pool) => pool.send(msg, lane).await,
+            None => Err(crate::error::NetError::Protocol(
+                "no connection pool".into(),
+            )),
+        }
+    }
+
+    /// Send a message to a peer on the specified lane with a custom timeout.
+    ///
+    /// # Cancel Safety
+    ///
+    /// This method is cancel-safe. The timeout is managed inside the lane actor;
+    /// dropping the returned future before it resolves does not orphan an in-flight
+    /// request — the actor discards the response slot when the timeout fires.
+    pub async fn send_with_timeout(
+        &self,
+        host_id: uuid::Uuid,
+        msg: Message,
+        lane: Lane,
+        timeout: Duration,
+    ) -> crate::error::Result<Message> {
+        let peers = self.peers.read().await;
+        let state = peers
+            .get(&host_id)
+            .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
+        match &state.pool {
+            Some(pool) => pool.send_with_timeout(msg, lane, timeout).await,
             None => Err(crate::error::NetError::Protocol(
                 "no connection pool".into(),
             )),

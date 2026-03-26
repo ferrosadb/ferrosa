@@ -64,7 +64,18 @@ else
   echo ""
   if command -v cargo-llvm-cov &> /dev/null; then
     echo "=== Running cargo llvm-cov$CARGO_ARGS ==="
-    cargo llvm-cov --all-features $CARGO_ARGS --summary-only
+    COV_OUTPUT=$(cargo llvm-cov --all-features $CARGO_ARGS --summary-only 2>&1)
+    echo "$COV_OUTPUT"
+    # Check 80% coverage threshold (matches CI)
+    COVERAGE=$(echo "$COV_OUTPUT" | grep 'TOTAL' | awk '{print $10}' | tr -d '%')
+    if [ -n "$COVERAGE" ]; then
+      THRESHOLD=80
+      if [ "$(echo "$COVERAGE < $THRESHOLD" | bc -l 2>/dev/null || echo 0)" -eq 1 ]; then
+        echo "FAIL: Line coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
+        exit 1
+      fi
+      echo "Coverage ${COVERAGE}% meets threshold ${THRESHOLD}%"
+    fi
   else
     echo "=== Running cargo test$CARGO_ARGS ==="
     echo "(install cargo-llvm-cov for coverage: cargo install cargo-llvm-cov)"
