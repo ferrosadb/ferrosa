@@ -147,7 +147,7 @@ fn merge_rows(a: Row, b: Row) -> Row {
 /// - Row-level deletion suppresses cells with timestamps older than the row
 ///   deletion timestamp.
 /// - Partition deletion also applies to the static row.
-fn apply_deletions(partition: &mut Partition) {
+pub(crate) fn apply_deletions(partition: &mut Partition) {
     let partition_delete_at = partition.deletion.marked_for_delete_at;
 
     if !partition.deletion.is_live() {

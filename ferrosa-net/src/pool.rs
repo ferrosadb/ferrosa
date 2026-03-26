@@ -213,7 +213,11 @@ mod tests {
     impl RpcHandler for EchoPingHandler {
         async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
             match msg {
-                Message::Ping { nonce } => Some(Message::Pong { nonce }),
+                Message::Ping { nonce, .. } => Some(Message::Pong {
+                    nonce,
+                    ping_recv_at: 0,
+                    sent_at: 0,
+                }),
                 _ => None,
             }
         }
@@ -239,8 +243,17 @@ mod tests {
             .unwrap();
 
         for lane in [Lane::Raft, Lane::Data, Lane::Bulk] {
-            let resp = pool.send(Message::Ping { nonce: 1 }, lane).await.unwrap();
-            assert!(matches!(resp, Message::Pong { nonce: 1 }));
+            let resp = pool
+                .send(
+                    Message::Ping {
+                        nonce: 1,
+                        sent_at: 0,
+                    },
+                    lane,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(resp, Message::Pong { nonce: 1, .. }));
         }
     }
 
@@ -267,16 +280,33 @@ mod tests {
 
         // Send (request/response) on each lane.
         for lane in [Lane::Raft, Lane::Data, Lane::Bulk] {
-            let resp = pool.send(Message::Ping { nonce: 42 }, lane).await.unwrap();
+            let resp = pool
+                .send(
+                    Message::Ping {
+                        nonce: 42,
+                        sent_at: 0,
+                    },
+                    lane,
+                )
+                .await
+                .unwrap();
             assert!(
-                matches!(resp, Message::Pong { nonce: 42 }),
+                matches!(resp, Message::Pong { nonce: 42, .. }),
                 "expected Pong {{ nonce: 42 }} on {lane:?}, got {resp:?}"
             );
         }
 
         // Fire (fire-and-forget) on each lane.
         for lane in [Lane::Raft, Lane::Data, Lane::Bulk] {
-            pool.fire(Message::Ping { nonce: 99 }, lane).await.unwrap();
+            pool.fire(
+                Message::Ping {
+                    nonce: 99,
+                    sent_at: 0,
+                },
+                lane,
+            )
+            .await
+            .unwrap();
         }
 
         // All lanes should be connected.
@@ -315,7 +345,15 @@ mod tests {
         );
 
         // Send via LaneHandle: should return Reconnecting.
-        let result = handle.send(Message::Ping { nonce: 1 }, None).await;
+        let result = handle
+            .send(
+                Message::Ping {
+                    nonce: 1,
+                    sent_at: 0,
+                },
+                None,
+            )
+            .await;
         assert!(
             matches!(result, Err(NetError::Reconnecting)),
             "expected Reconnecting, got {result:?}"
@@ -327,7 +365,15 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Next send should return LaneFailed.
-        let result = handle.send(Message::Ping { nonce: 2 }, None).await;
+        let result = handle
+            .send(
+                Message::Ping {
+                    nonce: 2,
+                    sent_at: 0,
+                },
+                None,
+            )
+            .await;
         assert!(
             matches!(result, Err(NetError::LaneFailed)),
             "expected LaneFailed, got {result:?}"

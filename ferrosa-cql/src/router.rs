@@ -45,6 +45,62 @@ use crate::virtual_tables::connections::ConnectionTracker;
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
 const MAX_BATCH_STATEMENTS: usize = 500;
 
+/// UUID epoch offset: 100-nanosecond intervals between 1582-10-15 and 1970-01-01.
+const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
+
+/// Generate a v1 Timeuuid containing the current timestamp.
+///
+/// Returns `CqlValue::Timeuuid` with a version-1 UUID built from the
+/// current system clock. Uses a v4 UUID as entropy source for the
+/// clock sequence and node fields (avoids pulling in `rand` directly).
+fn eval_now() -> CqlValue {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let uuid_ts = now.as_nanos() as u64 / 100 + UUID_EPOCH_OFFSET;
+    let time_low = (uuid_ts & 0xFFFF_FFFF) as u32;
+    let time_mid = ((uuid_ts >> 32) & 0xFFFF) as u16;
+    let time_hi = ((uuid_ts >> 48) & 0x0FFF) as u16 | 0x1000; // version 1
+
+    // Use a v4 UUID as entropy source for clock_seq and node bytes.
+    let entropy = uuid::Uuid::new_v4();
+    let ebytes = entropy.as_bytes();
+    let clock_seq: u16 = u16::from_be_bytes([ebytes[0], ebytes[1]]) & 0x3FFF | 0x8000; // variant 1
+    let node: [u8; 6] = [
+        ebytes[2], ebytes[3], ebytes[4], ebytes[5], ebytes[6], ebytes[7],
+    ];
+
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&time_low.to_be_bytes());
+    bytes[4..6].copy_from_slice(&time_mid.to_be_bytes());
+    bytes[6..8].copy_from_slice(&time_hi.to_be_bytes());
+    bytes[8..10].copy_from_slice(&clock_seq.to_be_bytes());
+    bytes[10..16].copy_from_slice(&node);
+
+    CqlValue::Timeuuid(uuid::Uuid::from_bytes(bytes))
+}
+
+/// Extract the Unix-epoch millisecond timestamp from a Timeuuid.
+///
+/// Converts from 100-nanosecond intervals since 1582-10-15 (UUID epoch) to
+/// milliseconds since 1970-01-01 (Unix epoch).
+fn eval_to_timestamp(timeuuid: &CqlValue) -> Result<CqlValue, CqlError> {
+    match timeuuid {
+        CqlValue::Timeuuid(uuid) => {
+            let bytes = uuid.as_bytes();
+            let time_low = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
+            let time_mid = u16::from_be_bytes([bytes[4], bytes[5]]) as u64;
+            let time_hi = (u16::from_be_bytes([bytes[6], bytes[7]]) & 0x0FFF) as u64;
+            let uuid_ts = time_low | (time_mid << 32) | (time_hi << 48);
+            let millis = (uuid_ts - UUID_EPOCH_OFFSET) / 10_000;
+            Ok(CqlValue::Timestamp(millis as i64))
+        }
+        _ => Err(CqlError::Invalid(
+            "toTimestamp requires a timeuuid argument".into(),
+        )),
+    }
+}
+
 // ── UDF/UDA query-time resolution types ──────────────────────────────────
 
 /// A user-defined function (scalar or aggregate) resolved from the schema,
@@ -104,6 +160,11 @@ pub struct RequestContext<'a> {
     pub current_keyspace: &'a Option<String>,
     /// Client-requested consistency level parsed from the CQL protocol frame.
     pub consistency: ConsistencyLevel,
+    /// Serial consistency level for lightweight transactions (LWT).
+    /// Parsed from the CQL QUERY/EXECUTE frame when flags bit 0x0010 is set.
+    pub serial_consistency: Option<ConsistencyLevel>,
+    /// Pagination parameters from the QUERY/EXECUTE frame.
+    pub paging: crate::paging::PagingParams,
 }
 
 /// Result of routing a statement.
@@ -307,6 +368,11 @@ pub async fn route(
             .await
             .map(RouteResult::Result),
         Statement::Explain(s) => route_explain(state, ctx, *s).map(RouteResult::Result),
+        // Accord transaction control statements are handled at the session/connection
+        // level, not in the router. If they reach here, return a void result.
+        Statement::BeginTransaction | Statement::Commit | Statement::Rollback => {
+            Ok(RouteResult::Result(crate::result::encode_void()))
+        }
     }
 }
 
@@ -322,6 +388,36 @@ fn route_select(
         .as_deref()
         .or(ctx.current_keyspace.as_deref())
         .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
+
+    // Helper: filter system table columns to match the SELECT list.
+    // If the SELECT list is `*`, return everything unchanged.
+    fn filter_system_columns(
+        select_cols: &[SelectColumn],
+        all_names: &[String],
+        all_types: &[CqlType],
+        all_rows: &[Vec<Option<CqlValue>>],
+    ) -> (Vec<String>, Vec<CqlType>, Vec<Vec<Option<CqlValue>>>) {
+        let is_star = select_cols.iter().any(|c| matches!(c, SelectColumn::Star));
+        if is_star || select_cols.is_empty() {
+            return (all_names.to_vec(), all_types.to_vec(), all_rows.to_vec());
+        }
+        // Build index of requested columns by name.
+        let mut indices = Vec::new();
+        for sc in select_cols {
+            if let SelectColumn::Column(name) = sc {
+                if let Some(pos) = all_names.iter().position(|n| n == name) {
+                    indices.push(pos);
+                }
+            }
+        }
+        let names: Vec<String> = indices.iter().map(|&i| all_names[i].clone()).collect();
+        let types: Vec<CqlType> = indices.iter().map(|&i| all_types[i].clone()).collect();
+        let rows: Vec<Vec<Option<CqlValue>>> = all_rows
+            .iter()
+            .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
+            .collect();
+        (names, types, rows)
+    }
 
     // System table dispatch — no permission check needed for system tables.
     match (ks, s.table.as_str()) {
@@ -389,12 +485,14 @@ fn route_select(
                 Some(CqlValue::Text(info.bootstrapped)),
                 Some(CqlValue::Set(tokens_set)),
             ];
+            let (filt_names, filt_types, filt_rows) =
+                filter_system_columns(&s.columns, &col_names, &col_types, &[row]);
             Ok(result::encode_rows(
-                &col_names,
-                &col_types,
+                &filt_names,
+                &filt_types,
                 "system",
                 "local",
-                &[row],
+                &filt_rows,
             ))
         }
         ("system", "peers" | "peers_v2") => {
@@ -440,55 +538,52 @@ fn route_select(
                     ]
                 })
                 .collect();
+            let (filt_names, filt_types, filt_rows) =
+                filter_system_columns(&s.columns, &col_names, &col_types, &rows);
             Ok(result::encode_rows(
-                &col_names,
-                &col_types,
+                &filt_names,
+                &filt_types,
                 "system",
                 s.table.as_str(),
-                &rows,
+                &filt_rows,
             ))
         }
         ("system_schema", "keyspaces") => {
             let snap = state.schema.snapshot();
             let ks_rows = query_keyspaces(&snap);
-            // cdrs-tokio queries: SELECT keyspace_name, toJson(replication) AS replication
-            // Return exactly those 2 columns. replication is a JSON string.
-            let col_names = vec!["keyspace_name".into(), "replication".into()];
-            let col_types = vec![CqlType::Varchar, CqlType::Varchar];
-            let rows: Vec<Vec<Option<CqlValue>>> = ks_rows
+            let all_col_names: Vec<String> = vec![
+                "keyspace_name".into(),
+                "durable_writes".into(),
+                "replication".into(),
+            ];
+            let map_type = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Varchar));
+            let all_col_types = vec![CqlType::Varchar, CqlType::Boolean, map_type];
+            let all_rows: Vec<Vec<Option<CqlValue>>> = ks_rows
                 .iter()
                 .map(|k| {
-                    let repl_json = if let Some(ks_meta) = snap.keyspaces.get(&k.keyspace_name) {
-                        let mut pairs: Vec<String> =
-                            vec![format!("\"class\":\"{}\"", ks_meta.replication.strategy)];
-                        // Always include replication_factor (cdrs-tokio requires it)
-                        if !ks_meta
-                            .replication
-                            .options
-                            .contains_key("replication_factor")
-                        {
-                            pairs.push("\"replication_factor\":\"1\"".to_string());
-                        }
-                        for (rk, rv) in &ks_meta.replication.options {
-                            pairs.push(format!("\"{}\":\"{}\"", rk, rv));
-                        }
-                        format!("{{{}}}", pairs.join(","))
-                    } else {
-                        r#"{"class":"SimpleStrategy","replication_factor":"1"}"#.to_string()
-                    };
+                    // Build the replication map as CqlValue::Map
+                    let repl_map: Vec<(CqlValue, CqlValue)> = k
+                        .replication
+                        .iter()
+                        .map(|(key, val)| {
+                            (CqlValue::Text(key.clone()), CqlValue::Text(val.clone()))
+                        })
+                        .collect();
                     vec![
                         Some(CqlValue::Text(k.keyspace_name.clone())),
-                        Some(CqlValue::Text(repl_json)),
+                        Some(CqlValue::Boolean(k.durable_writes)),
+                        Some(CqlValue::Map(repl_map)),
                     ]
                 })
                 .collect();
-            Ok(result::encode_rows(
-                &col_names,
-                &col_types,
+            apply_system_select(
+                &s.columns,
+                &all_col_names,
+                &all_col_types,
+                &all_rows,
                 "system_schema",
                 "keyspaces",
-                &rows,
-            ))
+            )
         }
         ("system_schema", "tables") => {
             let snap = state.schema.snapshot();
@@ -516,7 +611,7 @@ fn route_select(
         ("system_schema", "columns") => {
             let snap = state.schema.snapshot();
             let col_rows = query_columns(&snap);
-            let col_names = vec![
+            let col_names: Vec<String> = vec![
                 "keyspace_name".into(),
                 "table_name".into(),
                 "column_name".into(),
@@ -534,7 +629,30 @@ fn route_select(
                 CqlType::Varchar,
                 CqlType::Varchar,
             ];
-            let rows: Vec<Vec<Option<CqlValue>>> = col_rows
+            // Apply WHERE equality filters (string columns only).
+            let filtered: Vec<_> = col_rows
+                .iter()
+                .filter(|c| {
+                    s.where_clauses.iter().all(|wc| {
+                        if wc.op != crate::ast::ComparisonOp::Eq {
+                            return true; // skip non-equality ops
+                        }
+                        let val = match &wc.value {
+                            crate::ast::Term::StringLiteral(s) => s.as_str(),
+                            _ => return true,
+                        };
+                        match wc.column.as_str() {
+                            "keyspace_name" => c.keyspace_name == val,
+                            "table_name" => c.table_name == val,
+                            "column_name" => c.column_name == val,
+                            "kind" => c.kind == val,
+                            "clustering_order" => c.clustering_order == val,
+                            _ => true,
+                        }
+                    })
+                })
+                .collect();
+            let rows: Vec<Vec<Option<CqlValue>>> = filtered
                 .iter()
                 .map(|c| {
                     vec![
@@ -548,13 +666,14 @@ fn route_select(
                     ]
                 })
                 .collect();
-            Ok(result::encode_rows(
+            apply_system_select(
+                &s.columns,
                 &col_names,
                 &col_types,
+                &rows,
                 "system_schema",
                 "columns",
-                &rows,
-            ))
+            )
         }
         ("system_auth", "roles") => {
             let snap = state.schema.snapshot();
@@ -693,6 +812,7 @@ fn route_select(
                         IndexType::Composite => "COMPOSITES",
                         IndexType::Phonetic => "CUSTOM",
                         IndexType::Filtered => "CUSTOM",
+                        IndexType::Vector => "CUSTOM",
                     };
                     // Format options as a simple comma-separated key=value string
                     // (avoiding a serde_json dependency in this crate).
@@ -767,8 +887,16 @@ fn route_select_user_table(
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
 
-    // ALLOW FILTERING: permit it (Cassandra-compatible behavior).
-    // The read_range path does client-side filtering when full scan is needed.
+    // ALLOW FILTERING: permit full-table scans with post-filter when the
+    // client explicitly opts in.  Log a warning so operators can identify
+    // expensive queries, but do not reject.
+    if s.allow_filtering && !where_has_udf_calls(&s.where_clauses) {
+        tracing::warn!(
+            keyspace = ks,
+            table = %s.table,
+            "executing query with ALLOW FILTERING — full table scan with post-filter"
+        );
+    }
 
     // If WHERE contains UDF calls but ALLOW FILTERING is not set, reject.
     if where_has_udf_calls(&s.where_clauses) && !s.allow_filtering {
@@ -830,7 +958,7 @@ fn route_select_user_table(
             .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
             .collect::<Result<Vec<_>, _>>()?;
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-        match state.engine.read(&table_id, &decorated_key)? {
+        let mut pk_rows = match state.engine.read(&table_id, &decorated_key)? {
             Some(partition) => bridge::partition_to_rows(
                 &partition,
                 &all_col_names,
@@ -839,7 +967,45 @@ fn route_select_user_table(
                 &ck_indices,
             ),
             None => vec![],
-        }
+        };
+        // Apply clustering key and other non-PK WHERE predicates.
+        pk_rows.retain(|row| {
+            evaluate_where_predicates(
+                row,
+                &s.where_clauses,
+                &all_col_names,
+                table_meta,
+                ks,
+                &state.schema,
+            )
+        });
+        pk_rows
+    } else if let Some(in_rows) = try_pk_in_lookup(
+        &s.where_clauses,
+        table_meta,
+        ks,
+        &state.schema,
+        &state.engine,
+        &table_id,
+        &all_col_names,
+        &all_col_types,
+        &pk_indices,
+        &ck_indices,
+    )? {
+        // PK IN (...) — multi-partition lookup.
+        // Apply clustering key and other non-PK WHERE predicates.
+        let mut filtered = in_rows;
+        filtered.retain(|row| {
+            evaluate_where_predicates(
+                row,
+                &s.where_clauses,
+                &all_col_names,
+                table_meta,
+                ks,
+                &state.schema,
+            )
+        });
+        filtered
     } else {
         // No PK — use the query planner to decide the access path.
         let planner_indexes: Vec<(String, Vec<String>)> = snap
@@ -857,33 +1023,34 @@ fn route_select_user_table(
 
         match scan_plan {
             ScanPlan::PartitionKeyLookup => {
-                // PK lookup was tried above but extract_pk_values failed (e.g.,
-                // type conversion issue). Retry here as a fallback before full scan.
-                let pk_values = extract_pk_values(
-                    &s.where_clauses,
-                    &table_meta.partition_key,
-                    table_meta,
-                    ks,
-                    &state.schema,
-                )?;
-                let pk_types: Vec<CqlType> = table_meta
-                    .partition_key
-                    .iter()
-                    .map(|name| {
-                        resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-                match state.engine.read(&table_id, &decorated_key)? {
-                    Some(partition) => bridge::partition_to_rows(
-                        &partition,
+                // This can happen when extract_pk_values fails (e.g., bind
+                // values that can't be coerced to the PK column type) but
+                // the planner still sees Eq predicates on all PK columns.
+                // Fall through to a full scan rather than panicking.
+                let scan_limit = 10_000;
+                let partitions = state.engine.read_range(&table_id, None, None, scan_limit)?;
+                let mut all_rows = Vec::new();
+                for partition in &partitions {
+                    let mut prows = bridge::partition_to_rows(
+                        partition,
                         &all_col_names,
                         &all_col_types,
                         &pk_indices,
                         &ck_indices,
-                    ),
-                    None => vec![],
+                    );
+                    all_rows.append(&mut prows);
                 }
+                all_rows.retain(|row| {
+                    evaluate_where_predicates(
+                        row,
+                        &s.where_clauses,
+                        &all_col_names,
+                        table_meta,
+                        ks,
+                        &state.schema,
+                    )
+                });
+                all_rows
             }
 
             ScanPlan::SingleIndex {
@@ -896,12 +1063,12 @@ fn route_select_user_table(
                 ..
             } => {
                 // IndexScanWithFilter means some WHERE columns are not covered
-                // by any index — reject unless ALLOW FILTERING is set.
+                // by any index — require ALLOW FILTERING for these queries.
                 if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) && !s.allow_filtering {
                     return Err(CqlError::Invalid(
                         "Cannot execute this query as it requires filtering on non-indexed \
-                         columns. Create a secondary index on the filtered columns or \
-                         restructure your query to use partition keys."
+                         columns. Use ALLOW FILTERING, create a secondary index on the \
+                         filtered columns, or restructure your query to use partition keys."
                             .into(),
                     ));
                 }
@@ -1036,16 +1203,20 @@ fn route_select_user_table(
                     .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
                     .collect();
 
-                let all_where_columns_indexed = s
-                    .where_clauses
+                // Exclude token() predicates — they are range scan hints,
+                // not column filters that require indexing.
+                let non_token_clauses: Vec<&WhereClause> =
+                    s.where_clauses.iter().filter(|wc| !wc.token_fn).collect();
+                let all_where_columns_indexed = non_token_clauses
                     .iter()
                     .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
 
-                if !s.where_clauses.is_empty() && !all_where_columns_indexed && !s.allow_filtering {
+                if !non_token_clauses.is_empty() && !all_where_columns_indexed && !s.allow_filtering
+                {
                     return Err(CqlError::Invalid(
                         "Cannot execute this query as it requires filtering on non-indexed \
-                         columns. Create a secondary index on the filtered columns or \
-                         restructure your query to use partition keys."
+                         columns. Use ALLOW FILTERING, create a secondary index on the \
+                         filtered columns, or restructure your query to use partition keys."
                             .into(),
                     ));
                 }
@@ -1079,6 +1250,18 @@ fn route_select_user_table(
             }
         }
     };
+
+    // ANN OF ordering: vector similarity search is deferred — log and fall
+    // through to normal result ordering. The query parses successfully but
+    // ANN execution will be implemented when the vector index query path is
+    // wired up.
+    if s.ann_of.is_some() {
+        tracing::warn!(
+            keyspace = ks,
+            table = %s.table,
+            "ORDER BY ... ANN OF parsed but ANN execution is deferred — returning unordered results"
+        );
+    }
 
     // Apply ORDER BY sorting (FRSA-BUG-004)
     let rows = if !s.order_by.is_empty() {
@@ -1127,7 +1310,17 @@ fn route_select_user_table(
             // Skip built-in functions — they are handled inline.
             if matches!(
                 fn_lower.as_str(),
-                "count" | "writetime" | "ttl" | "uuid" | "now" | "totimestamp" | "todate"
+                "count"
+                    | "avg"
+                    | "min"
+                    | "max"
+                    | "sum"
+                    | "writetime"
+                    | "ttl"
+                    | "uuid"
+                    | "now"
+                    | "totimestamp"
+                    | "todate"
             ) {
                 continue;
             }
@@ -1145,9 +1338,14 @@ fn route_select_user_table(
         }
     }
 
-    // Check for aggregate functions (builtin COUNT(*) or UDA).
+    // Check for aggregate functions (builtin COUNT/AVG/MIN/MAX/SUM or UDA).
     let has_builtin_agg = s.columns.iter().any(|c| {
-        matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+        matches!(c, SelectColumn::FunctionCall { name, .. }
+            if name.eq_ignore_ascii_case("count")
+                || name.eq_ignore_ascii_case("avg")
+                || name.eq_ignore_ascii_case("min")
+                || name.eq_ignore_ascii_case("max")
+                || name.eq_ignore_ascii_case("sum"))
     });
     let has_uda = resolved_funcs
         .iter()
@@ -1161,6 +1359,35 @@ fn route_select_user_table(
             match sc {
                 SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count") => {
                     agg_row.push(Some(CqlValue::Bigint(rows.len() as i64)));
+                }
+                SelectColumn::FunctionCall { name, args, .. }
+                    if name.eq_ignore_ascii_case("avg")
+                        || name.eq_ignore_ascii_case("min")
+                        || name.eq_ignore_ascii_case("max")
+                        || name.eq_ignore_ascii_case("sum") =>
+                {
+                    let fn_lower = name.to_lowercase();
+                    // Resolve the target column from the first argument.
+                    if let Some(arg) = args.first() {
+                        if let Ok(col_name) = extract_column_name(arg) {
+                            if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name)
+                            {
+                                let col_type = &all_col_types[src_idx];
+                                let result =
+                                    compute_builtin_aggregate(&fn_lower, &rows, src_idx, col_type);
+                                agg_row.push(result);
+                            } else {
+                                return Err(CqlError::Invalid(format!(
+                                    "unknown column in {}(): {}",
+                                    fn_lower, col_name
+                                )));
+                            }
+                        } else {
+                            agg_row.push(Some(CqlValue::Null));
+                        }
+                    } else {
+                        agg_row.push(Some(CqlValue::Null));
+                    }
                 }
                 SelectColumn::FunctionCall { .. } => {
                     // Check if this column is a resolved UDA.
@@ -1230,6 +1457,10 @@ fn route_select_user_table(
         }
     };
 
+    // Apply toJson() built-in on projected columns.
+    let selected_rows =
+        apply_tojson_projections(&s.columns, &col_names, &all_col_names, &rows, selected_rows);
+
     // Apply LIMIT
     let limited = if let Some(limit) = s.limit {
         &selected_rows[..std::cmp::min(selected_rows.len(), limit as usize)]
@@ -1237,8 +1468,30 @@ fn route_select_user_table(
         &selected_rows
     };
 
-    Ok(result::encode_rows(
-        &col_names, &col_types, ks, &s.table, limited,
+    // Apply pagination: page_size interacts with LIMIT.
+    // If both page_size and LIMIT are set, the effective limit is min(page_size, limit).
+    // Pagination operates on the already-limited result set.
+    let effective_page_size = match (ctx.paging.page_size, s.limit) {
+        (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
+        (Some(ps), None) => Some(ps),
+        (None, _) => None,
+    };
+
+    let paged = crate::paging::apply_pagination(
+        limited.len(),
+        effective_page_size,
+        ctx.paging.paging_state.as_deref(),
+    )?;
+
+    let page_rows = &limited[paged.start..paged.end];
+
+    Ok(result::encode_rows_paged(
+        &col_names,
+        &col_types,
+        ks,
+        &s.table,
+        page_rows,
+        paged.next_paging_state.as_deref(),
     ))
 }
 
@@ -1415,16 +1668,10 @@ async fn route_insert(
             ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
             ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
             ColumnKind::Regular | ColumnKind::Static => {
-                // Cell column index must match SSTable's SerializationHeader
-                // which indexes regular columns only (excluding PK and CK).
-                let regular_idx = table_meta
-                    .columns
-                    .values()
-                    .filter(|c| c.kind == ColumnKind::Regular || c.kind == ColumnKind::Static)
-                    .position(|c| c.name == *col_name)
-                    .ok_or_else(|| CqlError::Invalid(format!("column '{}' not found", col_name)))?
-                    as u16;
-                regular_cells.push((regular_idx, value));
+                let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+                    CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+                })?;
+                regular_cells.push((col_idx, value));
             }
         }
     }
@@ -1445,6 +1692,60 @@ async fn route_insert(
     let table_id = TableId::new(ks, &s.table);
     let rf = keyspace_rf(&state.schema, ks);
 
+    // BUG-0016: IF NOT EXISTS — check whether the row already exists before writing.
+    if s.if_not_exists {
+        let existing_row = if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+            let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+            let all_col_types: Vec<CqlType> = table_meta
+                .columns
+                .values()
+                .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            let pk_indices: Vec<usize> = table_meta
+                .partition_key
+                .iter()
+                .filter_map(|name| table_meta.columns.get_index_of(name))
+                .collect();
+            let ck_indices: Vec<usize> = table_meta
+                .clustering_key
+                .iter()
+                .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
+                .collect();
+            let rows = bridge::partition_to_rows(
+                &partition,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+            );
+            let matching = if ck_values.is_empty() {
+                rows.into_iter().next()
+            } else {
+                rows.into_iter().find(|row| {
+                    ck_indices
+                        .iter()
+                        .zip(ck_values.iter())
+                        .all(|(&idx, ck_val)| row.get(idx).and_then(|v| v.as_ref()) == Some(ck_val))
+                })
+            };
+            matching
+        } else {
+            None
+        };
+
+        if let Some(ref existing) = existing_row {
+            // Row already exists — return [applied] = false with existing row data
+            return Ok(encode_lwt_applied(
+                false,
+                ks,
+                &s.table,
+                table_meta,
+                &state.schema,
+                Some(existing),
+            ));
+        }
+    }
+
     state
         .write_path
         .load()
@@ -1457,7 +1758,50 @@ async fn route_insert(
             rf,
         )
         .await?;
-    Ok(result::encode_void())
+
+    if s.if_not_exists {
+        // Insert was applied — return [applied] = true
+        Ok(encode_lwt_applied(
+            true,
+            ks,
+            &s.table,
+            table_meta,
+            &state.schema,
+            None,
+        ))
+    } else {
+        Ok(result::encode_void())
+    }
+}
+
+/// Encode a lightweight-transaction `[applied]` result.
+///
+/// CQL protocol returns a RESULT Rows frame with `[applied]` boolean plus
+/// all table columns.  When `applied=true`, the extra columns are NULL.
+/// When `applied=false`, `existing_row` contains the current row values.
+/// When `applied=true`, all table columns are NULL.
+fn encode_lwt_applied(
+    applied: bool,
+    keyspace: &str,
+    table: &str,
+    table_meta: &TableMetadata,
+    schema: &Schema,
+    existing_row: Option<&[Option<CqlValue>]>,
+) -> BytesMut {
+    let mut col_names = vec!["[applied]".to_string()];
+    let mut col_types = vec![CqlType::Boolean];
+    let mut row: Vec<Option<CqlValue>> = vec![Some(CqlValue::Boolean(applied))];
+
+    for (i, (name, cm)) in table_meta.columns.iter().enumerate() {
+        col_names.push(name.clone());
+        let cql_type = resolve_col_type(&cm.column_type, keyspace, schema).unwrap_or(CqlType::Blob);
+        col_types.push(cql_type);
+        // Use existing row values when not applied, NULL when applied
+        let val = existing_row.and_then(|r| r.get(i)).and_then(|v| v.clone());
+        row.push(val);
+    }
+
+    result::encode_rows(&col_names, &col_types, keyspace, table, &[row])
 }
 
 // ── UPDATE ───────────────────────────────────────────────────────────────
@@ -1523,6 +1867,60 @@ async fn route_update(
         }
     }
 
+    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    let table_id = TableId::new(ks, &s.table);
+
+    // Check if any assignments require a read-modify-write (collection +/- or counter)
+    let needs_read = s
+        .assignments
+        .iter()
+        .any(|a| matches!(a, Assignment::Add { .. } | Assignment::Sub { .. }));
+
+    // Lazily read existing row for collection Add/Sub merge
+    let existing_row: Option<Vec<Option<CqlValue>>> = if needs_read {
+        let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+        let all_col_types: Vec<CqlType> = table_meta
+            .columns
+            .values()
+            .map(|c| resolve_col_type(&c.column_type, ks, &state.schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pk_indices: Vec<usize> = table_meta
+            .partition_key
+            .iter()
+            .filter_map(|name| table_meta.columns.get_index_of(name))
+            .collect();
+        let ck_indices: Vec<usize> = table_meta
+            .clustering_key
+            .iter()
+            .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
+            .collect();
+
+        if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+            let rows = bridge::partition_to_rows(
+                &partition,
+                &all_col_names,
+                &all_col_types,
+                &pk_indices,
+                &ck_indices,
+            );
+            // Find the row matching our CK values
+            if ck_values.is_empty() {
+                rows.into_iter().next()
+            } else {
+                rows.into_iter().find(|row| {
+                    ck_indices
+                        .iter()
+                        .zip(ck_values.iter())
+                        .all(|(&idx, ck_val)| row.get(idx).and_then(|v| v.as_ref()) == Some(ck_val))
+                })
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Build cells from SET assignments
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
     for assignment in &s.assignments {
@@ -1543,12 +1941,25 @@ async fn route_update(
                     .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
                 let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
 
-                // For counters: increment. For collections: append.
+                // For counters: read-modify-write increment. For collections: append/merge.
                 match &cql_type {
                     CqlType::Counter => {
                         let increment = bridge::term_to_cql_value(value, &CqlType::Bigint)?;
                         if let CqlValue::Bigint(n) = increment {
-                            (column.as_str(), CqlValue::Counter(n))
+                            let col_table_idx = table_meta
+                                .columns
+                                .get_index_of(column)
+                                .expect("column verified above");
+                            let current = existing_row
+                                .as_ref()
+                                .and_then(|row| row.get(col_table_idx))
+                                .and_then(|v| v.as_ref())
+                                .and_then(|v| match v {
+                                    CqlValue::Counter(c) => Some(*c),
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            (column.as_str(), CqlValue::Counter(current + n))
                         } else {
                             return Err(CqlError::Invalid(
                                 "counter increment must be an integer".into(),
@@ -1556,9 +1967,17 @@ async fn route_update(
                         }
                     }
                     _ => {
-                        // Collection append: store the new value (simplified)
-                        let val = bridge::term_to_cql_value(value, &cql_type)?;
-                        (column.as_str(), val)
+                        let new_val = bridge::term_to_cql_value(value, &cql_type)?;
+                        let col_table_idx = table_meta
+                            .columns
+                            .get_index_of(column)
+                            .expect("column verified above");
+                        let existing = existing_row
+                            .as_ref()
+                            .and_then(|row| row.get(col_table_idx))
+                            .and_then(|v| v.as_ref());
+                        let merged = collection_add(existing, &new_val);
+                        (column.as_str(), merged)
                     }
                 }
             }
@@ -1573,7 +1992,20 @@ async fn route_update(
                     CqlType::Counter => {
                         let decrement = bridge::term_to_cql_value(value, &CqlType::Bigint)?;
                         if let CqlValue::Bigint(n) = decrement {
-                            (column.as_str(), CqlValue::Counter(-n))
+                            let col_table_idx = table_meta
+                                .columns
+                                .get_index_of(column)
+                                .expect("column verified above");
+                            let current = existing_row
+                                .as_ref()
+                                .and_then(|row| row.get(col_table_idx))
+                                .and_then(|v| v.as_ref())
+                                .and_then(|v| match v {
+                                    CqlValue::Counter(c) => Some(*c),
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            (column.as_str(), CqlValue::Counter(current - n))
                         } else {
                             return Err(CqlError::Invalid(
                                 "counter decrement must be an integer".into(),
@@ -1582,15 +2014,32 @@ async fn route_update(
                     }
                     CqlType::Map(key_type, _) => {
                         // Map subtraction: RHS is a set of keys to remove.
-                        // Coerce the set literal to Set<K>, not Map<K,V>.
                         let set_of_keys = CqlType::Set(key_type.clone());
-                        let val = bridge::term_to_cql_value(value, &set_of_keys)?;
-                        (column.as_str(), val)
+                        let keys_to_remove = bridge::term_to_cql_value(value, &set_of_keys)?;
+                        let col_table_idx = table_meta
+                            .columns
+                            .get_index_of(column)
+                            .expect("column verified above");
+                        let existing = existing_row
+                            .as_ref()
+                            .and_then(|row| row.get(col_table_idx))
+                            .and_then(|v| v.as_ref());
+                        let merged = collection_sub_map(existing, &keys_to_remove);
+                        (column.as_str(), merged)
                     }
                     _ => {
-                        // Set/list subtraction: RHS is the same collection type.
-                        let val = bridge::term_to_cql_value(value, &cql_type)?;
-                        (column.as_str(), val)
+                        // Set/list subtraction: remove matching elements.
+                        let to_remove = bridge::term_to_cql_value(value, &cql_type)?;
+                        let col_table_idx = table_meta
+                            .columns
+                            .get_index_of(column)
+                            .expect("column verified above");
+                        let existing = existing_row
+                            .as_ref()
+                            .and_then(|row| row.get(col_table_idx))
+                            .and_then(|v| v.as_ref());
+                        let merged = collection_sub(existing, &to_remove);
+                        (column.as_str(), merged)
                     }
                 }
             }
@@ -1614,19 +2063,13 @@ async fn route_update(
                 (column.as_str(), val)
             }
         };
-        let regular_idx = table_meta
-            .columns
-            .values()
-            .filter(|c| c.kind == ColumnKind::Regular || c.kind == ColumnKind::Static)
-            .position(|c| c.name == *col_name)
-            .ok_or_else(|| CqlError::Invalid(format!("column '{}' not found", col_name)))?
-            as u16;
-        regular_cells.push((regular_idx, value));
+        let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+            CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+        })?;
+        regular_cells.push((col_idx, value));
     }
 
-    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
-    let table_id = TableId::new(ks, &s.table);
     let rf = keyspace_rf(&state.schema, ks);
 
     state
@@ -1642,6 +2085,91 @@ async fn route_update(
         )
         .await?;
     Ok(result::encode_void())
+}
+
+/// Merge a new collection value into an existing one (for `col = col + val`).
+///
+/// - List: appends new elements to the end of the existing list.
+/// - Set: merges new elements into the existing set (deduplicating).
+/// - Map: merges new key-value pairs, overwriting existing keys.
+/// - Non-collection: returns the new value as-is.
+fn collection_add(existing: Option<&CqlValue>, new_val: &CqlValue) -> CqlValue {
+    match (existing, new_val) {
+        (Some(CqlValue::List(old)), CqlValue::List(add)) => {
+            let mut merged = old.clone();
+            merged.extend(add.iter().cloned());
+            CqlValue::List(merged)
+        }
+        (Some(CqlValue::Set(old)), CqlValue::Set(add)) => {
+            let mut merged = old.clone();
+            for item in add {
+                if !merged.contains(item) {
+                    merged.push(item.clone());
+                }
+            }
+            CqlValue::Set(merged)
+        }
+        (Some(CqlValue::Map(old)), CqlValue::Map(add)) => {
+            let mut merged = old.clone();
+            for (k, v) in add {
+                if let Some(entry) = merged.iter_mut().find(|(ek, _)| ek == k) {
+                    entry.1 = v.clone();
+                } else {
+                    merged.push((k.clone(), v.clone()));
+                }
+            }
+            CqlValue::Map(merged)
+        }
+        (None, _) => new_val.clone(),
+        _ => new_val.clone(),
+    }
+}
+
+/// Subtract elements from a collection (for `col = col - val` on list/set).
+///
+/// - List: removes all occurrences of each element in `to_remove`.
+/// - Set: removes matching elements.
+/// - Non-collection: returns the existing value or Null.
+fn collection_sub(existing: Option<&CqlValue>, to_remove: &CqlValue) -> CqlValue {
+    match (existing, to_remove) {
+        (Some(CqlValue::List(old)), CqlValue::List(remove)) => {
+            let filtered: Vec<CqlValue> = old
+                .iter()
+                .filter(|item| !remove.contains(item))
+                .cloned()
+                .collect();
+            CqlValue::List(filtered)
+        }
+        (Some(CqlValue::Set(old)), CqlValue::Set(remove)) => {
+            let filtered: Vec<CqlValue> = old
+                .iter()
+                .filter(|item| !remove.contains(item))
+                .cloned()
+                .collect();
+            CqlValue::Set(filtered)
+        }
+        (Some(existing_val), _) => existing_val.clone(),
+        (None, _) => CqlValue::Null,
+    }
+}
+
+/// Remove map entries by key (for `col = col - {key_set}` on maps).
+///
+/// The `keys_to_remove` is a Set of keys. All map entries whose key appears
+/// in the set are removed.
+fn collection_sub_map(existing: Option<&CqlValue>, keys_to_remove: &CqlValue) -> CqlValue {
+    match (existing, keys_to_remove) {
+        (Some(CqlValue::Map(old)), CqlValue::Set(remove_keys)) => {
+            let filtered: Vec<(CqlValue, CqlValue)> = old
+                .iter()
+                .filter(|(k, _)| !remove_keys.contains(k))
+                .cloned()
+                .collect();
+            CqlValue::Map(filtered)
+        }
+        (Some(existing_val), _) => existing_val.clone(),
+        (None, _) => CqlValue::Null,
+    }
 }
 
 // ── DELETE ────────────────────────────────────────────────────────────────
@@ -1707,16 +2235,18 @@ async fn route_delete(
         }
     }
 
-    // Build delete column indices (empty = row-level delete)
+    // Build delete column indices (empty = row-level delete).
+    // MapElement targets are treated as whole-column deletes for now —
+    // the storage layer tombstones the column, which is safe (if broader
+    // than strictly necessary).
     let delete_columns: Vec<u16> = s
         .columns
         .iter()
-        .map(|col_name| {
-            table_meta
-                .columns
-                .get_index_of(col_name)
-                .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))
-                .map(|idx| idx as u16)
+        .map(|target| {
+            let col_name = target.column_name();
+            table_meta.storage_column_index(col_name).ok_or_else(|| {
+                CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1918,16 +2448,10 @@ fn materialize_insert(
             ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
             ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
             ColumnKind::Regular | ColumnKind::Static => {
-                // Cell column index must match SSTable's SerializationHeader
-                // which indexes regular columns only (excluding PK and CK).
-                let regular_idx = table_meta
-                    .columns
-                    .values()
-                    .filter(|c| c.kind == ColumnKind::Regular || c.kind == ColumnKind::Static)
-                    .position(|c| c.name == *col_name)
-                    .ok_or_else(|| CqlError::Invalid(format!("column '{}' not found", col_name)))?
-                    as u16;
-                regular_cells.push((regular_idx, value));
+                let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+                    CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+                })?;
+                regular_cells.push((col_idx, value));
             }
         }
     }
@@ -2030,11 +2554,9 @@ fn materialize_update(
                 continue;
             }
         };
-        let col_idx = table_meta
-            .columns
-            .get_index_of(col_name)
-            .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))?
-            as u16;
+        let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
+            CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+        })?;
         regular_cells.push((col_idx, value));
     }
 
@@ -2111,12 +2633,11 @@ fn materialize_delete(
     let delete_columns: Vec<u16> = s
         .columns
         .iter()
-        .map(|col_name| {
-            table_meta
-                .columns
-                .get_index_of(col_name)
-                .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", col_name)))
-                .map(|idx| idx as u16)
+        .map(|target| {
+            let col_name = target.column_name();
+            table_meta.storage_column_index(col_name).ok_or_else(|| {
+                CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -2425,14 +2946,23 @@ async fn route_create_table(
             // Register with storage engine
             let storage_schema = table_meta.to_storage_schema();
             state.engine.register_table(storage_schema)?;
+
+            // Auto-create cascade tables if consolidation.cascade is enabled.
+            create_cascade_tables_if_needed(state, &table_meta)?;
         }
         DdlPath::Pair(coordinator) => {
-            let op = DdlOperation::CreateTable(Box::new(table_meta));
+            let op = DdlOperation::CreateTable(Box::new(table_meta.clone()));
             coordinator.coordinate_ddl(op).await?;
+
+            // Auto-create cascade tables after primary table is created.
+            create_cascade_tables_if_needed(state, &table_meta)?;
         }
         DdlPath::Cluster { .. } => {
-            let op = DdlOperation::CreateTable(Box::new(table_meta));
+            let op = DdlOperation::CreateTable(Box::new(table_meta.clone()));
             ddl.execute(op).await.map_err(CqlError::from)?;
+
+            // Auto-create cascade tables after primary table is created.
+            create_cascade_tables_if_needed(state, &table_meta)?;
         }
         DdlPath::Unavailable => {
             return Err(CqlError::ServerError(
@@ -2446,6 +2976,174 @@ async fn route_create_table(
         "TABLE",
         &[ks, &s.name],
     ))
+}
+
+/// If the table has `consolidation.cascade = true` in its extensions,
+/// auto-create the downstream cascade tables (e.g., sensor_5m, sensor_15m, sensor_1h).
+fn create_cascade_tables_if_needed(
+    state: &SharedState,
+    source: &TableMetadata,
+) -> Result<(), CqlError> {
+    use ferrosa_storage::timeseries::config::{generate_cascade_chain, ConsolidationConfig};
+
+    let config = match ConsolidationConfig::from_extensions(&source.extensions) {
+        Some(Ok(c)) if c.cascade => c,
+        Some(Err(e)) => {
+            tracing::warn!(
+                table = %source.name,
+                "invalid consolidation extensions: {e}"
+            );
+            return Ok(());
+        }
+        _ => return Ok(()), // no consolidation or cascade disabled
+    };
+
+    let chain = generate_cascade_chain(&source.name, &config);
+    if chain.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        table = %source.name,
+        cascade_len = chain.len(),
+        "auto-creating cascade tables"
+    );
+
+    for spec in &chain {
+        // Build columns: same partition key + clustering key as source,
+        // plus output columns (e.g., value_min, value_max, value_avg, value_stddev).
+        let mut columns = IndexMap::new();
+
+        // Copy partition key columns from source.
+        for pk_name in &source.partition_key {
+            if let Some(col) = source.columns.get(pk_name) {
+                columns.insert(pk_name.clone(), col.clone());
+            }
+        }
+
+        // Clustering key: `ts timestamp` (DESC).
+        let ck_name = source
+            .clustering_key
+            .first()
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| "ts".to_string());
+
+        if !columns.contains_key(&ck_name) {
+            columns.insert(
+                ck_name.clone(),
+                ColumnMetadata {
+                    name: ck_name.clone(),
+                    kind: ColumnKind::Clustering,
+                    position: 0,
+                    column_type: "timestamp".to_string(),
+                    clustering_order: SchemaClusteringOrder::Desc,
+                    mask: None,
+                },
+            );
+        }
+
+        // Add output columns (value_min, value_max, value_avg, etc.).
+        for (i, col_name) in spec.output_columns.iter().enumerate() {
+            columns.insert(
+                col_name.clone(),
+                ColumnMetadata {
+                    name: col_name.clone(),
+                    kind: ColumnKind::Regular,
+                    position: i as i32,
+                    column_type: "double".to_string(),
+                    clustering_order: SchemaClusteringOrder::None,
+                    mask: None,
+                },
+            );
+        }
+
+        // Build extensions for this tier's consolidation config.
+        let mut extensions = HashMap::new();
+        if let Some(ref target) = spec.target {
+            extensions.insert("consolidation.target".to_string(), target.clone());
+            extensions.insert(
+                "consolidation.interval".to_string(),
+                format_consolidation_interval(&spec.interval),
+            );
+            // Inherit functions and columns from source config.
+            let fn_str: String = config
+                .functions
+                .iter()
+                .filter_map(|f| consolidation_fn_name(f))
+                .collect::<Vec<_>>()
+                .join(",");
+            extensions.insert("consolidation.functions".to_string(), fn_str);
+            extensions.insert(
+                "consolidation.columns".to_string(),
+                spec.output_columns
+                    .iter()
+                    .filter_map(|c| c.rsplit_once('_').map(|(base, _)| base.to_string()))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+
+        let cascade_table = TableMetadata {
+            keyspace: source.keyspace.clone(),
+            name: spec.table_name.clone(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: source.partition_key.clone(),
+            clustering_key: vec![(ck_name.clone(), SchemaClusteringOrder::Desc)],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions,
+            is_system: false,
+        };
+
+        // Idempotent: silently succeeds if table already exists.
+        state
+            .schema
+            .create_table_internal(cascade_table.clone())
+            .map_err(|e| CqlError::ServerError(format!("cascade table creation failed: {e}")))?;
+
+        let storage_schema = cascade_table.to_storage_schema();
+        // Ignore error if already registered.
+        let _ = state.engine.register_table(storage_schema);
+
+        tracing::info!(
+            cascade_table = %spec.table_name,
+            "created cascade table"
+        );
+    }
+
+    Ok(())
+}
+
+/// Format a Duration as a consolidation interval string (e.g., "5m", "15m", "1h").
+fn format_consolidation_interval(d: &std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// Map a ConsolidationFn to its string name for extension serialization.
+fn consolidation_fn_name(
+    f: &ferrosa_storage::timeseries::consolidation::ConsolidationFn,
+) -> Option<&'static str> {
+    use ferrosa_storage::timeseries::consolidation::ConsolidationFn;
+    match f {
+        ConsolidationFn::Min => Some("min"),
+        ConsolidationFn::Max => Some("max"),
+        ConsolidationFn::Avg => Some("avg"),
+        ConsolidationFn::Median => Some("median"),
+        ConsolidationFn::StdDev => Some("stddev"),
+        ConsolidationFn::Count => Some("count"),
+        ConsolidationFn::Sum => Some("sum"),
+        _ => None,
+    }
 }
 
 async fn route_alter_table(
@@ -2599,6 +3297,7 @@ fn resolve_index_type(
         Some("composite") => Ok(IndexType::Composite),
         Some("phonetic") => Ok(IndexType::Phonetic),
         Some("filtered") => Ok(IndexType::Filtered),
+        Some("vector") => Ok(IndexType::Vector),
         Some(other) => Err(CqlError::Invalid(format!("unknown index type: {other}"))),
     }
 }
@@ -2694,10 +3393,12 @@ async fn route_create_index(
         }
     }
 
+    // CQL native protocol: INDEX schema changes use TABLE as the target
+    // so cqlsh refreshes the table metadata (which includes indexes).
     Ok(result::encode_schema_change(
         "CREATED",
-        "INDEX",
-        &[ks, &index_name],
+        "TABLE",
+        &[ks, &s.table],
     ))
 }
 
@@ -2722,7 +3423,7 @@ async fn route_drop_index(
             if s.if_exists {
                 return Ok(result::encode_schema_change(
                     "DROPPED",
-                    "INDEX",
+                    "TABLE",
                     &[ks, &s.name],
                 ));
             }
@@ -2771,10 +3472,11 @@ async fn route_drop_index(
         }
     }
 
+    // Return TABLE event so cqlsh refreshes table metadata (includes indexes).
     Ok(result::encode_schema_change(
         "DROPPED",
-        "INDEX",
-        &[ks, &s.name],
+        "TABLE",
+        &[ks, &table_name],
     ))
 }
 
@@ -3100,12 +3802,53 @@ fn build_column_info(
                 alias,
                 args,
             } => {
-                let display_name = alias.clone().unwrap_or_else(|| format!("system.{}", name));
+                let builtin_display_name = alias.clone().unwrap_or_else(|| name.to_lowercase());
                 let fn_lower = name.to_lowercase();
-                let cql_type = match fn_lower.as_str() {
-                    "count" => CqlType::Bigint,
-                    "writetime" => CqlType::Bigint,
-                    "ttl" => CqlType::Int,
+                let (display_name, cql_type) = match fn_lower.as_str() {
+                    // COUNT(*) column name must be "count" (not "system.count")
+                    // to match Cassandra driver expectations. The alias takes
+                    // precedence if provided.
+                    "count" => {
+                        let display = alias.clone().unwrap_or_else(|| "count".to_string());
+                        (display, CqlType::Bigint)
+                    }
+                    "writetime" => (builtin_display_name, CqlType::Bigint),
+                    "ttl" => (builtin_display_name, CqlType::Int),
+                    "now" | "totimestamp" | "todate" | "currenttimestamp" => {
+                        (builtin_display_name, CqlType::Timestamp)
+                    }
+                    "uuid" | "timeuuid" => (builtin_display_name, CqlType::Uuid),
+                    "token" => (builtin_display_name, CqlType::Bigint),
+                    "avg" | "min" | "max" | "sum" => {
+                        // Resolve the argument column type.
+                        let t = if let Some(arg) = args.first() {
+                            if let Ok(col_name) = extract_column_name(arg) {
+                                let col = table_meta.columns.get(&col_name).ok_or_else(|| {
+                                    CqlError::Invalid(format!(
+                                        "unknown column in {}(): {}",
+                                        fn_lower, col_name
+                                    ))
+                                })?;
+                                let arg_type = resolve_col_type(&col.column_type, ks, schema)?;
+                                if fn_lower == "avg" {
+                                    // avg always returns Double (matches Cassandra for
+                                    // non-decimal types; close enough for now).
+                                    match arg_type {
+                                        CqlType::Float => CqlType::Float,
+                                        _ => CqlType::Double,
+                                    }
+                                } else {
+                                    // min, max, sum return the same type as the column.
+                                    arg_type
+                                }
+                            } else {
+                                CqlType::Double
+                            }
+                        } else {
+                            CqlType::Double
+                        };
+                        (builtin_display_name, t)
+                    }
                     _ => {
                         // Try to resolve as UDF/UDA — need table column info.
                         let all_col_names: Vec<String> =
@@ -3125,7 +3868,10 @@ fn build_column_info(
                             &all_col_types,
                             schema,
                         )?;
-                        resolved.return_type.clone()
+                        // Use the resolved display_name so it matches the
+                        // name produced by resolve_select_function during
+                        // UDF evaluation (ensures col_names alignment).
+                        (resolved.display_name, resolved.return_type.clone())
                     }
                 };
                 names.push(display_name);
@@ -3163,6 +3909,125 @@ fn extract_pk_values(
     Ok(values)
 }
 
+/// Try to handle `WHERE partition_key IN (v1, v2, ...)` by performing a
+/// separate PK lookup for each value in the IN list.
+///
+/// Returns `Ok(Some(rows))` if the WHERE clause contains an IN predicate on
+/// all partition key columns (currently supports single-column PK with IN,
+/// or multi-column PK where all but one column are `Eq` and one is `In`).
+/// Returns `Ok(None)` if no IN predicate is found on PK columns, letting
+/// the caller fall through to the planner.
+#[allow(clippy::too_many_arguments)]
+fn try_pk_in_lookup(
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+    engine: &StorageEngine,
+    table_id: &TableId,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    pk_indices: &[usize],
+    ck_indices: &[usize],
+) -> Result<Option<Vec<Vec<Option<CqlValue>>>>, CqlError> {
+    let pk_names = &table_meta.partition_key;
+
+    // Find which PK column (if any) has an IN predicate.
+    let in_col_idx = pk_names.iter().position(|pk_name| {
+        where_clauses
+            .iter()
+            .any(|w| w.column == *pk_name && w.op == ComparisonOp::In)
+    });
+
+    let in_col_idx = match in_col_idx {
+        Some(idx) => idx,
+        None => return Ok(None),
+    };
+
+    // For the IN column, every other PK column must have an Eq predicate.
+    for (i, pk_name) in pk_names.iter().enumerate() {
+        if i == in_col_idx {
+            continue;
+        }
+        let has_eq = where_clauses
+            .iter()
+            .any(|w| w.column == *pk_name && w.op == ComparisonOp::Eq);
+        if !has_eq {
+            return Ok(None);
+        }
+    }
+
+    // Extract the IN list values.
+    let in_wc = where_clauses
+        .iter()
+        .find(|w| w.column == pk_names[in_col_idx] && w.op == ComparisonOp::In)
+        .expect("IN predicate verified above");
+
+    let in_terms = match &in_wc.value {
+        Term::InList(terms) => terms,
+        _ => {
+            return Err(CqlError::Invalid(
+                "IN predicate value must be a list".into(),
+            ));
+        }
+    };
+
+    if in_terms.is_empty() {
+        return Ok(Some(vec![]));
+    }
+
+    // Resolve PK column types.
+    let pk_types: Vec<CqlType> = pk_names
+        .iter()
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, schema))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Pre-resolve the Eq values for non-IN PK columns.
+    let mut eq_values: Vec<Option<CqlValue>> = vec![None; pk_names.len()];
+    for (i, pk_name) in pk_names.iter().enumerate() {
+        if i == in_col_idx {
+            continue;
+        }
+        let wc = where_clauses
+            .iter()
+            .find(|w| w.column == *pk_name && w.op == ComparisonOp::Eq)
+            .expect("Eq predicate verified above");
+        eq_values[i] = Some(bridge::term_to_cql_value(&wc.value, &pk_types[i])?);
+    }
+
+    // Iterate over each value in the IN list, build PK, and read.
+    let in_col_type = &pk_types[in_col_idx];
+    let mut all_rows = Vec::new();
+
+    for term in in_terms {
+        let in_value = bridge::term_to_cql_value(term, in_col_type)?;
+
+        // Assemble the full PK values vector in column order.
+        let mut pk_values = Vec::with_capacity(pk_names.len());
+        for (i, _) in pk_names.iter().enumerate() {
+            if i == in_col_idx {
+                pk_values.push(in_value.clone());
+            } else {
+                pk_values.push(eq_values[i].clone().expect("Eq value resolved above"));
+            }
+        }
+
+        let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+        if let Some(partition) = engine.read(table_id, &decorated_key)? {
+            let mut prows = bridge::partition_to_rows(
+                &partition,
+                all_col_names,
+                all_col_types,
+                pk_indices,
+                ck_indices,
+            );
+            all_rows.append(&mut prows);
+        }
+    }
+
+    Ok(Some(all_rows))
+}
+
 /// Convert a WHERE clause `Term` for a given column into an `IndexKey` for
 /// secondary index lookup.
 fn term_to_index_key(
@@ -3192,6 +4057,11 @@ fn evaluate_where_predicates(
     schema: &Schema,
 ) -> bool {
     for wc in where_clauses {
+        // Skip token() predicates — token range filtering is handled by
+        // the scan bounds, not by post-filter row evaluation.
+        if wc.token_fn {
+            continue;
+        }
         let col_idx = match all_col_names.iter().position(|n| n == &wc.column) {
             Some(i) => i,
             None => return false,
@@ -3204,30 +4074,114 @@ fn evaluate_where_predicates(
             Ok(t) => t,
             Err(_) => return false,
         };
-        let expected = match bridge::term_to_cql_value(&wc.value, &cql_type) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
         let actual = match &row[col_idx] {
             Some(v) => v,
             None => return false,
         };
+
+        // IN requires special handling: the term is an InList, not a single
+        // value, so we must check membership before the normal term_to_cql_value
+        // path (which rejects InList terms).
+        if wc.op == ComparisonOp::In {
+            let in_terms = match &wc.value {
+                Term::InList(terms) => terms,
+                _ => return false,
+            };
+            let found = in_terms.iter().any(|t| {
+                if let Ok(v) = bridge::term_to_cql_value(t, &cql_type) {
+                    *actual == v
+                } else {
+                    false
+                }
+            });
+            if !found {
+                return false;
+            }
+            continue;
+        }
+
+        // CONTAINS / CONTAINS KEY require element/key type coercion, not
+        // collection-level coercion, so they are handled before the normal
+        // term_to_cql_value path (same pattern as IN above).
+        if wc.op == ComparisonOp::Contains {
+            let element_type = match &cql_type {
+                CqlType::List(inner) | CqlType::Set(inner) => (**inner).clone(),
+                CqlType::Map(_, val_type) => (**val_type).clone(),
+                _ => return false,
+            };
+            let needle = match bridge::term_to_cql_value(&wc.value, &element_type) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let found = match actual {
+                CqlValue::List(items) | CqlValue::Set(items) => items.contains(&needle),
+                CqlValue::Map(entries) => entries.iter().any(|(_, v)| *v == needle),
+                _ => false,
+            };
+            if !found {
+                return false;
+            }
+            continue;
+        }
+        if wc.op == ComparisonOp::ContainsKey {
+            let key_type = match &cql_type {
+                CqlType::Map(key_type, _) => (**key_type).clone(),
+                _ => return false,
+            };
+            let needle = match bridge::term_to_cql_value(&wc.value, &key_type) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let found = match actual {
+                CqlValue::Map(entries) => entries.iter().any(|(k, _)| *k == needle),
+                _ => false,
+            };
+            if !found {
+                return false;
+            }
+            continue;
+        }
+
+        let expected = match bridge::term_to_cql_value(&wc.value, &cql_type) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        // Phonetic index support: when the predicate is Eq on a column that
+        // has a phonetic index, use case-insensitive comparison as a partial
+        // phonetic match. Full Double Metaphone matching requires the SOUNDS
+        // LIKE syntax (deferred).
+        let has_phonetic_index = if wc.op == ComparisonOp::Eq {
+            let snap = schema.snapshot();
+            snap.indexes.values().any(|idx| {
+                idx.keyspace == table_meta.keyspace
+                    && idx.table == table_meta.name
+                    && idx.index_type == IndexType::Phonetic
+                    && idx.target_columns.contains(&wc.column)
+            })
+        } else {
+            false
+        };
+
         let matches = match wc.op {
+            ComparisonOp::Eq if has_phonetic_index => {
+                // Phonetic matching via simplified Soundex-like comparison.
+                // Words that sound similar should match even if spelled differently
+                // (e.g., "John Smith" matches "Jon Smyth").
+                match (actual, &expected) {
+                    (CqlValue::Text(a), CqlValue::Text(b)) => phonetic_match(a, b),
+                    _ => *actual == expected,
+                }
+            }
             ComparisonOp::Eq => *actual == expected,
             ComparisonOp::Ne => *actual != expected,
             ComparisonOp::Gt => *actual > expected,
             ComparisonOp::Lt => *actual < expected,
             ComparisonOp::Ge => *actual >= expected,
             ComparisonOp::Le => *actual <= expected,
-            ComparisonOp::In => {
-                // IN comparison: check if actual is in the expected list.
-                // For now, treat as equality (single-value IN).
-                *actual == expected
-            }
+            ComparisonOp::In => unreachable!("IN handled above"),
             ComparisonOp::Contains | ComparisonOp::ContainsKey => {
-                // CONTAINS / CONTAINS KEY: not yet implemented for filtering.
-                // Conservatively exclude the row so we don't return false positives.
-                false
+                unreachable!("CONTAINS/CONTAINS KEY handled above")
             }
         };
         if !matches {
@@ -3237,7 +4191,457 @@ fn evaluate_where_predicates(
     true
 }
 
+/// Apply column selection (with `toJson()` support) to system table query results.
+///
+/// System table handlers build the full set of columns, then this function
+/// projects down to the columns requested in the `SELECT` list. If the
+/// `SELECT` list contains `toJson(col)`, the column value is serialized to
+/// a JSON string using [`bridge::cql_value_to_json`].
+fn apply_system_select(
+    select_columns_ast: &[SelectColumn],
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    all_rows: &[Vec<Option<CqlValue>>],
+    keyspace: &str,
+    table: &str,
+) -> Result<BytesMut, CqlError> {
+    // Star — return everything
+    if select_columns_ast
+        .iter()
+        .any(|c| matches!(c, SelectColumn::Star))
+    {
+        return Ok(result::encode_rows(
+            all_col_names,
+            all_col_types,
+            keyspace,
+            table,
+            all_rows,
+        ));
+    }
+
+    // Build projected column names, types, and transform descriptors.
+    let mut proj_names: Vec<String> = Vec::new();
+    let mut proj_types: Vec<CqlType> = Vec::new();
+    // Each entry: (source column index, apply_tojson)
+    let mut proj_ops: Vec<(usize, bool)> = Vec::new();
+
+    for sc in select_columns_ast {
+        match sc {
+            SelectColumn::Star => unreachable!(),
+            SelectColumn::Column(name) => {
+                let idx = all_col_names
+                    .iter()
+                    .position(|n| n == name)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", name)))?;
+                proj_names.push(name.clone());
+                proj_types.push(all_col_types[idx].clone());
+                proj_ops.push((idx, false));
+            }
+            SelectColumn::FunctionCall {
+                name, args, alias, ..
+            } => {
+                let fn_lower = name.to_lowercase();
+                if fn_lower == "tojson" {
+                    // toJson(column_ref) — single argument expected
+                    if args.len() != 1 {
+                        return Err(CqlError::Invalid(
+                            "toJson() requires exactly one argument".into(),
+                        ));
+                    }
+                    let col_name = extract_column_name(&args[0])?;
+                    let idx = all_col_names
+                        .iter()
+                        .position(|n| *n == col_name)
+                        .ok_or_else(|| {
+                            CqlError::Invalid(format!("unknown column: {}", col_name))
+                        })?;
+                    let display = alias
+                        .clone()
+                        .unwrap_or_else(|| format!("system.tojson({})", col_name));
+                    proj_names.push(display);
+                    proj_types.push(CqlType::Varchar); // toJson returns text
+                    proj_ops.push((idx, true));
+                } else if fn_lower == "count" {
+                    let display = alias.clone().unwrap_or_else(|| "count".to_string());
+                    proj_names.push(display);
+                    proj_types.push(CqlType::Bigint);
+                    // COUNT is handled below as aggregate
+                    proj_ops.push((usize::MAX, false));
+                } else if fn_lower == "now" {
+                    let display = alias.clone().unwrap_or_else(|| "system.now()".to_string());
+                    proj_names.push(display);
+                    proj_types.push(CqlType::Timeuuid);
+                    // Sentinel: usize::MAX - 1 for now()
+                    proj_ops.push((usize::MAX - 1, false));
+                } else if fn_lower == "totimestamp" {
+                    let display = alias
+                        .clone()
+                        .unwrap_or_else(|| "system.totimestamp(system.now())".to_string());
+                    proj_names.push(display);
+                    proj_types.push(CqlType::Timestamp);
+                    // Sentinel: usize::MAX - 2 for toTimestamp(now())
+                    proj_ops.push((usize::MAX - 2, false));
+                } else {
+                    return Err(CqlError::Invalid(format!(
+                        "unsupported function in system table query: {}",
+                        name
+                    )));
+                }
+            }
+        }
+    }
+
+    // Check for COUNT(*) aggregate
+    let has_count = select_columns_ast.iter().any(|c| {
+        matches!(c, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+    });
+
+    if has_count {
+        // Aggregate query -- return a single row
+        let mut agg_row: Vec<Option<CqlValue>> = Vec::new();
+        for (i, sc) in select_columns_ast.iter().enumerate() {
+            if matches!(sc, SelectColumn::FunctionCall { name, .. } if name.eq_ignore_ascii_case("count"))
+            {
+                agg_row.push(Some(CqlValue::Bigint(all_rows.len() as i64)));
+            } else {
+                let (src_idx, apply_tojson) = proj_ops[i];
+                if src_idx == usize::MAX - 1 {
+                    // now()
+                    agg_row.push(Some(eval_now()));
+                } else if src_idx == usize::MAX - 2 {
+                    // toTimestamp(now())
+                    let timeuuid = eval_now();
+                    agg_row.push(eval_to_timestamp(&timeuuid).ok());
+                } else if src_idx < all_col_names.len() {
+                    let val = all_rows
+                        .first()
+                        .and_then(|r| r.get(src_idx))
+                        .cloned()
+                        .flatten();
+                    if apply_tojson {
+                        let json =
+                            bridge::cql_value_to_json(val.as_ref().unwrap_or(&CqlValue::Null));
+                        agg_row.push(Some(CqlValue::Text(json)));
+                    } else {
+                        agg_row.push(val);
+                    }
+                } else {
+                    agg_row.push(None);
+                }
+            }
+        }
+        return Ok(result::encode_rows(
+            &proj_names,
+            &proj_types,
+            keyspace,
+            table,
+            &[agg_row],
+        ));
+    }
+
+    // Non-aggregate: project each row
+    let projected: Vec<Vec<Option<CqlValue>>> = all_rows
+        .iter()
+        .map(|row| {
+            proj_ops
+                .iter()
+                .map(|&(src_idx, apply_tojson)| {
+                    if src_idx == usize::MAX - 1 {
+                        // now()
+                        Some(eval_now())
+                    } else if src_idx == usize::MAX - 2 {
+                        // toTimestamp(now())
+                        let timeuuid = eval_now();
+                        eval_to_timestamp(&timeuuid).ok()
+                    } else {
+                        let val = row.get(src_idx).cloned().flatten();
+                        if apply_tojson {
+                            let json =
+                                bridge::cql_value_to_json(val.as_ref().unwrap_or(&CqlValue::Null));
+                            Some(CqlValue::Text(json))
+                        } else {
+                            val
+                        }
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    Ok(result::encode_rows(
+        &proj_names,
+        &proj_types,
+        keyspace,
+        table,
+        &projected,
+    ))
+}
+
+/// Extract a column name from a `Term` that should reference a column.
+///
+/// In the `parse_term` codepath, bare identifiers in function arguments are
+/// parsed as `Term::FunctionCall { name, args: [] }` (zero-arg function call).
+fn extract_column_name(term: &Term) -> Result<String, CqlError> {
+    match term {
+        Term::FunctionCall { name, args, .. } if args.is_empty() => Ok(name.to_lowercase()),
+        Term::StringLiteral(s) => Ok(s.clone()),
+        _ => Err(CqlError::Invalid(format!(
+            "expected column reference in toJson(), got {:?}",
+            term
+        ))),
+    }
+}
+
+/// Convert a [`CqlValue`] to `f64` for built-in aggregate computation.
+///
+/// Supports all numeric CQL types. Returns `None` for non-numeric values so
+/// that NULL / non-numeric cells are skipped during aggregation.
+fn cql_value_to_f64(val: &CqlValue) -> Option<f64> {
+    match val {
+        CqlValue::Tinyint(v) => Some(f64::from(*v)),
+        CqlValue::Smallint(v) => Some(f64::from(*v)),
+        CqlValue::Int(v) => Some(f64::from(*v)),
+        CqlValue::Bigint(v) => Some(*v as f64),
+        CqlValue::Float(bits) => Some(f64::from(f32::from_bits(*bits))),
+        CqlValue::Double(bits) => Some(f64::from_bits(*bits)),
+        CqlValue::Counter(v) => Some(*v as f64),
+        _ => None,
+    }
+}
+
+/// Build the result [`CqlValue`] for a built-in aggregate (`avg`, `sum`,
+/// `min`, `max`) given the source column type.
+///
+/// `avg` and `sum` on integer types still return `Double` for consistency
+/// with Cassandra semantics (CQL `avg(int)` returns `int`, but returning
+/// `Double` avoids truncation and matches driver expectations for
+/// analytics queries).  If more precise Cassandra-compat semantics are
+/// needed later, this can be refined per-type.
+fn f64_to_cql_aggregate(val: f64, col_type: &CqlType) -> CqlValue {
+    match col_type {
+        CqlType::Tinyint => CqlValue::Tinyint(val as i8),
+        CqlType::Smallint => CqlValue::Smallint(val as i16),
+        CqlType::Int => CqlValue::Int(val as i32),
+        CqlType::Bigint | CqlType::Counter => CqlValue::Bigint(val as i64),
+        CqlType::Float => CqlValue::Float((val as f32).to_bits()),
+        // Default to Double for any other numeric or unknown type.
+        _ => CqlValue::Double(val.to_bits()),
+    }
+}
+
+/// Compute a built-in aggregate (`avg`, `min`, `max`, `sum`) over a column.
+///
+/// `agg_name` must be one of `"avg"`, `"min"`, `"max"`, `"sum"` (lowercase).
+/// The function iterates over `rows`, extracting the value at `col_idx`,
+/// converts to `f64`, and applies the aggregate.  NULL cells are skipped.
+fn compute_builtin_aggregate(
+    agg_name: &str,
+    rows: &[Vec<Option<CqlValue>>],
+    col_idx: usize,
+    col_type: &CqlType,
+) -> Option<CqlValue> {
+    let values: Vec<f64> = rows
+        .iter()
+        .filter_map(|row| row.get(col_idx).and_then(|cell| cell.as_ref()))
+        .filter_map(cql_value_to_f64)
+        .collect();
+
+    if values.is_empty() {
+        return Some(CqlValue::Null);
+    }
+
+    let result = match agg_name {
+        "avg" => values.iter().sum::<f64>() / values.len() as f64,
+        "sum" => values.iter().sum::<f64>(),
+        "min" => values.iter().copied().fold(f64::INFINITY, f64::min),
+        "max" => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        _ => return None,
+    };
+    Some(f64_to_cql_aggregate(result, col_type))
+}
+
+/// Apply `toJson()` transformations to projected rows for user-table SELECT queries.
+///
+/// Scans the SELECT column list for `toJson(col)` calls. For each one, finds the
+/// source column value from the full (unprojected) row and replaces the projected
+/// cell with its JSON representation.
+fn apply_tojson_projections(
+    select_columns_ast: &[SelectColumn],
+    proj_col_names: &[String],
+    all_col_names: &[String],
+    full_rows: &[Vec<Option<CqlValue>>],
+    mut projected_rows: Vec<Vec<Option<CqlValue>>>,
+) -> Vec<Vec<Option<CqlValue>>> {
+    // Find toJson columns: (projected_index, source_column_index)
+    let mut tojson_ops: Vec<(usize, usize)> = Vec::new();
+    for (proj_idx, sc) in select_columns_ast.iter().enumerate() {
+        if let SelectColumn::FunctionCall { name, args, .. } = sc {
+            if name.eq_ignore_ascii_case("tojson") {
+                if let Some(arg) = args.first() {
+                    if let Ok(col_name) = extract_column_name(arg) {
+                        if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name) {
+                            if proj_idx < proj_col_names.len() {
+                                tojson_ops.push((proj_idx, src_idx));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if tojson_ops.is_empty() {
+        return projected_rows;
+    }
+
+    for (full_row, proj_row) in full_rows.iter().zip(projected_rows.iter_mut()) {
+        for &(proj_idx, src_idx) in &tojson_ops {
+            let val = full_row
+                .get(src_idx)
+                .and_then(|v| v.as_ref())
+                .unwrap_or(&CqlValue::Null);
+            let json = bridge::cql_value_to_json(val);
+            proj_row[proj_idx] = Some(CqlValue::Text(json));
+        }
+    }
+
+    projected_rows
+}
+
+/// Apply `now()`, `toTimestamp()`, `writetime()`, and `TTL()` built-in functions
+/// to projected rows for user-table SELECT queries.
+///
+/// `cell_meta` carries per-column metadata (timestamp, TTL) from storage,
+/// parallel to `full_rows`. For `now()` and `toTimestamp()`, no source data
+/// is needed. For `writetime()` and `TTL()`, the metadata is looked up by
+/// the target column name.
+///
+/// Currently unused — will be wired into route_select when partition reads
+/// integrate cell metadata via partition_to_rows_with_metadata.
+#[allow(dead_code)]
+fn apply_builtin_functions(
+    select_columns_ast: &[SelectColumn],
+    proj_col_names: &[String],
+    all_col_names: &[String],
+    cell_meta: &[Vec<bridge::CellMeta>],
+    mut projected_rows: Vec<Vec<Option<CqlValue>>>,
+) -> Vec<Vec<Option<CqlValue>>> {
+    // Collect operations: (projected_index, kind)
+    enum BuiltinOp {
+        Now,
+        ToTimestamp,
+        Writetime(usize), // source column index in full row
+        Ttl(usize),       // source column index in full row
+    }
+    let mut ops: Vec<(usize, BuiltinOp)> = Vec::new();
+
+    for (proj_idx, sc) in select_columns_ast.iter().enumerate() {
+        if let SelectColumn::FunctionCall { name, args, .. } = sc {
+            let fn_lower = name.to_lowercase();
+            match fn_lower.as_str() {
+                "now" => {
+                    if proj_idx < proj_col_names.len() {
+                        ops.push((proj_idx, BuiltinOp::Now));
+                    }
+                }
+                "totimestamp" => {
+                    if proj_idx < proj_col_names.len() {
+                        ops.push((proj_idx, BuiltinOp::ToTimestamp));
+                    }
+                }
+                "writetime" => {
+                    if let Some(arg) = args.first() {
+                        if let Ok(col_name) = extract_column_name(arg) {
+                            if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name)
+                            {
+                                if proj_idx < proj_col_names.len() {
+                                    ops.push((proj_idx, BuiltinOp::Writetime(src_idx)));
+                                }
+                            }
+                        }
+                    }
+                }
+                "ttl" => {
+                    if let Some(arg) = args.first() {
+                        if let Ok(col_name) = extract_column_name(arg) {
+                            if let Some(src_idx) = all_col_names.iter().position(|n| *n == col_name)
+                            {
+                                if proj_idx < proj_col_names.len() {
+                                    ops.push((proj_idx, BuiltinOp::Ttl(src_idx)));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if ops.is_empty() {
+        return projected_rows;
+    }
+
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    for (row_idx, proj_row) in projected_rows.iter_mut().enumerate() {
+        let meta = cell_meta.get(row_idx);
+        for (proj_idx, op) in &ops {
+            match op {
+                BuiltinOp::Now => {
+                    proj_row[*proj_idx] = Some(eval_now());
+                }
+                BuiltinOp::ToTimestamp => {
+                    // toTimestamp(now()) -- generate a timeuuid and convert
+                    let timeuuid = eval_now();
+                    proj_row[*proj_idx] = eval_to_timestamp(&timeuuid).ok();
+                }
+                BuiltinOp::Writetime(src_idx) => {
+                    if let Some(m) = meta.and_then(|m| m.get(*src_idx)) {
+                        if m.timestamp != i64::MIN {
+                            proj_row[*proj_idx] = Some(CqlValue::Bigint(m.timestamp));
+                        } else {
+                            proj_row[*proj_idx] = None;
+                        }
+                    } else {
+                        proj_row[*proj_idx] = None;
+                    }
+                }
+                BuiltinOp::Ttl(src_idx) => {
+                    if let Some(m) = meta.and_then(|m| m.get(*src_idx)) {
+                        if m.ttl > 0 {
+                            // Remaining TTL = ttl - (now_secs - cell_timestamp_secs)
+                            let cell_ts_secs = m.timestamp / 1_000_000;
+                            let elapsed = now_ts - cell_ts_secs;
+                            let remaining = (m.ttl as i64) - elapsed;
+                            if remaining > 0 {
+                                proj_row[*proj_idx] = Some(CqlValue::Int(remaining as i32));
+                            } else {
+                                proj_row[*proj_idx] = None; // expired
+                            }
+                        } else {
+                            proj_row[*proj_idx] = None; // no TTL set
+                        }
+                    } else {
+                        proj_row[*proj_idx] = None;
+                    }
+                }
+            }
+        }
+    }
+
+    projected_rows
+}
+
 /// Project rows to a selected column subset.
+///
+/// Columns that do not match any name in `all_names` (e.g. UDF display
+/// names like `"ks.to_celsius"`) get a `None` placeholder so the
+/// projected row has exactly `selected.len()` cells. The caller can
+/// then overwrite those placeholders with UDF results.
 fn select_columns(
     rows: &[Vec<Option<CqlValue>>],
     all_names: &[String],
@@ -3247,13 +4651,21 @@ fn select_columns(
     if all_names == selected {
         return rows.to_vec();
     }
-    // Build index mapping
-    let indices: Vec<usize> = selected
+    // Build index mapping: Some(idx) for real columns, None for function calls.
+    let indices: Vec<Option<usize>> = selected
         .iter()
-        .filter_map(|name| all_names.iter().position(|n| n == name))
+        .map(|name| all_names.iter().position(|n| n == name))
         .collect();
     rows.iter()
-        .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
+        .map(|row| {
+            indices
+                .iter()
+                .map(|opt_i| match opt_i {
+                    Some(i) => row[*i].clone(),
+                    None => None,
+                })
+                .collect()
+        })
         .collect()
 }
 
@@ -3354,6 +4766,9 @@ fn cql_type_name_to_string(type_name: &CqlTypeName) -> String {
             format!("tuple<{}>", inner.join(", "))
         }
         CqlTypeName::Frozen(inner) => format!("frozen<{}>", cql_type_name_to_string(inner)),
+        CqlTypeName::Vector(inner, dim) => {
+            format!("vector<{}, {}>", cql_type_name_to_string(inner), dim)
+        }
     }
 }
 
@@ -3547,6 +4962,11 @@ async fn route_drop_type(
 
 /// Decode a hex-encoded string to bytes.
 fn hex_decode(hex: &str) -> Result<Vec<u8>, CqlError> {
+    // Strip optional 0x / 0X prefix.
+    let hex = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
     if !hex.len().is_multiple_of(2) {
         return Err(CqlError::Invalid("hex body has odd length".into()));
     }
@@ -3605,6 +5025,13 @@ async fn route_create_function(
     let resolved_return = bridge::resolve_type_name(&return_type, &ks, &state.schema)?;
     let common_return = cql_type_to_common(&resolved_return);
 
+    // Build arg type name strings for the SCHEMA_CHANGE response (CQL protocol
+    // requires a [string list] of argument type names for FUNCTION targets).
+    let arg_type_names: Vec<String> = arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
+
     // Decode hex body to WASM bytes and compile
     let wasm_bytes = hex_decode(&body)?;
     state
@@ -3619,10 +5046,11 @@ async fn route_create_function(
             // Drop the old one first, then create the new one
             state.udf_executor.invalidate(&ks, &name);
         } else if if_not_exists {
-            return Ok(result::encode_schema_change(
+            return Ok(result::encode_schema_change_with_args(
                 "CREATED",
                 "FUNCTION",
                 &[&ks, &name],
+                &arg_type_names,
             ));
         } else {
             return Err(CqlError::Invalid(format!(
@@ -3665,10 +5093,11 @@ async fn route_create_function(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "CREATED",
         "FUNCTION",
         &[&ks, &name],
+        &arg_type_names,
     ))
 }
 
@@ -3711,10 +5140,11 @@ async fn route_drop_function(
             match matching.len() {
                 0 => {
                     if if_exists {
-                        return Ok(result::encode_schema_change(
+                        return Ok(result::encode_schema_change_with_args(
                             "DROPPED",
                             "FUNCTION",
                             &[&ks, &name],
+                            &[],
                         ));
                     }
                     return Err(CqlError::Invalid(format!("function {ks}.{name} not found")));
@@ -3734,6 +5164,12 @@ async fn route_drop_function(
         }
     };
 
+    // Build arg type name strings for the SCHEMA_CHANGE response.
+    let resolved_arg_type_names: Vec<String> = resolved_arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
+
     // IF EXISTS check
     if if_exists
         && state
@@ -3741,10 +5177,11 @@ async fn route_drop_function(
             .get_function(&ks, &name, &resolved_arg_types)
             .is_none()
     {
-        return Ok(result::encode_schema_change(
+        return Ok(result::encode_schema_change_with_args(
             "DROPPED",
             "FUNCTION",
             &[&ks, &name],
+            &resolved_arg_type_names,
         ));
     }
 
@@ -3786,10 +5223,11 @@ async fn route_drop_function(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "DROPPED",
         "FUNCTION",
         &[&ks, &name],
+        &resolved_arg_type_names,
     ))
 }
 
@@ -3824,6 +5262,12 @@ async fn route_create_aggregate(
             Ok(cql_type_to_common(&resolved))
         })
         .collect::<Result<_, CqlError>>()?;
+
+    // Build arg type name strings for the SCHEMA_CHANGE response.
+    let agg_arg_type_names: Vec<String> = arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
 
     // Resolve state type
     let resolved_state_type = bridge::resolve_type_name(&state_type, &ks, &state.schema)?;
@@ -3875,10 +5319,11 @@ async fn route_create_aggregate(
         if or_replace {
             // Will be replaced by the new creation
         } else if if_not_exists {
-            return Ok(result::encode_schema_change(
+            return Ok(result::encode_schema_change_with_args(
                 "CREATED",
                 "AGGREGATE",
                 &[&ks, &name],
+                &agg_arg_type_names,
             ));
         } else {
             return Err(CqlError::Invalid(format!(
@@ -3922,10 +5367,11 @@ async fn route_create_aggregate(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "CREATED",
         "AGGREGATE",
         &[&ks, &name],
+        &agg_arg_type_names,
     ))
 }
 
@@ -3967,10 +5413,11 @@ async fn route_drop_aggregate(
             match matching.len() {
                 0 => {
                     if if_exists {
-                        return Ok(result::encode_schema_change(
+                        return Ok(result::encode_schema_change_with_args(
                             "DROPPED",
                             "AGGREGATE",
                             &[&ks, &name],
+                            &[],
                         ));
                     }
                     return Err(CqlError::Invalid(format!(
@@ -3992,6 +5439,12 @@ async fn route_drop_aggregate(
         }
     };
 
+    // Build arg type name strings for the SCHEMA_CHANGE response.
+    let resolved_agg_arg_type_names: Vec<String> = resolved_arg_types
+        .iter()
+        .map(bridge::cql_type_display_name)
+        .collect();
+
     // IF EXISTS check
     if if_exists
         && state
@@ -3999,10 +5452,11 @@ async fn route_drop_aggregate(
             .get_aggregate(&ks, &name, &resolved_arg_types)
             .is_none()
     {
-        return Ok(result::encode_schema_change(
+        return Ok(result::encode_schema_change_with_args(
             "DROPPED",
             "AGGREGATE",
             &[&ks, &name],
+            &resolved_agg_arg_type_names,
         ));
     }
 
@@ -4041,10 +5495,11 @@ async fn route_drop_aggregate(
         }
     }
 
-    Ok(result::encode_schema_change(
+    Ok(result::encode_schema_change_with_args(
         "DROPPED",
         "AGGREGATE",
         &[&ks, &name],
+        &resolved_agg_arg_type_names,
     ))
 }
 
@@ -4352,6 +5807,24 @@ fn where_has_udf_calls(where_clauses: &[WhereClause]) -> bool {
     false
 }
 
+/// Simple phonetic matching: compare two strings word-by-word using Soundex.
+/// Returns true if all words have the same Soundex code.
+/// Phonetic matching using the Double Metaphone encoder from ferrosa-index.
+/// Compares word-by-word: "John Smith" matches "Jon Smyth" because each
+/// word pair produces the same phonetic code.
+fn phonetic_match(a: &str, b: &str) -> bool {
+    let encoder = ferrosa_index::phonetic::PhoneticAlgorithm::DoubleMetaphone.encoder();
+    let a_words: Vec<&str> = a.split_whitespace().collect();
+    let b_words: Vec<&str> = b.split_whitespace().collect();
+    if a_words.len() != b_words.len() {
+        return false;
+    }
+    a_words
+        .iter()
+        .zip(b_words.iter())
+        .all(|(wa, wb)| encoder.encode(wa) == encoder.encode(wb))
+}
+
 /// Check if a Term contains a non-builtin function call.
 fn term_has_udf_call(term: &Term) -> bool {
     match term {
@@ -4359,7 +5832,7 @@ fn term_has_udf_call(term: &Term) -> bool {
             let lower = name.to_lowercase();
             let is_builtin = matches!(
                 lower.as_str(),
-                "uuid" | "now" | "totimestamp" | "todate" | "count" | "writetime" | "ttl"
+                "uuid" | "now" | "totimestamp" | "todate" | "count" | "writetime" | "ttl" | "token"
             );
             if !is_builtin && !args.is_empty() {
                 return true;
@@ -4475,6 +5948,17 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
+    fn test_ctx<'a>(auth: &'a AuthContext, ks: &'a Option<String>) -> RequestContext<'a> {
+        RequestContext {
+            auth,
+            current_keyspace: ks,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        }
+    }
+
     #[tokio::test]
     async fn create_keyspace_then_table_then_insert_then_select() {
         let (state, _dir) = setup();
@@ -4482,6 +5966,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // CREATE KEYSPACE
@@ -4529,6 +6015,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("USE my_ks").unwrap();
         match route(&state, &ctx, stmt).await.unwrap() {
@@ -4547,6 +6035,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -4576,6 +6066,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -4629,6 +6121,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM users WHERE id = 1").unwrap();
         assert!(route(&state, &ctx, stmt).await.is_err());
@@ -4641,6 +6135,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         // Build a batch statement with > 500 entries programmatically
         let stmts: Vec<Statement> = (0..501)
@@ -4671,6 +6167,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.peers").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -4687,6 +6185,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system_schema.keyspaces").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -4747,6 +6247,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let _ = route(&state, &ctx, stmt).await;
@@ -4760,6 +6262,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &Some("ks".into()),
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace and table first
@@ -4845,6 +6349,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse("SELECT * FROM test_ks.test_vtable").unwrap();
@@ -4916,6 +6422,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -4968,6 +6476,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + table + hash index
@@ -5016,6 +6526,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace first
@@ -5055,6 +6567,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -5092,6 +6606,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -5122,6 +6638,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -5144,6 +6662,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -5173,6 +6693,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -5203,6 +6725,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &ks,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace first (with explicit ks in statement)
@@ -5228,6 +6752,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // CREATE TYPE without keyspace and no session keyspace
@@ -5243,6 +6769,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace + type
@@ -5271,6 +6799,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace but no type
@@ -5298,6 +6828,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -5329,6 +6861,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -5360,6 +6894,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -5392,6 +6928,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -5408,6 +6946,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -5432,6 +6972,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -5456,6 +6998,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -5480,6 +7024,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -5550,6 +7096,860 @@ mod tests {
         i32::from_be_bytes(buf[off..off + 4].try_into().unwrap())
     }
 
+    /// Extract column names from a Rows result buffer.
+    fn extract_column_names(buf: &[u8]) -> Vec<String> {
+        assert_eq!(
+            &buf[0..4],
+            &0x0002i32.to_be_bytes(),
+            "expected Rows result kind"
+        );
+        let col_count = i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let mut off = 12;
+        // Skip keyspace string
+        let ks_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        // Skip table string
+        let tbl_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+        // Read column names
+        let mut names = Vec::new();
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+            off += 2;
+            let name = std::str::from_utf8(&buf[off..off + name_len])
+                .unwrap()
+                .to_string();
+            names.push(name);
+            off += name_len;
+            let type_id = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2,
+                0x0021 => off += 4,
+                0x0031 => {
+                    let n = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + n * 2;
+                }
+                _ => {}
+            }
+        }
+        names
+    }
+
+    /// Extract the column count from a Rows result buffer.
+    fn extract_column_count(buf: &[u8]) -> usize {
+        assert_eq!(
+            &buf[0..4],
+            &0x0002i32.to_be_bytes(),
+            "expected Rows result kind"
+        );
+        i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize
+    }
+
+    // ── gocql / Temporal compatibility ──────────────────────────────────
+
+    /// gocql schema agreement: SELECT schema_version FROM system.local WHERE key='local'
+    /// Must return exactly 1 column (schema_version), not all 16.
+    #[tokio::test]
+    async fn gocql_select_schema_version_from_system_local() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT schema_version FROM system.local WHERE key = 'local'")
+                .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let col_names = extract_column_names(b);
+                assert_eq!(
+                    col_names,
+                    vec!["schema_version"],
+                    "gocql schema agreement expects exactly 1 column, got: {col_names:?}"
+                );
+                assert_eq!(extract_row_count(b), 1, "system.local must return 1 row");
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// gocql host discovery: SELECT * FROM system.local WHERE key='local'
+    /// Must return all columns and 1 row (WHERE clause must not break it).
+    #[tokio::test]
+    async fn gocql_select_star_from_system_local_where_key() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system.local WHERE key = 'local'").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let col_count = extract_column_count(b);
+                assert_eq!(col_count, 16, "SELECT * should return all 16 columns");
+                assert_eq!(extract_row_count(b), 1);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// gocql peer discovery: SELECT * FROM system.peers_v2 (empty on single node)
+    /// Must succeed with 0 rows, not error.
+    #[tokio::test]
+    async fn gocql_select_star_from_system_peers_v2() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system.peers_v2").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let col_names = extract_column_names(b);
+                assert!(
+                    col_names.contains(&"schema_version".to_string()),
+                    "system.peers_v2 must include schema_version column"
+                );
+                assert_eq!(extract_row_count(b), 0, "single node has no peers");
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Selecting specific columns from system.local must filter the result.
+    #[tokio::test]
+    async fn system_local_column_filtering() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT cluster_name, release_version FROM system.local").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let col_names = extract_column_names(b);
+                assert_eq!(
+                    col_names,
+                    vec!["cluster_name", "release_version"],
+                    "should return only requested columns"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Selecting specific columns from system.peers must filter the result.
+    #[tokio::test]
+    async fn system_peers_column_filtering() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT peer, host_id, schema_version FROM system.peers").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                let col_names = extract_column_names(b);
+                assert_eq!(
+                    col_names,
+                    vec!["peer", "host_id", "schema_version"],
+                    "should return only requested columns"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Temporal schema migrations use CREATE TYPE for UDTs.
+    #[tokio::test]
+    async fn create_type_udt() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("temporal".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TYPE temporal.serialized_event_batch (encoding_type text, version int, data blob)",
+        ).unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "CREATE TYPE must succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Temporal schema migrations use ALTER TABLE ADD.
+    #[tokio::test]
+    async fn alter_table_add_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("ALTER TABLE ks.t ADD new_col blob").unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALTER TABLE ADD must succeed, got: {:?}",
+            result.err()
+        );
+
+        // Verify the column exists by inserting into it
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.t (k, v, new_col) VALUES (1, 'hello', 0xdeadbeef)",
+        )
+        .unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "INSERT into added column must succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Temporal schema migrations use ALTER TABLE DROP.
+    #[tokio::test]
+    async fn alter_table_drop_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text, extra blob)")
+                .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("ALTER TABLE ks.t DROP extra").unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALTER TABLE DROP must succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// PREPARE for a SELECT must include result column metadata so gocql's
+    /// Scan() knows how many columns to expect.
+    #[tokio::test]
+    async fn prepare_select_includes_result_columns() {
+        use bytes::{BufMut, BytesMut};
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        // Create keyspace and table
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("CREATE TABLE ks.t (k text PRIMARY KEY, v text, n int)").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // Now test PREPARE — build a PREPARE frame body
+        let query = "SELECT v, n FROM ks.t WHERE k = ?";
+        let query_bytes = query.as_bytes();
+        let mut body = BytesMut::new();
+        body.put_i32(query_bytes.len() as i32);
+        body.put_slice(query_bytes);
+
+        let result = crate::connection::handle_prepare(
+            &mut None,
+            &mut Some("ks".into()),
+            &state,
+            &body.freeze(),
+        );
+        match result {
+            crate::connection::HandleResult::Reply(opcode, body) => {
+                // PREPARED = 0x04 Result opcode
+                assert_eq!(opcode, crate::frame::Opcode::Result);
+                // Result body: [4 kind][id...][bind_metadata...][result_metadata]
+                // kind = 0x0004 (Prepared)
+                assert_eq!(&body[0..4], &0x0004i32.to_be_bytes());
+
+                // Skip past the prepared ID (short_bytes: [u16 len][bytes])
+                let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+                let mut off = 6 + id_len;
+
+                // Bind metadata: [i32 flags][i32 columns_count]
+                let _bind_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+                let bind_col_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+
+                // Skip pk_count if global_tables_spec flag is set
+                if _bind_flags & 0x0001 != 0 {
+                    // pk_count
+                    let pk_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                    off += 4;
+                    // pk indexes
+                    off += pk_count as usize * 2;
+                    // global table spec: ks string + table string
+                    let ks_len =
+                        u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + ks_len;
+                    let tbl_len =
+                        u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + tbl_len;
+                }
+                // Skip bind column specs
+                for _ in 0..bind_col_count {
+                    if _bind_flags & 0x0001 == 0 {
+                        // per-column ks+table
+                        let ks_len =
+                            u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                        off += 2 + ks_len;
+                        let tbl_len =
+                            u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                        off += 2 + tbl_len;
+                    }
+                    let name_len =
+                        u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + name_len;
+                    off += 2; // type_id
+                }
+
+                // Result metadata: [i32 flags][i32 columns_count]
+                let _result_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+                let result_col_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+
+                assert_eq!(
+                    result_col_count, 2,
+                    "PREPARE for SELECT v, n should report 2 result columns, got {result_col_count}"
+                );
+            }
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    /// Temporal's CREATE TABLE uses WITH COMPACTION = { map }.
+    /// Parser must handle map-valued table options.
+    #[tokio::test]
+    async fn create_table_with_compaction_option() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("temporal".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE temporal.t (k int PRIMARY KEY) WITH COMPACTION = { 'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy' }",
+        );
+        assert!(
+            stmt.is_ok(),
+            "CREATE TABLE WITH COMPACTION = {{map}} must parse, got: {:?}",
+            stmt.err()
+        );
+        let result = route(&state, &ctx_ks, stmt.unwrap()).await;
+        assert!(
+            result.is_ok(),
+            "CREATE TABLE WITH COMPACTION must succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Temporal uses frozen<UDT> in collection types.
+    #[tokio::test]
+    async fn create_table_with_frozen_udt_collection() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("temporal".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        // Create the UDT first
+        let stmt = crate::parser::parse(
+            "CREATE TYPE temporal.serialized_event_batch (encoding_type text, version int, data blob)",
+        ).unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // Create table with frozen<UDT> in a list
+        let stmt = crate::parser::parse(
+            "CREATE TABLE temporal.executions (k int PRIMARY KEY, events list<frozen<serialized_event_batch>>)",
+        );
+        assert!(
+            stmt.is_ok(),
+            "frozen<UDT> in list must parse, got: {:?}",
+            stmt.err()
+        );
+    }
+
+    /// Temporal uses CLUSTERING ORDER BY in table definition.
+    #[tokio::test]
+    async fn create_table_with_clustering_order_and_compaction() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let _ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("temporal".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE temporal.history_node (\
+                tree_id uuid, branch_id uuid, node_id bigint, txn_id bigint, \
+                data blob, data_encoding text, \
+                PRIMARY KEY ((tree_id), branch_id, node_id, txn_id)) \
+            WITH CLUSTERING ORDER BY (branch_id ASC, node_id ASC, txn_id DESC) \
+            AND COMPACTION = { 'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy' }",
+        );
+        assert!(
+            stmt.is_ok(),
+            "CLUSTERING ORDER + COMPACTION must parse, got: {:?}",
+            stmt.err()
+        );
+    }
+
+    /// FRSA-BUG-024: PREPARE must see columns added by ALTER TABLE ADD.
+    /// Temporal's SaveClusterMetadata fails because PREPARE only reports
+    /// original table columns, not those added by ALTER TABLE.
+    #[tokio::test]
+    async fn prepare_sees_alter_table_add_columns() {
+        use bytes::{BufMut, BytesMut};
+
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        // Create keyspace and table with 2 columns
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt =
+            crate::parser::parse("CREATE TABLE ks.cluster_metadata (k int PRIMARY KEY, data blob)")
+                .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // ALTER TABLE ADD 2 new columns
+        let stmt =
+            crate::parser::parse("ALTER TABLE ks.cluster_metadata ADD encoding text").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+        let stmt =
+            crate::parser::parse("ALTER TABLE ks.cluster_metadata ADD version bigint").unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // PREPARE an INSERT with all 4 columns (including the 2 added ones)
+        let query =
+            "INSERT INTO ks.cluster_metadata (k, data, encoding, version) VALUES (?, ?, ?, ?)";
+        let query_bytes = query.as_bytes();
+        let mut body = BytesMut::new();
+        body.put_i32(query_bytes.len() as i32);
+        body.put_slice(query_bytes);
+
+        let result = crate::connection::handle_prepare(
+            &mut None,
+            &mut Some("ks".into()),
+            &state,
+            &body.freeze(),
+        );
+        match result {
+            crate::connection::HandleResult::Reply(opcode, body) => {
+                assert_eq!(opcode, crate::frame::Opcode::Result);
+                // kind = 0x0004 (Prepared)
+                assert_eq!(&body[0..4], &0x0004i32.to_be_bytes());
+                // Skip past prepared ID
+                let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+                let mut off = 6 + id_len;
+                // Bind metadata: [i32 flags][i32 columns_count]
+                let _bind_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+                let bind_col_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+
+                assert_eq!(
+                    bind_col_count, 4,
+                    "PREPARE should see 4 bind columns (k, data, encoding, version) after ALTER TABLE ADD, got {bind_col_count}"
+                );
+            }
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    /// FRSA-BUG-024: PREPARE for UPDATE...IF condition must include the
+    /// condition's bind marker in the bind columns count.
+    /// Temporal's SaveClusterMetadata uses: UPDATE ... SET ... WHERE ... IF version = ?
+    #[tokio::test]
+    async fn prepare_update_if_condition_includes_bind_marker() {
+        use bytes::{BufMut, BytesMut};
+
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.meta (p int, name text, data blob, version bigint, PRIMARY KEY (p, name))",
+        ).unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // PREPARE: UPDATE with IF condition containing a bind marker
+        let query =
+            "UPDATE ks.meta SET data = ?, version = ? WHERE p = ? AND name = ? IF version = ?";
+        let query_bytes = query.as_bytes();
+        let mut body = BytesMut::new();
+        body.put_i32(query_bytes.len() as i32);
+        body.put_slice(query_bytes);
+
+        let result = crate::connection::handle_prepare(
+            &mut None,
+            &mut Some("ks".into()),
+            &state,
+            &body.freeze(),
+        );
+        match result {
+            crate::connection::HandleResult::Reply(opcode, body) => {
+                assert_eq!(opcode, crate::frame::Opcode::Result);
+                assert_eq!(&body[0..4], &0x0004i32.to_be_bytes());
+                let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+                let mut off = 6 + id_len;
+                let _bind_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+                let bind_col_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+
+                // 5 bind markers: data=?, version=? (SET) + p=?, name=? (WHERE) + version=? (IF)
+                assert_eq!(
+                    bind_col_count, 5,
+                    "PREPARE should report 5 bind columns for UPDATE...IF version=?, got {bind_col_count}"
+                );
+            }
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    // ── FRSA-BUG-026: INSERT IF NOT EXISTS with map column ────────────
+
+    /// Temporal's queue_metadata: INSERT IF NOT EXISTS with a map column
+    /// must not error on the existence check read-back.
+    #[tokio::test]
+    async fn insert_if_not_exists_with_map_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.queue_metadata (queue_type int PRIMARY KEY, cluster_ack_level map<text, bigint>, version bigint)",
+        ).unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // First insert: should succeed (row doesn't exist)
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.queue_metadata (queue_type, cluster_ack_level, version) VALUES (1, {}, 0) IF NOT EXISTS",
+        ).unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "first INSERT IF NOT EXISTS should succeed: {:?}",
+            result.err()
+        );
+
+        // Second insert: should return [applied]=false (row exists)
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.queue_metadata (queue_type, cluster_ack_level, version) VALUES (1, {}, 0) IF NOT EXISTS",
+        ).unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "second INSERT IF NOT EXISTS should succeed (return applied=false): {:?}",
+            result.err()
+        );
+    }
+
+    // ── FRSA-BUG-025: collection bind value decoding ──────────────────
+
+    /// Empty map bind value must not error with "type mismatch: expected map".
+    #[tokio::test]
+    async fn insert_empty_map_literal() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
+        )
+        .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        // Empty map literal
+        let stmt =
+            crate::parser::parse("INSERT INTO ks.qm (qt, ack, ver) VALUES (1, {}, 0)").unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "empty map insert failed: {:?}",
+            result.err()
+        );
+    }
+
+    /// Non-empty map literal roundtrip.
+    #[tokio::test]
+    async fn insert_and_select_map_literal() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
+        )
+        .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("INSERT INTO ks.qm (qt, ack, ver) VALUES (1, {'dc1': 100}, 0)")
+                .unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(result.is_ok(), "map insert failed: {:?}", result.err());
+
+        let sel = crate::parser::parse("SELECT qt, ver FROM ks.qm WHERE qt = 1").unwrap();
+        let result = route(&state, &ctx_ks, sel).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_row_count(b), 1);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Set and list bind values must also decode correctly.
+    #[tokio::test]
+    async fn insert_set_and_list_literals() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("ks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ks.coll (k int PRIMARY KEY, ids set<uuid>, events list<text>)",
+        )
+        .unwrap();
+        route(&state, &ctx_ks, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO ks.coll (k, ids, events) VALUES (1, {550e8400-e29b-41d4-a716-446655440000}, ['login', 'logout'])",
+        )
+        .unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(result.is_ok(), "set/list insert failed: {:?}", result.err());
+    }
+
     // ── BUG-001: TRUNCATE must actually delete data ──────────────────
 
     #[tokio::test]
@@ -5559,6 +7959,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup: create keyspace and table
@@ -5614,18 +8016,21 @@ mod tests {
         }
     }
 
-    // ── ALLOW FILTERING is always rejected ────────────────────────
+    // ── ALLOW FILTERING executes full scan with post-filter ────────
     //
-    // Ferrosa policy: ALLOW FILTERING is not supported.  Queries must use
-    // partition keys or secondary indexes.
+    // ALLOW FILTERING performs a full table scan and filters rows in
+    // memory.  Queries without ALLOW FILTERING on non-indexed columns
+    // are still rejected.
 
     #[tokio::test]
-    async fn allow_filtering_rejected() {
+    async fn allow_filtering_executes_full_scan() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup
@@ -5638,30 +8043,25 @@ mod tests {
             crate::parser::parse("CREATE TABLE ks.t (id int PRIMARY KEY, score int)").unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
-        // ALLOW FILTERING is accepted (Cassandra-compatible). The query may
-        // still fail for other reasons (no index, etc.) but NOT because of
-        // the ALLOW FILTERING clause itself.
         let stmt =
             crate::parser::parse("SELECT * FROM ks.t WHERE score > 25 ALLOW FILTERING").unwrap();
-        match route(&state, &ctx, stmt).await {
-            Ok(_) => {} // fine: full scan worked
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    !msg.contains("ALLOW FILTERING is not supported"),
-                    "should not reject ALLOW FILTERING itself: {msg}"
-                );
-            }
-        }
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALLOW FILTERING should execute full scan, got: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
-    async fn allow_filtering_with_limit_also_rejected() {
+    async fn allow_filtering_with_limit_executes() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -5673,11 +8073,15 @@ mod tests {
             crate::parser::parse("CREATE TABLE afl.t (id int PRIMARY KEY, flag int)").unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
-        // ALLOW FILTERING is now accepted — query should succeed (full scan with filter).
         let stmt =
             crate::parser::parse("SELECT * FROM afl.t WHERE flag = 1 LIMIT 2 ALLOW FILTERING")
                 .unwrap();
-        route(&state, &ctx, stmt).await.unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALLOW FILTERING with LIMIT should execute, got: {:?}",
+            result.err()
+        );
     }
 
     // ── ALLOW FILTERING rejection: exact Cassandra semantics ─────────
@@ -5705,6 +8109,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup: table with an index on `email` but NOT on `name`
@@ -5751,14 +8157,17 @@ mod tests {
         }
     }
 
-    /// Even with an index on some columns, ALLOW FILTERING is rejected.
+    /// With an index on some columns and ALLOW FILTERING, the query should
+    /// succeed — the index narrows the scan, post-filter handles the rest.
     #[tokio::test]
-    async fn allow_filtering_rejected_even_with_partial_index() {
+    async fn allow_filtering_with_partial_index_succeeds() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -5776,12 +8185,16 @@ mod tests {
         let stmt = crate::parser::parse("CREATE INDEX af2_email_idx ON af2.users (email)").unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
-        // ALLOW FILTERING with partial index is now accepted (index+filter scan).
         let stmt = crate::parser::parse(
             "SELECT * FROM af2.users WHERE email = 'ada@example.com' AND name = 'Ada' ALLOW FILTERING",
         )
         .unwrap();
-        route(&state, &ctx, stmt).await.unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALLOW FILTERING with partial index should succeed: {:?}",
+            result.err()
+        );
     }
 
     /// Querying on a fully-indexed column without ALLOW FILTERING must succeed.
@@ -5793,6 +8206,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let stmt = crate::parser::parse(
@@ -5836,6 +8251,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Setup: table with composite key (pk, ck) and a value column
@@ -5977,6 +8394,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system_observability.connections").unwrap();
         let result = route(&state, &ctx, stmt).await;
@@ -5999,6 +8418,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt =
             crate::parser::parse("SELECT * FROM system_observability.active_queries").unwrap();
@@ -6028,6 +8449,8 @@ mod tests {
                 auth: &dev,
                 current_keyspace: &None,
                 consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
             },
             use_stmt,
         )
@@ -6047,6 +8470,8 @@ mod tests {
                 auth: &dev,
                 current_keyspace: &Some(new_ks),
                 consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
             },
             sel_stmt,
         )
@@ -6087,6 +8512,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -6133,6 +8560,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -6188,6 +8617,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -6222,6 +8653,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -6259,6 +8692,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace and function
@@ -6309,6 +8744,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE cur_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -6322,6 +8759,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &cur_ks,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         let hex_body = hex_encode(&minimal_wasm_component());
@@ -6353,6 +8792,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace
@@ -6388,6 +8829,177 @@ mod tests {
         assert_eq!(original, decoded);
     }
 
+    /// Phonetic index: equality on clustering key column with phonetic index matches by
+    /// Double Metaphone code, not exact string. PK lookup + post-filter path.
+    #[tokio::test]
+    async fn phonetic_index_equality_matches_by_metaphone_clustering_key() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE phon_ck WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE phon_ck.entities (tenant_id text, session_id text, entity_name text, data text, PRIMARY KEY ((tenant_id, session_id), entity_name))",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE INDEX phon_ck_idx ON phon_ck.entities (entity_name) USING 'phonetic'",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO phon_ck.entities (tenant_id, session_id, entity_name, data) VALUES ('t1', 's1', 'John Smith', 'some data')",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // SELECT with phonetically equivalent name — must match via post-filter
+        let stmt = crate::parser::parse(
+            "SELECT entity_name, data FROM phon_ck.entities WHERE tenant_id = 't1' AND session_id = 's1' AND entity_name = 'Jon Smyth'",
+        ).unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "phonetic query should not error: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "phonetic index should match 'Jon Smyth' to 'John Smith', got {count} rows"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Phonetic index: equality on regular column (not part of PK) matches
+    /// by Double Metaphone. This exercises the index-based scan path.
+    #[tokio::test]
+    async fn phonetic_index_equality_matches_by_metaphone_regular_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE phon_reg WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // entity_name is a REGULAR column, entity_id is clustering key
+        let stmt = crate::parser::parse(
+            "CREATE TABLE phon_reg.entities (tenant_id text, session_id text, entity_id text, entity_name text, data text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE INDEX phon_reg_idx ON phon_reg.entities (entity_name) USING 'phonetic'",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO phon_reg.entities (tenant_id, session_id, entity_id, entity_name, data) VALUES ('t1', 's1', 'e1', 'John Smith', 'some data')",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Query with phonetically equivalent name on regular column
+        let stmt = crate::parser::parse(
+            "SELECT entity_name, data FROM phon_reg.entities WHERE tenant_id = 't1' AND session_id = 's1' AND entity_name = 'Jon Smyth'",
+        ).unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "phonetic query should not error: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "phonetic index should match 'Jon Smyth' to 'John Smith' on regular column, got {count} rows"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// Phonetic index: query WITHOUT partition key — forces index-only scan path.
+    #[tokio::test]
+    async fn phonetic_index_equality_matches_without_pk() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE phon_nopk WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE phon_nopk.entities (id int PRIMARY KEY, entity_name text)",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE INDEX phon_nopk_idx ON phon_nopk.entities (entity_name) USING 'phonetic'",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "INSERT INTO phon_nopk.entities (id, entity_name) VALUES (1, 'John Smith')",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Query by phonetic equivalent WITHOUT specifying PK — forces index path
+        let stmt = crate::parser::parse(
+            "SELECT id, entity_name FROM phon_nopk.entities WHERE entity_name = 'Jon Smyth'",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "phonetic query without PK should not error: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "phonetic index lookup should match 'Jon Smyth' to 'John Smith', got {count} rows"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
     /// `CREATE INDEX` followed by `INSERT` then `SELECT WHERE indexed_col = ?`
     /// must return the inserted row via the memtable index.  This verifies the
     /// full wire-up: router calls engine.add_index(), the TableStore's
@@ -6399,6 +9011,8 @@ mod tests {
             auth: &dev_auth(),
             current_keyspace: &None,
             consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
         };
 
         // Create keyspace and table
@@ -6447,107 +9061,42 @@ mod tests {
         }
     }
 
-    /// Verify that SELECT * FROM system_schema.keyspaces includes a `replication`
-    /// column and the JSON value contains "class".
+    // ── CQL built-in function tests ─────────────────────────────────────
+
     #[tokio::test]
-    async fn select_system_schema_keyspaces_includes_replication() {
-        let (state, _dir) = setup();
-        let ctx = RequestContext {
-            auth: &dev_auth(),
-            current_keyspace: &None,
-            consistency: ConsistencyLevel::One,
-        };
-
-        // Create a keyspace so there is at least one result row
-        let stmt = crate::parser::parse(
-            "CREATE KEYSPACE repl_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
-        )
-        .unwrap();
-        route(&state, &ctx, stmt).await.unwrap();
-
-        let stmt = crate::parser::parse("SELECT * FROM system_schema.keyspaces").unwrap();
-        let result = route(&state, &ctx, stmt).await.unwrap();
-        let b = match &result {
-            RouteResult::Result(b) => b,
-            _ => panic!("expected Result"),
-        };
-
-        // Parse the Rows result to find column names and row data.
-        assert_eq!(&b[0..4], &0x0002i32.to_be_bytes(), "expected Rows kind");
-        let flags = i32::from_be_bytes(b[4..8].try_into().unwrap());
-        let col_count = i32::from_be_bytes(b[8..12].try_into().unwrap()) as usize;
-        let mut off = 12;
-
-        // If Global_tables_spec flag (0x0001) is set, skip ks and table strings
-        if flags & 0x0001 != 0 {
-            let ks_len = u16::from_be_bytes(b[off..off + 2].try_into().unwrap()) as usize;
-            off += 2 + ks_len;
-            let tbl_len = u16::from_be_bytes(b[off..off + 2].try_into().unwrap()) as usize;
-            off += 2 + tbl_len;
-        }
-
-        // Read column names
-        let mut col_names = Vec::new();
-        for _ in 0..col_count {
-            let name_len = u16::from_be_bytes(b[off..off + 2].try_into().unwrap()) as usize;
-            off += 2;
-            let name = std::str::from_utf8(&b[off..off + name_len])
-                .unwrap()
-                .to_string();
-            off += name_len;
-            // Skip type_id
-            let type_id = u16::from_be_bytes(b[off..off + 2].try_into().unwrap());
-            off += 2;
-            match type_id {
-                0x0020 | 0x0022 => off += 2,
-                0x0021 => off += 4,
-                _ => {}
+    async fn cql_function_now() {
+        // Test eval_now() directly: should produce a v1 UUID.
+        let timeuuid = super::eval_now();
+        match timeuuid {
+            CqlValue::Timeuuid(uuid) => {
+                let bytes = uuid.as_bytes();
+                let version = (bytes[6] >> 4) & 0x0F;
+                assert_eq!(version, 1, "now() should return a v1 UUID, got v{version}");
             }
-            col_names.push(name);
+            other => panic!("expected Timeuuid, got {:?}", other),
         }
+    }
 
-        // Verify `replication` column exists
-        let repl_idx = col_names
-            .iter()
-            .position(|n| n == "replication")
-            .expect("should have 'replication' column");
+    #[tokio::test]
+    async fn cql_function_to_timestamp() {
+        // Test eval_now() + eval_to_timestamp() directly.
+        let timeuuid = super::eval_now();
+        let ts = super::eval_to_timestamp(&timeuuid).expect("toTimestamp should succeed");
 
-        // Parse rows to find the replication value for repl_ks
-        let row_count = i32::from_be_bytes(b[off..off + 4].try_into().unwrap()) as usize;
-        off += 4;
-        assert!(row_count > 0, "should have at least 1 keyspace row");
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
 
-        let mut found_repl_ks = false;
-        for _ in 0..row_count {
-            let mut cells = Vec::new();
-            for _ in 0..col_count {
-                let cell_len = i32::from_be_bytes(b[off..off + 4].try_into().unwrap());
-                off += 4;
-                if cell_len < 0 {
-                    cells.push(None);
-                } else {
-                    let cell_data = &b[off..off + cell_len as usize];
-                    cells.push(Some(cell_data.to_vec()));
-                    off += cell_len as usize;
-                }
+        match ts {
+            CqlValue::Timestamp(millis) => {
+                let diff = (now_millis - millis).abs();
+                assert!(
+                    diff < 5000,
+                    "toTimestamp(now()) should be within 5s of current time, diff={diff}ms"
+                );
             }
-
-            // Check if this is our keyspace
-            if let Some(ref ks_bytes) = cells[0] {
-                let ks_name = std::str::from_utf8(ks_bytes).unwrap();
-                if ks_name == "repl_ks" {
-                    found_repl_ks = true;
-                    let repl_bytes = cells[repl_idx]
-                        .as_ref()
-                        .expect("replication column should not be null");
-                    let repl_str = std::str::from_utf8(repl_bytes).unwrap();
-                    assert!(
-                        repl_str.contains("class"),
-                        "replication JSON should contain 'class', got: {repl_str}"
-                    );
-                }
-            }
+            other => panic!("expected Timestamp, got {:?}", other),
         }
-        assert!(found_repl_ks, "should have found repl_ks in the results");
     }
 }

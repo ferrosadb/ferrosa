@@ -99,6 +99,9 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
     schema
         .virtual_tables()
         .register(Arc::new(ActiveQueriesTable::new(query_tracker.clone())));
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::ConsolidationStatusTable::new(schema.clone()),
+    ));
 
     let udf_executor =
         Arc::new(ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default()).unwrap());

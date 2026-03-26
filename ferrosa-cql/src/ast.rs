@@ -88,6 +88,41 @@ pub enum Statement {
         stream_id: Option<u16>,
     },
     Explain(Box<SelectStatement>),
+    /// BEGIN TRANSACTION — starts a multi-statement Accord transaction.
+    BeginTransaction,
+    /// COMMIT — commits the current Accord transaction.
+    Commit,
+    /// ROLLBACK — aborts the current Accord transaction.
+    Rollback,
+}
+
+impl Statement {
+    /// Returns true if this is a DDL statement (schema-modifying).
+    /// DDL is not permitted inside Accord transactions.
+    pub fn is_ddl(&self) -> bool {
+        matches!(
+            self,
+            Statement::CreateKeyspace(_)
+                | Statement::AlterKeyspace(_)
+                | Statement::DropKeyspace(_)
+                | Statement::CreateTable(_)
+                | Statement::AlterTable(_)
+                | Statement::DropTable(_)
+                | Statement::CreateRole(_)
+                | Statement::AlterRole(_)
+                | Statement::DropRole(_)
+                | Statement::CreateIndex(_)
+                | Statement::DropIndex(_)
+                | Statement::CreateType { .. }
+                | Statement::AlterType { .. }
+                | Statement::DropType { .. }
+                | Statement::CreateFunction { .. }
+                | Statement::DropFunction { .. }
+                | Statement::CreateAggregate { .. }
+                | Statement::DropAggregate { .. }
+                | Statement::Truncate(_)
+        )
+    }
 }
 
 /// A value expression in DML statements.
@@ -135,6 +170,9 @@ pub struct WhereClause {
     pub column: String,
     pub op: ComparisonOp,
     pub value: Term,
+    /// When true, this clause represents `token(column) op token(value)`
+    /// and should be evaluated as a token-range predicate.
+    pub token_fn: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -164,6 +202,9 @@ pub struct SelectStatement {
     pub order_by: Vec<(String, OrderDirection)>,
     pub limit: Option<i32>,
     pub allow_filtering: bool,
+    /// ANN (Approximate Nearest Neighbor) ordering: `ORDER BY col ANN OF <term>`.
+    /// Stores the column name and the vector term for similarity search.
+    pub ann_of: Option<(String, Term)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -194,6 +235,27 @@ pub enum Assignment {
     },
 }
 
+/// Comparison operator in an IF condition on UPDATE/DELETE (LWT).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IfOperator {
+    Eq,    // =
+    NotEq, // !=
+    Lt,    // <
+    Gt,    // >
+    LtEq,  // <=
+    GtEq,  // >=
+    In,    // IN
+}
+
+/// A condition in an IF clause on UPDATE/DELETE (LWT).
+/// e.g., `IF col = 'value' AND other_col != 42`
+#[derive(Debug, Clone, PartialEq)]
+pub struct IfCondition {
+    pub column: String,
+    pub operator: IfOperator,
+    pub value: Term,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStatement {
     pub keyspace: Option<String>,
@@ -201,17 +263,38 @@ pub struct UpdateStatement {
     pub assignments: Vec<Assignment>,
     pub where_clauses: Vec<WhereClause>,
     pub if_exists: bool,
+    pub if_conditions: Vec<IfCondition>,
     pub using_timestamp: Option<i64>,
     pub using_ttl: Option<i32>,
+}
+
+/// A column target in a DELETE statement — either a whole column or a map element.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteTarget {
+    /// Delete entire column: `DELETE col FROM ...`
+    Column(String),
+    /// Delete a single map element: `DELETE col['key'] FROM ...`
+    MapElement { column: String, key: Term },
+}
+
+impl DeleteTarget {
+    /// Returns the column name regardless of variant.
+    pub fn column_name(&self) -> &str {
+        match self {
+            DeleteTarget::Column(name) => name,
+            DeleteTarget::MapElement { column, .. } => column,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteStatement {
     pub keyspace: Option<String>,
     pub table: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<DeleteTarget>,
     pub where_clauses: Vec<WhereClause>,
     pub if_exists: bool,
+    pub if_conditions: Vec<IfCondition>,
     pub using_timestamp: Option<i64>,
 }
 
@@ -238,6 +321,8 @@ pub enum CqlTypeName {
     Map(Box<CqlTypeName>, Box<CqlTypeName>),
     Tuple(Vec<CqlTypeName>),
     Frozen(Box<CqlTypeName>),
+    /// Vector type with element type and fixed dimension: `vector<float, 3>`.
+    Vector(Box<CqlTypeName>, usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +352,8 @@ pub struct AlterTableStatement {
     pub drop_columns: Vec<String>,
     /// Table extensions (e.g. graph metadata: `WITH extensions = {'vertex_label': 'Person'}`).
     pub extensions: Option<Vec<(String, String)>>,
+    /// Generic table options (compaction, compression, comment, etc.).
+    pub table_options: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,6 +499,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             allow_filtering: false,
+            ann_of: None,
         });
         let stmt = Statement::Subscribe {
             inner: Box::new(inner),

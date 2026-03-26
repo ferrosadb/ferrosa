@@ -15,6 +15,7 @@
 //! prepared statement cache uses `moka` (W-TinyLFU), and storage
 //! access goes through `Arc<StorageEngine>`.
 
+pub mod accord_router;
 pub mod ast;
 pub mod auth;
 pub mod bridge;
@@ -24,6 +25,7 @@ pub mod error;
 pub mod event;
 pub mod frame;
 pub mod lexer;
+pub mod paging;
 pub mod parser;
 pub mod planner;
 pub mod prepared;
@@ -31,6 +33,9 @@ pub mod prometheus;
 pub mod result;
 pub mod router;
 pub mod server;
+pub mod session;
 pub mod subscribe;
+pub mod transaction_keys;
+pub mod transaction_limits;
 pub mod types;
 pub mod virtual_tables;

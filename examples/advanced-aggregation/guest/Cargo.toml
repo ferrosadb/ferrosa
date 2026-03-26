@@ -14,9 +14,4 @@ wit-bindgen = { version = "0.41", default-features = false, features = ["macros"
 
 [package.metadata.component]
 package = "ferrosa:udf-guest"
-
-[package.metadata.component.target]
-world = "udf"
-
-[package.metadata.component.target.dependencies]
-"ferrosa:udf" = { path = "wit" }
+target = { path = "wit", world = "udf" }

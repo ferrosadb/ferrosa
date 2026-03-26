@@ -33,6 +33,9 @@ jobs:
       - name: Start 3-node cluster
         run: docker compose up -d node1
 
+      - name: Install cqlsh
+        run: pip install cqlsh
+
       - name: Wait for CQL port
         run: |
           echo "Waiting for Ferrosa CQL port (9042)..."
@@ -48,9 +51,6 @@ jobs:
             fi
             sleep 1
           done
-
-      - name: Install cqlsh
-        run: pip install cqlsh
 
       - name: Run example tests
         run: |

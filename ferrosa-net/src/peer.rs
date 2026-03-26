@@ -181,7 +181,13 @@ impl PeerManager {
                 // Send Ping via raft lane (fire-and-forget)
                 if let Some(pool) = &state.pool {
                     let nonce = rand::random();
-                    let _ = pool.fire(Message::Ping { nonce }, Lane::Raft).await;
+                    let sent_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    let _ = pool
+                        .fire(Message::Ping { nonce, sent_at }, Lane::Raft)
+                        .await;
                 }
             }
 
@@ -412,7 +418,14 @@ mod tests {
         let listener = Arc::new(TestListener::new());
         let pm = PeerManager::new(config, uuid::Uuid::new_v4(), listener);
         let result = pm
-            .fire(uuid::Uuid::new_v4(), Message::Ping { nonce: 1 }, Lane::Data)
+            .fire(
+                uuid::Uuid::new_v4(),
+                Message::Ping {
+                    nonce: 1,
+                    sent_at: 0,
+                },
+                Lane::Data,
+            )
             .await;
         assert!(result.is_err(), "fire to unknown peer should fail");
     }

@@ -400,19 +400,25 @@ pub fn filter_passes(expr: &Expr, bindings: &HashMap<String, Value>) -> Result<b
 
 /// Convert a partition's cells to a JSON object suitable for bindings.
 ///
-/// Since we don't carry schema metadata into the executor yet, this produces
-/// a minimal object with `_id` (hex key) and `_raw_cells` (array of cell
-/// values). Property-name-based lookup requires schema threading in a future
-/// revision.
-pub fn partition_to_json(partition: &ferrosa_sstable::types::Partition, hex_id: &str) -> Value {
+/// Uses `column_names` from schema metadata to map cell indices to real
+/// property names (e.g., `name`, `age`). When a column name is not available
+/// for a given index, falls back to `col_{idx}`.
+pub fn partition_to_json(
+    partition: &ferrosa_sstable::types::Partition,
+    hex_id: &str,
+    column_names: &[String],
+) -> Value {
     let mut map = serde_json::Map::new();
     map.insert("_id".to_string(), Value::String(hex_id.to_string()));
 
-    // Collect cell values as an array for access.
+    // Collect cell values, keyed by column name from schema metadata.
     let all_rows = partition.static_row.iter().chain(partition.rows.iter());
     for row in all_rows {
         for (col_idx, cell) in &row.cells {
-            let key = format!("col_{col_idx}");
+            let key = column_names
+                .get(*col_idx as usize)
+                .cloned()
+                .unwrap_or_else(|| format!("col_{col_idx}"));
             let val = match &cell.value {
                 Some(bytes) => match std::str::from_utf8(bytes) {
                     Ok(s) => Value::String(s.to_string()),

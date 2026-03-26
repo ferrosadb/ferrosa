@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
-use tokio_util::sync::CancellationToken;
 
 use ferrosa_schema::auth::role::AuthContext;
 use ferrosa_schema::Schema;
 use ferrosa_storage::StorageEngine;
+
+use tokio_util::sync::CancellationToken;
 
 use crate::adjacency::observer::AdjacencyIndexObserver;
 use crate::adjacency::reconcile::spawn_reconciliation;
@@ -51,8 +52,8 @@ pub struct GraphEngine {
     schema: Arc<Schema>,
     storage: Arc<StorageEngine>,
     config: GraphEngineConfig,
-    reconciliation_cancel: CancellationToken,
     reconciliation_handles: Vec<tokio::task::JoinHandle<()>>,
+    reconciliation_cancel: CancellationToken,
     subscription_registry: Arc<SubscriptionRegistry>,
 }
 
@@ -99,31 +100,34 @@ impl GraphEngine {
             }
         }
 
-        // Shared cancellation token for all reconciliation loops.
-        let reconciliation_cancel = CancellationToken::new();
-
         // Register an adjacency observer and start reconciliation for each keyspace.
         let mut reconciliation_handles = Vec::new();
+        let reconciliation_cancel = CancellationToken::new();
         for ks in &edge_keyspaces {
             let observer = Arc::new(AdjacencyIndexObserver::new(Arc::clone(&schema), ks.clone()));
             storage.register_observer(observer);
 
-            let handle = spawn_reconciliation(
-                Arc::clone(&schema),
-                Arc::clone(&storage),
-                ks.clone(),
-                reconciliation_interval,
-                reconciliation_cancel.clone(),
-            );
-            reconciliation_handles.push(handle);
+            // spawn_reconciliation requires a tokio runtime. In test
+            // contexts (e.g., proptest without #[tokio::test]), there may
+            // be no runtime. Check before spawning.
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let handle = spawn_reconciliation(
+                    Arc::clone(&schema),
+                    Arc::clone(&storage),
+                    ks.clone(),
+                    reconciliation_interval,
+                    reconciliation_cancel.child_token(),
+                );
+                reconciliation_handles.push(handle);
+            }
         }
 
         Self {
             schema,
             storage,
             config,
-            reconciliation_cancel,
             reconciliation_handles,
+            reconciliation_cancel,
             subscription_registry: Arc::new(SubscriptionRegistry::new(DEFAULT_MAX_SUBSCRIPTIONS)),
         }
     }
@@ -140,6 +144,7 @@ impl GraphEngine {
             keyspace,
             &self.config,
             Some(self.schema.virtual_tables()),
+            Some(&self.schema),
         )
     }
 
@@ -196,6 +201,7 @@ impl GraphEngine {
             keyspace,
             &self.config,
             Some(self.schema.virtual_tables()),
+            Some(&self.schema),
         )?;
 
         Ok((result, interval, delta))
@@ -250,26 +256,18 @@ impl GraphEngine {
         Ok(GraphSchema { vertices, edges })
     }
 
-    /// Gracefully stop reconciliation tasks (for controlled shutdown).
-    ///
-    /// Cancels all reconciliation loops and waits up to 5 s for them to
-    /// drain, then drops any remaining handles.
-    pub async fn shutdown(&mut self) {
+    /// Cancel and abort reconciliation tasks (for graceful shutdown).
+    pub fn shutdown(&mut self) {
         self.reconciliation_cancel.cancel();
-        let handles: Vec<_> = self.reconciliation_handles.drain(..).collect();
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            futures::future::join_all(handles),
-        )
-        .await;
+        for handle in self.reconciliation_handles.drain(..) {
+            handle.abort();
+        }
     }
 }
 
 impl Drop for GraphEngine {
     fn drop(&mut self) {
-        // Synchronous path: just signal cancellation.
-        // Handles are dropped here — tasks will stop at their next yield.
-        self.reconciliation_cancel.cancel();
+        self.shutdown();
     }
 }
 
@@ -337,12 +335,14 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             expand,
             variables,
             detach,
+            variable_tables,
         } => {
             let mut out = String::new();
             out.push_str("DeleteNodes {\n");
             out.push_str(&format!("  expand: {}\n", format_plan(expand)));
             out.push_str(&format!("  variables: {:?}\n", variables));
             out.push_str(&format!("  detach: {}\n", detach));
+            out.push_str(&format!("  variable_tables: {:?}\n", variable_tables));
             out.push('}');
             out
         }

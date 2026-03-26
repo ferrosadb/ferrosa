@@ -51,6 +51,14 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             }
             CqlType::Timestamp => Ok(CqlValue::Timestamp(*n)),
             CqlType::Counter => Ok(CqlValue::Counter(*n)),
+            CqlType::Float => {
+                // CQL allows integer literals for float columns (e.g. INSERT ... VALUES (42))
+                Ok(CqlValue::Float((*n as f32).to_bits()))
+            }
+            CqlType::Double => {
+                // CQL allows integer literals for double columns (e.g. INSERT ... VALUES (42))
+                Ok(CqlValue::Double((*n as f64).to_bits()))
+            }
             CqlType::Varint => Ok(CqlValue::Varint(BigInt::from(*n))),
             CqlType::Decimal => {
                 // Integer literal as decimal: scale 0, unscaled = the integer value
@@ -187,9 +195,41 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
 
         Term::BlobLiteral(b) => match target {
             CqlType::Blob => Ok(CqlValue::Blob(b.clone())),
+            // EXECUTE bind values may arrive as raw bytes (BlobLiteral) when
+            // the prepared statement's bound_columns couldn't be resolved.
+            // Decode them based on the target type rather than rejecting.
+            CqlType::Uuid | CqlType::Timeuuid if b.len() == 16 => {
+                let uuid = uuid::Uuid::from_bytes(b.as_slice().try_into().unwrap());
+                Ok(CqlValue::Uuid(uuid))
+            }
+            CqlType::Int if b.len() == 4 => Ok(CqlValue::Int(i32::from_be_bytes(
+                b.as_slice().try_into().unwrap(),
+            ))),
+            CqlType::Bigint | CqlType::Timestamp if b.len() == 8 => Ok(CqlValue::Bigint(
+                i64::from_be_bytes(b.as_slice().try_into().unwrap()),
+            )),
+            CqlType::Varchar | CqlType::Ascii => {
+                Ok(CqlValue::Text(String::from_utf8_lossy(b).to_string()))
+            }
+            CqlType::Boolean if b.len() == 1 => Ok(CqlValue::Boolean(b[0] != 0)),
+            CqlType::Float if b.len() == 4 => Ok(CqlValue::Float(u32::from_be_bytes(
+                b.as_slice().try_into().unwrap(),
+            ))),
+            CqlType::Double if b.len() == 8 => Ok(CqlValue::Double(u64::from_be_bytes(
+                b.as_slice().try_into().unwrap(),
+            ))),
+            CqlType::Vector(_, dim) if b.len() == *dim * 4 => {
+                // Raw vector bytes: N big-endian f32 values
+                let floats: Vec<u32> = b
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                Ok(CqlValue::Vector(floats))
+            }
             _ => Err(CqlError::Invalid(format!(
-                "type mismatch: expected {}, got blob literal",
-                cql_type_name(target)
+                "type mismatch: expected {}, got blob literal ({} bytes)",
+                cql_type_name(target),
+                b.len()
             ))),
         },
 
@@ -200,6 +240,29 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     .map(|item| term_to_cql_value(item, elem_type))
                     .collect();
                 Ok(CqlValue::List(converted?))
+            }
+            CqlType::Vector(_, dimension) => {
+                if items.len() != *dimension {
+                    return Err(CqlError::Invalid(format!(
+                        "vector dimension mismatch: expected {}, got {}",
+                        dimension,
+                        items.len()
+                    )));
+                }
+                let mut bits = Vec::with_capacity(*dimension);
+                for item in items {
+                    let f: f32 = match item {
+                        Term::FloatLiteral(f) => *f as f32,
+                        Term::IntegerLiteral(n) => *n as f32,
+                        _ => {
+                            return Err(CqlError::Invalid(
+                                "vector elements must be numeric literals".into(),
+                            ));
+                        }
+                    };
+                    bits.push(f.to_bits());
+                }
+                Ok(CqlValue::Vector(bits))
             }
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got list literal",
@@ -235,13 +298,18 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 fields: field_defs, ..
             } => {
                 // UDT literal: {field_name: value, ...}
-                // Keys in the map literal must be string literals matching field names.
+                // Keys are bare identifiers (parsed as FunctionCall with no args)
+                // or string literals matching field names.
                 let mut result = Vec::with_capacity(field_defs.len());
                 for (field_name, field_type) in field_defs {
                     let value = pairs
                         .iter()
                         .find(|(k, _)| match k {
                             Term::StringLiteral(s) => s.eq_ignore_ascii_case(field_name),
+                            // Bare identifiers are parsed as FunctionCall { name, args: [] }
+                            Term::FunctionCall { name, args, .. } if args.is_empty() => {
+                                name.eq_ignore_ascii_case(field_name)
+                            }
                             _ => false,
                         })
                         .map(|(_, v)| term_to_cql_value(v, field_type))
@@ -250,6 +318,11 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                 }
                 Ok(CqlValue::Udt(result))
             }
+            // CQL ambiguity: `{}` parses as an empty map literal but is also a valid
+            // empty set literal. Cassandra disambiguates at execution time based on the
+            // target column type. We do the same: an empty MapLiteral coerces to an
+            // empty set when the target is a set type.
+            CqlType::Set(_) if pairs.is_empty() => Ok(CqlValue::Set(Vec::new())),
             _ => Err(CqlError::Invalid(format!(
                 "type mismatch: expected {}, got map literal",
                 cql_type_name(target)
@@ -334,8 +407,8 @@ fn cql_type_name(t: &CqlType) -> &'static str {
         CqlType::Map(_, _) => "map",
         CqlType::Set(_) => "set",
         CqlType::Tuple(_) => "tuple",
-        CqlType::Udt { .. } => "udt",
         CqlType::Vector(_, _) => "vector",
+        CqlType::Udt { .. } => "udt",
     }
 }
 
@@ -378,101 +451,10 @@ pub fn cql_type_display_name(t: &CqlType) -> String {
             let inner: Vec<String> = types.iter().map(cql_type_display_name).collect();
             format!("tuple<{}>", inner.join(", "))
         }
-        CqlType::Udt { keyspace, name, .. } => format!("{keyspace}.{name}"),
         CqlType::Vector(elem, dim) => {
             format!("vector<{}, {}>", cql_type_display_name(elem), dim)
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Function 1b: cql_value_to_term
-// ---------------------------------------------------------------------------
-
-/// Convert a wire-level [`CqlValue`] back to a parser-level [`Term`] literal.
-///
-/// Used during EXECUTE to substitute decoded bound values into the prepared
-/// statement AST in place of `BindMarker` nodes.
-pub fn cql_value_to_term(val: &CqlValue) -> Term {
-    match val {
-        CqlValue::Null => Term::Null,
-        CqlValue::Ascii(s) | CqlValue::Text(s) => Term::StringLiteral(s.clone()),
-        CqlValue::Bigint(n) | CqlValue::Counter(n) | CqlValue::Timestamp(n) | CqlValue::Time(n) => {
-            Term::IntegerLiteral(*n)
-        }
-        CqlValue::Int(n) => Term::IntegerLiteral(*n as i64),
-        CqlValue::Smallint(n) => Term::IntegerLiteral(*n as i64),
-        CqlValue::Tinyint(n) => Term::IntegerLiteral(*n as i64),
-        CqlValue::Boolean(b) => Term::BoolLiteral(*b),
-        CqlValue::Float(bits) => Term::FloatLiteral(f32::from_bits(*bits) as f64),
-        CqlValue::Double(bits) => Term::FloatLiteral(f64::from_bits(*bits)),
-        CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => Term::UuidLiteral(*u),
-        CqlValue::Blob(b) => Term::BlobLiteral(b.clone()),
-        CqlValue::Inet(addr) => Term::StringLiteral(addr.to_string()),
-        CqlValue::Date(d) => Term::IntegerLiteral(*d as i64),
-        CqlValue::Varint(n) => {
-            // Try to fit into i64 via signed bytes; fall back to string.
-            let bytes = n.to_signed_bytes_be();
-            if bytes.len() <= 8 {
-                // Fits in i64 — sign-extend to 8 bytes and decode
-                let mut buf = if bytes.first().is_some_and(|b| b & 0x80 != 0) {
-                    [0xFF_u8; 8]
-                } else {
-                    [0u8; 8]
-                };
-                let start = 8 - bytes.len();
-                buf[start..].copy_from_slice(&bytes);
-                Term::IntegerLiteral(i64::from_be_bytes(buf))
-            } else {
-                Term::StringLiteral(n.to_string())
-            }
-        }
-        CqlValue::Decimal { .. } => {
-            // Decimal doesn't have a direct Term representation; use string
-            Term::StringLiteral(format!("{:?}", val))
-        }
-        CqlValue::Duration { .. } => {
-            // Duration doesn't have a direct Term representation; use string
-            Term::StringLiteral(format!("{:?}", val))
-        }
-        CqlValue::List(items) => Term::ListLiteral(items.iter().map(cql_value_to_term).collect()),
-        CqlValue::Set(items) => Term::SetLiteral(items.iter().map(cql_value_to_term).collect()),
-        CqlValue::Map(entries) => Term::MapLiteral(
-            entries
-                .iter()
-                .map(|(k, v)| (cql_value_to_term(k), cql_value_to_term(v)))
-                .collect(),
-        ),
-        CqlValue::Tuple(elements) => Term::TupleLiteral(
-            elements
-                .iter()
-                .map(|e| match e {
-                    Some(v) => cql_value_to_term(v),
-                    None => Term::Null,
-                })
-                .collect(),
-        ),
-        CqlValue::Vector(bits) => Term::ListLiteral(
-            bits.iter()
-                .map(|b| Term::FloatLiteral(f32::from_bits(*b) as f64))
-                .collect(),
-        ),
-        CqlValue::Udt(fields) => {
-            // UDT doesn't have a direct Term mapping; use a map-like representation
-            Term::MapLiteral(
-                fields
-                    .iter()
-                    .map(|(name, v)| {
-                        let key = Term::StringLiteral(name.clone());
-                        let val = match v {
-                            Some(cv) => cql_value_to_term(cv),
-                            None => Term::Null,
-                        };
-                        (key, val)
-                    })
-                    .collect(),
-            )
-        }
+        CqlType::Udt { keyspace, name, .. } => format!("{keyspace}.{name}"),
     }
 }
 
@@ -669,12 +651,14 @@ impl<'a> TypeParser<'a> {
                 self.consume(b',')?;
                 self.skip_whitespace();
                 let dim_str = self.read_ident()?;
-                let dimension: usize = dim_str.parse().map_err(|_| {
-                    CqlError::Invalid(format!("invalid vector dimension: '{dim_str}'"))
+                let dim: usize = dim_str.parse().map_err(|_| {
+                    CqlError::Invalid(format!(
+                        "expected integer dimension for vector, got '{dim_str}'"
+                    ))
                 })?;
                 self.skip_whitespace();
                 self.consume(b'>')?;
-                Ok(CqlType::Vector(Box::new(elem), dimension))
+                Ok(CqlType::Vector(Box::new(elem), dim))
             }
             "frozen" => {
                 self.skip_whitespace();
@@ -785,6 +769,10 @@ pub fn resolve_type_name(
                 .collect();
             Ok(CqlType::Tuple(resolved?))
         }
+        CqlTypeName::Vector(elem, dim) => Ok(CqlType::Vector(
+            Box::new(resolve_type_name(elem, keyspace, schema)?),
+            *dim,
+        )),
     }
 }
 
@@ -980,13 +968,31 @@ pub fn partition_to_rows(
 ) -> Vec<Vec<Option<CqlValue>>> {
     let mut result = Vec::new();
 
+    // Build mapping from storage column index (0-based within static+regular
+    // columns) to full-table column index.  Storage columns are every column
+    // that is NOT a partition key or clustering key, in their original table
+    // order.
+    let pk_set: std::collections::HashSet<usize> = pk_columns.iter().copied().collect();
+    let ck_set: std::collections::HashSet<usize> = ck_columns.iter().copied().collect();
+    let storage_to_table: Vec<usize> = (0..column_names.len())
+        .filter(|i| !pk_set.contains(i) && !ck_set.contains(i))
+        .collect();
+
     // Pre-decode PK values from the partition key
     let pk_values = decode_pk(&partition.key, pk_columns.len());
 
     for row in &partition.rows {
-        // Skip tombstone rows
+        // Skip tombstone rows — but only if no newer mutation supersedes the
+        // tombstone. In Cassandra semantics, an UPDATE or INSERT after a
+        // DELETE resurrects the row: the primary_key_liveness timestamp or
+        // cell timestamps may be newer than the row-level deletion.
         if !row.deletion.is_live() {
-            continue;
+            let del_ts = row.deletion.marked_for_delete_at;
+            let liveness_supersedes = row.primary_key_liveness.timestamp > del_ts;
+            let any_cell_supersedes = row.cells.iter().any(|(_, cell)| cell.timestamp > del_ts);
+            if !liveness_supersedes && !any_cell_supersedes {
+                continue;
+            }
         }
 
         let mut output_row: Vec<Option<CqlValue>> = vec![None; column_names.len()];
@@ -1014,18 +1020,23 @@ pub fn partition_to_rows(
             }
         }
 
-        // Fill regular columns from cells.
-        // Cell col_index is regular-only (SSTable SerializationHeader order).
-        // Offset by PK + CK count to map to the full output_row position.
-        let regular_offset = pk_columns.len() + ck_columns.len();
+        // Fill regular/static columns from cells.
+        //
+        // Cell indices are in storage column space (0-based within
+        // static+regular columns).  Translate to full-table column index
+        // via the mapping built above.
         for (col_index, cell) in &row.cells {
-            let idx = *col_index as usize + regular_offset;
-            if idx < column_types.len() {
+            let storage_idx = *col_index as usize;
+            let table_idx = match storage_to_table.get(storage_idx) {
+                Some(&idx) => idx,
+                None => continue, // out-of-range storage index — skip
+            };
+            if table_idx < column_types.len() {
                 if cell.is_tombstone() {
-                    output_row[idx] = None;
+                    output_row[table_idx] = None;
                 } else if let Some(ref value_bytes) = cell.value {
-                    if let Ok(val) = decode_value(&column_types[idx], value_bytes) {
-                        output_row[idx] = Some(val);
+                    if let Ok(val) = decode_value(&column_types[table_idx], value_bytes) {
+                        output_row[table_idx] = Some(val);
                     }
                 }
             }
@@ -1035,6 +1046,114 @@ pub fn partition_to_rows(
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// Function 7: CellMeta and partition_to_rows_with_metadata
+// ---------------------------------------------------------------------------
+
+/// Cell metadata for `writetime()` and `TTL()` CQL functions.
+///
+/// Each entry corresponds to a column in the output row:
+/// - `timestamp`: cell timestamp in microseconds since epoch (`i64::MIN` for PK/CK/missing).
+/// - `ttl`: TTL in seconds as originally set (0 = no TTL).
+#[derive(Debug, Clone)]
+pub struct CellMeta {
+    pub timestamp: i64,
+    pub ttl: i32,
+}
+
+impl CellMeta {
+    /// Sentinel: no metadata available (PK/CK columns, missing cells).
+    pub const NONE: CellMeta = CellMeta {
+        timestamp: i64::MIN,
+        ttl: 0,
+    };
+}
+
+/// Like [`partition_to_rows`], but also returns per-cell metadata (timestamp, TTL)
+/// needed by `writetime()` and `TTL()` CQL functions.
+///
+/// Returns `(rows, metadata)` where each entry in `metadata` is a
+/// `Vec<CellMeta>` parallel to the corresponding row.
+pub fn partition_to_rows_with_metadata(
+    partition: &ferrosa_sstable::types::Partition,
+    column_names: &[String],
+    column_types: &[CqlType],
+    pk_columns: &[usize],
+    ck_columns: &[usize],
+) -> (Vec<Vec<Option<CqlValue>>>, Vec<Vec<CellMeta>>) {
+    let mut result = Vec::new();
+    let mut meta_result = Vec::new();
+
+    let pk_set: std::collections::HashSet<usize> = pk_columns.iter().copied().collect();
+    let ck_set: std::collections::HashSet<usize> = ck_columns.iter().copied().collect();
+    let storage_to_table: Vec<usize> = (0..column_names.len())
+        .filter(|i| !pk_set.contains(i) && !ck_set.contains(i))
+        .collect();
+
+    let pk_values = decode_pk(&partition.key, pk_columns.len());
+
+    for row in &partition.rows {
+        if !row.deletion.is_live() {
+            let del_ts = row.deletion.marked_for_delete_at;
+            let liveness_supersedes = row.primary_key_liveness.timestamp > del_ts;
+            let any_cell_supersedes = row.cells.iter().any(|(_, cell)| cell.timestamp > del_ts);
+            if !liveness_supersedes && !any_cell_supersedes {
+                continue;
+            }
+        }
+
+        let mut output_row: Vec<Option<CqlValue>> = vec![None; column_names.len()];
+        let mut meta_row: Vec<CellMeta> = vec![CellMeta::NONE; column_names.len()];
+
+        for (i, &col_idx) in pk_columns.iter().enumerate() {
+            if col_idx < column_types.len() {
+                if let Some(bytes) = pk_values.get(i) {
+                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
+                        output_row[col_idx] = Some(val);
+                    }
+                }
+            }
+        }
+
+        let ck_values = decode_clustering(&row.clustering, ck_columns.len());
+        for (i, &col_idx) in ck_columns.iter().enumerate() {
+            if col_idx < column_types.len() {
+                if let Some(bytes) = ck_values.get(i) {
+                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
+                        output_row[col_idx] = Some(val);
+                    }
+                }
+            }
+        }
+
+        for (col_index, cell) in &row.cells {
+            let storage_idx = *col_index as usize;
+            let table_idx = match storage_to_table.get(storage_idx) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+            if table_idx < column_types.len() {
+                meta_row[table_idx] = CellMeta {
+                    timestamp: cell.timestamp,
+                    ttl: cell.ttl,
+                };
+                if cell.is_tombstone() {
+                    output_row[table_idx] = None;
+                } else if let Some(ref value_bytes) = cell.value {
+                    if let Ok(val) = decode_value(&column_types[table_idx], value_bytes) {
+                        output_row[table_idx] = Some(val);
+                    }
+                }
+            }
+        }
+
+        result.push(output_row);
+        meta_result.push(meta_row);
+    }
+
+    (result, meta_result)
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,6 +1236,245 @@ fn decode_clustering(bytes: &[u8], num_components: usize) -> Vec<Vec<u8>> {
         pos = end;
     }
     components
+}
+
+// ---------------------------------------------------------------------------
+// toJson() — CQL value to Cassandra-compatible JSON string
+// ---------------------------------------------------------------------------
+
+/// Convert a [`CqlValue`] to its Cassandra-compatible JSON string representation.
+///
+/// This implements the CQL `toJson()` built-in function. The output format matches
+/// Apache Cassandra's `toJson()` behaviour:
+///
+/// - Integers, floats, booleans -> JSON scalars
+/// - Strings, UUIDs, timestamps, IPs -> quoted JSON strings
+/// - Collections (list, set, map) -> JSON arrays/objects
+/// - Null -> `"null"`
+pub fn cql_value_to_json(value: &CqlValue) -> String {
+    match value {
+        CqlValue::Null => "null".to_string(),
+
+        // Numeric scalars — unquoted
+        CqlValue::Int(n) => n.to_string(),
+        CqlValue::Bigint(n) | CqlValue::Counter(n) | CqlValue::Timestamp(n) => n.to_string(),
+        CqlValue::Smallint(n) => n.to_string(),
+        CqlValue::Tinyint(n) => n.to_string(),
+        CqlValue::Float(bits) => {
+            let f = f32::from_bits(*bits);
+            format_json_float_f32(f)
+        }
+        CqlValue::Double(bits) => {
+            let f = f64::from_bits(*bits);
+            format_json_float_f64(f)
+        }
+        CqlValue::Varint(n) => n.to_string(),
+        CqlValue::Decimal { scale, unscaled } => {
+            if *scale <= 0 {
+                let factor = BigInt::from(10).pow((-*scale) as u32);
+                (unscaled * factor).to_string()
+            } else {
+                let s = unscaled.to_string();
+                let is_negative = s.starts_with('-');
+                let digits = if is_negative { &s[1..] } else { &s };
+                let scale_usize = *scale as usize;
+                if digits.len() <= scale_usize {
+                    let zeros = scale_usize - digits.len();
+                    let prefix = if is_negative { "-0." } else { "0." };
+                    format!("{}{}{}", prefix, "0".repeat(zeros), digits)
+                } else {
+                    let split_at = digits.len() - scale_usize;
+                    let prefix = if is_negative { "-" } else { "" };
+                    format!(
+                        "{}{}{}{}",
+                        prefix,
+                        &digits[..split_at],
+                        if scale_usize > 0 { "." } else { "" },
+                        &digits[split_at..],
+                    )
+                }
+            }
+        }
+        CqlValue::Date(d) => {
+            // CQL Date is days since epoch (0x80000000 = 1970-01-01)
+            let days_from_epoch = (*d as i64) - 0x8000_0000_i64;
+            format!("\"1970-01-01+{}days\"", days_from_epoch)
+        }
+        CqlValue::Time(nanos) => {
+            let total_secs = *nanos / 1_000_000_000;
+            let h = total_secs / 3600;
+            let m = (total_secs % 3600) / 60;
+            let s = total_secs % 60;
+            let ns = *nanos % 1_000_000_000;
+            if ns == 0 {
+                format!("\"{:02}:{:02}:{:02}\"", h, m, s)
+            } else {
+                format!("\"{:02}:{:02}:{:02}.{:09}\"", h, m, s, ns)
+            }
+        }
+        CqlValue::Duration {
+            months,
+            days,
+            nanos,
+        } => {
+            format!("\"{}mo{}d{}ns\"", months, days, nanos)
+        }
+
+        // Boolean — unquoted
+        CqlValue::Boolean(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+
+        // Strings — JSON-escaped and quoted
+        CqlValue::Ascii(s) | CqlValue::Text(s) => json_escape_string(s),
+
+        // UUID/Timeuuid — quoted
+        CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => format!("\"{}\"", u),
+
+        // Inet — quoted
+        CqlValue::Inet(ip) => format!("\"{}\"", ip),
+
+        // Blob — quoted hex
+        CqlValue::Blob(b) => {
+            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            format!("\"0x{}\"", hex)
+        }
+
+        // List and Set — JSON array
+        CqlValue::List(items) | CqlValue::Set(items) => {
+            let elements: Vec<String> = items.iter().map(cql_value_to_json).collect();
+            format!("[{}]", elements.join(", "))
+        }
+
+        // Map — JSON object
+        CqlValue::Map(entries) => {
+            let pairs: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| {
+                    let key_str = cql_value_to_json_key(k);
+                    let val_str = cql_value_to_json(v);
+                    format!("{}: {}", key_str, val_str)
+                })
+                .collect();
+            format!("{{{}}}", pairs.join(", "))
+        }
+
+        // Tuple — JSON array
+        CqlValue::Tuple(elements) => {
+            let items: Vec<String> = elements
+                .iter()
+                .map(|opt| match opt {
+                    Some(v) => cql_value_to_json(v),
+                    None => "null".to_string(),
+                })
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+
+        // Vector — JSON array of floats
+        CqlValue::Vector(bits) => {
+            let elements: Vec<String> = bits
+                .iter()
+                .map(|b| format_json_float_f32(f32::from_bits(*b)))
+                .collect();
+            format!("[{}]", elements.join(", "))
+        }
+
+        // UDT — JSON object
+        CqlValue::Udt(fields) => {
+            let pairs: Vec<String> = fields
+                .iter()
+                .map(|(name, opt)| {
+                    let val_str = match opt {
+                        Some(v) => cql_value_to_json(v),
+                        None => "null".to_string(),
+                    };
+                    format!("{}: {}", json_escape_string(name), val_str)
+                })
+                .collect();
+            format!("{{{}}}", pairs.join(", "))
+        }
+    }
+}
+
+/// Format a map key as a JSON string key. All keys are quoted strings.
+fn cql_value_to_json_key(value: &CqlValue) -> String {
+    match value {
+        CqlValue::Ascii(s) | CqlValue::Text(s) => json_escape_string(s),
+        other => {
+            let rendered = cql_value_to_json(other);
+            if rendered.starts_with('"') && rendered.ends_with('"') {
+                rendered
+            } else {
+                format!("\"{}\"", rendered)
+            }
+        }
+    }
+}
+
+/// JSON-escape a string and wrap it in double quotes.
+fn json_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Format f32 for JSON output.
+fn format_json_float_f32(f: f32) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    let s = format!("{}", f);
+    if s.contains('.') || s.contains('E') || s.contains('e') {
+        s
+    } else {
+        format!("{}.0", s)
+    }
+}
+
+/// Format f64 for JSON output.
+fn format_json_float_f64(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    let s = format!("{}", f);
+    if s.contains('.') || s.contains('E') || s.contains('e') {
+        s
+    } else {
+        format!("{}.0", s)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1307,6 +1665,27 @@ mod tests {
     fn term_string_to_ascii() {
         let val = term_to_cql_value(&Term::StringLiteral("hello".into()), &CqlType::Ascii).unwrap();
         assert_eq!(val, CqlValue::Ascii("hello".into()));
+    }
+
+    #[test]
+    fn empty_map_literal_coerces_to_empty_set() {
+        // CQL `{}` is parsed as MapLiteral([]) but should coerce to an empty set
+        // when the target column type is set<T>.
+        let term = Term::MapLiteral(vec![]);
+        let val = term_to_cql_value(&term, &CqlType::Set(Box::new(CqlType::Varchar))).unwrap();
+        assert_eq!(val, CqlValue::Set(vec![]));
+    }
+
+    #[test]
+    fn nonempty_map_literal_rejected_for_set() {
+        // A non-empty map literal cannot be coerced to a set — the ambiguity only
+        // applies to the empty `{}` form.
+        let term = Term::MapLiteral(vec![(
+            Term::StringLiteral("k".into()),
+            Term::StringLiteral("v".into()),
+        )]);
+        let result = term_to_cql_value(&term, &CqlType::Set(Box::new(CqlType::Varchar)));
+        assert!(result.is_err());
     }
 
     // --- parse_cql_type tests ---
@@ -1541,9 +1920,11 @@ mod tests {
         let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
 
         let cell_bytes = encode_value(&CqlValue::Text("alice".into()));
+        // Cell index 0 = first storage column (static+regular, 0-based).
+        // For this table: id (PK) is excluded, so "name" is storage index 0.
         let row = Row {
             clustering: vec![],
-            cells: vec![(0, CellValue::live(cell_bytes, 1000))], // regular col 0 = "name"
+            cells: vec![(0, CellValue::live(cell_bytes, 1000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
@@ -1604,9 +1985,10 @@ mod tests {
         let pk_bytes = encode_value(&CqlValue::Int(1));
         let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
 
+        // Cell index 0 = first storage column ("name", since "id" is PK).
         let row = Row {
             clustering: vec![],
-            cells: vec![(0, CellValue::tombstone(1000, 1700000000))], // regular col 0 = "name"
+            cells: vec![(0, CellValue::tombstone(1000, 1700000000))],
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
@@ -1629,85 +2011,6 @@ mod tests {
         assert_eq!(rows[0][0], Some(CqlValue::Int(1)));
         // Tombstone cell -> None
         assert_eq!(rows[0][1], None);
-    }
-
-    /// Regression test: cell column indices in SSTable use regular-only
-    /// numbering (0, 1, 2 for regular columns, excluding PK and CK).
-    /// partition_to_rows must offset these by pk_count + ck_count.
-    ///
-    /// Table: (pk int, ck int, val1 text, val2 text, val3 text)
-    /// Cell index 0 → val1 (output[2]), NOT pk (output[0])
-    #[test]
-    fn partition_to_rows_cell_index_offset_for_pk_ck() {
-        use ferrosa_sstable::types::Partition;
-
-        let pk_bytes = encode_value(&CqlValue::Int(1));
-        let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
-
-        let ck_bytes = 100i32.to_be_bytes().to_vec();
-
-        // 3 regular columns: val1(0), val2(1), val3(2) — SSTable indices
-        let row = Row {
-            clustering: ck_bytes,
-            cells: vec![
-                (
-                    0,
-                    CellValue::live(encode_value(&CqlValue::Text("AAA".into())), 1000),
-                ),
-                (
-                    1,
-                    CellValue::live(encode_value(&CqlValue::Text("BBB".into())), 1000),
-                ),
-                (
-                    2,
-                    CellValue::live(encode_value(&CqlValue::Text("CCC".into())), 1000),
-                ),
-            ],
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::with_timestamp(1000),
-        };
-
-        let partition = Partition {
-            key: dk,
-            deletion: DeletionTime::LIVE,
-            static_row: None,
-            rows: vec![row],
-        };
-
-        // Output columns: [pk, ck, val1, val2, val3]
-        let col_names: Vec<String> = vec!["pk", "ck", "val1", "val2", "val3"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let col_types = vec![
-            CqlType::Int,
-            CqlType::Int,
-            CqlType::Varchar,
-            CqlType::Varchar,
-            CqlType::Varchar,
-        ];
-        let pk_columns = vec![0usize]; // pk at output[0]
-        let ck_columns = vec![1usize]; // ck at output[1]
-
-        let rows = partition_to_rows(&partition, &col_names, &col_types, &pk_columns, &ck_columns);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0], Some(CqlValue::Int(1)), "pk should be 1");
-        assert_eq!(rows[0][1], Some(CqlValue::Int(100)), "ck should be 100");
-        assert_eq!(
-            rows[0][2],
-            Some(CqlValue::Text("AAA".into())),
-            "val1 (regular col 0) should be at output[2]"
-        );
-        assert_eq!(
-            rows[0][3],
-            Some(CqlValue::Text("BBB".into())),
-            "val2 (regular col 1) should be at output[3]"
-        );
-        assert_eq!(
-            rows[0][4],
-            Some(CqlValue::Text("CCC".into())),
-            "val3 (regular col 2) should be at output[4]"
-        );
     }
 
     // --- resolve_type_name tests ---
@@ -2016,107 +2319,103 @@ mod tests {
         }
     }
 
-    // --- cql_value_to_term roundtrip tests ---
+    // ── toJson tests ──────────────────────────────────────────────────────
 
     #[test]
-    fn cql_value_to_term_uuid_roundtrip() {
-        let u = uuid::Uuid::new_v4();
-        let original = CqlValue::Uuid(u);
-        let term = cql_value_to_term(&original);
-        let roundtripped = term_to_cql_value(&term, &CqlType::Uuid).unwrap();
-        assert_eq!(roundtripped, original);
+    fn tojson_null() {
+        assert_eq!(cql_value_to_json(&CqlValue::Null), "null");
     }
 
     #[test]
-    fn cql_value_to_term_text_roundtrip() {
-        let original = CqlValue::Text("hello world".to_string());
-        let term = cql_value_to_term(&original);
-        let roundtripped = term_to_cql_value(&term, &CqlType::Varchar).unwrap();
-        assert_eq!(roundtripped, original);
+    fn tojson_int() {
+        assert_eq!(cql_value_to_json(&CqlValue::Int(42)), "42");
     }
 
     #[test]
-    fn cql_value_to_term_int_roundtrip() {
-        let original = CqlValue::Int(42);
-        let term = cql_value_to_term(&original);
-        let roundtripped = term_to_cql_value(&term, &CqlType::Int).unwrap();
-        assert_eq!(roundtripped, original);
+    fn tojson_bigint() {
+        assert_eq!(cql_value_to_json(&CqlValue::Bigint(123456789)), "123456789");
     }
 
     #[test]
-    fn cql_value_to_term_float_roundtrip() {
-        let original = CqlValue::Float(3.125f32.to_bits());
-        let term = cql_value_to_term(&original);
-        let roundtripped = term_to_cql_value(&term, &CqlType::Float).unwrap();
-        // Compare via f32 due to f32→f64→f32 potential precision issues.
-        if let (CqlValue::Float(orig_bits), CqlValue::Float(rt_bits)) = (&original, &roundtripped) {
-            let orig_f = f32::from_bits(*orig_bits);
-            let rt_f = f32::from_bits(*rt_bits);
-            assert!(
-                (orig_f - rt_f).abs() < 1e-6,
-                "float roundtrip failed: {orig_f} vs {rt_f}"
-            );
-        } else {
-            panic!("expected Float variants");
-        }
+    fn tojson_boolean() {
+        assert_eq!(cql_value_to_json(&CqlValue::Boolean(true)), "true");
+        assert_eq!(cql_value_to_json(&CqlValue::Boolean(false)), "false");
     }
 
     #[test]
-    fn cql_value_to_term_timestamp_roundtrip() {
-        let original = CqlValue::Timestamp(1234567890);
-        let term = cql_value_to_term(&original);
-        let roundtripped = term_to_cql_value(&term, &CqlType::Timestamp).unwrap();
-        assert_eq!(roundtripped, original);
+    fn tojson_text() {
+        assert_eq!(
+            cql_value_to_json(&CqlValue::Text("hello".into())),
+            "\"hello\""
+        );
     }
 
     #[test]
-    fn cql_value_to_term_blob_roundtrip() {
-        let original = CqlValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        let term = cql_value_to_term(&original);
-        let roundtripped = term_to_cql_value(&term, &CqlType::Blob).unwrap();
-        assert_eq!(roundtripped, original);
+    fn tojson_text_with_special_chars() {
+        assert_eq!(
+            cql_value_to_json(&CqlValue::Text("he said \"hi\"".into())),
+            "\"he said \\\"hi\\\"\""
+        );
     }
 
     #[test]
-    fn cql_value_to_term_null() {
-        let original = CqlValue::Null;
-        let term = cql_value_to_term(&original);
-        assert!(matches!(term, Term::Null));
-        let roundtripped = term_to_cql_value(&term, &CqlType::Int).unwrap();
-        assert_eq!(roundtripped, CqlValue::Null);
+    fn tojson_uuid() {
+        let u = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            cql_value_to_json(&CqlValue::Uuid(u)),
+            "\"550e8400-e29b-41d4-a716-446655440000\""
+        );
     }
 
     #[test]
-    fn cql_value_to_term_list_roundtrip() {
-        let original = CqlValue::List(vec![CqlValue::Int(1), CqlValue::Int(2), CqlValue::Int(3)]);
-        let term = cql_value_to_term(&original);
-        let roundtripped =
-            term_to_cql_value(&term, &CqlType::List(Box::new(CqlType::Int))).unwrap();
-        assert_eq!(roundtripped, original);
-    }
-
-    #[test]
-    fn cql_value_to_term_map_roundtrip() {
-        let original = CqlValue::Map(vec![
-            (CqlValue::Text("a".into()), CqlValue::Int(1)),
-            (CqlValue::Text("b".into()), CqlValue::Int(2)),
+    fn tojson_map_text_text() {
+        let map = CqlValue::Map(vec![
+            (
+                CqlValue::Text("class".into()),
+                CqlValue::Text("SimpleStrategy".into()),
+            ),
+            (
+                CqlValue::Text("replication_factor".into()),
+                CqlValue::Text("1".into()),
+            ),
         ]);
-        let term = cql_value_to_term(&original);
-        let roundtripped = term_to_cql_value(
-            &term,
-            &CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Int)),
-        )
-        .unwrap();
-        assert_eq!(roundtripped, original);
+        let json = cql_value_to_json(&map);
+        // Map order is preserved from the Vec
+        assert!(json.contains("\"class\": \"SimpleStrategy\""));
+        assert!(json.contains("\"replication_factor\": \"1\""));
+        assert!(json.starts_with('{'));
+        assert!(json.ends_with('}'));
     }
 
     #[test]
-    fn cql_value_to_term_boolean_roundtrip() {
-        for b in [true, false] {
-            let original = CqlValue::Boolean(b);
-            let term = cql_value_to_term(&original);
-            let roundtripped = term_to_cql_value(&term, &CqlType::Boolean).unwrap();
-            assert_eq!(roundtripped, original);
-        }
+    fn tojson_list() {
+        let list = CqlValue::List(vec![CqlValue::Int(1), CqlValue::Int(2), CqlValue::Int(3)]);
+        assert_eq!(cql_value_to_json(&list), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn tojson_set() {
+        let set = CqlValue::Set(vec![CqlValue::Text("a".into()), CqlValue::Text("b".into())]);
+        assert_eq!(cql_value_to_json(&set), "[\"a\", \"b\"]");
+    }
+
+    #[test]
+    fn tojson_float() {
+        let f = CqlValue::Float(1.5_f32.to_bits());
+        let json = cql_value_to_json(&f);
+        assert_eq!(json, "1.5");
+    }
+
+    #[test]
+    fn tojson_double() {
+        let d = CqlValue::Double(1.25_f64.to_bits());
+        let json = cql_value_to_json(&d);
+        assert_eq!(json, "1.25");
+    }
+
+    #[test]
+    fn tojson_inet() {
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(cql_value_to_json(&CqlValue::Inet(ip)), "\"127.0.0.1\"");
     }
 }

@@ -113,14 +113,25 @@ fn error_to_response(err: &GraphError) -> Response {
 
 /// Auth middleware (T2): extract Basic auth header, decode, authenticate.
 ///
-/// Injects `AuthContext` as a request extension on success.
+/// Injects `AuthContext` as a request extension on success. When
+/// `auth_disabled` is set (e.g. FERROSA_AUTH_DISABLED=true), the
+/// middleware injects a default superuser context and skips
+/// credential validation.
 async fn auth_middleware(
     State(state): State<AppState>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // Graph HTTP endpoints always require auth -- FERROSA_AUTH_DISABLED applies
-    // to CQL protocol auth only, not graph HTTP endpoints.
+    // When auth is disabled, inject a default superuser context and skip
+    // credential validation — same behaviour as the CQL protocol path.
+    if state.auth_disabled {
+        req.extensions_mut().insert(AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        });
+        return next.run(req).await;
+    }
 
     let auth_header = req
         .headers()
@@ -605,7 +616,11 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state.clone());
 
     // Health check does not require auth.
-    let health = Router::new().route("/graph/health", get(handle_health));
+    // /graph/health is the canonical path; /health is an alias for convenience
+    // (e.g. load-balancer probes that hit the root path prefix).
+    let health = Router::new()
+        .route("/graph/health", get(handle_health))
+        .route("/health", get(handle_health));
 
     Router::new().merge(authenticated).merge(health)
 }

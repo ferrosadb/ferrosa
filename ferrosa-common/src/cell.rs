@@ -35,7 +35,7 @@ pub const NO_DELETION_TIME: i32 = i32::MAX;
 /// - **Live**: has a value and timestamp, no expiration
 /// - **Expiring**: has a value, timestamp, TTL, and deletion time
 /// - **Tombstone**: no value, marks deletion at a specific timestamp
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CellValue {
     /// The cell's bytes. `None` for tombstones.
     pub value: Option<Vec<u8>>,

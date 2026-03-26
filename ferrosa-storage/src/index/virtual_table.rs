@@ -104,7 +104,7 @@ impl VirtualTable for SecondaryIndexesVirtualTable {
     }
 
     fn keyspace(&self) -> &str {
-        "system_views"
+        "system_observability"
     }
 
     fn columns(&self) -> &[VirtualColumnDef] {
@@ -293,7 +293,7 @@ mod tests {
         let tracker = Arc::new(IndexStateTracker::new());
         let table = SecondaryIndexesVirtualTable::new(tracker);
         assert_eq!(table.name(), "secondary_indexes");
-        assert_eq!(table.keyspace(), "system_views");
+        assert_eq!(table.keyspace(), "system_observability");
         assert_eq!(table.primary_key_columns(), &[0, 1, 2]);
         assert!(matches!(table.subscription_mode(), SubscriptionMode::None));
     }

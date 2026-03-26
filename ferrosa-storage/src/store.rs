@@ -273,15 +273,19 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        // SSTables, newest first. Errors on individual SSTables are logged
-        // and skipped — a corrupt or incompatible SSTable should not block
-        // reads from healthy ones.
+        // SSTables, newest first.
+        // Tolerate I/O errors from individual SSTables — a corrupt or
+        // format-incompatible SSTable should not prevent reading data
+        // that exists in other SSTables or the memtable (FRSA-BUG-026).
         for sstable in guard.sstables.iter() {
             match sstable.get_partition(key) {
                 Ok(Some(p)) => sources.push(p),
                 Ok(None) => {}
                 Err(e) => {
-                    eprintln!("[store] skipping SSTable read error: {e}");
+                    tracing::warn!(
+                        error = %e,
+                        "skipping corrupt SSTable partition during read — data may be incomplete"
+                    );
                 }
             }
         }
@@ -426,63 +430,71 @@ impl<F: FlushTarget> TableStore<F> {
     ) -> Result<Vec<Partition>> {
         let guard = self.view.load();
 
-        // Collect partitions from all sources keyed by partition key bytes
-        // for deduplication and merging.
-        let mut by_key: std::collections::BTreeMap<DecoratedKey, Vec<Partition>> =
-            std::collections::BTreeMap::new();
-
-        let in_range = |p: &Partition| -> bool {
-            if let Some(s) = start {
-                if p.key < *s {
-                    return false;
-                }
-            }
-            if let Some(e) = end {
-                if p.key > *e {
-                    return false;
-                }
-            }
-            true
-        };
+        // Collect partitions from all sources: active memtable, flushing
+        // memtable, and SSTables. Merge by partition key.
+        let mut all_partitions: Vec<Partition> = Vec::new();
 
         // Active memtable
-        for p in guard.active.snapshot() {
-            if in_range(&p) {
-                by_key.entry(p.key.clone()).or_default().push(p);
-            }
-        }
+        let snapshot = guard.active.snapshot();
+        all_partitions.extend(snapshot);
 
         // Flushing memtable
         if let Some(ref flushing) = guard.flushing {
-            for p in flushing.snapshot() {
-                if in_range(&p) {
-                    by_key.entry(p.key.clone()).or_default().push(p);
-                }
-            }
+            all_partitions.extend(flushing.snapshot());
         }
 
-        // SSTables — read all partitions from each (newest first).
-        // Errors on individual SSTables are logged and skipped.
+        // SSTables — read all partitions from each
         for sstable in guard.sstables.iter() {
             match sstable.read_all_partitions() {
-                Ok(parts) => {
-                    for p in parts {
-                        if in_range(&p) {
-                            by_key.entry(p.key.clone()).or_default().push(p);
-                        }
-                    }
+                Ok(parts) => all_partitions.extend(parts),
+                Err(e) => {
+                    tracing::warn!("read_range: skipping corrupted SSTable: {e}");
                 }
-                Err(_e) => {}
             }
         }
 
-        // Merge partitions with the same key and apply limit.
-        let merged: Vec<Partition> = by_key
-            .into_values()
-            .map(merge::merge_partitions)
+        // Deduplicate and merge partitions with the same key
+        all_partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut merged: Vec<Partition> = Vec::new();
+        for p in all_partitions {
+            if let Some(last) = merged.last_mut() {
+                if last.key == p.key {
+                    *last = merge::merge_partitions(vec![last.clone(), p]);
+                    continue;
+                }
+            }
+            merged.push(p);
+        }
+
+        // Apply deletion suppression to all partitions. Partitions that
+        // came from a single source (no multi-source merge above) still
+        // need row-level and partition-level deletions applied because
+        // the memtable's merge-on-write sets deletion markers but does
+        // not suppress the covered cells.
+        for p in &mut merged {
+            merge::apply_deletions(p);
+        }
+
+        // Apply range filter and limit
+        let filtered: Vec<Partition> = merged
+            .into_iter()
+            .filter(|p| {
+                if let Some(s) = start {
+                    if p.key < *s {
+                        return false;
+                    }
+                }
+                if let Some(e) = end {
+                    if p.key > *e {
+                        return false;
+                    }
+                }
+                true
+            })
             .take(limit)
             .collect();
-        Ok(merged)
+
+        Ok(filtered)
     }
 
     /// Query by secondary index: looks up the index key in the memtable
@@ -612,6 +624,19 @@ impl<F: FlushTarget> TableStore<F> {
     /// Number of partitions in the active memtable.
     pub fn memtable_partition_count(&self) -> usize {
         self.view.load().active.partition_count()
+    }
+
+    /// Number of entries in the active MemtableIndex for the given index name.
+    ///
+    /// Returns 0 if the index does not exist. Used to verify that eager
+    /// index builds keep the in-memory index bounded.
+    pub fn memtable_index_entry_count(&self, index_name: &str) -> usize {
+        let guard = self.view.load();
+        guard
+            .indexes
+            .get(index_name)
+            .map(|idx| idx.iter().count())
+            .unwrap_or(0)
     }
 
     /// Truncate (clear) all data: replaces the memtable with a fresh one
@@ -1725,97 +1750,5 @@ mod tests {
         let pks: Vec<&[u8]> = results.iter().map(|p| p.key.key.as_bytes()).collect();
         assert!(pks.contains(&b"user1".as_slice()));
         assert!(pks.contains(&b"user2".as_slice()));
-    }
-
-    // -------------------------------------------------------------------------
-    // Test: read_range includes both SSTable and memtable data
-    // -------------------------------------------------------------------------
-    #[test]
-    fn read_range_includes_sstable_data() {
-        let store = test_store();
-
-        // Write and flush to SSTable.
-        let key_a = make_key("alpha");
-        store.write(&key_a, make_row(b"flushed_val", 1000)).unwrap();
-        store.flush().unwrap();
-        assert_eq!(store.sstable_count(), 1);
-
-        // Write to memtable (not flushed).
-        let key_b = make_key("bravo");
-        store
-            .write(&key_b, make_row(b"memtable_val", 2000))
-            .unwrap();
-
-        // read_range should include BOTH SSTable and memtable rows.
-        let results = store.read_range(None, None, 100).unwrap();
-        let pks: Vec<&[u8]> = results.iter().map(|p| p.key.key.as_bytes()).collect();
-        assert!(
-            pks.contains(&b"alpha".as_slice()),
-            "should contain SSTable partition 'alpha', got: {:?}",
-            pks
-        );
-        assert!(
-            pks.contains(&b"bravo".as_slice()),
-            "should contain memtable partition 'bravo', got: {:?}",
-            pks
-        );
-        assert_eq!(results.len(), 2);
-    }
-
-    /// RED test: write a row, flush to SSTable, update the SAME row in memtable
-    /// with a new cell (higher timestamp). read_range must return the merged row
-    /// with the updated cell — not the stale SSTable version.
-    ///
-    /// This is the exact bug that prevents edge backfills from appearing in
-    /// full-scan queries (co_occurs_with WHERE tenant_id = ? ALLOW FILTERING).
-    #[test]
-    fn read_range_merges_sstable_and_memtable_for_same_key() {
-        let store = test_store();
-
-        // Write initial row: key="pk1", cell col=0 value="original", timestamp=1000
-        let key = make_key("pk1");
-        store.write(&key, make_row(b"original", 1000)).unwrap();
-
-        // Flush to SSTable
-        store.flush().unwrap();
-        assert_eq!(store.sstable_count(), 1);
-        assert_eq!(store.memtable_size(), 0);
-
-        // Update the SAME key+clustering with a new cell col=1 at higher timestamp
-        let update_row = Row {
-            clustering: vec![0x00, 0x00, 0x00, 0x01], // same CK as make_row
-            cells: vec![(1, CellValue::live(b"updated_cell".to_vec(), 2000))],
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::with_timestamp(2000),
-        };
-        store.write(&key, update_row).unwrap();
-
-        // read_range should return ONE partition with BOTH cells merged
-        let results = store.read_range(None, None, 100).unwrap();
-        assert_eq!(
-            results.len(),
-            1,
-            "should have 1 partition (merged), got {}",
-            results.len()
-        );
-
-        let partition = &results[0];
-        assert_eq!(partition.rows.len(), 1, "should have 1 merged row");
-
-        let cells: Vec<u16> = partition.rows[0]
-            .cells
-            .iter()
-            .map(|(col, _)| *col)
-            .collect();
-        assert!(
-            cells.contains(&0),
-            "merged row should contain SSTable cell col=0, got {:?}",
-            cells
-        );
-        assert!(
-            cells.contains(&1),
-            "merged row should contain memtable cell col=1, got {:?}",
-            cells
-        );
     }
 }

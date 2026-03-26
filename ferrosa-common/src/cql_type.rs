@@ -42,8 +42,9 @@ pub enum CqlType {
         name: String,
         fields: Vec<(String, CqlType)>,
     },
-    /// Vector type (CQL v5): `vector<element_type, dimension>`.
-    Vector(Box<CqlType>, usize), // 0x0000 (Custom)
+    /// Vector type: element type + fixed dimension.
+    /// Cassandra encodes vectors as Custom type (0x0000) on the wire.
+    Vector(Box<CqlType>, usize),
 }
 
 impl CqlType {
@@ -136,8 +137,8 @@ pub enum CqlValue {
     Map(Vec<(CqlValue, CqlValue)>),
     /// Tuple -- fixed number of typed elements, some potentially null.
     Tuple(Vec<Option<CqlValue>>),
-    /// Vector of f32 values (Cassandra 5.0 vector<float, N>).
-    /// Stored as u32 bit patterns (like Float) so Eq can be derived.
+    /// Vector of f32 values (Cassandra 5.0 `vector<float, N>`).
+    /// Stored as u32 bit patterns (like Float) so `Eq` can be derived.
     Vector(Vec<u32>),
     /// User-Defined Type -- named fields, some potentially null.
     Udt(Vec<(String, Option<CqlValue>)>),

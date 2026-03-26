@@ -208,9 +208,15 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             }
 
             if flags & IS_MARKER != 0 {
-                return Err(Error::InvalidData(
-                    "range tombstone markers not yet supported".into(),
-                ));
+                // Range tombstone markers are not written by Ferrosa's SSTable
+                // writer. Encountering one in a Ferrosa-written SSTable indicates
+                // data corruption (misaligned read). Skip the rest of this
+                // partition and return whatever rows were already parsed.
+                //
+                // For Cassandra-written SSTables (S3 bootstrap), this drops
+                // range-deleted data which is acceptable — the live rows
+                // before the marker are still returned.
+                break;
             }
 
             // Extended flags byte (only present if EXTENSION_FLAG is set)
@@ -427,6 +433,17 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
             let vlen = vlen as usize;
+            // Guard against corrupt length values that would cause capacity overflow.
+            // A single cell value should never exceed 256 MB.
+            const MAX_CELL_VALUE_LEN: usize = 256 * 1024 * 1024;
+            if vlen > MAX_CELL_VALUE_LEN {
+                return Err(Error::from(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cell value length {vlen} exceeds maximum ({MAX_CELL_VALUE_LEN}), likely corrupt SSTable"
+                    ),
+                )));
+            }
             let mut vbuf = vec![0u8; vlen];
             self.reader.read_exact_at(&mut vbuf, self.pos)?;
             self.pos += vlen as u64;

@@ -1,6 +1,6 @@
 # Ferrosa Architecture Specs
 
-> Last updated: 2026-03-20
+> Last updated: 2026-03-22
 
 Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassandra with S3-backed storage.
 
@@ -8,16 +8,16 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 
 | Crate | Status |
 |-------|--------|
-| ferrosa-common | Done |
+| ferrosa-common | Done (+ Accord types: Timestamp/HLC, TxnId, Ballot) |
 | ferrosa-sstable | Done |
-| ferrosa-storage | Done (core engine + PITR + sidecar indexes + observers + virtual tables) |
+| ferrosa-storage | Done (core engine + PITR + sidecar indexes + observers + virtual tables + Accord storage) |
 | ferrosa-schema | Done (DDL, auth, audit, system KS, graph, virtual tables, UDT, index, BACKUP permission) |
-| ferrosa-cql | Done (Parts A-D + observability + compression + UDT/UDF DDL + EXPLAIN + query planner) |
+| ferrosa-cql | Done (Parts A-D + observability + compression + UDT/UDF DDL + EXPLAIN + query planner + LWT + transactions + pagination) |
 | ferrosa-index | Done (8 secondary index types + 2 vector index types: HNSW, IVFFlat) |
 | ferrosa-udf | Done (parser, schema, DDL replication, Wasmtime compilation, router wiring; wit-bindgen invoke TODO) |
 | ferrosa-graph | Done (eval, aggregations, var-length paths, SUBSCRIBE, leapfrog triejoin, Bolt v5, HTTP+auth) |
 | ferrosa-net | Done (Phase 1 + reconnection, graceful drain) |
-| ferrosa-cluster | Done (Phase 1-3 + UDT/index DDL replication) |
+| ferrosa-cluster | Done (Phase 1-3 + UDT/index DDL replication + Accord transactions A1-A7) |
 | ferrosa-ctl | Done (CLI + TUI + cluster management + snapshot/restore commands) |
 | ferrosa (binary) | Done (CQL 9042, graph HTTP 7474, Bolt 7687, web 9090, Prometheus, PITR REST API) |
 
@@ -31,8 +31,10 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [Data Flow](data-flow.md) | Write path, read path, compaction, S3 lifecycle | Approved |
 | [SSTable](sstable.md) | BTI format, trie encoding, I/O traits, compression, public API | Approved |
 | [Storage](storage.md) | Storage engine: memtable, flush, merge, commit log, compaction, S3 upload, cache, engine composition | Approved |
-| [Testing](testing.md) | Test infrastructure, suites, performance regression detection | Approved |
-| [CQL](cql.md) | CQL native protocol v5, parser, query routing, prepared cache | Approved |
+| [Testing](testing.md) | Test infrastructure, suites, Jepsen, performance regression detection | Approved |
+| [CQL](cql.md) | CQL native protocol v5, parser, query routing, LWT, transactions, pagination | Approved |
+| [Accord](accord.md) | Accord consensus protocol: state machine, coordinator, conflict detection, Jepsen tests | Implemented |
+| [Accord Project Plan](accord-project-plan.md) | 7-sprint plan (A1-A7): core types through electorate reconfiguration | Complete |
 | [Schema](schema.md) | Schema management: metadata types, registry, auth, system keyspaces | Approved |
 | [Threat Model](threat-model.md) | STRIDE threat analysis: trust boundaries, threat inventory, mitigations | Draft |
 | [Threat Model — CQL B/C](threat-model-cql-bc.md) | STRIDE for CQL parser, routing, prepared cache | Approved |
@@ -51,6 +53,12 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [PITR FMEA](pitr-fmea.md) | Failure modes for PITR (16 modes, 21 test cases) | Implemented |
 | [PITR Project Plan](pitr-project-plan.md) | 4-sprint plan: archiving, snapshots, restore, tooling | Complete |
 | [Combined Project Plan](project-plan-combined.md) | Parallel index + PITR workstreams, execution status | Complete |
+| [Accord Transactions](accord.md) | Accord architecture: component diagrams, data flow, integration map, ADRs | Draft |
+| [DSM — Accord](dsm-accord.md) | DSM dependency analysis for Accord integration (fan-in/out, propagation cost) | Draft |
+| [Threat Model — Accord](threat-model-accord.md) | STRIDE for Accord: 30 threats across 6 trust boundaries | Draft |
+| [FMEA — Accord](fmea-accord.md) | Failure modes for Accord (19 modes, 19 test cases, 3 critical) | Draft |
+| [Accord Project Plan](accord-project-plan.md) | 7-sprint plan: foundation, single-key, multi-key, 2i, electorates | Draft |
+| [Accord Test Spec](accord-test-spec.md) | 6-layer test pyramid: 97 tests from unit to 24-step capstone | Draft |
 | [Nightly Test Infrastructure](../superpowers/specs/2026-03-19-nightly-test-infrastructure-design.md) | Nightly test infrastructure design | Draft |
 | [Cluster Phase 2 Design](../superpowers/specs/2026-03-14-cluster-phase2-design.md) | Raft consensus, token ring, coordinator pattern | Implemented |
 

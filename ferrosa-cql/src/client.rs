@@ -314,6 +314,19 @@ fn skip_type_option(cursor: &mut &[u8]) -> Result<(), CqlError> {
                 skip_type_option(cursor)?;
             }
         }
+        // Custom (0x0000) — string class name (used for vector, etc.)
+        0x0000 => {
+            if cursor.len() < 2 {
+                return Err(CqlError::Protocol("truncated custom type".into()));
+            }
+            let len = cursor.get_u16() as usize;
+            if cursor.len() < len {
+                return Err(CqlError::Protocol(
+                    "truncated custom type class name".into(),
+                ));
+            }
+            cursor.advance(len);
+        }
         // UDT (0x0030) — keyspace + name + n fields
         0x0030 => {
             skip_short_string(cursor)?; // keyspace

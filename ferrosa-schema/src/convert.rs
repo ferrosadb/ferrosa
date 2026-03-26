@@ -114,6 +114,57 @@ impl TableMetadata {
     ///
     /// Maps partition key columns to a single `key_type` (or `CompositeType` for
     /// compound keys), and sorts clustering/static/regular columns by position.
+    /// Compute the storage-layer column index for a given column name.
+    ///
+    /// Storage column indices are 0-based within `[static_columns... regular_columns...]`,
+    /// matching the SSTable format. PK and CK columns are NOT included in this
+    /// index space — they are encoded separately in the partition key and
+    /// clustering key, respectively.
+    ///
+    /// Returns `None` if the column is not found, or is a PK/CK column.
+    pub fn storage_column_index(&self, col_name: &str) -> Option<u16> {
+        let col = self.columns.get(col_name)?;
+        match col.kind {
+            ColumnKind::PartitionKey | ColumnKind::Clustering => None,
+            ColumnKind::Static => {
+                // Static columns are indexed first. Count how many static
+                // columns (sorted by position) precede this one.
+                let mut static_cols: Vec<_> = self
+                    .columns
+                    .values()
+                    .filter(|c| c.kind == ColumnKind::Static)
+                    .collect();
+                static_cols.sort_by_key(|c| c.position);
+                static_cols
+                    .iter()
+                    .position(|c| c.name == col_name)
+                    .map(|p| p as u16)
+            }
+            ColumnKind::Regular => {
+                // Regular columns follow static columns.
+                let num_statics = self
+                    .columns
+                    .values()
+                    .filter(|c| c.kind == ColumnKind::Static)
+                    .count();
+                let mut regulars: Vec<_> = self
+                    .columns
+                    .values()
+                    .filter(|c| c.kind == ColumnKind::Regular)
+                    .collect();
+                regulars.sort_by_key(|c| c.position);
+                regulars
+                    .iter()
+                    .position(|c| c.name == col_name)
+                    .map(|p| (num_statics + p) as u16)
+            }
+        }
+    }
+
+    /// Convert this table metadata to a `TableSchema` suitable for the storage layer.
+    ///
+    /// Maps partition key columns to a single `key_type` (or `CompositeType` for
+    /// compound keys), and sorts clustering/static/regular columns by position.
     pub fn to_storage_schema(&self) -> TableSchema {
         // Build key_type
         let key_type = if self.partition_key.len() == 1 {

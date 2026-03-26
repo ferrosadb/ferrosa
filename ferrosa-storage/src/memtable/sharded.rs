@@ -190,6 +190,11 @@ pub(crate) fn merge_row_into_partition(partition: &mut Partition, new_row: Row) 
             // Row with same clustering key exists — merge cells
             let existing_row = &mut partition.rows[idx];
 
+            // Update row-level deletion: newer tombstone wins (LWW).
+            if new_row.deletion.marked_for_delete_at > existing_row.deletion.marked_for_delete_at {
+                existing_row.deletion = new_row.deletion;
+            }
+
             // Update primary key liveness to the newer timestamp
             if new_row.primary_key_liveness.timestamp > existing_row.primary_key_liveness.timestamp
             {

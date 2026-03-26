@@ -57,12 +57,13 @@ const DELETION_IS_LIVE: u8 = 0x80;
 /// Cell is a tombstone (deleted).
 const CELL_IS_DELETED: u8 = 0x01;
 /// Cell is expiring (has TTL).
-#[allow(dead_code)]
 const CELL_IS_EXPIRING: u8 = 0x02;
 /// Cell has an empty value.
 const CELL_HAS_EMPTY_VALUE: u8 = 0x04;
 /// Cell inherits the row-level timestamp (no per-cell timestamp encoded).
 const CELL_USE_ROW_TIMESTAMP: u8 = 0x08;
+/// Cell inherits the row-level TTL and local deletion time.
+const CELL_USE_ROW_TTL: u8 = 0x10;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -304,17 +305,21 @@ impl SSTableWriter {
         if !is_static {
             push_unsigned_vint_to(&mut self.data_buf, 0); // header: all non-null, non-empty
 
-            // For single clustering column, the entire clustering blob is the value
-            if self.header.clustering_types.len() == 1 {
+            let num_ck = self.header.clustering_types.len();
+            if num_ck == 1 {
+                // Single clustering column: write value directly (fixed-length)
+                // or with a length prefix (variable-length).
                 let type_name = &self.header.clustering_types[0];
                 if crate::marshal::value_length_if_fixed(type_name).is_none() {
                     push_unsigned_vint_to(&mut self.data_buf, row.clustering.len() as u64);
                 }
-            } else {
+                self.data_buf.extend_from_slice(&row.clustering);
+            } else if num_ck > 1 {
                 // Multi-column: treat as single variable-length blob (simplified)
                 push_unsigned_vint_to(&mut self.data_buf, row.clustering.len() as u64);
+                self.data_buf.extend_from_slice(&row.clustering);
             }
-            self.data_buf.extend_from_slice(&row.clustering);
+            // num_ck == 0: no clustering columns — header varint only, no data.
         }
 
         // Serialize the row body to a temporary buffer to compute its size.
@@ -501,19 +506,32 @@ fn serialize_cell(
     header: &SerializationHeader,
 ) {
     let is_tombstone = cell.is_tombstone();
+    let is_expiring = !is_tombstone
+        && cell.ttl != ferrosa_common::NO_TTL
+        && cell.local_deletion_time != ferrosa_common::NO_DELETION_TIME;
     let has_empty_value = cell.value.is_none() || (is_tombstone && cell.value.is_none());
     let use_row_timestamp = row.primary_key_liveness.has_timestamp()
         && cell.timestamp == row.primary_key_liveness.timestamp;
+    let use_row_ttl = is_expiring
+        && row.primary_key_liveness.ttl != ferrosa_common::NO_TTL
+        && cell.ttl == row.primary_key_liveness.ttl
+        && cell.local_deletion_time == row.primary_key_liveness.local_deletion_time;
 
     let mut cell_flags: u8 = 0;
     if is_tombstone {
         cell_flags |= CELL_IS_DELETED;
+    }
+    if is_expiring {
+        cell_flags |= CELL_IS_EXPIRING;
     }
     if has_empty_value {
         cell_flags |= CELL_HAS_EMPTY_VALUE;
     }
     if use_row_timestamp {
         cell_flags |= CELL_USE_ROW_TIMESTAMP;
+    }
+    if use_row_ttl {
+        cell_flags |= CELL_USE_ROW_TTL;
     }
     buf.push(cell_flags);
 
@@ -523,11 +541,17 @@ fn serialize_cell(
         push_unsigned_vint_to(buf, ts_delta);
     }
 
-    // Local deletion time (unsigned varint delta, for tombstones)
-    if is_tombstone {
+    // Local deletion time (unsigned varint delta, for tombstones and expiring cells)
+    if !use_row_ttl && (is_tombstone || is_expiring) {
         let ldt_delta =
             (cell.local_deletion_time as i64 - header.min_local_deletion_time as i64) as u64;
         push_unsigned_vint_to(buf, ldt_delta);
+    }
+
+    // TTL (unsigned varint delta, for expiring cells only)
+    if is_expiring && !use_row_ttl {
+        let ttl_delta = (cell.ttl - header.min_ttl) as u64;
+        push_unsigned_vint_to(buf, ttl_delta);
     }
 
     // Value (absent if HAS_EMPTY_VALUE)
@@ -640,6 +664,341 @@ mod tests {
 
         // No more partitions
         assert!(reader.read_partition().unwrap().is_none());
+    }
+
+    /// Large cell values (100KB+) must survive a write-read roundtrip.
+    /// This is a P0 regression test: embedding hex-encoded WASM binaries
+    /// (~160KB) as CQL function bodies corrupted the SSTable data file,
+    /// causing subsequent reads to fail with "read_exact_at: wanted N
+    /// bytes, got M" or "range tombstone markers not yet supported".
+    #[test]
+    fn write_large_cell_value_roundtrip() {
+        let header = test_header();
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        // 100KB value — larger than a typical SSTable chunk.
+        let large_value: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let timestamp = 1_000_042i64;
+        let partition = make_partition(
+            b"pk_large",
+            &[0x00, 0x00, 0x00, 0x01],
+            &large_value,
+            timestamp,
+        );
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        // Read back — must not corrupt or error.
+        let mut reader = DataReader::new(&output.data, &header, 0);
+        let read_partition = reader
+            .read_partition()
+            .unwrap()
+            .expect("expected partition with large cell");
+
+        assert_eq!(read_partition.key.key.as_bytes(), b"pk_large");
+        assert_eq!(read_partition.rows.len(), 1);
+        let (_, ref cell) = read_partition.rows[0].cells[0];
+        assert_eq!(
+            cell.value.as_deref().unwrap().len(),
+            100_000,
+            "large value should survive roundtrip"
+        );
+        assert_eq!(cell.value.as_deref().unwrap(), large_value.as_slice());
+    }
+
+    /// Exact production scenario: memo_cache with composite text PK,
+    /// UUID clustering, and multiple regular columns including text + bigint.
+    /// Corruption happens with longer model_version (15 chars) but not
+    /// shorter (7 chars). Tests both at the SSTable write/read level.
+    #[test]
+    fn composite_text_pk_uuid_clustering_roundtrip() {
+        // Header matching memo_cache: CompositeType(UTF8,UTF8) PK, UUID clustering
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.UTF8Type)".into(),
+            clustering_types: vec![
+                "org.apache.cassandra.db.marshal.UUIDType".into(),
+            ],
+            static_columns: vec![],
+            regular_columns: vec![
+                (b"result".to_vec(), "org.apache.cassandra.db.marshal.UTF8Type".into()),
+                (b"hit_count".to_vec(), "org.apache.cassandra.db.marshal.LongType".into()),
+            ],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let timestamp = 1_000_042i64;
+
+        // Composite PK encoding: [u16 len][bytes][0x00] per component
+        fn make_composite_pk(part1: &str, part2: &str) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&(part1.len() as u16).to_be_bytes());
+            buf.extend_from_slice(part1.as_bytes());
+            buf.push(0x00);
+            buf.extend_from_slice(&(part2.len() as u16).to_be_bytes());
+            buf.extend_from_slice(part2.as_bytes());
+            buf.push(0x00);
+            buf
+        }
+
+        // Row 1: LONG model_version (15 chars) — this is the one that corrupts
+        let pk1 = make_composite_pk(
+            "cac0302657b4c1d0dfd5aec98f2754f46a42f117e53c77a9ba384ebf2095633a", // pragma: allowlist secret
+            "claude-opus-4-6",
+        );
+        let uuid1 = [0x11u8; 16]; // tenant_id UUID
+        let p1 = Partition {
+            key: DecoratedKey::new(PartitionKey::new(pk1.clone())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: uuid1.to_vec(),
+                cells: vec![
+                    (
+                        0,
+                        CellValue::live(b"The capital of France is Paris.".to_vec(), timestamp),
+                    ),
+                    (1, CellValue::live(0i64.to_be_bytes().to_vec(), timestamp)),
+                ],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        };
+
+        // Row 2: SHORT model_version (7 chars) — this one survives
+        let pk2 = make_composite_pk(
+            "4bbe47ee6bb1d0ecaa4d47fce3d99e2044cdfdbfac4dde0c0c083f97e4fad000", // pragma: allowlist secret
+            "test-v1",
+        );
+        let uuid2 = [0x22u8; 16];
+        let p2 = Partition {
+            key: DecoratedKey::new(PartitionKey::new(pk2.clone())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: uuid2.to_vec(),
+                cells: vec![
+                    (0, CellValue::live(b"4".to_vec(), timestamp)),
+                    (1, CellValue::live(0i64.to_be_bytes().to_vec(), timestamp)),
+                ],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        };
+
+        // Sort by key (required by SSTableWriter)
+        let mut partitions = vec![p1, p2];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        // Sequential read: both partitions must be readable
+        let mut reader = DataReader::new(&output.data, &header, 0);
+        let mut read_partitions = Vec::new();
+        while let Some(partition) = reader.read_partition().unwrap() {
+            read_partitions.push(partition);
+        }
+        assert_eq!(
+            read_partitions.len(),
+            2,
+            "sequential read should find both partitions"
+        );
+
+        // Verify each partition has correct data
+        for rp in &read_partitions {
+            assert_eq!(rp.rows.len(), 1, "each partition should have 1 row");
+            assert_eq!(
+                rp.rows[0].cells.len(),
+                2,
+                "each row should have 2 cells (result + hit_count)"
+            );
+            // Clustering key should be 16 bytes (UUID)
+            assert_eq!(
+                rp.rows[0].clustering.len(),
+                16,
+                "clustering key should be 16 bytes (UUID)"
+            );
+        }
+
+        // Verify the data bytes are well-formed by re-reading at each
+        // partition's offset (simulates what get_partition does).
+        for rp in &read_partitions {
+            let key_bytes = rp.key.key.as_bytes();
+            assert!(
+                key_bytes.len() > 70,
+                "composite PK should be > 70 bytes, got {}",
+                key_bytes.len()
+            );
+        }
+    }
+
+    /// End-to-end: exact production memo_cache scenario through full
+    /// SSTableWriter → SSTableReader::get_partition() cycle.
+    /// Uses composite text PK, UUID clustering, and multiple column types.
+    #[test]
+    fn e2e_composite_pk_get_partition_exact_production_keys() {
+        use crate::reader::{SSTableComponents, SSTableReader};
+
+        // Header matching memo_cache: CompositeType(UTF8,UTF8) PK, UUID clustering
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UTF8Type,\
+                       org.apache.cassandra.db.marshal.UTF8Type)"
+                .into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.UUIDType".into()],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"result".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"hit_count".to_vec(),
+                    "org.apache.cassandra.db.marshal.LongType".into(),
+                ),
+            ],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+        let ts = 1_000_042i64;
+
+        // Composite PK encoding: [u16 len][bytes][0x00] per component
+        fn composite(part1: &str, part2: &str) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&(part1.len() as u16).to_be_bytes());
+            buf.extend_from_slice(part1.as_bytes());
+            buf.push(0x00);
+            buf.extend_from_slice(&(part2.len() as u16).to_be_bytes());
+            buf.extend_from_slice(part2.as_bytes());
+            buf.push(0x00);
+            buf
+        }
+
+        // EXACT production keys
+        let pk1_bytes = composite(
+            "4bbe47ee6bb1d0ecaa4d47fce3d99e2044cdfdbfac4dde0c0c083f97e4fad000", // pragma: allowlist secret
+            "test-v1",
+        );
+        let pk2_bytes = composite(
+            "cac0302657b4c1d0dfd5aec98f2754f46a42f117e53c77a9ba384ebf2095633a", // pragma: allowlist secret
+            "claude-opus-4-6",
+        );
+
+        let p1 = Partition {
+            key: DecoratedKey::new(PartitionKey::new(pk1_bytes.clone())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![0x11u8; 16], // UUID
+                cells: vec![
+                    (0, CellValue::live(b"4".to_vec(), ts)),
+                    (1, CellValue::live(0i64.to_be_bytes().to_vec(), ts)),
+                ],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+        };
+        let p2 = Partition {
+            key: DecoratedKey::new(PartitionKey::new(pk2_bytes.clone())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![0x22u8; 16], // UUID
+                cells: vec![
+                    (
+                        0,
+                        CellValue::live(b"The capital of France is Paris.".to_vec(), ts),
+                    ),
+                    (1, CellValue::live(0i64.to_be_bytes().to_vec(), ts)),
+                ],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+        };
+
+        // Sort by decorated key (token order)
+        let mut partitions = vec![p1, p2];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        eprintln!(
+            "Data.db: {} bytes, Partitions.db: {} bytes",
+            output.data.len(),
+            output.partitions.len()
+        );
+
+        // Build SSTableReader from raw bytes
+        let components = SSTableComponents {
+            data: output.data.as_slice(),
+            partitions: output.partitions.as_slice(),
+            rows: output.rows.as_slice(),
+            filter: output.filter.clone(),
+            compression_info: output.compression_info.clone(),
+            statistics: output.statistics.clone(),
+        };
+        let reader = SSTableReader::open(components).unwrap();
+        assert_eq!(reader.key_count(), 2);
+
+        // get_partition for BOTH keys must succeed
+        let key1 = DecoratedKey::new(PartitionKey::new(pk1_bytes));
+        let r1 = reader.get_partition(&key1);
+        assert!(r1.is_ok(), "get_partition key1 error: {:?}", r1.err());
+        let r1 = r1.unwrap();
+        assert!(r1.is_some(), "key1 (test-v1) not found via trie");
+        let r1 = r1.unwrap();
+        assert_eq!(r1.rows.len(), 1, "key1 should have 1 row");
+        assert_eq!(
+            r1.rows[0].clustering.len(),
+            16,
+            "UUID clustering = 16 bytes"
+        );
+
+        let key2 = DecoratedKey::new(PartitionKey::new(pk2_bytes));
+        let r2 = reader.get_partition(&key2);
+        assert!(r2.is_ok(), "get_partition key2 error: {:?}", r2.err());
+        let r2 = r2.unwrap();
+        assert!(r2.is_some(), "key2 (claude-opus-4-6) not found via trie");
+        let r2 = r2.unwrap();
+        assert_eq!(r2.rows.len(), 1, "key2 should have 1 row");
+        assert_eq!(
+            r2.rows[0].clustering.len(),
+            16,
+            "UUID clustering = 16 bytes"
+        );
+
+        // Verify cell values round-tripped
+        let r2_result = r2.rows[0].cells[0].1.value.as_deref().unwrap();
+        assert_eq!(
+            r2_result, b"The capital of France is Paris.",
+            "cell value must survive roundtrip"
+        );
     }
 
     #[test]
@@ -909,5 +1268,130 @@ mod tests {
         assert_eq!(cell.timestamp, cell_ts);
         assert_eq!(cell.local_deletion_time, ldt);
         assert!(cell.value.is_none());
+    }
+
+    /// Tables with no clustering columns (simple PRIMARY KEY) must roundtrip.
+    /// Regression test for the extra clustering-length varint bug.
+    #[test]
+    fn write_no_clustering_columns_roundtrip() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_types: vec![], // No clustering columns
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let timestamp = 1_000_042i64;
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::new(vec![0x00, 0x00, 0x00, 0x01])),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![], // empty — no clustering columns
+                cells: vec![(0, CellValue::live(b"hello".to_vec(), timestamp))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        };
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        let mut reader = DataReader::new(&output.data, &header, 0);
+        let read_partition = reader
+            .read_partition()
+            .unwrap()
+            .expect("expected partition");
+
+        assert_eq!(read_partition.rows.len(), 1);
+        let row = &read_partition.rows[0];
+        assert!(row.clustering.is_empty());
+        assert_eq!(row.cells.len(), 1);
+        let (_, ref cell) = row.cells[0];
+        assert!(cell.is_live());
+        assert_eq!(cell.value.as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(cell.timestamp, timestamp);
+
+        assert!(reader.read_partition().unwrap().is_none());
+    }
+
+    /// FRSA-BUG-026 root cause: expiring cells (USING TTL) must roundtrip
+    /// through SSTable write + read. The writer must set CELL_IS_EXPIRING
+    /// and write the local_deletion_time + TTL deltas.
+    #[test]
+    fn write_partition_with_expiring_cell_roundtrip() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: 0,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let timestamp = 1_000_100i64;
+        let ttl = 3600i32;
+        let ldt = 1_700_000i32; // local deletion time = now + ttl
+
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::new(42i32.to_be_bytes().to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![],
+                cells: vec![(
+                    0,
+                    CellValue::expiring(b"hello_ttl".to_vec(), timestamp, ttl, ldt),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        };
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        let mut reader = DataReader::new(&output.data, &header, 0);
+        let p = reader.read_partition().unwrap().expect("partition");
+
+        let row = &p.rows[0];
+        let (_, ref cell) = row.cells[0];
+        assert!(
+            !cell.is_tombstone(),
+            "expiring cell should not be a tombstone"
+        );
+        assert_eq!(cell.timestamp, timestamp);
+        assert_eq!(cell.ttl, ttl, "TTL must roundtrip");
+        assert_eq!(
+            cell.local_deletion_time, ldt,
+            "local_deletion_time must roundtrip"
+        );
+        assert_eq!(
+            cell.value.as_deref(),
+            Some(b"hello_ttl".as_slice()),
+            "value must roundtrip"
+        );
     }
 }

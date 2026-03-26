@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
-use ferrosa_schema::VirtualTableRegistry;
+use ferrosa_schema::{Schema, VirtualTableRegistry};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{StorageEngine, TableId};
 
@@ -58,12 +58,17 @@ impl Default for GraphEngineConfig {
 /// If `virtual_tables` is provided, the executor checks the registry before
 /// going to storage for anchor lookups. Virtual tables (e.g. in
 /// `system_observability`) return rows directly from memory.
+///
+/// If `schema` is provided, column names from table metadata are used to
+/// map cell indices to property names (e.g., `name`, `age`) so that Cypher
+/// property lookups like `a.name` resolve correctly.
 pub fn execute(
     plan: PhysicalPlan,
     storage: &StorageEngine,
     keyspace: &str,
     config: &GraphEngineConfig,
     virtual_tables: Option<&VirtualTableRegistry>,
+    schema: Option<&Schema>,
 ) -> Result<GraphResult> {
     let start = Instant::now();
 
@@ -81,6 +86,7 @@ pub fn execute(
             config,
             start,
             virtual_tables,
+            schema,
         ),
         PhysicalPlan::CreateNodes { creates } => execute_create(storage, &creates, config, start),
         PhysicalPlan::SetProperties {
@@ -94,11 +100,13 @@ pub fn execute(
             config,
             virtual_tables,
             start,
+            schema,
         ),
         PhysicalPlan::DeleteNodes {
             expand,
             variables,
             detach,
+            variable_tables,
         } => execute_delete(
             storage,
             *expand,
@@ -108,6 +116,8 @@ pub fn execute(
             config,
             virtual_tables,
             start,
+            schema,
+            &variable_tables,
         ),
         PhysicalPlan::Aggregate {
             inner,
@@ -124,10 +134,11 @@ pub fn execute(
             config,
             start,
             virtual_tables,
+            schema,
         ),
         PhysicalPlan::Subscribe { inner, .. } => {
             // Execute the initial snapshot from the inner plan.
-            execute(*inner, storage, keyspace, config, virtual_tables)
+            execute(*inner, storage, keyspace, config, virtual_tables, schema)
         }
         PhysicalPlan::ExpandVarLength {
             anchor,
@@ -146,6 +157,7 @@ pub fn execute(
             config,
             start,
             virtual_tables,
+            schema,
         ),
         PhysicalPlan::WcoJoin {
             plan,
@@ -158,6 +170,7 @@ pub fn execute(
             config,
             start,
             virtual_tables,
+            schema,
         ),
     }
 }
@@ -173,6 +186,7 @@ fn execute_expand(
     config: &GraphEngineConfig,
     start: Instant,
     virtual_tables: Option<&VirtualTableRegistry>,
+    schema: Option<&Schema>,
 ) -> Result<GraphResult> {
     let mut stats = QueryStats::default();
 
@@ -203,12 +217,23 @@ fn execute_expand(
     stats.vertices_read += anchor_partitions.len();
     check_timeout(start, config.query_timeout)?;
 
+    // Resolve column names from schema for property mapping.
+    let anchor_col_names =
+        column_names_for_table(schema, &anchor.table.keyspace, &anchor.table.table);
+
     // Apply WHERE filters to anchor partitions using the expression evaluator.
+    // Skip partitions that are fully tombstoned (no live cells in any row
+    // and no live static row) — these represent deleted vertices whose
+    // tombstones have not yet been purged by compaction.
     let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
     let mut current_keys: Vec<DecoratedKey> = Vec::with_capacity(anchor_partitions.len());
     for partition in &anchor_partitions {
+        if is_partition_dead(partition) {
+            continue;
+        }
+
         let hex_id = hex::encode(partition.key.key.as_bytes());
-        let row_json = eval::partition_to_json(partition, &hex_id);
+        let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
         let mut bindings = HashMap::new();
         bindings.insert(anchor_var.to_string(), row_json);
 
@@ -305,7 +330,7 @@ fn execute_expand(
         // partition's JSON representation so that RETURN expressions
         // (arithmetic, function calls, property lookups) all work.
         let row_json = if let Some(ref part) = partition {
-            eval::partition_to_json(part, &hex_id)
+            eval::partition_to_json(part, &hex_id, &anchor_col_names)
         } else {
             serde_json::Value::String(hex_id.clone())
         };
@@ -487,9 +512,10 @@ fn execute_set(
     config: &GraphEngineConfig,
     virtual_tables: Option<&VirtualTableRegistry>,
     start: Instant,
+    schema: Option<&Schema>,
 ) -> Result<GraphResult> {
     // Execute the inner expand to find matching vertices.
-    let expand_result = execute(expand, storage, keyspace, config, virtual_tables)?;
+    let expand_result = execute(expand, storage, keyspace, config, virtual_tables, schema)?;
     let mut stats = QueryStats::default();
     stats.vertices_read = expand_result.stats.vertices_read;
     stats.edges_read = expand_result.stats.edges_read;
@@ -570,8 +596,10 @@ fn execute_delete(
     config: &GraphEngineConfig,
     virtual_tables: Option<&VirtualTableRegistry>,
     start: Instant,
+    schema: Option<&Schema>,
+    variable_tables: &HashMap<String, String>,
 ) -> Result<GraphResult> {
-    let expand_result = execute(expand, storage, keyspace, config, virtual_tables)?;
+    let expand_result = execute(expand, storage, keyspace, config, virtual_tables, schema)?;
     let mut stats = QueryStats::default();
     stats.vertices_read = expand_result.stats.vertices_read;
     stats.edges_read = expand_result.stats.edges_read;
@@ -589,11 +617,31 @@ fn execute_delete(
                 continue;
             }
 
-            if let Some(serde_json::Value::String(hex_id)) = row_values.get(col_idx) {
-                let key_bytes = hex::decode(hex_id)
+            // Extract the hex-encoded vertex ID from the expand result.
+            // The expand returns either:
+            //   - a JSON object with an `_id` field (Expr::Var bindings), or
+            //   - a plain hex string (legacy / property projection).
+            let hex_id = match row_values.get(col_idx) {
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(serde_json::Value::Object(map)) => {
+                    map.get("_id").and_then(|v| v.as_str()).map(String::from)
+                }
+                _ => None,
+            };
+
+            if let Some(hex_id) = hex_id {
+                let key_bytes = hex::decode(&hex_id)
                     .map_err(|e| GraphError::Internal(format!("invalid hex vertex ID: {e}")))?;
                 let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-                let table_id = TableId::new(keyspace, col_name);
+
+                // Use the resolved table name (e.g. "Person") rather than
+                // the Cypher variable name (e.g. "n") so the tombstone is
+                // written to the same table that the vertex lives in.
+                let table_name = variable_tables
+                    .get(col_name)
+                    .map(String::as_str)
+                    .unwrap_or(col_name);
+                let table_id = TableId::new(keyspace, table_name);
 
                 // Write a row-level tombstone.
                 let tombstone_row = Row {
@@ -638,9 +686,10 @@ fn execute_aggregate(
     config: &GraphEngineConfig,
     start: Instant,
     virtual_tables: Option<&VirtualTableRegistry>,
+    schema: Option<&Schema>,
 ) -> Result<GraphResult> {
     // Step 1: Execute inner plan to get all rows.
-    let inner_result = execute(inner, storage, keyspace, config, virtual_tables)?;
+    let inner_result = execute(inner, storage, keyspace, config, virtual_tables, schema)?;
     check_timeout(start, config.query_timeout)?;
 
     let inner_columns = &inner_result.columns;
@@ -975,6 +1024,33 @@ fn expr_to_column_name(expr: &Expr) -> String {
     }
 }
 
+/// Look up regular column names for a table from the schema.
+///
+/// Returns the names of regular (non-key, non-static) columns in the order
+/// they appear in the schema's `IndexMap`, which matches the cell index
+/// positions used by the storage engine. Falls back to an empty vec when
+/// the schema or table is unavailable.
+pub fn column_names_for_table(schema: Option<&Schema>, keyspace: &str, table: &str) -> Vec<String> {
+    let schema = match schema {
+        Some(s) => s,
+        None => return vec![],
+    };
+    let snap = schema.snapshot();
+    snap.tables
+        .get(&(keyspace.to_string(), table.to_string()))
+        .map(|meta| {
+            meta.columns
+                .values()
+                .filter(|col| {
+                    col.kind == ferrosa_schema::metadata::column::ColumnKind::Regular
+                        || col.kind == ferrosa_schema::metadata::column::ColumnKind::Static
+                })
+                .map(|col| col.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Extract the neighbor ID from an adjacency row's clustering key.
 ///
 /// Clustering format:
@@ -1020,6 +1096,44 @@ pub fn extract_neighbor_id(clustering: &[u8], expected_label: Option<&str>) -> O
     }
 
     Some(clustering[pos..pos + id_len].to_vec())
+}
+
+/// Returns `true` if a partition has no live data — i.e., it is either
+/// partition-level deleted or every row has been tombstoned (row-level
+/// deletion with no surviving cells and no live static row). Such
+/// partitions represent deleted vertices that have not yet been purged
+/// by compaction and must be skipped during graph traversal.
+fn is_partition_dead(partition: &ferrosa_sstable::types::Partition) -> bool {
+    // Partition-level deletion with no surviving rows.
+    if !partition.deletion.is_live() && partition.rows.is_empty() {
+        return partition
+            .static_row
+            .as_ref()
+            .is_none_or(|sr| sr.cells.is_empty());
+    }
+
+    // If there are no rows at all and no static row, the partition is empty
+    // (but not necessarily deleted — could be a key-only entry). Treat as dead.
+    if partition.rows.is_empty() && partition.static_row.is_none() {
+        return true;
+    }
+
+    // Check whether every row is tombstoned: the row has a deletion marker
+    // and no surviving cells.
+    let all_rows_dead = partition
+        .rows
+        .iter()
+        .all(|row| !row.deletion.is_live() && row.cells.is_empty());
+
+    if !all_rows_dead {
+        return false;
+    }
+
+    // If all rows are dead, also check the static row.
+    partition
+        .static_row
+        .as_ref()
+        .is_none_or(|sr| sr.cells.is_empty())
 }
 
 /// Check whether the query has exceeded its timeout.
@@ -1164,6 +1278,7 @@ mod tests {
             "system_observability",
             &config,
             Some(&registry),
+            None,
         )
         .unwrap();
 
@@ -1219,6 +1334,7 @@ mod tests {
             "system_observability",
             &config,
             Some(&registry),
+            None,
         )
         .unwrap();
 
@@ -1258,6 +1374,7 @@ mod tests {
             "system_observability",
             &config,
             Some(&registry),
+            None,
         )
         .unwrap();
 
@@ -1291,6 +1408,7 @@ mod tests {
             "system_observability",
             &config,
             Some(&registry),
+            None,
         )
         .unwrap();
 
@@ -1312,7 +1430,7 @@ mod tests {
 
         let config = GraphEngineConfig::default();
         // This should succeed (empty result from storage, not error).
-        let result = execute(plan, &storage, "social", &config, Some(&registry)).unwrap();
+        let result = execute(plan, &storage, "social", &config, Some(&registry), None).unwrap();
         assert!(result.rows.is_empty());
     }
 
@@ -1325,7 +1443,7 @@ mod tests {
         let storage = test_storage_engine(tmp.path());
 
         let config = GraphEngineConfig::default();
-        let result = execute(plan, &storage, "social", &config, None).unwrap();
+        let result = execute(plan, &storage, "social", &config, None, None).unwrap();
         assert!(result.rows.is_empty());
     }
 
@@ -1366,6 +1484,7 @@ mod tests {
             "system_observability",
             &config,
             Some(&registry),
+            None,
         )
         .unwrap();
         assert_eq!(result.rows.len(), 5);
@@ -1712,7 +1831,7 @@ mod tests {
         let storage = test_storage_engine(tmp.path());
 
         let config = GraphEngineConfig::default();
-        let result = execute(agg_plan, &storage, "social", &config, Some(&registry)).unwrap();
+        let result = execute(agg_plan, &storage, "social", &config, Some(&registry), None).unwrap();
 
         assert_eq!(result.columns, vec!["count(*)"]);
         assert_eq!(result.rows.len(), 1);

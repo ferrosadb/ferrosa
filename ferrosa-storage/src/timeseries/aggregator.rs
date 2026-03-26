@@ -42,6 +42,10 @@ pub struct TimeSeriesAggregator {
     table_id: TableId,
     /// Column indices to extract from mutations (by position in cells vec).
     value_column_indices: Vec<u16>,
+    /// CQL type names for each column (e.g., "double", "float", "int", "bigint").
+    /// When present, enables type-aware decoding via `decode_typed_numeric`.
+    /// Must be the same length as `value_column_indices`.
+    column_types: Vec<String>,
     /// Per-partition_key ring buffers. DashMap provides per-shard locking.
     rings: DashMap<Vec<u8>, RingBuffer>,
     /// Channel sender for async consolidation tasks.
@@ -50,6 +54,8 @@ pub struct TimeSeriesAggregator {
     drop_count: AtomicU64,
     /// Maximum number of ring buffers.
     max_rings: usize,
+    /// Optional shared metrics for observability.
+    shared_metrics: Option<Arc<ConsolidationMetrics>>,
 }
 
 impl TimeSeriesAggregator {
@@ -69,11 +75,49 @@ impl TimeSeriesAggregator {
             config,
             table_id,
             value_column_indices,
+            column_types: vec![],
             rings: DashMap::new(),
             task_tx,
             drop_count: AtomicU64::new(0),
             max_rings,
+            shared_metrics: None,
         }
+    }
+
+    /// Create a new aggregator with CQL column type metadata for type-aware decoding.
+    ///
+    /// `column_types` must be the same length as `value_column_indices`, with CQL
+    /// type names such as "double", "float", "int", "bigint", "counter".
+    pub fn with_column_types(
+        config: ConsolidationConfig,
+        table_id: TableId,
+        value_column_indices: Vec<u16>,
+        column_types: Vec<String>,
+        task_tx: std::sync::mpsc::SyncSender<ConsolidationTask>,
+    ) -> Self {
+        assert_eq!(
+            value_column_indices.len(),
+            column_types.len(),
+            "column_types must match value_column_indices length"
+        );
+        let mut agg = Self::new(config, table_id, value_column_indices, task_tx);
+        agg.column_types = column_types;
+        agg
+    }
+
+    /// Create a new aggregator with externally managed shared metrics.
+    pub fn with_metrics(
+        config: ConsolidationConfig,
+        table_id: TableId,
+        value_column_indices: Vec<u16>,
+        task_tx: std::sync::mpsc::SyncSender<ConsolidationTask>,
+        _metrics: Arc<ConsolidationMetrics>,
+    ) -> Self {
+        // Store metrics reference for observability; the aggregator still uses
+        // its internal drop_count for the fast path.
+        let mut agg = Self::new(config, table_id, value_column_indices, task_tx);
+        agg.shared_metrics = Some(_metrics);
+        agg
     }
 
     /// Returns the number of active ring buffers.
@@ -86,25 +130,45 @@ impl TimeSeriesAggregator {
         self.drop_count.load(Ordering::Relaxed)
     }
 
+    /// Returns a reference to the shared metrics, if set.
+    pub fn metrics(&self) -> Option<&Arc<ConsolidationMetrics>> {
+        self.shared_metrics.as_ref()
+    }
+
     /// Extract f64 values from a mutation row for the configured columns.
     ///
-    /// Decodes CQL big-endian bytes to f64. Supports double (8 bytes),
-    /// float (4 bytes), int (4 bytes), bigint (8 bytes).
+    /// Uses type-aware decoding when `column_types` is available, falling back
+    /// to length-based heuristic via `decode_numeric_bytes` otherwise.
     fn extract_values(
         &self,
         row: &ferrosa_sstable::types::Row,
     ) -> Option<(i64, SmallVec<[f64; 8]>)> {
         let mut values = SmallVec::new();
         let timestamp = row.primary_key_liveness.timestamp;
+        let has_types = !self.column_types.is_empty();
 
-        for &col_idx in &self.value_column_indices {
+        for (i, &col_idx) in self.value_column_indices.iter().enumerate() {
             let cell = row.cells.iter().find(|(idx, _)| *idx == col_idx);
             match cell {
                 Some((_, cv)) => {
                     if let Some(ref bytes) = cv.value {
-                        if let Some(v) = decode_numeric_bytes(bytes) {
+                        let decoded = if has_types {
+                            decode_typed_numeric(bytes, &self.column_types[i])
+                        } else {
+                            decode_numeric_bytes(bytes)
+                        };
+                        if let Some(v) = decoded {
                             values.push(v);
                         } else {
+                            tracing::warn!(
+                                table = %self.table_id.table,
+                                column_index = col_idx,
+                                byte_len = bytes.len(),
+                                "failed to decode numeric bytes for consolidation column"
+                            );
+                            if let Some(ref m) = self.shared_metrics {
+                                m.decode_failures.fetch_add(1, Ordering::Relaxed);
+                            }
                             return None; // non-decodable value, skip this row
                         }
                     } else {
@@ -215,6 +279,11 @@ impl WriteObserver for TimeSeriesAggregator {
                         };
                         if self.task_tx.try_send(task).is_err() {
                             self.drop_count.fetch_add(1, Ordering::Relaxed);
+                            if let Some(ref m) = self.shared_metrics {
+                                m.consolidation_drops.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else if let Some(ref m) = self.shared_metrics {
+                            m.windows_consolidated.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -229,6 +298,11 @@ impl WriteObserver for TimeSeriesAggregator {
                     };
                     if self.task_tx.try_send(task).is_err() {
                         self.drop_count.fetch_add(1, Ordering::Relaxed);
+                        if let Some(ref m) = self.shared_metrics {
+                            m.consolidation_drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else if let Some(ref m) = self.shared_metrics {
+                        m.late_arrivals.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 BoundaryStatus::Normal => {}
@@ -240,11 +314,45 @@ impl WriteObserver for TimeSeriesAggregator {
 }
 
 /// Metrics for consolidation observability.
+///
+/// All counters use relaxed ordering since they are monotonic and
+/// approximate counts are acceptable for observability.
 #[derive(Debug, Default)]
 pub struct ConsolidationMetrics {
+    /// Total number of windows that have been consolidated.
     pub windows_consolidated: AtomicU64,
+    /// Total number of late-arriving data points detected.
     pub late_arrivals: AtomicU64,
+    /// Total number of consolidation tasks dropped (channel full).
     pub consolidation_drops: AtomicU64,
+    /// Total number of failed numeric byte decodes during value extraction.
+    pub decode_failures: AtomicU64,
+}
+
+impl ConsolidationMetrics {
+    /// Create a new metrics instance with all counters at zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns a point-in-time snapshot of all metric values.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            windows_consolidated: self.windows_consolidated.load(Ordering::Relaxed),
+            late_arrivals: self.late_arrivals.load(Ordering::Relaxed),
+            consolidation_drops: self.consolidation_drops.load(Ordering::Relaxed),
+            decode_failures: self.decode_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time snapshot of consolidation metrics for reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub windows_consolidated: u64,
+    pub late_arrivals: u64,
+    pub consolidation_drops: u64,
+    pub decode_failures: u64,
 }
 
 /// Async worker that processes consolidation tasks.
@@ -253,7 +361,6 @@ pub struct ConsolidationMetrics {
 /// and writes results to downstream tables via `StorageEngine::write()`.
 pub struct ConsolidationWorker {
     config: ConsolidationConfig,
-    #[allow(dead_code)]
     task_rx: std::sync::mpsc::Receiver<ConsolidationTask>,
     metrics: Arc<ConsolidationMetrics>,
 }
@@ -285,6 +392,11 @@ impl ConsolidationWorker {
     /// Returns a reference to the metrics.
     pub fn metrics(&self) -> &Arc<ConsolidationMetrics> {
         &self.metrics
+    }
+
+    /// Returns a reference to the task receiver for polling.
+    pub fn task_rx(&self) -> &std::sync::mpsc::Receiver<ConsolidationTask> {
+        &self.task_rx
     }
 }
 
@@ -534,7 +646,7 @@ mod tests {
         use super::super::consolidation::{consolidate_values, ConsolidationFn};
 
         // Verify consolidation logic works end-to-end for a task's window entries.
-        let entries = vec![
+        let entries = [
             RingEntry {
                 timestamp: 0,
                 values: SmallVec::from_slice(&[1.0]),
@@ -583,7 +695,7 @@ mod tests {
         let metrics = Arc::new(ConsolidationMetrics::default());
         let worker = ConsolidationWorker::new(config, rx, metrics);
 
-        let entries = vec![
+        let entries = [
             RingEntry {
                 timestamp: 0,
                 values: SmallVec::from_slice(&[1.0]),
@@ -610,7 +722,7 @@ mod tests {
         use super::super::consolidation::{consolidate_values, ConsolidationFn};
 
         // 3 entries, 2 columns each.
-        let entries = vec![
+        let entries = [
             RingEntry {
                 timestamp: 0,
                 values: SmallVec::from_slice(&[10.0, 100.0]),
@@ -728,6 +840,61 @@ mod tests {
         assert_eq!(aggregator.ring_count(), 2);
     }
 
+    // --- Task 14: Late data detection in on_write ---
+
+    #[test]
+    fn aggregator_late_data_sends_task() {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ring_capacity: 64,
+            max_rings: 100,
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+        let aggregator = TimeSeriesAggregator::new(config, table_id.clone(), vec![0], tx);
+
+        let make_mutation = |ts: i64, val: f64| Mutation {
+            keyspace: "ks".to_string(),
+            table: "sensor".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"s1".to_vec())),
+            rows: vec![Row {
+                clustering: ts.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(val.to_be_bytes().to_vec(), ts))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+            timestamp: ts,
+        };
+
+        // Write at ts=15M (boundary at 20M).
+        aggregator.on_write(&table_id, &make_mutation(15_000_000, 1.0));
+
+        // Cross boundary to 30M.
+        aggregator.on_write(&table_id, &make_mutation(25_000_000, 2.0));
+        let _ = rx.try_recv(); // consume BoundaryCrossed
+
+        // Late write at ts=5M (before boundary - interval = 20M).
+        aggregator.on_write(&table_id, &make_mutation(5_000_000, 3.0));
+
+        // Should get a LateData task.
+        let task = rx.try_recv().expect("expected LateData task");
+        match task {
+            ConsolidationTask::LateData { late_timestamp, .. } => {
+                assert_eq!(late_timestamp, 5_000_000);
+            }
+            _ => panic!("expected LateData"),
+        }
+    }
+
     #[test]
     fn aggregator_drop_count_tracks_channel_full() {
         let config = ConsolidationConfig {
@@ -768,5 +935,177 @@ mod tests {
 
         // The boundary crossing should have tried to send and been dropped.
         assert!(aggregator.drop_count() >= 1);
+    }
+
+    // --- Task 22: ConsolidationMetrics tests ---
+
+    #[test]
+    fn consolidation_metrics_default() {
+        let metrics = ConsolidationMetrics::default();
+        assert_eq!(metrics.windows_consolidated.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.late_arrivals.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.consolidation_drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn consolidation_metrics_increment() {
+        let metrics = ConsolidationMetrics::default();
+        metrics.windows_consolidated.fetch_add(1, Ordering::Relaxed);
+        metrics.late_arrivals.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(metrics.windows_consolidated.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.late_arrivals.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn consolidation_metrics_snapshot() {
+        let metrics = ConsolidationMetrics::new();
+        metrics.windows_consolidated.fetch_add(5, Ordering::Relaxed);
+        metrics.late_arrivals.fetch_add(2, Ordering::Relaxed);
+        metrics.consolidation_drops.fetch_add(1, Ordering::Relaxed);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.windows_consolidated, 5);
+        assert_eq!(snap.late_arrivals, 2);
+        assert_eq!(snap.consolidation_drops, 1);
+    }
+
+    #[test]
+    fn consolidation_metrics_concurrent_increments() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let metrics = Arc::new(ConsolidationMetrics::new());
+        let mut handles = vec![];
+
+        for _ in 0..4 {
+            let m = Arc::clone(&metrics);
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    m.windows_consolidated.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(metrics.windows_consolidated.load(Ordering::Relaxed), 400);
+    }
+
+    // --- FMEA Fix 2: Track decode failures in metrics ---
+
+    #[test]
+    fn metrics_track_decode_failures() {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let metrics = Arc::new(ConsolidationMetrics::new());
+
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["v".to_string()],
+            ring_capacity: 64,
+            max_rings: 100,
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+        let aggregator = TimeSeriesAggregator::with_metrics(
+            config,
+            table_id.clone(),
+            vec![0],
+            tx,
+            metrics.clone(),
+        );
+
+        // Send a mutation with non-decodable bytes (3 bytes -- not 4 or 8).
+        let bad_bytes = vec![0xDE, 0xAD, 0xFF];
+        let mutation = Mutation {
+            keyspace: "ks".to_string(),
+            table: "sensor".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
+            rows: vec![Row {
+                clustering: 1_000_000_i64.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(bad_bytes, 1_000_000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000_000),
+            }],
+            timestamp: 1_000_000,
+        };
+
+        aggregator.on_write(&table_id, &mutation);
+
+        // decode_failures should have been incremented.
+        assert_eq!(metrics.decode_failures.load(Ordering::Relaxed), 1);
+
+        // Ring should NOT have been created (row was skipped).
+        assert_eq!(aggregator.ring_count(), 0);
+    }
+
+    // --- FMEA Fix 5: Typed decode using column type metadata ---
+
+    #[test]
+    fn extract_values_uses_typed_decode() {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let config = ConsolidationConfig {
+            interval: std::time::Duration::from_secs(10),
+            functions: vec![super::super::consolidation::ConsolidationFn::Avg],
+            target_table: "t".to_string(),
+            columns: vec!["temp".to_string()],
+            ring_capacity: 64,
+            max_rings: 100,
+            ..ConsolidationConfig::default()
+        };
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConsolidationTask>(100);
+        let table_id = TableId::new("ks", "sensor");
+
+        // Create aggregator WITH column types -- "float" means 4-byte IEEE 754.
+        let aggregator = TimeSeriesAggregator::with_column_types(
+            config,
+            table_id.clone(),
+            vec![0],
+            vec!["float".to_string()],
+            tx,
+        );
+
+        // Encode a float32 value (42.5f32).
+        let float_bytes = 42.5_f32.to_be_bytes().to_vec();
+        let mutation = Mutation {
+            keyspace: "ks".to_string(),
+            table: "sensor".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
+            rows: vec![Row {
+                clustering: 1_000_000_i64.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(float_bytes, 1_000_000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000_000),
+            }],
+            timestamp: 1_000_000,
+        };
+
+        aggregator.on_write(&table_id, &mutation);
+
+        // Ring should have been created -- typed decode of float succeeds.
+        assert_eq!(aggregator.ring_count(), 1);
+
+        // Verify the value was decoded correctly as float (not as i32).
+        let ring = aggregator.rings.get(&b"pk1".to_vec()).unwrap();
+        let entries = ring.window(0, 2_000_000);
+        assert_eq!(entries.len(), 1);
+        // float decode of 42.5f32 should be ~42.5 (not 1110179840 which is i32 interpretation).
+        assert!(
+            (entries[0].values[0] - 42.5).abs() < 0.01,
+            "expected ~42.5, got {}",
+            entries[0].values[0]
+        );
     }
 }

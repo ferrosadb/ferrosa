@@ -40,7 +40,7 @@ pub enum PhoneticAlgorithm {
 }
 
 impl PhoneticAlgorithm {
-    fn encoder(&self) -> Box<dyn PhoneticEncoder> {
+    pub fn encoder(&self) -> Box<dyn PhoneticEncoder> {
         match self {
             PhoneticAlgorithm::Soundex => Box::new(soundex::SoundexEncoder),
             PhoneticAlgorithm::Metaphone => Box::new(metaphone::MetaphoneEncoder),

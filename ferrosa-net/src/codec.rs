@@ -85,6 +85,18 @@ pub enum MsgType {
     // Index build coordination
     IndexBuildRequest = 0x60,
     IndexBuildComplete = 0x61,
+    // Accord consensus
+    AccordPreAccept = 0x70,
+    AccordPreAcceptOK = 0x71,
+    AccordAccept = 0x72,
+    AccordAcceptOK = 0x73,
+    AccordCommit = 0x74,
+    AccordRead = 0x75,
+    AccordReadOK = 0x76,
+    AccordApply = 0x77,
+    AccordApplyOK = 0x78,
+    AccordRecover = 0x79,
+    AccordRecoverOK = 0x7A,
 }
 
 impl TryFrom<u8> for MsgType {
@@ -121,6 +133,17 @@ impl TryFrom<u8> for MsgType {
             0x52 => Ok(Self::BatchlogReplay),
             0x60 => Ok(Self::IndexBuildRequest),
             0x61 => Ok(Self::IndexBuildComplete),
+            0x70 => Ok(Self::AccordPreAccept),
+            0x71 => Ok(Self::AccordPreAcceptOK),
+            0x72 => Ok(Self::AccordAccept),
+            0x73 => Ok(Self::AccordAcceptOK),
+            0x74 => Ok(Self::AccordCommit),
+            0x75 => Ok(Self::AccordRead),
+            0x76 => Ok(Self::AccordReadOK),
+            0x77 => Ok(Self::AccordApply),
+            0x78 => Ok(Self::AccordApplyOK),
+            0x79 => Ok(Self::AccordRecover),
+            0x7A => Ok(Self::AccordRecoverOK),
             _ => Err(NetError::UnknownMessageType(value)),
         }
     }

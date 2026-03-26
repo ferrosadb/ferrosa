@@ -47,8 +47,22 @@ pub fn format_metric(name: &str, labels: &[(&str, &str)], value: f64) -> String 
 pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
     let mut output = String::new();
 
+    // Baseline process metrics — always emitted so /metrics is never empty.
+    output
+        .push_str("# HELP ferrosa_up Whether the Ferrosa node is up (always 1 when reachable).\n");
+    output.push_str("# TYPE ferrosa_up gauge\n");
+    output.push_str(&format_metric("ferrosa_up", &[], 1.0));
+
     // Get all tables from system_observability keyspace
     let tables = registry.list("system_observability");
+
+    output.push_str("# HELP ferrosa_virtual_tables_registered Number of registered observability virtual tables.\n");
+    output.push_str("# TYPE ferrosa_virtual_tables_registered gauge\n");
+    output.push_str(&format_metric(
+        "ferrosa_virtual_tables_registered",
+        &[],
+        tables.len() as f64,
+    ));
 
     for table in &tables {
         let table_name = table.name();
@@ -209,10 +223,12 @@ mod tests {
     }
 
     #[test]
-    fn render_metrics_empty_registry() {
+    fn render_metrics_empty_registry_has_baseline() {
         let registry = VirtualTableRegistry::new();
         let output = render_metrics(&registry);
-        assert!(output.is_empty());
+        // Even with no virtual tables, baseline metrics are always emitted.
+        assert!(output.contains("ferrosa_up"));
+        assert!(output.contains("ferrosa_virtual_tables_registered"));
     }
 
     #[test]
@@ -305,7 +321,10 @@ mod tests {
 
         registry.register(Arc::new(OtherKeyspaceTable));
         let output = render_metrics(&registry);
-        assert!(output.is_empty());
+        // Baseline metrics are always present, but no table-specific metrics
+        // should appear from a non-observability keyspace table.
+        assert!(output.contains("ferrosa_up"));
+        assert!(!output.contains("ferrosa_other_"));
     }
 
     #[test]

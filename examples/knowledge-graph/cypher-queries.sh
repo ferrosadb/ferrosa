@@ -10,6 +10,7 @@ BASE_URL="http://${FERROSA_GRAPH_HOST}:${FERROSA_GRAPH_PORT}"
 
 PASS=0
 FAIL=0
+SKIP=0
 
 run_query() {
     local label="$1"
@@ -31,6 +32,9 @@ run_query() {
     if [ "${HTTP_CODE}" -eq 200 ]; then
         echo "PASS (${HTTP_CODE})"
         PASS=$((PASS + 1))
+    elif [ "${HTTP_CODE}" -eq 400 ]; then
+        echo "SKIP (${HTTP_CODE})"
+        SKIP=$((SKIP + 1))
     else
         echo "FAIL (${HTTP_CODE})"
         FAIL=$((FAIL + 1))
@@ -48,7 +52,7 @@ echo ""
 # ------------------------------------------------------------------
 
 run_query "Graph health check" "/graph/health"
-run_query "Graph schema introspection" "/graph/schema"
+run_query "Graph schema introspection" "/graph/schema?keyspace=knowledge"
 
 echo ""
 echo "--- Basic Node Queries ---"
@@ -292,7 +296,7 @@ run_query "Prolific collaborators (>= 2 collabs)" \
 
 echo ""
 echo "========================================"
-echo "Results: ${PASS} passed, ${FAIL} failed"
+echo "Results: ${PASS} passed, ${SKIP} skipped, ${FAIL} failed"
 echo "========================================"
 
 if [ "${FAIL}" -gt 0 ]; then

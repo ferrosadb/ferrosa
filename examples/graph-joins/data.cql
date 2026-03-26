@@ -28,37 +28,37 @@ INSERT INTO company (company_id, name, industry, city, founded_year) VALUES
 
 -- Posts
 INSERT INTO post (post_id, author_id, content, created_at, tags) VALUES
-  (p0000001-0000-0000-0000-000000000001,
+  (b0000001-0000-0000-0000-000000000001,
    aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,
    'Just deployed our new graph engine. The future is traversals!',
    '2025-01-10T09:00:00Z', {'ferrosa', 'graph'});
 
 INSERT INTO post (post_id, author_id, content, created_at, tags) VALUES
-  (p0000002-0000-0000-0000-000000000002,
+  (b0000002-0000-0000-0000-000000000002,
    bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb,
    'Hot take: denormalization is a workaround, not a strategy.',
    '2025-01-12T14:30:00Z', {'databases', 'opinion'});
 
 INSERT INTO post (post_id, author_id, content, created_at, tags) VALUES
-  (p0000003-0000-0000-0000-000000000003,
+  (b0000003-0000-0000-0000-000000000003,
    cccccccc-cccc-cccc-cccc-cccccccccccc,
    'Wrote a fraud detection pipeline in 20 lines of Cypher. Mind blown.',
    '2025-01-15T11:00:00Z', {'fraud', 'cypher'});
 
 INSERT INTO post (post_id, author_id, content, created_at, tags) VALUES
-  (p0000004-0000-0000-0000-000000000004,
+  (b0000004-0000-0000-0000-000000000004,
    eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee,
    'Exploring lock-free data structures for concurrent graph indexing.',
    '2025-01-18T16:00:00Z', {'concurrency', 'research'});
 
 INSERT INTO post (post_id, author_id, content, created_at, tags) VALUES
-  (p0000005-0000-0000-0000-000000000005,
+  (b0000005-0000-0000-0000-000000000005,
    dddddddd-dddd-dddd-dddd-dddddddddddd,
    'Benchmarked Ferrosa against Cassandra + Neo4j. Single system wins.',
    '2025-01-20T08:45:00Z', {'benchmark', 'ferrosa'});
 
 INSERT INTO post (post_id, author_id, content, created_at, tags) VALUES
-  (p0000006-0000-0000-0000-000000000006,
+  (b0000006-0000-0000-0000-000000000006,
    11111111-1111-1111-1111-111111111111,
    'Graph indexes + S3 write-behind = best of all worlds.',
    '2025-01-22T10:30:00Z', {'ferrosa', 's3'});
@@ -101,31 +101,31 @@ INSERT INTO follows (source_id, target_id, since) VALUES
 -- Likes
 -- Alice likes Bob's post and Carol's post
 INSERT INTO likes (source_id, target_id, liked_at) VALUES
-  (aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, p0000002-0000-0000-0000-000000000002, '2025-01-12T15:00:00Z');
+  (aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, b0000002-0000-0000-0000-000000000002, '2025-01-12T15:00:00Z');
 INSERT INTO likes (source_id, target_id, liked_at) VALUES
-  (aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, p0000003-0000-0000-0000-000000000003, '2025-01-15T12:00:00Z');
+  (aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, b0000003-0000-0000-0000-000000000003, '2025-01-15T12:00:00Z');
 
 -- Bob likes Alice's post and Eve's post
 INSERT INTO likes (source_id, target_id, liked_at) VALUES
-  (bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb, p0000001-0000-0000-0000-000000000001, '2025-01-10T10:00:00Z');
+  (bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb, b0000001-0000-0000-0000-000000000001, '2025-01-10T10:00:00Z');
 INSERT INTO likes (source_id, target_id, liked_at) VALUES
-  (bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb, p0000004-0000-0000-0000-000000000004, '2025-01-19T08:00:00Z');
+  (bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb, b0000004-0000-0000-0000-000000000004, '2025-01-19T08:00:00Z');
 
 -- Carol likes Alice's post and David's post
 INSERT INTO likes (source_id, target_id, liked_at) VALUES
-  (cccccccc-cccc-cccc-cccc-cccccccccccc, p0000001-0000-0000-0000-000000000001, '2025-01-11T09:00:00Z');
+  (cccccccc-cccc-cccc-cccc-cccccccccccc, b0000001-0000-0000-0000-000000000001, '2025-01-11T09:00:00Z');
 INSERT INTO likes (source_id, target_id, liked_at) VALUES
-  (cccccccc-cccc-cccc-cccc-cccccccccccc, p0000005-0000-0000-0000-000000000005, '2025-01-20T10:00:00Z');
+  (cccccccc-cccc-cccc-cccc-cccccccccccc, b0000005-0000-0000-0000-000000000005, '2025-01-20T10:00:00Z');
 
 -- Eve likes Bob's post and Carol's post
 INSERT INTO likes (source_id, target_id, liked_at) VALUES
-  (eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee, p0000002-0000-0000-0000-000000000002, '2025-01-13T07:30:00Z');
+  (eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee, b0000002-0000-0000-0000-000000000002, '2025-01-13T07:30:00Z');
 INSERT INTO likes (source_id, target_id, liked_at) VALUES
-  (eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee, p0000003-0000-0000-0000-000000000003, '2025-01-16T11:00:00Z');
+  (eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee, b0000003-0000-0000-0000-000000000003, '2025-01-16T11:00:00Z');
 
 -- David likes Grace's post
 INSERT INTO likes (source_id, target_id, liked_at) VALUES
-  (dddddddd-dddd-dddd-dddd-dddddddddddd, p0000006-0000-0000-0000-000000000006, '2025-01-22T14:00:00Z');
+  (dddddddd-dddd-dddd-dddd-dddddddddddd, b0000006-0000-0000-0000-000000000006, '2025-01-22T14:00:00Z');
 
 -- Employment
 -- Alice and Bob work at Acme Corp

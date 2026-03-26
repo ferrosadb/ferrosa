@@ -191,9 +191,18 @@ impl CommitLog {
                     drop(seg);
                     self.force_rotate()?;
                     let new_seg = self.active.load_full();
-                    let offset = new_seg
-                        .allocate_and_begin_write(total_size)
-                        .expect("freshly rotated segment should have space");
+                    let offset = match new_seg.allocate_and_begin_write(total_size) {
+                        Some(o) => o,
+                        None => {
+                            // Entry exceeds segment capacity. This happens when
+                            // a single mutation is larger than segment_size.
+                            // Return an error instead of panicking.
+                            return Err(ferrosa_common::Error::InvalidData(format!(
+                                "commit log entry ({total_size} bytes) exceeds \
+                                 segment capacity; increase segment_size"
+                            )));
+                        }
+                    };
                     (new_seg, offset)
                 }
             }

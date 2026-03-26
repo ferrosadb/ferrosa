@@ -123,6 +123,10 @@ pub struct StorageEngine {
     batchlog: Option<crate::batchlog::BatchlogManager>,
     /// Background archiver task handle, if archiving is enabled.
     archiver_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Whether the configured object store supports conditional puts (CAS).
+    /// Set once at startup via `probe_conditional_put_support()`.
+    /// When false, manifest writes use unconditional overwrite.
+    s3_cas_supported: bool,
 }
 
 /// Per-table state: schema + store.
@@ -210,7 +214,22 @@ impl StorageEngine {
                 crate::batchlog::BatchlogConfig::default(),
             )),
             archiver_handle: None,
+            s3_cas_supported: true, // default; call probe_s3_cas() after construction
         })
+    }
+
+    /// Probe the configured object store for conditional put support.
+    /// Call this once after construction when an S3 store is configured.
+    /// Sets `s3_cas_supported` to false if the store (e.g. RustFS) doesn't
+    /// support etag-based conditional writes.
+    pub async fn probe_s3_cas(&mut self) {
+        if let Ok((_, store)) = self.object_store_and_config() {
+            let supported = crate::manifest::probe_conditional_put_support(store.as_ref()).await;
+            if !supported {
+                tracing::info!("object store does not support conditional puts — using unconditional manifest writes");
+            }
+            self.s3_cas_supported = supported;
+        }
     }
 
     /// Creates a storage engine with an explicit archive object store.
@@ -329,6 +348,7 @@ impl StorageEngine {
                 crate::batchlog::BatchlogConfig::default(),
             )),
             archiver_handle,
+            s3_cas_supported: true,
         })
     }
 
@@ -399,6 +419,7 @@ impl StorageEngine {
                 crate::batchlog::BatchlogConfig::default(),
             )),
             archiver_handle: None,
+            s3_cas_supported: true,
         };
 
         Ok((engine, pending_mutations))
@@ -1158,10 +1179,9 @@ impl StorageEngine {
 
         state.store.flush()?;
 
-        // Submit index rebuild for the newly flushed SSTable if needed.
-        // This handles the case where CREATE INDEX was called after data
-        // was already in the memtable -- flush produces the SSTable but
-        // the sidecar may be incomplete, so we rebuild it.
+        // Eager index build: submit high-priority index rebuild for the newly
+        // flushed SSTable. This keeps the MemtableIndex (Layer 4) bounded to
+        // 0-1 entries in steady state by ensuring sidecar indexes are current.
         if let Some(ref scheduler) = self.index_scheduler {
             let gen = state.store.last_flush_generation();
             for (index_name, col_pos) in state.store.indexed_columns() {
@@ -1179,7 +1199,7 @@ impl StorageEngine {
                                 table_id.keyspace().to_string(),
                                 table_id.table().to_string(),
                             ),
-                            priority: crate::index::BuildPriority::Normal,
+                            priority: crate::index::BuildPriority::High,
                             enqueued_at: std::time::Instant::now(),
                             column_position: *col_pos,
                         };
@@ -1261,7 +1281,8 @@ impl StorageEngine {
                     eprintln!("[compaction] swap failed: {e}");
                 }
 
-                // Submit index rebuild jobs for the compacted output.
+                // Eager index build: submit high-priority rebuild for compacted output.
+                // Same as flush — keeps MemtableIndex bounded in steady state.
                 if let Some(ref scheduler) = self.index_scheduler {
                     for (index_name, col_pos) in state.store.indexed_columns() {
                         let job = crate::index::IndexBuildJob {
@@ -1272,7 +1293,7 @@ impl StorageEngine {
                                 table_id.keyspace().to_string(),
                                 table_id.table().to_string(),
                             ),
-                            priority: crate::index::BuildPriority::Normal,
+                            priority: crate::index::BuildPriority::High,
                             enqueued_at: std::time::Instant::now(),
                             column_position: *col_pos,
                         };
@@ -1413,6 +1434,11 @@ impl StorageEngine {
         self.upload_manager.is_some()
     }
 
+    /// Returns the shared index state tracker.
+    pub fn index_tracker(&self) -> &Arc<crate::index::IndexStateTracker> {
+        &self.index_tracker
+    }
+
     /// Returns the S3 object store and config, if S3 is configured.
     pub fn object_store_and_config(
         &self,
@@ -1514,7 +1540,9 @@ impl StorageEngine {
 
         if uploaded > 0 {
             // Save updated manifest.
-            manifest.save_with_retry(store.as_ref(), &prefix).await?;
+            manifest
+                .save_with_retry(store.as_ref(), &prefix, self.s3_cas_supported)
+                .await?;
             eprintln!("[s3-sync] uploaded {uploaded} SSTables, manifest saved");
         }
 
@@ -1638,6 +1666,58 @@ impl StorageEngine {
                 }
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual table provider implementations
+// ---------------------------------------------------------------------------
+
+impl crate::virtual_tables::StorageStatsProvider for StorageEngine {
+    fn collect_stats(&self) -> Vec<crate::virtual_tables::StorageStats> {
+        let tables = self.tables.read();
+        tables
+            .iter()
+            .map(|(table_id, state)| crate::virtual_tables::StorageStats {
+                keyspace: table_id.keyspace().to_string(),
+                table_name: table_id.table().to_string(),
+                memtable_size_bytes: state.store.memtable_size() as i64,
+                memtable_count: 1, // One active memtable per table
+                sstable_count: state.store.sstable_count() as i32,
+                sstable_size_bytes: 0,  // Exact tracking not yet implemented
+                s3_object_count: 0,     // S3 stats not yet tracked per-table
+                s3_bytes: 0,            // S3 stats not yet tracked per-table
+                pending_compactions: 0, // Per-table pending count not yet exposed
+            })
+            .collect()
+    }
+}
+
+impl crate::virtual_tables::ArchiveStatusProvider for StorageEngine {
+    fn archive_status(&self) -> crate::virtual_tables::ArchiveStatusRow {
+        let archived = self.commit_log.archived_segments();
+        crate::virtual_tables::ArchiveStatusRow {
+            // Approximate: total closed segments minus archived ones would
+            // require knowing the full closed set. For now report archived count
+            // as "0 unarchived" if any archiving has occurred.
+            unarchived_segments: 0,
+            oldest_unarchived_age_secs: 0,
+            last_archive_success: if archived.is_empty() {
+                "never".to_string()
+            } else {
+                "unknown".to_string()
+            },
+            archive_errors_total: 0,
+        }
+    }
+}
+
+/// Snapshot listing requires async S3 access which cannot be called from
+/// the synchronous `VirtualTable::read` method. Returns an empty list
+/// until a background cache is implemented.
+impl crate::virtual_tables::SnapshotInfoProvider for StorageEngine {
+    fn snapshot_info(&self) -> Vec<crate::virtual_tables::SnapshotInfoRow> {
+        Vec::new()
     }
 }
 
@@ -1987,6 +2067,185 @@ mod tests {
             1,
             "one SSTable should exist after flush_all"
         );
+    }
+
+    /// Regression test: write data, flush to SSTable, read back the exact
+    /// partition key. Catches format mismatches where read_exact_at fails
+    /// with "wanted N bytes, got M" after a flush (e.g., when the SSTable
+    /// format changes between binary versions).
+    #[test]
+    fn write_flush_read_point_query_no_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // Table with composite partition key + clustering + regular column
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "memo_cache".into(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.UTF8Type)".into(),
+            clustering_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "tenant_id".into(),
+                type_name: "org.apache.cassandra.db.marshal.UUIDType".into(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "result".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new("test_ks", "memo_cache");
+
+        // Write multiple partitions with different composite keys
+        for i in 0..5 {
+            let pk_bytes = format!("hash_{i}\x00v1");
+            let key = DecoratedKey::new(PartitionKey::new(pk_bytes.into_bytes()));
+            let row = Row {
+                clustering: vec![0u8; 16], // UUID-sized clustering
+                cells: vec![(
+                    0,
+                    CellValue::live(format!("result_{i}").into_bytes(), 1000 + i),
+                )],
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                    1000 + i,
+                ),
+            };
+            engine.write(&tid, &key, row, 1000 + i).unwrap();
+        }
+
+        // Force flush to SSTable
+        engine.flush_all().unwrap();
+        assert!(engine.sstable_count(&tid) >= 1, "should have flushed");
+
+        // Point read each partition — must not error
+        for i in 0..5 {
+            let pk_bytes = format!("hash_{i}\x00v1");
+            let key = DecoratedKey::new(PartitionKey::new(pk_bytes.into_bytes()));
+            let result = engine.read(&tid, &key);
+            assert!(
+                result.is_ok(),
+                "point read after flush failed for partition {i}: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// Regression: SSTable corruption with long composite partition keys.
+    /// Row 1 (long value) corrupts after flush; Row 2 (short value) survives.
+    /// Reproduces the exact memo_cache scenario from production.
+    #[test]
+    fn write_flush_read_long_composite_pk_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // memo_cache schema: ((content_hash text, model_version text), tenant_id uuid)
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "agent_memory".into(),
+            table: "memo_cache".into(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.UTF8Type)".into(),
+            clustering_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "tenant_id".into(),
+                type_name: "org.apache.cassandra.db.marshal.UUIDType".into(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "result".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new("agent_memory", "memo_cache");
+
+        // Row 1: long hash + medium model version + 31-byte result (CORRUPTS in prod)
+        let hash1 = "cac0302657b4c1d0dfd5aec98f2754f46a42f117e53c77a9ba384ebf2095633a"; // pragma: allowlist secret
+        let model1 = "claude-opus-4-6";
+        let result1 = "The capital of France is Paris.";
+        // Composite key encoding: [u16 len][bytes][0x00] per component
+        let mut pk1_bytes = Vec::new();
+        pk1_bytes.extend_from_slice(&(hash1.len() as u16).to_be_bytes());
+        pk1_bytes.extend_from_slice(hash1.as_bytes());
+        pk1_bytes.push(0x00);
+        pk1_bytes.extend_from_slice(&(model1.len() as u16).to_be_bytes());
+        pk1_bytes.extend_from_slice(model1.as_bytes());
+        pk1_bytes.push(0x00);
+
+        let key1 = DecoratedKey::new(PartitionKey::new(pk1_bytes.clone()));
+        let row1 = Row {
+            clustering: vec![0x11u8; 16], // UUID
+            cells: vec![(0, CellValue::live(result1.as_bytes().to_vec(), 1000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key1, row1, 1000).unwrap();
+
+        // Row 2: long hash + short model version + 1-byte result (SURVIVES in prod)
+        let hash2 = "4bbe47ee6bb1d0ecaa4d47fce3d99e2044cdfdbfac4dde0c0c083f97e4fad000"; // pragma: allowlist secret
+        let model2 = "test-v1";
+        let result2 = "4";
+        let mut pk2_bytes = Vec::new();
+        pk2_bytes.extend_from_slice(&(hash2.len() as u16).to_be_bytes());
+        pk2_bytes.extend_from_slice(hash2.as_bytes());
+        pk2_bytes.push(0x00);
+        pk2_bytes.extend_from_slice(&(model2.len() as u16).to_be_bytes());
+        pk2_bytes.extend_from_slice(model2.as_bytes());
+        pk2_bytes.push(0x00);
+
+        let key2 = DecoratedKey::new(PartitionKey::new(pk2_bytes.clone()));
+        let row2 = Row {
+            clustering: vec![0x22u8; 16], // UUID
+            cells: vec![(0, CellValue::live(result2.as_bytes().to_vec(), 2000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
+        };
+        engine.write(&tid, &key2, row2, 2000).unwrap();
+
+        // Verify memtable reads work
+        assert!(
+            engine.read(&tid, &key1).unwrap().is_some(),
+            "row1 memtable read"
+        );
+        assert!(
+            engine.read(&tid, &key2).unwrap().is_some(),
+            "row2 memtable read"
+        );
+
+        // Flush to SSTable
+        engine.flush_all().unwrap();
+        assert!(engine.sstable_count(&tid) >= 1);
+
+        // Point reads after flush — BOTH must succeed with data
+        let p1 = engine
+            .read(&tid, &key1)
+            .expect("row1 read after flush should not error")
+            .expect("row1 should exist after flush");
+        assert!(
+            !p1.rows.is_empty(),
+            "row1 partition should have rows after flush"
+        );
+
+        let p2 = engine
+            .read(&tid, &key2)
+            .expect("row2 read after flush should not error")
+            .expect("row2 should exist after flush");
+        assert!(
+            !p2.rows.is_empty(),
+            "row2 partition should have rows after flush"
+        );
+
+        // Range scan should return both partitions
+        let all = engine.read_range(&tid, None, None, 100).unwrap();
+        assert_eq!(all.len(), 2, "range scan should find both partitions");
     }
 
     /// A test observer that counts `on_write` calls.
@@ -2417,7 +2676,7 @@ mod tests {
             // Set up: manifest + schema in S3, then create a snapshot.
             let manifest = crate::manifest::Manifest::new();
             manifest
-                .save_with_retry(store.as_ref(), prefix)
+                .save_with_retry(store.as_ref(), prefix, true)
                 .await
                 .unwrap();
             crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
@@ -2473,7 +2732,7 @@ mod tests {
 
             let manifest = crate::manifest::Manifest::new();
             manifest
-                .save_with_retry(store.as_ref(), prefix)
+                .save_with_retry(store.as_ref(), prefix, true)
                 .await
                 .unwrap();
             crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
@@ -2537,7 +2796,7 @@ mod tests {
 
             let manifest = crate::manifest::Manifest::new();
             manifest
-                .save_with_retry(store.as_ref(), prefix)
+                .save_with_retry(store.as_ref(), prefix, true)
                 .await
                 .unwrap();
             crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
@@ -2633,7 +2892,7 @@ mod tests {
             // Save a manifest and schema so snapshot can load them.
             let manifest = crate::manifest::Manifest::new();
             manifest
-                .save_with_retry(store.as_ref(), prefix)
+                .save_with_retry(store.as_ref(), prefix, true)
                 .await
                 .unwrap();
             crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
@@ -2865,5 +3124,335 @@ mod tests {
         engine.register_system_tables().unwrap();
         // Second call should not error.
         engine.register_system_tables().unwrap();
+    }
+
+    /// FRSA-BUG-026: write a row with a map-typed cell value (CQL binary
+    /// format), flush to SSTable, read back. The read must not error with
+    /// "read_exact_at: wanted 1 bytes, got 0".
+    #[test]
+    fn write_flush_read_map_cell_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // Temporal's queue_metadata: (queue_type int PK, cluster_ack_level map<text,bigint>, version bigint)
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "temporal".into(),
+            table: "queue_metadata".into(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                ferrosa_common::ColumnDefinition {
+                    name: "cluster_ack_level".into(),
+                    type_name: "org.apache.cassandra.db.marshal.MapType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.LongType)".into(),
+                },
+                ferrosa_common::ColumnDefinition {
+                    name: "version".into(),
+                    type_name: "org.apache.cassandra.db.marshal.LongType".into(),
+                },
+            ],
+        };
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new("temporal", "queue_metadata");
+
+        // Write a row: queue_type=1, cluster_ack_level={} (empty map), version=0
+        let pk_bytes = 1i32.to_be_bytes().to_vec();
+        let key = DecoratedKey::new(PartitionKey::new(pk_bytes));
+
+        // Empty map in CQL binary: [i32 count=0] = 4 bytes of zeros
+        let empty_map_bytes = 0i32.to_be_bytes().to_vec();
+        let version_bytes = 0i64.to_be_bytes().to_vec();
+
+        let row = Row {
+            clustering: vec![],
+            cells: vec![
+                (0, CellValue::live(empty_map_bytes, 1000)),
+                (1, CellValue::live(version_bytes, 1000)),
+            ],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key, row, 1000).unwrap();
+
+        // Read from memtable — should work
+        let memtable_result = engine.read(&tid, &key);
+        assert!(
+            memtable_result.is_ok(),
+            "memtable read failed: {:?}",
+            memtable_result.err()
+        );
+        assert!(
+            memtable_result.unwrap().is_some(),
+            "row should exist in memtable"
+        );
+
+        // Flush to SSTable
+        engine.flush_all().unwrap();
+        assert!(
+            engine.sstable_count(&tid) >= 1,
+            "should have flushed to SSTable"
+        );
+
+        // Read from SSTable — this is where FRSA-BUG-026 fails
+        let sstable_result = engine.read(&tid, &key);
+        assert!(
+            sstable_result.is_ok(),
+            "SSTable read after flush failed: {:?}",
+            sstable_result.err()
+        );
+        assert!(
+            sstable_result.unwrap().is_some(),
+            "row should exist in SSTable"
+        );
+    }
+
+    // ── FMEA: SSTable corruption resilience ─────────────────────────────
+
+    /// FMEA #1: Truncating an SSTable Data.db file should not crash reads.
+    /// The read should return data from the memtable or other SSTables,
+    /// logging a warning about the corrupt SSTable.
+    #[test]
+    fn read_survives_truncated_sstable_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "resilience".into(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "v".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+        let tid = TableId::new("test_ks", "resilience");
+
+        // Write and flush to SSTable
+        let key = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key, row, 1000).unwrap();
+        engine.flush_all().unwrap();
+
+        // Corrupt: truncate the Data.db file to 1 byte
+        let sstable_dir = dir.path().join("sstables/test_ks.resilience");
+        if let Ok(entries) = std::fs::read_dir(&sstable_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.to_string_lossy().ends_with("-Data.db") {
+                    std::fs::write(&path, [0u8]).unwrap();
+                }
+            }
+        }
+
+        // Read should NOT crash — should return None (data lost but no panic)
+        let result = engine.read(&tid, &key);
+        assert!(
+            result.is_ok(),
+            "read with corrupt SSTable should not crash: {:?}",
+            result.err()
+        );
+        // Data may be lost (from corrupt SSTable) but the operation didn't crash
+    }
+
+    /// FMEA #6: Zero-length Data.db should not crash reads.
+    #[test]
+    fn read_survives_zero_length_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "zero_data".into(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "v".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+        let tid = TableId::new("test_ks", "zero_data");
+
+        let key = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key, row, 1000).unwrap();
+        engine.flush_all().unwrap();
+
+        // Corrupt: zero out the Data.db file
+        let sstable_dir = dir.path().join("sstables/test_ks.zero_data");
+        if let Ok(entries) = std::fs::read_dir(&sstable_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.to_string_lossy().ends_with("-Data.db") {
+                    std::fs::write(&path, []).unwrap();
+                }
+            }
+        }
+
+        let result = engine.read(&tid, &key);
+        assert!(
+            result.is_ok(),
+            "read with zero-length SSTable should not crash: {:?}",
+            result.err()
+        );
+    }
+
+    /// FMEA #9: Write data, flush, ALTER TABLE ADD column, write more,
+    /// flush again, read back — old SSTables should still be readable.
+    #[test]
+    fn read_survives_schema_evolution_across_sstables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // Original schema: (k int PK, v text)
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "evolving".into(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "v".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+        let tid = TableId::new("test_ks", "evolving");
+
+        // Write row with 1 column, flush to SSTable
+        let key1 = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+        let row1 = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"old".to_vec(), 1000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key1, row1, 1000).unwrap();
+        engine.flush_all().unwrap();
+
+        // "ALTER TABLE ADD" — write row with 2 columns (cell index 0 and 1)
+        let key2 = DecoratedKey::new(PartitionKey::new(2i32.to_be_bytes().to_vec()));
+        let row2 = Row {
+            clustering: vec![],
+            cells: vec![
+                (0, CellValue::live(b"new_v".to_vec(), 2000)),
+                (1, CellValue::live(b"extra".to_vec(), 2000)),
+            ],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
+        };
+        engine.write(&tid, &key2, row2, 2000).unwrap();
+        engine.flush_all().unwrap();
+
+        // Read both rows — old SSTable should not crash
+        let r1 = engine.read(&tid, &key1);
+        assert!(r1.is_ok(), "old row read failed: {:?}", r1.err());
+        assert!(r1.unwrap().is_some(), "old row should exist");
+
+        let r2 = engine.read(&tid, &key2);
+        assert!(r2.is_ok(), "new row read failed: {:?}", r2.err());
+        assert!(r2.unwrap().is_some(), "new row should exist");
+    }
+
+    /// FMEA #8: Memtable write + new data in memtable should still work
+    /// even if an SSTable is corrupt.
+    #[test]
+    fn memtable_data_survives_corrupt_sstable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "survive".into(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "v".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+        let tid = TableId::new("test_ks", "survive");
+
+        // Write old data and flush
+        let key_old = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"flushed".to_vec(), 1000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key_old, row, 1000).unwrap();
+        engine.flush_all().unwrap();
+
+        // Corrupt the SSTable
+        let sstable_dir = dir.path().join("sstables/test_ks.survive");
+        if let Ok(entries) = std::fs::read_dir(&sstable_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.to_string_lossy().ends_with("-Data.db") {
+                    std::fs::write(&path, [0xDE, 0xAD]).unwrap();
+                }
+            }
+        }
+
+        // Write new data to memtable
+        let key_new = DecoratedKey::new(PartitionKey::new(2i32.to_be_bytes().to_vec()));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"memtable".to_vec(), 2000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
+        };
+        engine.write(&tid, &key_new, row, 2000).unwrap();
+
+        // Read new data from memtable — should work despite corrupt SSTable
+        let r = engine.read(&tid, &key_new);
+        assert!(r.is_ok(), "memtable read should work: {:?}", r.err());
+        assert!(r.unwrap().is_some(), "memtable row should exist");
+
+        // Read old data — corrupt SSTable, but should not crash
+        let r_old = engine.read(&tid, &key_old);
+        assert!(
+            r_old.is_ok(),
+            "read of corrupt SSTable data should not crash: {:?}",
+            r_old.err()
+        );
     }
 }

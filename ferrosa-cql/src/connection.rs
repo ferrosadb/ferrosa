@@ -32,7 +32,7 @@ use crate::prepared::{PreparedCache, PreparedPlan};
 use crate::result;
 use crate::router::{RequestContext, RouteResult, SharedState};
 use crate::subscribe::SubscriptionState;
-use crate::types::{decode_value, CqlType};
+use crate::types::{decode_value, CqlType, CqlValue};
 use crate::virtual_tables::connections::{ConnectionInfo, ConnectionTracker};
 
 use ferrosa_schema::AuthContext;
@@ -398,7 +398,7 @@ enum FrameOrPush {
 }
 
 /// Outcome of processing a single frame.
-enum HandleResult {
+pub(crate) enum HandleResult {
     /// Send a response and continue reading.
     Reply(Opcode, BytesMut),
     /// Send a response and then close the connection.
@@ -736,7 +736,7 @@ async fn handle_query(
 
 // ── PREPARE ──────────────────────────────────────────────────────────────
 
-fn handle_prepare(
+pub(crate) fn handle_prepare(
     _auth_context: &mut Option<AuthContext>,
     current_keyspace: &mut Option<String>,
     state: &SharedState,
@@ -805,6 +805,7 @@ fn handle_prepare(
         &result_types,
         &table_ks,
         &table_name,
+        &[],
     );
 
     HandleResult::Reply(Opcode::Result, result_body)
@@ -1035,6 +1036,8 @@ fn build_request_context<'a>(
         auth: auth_context.as_ref().unwrap(),
         current_keyspace,
         consistency,
+        serial_consistency: None,
+        paging: crate::paging::PagingParams::default(),
     }
 }
 
@@ -1143,6 +1146,14 @@ fn analyze_prepared_columns(
                     }
                 }
             }
+            // Bind markers in IF conditions (LWT)
+            for cond in &u.if_conditions {
+                if matches!(cond.value, Term::BindMarker(_)) {
+                    if let Some(cql_type) = resolve(&cond.column) {
+                        bound_columns.push((cond.column.clone(), cql_type));
+                    }
+                }
+            }
         }
         Statement::Delete(d) => {
             // Bind markers in WHERE clauses
@@ -1208,6 +1219,67 @@ fn build_result_columns(
     result
 }
 
+/// Convert a decoded `CqlValue` back into a parser-level `Term` for AST substitution.
+///
+/// This is the reverse of `bridge::term_to_cql_value`. We only need to cover the
+/// scalar types that appear as bind-variable values; collections and UDTs are
+/// passed through as blob literals (the router will re-decode them).
+fn cql_value_to_term(v: &CqlValue) -> Term {
+    match v {
+        CqlValue::Null => Term::Null,
+        CqlValue::Int(n) => Term::IntegerLiteral(*n as i64),
+        CqlValue::Bigint(n) | CqlValue::Counter(n) | CqlValue::Timestamp(n) => {
+            Term::IntegerLiteral(*n)
+        }
+        CqlValue::Smallint(n) => Term::IntegerLiteral(*n as i64),
+        CqlValue::Tinyint(n) => Term::IntegerLiteral(*n as i64),
+        CqlValue::Float(bits) => Term::FloatLiteral(f32::from_bits(*bits) as f64),
+        CqlValue::Double(bits) => Term::FloatLiteral(f64::from_bits(*bits)),
+        CqlValue::Text(s) | CqlValue::Ascii(s) => Term::StringLiteral(s.clone()),
+        CqlValue::Boolean(b) => Term::BoolLiteral(*b),
+        CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => Term::UuidLiteral(*u),
+        CqlValue::Blob(b) => Term::BlobLiteral(b.clone()),
+        CqlValue::Inet(addr) => Term::StringLiteral(addr.to_string()),
+        CqlValue::Date(d) => Term::IntegerLiteral(*d as i64),
+        CqlValue::Time(t) => Term::IntegerLiteral(*t),
+        CqlValue::Varint(big) => {
+            // Best-effort: try to fit into i64, otherwise render as string.
+            match i64::try_from(big) {
+                Ok(n) => Term::IntegerLiteral(n),
+                Err(_) => Term::StringLiteral(big.to_string()),
+            }
+        }
+        CqlValue::Decimal { .. } => {
+            // Decimals don't have a direct Term representation; use string.
+            Term::StringLiteral(format!("{v:?}"))
+        }
+        CqlValue::Duration { .. } => Term::StringLiteral(format!("{v:?}")),
+        // Collections: encode back to blob bytes so the router re-decodes them.
+        CqlValue::List(items) => Term::ListLiteral(items.iter().map(cql_value_to_term).collect()),
+        CqlValue::Set(items) => Term::SetLiteral(items.iter().map(cql_value_to_term).collect()),
+        CqlValue::Map(pairs) => Term::MapLiteral(
+            pairs
+                .iter()
+                .map(|(k, v)| (cql_value_to_term(k), cql_value_to_term(v)))
+                .collect(),
+        ),
+        CqlValue::Tuple(elems) => Term::TupleLiteral(
+            elems
+                .iter()
+                .map(|e| match e {
+                    Some(v) => cql_value_to_term(v),
+                    None => Term::Null,
+                })
+                .collect(),
+        ),
+        CqlValue::Vector(_) | CqlValue::Udt(_) => {
+            // Opaque types: pass as debug string. The router handles these
+            // through the typed path, not AST substitution.
+            Term::StringLiteral(format!("{v:?}"))
+        }
+    }
+}
+
 /// Parse bound values from the EXECUTE frame cursor and substitute them
 /// into the prepared statement AST, replacing `BindMarker` nodes with
 /// literal `Term` values.
@@ -1262,7 +1334,7 @@ fn substitute_bound_values(plan: &PreparedPlan, mut cursor: &[u8]) -> Result<Sta
             };
 
             let cql_value = decode_value(cql_type, val_bytes)?;
-            bound_terms.push(bridge::cql_value_to_term(&cql_value));
+            bound_terms.push(cql_value_to_term(&cql_value));
         }
     }
 

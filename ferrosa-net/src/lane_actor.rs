@@ -407,14 +407,30 @@ mod tests {
         assert_eq!(handle.lane(), Lane::Raft);
 
         // Send should return LaneFailed for a Failed lane.
-        let result = handle.send(Message::Ping { nonce: 1 }, None).await;
+        let result = handle
+            .send(
+                Message::Ping {
+                    nonce: 1,
+                    sent_at: 0,
+                },
+                None,
+            )
+            .await;
         assert!(
             matches!(result, Err(NetError::LaneFailed)),
             "expected LaneFailed, got {result:?}"
         );
 
         // Fire should also return LaneFailed.
-        let result = handle.fire(Message::Ping { nonce: 2 }, None).await;
+        let result = handle
+            .fire(
+                Message::Ping {
+                    nonce: 2,
+                    sent_at: 0,
+                },
+                None,
+            )
+            .await;
         assert!(
             matches!(result, Err(NetError::LaneFailed)),
             "expected LaneFailed, got {result:?}"
@@ -450,7 +466,15 @@ mod tests {
 
         assert_eq!(handle.lane(), Lane::Data);
 
-        let result = handle.send(Message::Ping { nonce: 1 }, None).await;
+        let result = handle
+            .send(
+                Message::Ping {
+                    nonce: 1,
+                    sent_at: 0,
+                },
+                None,
+            )
+            .await;
         assert!(
             matches!(result, Err(NetError::Reconnecting)),
             "expected Reconnecting, got {result:?}"
@@ -517,7 +541,15 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
 
-        let result = handle.send(Message::Ping { nonce: 1 }, None).await;
+        let result = handle
+            .send(
+                Message::Ping {
+                    nonce: 1,
+                    sent_at: 0,
+                },
+                None,
+            )
+            .await;
         assert!(
             matches!(result, Err(NetError::LaneFailed)),
             "expected LaneFailed after shutdown, got {result:?}"

@@ -85,6 +85,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 allow_filtering: false,
+                ann_of: None,
             }),
             keyspace: Some("ks".into()),
             result_columns: vec![("id".into(), CqlType::Int)],

@@ -101,6 +101,7 @@ pub enum IndexType {
     Composite,
     Phonetic,
     Filtered,
+    Vector,
 }
 
 impl fmt::Display for IndexType {
@@ -110,6 +111,7 @@ impl fmt::Display for IndexType {
             IndexType::Hash => write!(f, "hash"),
             IndexType::Composite => write!(f, "composite"),
             IndexType::Phonetic => write!(f, "phonetic"),
+            IndexType::Vector => write!(f, "vector"),
             IndexType::Filtered => write!(f, "filtered"),
         }
     }
