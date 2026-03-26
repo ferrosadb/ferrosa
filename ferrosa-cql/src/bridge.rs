@@ -1009,9 +1009,12 @@ pub fn partition_to_rows(
             }
         }
 
-        // Fill regular columns from cells
+        // Fill regular columns from cells.
+        // Cell col_index is regular-only (SSTable SerializationHeader order).
+        // Offset by PK + CK count to map to the full output_row position.
+        let regular_offset = pk_columns.len() + ck_columns.len();
         for (col_index, cell) in &row.cells {
-            let idx = *col_index as usize;
+            let idx = *col_index as usize + regular_offset;
             if idx < column_types.len() {
                 if cell.is_tombstone() {
                     output_row[idx] = None;
@@ -1535,7 +1538,7 @@ mod tests {
         let cell_bytes = encode_value(&CqlValue::Text("alice".into()));
         let row = Row {
             clustering: vec![],
-            cells: vec![(1, CellValue::live(cell_bytes, 1000))],
+            cells: vec![(0, CellValue::live(cell_bytes, 1000))], // regular col 0 = "name"
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
@@ -1598,7 +1601,7 @@ mod tests {
 
         let row = Row {
             clustering: vec![],
-            cells: vec![(1, CellValue::tombstone(1000, 1700000000))],
+            cells: vec![(0, CellValue::tombstone(1000, 1700000000))], // regular col 0 = "name"
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
@@ -1621,6 +1624,85 @@ mod tests {
         assert_eq!(rows[0][0], Some(CqlValue::Int(1)));
         // Tombstone cell -> None
         assert_eq!(rows[0][1], None);
+    }
+
+    /// Regression test: cell column indices in SSTable use regular-only
+    /// numbering (0, 1, 2 for regular columns, excluding PK and CK).
+    /// partition_to_rows must offset these by pk_count + ck_count.
+    ///
+    /// Table: (pk int, ck int, val1 text, val2 text, val3 text)
+    /// Cell index 0 → val1 (output[2]), NOT pk (output[0])
+    #[test]
+    fn partition_to_rows_cell_index_offset_for_pk_ck() {
+        use ferrosa_sstable::types::Partition;
+
+        let pk_bytes = encode_value(&CqlValue::Int(1));
+        let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
+
+        let ck_bytes = 100i32.to_be_bytes().to_vec();
+
+        // 3 regular columns: val1(0), val2(1), val3(2) — SSTable indices
+        let row = Row {
+            clustering: ck_bytes,
+            cells: vec![
+                (
+                    0,
+                    CellValue::live(encode_value(&CqlValue::Text("AAA".into())), 1000),
+                ),
+                (
+                    1,
+                    CellValue::live(encode_value(&CqlValue::Text("BBB".into())), 1000),
+                ),
+                (
+                    2,
+                    CellValue::live(encode_value(&CqlValue::Text("CCC".into())), 1000),
+                ),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+
+        let partition = Partition {
+            key: dk,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row],
+        };
+
+        // Output columns: [pk, ck, val1, val2, val3]
+        let col_names: Vec<String> = vec!["pk", "ck", "val1", "val2", "val3"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let col_types = vec![
+            CqlType::Int,
+            CqlType::Int,
+            CqlType::Varchar,
+            CqlType::Varchar,
+            CqlType::Varchar,
+        ];
+        let pk_columns = vec![0usize]; // pk at output[0]
+        let ck_columns = vec![1usize]; // ck at output[1]
+
+        let rows = partition_to_rows(&partition, &col_names, &col_types, &pk_columns, &ck_columns);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Some(CqlValue::Int(1)), "pk should be 1");
+        assert_eq!(rows[0][1], Some(CqlValue::Int(100)), "ck should be 100");
+        assert_eq!(
+            rows[0][2],
+            Some(CqlValue::Text("AAA".into())),
+            "val1 (regular col 0) should be at output[2]"
+        );
+        assert_eq!(
+            rows[0][3],
+            Some(CqlValue::Text("BBB".into())),
+            "val2 (regular col 1) should be at output[3]"
+        );
+        assert_eq!(
+            rows[0][4],
+            Some(CqlValue::Text("CCC".into())),
+            "val3 (regular col 2) should be at output[4]"
+        );
     }
 
     // --- resolve_type_name tests ---

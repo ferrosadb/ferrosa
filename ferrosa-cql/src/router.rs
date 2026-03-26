@@ -1415,11 +1415,16 @@ async fn route_insert(
             ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
             ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
             ColumnKind::Regular | ColumnKind::Static => {
-                let col_idx =
-                    table_meta.columns.get_index_of(col_name).ok_or_else(|| {
-                        CqlError::Invalid(format!("column '{}' not found", col_name))
-                    })? as u16;
-                regular_cells.push((col_idx, value));
+                // Cell column index must match SSTable's SerializationHeader
+                // which indexes regular columns only (excluding PK and CK).
+                let regular_idx = table_meta
+                    .columns
+                    .values()
+                    .filter(|c| c.kind == ColumnKind::Regular || c.kind == ColumnKind::Static)
+                    .position(|c| c.name == *col_name)
+                    .ok_or_else(|| CqlError::Invalid(format!("column '{}' not found", col_name)))?
+                    as u16;
+                regular_cells.push((regular_idx, value));
             }
         }
     }
@@ -1609,12 +1614,14 @@ async fn route_update(
                 (column.as_str(), val)
             }
         };
-        let col_idx = table_meta
+        let regular_idx = table_meta
             .columns
-            .get_index_of(col_name)
+            .values()
+            .filter(|c| c.kind == ColumnKind::Regular || c.kind == ColumnKind::Static)
+            .position(|c| c.name == *col_name)
             .ok_or_else(|| CqlError::Invalid(format!("column '{}' not found", col_name)))?
             as u16;
-        regular_cells.push((col_idx, value));
+        regular_cells.push((regular_idx, value));
     }
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
@@ -1911,11 +1918,16 @@ fn materialize_insert(
             ColumnKind::PartitionKey => pk_vals.push((col_meta.position, value)),
             ColumnKind::Clustering => ck_vals.push((col_meta.position, value)),
             ColumnKind::Regular | ColumnKind::Static => {
-                let col_idx =
-                    table_meta.columns.get_index_of(col_name).ok_or_else(|| {
-                        CqlError::Invalid(format!("column '{}' not found", col_name))
-                    })? as u16;
-                regular_cells.push((col_idx, value));
+                // Cell column index must match SSTable's SerializationHeader
+                // which indexes regular columns only (excluding PK and CK).
+                let regular_idx = table_meta
+                    .columns
+                    .values()
+                    .filter(|c| c.kind == ColumnKind::Regular || c.kind == ColumnKind::Static)
+                    .position(|c| c.name == *col_name)
+                    .ok_or_else(|| CqlError::Invalid(format!("column '{}' not found", col_name)))?
+                    as u16;
+                regular_cells.push((regular_idx, value));
             }
         }
     }
