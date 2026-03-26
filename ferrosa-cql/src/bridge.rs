@@ -335,6 +335,7 @@ fn cql_type_name(t: &CqlType) -> &'static str {
         CqlType::Set(_) => "set",
         CqlType::Tuple(_) => "tuple",
         CqlType::Udt { .. } => "udt",
+        CqlType::Vector(_, _) => "vector",
     }
 }
 
@@ -378,6 +379,9 @@ pub fn cql_type_display_name(t: &CqlType) -> String {
             format!("tuple<{}>", inner.join(", "))
         }
         CqlType::Udt { keyspace, name, .. } => format!("{keyspace}.{name}"),
+        CqlType::Vector(elem, dim) => {
+            format!("vector<{}, {}>", cql_type_display_name(elem), dim)
+        }
     }
 }
 
@@ -565,6 +569,21 @@ impl<'a> TypeParser<'a> {
                 }
                 self.consume(b'>')?;
                 Ok(CqlType::Tuple(types))
+            }
+            "vector" => {
+                self.skip_whitespace();
+                self.consume(b'<')?;
+                let elem = self.parse_type()?;
+                self.skip_whitespace();
+                self.consume(b',')?;
+                self.skip_whitespace();
+                let dim_str = self.read_ident()?;
+                let dimension: u32 = dim_str.parse().map_err(|_| {
+                    CqlError::Invalid(format!("invalid vector dimension: '{dim_str}'"))
+                })?;
+                self.skip_whitespace();
+                self.consume(b'>')?;
+                Ok(CqlType::Vector(Box::new(elem), dimension))
             }
             "frozen" => {
                 self.skip_whitespace();

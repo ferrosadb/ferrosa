@@ -81,6 +81,11 @@ impl Manifest {
     ///
     /// If `version` doesn't match the current version in the store,
     /// returns an error (concurrent update detected).
+    ///
+    /// When the object store does not support conditional put (e.g. RustFS),
+    /// falls back to an unconditional PUT. This is safe for single-node
+    /// deployments; multi-node setups should use an S3-compatible store
+    /// that supports conditional writes.
     pub async fn save(
         &self,
         store: &dyn ObjectStore,
@@ -91,6 +96,7 @@ impl Manifest {
         let data = serde_json::to_vec_pretty(self).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to serialize manifest: {e}"))
         })?;
+        let data_bytes = Bytes::from(data);
 
         let opts = match version {
             Some(v) => PutOptions {
@@ -103,14 +109,31 @@ impl Manifest {
             },
         };
 
-        store
-            .put_opts(&path, PutPayload::from(Bytes::from(data)), opts)
+        match store
+            .put_opts(&path, PutPayload::from(data_bytes.clone()), opts)
             .await
-            .map_err(|e| {
-                ferrosa_common::Error::InvalidFormat(format!("failed to save manifest: {e}"))
-            })?;
-
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::NotImplemented) => {
+                // Object store doesn't support conditional put — fall back to
+                // unconditional PUT.
+                eprintln!(
+                    "manifest: conditional put not supported, falling back to unconditional PUT"
+                );
+                store
+                    .put(&path, PutPayload::from(data_bytes))
+                    .await
+                    .map_err(|e| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "failed to save manifest: {e}"
+                        ))
+                    })?;
+                Ok(())
+            }
+            Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
+                "failed to save manifest: {e}"
+            ))),
+        }
     }
 
     /// Saves the manifest with automatic CAS retry and exponential backoff.
@@ -359,5 +382,113 @@ mod tests {
             let loaded = load_schema_snapshot(&store, "").await.unwrap();
             assert!(loaded.is_none());
         });
+    }
+
+    /// Object store that rejects conditional PUT (PutMode::Create /
+    /// PutMode::Update) with `NotImplemented`, simulating RustFS.
+    #[derive(Debug)]
+    struct NoCasPutStore {
+        inner: InMemory,
+    }
+
+    impl std::fmt::Display for NoCasPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "NoCasPutStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for NoCasPutStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            match options.mode {
+                PutMode::Overwrite => self.inner.put_opts(location, payload, options).await,
+                _ => Err(object_store::Error::NotImplemented),
+            }
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn save_falls_back_to_unconditional_put_when_cas_not_supported() {
+        let store = NoCasPutStore {
+            inner: InMemory::new(),
+        };
+        let mut manifest = Manifest::new();
+        manifest.add_sstable("ks.table", sample_entry("sst1"));
+
+        // save with version=None triggers PutMode::Create, which our mock
+        // rejects — the fallback to unconditional PUT should succeed.
+        manifest.save(&store, "test", None).await.unwrap();
+
+        // Verify it was actually persisted.
+        let (loaded, _) = Manifest::load(&store, "test").await.unwrap();
+        assert_eq!(loaded.sstables["ks.table"].len(), 1);
+        assert_eq!(loaded.sstables["ks.table"][0].id, "sst1");
+    }
+
+    #[tokio::test]
+    async fn save_with_retry_works_when_cas_not_supported() {
+        let store = NoCasPutStore {
+            inner: InMemory::new(),
+        };
+        let mut manifest = Manifest::new();
+        manifest.add_sstable("ks.table", sample_entry("sst1"));
+
+        // save_with_retry should succeed via the fallback path.
+        manifest.save_with_retry(&store, "test").await.unwrap();
+
+        let (loaded, _) = Manifest::load(&store, "test").await.unwrap();
+        assert_eq!(loaded.sstables["ks.table"].len(), 1);
     }
 }

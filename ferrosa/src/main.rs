@@ -260,16 +260,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let schema = Arc::new(ferrosa_schema::Schema::new(schema_config)?);
 
-    // 4b. S3 bootstrap: if S3 is configured and local data is empty,
-    //     try to recover schema + table registrations from S3.
-    if storage.has_s3() {
+    // 4b. Schema and table recovery on restart.
+    //
+    // Two cases:
+    //   - Warm restart (local SSTables exist): load schema from local schema.json,
+    //     register tables so existing SSTables become readable.
+    //   - Cold restart (local data empty, S3 configured): download schema + SSTables
+    //     from S3.
+    {
         let sstables_dir = Path::new(&data_dir).join("sstables");
         let local_empty = !sstables_dir.exists()
             || std::fs::read_dir(&sstables_dir)
                 .map(|mut d| d.next().is_none())
                 .unwrap_or(true);
 
-        if local_empty {
+        if !local_empty {
+            // Warm restart: load schema from local disk and register tables.
+            let schema_path = Path::new(&data_dir).join("schema.json");
+            if schema_path.exists() {
+                match std::fs::read(&schema_path) {
+                    Ok(data) => {
+                        match serde_json::from_slice::<ferrosa_schema::SchemaSnapshot>(&data) {
+                            Ok(snapshot) => {
+                                let table_count = snapshot.tables.len();
+                                let ks_count = snapshot.keyspaces.len();
+                                if let Err(e) = schema.apply_snapshot(snapshot) {
+                                    tracing::warn!("failed to apply local schema snapshot: {e}");
+                                } else {
+                                    // Register each table with the StorageEngine so existing
+                                    // SSTables on disk become readable.
+                                    let snap = schema.snapshot();
+                                    for ((_ks, _tbl), table_meta) in &snap.tables {
+                                        if ferrosa_schema::is_system_keyspace(&table_meta.keyspace)
+                                        {
+                                            continue;
+                                        }
+                                        let storage_schema = table_meta.to_storage_schema();
+                                        if let Err(e) = storage.register_table(storage_schema) {
+                                            tracing::warn!(
+                                                table = %table_meta.name,
+                                                ks = %table_meta.keyspace,
+                                                "failed to register table from local schema: {e}"
+                                            );
+                                        }
+                                    }
+                                    tracing::info!(
+                                        ks_count,
+                                        table_count,
+                                        "warm restart: loaded schema from local disk"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::warn!("failed to parse local schema.json: {e}"),
+                        }
+                    }
+                    Err(e) => tracing::warn!("failed to read local schema.json: {e}"),
+                }
+            }
+        } else if storage.has_s3() {
             tracing::info!("S3 configured, local data empty — attempting S3 bootstrap");
             if let Err(e) = bootstrap_from_s3(&storage, &schema).await {
                 tracing::warn!("S3 bootstrap failed (non-fatal, starting fresh): {e}");

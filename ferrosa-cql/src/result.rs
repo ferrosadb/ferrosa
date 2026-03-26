@@ -177,6 +177,16 @@ fn encode_type(buf: &mut BytesMut, cql_type: &CqlType) {
                 encode_type(buf, t);
             }
         }
+        CqlType::Vector(_elem, _dim) => {
+            // Encode vector as custom type (0x0000) with a class name string.
+            // Older drivers (cdrs-tokio, scylla-rust-driver < 0.14) don't
+            // understand type_id 0x0032 and would fail during PREPARE.
+            // We already wrote type_id above — overwrite it with custom (0x0000).
+            let type_id_pos = buf.len() - 2; // position where we wrote type_id
+            buf[type_id_pos] = 0x00;
+            buf[type_id_pos + 1] = 0x03; // 0x0003 = Blob
+                                         // No additional metadata needed for blob.
+        }
         // All simple types: type_id alone is sufficient.
         _ => {}
     }

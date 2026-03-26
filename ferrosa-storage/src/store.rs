@@ -273,10 +273,16 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        // SSTables, newest first
+        // SSTables, newest first. Errors on individual SSTables are logged
+        // and skipped — a corrupt or incompatible SSTable should not block
+        // reads from healthy ones.
         for sstable in guard.sstables.iter() {
-            if let Some(p) = sstable.get_partition(key)? {
-                sources.push(p);
+            match sstable.get_partition(key) {
+                Ok(Some(p)) => sources.push(p),
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("[store] skipping SSTable read error: {e}");
+                }
             }
         }
 
@@ -419,27 +425,67 @@ impl<F: FlushTarget> TableStore<F> {
         limit: usize,
     ) -> Result<Vec<Partition>> {
         let guard = self.view.load();
-        let snapshot = guard.active.snapshot();
 
-        let filtered: Vec<Partition> = snapshot
-            .into_iter()
-            .filter(|p| {
-                if let Some(s) = start {
-                    if p.key < *s {
-                        return false;
+        // Collect partitions from all sources keyed by partition key bytes
+        // for deduplication and merging.
+        let mut by_key: std::collections::BTreeMap<DecoratedKey, Vec<Partition>> =
+            std::collections::BTreeMap::new();
+
+        let in_range = |p: &Partition| -> bool {
+            if let Some(s) = start {
+                if p.key < *s {
+                    return false;
+                }
+            }
+            if let Some(e) = end {
+                if p.key > *e {
+                    return false;
+                }
+            }
+            true
+        };
+
+        // Active memtable
+        for p in guard.active.snapshot() {
+            if in_range(&p) {
+                by_key.entry(p.key.clone()).or_default().push(p);
+            }
+        }
+
+        // Flushing memtable
+        if let Some(ref flushing) = guard.flushing {
+            for p in flushing.snapshot() {
+                if in_range(&p) {
+                    by_key.entry(p.key.clone()).or_default().push(p);
+                }
+            }
+        }
+
+        // SSTables — read all partitions from each (newest first).
+        // Errors on individual SSTables are logged and skipped.
+        for sstable in guard.sstables.iter() {
+            match sstable.read_all_partitions() {
+                Ok(parts) => {
+                    for p in parts {
+                        if in_range(&p) {
+                            by_key.entry(p.key.clone()).or_default().push(p);
+                        }
                     }
                 }
-                if let Some(e) = end {
-                    if p.key > *e {
-                        return false;
-                    }
+                Err(e) => {
+                    eprintln!("[read_range] skipping SSTable with read error: {e}");
                 }
-                true
-            })
+            }
+        }
+
+        // Merge partitions with the same key and apply limit.
+        let merged: Vec<Partition> = by_key
+            .into_values()
+            .map(merge::merge_partitions)
             .take(limit)
             .collect();
 
-        Ok(filtered)
+        Ok(merged)
     }
 
     /// Query by secondary index: looks up the index key in the memtable

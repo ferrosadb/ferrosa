@@ -42,6 +42,8 @@ pub enum CqlType {
         name: String,
         fields: Vec<(String, CqlType)>,
     },
+    /// Vector type (CQL v5): `vector<element_type, dimension>`.
+    Vector(Box<CqlType>, u32), // 0x0032
 }
 
 impl CqlType {
@@ -73,6 +75,7 @@ impl CqlType {
             Self::Set(_) => 0x0022,
             Self::Udt { .. } => 0x0030,
             Self::Tuple(_) => 0x0031,
+            Self::Vector(_, _) => 0x0032,
         }
     }
 }

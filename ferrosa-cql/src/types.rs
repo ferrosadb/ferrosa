@@ -322,6 +322,16 @@ pub fn decode_value(cql_type: &CqlType, bytes: &[u8]) -> Result<CqlValue, CqlErr
             }
             Ok(CqlValue::Udt(result_fields))
         }
+        CqlType::Vector(elem_type, _dim) => {
+            let (count, mut pos) = read_collection_header(bytes)?;
+            let mut items = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let (val, next_pos) = read_collection_element(bytes, pos, elem_type)?;
+                items.push(val);
+                pos = next_pos;
+            }
+            Ok(CqlValue::List(items))
+        }
     }
 }
 
