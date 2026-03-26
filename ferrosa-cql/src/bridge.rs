@@ -1928,4 +1928,108 @@ mod tests {
             other => panic!("expected Udt, got {:?}", other),
         }
     }
+
+    // --- cql_value_to_term roundtrip tests ---
+
+    #[test]
+    fn cql_value_to_term_uuid_roundtrip() {
+        let u = uuid::Uuid::new_v4();
+        let original = CqlValue::Uuid(u);
+        let term = cql_value_to_term(&original);
+        let roundtripped = term_to_cql_value(&term, &CqlType::Uuid).unwrap();
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn cql_value_to_term_text_roundtrip() {
+        let original = CqlValue::Text("hello world".to_string());
+        let term = cql_value_to_term(&original);
+        let roundtripped = term_to_cql_value(&term, &CqlType::Varchar).unwrap();
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn cql_value_to_term_int_roundtrip() {
+        let original = CqlValue::Int(42);
+        let term = cql_value_to_term(&original);
+        let roundtripped = term_to_cql_value(&term, &CqlType::Int).unwrap();
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn cql_value_to_term_float_roundtrip() {
+        let original = CqlValue::Float(3.125f32.to_bits());
+        let term = cql_value_to_term(&original);
+        let roundtripped = term_to_cql_value(&term, &CqlType::Float).unwrap();
+        // Compare via f32 due to f32→f64→f32 potential precision issues.
+        if let (CqlValue::Float(orig_bits), CqlValue::Float(rt_bits)) = (&original, &roundtripped) {
+            let orig_f = f32::from_bits(*orig_bits);
+            let rt_f = f32::from_bits(*rt_bits);
+            assert!(
+                (orig_f - rt_f).abs() < 1e-6,
+                "float roundtrip failed: {orig_f} vs {rt_f}"
+            );
+        } else {
+            panic!("expected Float variants");
+        }
+    }
+
+    #[test]
+    fn cql_value_to_term_timestamp_roundtrip() {
+        let original = CqlValue::Timestamp(1234567890);
+        let term = cql_value_to_term(&original);
+        let roundtripped = term_to_cql_value(&term, &CqlType::Timestamp).unwrap();
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn cql_value_to_term_blob_roundtrip() {
+        let original = CqlValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let term = cql_value_to_term(&original);
+        let roundtripped = term_to_cql_value(&term, &CqlType::Blob).unwrap();
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn cql_value_to_term_null() {
+        let original = CqlValue::Null;
+        let term = cql_value_to_term(&original);
+        assert!(matches!(term, Term::Null));
+        let roundtripped = term_to_cql_value(&term, &CqlType::Int).unwrap();
+        assert_eq!(roundtripped, CqlValue::Null);
+    }
+
+    #[test]
+    fn cql_value_to_term_list_roundtrip() {
+        let original = CqlValue::List(vec![CqlValue::Int(1), CqlValue::Int(2), CqlValue::Int(3)]);
+        let term = cql_value_to_term(&original);
+        let roundtripped =
+            term_to_cql_value(&term, &CqlType::List(Box::new(CqlType::Int))).unwrap();
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn cql_value_to_term_map_roundtrip() {
+        let original = CqlValue::Map(vec![
+            (CqlValue::Text("a".into()), CqlValue::Int(1)),
+            (CqlValue::Text("b".into()), CqlValue::Int(2)),
+        ]);
+        let term = cql_value_to_term(&original);
+        let roundtripped = term_to_cql_value(
+            &term,
+            &CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Int)),
+        )
+        .unwrap();
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn cql_value_to_term_boolean_roundtrip() {
+        for b in [true, false] {
+            let original = CqlValue::Boolean(b);
+            let term = cql_value_to_term(&original);
+            let roundtripped = term_to_cql_value(&term, &CqlType::Boolean).unwrap();
+            assert_eq!(roundtripped, original);
+        }
+    }
 }

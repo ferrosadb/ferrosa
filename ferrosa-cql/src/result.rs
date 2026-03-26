@@ -401,4 +401,52 @@ mod tests {
             "no keyspace/table strings should follow result metadata for INSERT"
         );
     }
+
+    /// Verify that PreparedMetadata includes [i32 pk_count] after [i32 columns_count].
+    ///
+    /// Buffer layout for bind metadata (PreparedMetadata):
+    ///   [i32 flags=0x0001]   (Global_tables_spec)
+    ///   [i32 columns_count]
+    ///   [i32 pk_count]       <-- this is what we verify
+    ///   ...
+    #[test]
+    fn encode_prepared_metadata_has_pk_count() {
+        let id = [0x42u8; 16];
+        let buf = encode_prepared(
+            &id,
+            &["k".into()],
+            &[CqlType::Int],
+            &[], // no result columns
+            &[],
+            "ks",
+            "t",
+        );
+
+        // Parse forward to the bind metadata section.
+        let mut pos = 0usize;
+
+        // kind(4)
+        assert_eq!(&buf[pos..pos + 4], &0x0004i32.to_be_bytes());
+        pos += 4;
+
+        // id: u16 length + 16 bytes
+        let id_len = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        assert_eq!(id_len, 16);
+        pos += 2 + id_len;
+
+        // Bind metadata starts here:
+        // flags(4)
+        let flags = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(flags, 0x0001, "flags should be Global_tables_spec");
+        pos += 4;
+
+        // columns_count(4)
+        let col_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(col_count, 1, "should have 1 bind variable");
+        pos += 4;
+
+        // pk_count(4) — this is the field under test
+        let pk_count = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+        assert_eq!(pk_count, 0, "pk_count should be 0");
+    }
 }

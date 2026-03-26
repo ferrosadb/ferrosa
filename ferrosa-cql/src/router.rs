@@ -6437,4 +6437,108 @@ mod tests {
             _ => panic!("expected Result"),
         }
     }
+
+    /// Verify that SELECT * FROM system_schema.keyspaces includes a `replication`
+    /// column and the JSON value contains "class".
+    #[tokio::test]
+    async fn select_system_schema_keyspaces_includes_replication() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+        };
+
+        // Create a keyspace so there is at least one result row
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE repl_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("SELECT * FROM system_schema.keyspaces").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let b = match &result {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected Result"),
+        };
+
+        // Parse the Rows result to find column names and row data.
+        assert_eq!(&b[0..4], &0x0002i32.to_be_bytes(), "expected Rows kind");
+        let flags = i32::from_be_bytes(b[4..8].try_into().unwrap());
+        let col_count = i32::from_be_bytes(b[8..12].try_into().unwrap()) as usize;
+        let mut off = 12;
+
+        // If Global_tables_spec flag (0x0001) is set, skip ks and table strings
+        if flags & 0x0001 != 0 {
+            let ks_len = u16::from_be_bytes(b[off..off + 2].try_into().unwrap()) as usize;
+            off += 2 + ks_len;
+            let tbl_len = u16::from_be_bytes(b[off..off + 2].try_into().unwrap()) as usize;
+            off += 2 + tbl_len;
+        }
+
+        // Read column names
+        let mut col_names = Vec::new();
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(b[off..off + 2].try_into().unwrap()) as usize;
+            off += 2;
+            let name = std::str::from_utf8(&b[off..off + name_len])
+                .unwrap()
+                .to_string();
+            off += name_len;
+            // Skip type_id
+            let type_id = u16::from_be_bytes(b[off..off + 2].try_into().unwrap());
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2,
+                0x0021 => off += 4,
+                _ => {}
+            }
+            col_names.push(name);
+        }
+
+        // Verify `replication` column exists
+        let repl_idx = col_names
+            .iter()
+            .position(|n| n == "replication")
+            .expect("should have 'replication' column");
+
+        // Parse rows to find the replication value for repl_ks
+        let row_count = i32::from_be_bytes(b[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        assert!(row_count > 0, "should have at least 1 keyspace row");
+
+        let mut found_repl_ks = false;
+        for _ in 0..row_count {
+            let mut cells = Vec::new();
+            for _ in 0..col_count {
+                let cell_len = i32::from_be_bytes(b[off..off + 4].try_into().unwrap());
+                off += 4;
+                if cell_len < 0 {
+                    cells.push(None);
+                } else {
+                    let cell_data = &b[off..off + cell_len as usize];
+                    cells.push(Some(cell_data.to_vec()));
+                    off += cell_len as usize;
+                }
+            }
+
+            // Check if this is our keyspace
+            if let Some(ref ks_bytes) = cells[0] {
+                let ks_name = std::str::from_utf8(ks_bytes).unwrap();
+                if ks_name == "repl_ks" {
+                    found_repl_ks = true;
+                    let repl_bytes = cells[repl_idx]
+                        .as_ref()
+                        .expect("replication column should not be null");
+                    let repl_str = std::str::from_utf8(repl_bytes).unwrap();
+                    assert!(
+                        repl_str.contains("class"),
+                        "replication JSON should contain 'class', got: {repl_str}"
+                    );
+                }
+            }
+        }
+        assert!(found_repl_ks, "should have found repl_ks in the results");
+    }
 }

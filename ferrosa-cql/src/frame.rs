@@ -755,6 +755,11 @@ mod tests {
     }
 
     #[test]
+    fn version_response_is_v4() {
+        assert_eq!(VERSION_RESPONSE, 0x84);
+    }
+
+    #[test]
     fn test_decoder_rejects_compressed_frame_without_negotiation() {
         // Manually encode a frame with the COMPRESSION_FLAG set but no
         // compression configured on the decoder.

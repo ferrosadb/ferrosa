@@ -1729,4 +1729,39 @@ mod tests {
         assert!(pks.contains(&b"user1".as_slice()));
         assert!(pks.contains(&b"user2".as_slice()));
     }
+
+    // -------------------------------------------------------------------------
+    // Test: read_range includes both SSTable and memtable data
+    // -------------------------------------------------------------------------
+    #[test]
+    fn read_range_includes_sstable_data() {
+        let store = test_store();
+
+        // Write and flush to SSTable.
+        let key_a = make_key("alpha");
+        store.write(&key_a, make_row(b"flushed_val", 1000)).unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.sstable_count(), 1);
+
+        // Write to memtable (not flushed).
+        let key_b = make_key("bravo");
+        store
+            .write(&key_b, make_row(b"memtable_val", 2000))
+            .unwrap();
+
+        // read_range should include BOTH SSTable and memtable rows.
+        let results = store.read_range(None, None, 100).unwrap();
+        let pks: Vec<&[u8]> = results.iter().map(|p| p.key.key.as_bytes()).collect();
+        assert!(
+            pks.contains(&b"alpha".as_slice()),
+            "should contain SSTable partition 'alpha', got: {:?}",
+            pks
+        );
+        assert!(
+            pks.contains(&b"bravo".as_slice()),
+            "should contain memtable partition 'bravo', got: {:?}",
+            pks
+        );
+        assert_eq!(results.len(), 2);
+    }
 }
