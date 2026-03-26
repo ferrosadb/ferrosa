@@ -9,6 +9,7 @@ pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod handshake;
+pub(crate) mod lane_actor;
 pub mod message;
 pub mod peer;
 pub mod pool;

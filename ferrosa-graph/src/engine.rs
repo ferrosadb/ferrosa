@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 use ferrosa_schema::auth::role::AuthContext;
 use ferrosa_schema::Schema;
@@ -50,6 +51,7 @@ pub struct GraphEngine {
     schema: Arc<Schema>,
     storage: Arc<StorageEngine>,
     config: GraphEngineConfig,
+    reconciliation_cancel: CancellationToken,
     reconciliation_handles: Vec<tokio::task::JoinHandle<()>>,
     subscription_registry: Arc<SubscriptionRegistry>,
 }
@@ -97,6 +99,9 @@ impl GraphEngine {
             }
         }
 
+        // Shared cancellation token for all reconciliation loops.
+        let reconciliation_cancel = CancellationToken::new();
+
         // Register an adjacency observer and start reconciliation for each keyspace.
         let mut reconciliation_handles = Vec::new();
         for ks in &edge_keyspaces {
@@ -108,6 +113,7 @@ impl GraphEngine {
                 Arc::clone(&storage),
                 ks.clone(),
                 reconciliation_interval,
+                reconciliation_cancel.clone(),
             );
             reconciliation_handles.push(handle);
         }
@@ -116,6 +122,7 @@ impl GraphEngine {
             schema,
             storage,
             config,
+            reconciliation_cancel,
             reconciliation_handles,
             subscription_registry: Arc::new(SubscriptionRegistry::new(DEFAULT_MAX_SUBSCRIPTIONS)),
         }
@@ -243,17 +250,26 @@ impl GraphEngine {
         Ok(GraphSchema { vertices, edges })
     }
 
-    /// Abort reconciliation tasks (for graceful shutdown).
-    pub fn shutdown(&mut self) {
-        for handle in self.reconciliation_handles.drain(..) {
-            handle.abort();
-        }
+    /// Gracefully stop reconciliation tasks (for controlled shutdown).
+    ///
+    /// Cancels all reconciliation loops and waits up to 5 s for them to
+    /// drain, then drops any remaining handles.
+    pub async fn shutdown(&mut self) {
+        self.reconciliation_cancel.cancel();
+        let handles: Vec<_> = self.reconciliation_handles.drain(..).collect();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::future::join_all(handles),
+        )
+        .await;
     }
 }
 
 impl Drop for GraphEngine {
     fn drop(&mut self) {
-        self.shutdown();
+        // Synchronous path: just signal cancellation.
+        // Handles are dropped here — tasks will stop at their next yield.
+        self.reconciliation_cancel.cancel();
     }
 }
 
