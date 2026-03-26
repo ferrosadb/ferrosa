@@ -1764,4 +1764,61 @@ mod tests {
         );
         assert_eq!(results.len(), 2);
     }
+
+    /// RED test: write a row, flush to SSTable, update the SAME row in memtable
+    /// with a new cell (higher timestamp). read_range must return the merged row
+    /// with the updated cell — not the stale SSTable version.
+    ///
+    /// This is the exact bug that prevents edge backfills from appearing in
+    /// full-scan queries (co_occurs_with WHERE tenant_id = ? ALLOW FILTERING).
+    #[test]
+    fn read_range_merges_sstable_and_memtable_for_same_key() {
+        let store = test_store();
+
+        // Write initial row: key="pk1", cell col=0 value="original", timestamp=1000
+        let key = make_key("pk1");
+        store.write(&key, make_row(b"original", 1000)).unwrap();
+
+        // Flush to SSTable
+        store.flush().unwrap();
+        assert_eq!(store.sstable_count(), 1);
+        assert_eq!(store.memtable_size(), 0);
+
+        // Update the SAME key+clustering with a new cell col=1 at higher timestamp
+        let update_row = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01], // same CK as make_row
+            cells: vec![(1, CellValue::live(b"updated_cell".to_vec(), 2000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(2000),
+        };
+        store.write(&key, update_row).unwrap();
+
+        // read_range should return ONE partition with BOTH cells merged
+        let results = store.read_range(None, None, 100).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "should have 1 partition (merged), got {}",
+            results.len()
+        );
+
+        let partition = &results[0];
+        assert_eq!(partition.rows.len(), 1, "should have 1 merged row");
+
+        let cells: Vec<u16> = partition.rows[0]
+            .cells
+            .iter()
+            .map(|(col, _)| *col)
+            .collect();
+        assert!(
+            cells.contains(&0),
+            "merged row should contain SSTable cell col=0, got {:?}",
+            cells
+        );
+        assert!(
+            cells.contains(&1),
+            "merged row should contain memtable cell col=1, got {:?}",
+            cells
+        );
+    }
 }
