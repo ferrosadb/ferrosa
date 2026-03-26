@@ -896,8 +896,8 @@ fn route_select_user_table(
                 ..
             } => {
                 // IndexScanWithFilter means some WHERE columns are not covered
-                // by any index — reject these queries.
-                if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) {
+                // by any index — reject unless ALLOW FILTERING is set.
+                if matches!(scan_plan, ScanPlan::IndexScanWithFilter { .. }) && !s.allow_filtering {
                     return Err(CqlError::Invalid(
                         "Cannot execute this query as it requires filtering on non-indexed \
                          columns. Create a secondary index on the filtered columns or \
@@ -1041,7 +1041,7 @@ fn route_select_user_table(
                     .iter()
                     .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
 
-                if !s.where_clauses.is_empty() && !all_where_columns_indexed {
+                if !s.where_clauses.is_empty() && !all_where_columns_indexed && !s.allow_filtering {
                     return Err(CqlError::Invalid(
                         "Cannot execute this query as it requires filtering on non-indexed \
                          columns. Create a secondary index on the filtered columns or \
@@ -5661,14 +5661,11 @@ mod tests {
             crate::parser::parse("CREATE TABLE afl.t (id int PRIMARY KEY, flag int)").unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
+        // ALLOW FILTERING is now accepted — query should succeed (full scan with filter).
         let stmt =
             crate::parser::parse("SELECT * FROM afl.t WHERE flag = 1 LIMIT 2 ALLOW FILTERING")
                 .unwrap();
-        let result = route(&state, &ctx, stmt).await;
-        assert!(
-            result.is_err(),
-            "ALLOW FILTERING with LIMIT should also be rejected"
-        );
+        route(&state, &ctx, stmt).await.unwrap();
     }
 
     // ── ALLOW FILTERING rejection: exact Cassandra semantics ─────────
@@ -5767,12 +5764,12 @@ mod tests {
         let stmt = crate::parser::parse("CREATE INDEX af2_email_idx ON af2.users (email)").unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
+        // ALLOW FILTERING with partial index is now accepted (index+filter scan).
         let stmt = crate::parser::parse(
             "SELECT * FROM af2.users WHERE email = 'ada@example.com' AND name = 'Ada' ALLOW FILTERING",
         )
         .unwrap();
-        let result = route(&state, &ctx, stmt).await;
-        assert!(result.is_err(), "ALLOW FILTERING should be rejected");
+        route(&state, &ctx, stmt).await.unwrap();
     }
 
     /// Querying on a fully-indexed column without ALLOW FILTERING must succeed.
