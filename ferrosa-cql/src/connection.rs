@@ -1535,4 +1535,188 @@ mod tests {
         assert!(matches!(result, HandleResult::Reply(Opcode::Error, _)));
         assert!(pending.is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // substitute_bound_values tests
+    // -----------------------------------------------------------------------
+
+    fn make_plan(query: &str, bound_cols: Vec<(&str, CqlType)>) -> PreparedPlan {
+        let stmt = parser::parse(query).unwrap();
+        let (table_ks, table_name) = match &stmt {
+            Statement::Select(s) => (s.keyspace.clone().unwrap_or_default(), s.table.clone()),
+            Statement::Insert(i) => (i.keyspace.clone().unwrap_or_default(), i.table.clone()),
+            _ => (String::new(), String::new()),
+        };
+        PreparedPlan {
+            id: [0u8; 16],
+            query: query.to_string(),
+            statement: stmt,
+            keyspace: None,
+            result_columns: Vec::new(),
+            bound_columns: bound_cols
+                .into_iter()
+                .map(|(n, t)| (n.to_string(), t))
+                .collect(),
+            table_keyspace: table_ks,
+            table_name,
+        }
+    }
+
+    /// Build a V4 EXECUTE-style value payload: [byte flags][short n_values][values...]
+    fn encode_values(values: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(0x01); // flags: Values present
+        buf.extend_from_slice(&(values.len() as u16).to_be_bytes()); // n_values
+        for val in values {
+            buf.extend_from_slice(&(val.len() as i32).to_be_bytes()); // value length
+            buf.extend_from_slice(val); // value bytes
+        }
+        buf
+    }
+
+    #[test]
+    fn substitute_uuid_values_in_select() {
+        // Given: a SELECT with 2 UUID bind markers
+        let plan = make_plan(
+            "SELECT entity_id FROM ks.t WHERE tenant_id = ? AND session_id = ?",
+            vec![("tenant_id", CqlType::Uuid), ("session_id", CqlType::Uuid)],
+        );
+
+        // When: we substitute 2 UUID values
+        let uuid1 = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let uuid2 = uuid::Uuid::parse_str("86da7931-7c87-54fe-8a49-eabc21c025aa").unwrap();
+        let payload = encode_values(&[uuid1.as_bytes(), uuid2.as_bytes()]);
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+
+        // Then: the WHERE clause values should be UuidLiterals, not BindMarkers
+        if let Statement::Select(s) = &result {
+            assert_eq!(s.where_clauses.len(), 2);
+            assert!(
+                matches!(&s.where_clauses[0].value, Term::UuidLiteral(u) if *u == uuid1),
+                "first WHERE value should be UUID1, got {:?}",
+                s.where_clauses[0].value
+            );
+            assert!(
+                matches!(&s.where_clauses[1].value, Term::UuidLiteral(u) if *u == uuid2),
+                "second WHERE value should be UUID2, got {:?}",
+                s.where_clauses[1].value
+            );
+        } else {
+            panic!("expected Select statement");
+        }
+    }
+
+    #[test]
+    fn substitute_no_values_flag_returns_unchanged() {
+        // Given: a SELECT with bind markers
+        let plan = make_plan(
+            "SELECT id FROM ks.t WHERE pk = ?",
+            vec![("pk", CqlType::Int)],
+        );
+
+        // When: the frame has no values (flags = 0)
+        let payload = vec![0x00u8]; // flags: no values
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+
+        // Then: bind markers remain
+        if let Statement::Select(s) = &result {
+            assert!(matches!(&s.where_clauses[0].value, Term::BindMarker(_)));
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn substitute_null_value_becomes_term_null() {
+        let plan = make_plan(
+            "SELECT id FROM ks.t WHERE pk = ?",
+            vec![("pk", CqlType::Int)],
+        );
+
+        // Null value: length = -1
+        let mut payload = Vec::new();
+        payload.push(0x01); // flags: Values
+        payload.extend_from_slice(&1u16.to_be_bytes()); // 1 value
+        payload.extend_from_slice(&(-1i32).to_be_bytes()); // null
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+        if let Statement::Select(s) = &result {
+            assert!(
+                matches!(&s.where_clauses[0].value, Term::Null),
+                "null value should become Term::Null"
+            );
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn substitute_insert_with_mixed_types() {
+        let plan = make_plan(
+            "INSERT INTO ks.t (id, name, score) VALUES (?, ?, ?)",
+            vec![
+                ("id", CqlType::Uuid),
+                ("name", CqlType::Varchar),
+                ("score", CqlType::Int),
+            ],
+        );
+
+        let uuid = uuid::Uuid::new_v4();
+        let name = b"test_entity";
+        let score = 42i32.to_be_bytes();
+        let payload = encode_values(&[uuid.as_bytes(), name, &score]);
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+        if let Statement::Insert(i) = &result {
+            assert_eq!(i.values.len(), 3);
+            assert!(matches!(&i.values[0], Term::UuidLiteral(_)));
+            assert!(matches!(&i.values[1], Term::StringLiteral(s) if s == "test_entity"));
+            assert!(matches!(&i.values[2], Term::IntegerLiteral(42)));
+        } else {
+            panic!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn substitute_empty_cursor_returns_unchanged() {
+        let plan = make_plan(
+            "SELECT id FROM ks.t WHERE pk = ?",
+            vec![("pk", CqlType::Int)],
+        );
+
+        let result = substitute_bound_values(&plan, &[]).unwrap();
+        if let Statement::Select(s) = &result {
+            assert!(matches!(&s.where_clauses[0].value, Term::BindMarker(_)));
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn substitute_more_values_than_bound_cols_uses_blob() {
+        // Only 1 bound column known, but 2 values sent
+        let plan = make_plan(
+            "SELECT id FROM ks.t WHERE pk = ? AND extra = ?",
+            vec![("pk", CqlType::Int)],
+        );
+
+        let v1 = 42i32.to_be_bytes();
+        let v2 = b"unknown";
+        let payload = encode_values(&[&v1, v2]);
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+        if let Statement::Select(s) = &result {
+            assert!(
+                matches!(&s.where_clauses[0].value, Term::IntegerLiteral(42)),
+                "first value should be Int"
+            );
+            assert!(
+                matches!(&s.where_clauses[1].value, Term::BlobLiteral(_)),
+                "second value should fall back to Blob, got {:?}",
+                s.where_clauses[1].value
+            );
+        } else {
+            panic!("expected Select");
+        }
+    }
 }
