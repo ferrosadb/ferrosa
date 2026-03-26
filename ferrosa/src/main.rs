@@ -706,8 +706,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 13. Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
+    // 13. Wait for shutdown signal (SIGINT or SIGTERM)
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
 
     // 14. Graceful shutdown: flush memtables, sync to S3, stop compaction
     tracing::info!("shutdown signal received, draining...");
