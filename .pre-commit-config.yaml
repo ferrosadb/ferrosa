@@ -62,7 +62,7 @@ repos:
 
       - id: cargo-clippy-ferrosa
         name: cargo clippy (ferrosa)
-        entry: cargo clippy -- -D warnings
+        entry: cargo clippy --all-targets -- -D warnings
         language: system
         files: \.rs$
         pass_filenames: false
@@ -144,6 +144,14 @@ repos:
         name: cargo doc (ferrosa)
         stages: [pre-push]
         entry: bash -c 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace'
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+      - id: cargo-musl-build
+        name: musl static build + verify + strip
+        stages: [pre-push]
+        entry: bash scripts/musl-build.sh
         language: system
         files: \.rs$
         pass_filenames: false
