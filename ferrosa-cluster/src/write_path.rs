@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use ferrosa_common::key::DecoratedKey;
-use ferrosa_sstable::types::Row;
+use ferrosa_sstable::types::{Partition, Row};
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::{Mutation, TableId};
 
@@ -85,6 +85,29 @@ impl WritePath {
                 .coordinate_logged_batch(mutations)
                 .await
                 .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+        }
+    }
+
+    /// Scatter a full-table range read to all nodes that hold data for
+    /// `table_id` and return the deduplicated union of all partitions.
+    ///
+    /// - `Direct` / `Pair`: reads from local storage only (single-node case).
+    /// - `Cluster`: fans out to every ring node and merges results.
+    /// - `Unavailable`: returns an empty vec (degraded mode).
+    pub async fn range_read(&self, table_id: &TableId) -> Vec<Partition> {
+        match self {
+            Self::Direct(engine) => engine
+                .read_range(table_id, None, None, 1_000_000)
+                .unwrap_or_default(),
+            Self::Pair(coordinator) => coordinator
+                .local_storage()
+                .read_range(table_id, None, None, 1_000_000)
+                .unwrap_or_default(),
+            Self::Cluster(coordinator) => coordinator
+                .coordinate_range_read(table_id)
+                .await
+                .unwrap_or_default(),
+            Self::Unavailable => vec![],
         }
     }
 

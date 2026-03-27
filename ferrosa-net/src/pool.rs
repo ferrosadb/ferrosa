@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
+use crate::error::NetError;
+
 use crate::codec::Lane;
 use crate::config::NetConfig;
 use crate::error::Result;
@@ -36,6 +38,8 @@ pub enum LaneOutcome {
 /// moves to `Failed` and callers receive [`crate::error::NetError::LaneFailed`].
 pub struct PriorityPool {
     peer_host_id: Uuid,
+    /// Resolved socket address from the initial connection.
+    resolved_addr: SocketAddr,
     raft: LaneHandle,
     data: LaneHandle,
     bulk: LaneHandle,
@@ -43,12 +47,26 @@ pub struct PriorityPool {
 
 impl PriorityPool {
     /// Open 3 TCP connections to the peer (one per lane).
+    ///
+    /// `peer_host` is a hostname:port or IP:port string.  It is resolved via
+    /// DNS for the initial connection and stored as-is in each lane actor's
+    /// reconnect context so that DNS is re-resolved on every reconnect attempt.
+    /// This allows peers that restart with a new container IP (e.g. after
+    /// `docker compose up --force-recreate`) to be reconnected automatically.
+    ///
     /// Builds TLS connector once and shares it across all 3 connections.
     pub async fn connect(
         config: Arc<NetConfig>,
         local_host_id: Uuid,
-        peer_addr: SocketAddr,
+        peer_host: &str,
     ) -> Result<Self> {
+        // Resolve once for the initial connection.
+        let peer_addr: SocketAddr = tokio::net::lookup_host(peer_host)
+            .await
+            .map_err(NetError::Io)?
+            .next()
+            .ok_or_else(|| NetError::Protocol(format!("no address resolved for {peer_host}")))?;
+
         let tls_connector = crate::tls::build_tls_connector(&config)?.map(Arc::new);
 
         let raft_client = RpcClient::connect_with_tls(
@@ -74,6 +92,7 @@ impl PriorityPool {
         .await?;
 
         let peer_host_id = raft_client.peer_host_id();
+        let peer_host = peer_host.to_owned();
 
         // Spawn a lane actor for each connection.  The ctx_builder closure
         // captures the shared config/TLS state and wires up the reconnect
@@ -83,7 +102,7 @@ impl PriorityPool {
                 lane: Lane::Raft,
                 config: Arc::clone(&config),
                 local_host_id,
-                peer_addr,
+                peer_host: peer_host.clone(),
                 tls_connector: tls_connector.clone(),
                 handle: h,
             }
@@ -93,7 +112,7 @@ impl PriorityPool {
                 lane: Lane::Data,
                 config: Arc::clone(&config),
                 local_host_id,
-                peer_addr,
+                peer_host: peer_host.clone(),
                 tls_connector: tls_connector.clone(),
                 handle: h,
             }
@@ -103,7 +122,7 @@ impl PriorityPool {
                 lane: Lane::Bulk,
                 config: Arc::clone(&config),
                 local_host_id,
-                peer_addr,
+                peer_host,
                 tls_connector: tls_connector.clone(),
                 handle: h,
             }
@@ -111,6 +130,7 @@ impl PriorityPool {
 
         Ok(Self {
             peer_host_id,
+            resolved_addr: peer_addr,
             raft,
             data,
             bulk,
@@ -120,6 +140,11 @@ impl PriorityPool {
     /// The peer's host_id, obtained during the handshake on the first connection.
     pub fn peer_host_id(&self) -> Uuid {
         self.peer_host_id
+    }
+
+    /// The socket address resolved during the initial connection.
+    pub fn resolved_addr(&self) -> SocketAddr {
+        self.resolved_addr
     }
 
     fn handle(&self, lane: Lane) -> &LaneHandle {
@@ -238,7 +263,7 @@ mod tests {
         ));
         let addr = server.start_and_get_addr().await.unwrap();
 
-        let pool = PriorityPool::connect(Arc::new(config), uuid::Uuid::new_v4(), addr)
+        let pool = PriorityPool::connect(Arc::new(config), uuid::Uuid::new_v4(), &addr.to_string())
             .await
             .unwrap();
 
@@ -274,7 +299,7 @@ mod tests {
         ));
         let addr = server.start_and_get_addr().await.unwrap();
 
-        let pool = PriorityPool::connect(Arc::new(config), uuid::Uuid::new_v4(), addr)
+        let pool = PriorityPool::connect(Arc::new(config), uuid::Uuid::new_v4(), &addr.to_string())
             .await
             .unwrap();
 
@@ -338,7 +363,7 @@ mod tests {
                 lane: Lane::Raft,
                 config: Arc::new(NetConfig::default()),
                 local_host_id: Uuid::new_v4(),
-                peer_addr: "127.0.0.1:9999".parse().unwrap(),
+                peer_host: "127.0.0.1:9999".to_owned(),
                 tls_connector: None,
                 handle: h,
             },

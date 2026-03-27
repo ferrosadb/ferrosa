@@ -362,6 +362,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Catch-up handler is always available; pair write/role-swap handlers are
     // registered dynamically by ModeController on mode transition.
     let registry = Arc::new(ferrosa_net::rpc::HandlerRegistry::new());
+    registry.register(
+        ferrosa_net::codec::MsgType::Ping,
+        Arc::new(ferrosa_net::rpc::PingHandler),
+    );
     let catchup_handler = Arc::new(ferrosa_cluster::pair::catchup::PairCatchUpHandler::new(
         storage.clone(),
     ));
@@ -654,31 +658,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let mut all_connected = true;
                 for seed in &seed_strs {
-                    match tokio::net::lookup_host(seed.as_str()).await {
-                        Ok(mut addrs) => {
-                            if let Some(seed_addr) = addrs.next() {
-                                match ferrosa_net::pool::PriorityPool::connect(
-                                    net_cfg.clone(),
-                                    host_id,
-                                    seed_addr,
-                                )
-                                .await
-                                {
-                                    Ok(pool) => {
-                                        let peer_host_id = pool.peer_host_id();
-                                        pm.add_peer((peer_host_id, seed_addr), pool).await;
-                                        tracing::info!(%seed, %peer_host_id, "seed connected");
-                                        continue; // This seed is done
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!(%seed, %e, "seed connection attempt failed, will retry");
-                                        all_connected = false;
-                                    }
-                                }
-                            }
+                    // PriorityPool::connect resolves the hostname internally and
+                    // stores the original string for DNS re-resolution on reconnect.
+                    match ferrosa_net::pool::PriorityPool::connect(
+                        net_cfg.clone(),
+                        host_id,
+                        seed.as_str(),
+                    )
+                    .await
+                    {
+                        Ok(pool) => {
+                            let peer_host_id = pool.peer_host_id();
+                            let seed_addr = pool.resolved_addr();
+                            pm.add_peer((peer_host_id, seed_addr), pool).await;
+                            tracing::info!(%seed, %peer_host_id, "seed connected");
+                            continue; // This seed is done
                         }
                         Err(e) => {
-                            tracing::debug!(%seed, %e, "seed DNS resolution failed, will retry");
+                            tracing::debug!(%seed, %e, "seed connection attempt failed, will retry");
                             all_connected = false;
                         }
                     }

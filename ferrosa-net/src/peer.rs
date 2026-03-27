@@ -152,62 +152,64 @@ impl PeerManager {
 
     /// Heartbeat loop: sends Ping at configured interval, marks peers suspected
     /// after 3 missed heartbeats.
-    pub async fn run_heartbeat_loop(&self) {
+    ///
+    /// Takes `Arc<Self>` so it can spawn per-peer tasks that call
+    /// [`Self::record_heartbeat`] when a Pong is received.
+    ///
+    /// # Cancel Safety
+    ///
+    /// This method is cancel-safe. All mutable state is updated while holding
+    /// the write lock with no `.await` inside the critical section. Per-peer
+    /// Ping sends are dispatched via `tokio::spawn`, so dropping this future
+    /// between ticks does not leave shared state inconsistent. Note that
+    /// `PriorityPool::send` (used inside each spawned task) is itself not
+    /// cancel-safe; wrapping it in `tokio::spawn` is what makes it safe here.
+    pub async fn run_heartbeat_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(self.config.heartbeat_interval);
         loop {
             interval.tick().await;
 
-            let mut peers = self.peers.write().await;
-            let mut suspected = Vec::new();
-
-            for (host_id, state) in peers.iter_mut() {
-                let elapsed = state.last_heartbeat.elapsed();
-                if elapsed >= self.config.heartbeat_timeout {
-                    state.missed_heartbeats += 1;
-                    if state.missed_heartbeats >= 3 {
-                        tracing::warn!(
-                            %host_id,
-                            "peer suspected dead: {} missed heartbeats",
-                            state.missed_heartbeats
-                        );
-                        // Collect (peer_id, pool_arc) so we can drive reconnection.
-                        let pool_arc = state.pool.as_ref().map(Arc::clone);
-                        suspected.push((state.peer_id, pool_arc));
+            // Collect work under the write lock, then release before any I/O.
+            let mut to_ping: Vec<(uuid::Uuid, Arc<PriorityPool>)> = Vec::new();
+            let mut suspected: Vec<(PeerId, Option<Arc<PriorityPool>>)> = Vec::new();
+            {
+                let mut peers = self.peers.write().await;
+                for (host_id, state) in peers.iter_mut() {
+                    let elapsed = state.last_heartbeat.elapsed();
+                    if elapsed >= self.config.heartbeat_timeout {
+                        state.missed_heartbeats += 1;
+                        if state.missed_heartbeats == 3 {
+                            // Only push on the first detection (== 3) to avoid
+                            // spawning a new monitor task on every subsequent tick.
+                            tracing::warn!(
+                                %host_id,
+                                "peer suspected dead: {} missed heartbeats",
+                                state.missed_heartbeats
+                            );
+                            let pool_arc = state.pool.as_ref().map(Arc::clone);
+                            suspected.push((state.peer_id, pool_arc));
+                        }
+                    } else {
+                        state.missed_heartbeats = 0;
                     }
-                } else {
-                    state.missed_heartbeats = 0;
-                }
 
-                // Send Ping via raft lane (fire-and-forget)
-                if let Some(pool) = &state.pool {
-                    let nonce = rand::random();
-                    let sent_at = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
-                    let _ = pool
-                        .fire(Message::Ping { nonce, sent_at }, Lane::Raft)
-                        .await;
+                    if let Some(pool) = &state.pool {
+                        to_ping.push((*host_id, Arc::clone(pool)));
+                    }
                 }
-            }
+            } // write lock released
 
-            // Notify listener outside the iteration and trigger reconnection.
-            drop(peers);
+            // Notify listener and trigger reconnection outside the lock.
             for (peer_id, pool_opt) in suspected {
                 self.listener.on_peer_suspected(peer_id);
 
                 let (host_id, _addr) = peer_id;
 
                 if let Some(pool) = pool_opt {
-                    // Trigger immediate reconnection of all lanes.
                     pool.reconnect_all_lanes();
 
-                    // Spawn a monitor task that fires on_peer_recovered or
-                    // on_peer_failed once the reconnect attempt resolves.
                     let listener = Arc::clone(&self.listener);
                     tokio::spawn(async move {
-                        // Poll every 500 ms until all lanes leave Reconnecting.
-                        // Max ~60 s before we give up and declare the peer failed.
                         for _ in 0u32..120 {
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
@@ -220,16 +222,32 @@ impl PeerManager {
                                     listener.on_peer_failed(host_id);
                                     return;
                                 }
-                                LaneOutcome::StillReconnecting => {
-                                    // Keep waiting.
-                                }
+                                LaneOutcome::StillReconnecting => {}
                             }
                         }
 
-                        // Timeout: treat as failed.
                         listener.on_peer_failed(host_id);
                     });
                 }
+            }
+
+            // Send Pings via request-response so Pong is delivered through the
+            // pending map and record_heartbeat resets the miss counter.
+            for (host_id, pool) in to_ping {
+                let this = Arc::clone(&self);
+                tokio::spawn(async move {
+                    let nonce: u64 = rand::random();
+                    let sent_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    if let Ok(Message::Pong { .. }) = pool
+                        .send(Message::Ping { nonce, sent_at }, Lane::Raft)
+                        .await
+                    {
+                        this.record_heartbeat(host_id).await;
+                    }
+                });
             }
         }
     }

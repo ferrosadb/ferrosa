@@ -44,7 +44,7 @@ use crate::pair::coordinator::{encode_mutation, PairCoordinator};
 use crate::pair::ddl::{DdlCoordinator, PairDdlForwardHandler, PairSchemaSyncHandler};
 use crate::pair::{PairRole, PairState};
 use crate::raft::handlers::{
-    RaftAppendHandler, RaftSnapshotHandler, RaftVoteHandler, ReadRequestHandler,
+    RaftAppendHandler, RaftSnapshotHandler, RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
 };
 use crate::raft::log_store::SledLogStore;
 use crate::raft::network::FerrosRaftNetworkFactory;
@@ -639,7 +639,7 @@ impl ModeController {
             tokio::spawn(async move {
                 // Small delay to let peer's RPC server be ready.
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                match PriorityPool::connect(net_cfg, local_id, reverse_addr).await {
+                match PriorityPool::connect(net_cfg, local_id, &reverse_addr.to_string()).await {
                     Ok(pool) => {
                         pm.add_peer((peer_host_id, reverse_addr), pool).await;
                         tracing::info!(%peer_host_id, %reverse_addr, "reverse connection established");
@@ -969,6 +969,9 @@ impl ModeController {
                 repair_metrics,
             ));
             registry.register(MsgType::RepairWrite, repair_handler);
+
+            let range_read_handler = Arc::new(RangeReadHandler::new(storage_for_handler.clone()));
+            registry.register(MsgType::RangeReadRequest, range_read_handler);
 
             let read_handler = Arc::new(ReadRequestHandler::new(storage_for_handler));
             registry.register(MsgType::ReadRequest, read_handler);

@@ -63,9 +63,10 @@ async fn two_peers_handshake_and_exchange_messages() {
         listener.clone(),
     ));
 
-    let pool = ferrosa_net::pool::PriorityPool::connect(Arc::new(config), client_id, addr)
-        .await
-        .unwrap();
+    let pool =
+        ferrosa_net::pool::PriorityPool::connect(Arc::new(config), client_id, &addr.to_string())
+            .await
+            .unwrap();
 
     let peer_id = (server_id, addr);
     pm.add_peer(peer_id, pool).await;

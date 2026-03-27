@@ -202,7 +202,7 @@ pub async fn route(
     );
 
     match stmt {
-        Statement::Select(s) => route_select(state, ctx, s).map(RouteResult::Result),
+        Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
         Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
         Statement::Update(u) => route_update(state, ctx, u).await.map(RouteResult::Result),
         Statement::Delete(d) => route_delete(state, ctx, d).await.map(RouteResult::Result),
@@ -378,7 +378,7 @@ pub async fn route(
 
 // ── SELECT ───────────────────────────────────────────────────────────────
 
-fn route_select(
+async fn route_select(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: SelectStatement,
@@ -863,12 +863,12 @@ fn route_select(
             }
 
             // User table: permission check + bridge + storage
-            route_select_user_table(state, ctx, ks, &s)
+            route_select_user_table(state, ctx, ks, &s).await
         }
     }
 }
 
-fn route_select_user_table(
+async fn route_select_user_table(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     ks: &str,
@@ -1027,8 +1027,7 @@ fn route_select_user_table(
                 // values that can't be coerced to the PK column type) but
                 // the planner still sees Eq predicates on all PK columns.
                 // Fall through to a full scan rather than panicking.
-                let scan_limit = 10_000;
-                let partitions = state.engine.read_range(&table_id, None, None, scan_limit)?;
+                let partitions = state.write_path.load().range_read(&table_id).await;
                 let mut all_rows = Vec::new();
                 for partition in &partitions {
                     let mut prows = bridge::partition_to_rows(
@@ -1100,8 +1099,7 @@ fn route_select_user_table(
                 // may not be wired yet (Sprint I-3). Fall back to full scan so
                 // queries still return correct results.
                 let partitions = if partitions.is_empty() {
-                    let scan_limit = 10_000;
-                    state.engine.read_range(&table_id, None, None, scan_limit)?
+                    state.write_path.load().range_read(&table_id).await
                 } else {
                     partitions
                 };
@@ -1162,8 +1160,7 @@ fn route_select_user_table(
                         .read_by_index(&table_id, first_idx_name, &index_key)?;
 
                 let partitions = if partitions.is_empty() {
-                    let scan_limit = 10_000;
-                    state.engine.read_range(&table_id, None, None, scan_limit)?
+                    state.write_path.load().range_read(&table_id).await
                 } else {
                     partitions
                 };
@@ -1223,8 +1220,7 @@ fn route_select_user_table(
 
                 // Use a large scan window — LIMIT is applied *after* filtering,
                 // not before, to avoid cutting off matching rows (FRSA-BUG-003).
-                let scan_limit = 10_000;
-                let partitions = state.engine.read_range(&table_id, None, None, scan_limit)?;
+                let partitions = state.write_path.load().range_read(&table_id).await;
                 let mut all_rows = Vec::new();
                 for partition in &partitions {
                     let mut prows = bridge::partition_to_rows(

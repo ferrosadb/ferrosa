@@ -187,7 +187,13 @@ impl PairNode {
         // Try to connect to peer — log and continue if peer isn't up yet.
         let peer_addr = self.state.read().await.peer_addr;
         let peer_host_id = self.state.read().await.peer_host_id;
-        match PriorityPool::connect(self.net_config.clone(), self.local_host_id, peer_addr).await {
+        match PriorityPool::connect(
+            self.net_config.clone(),
+            self.local_host_id,
+            &peer_addr.to_string(),
+        )
+        .await
+        {
             Ok(pool) => {
                 self.peer_manager
                     .add_peer((peer_host_id, peer_addr), pool)
@@ -216,9 +222,13 @@ impl PairNode {
 
     /// Connect (or reconnect) to the peer. Call after peer is known to be up.
     pub async fn connect_to_peer(&self, peer_addr: SocketAddr) -> Result<()> {
-        let pool = PriorityPool::connect(self.net_config.clone(), self.local_host_id, peer_addr)
-            .await
-            .map_err(crate::error::ClusterError::Net)?;
+        let pool = PriorityPool::connect(
+            self.net_config.clone(),
+            self.local_host_id,
+            &peer_addr.to_string(),
+        )
+        .await
+        .map_err(crate::error::ClusterError::Net)?;
 
         let peer_host_id = self.state.read().await.peer_host_id;
         self.peer_manager
