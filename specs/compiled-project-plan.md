@@ -858,7 +858,7 @@ async fn pause_resume_state_convergence() // SIGSTOP node 30s, SIGCONT; Accord s
 
 ### T-024 · C6.7–C6.10 · Disk-Fail + Packet-Reorder + LWT Batch + Metrics
 
-**Sprint:** C6 | **Status:** [~] In progress | **Batch:** 5a
+**Sprint:** C6 | **Status:** [x] Complete | **Batch:** 5a
 **Prerequisite:** T-023
 
 **Files:**
