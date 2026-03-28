@@ -97,3 +97,7 @@ Source under `cassandra/src/java/org/apache/cassandra/`:
 - **Transactions**: See [specs/accord-project-plan.md](specs/accord-project-plan.md) for the Accord implementation plan (7 sprints, 4 phases)
 - **Partitioner**: Murmur3Partitioner (Cassandra compatible)
 - **Target**: AWS-first, flag any lock-in for S3-compatible portability
+
+## Current Sprint Focus
+
+See [specs/project-plan-correctness-sprints.md](specs/project-plan-correctness-sprints.md) for the active sprint plan: 6 sprints focused on single-DC Jepsen correctness, S3/SSTable Cassandra format validation, and Accord transaction correctness under all failure modes. Start here before taking on new work.
