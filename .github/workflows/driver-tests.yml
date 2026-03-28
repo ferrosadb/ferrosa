@@ -1,0 +1,58 @@
+name: Driver Smoke Tests
+
+# Run all multi-language CQL driver tests whenever driver code, the Dockerfile,
+# or the CQL layer changes. Builds the Ferrosa image from source, spins up
+# RustFS (S3), and runs Python / Go / Node / Java / C# / Rust against it.
+#
+# Override the container runtime:
+#   CONTAINER_RUNTIME=podman ./tests/drivers/run-all.sh
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tests/drivers/**'
+      - 'Dockerfile'
+      - 'ferrosa-cql/**'
+      - 'ferrosa-common/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tests/drivers/**'
+      - 'Dockerfile'
+      - 'ferrosa-cql/**'
+      - 'ferrosa-common/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  driver-smoke:
+    name: Driver Smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run all language driver smoke tests
+        run: bash tests/drivers/run-all.sh
+        timeout-minutes: 20
+
+      - name: Collect driver test logs on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/driver-logs
+          docker compose -f tests/drivers/docker-compose.drivers.yml logs 2>/dev/null \
+            > /tmp/driver-logs/compose.log || true
+
+      - name: Upload driver test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-test-logs-${{ matrix.os }}
+          path: /tmp/driver-logs/
+          retention-days: 7

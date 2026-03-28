@@ -10,3 +10,5 @@ Cargo.lock
 .worktrees/
 .claude/worktrees/
 .fastembed_cache/
+rootfs/test_key
+rootfs/test_key.pub
