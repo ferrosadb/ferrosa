@@ -322,8 +322,11 @@ mod tests {
 
     /// Requires firecracker binary, root privileges, and a built rootfs.
     #[tokio::test]
-    #[ignore]
     async fn provision_single_vm() {
+        if std::env::var("FERROSA_TEST_FIRECRACKER").is_err() {
+            eprintln!("skip: set FERROSA_TEST_FIRECRACKER=1 to run provision_single_vm");
+            return;
+        }
         let mut vm = FirecrackerVm::create(VmConfig::default_test())
             .await
             .unwrap();

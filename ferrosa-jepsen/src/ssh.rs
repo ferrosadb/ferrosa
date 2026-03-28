@@ -206,8 +206,13 @@ mod tests {
 
     /// Requires a pre-provisioned VM with SSH running and the test key.
     #[tokio::test]
-    #[ignore]
     async fn ssh_execute_command() {
+        if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+            && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+        {
+            eprintln!("skip: set FERROSA_TEST_CLUSTER_NODES or FERROSA_TEST_FIRECRACKER=1 to run ssh_execute_command");
+            return;
+        }
         let ssh = SshClient::connect("172.16.0.2", 22, "root", Path::new("rootfs/test_key"))
             .await
             .unwrap();
@@ -219,8 +224,13 @@ mod tests {
 
     /// Requires a pre-provisioned VM with SSH running and the test key.
     #[tokio::test]
-    #[ignore]
     async fn ssh_upload_file() {
+        if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+            && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+        {
+            eprintln!("skip: set FERROSA_TEST_CLUSTER_NODES or FERROSA_TEST_FIRECRACKER=1 to run ssh_upload_file");
+            return;
+        }
         let ssh = SshClient::connect("172.16.0.2", 22, "root", Path::new("rootfs/test_key"))
             .await
             .unwrap();

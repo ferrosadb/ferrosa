@@ -121,10 +121,20 @@ fn ensure_cluster_ready() {
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
+/// Returns true when the Docker cluster environment is not available.
+fn docker_cluster_unavailable() -> bool {
+    // Check for Docker availability via env var.
+    // Set FERROSA_TEST_DOCKER=1 to run these tests.
+    std::env::var("FERROSA_TEST_DOCKER").is_err()
+}
+
 /// Test 1: Write entity, rolling restart, verify entity survives.
 #[test]
-#[ignore] // requires Docker cluster
 fn write_survives_rolling_restart() {
+    if docker_cluster_unavailable() {
+        eprintln!("skip: set FERROSA_TEST_DOCKER=1 with Docker cluster running to run write_survives_rolling_restart");
+        return;
+    }
     ensure_cluster_ready();
     let name = format!("JEPSEN_ROLLING_{}", Uuid::new_v4().as_simple());
 
@@ -150,8 +160,11 @@ fn write_survives_rolling_restart() {
 /// Test 2: Write entity, kill node1 (SIGKILL — no graceful shutdown),
 /// restart, verify entity is lost (expected with SIGKILL).
 #[test]
-#[ignore]
 fn write_lost_on_sigkill() {
+    if docker_cluster_unavailable() {
+        eprintln!("skip: set FERROSA_TEST_DOCKER=1 with Docker cluster running to run write_lost_on_sigkill");
+        return;
+    }
     ensure_cluster_ready();
     let name = format!("JEPSEN_SIGKILL_{}", Uuid::new_v4().as_simple());
 
@@ -185,8 +198,11 @@ fn write_lost_on_sigkill() {
 /// Test 3: Write entity, docker pause (network partition), verify reads
 /// on another node, unpause, verify consistency.
 #[test]
-#[ignore]
 fn pause_unpause_preserves_data() {
+    if docker_cluster_unavailable() {
+        eprintln!("skip: set FERROSA_TEST_DOCKER=1 with Docker cluster running to run pause_unpause_preserves_data");
+        return;
+    }
     ensure_cluster_ready();
     let name = format!("JEPSEN_PAUSE_{}", Uuid::new_v4().as_simple());
 
@@ -216,8 +232,11 @@ fn pause_unpause_preserves_data() {
 /// Test 4: Write multiple entities rapidly, rolling restart mid-write,
 /// verify all writes that acknowledged are present after restart.
 #[test]
-#[ignore]
 fn rapid_writes_during_rolling_restart() {
+    if docker_cluster_unavailable() {
+        eprintln!("skip: set FERROSA_TEST_DOCKER=1 with Docker cluster running to run rapid_writes_during_rolling_restart");
+        return;
+    }
     ensure_cluster_ready();
     let mut written: Vec<String> = Vec::new();
 
@@ -261,8 +280,11 @@ fn rapid_writes_during_rolling_restart() {
 
 /// Test 5: Verify S3 has data after flush cycle.
 #[test]
-#[ignore]
 fn s3_contains_manifest_and_sstables() {
+    if docker_cluster_unavailable() {
+        eprintln!("skip: set FERROSA_TEST_DOCKER=1 with Docker cluster running to run s3_contains_manifest_and_sstables");
+        return;
+    }
     // Check manifest exists via mc
     let output = Command::new("docker")
         .args([
