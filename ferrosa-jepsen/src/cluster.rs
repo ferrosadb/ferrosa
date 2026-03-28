@@ -217,8 +217,10 @@ mod tests {
     #[tokio::test]
     async fn provision_t1_cluster() {
         if std::env::var("FERROSA_TEST_FIRECRACKER").is_err() {
-            eprintln!("skip: set FERROSA_TEST_FIRECRACKER=1 to run provision_t1_cluster");
-            return;
+            panic!(
+                "cluster infrastructure not available — run scripts/lima-fc-cluster-up.sh \
+                 and set FERROSA_TEST_FIRECRACKER=1"
+            );
         }
         let cluster = FerrosCluster::provision(Topology::T1).await.unwrap();
         assert_eq!(cluster.nodes().len(), 3);

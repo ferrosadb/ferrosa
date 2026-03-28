@@ -35,11 +35,27 @@ fn container_runtime() -> &'static str {
     );
 }
 
-/// Returns true when the container cluster environment is not available.
-/// Tests should call this and return early to skip gracefully.
-fn container_cluster_unavailable() -> bool {
-    std::env::var("FERROSA_TEST_CONTAINERS").is_err()
-        && std::env::var("FERROSA_TEST_DOCKER").is_err()
+/// Assert that FERROSA_TEST_CONTAINERS=1 is set; panic with setup instructions otherwise.
+fn require_container_cluster() {
+    if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
+        let rt = if Command::new("docker")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            "docker"
+        } else {
+            "podman"
+        };
+        panic!(
+            "FERROSA_TEST_CONTAINERS not set.\n\
+             Start the cluster:\n  \
+             cd ~/src/ferrosa-memory && {rt} compose up -d\n\
+             Then re-run with:\n  \
+             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --test docker_mini_jepsen"
+        );
+    }
 }
 
 /// Execute a CQL query via cqlsh and return stdout.
@@ -153,10 +169,7 @@ fn ensure_cluster_ready() {
 /// Test 1: Write entity, rolling restart, verify entity survives.
 #[test]
 fn write_survives_rolling_restart() {
-    if container_cluster_unavailable() {
-        eprintln!("skip: set FERROSA_TEST_CONTAINERS=1 with cluster running to run write_survives_rolling_restart");
-        return;
-    }
+    require_container_cluster();
     ensure_cluster_ready();
     let name = format!("JEPSEN_ROLLING_{}", Uuid::new_v4().as_simple());
 
@@ -180,10 +193,7 @@ fn write_survives_rolling_restart() {
 /// restart, verify entity is lost (expected with SIGKILL).
 #[test]
 fn write_lost_on_sigkill() {
-    if container_cluster_unavailable() {
-        eprintln!("skip: set FERROSA_TEST_CONTAINERS=1 with cluster running to run write_lost_on_sigkill");
-        return;
-    }
+    require_container_cluster();
     ensure_cluster_ready();
     let name = format!("JEPSEN_SIGKILL_{}", Uuid::new_v4().as_simple());
 
@@ -215,10 +225,7 @@ fn write_lost_on_sigkill() {
 /// Test 3: Write entity, pause node1 (network partition), unpause, verify consistency.
 #[test]
 fn pause_unpause_preserves_data() {
-    if container_cluster_unavailable() {
-        eprintln!("skip: set FERROSA_TEST_CONTAINERS=1 with cluster running to run pause_unpause_preserves_data");
-        return;
-    }
+    require_container_cluster();
     ensure_cluster_ready();
     let name = format!("JEPSEN_PAUSE_{}", Uuid::new_v4().as_simple());
 
@@ -246,10 +253,7 @@ fn pause_unpause_preserves_data() {
 /// verify all acknowledged writes are present after restart.
 #[test]
 fn rapid_writes_during_rolling_restart() {
-    if container_cluster_unavailable() {
-        eprintln!("skip: set FERROSA_TEST_CONTAINERS=1 with cluster running to run rapid_writes_during_rolling_restart");
-        return;
-    }
+    require_container_cluster();
     ensure_cluster_ready();
     let mut written: Vec<String> = Vec::new();
 
@@ -291,10 +295,7 @@ fn rapid_writes_during_rolling_restart() {
 /// Test 5: Verify S3 has manifest and SSTables after a flush cycle.
 #[test]
 fn s3_contains_manifest_and_sstables() {
-    if container_cluster_unavailable() {
-        eprintln!("skip: set FERROSA_TEST_CONTAINERS=1 with cluster running to run s3_contains_manifest_and_sstables");
-        return;
-    }
+    require_container_cluster();
 
     let rt = container_runtime();
     let output = Command::new(rt)

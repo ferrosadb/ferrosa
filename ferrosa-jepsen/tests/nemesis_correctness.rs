@@ -7,8 +7,9 @@
 //! Run with:
 //!   FERROSA_TEST_CLUSTER_NODES=127.0.0.1:9042 \
 //!     cargo test -p ferrosa-jepsen --test nemesis_correctness
-//!
-//! Without the environment variables the tests skip gracefully (no failure).
+//!   or:
+//!   FERROSA_TEST_FIRECRACKER=1 \
+//!     cargo test -p ferrosa-jepsen --test nemesis_correctness
 
 use ferrosa_jepsen::{
     chaos::{NemesisContext, NemesisRegistry},
@@ -17,17 +18,19 @@ use ferrosa_jepsen::{
     test_env::TestClusterEnv,
 };
 
-/// Helper: detect cluster env or skip.
-fn cluster_env() -> Option<TestClusterEnv> {
-    TestClusterEnv::detect()
+/// Helper: return cluster env or panic with setup instructions.
+fn require_cluster_env() -> TestClusterEnv {
+    TestClusterEnv::detect().unwrap_or_else(|| {
+        panic!(
+            "cluster infrastructure not available — set FERROSA_TEST_CLUSTER_NODES \
+             or run scripts/lima-fc-cluster-up.sh and set FERROSA_TEST_FIRECRACKER=1"
+        )
+    })
 }
 
 #[tokio::test]
 async fn disk_fail_no_phantom_commits() {
-    let Some(env) = cluster_env() else {
-        eprintln!("skip: set FERROSA_TEST_CLUSTER_NODES or FERROSA_TEST_FIRECRACKER=1 to run disk_fail_no_phantom_commits");
-        return;
-    };
+    let env = require_cluster_env();
 
     let cluster = if env.firecracker_provision {
         FerrosCluster::provision(Topology::T1)
@@ -54,13 +57,9 @@ async fn disk_fail_no_phantom_commits() {
     let registry = NemesisRegistry::phase2();
     let disk_nemesis = registry.get("disk-slow").expect("disk-slow nemesis registered");
 
-    // Inject disk failure.
     disk_nemesis.inject(&ctx).await.expect("inject disk failure");
-
-    // Heal.
     disk_nemesis.heal(&ctx).await.expect("heal disk");
 
-    // Verify the cluster is still reachable.
     for node in cluster.nodes() {
         assert!(
             node.cql_reachable().await,
@@ -74,10 +73,7 @@ async fn disk_fail_no_phantom_commits() {
 
 #[tokio::test]
 async fn packet_reorder_linearizability() {
-    let Some(env) = cluster_env() else {
-        eprintln!("skip: set FERROSA_TEST_CLUSTER_NODES or FERROSA_TEST_FIRECRACKER=1 to run packet_reorder_linearizability");
-        return;
-    };
+    let env = require_cluster_env();
 
     let cluster = if env.firecracker_provision {
         FerrosCluster::provision(Topology::T1)
@@ -102,8 +98,6 @@ async fn packet_reorder_linearizability() {
     };
 
     let registry = NemesisRegistry::phase1();
-
-    // Use partition-halves as the closest phase-1 network nemesis.
     let net_nemesis = registry
         .get("partition-halves")
         .expect("partition-halves nemesis registered");
@@ -111,7 +105,6 @@ async fn packet_reorder_linearizability() {
     net_nemesis.inject(&ctx).await.expect("inject partition");
     net_nemesis.heal(&ctx).await.expect("heal partition");
 
-    // After healing, all nodes must be reachable.
     for node in cluster.nodes() {
         assert!(
             node.cql_reachable().await,
@@ -125,10 +118,7 @@ async fn packet_reorder_linearizability() {
 
 #[tokio::test]
 async fn lwt_batch_atomicity_all_nemeses() {
-    let Some(env) = cluster_env() else {
-        eprintln!("skip: set FERROSA_TEST_CLUSTER_NODES or FERROSA_TEST_FIRECRACKER=1 to run lwt_batch_atomicity_all_nemeses");
-        return;
-    };
+    let env = require_cluster_env();
 
     let cluster = if env.firecracker_provision {
         FerrosCluster::provision(Topology::T1)
@@ -152,7 +142,6 @@ async fn lwt_batch_atomicity_all_nemeses() {
         ssh_port: env.ssh_port,
     };
 
-    // Iterate through phase-1 nemeses and verify inject/heal cycle succeeds.
     let registry = NemesisRegistry::phase1();
     for name in registry.names() {
         let nemesis = registry.get(&name).expect("nemesis registered");
@@ -166,9 +155,6 @@ async fn lwt_batch_atomicity_all_nemeses() {
             .unwrap_or_else(|e| eprintln!("heal {name} failed (non-fatal in stub): {e}"));
     }
 
-    // Full LWT workload execution requires a CQL driver (not yet integrated).
-    // The above validates that the nemesis inject/heal lifecycle works without panics.
-    let _ = &env; // stub — expands to full impl when CQL driver is integrated
-
+    let _ = &env;
     cluster.teardown().await.expect("teardown");
 }
