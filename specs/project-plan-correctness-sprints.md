@@ -2,20 +2,21 @@
 
 > Created: 2026-03-28
 > Status: Draft
-> Focus: Single-datacenter N-node correctness validation, S3/SSTable Cassandra format verification, Accord transaction correctness under all Jepsen failure modes.
+> Focus: Single-datacenter N-node correctness validation, S3/SSTable Cassandra format verification, Accord transaction correctness under all Jepsen failure modes, compaction S3 integration, and full CQL driver compatibility.
 > Predecessor: [project-plan-unified.md](project-plan-unified.md) (Accord S1–S7)
 
 ---
 
 ## Objective
 
-Establish a correctness baseline for Ferrosa as a single-datacenter distributed database before extending to multi-DC topologies. Correctness is validated at three independent levels:
+Deliver a fully correct, end-to-end single-datacenter distributed database: multi-node clustering with working compaction, durable S3 write-behind across the full flush+compact+upload lifecycle, and complete CQL compatibility across all six drivers. Correctness is validated at four independent levels:
 
 1. **Protocol correctness** — Accord transactions are linearizable under all single-DC failure modes (T1: 3-node, T2: 5-node). Knossos/Elle must report zero violations.
-2. **Storage correctness** — Every byte written to ferrosa survives a flush cycle and is readable by an independent Cassandra 5.1 reader from S3. No silent data loss, corruption, or format deviation.
+2. **Storage correctness** — Every byte written to ferrosa survives flush, compaction, and S3 upload, and is readable by an independent Cassandra 5.1 reader. No silent data loss, corruption, or format deviation.
 3. **Application correctness** — All open bugs (BUG-021 through BUG-026) that cause silent data loss or protocol violations are closed before Jepsen runs begin.
+4. **CQL compatibility** — All six drivers (Python, Go, Node.js, Java, C#, Rust) execute the full workload matrix against a live cluster without errors or behavioral divergence.
 
-**Phase gate:** `ferrosa-jepsen run --tier standard` (T1+T2, all 16 nemeses, 16 LWT patterns, 6 drivers, low+medium concurrency) reports zero anomalies. Cassandra SSTable reader test passes for all cell types in CI.
+**Phase gate:** `ferrosa-jepsen run --tier standard` reports zero anomalies. Cassandra 5.1 reader CI gate passes for flush and compaction output. All six driver smoke tests pass against a 3-node cluster.
 
 ---
 
@@ -28,6 +29,8 @@ Establish a correctness baseline for Ferrosa as a single-datacenter distributed 
 | Firecracker provisioning not automatable on macOS dev box | Medium | Medium | Docker-based T1 fallback already in place (docker_mini_jepsen) |
 | Cassandra 5.1 reader finds format deviations in BTI writer | Medium | High | Sprint C5 dedicated to format validation; early discovery is the point |
 | Accord dep-wait under concurrent failures reveals new bugs | Medium | Medium | Failures are findings, not blockers — log as new BUG-### entries |
+| Compaction S3 upload races with manifest update | Medium | High | Sprint C7 addresses with explicit upload-confirmation callback before manifest write |
+| Driver compatibility gaps surface new CQL bugs beyond BUG-021–026 | High | Medium | Expected — log as BUG-### and fix in C8 before declaring CQL compatibility gate green |
 
 ---
 
@@ -186,21 +189,70 @@ Any cell that is not "pass" becomes a bug report (BUG-### in `bugs/`). The sprin
 
 ---
 
+## Sprint C7: Compaction S3 Integration
+
+**Duration:** 1 week
+**Gate:** Write → flush → compact → S3 upload cycle completes without orphaned files. Cassandra 5.1 reader reads compacted SSTables from S3. Compaction metrics reflect correct state.
+
+The compaction merge logic (`execute_task`), the result-polling swap (`poll_compactions`), and the background timer are all implemented. The missing piece is the S3 side: after `poll_compactions` swaps in the output SSTable, it never enqueues an S3 upload, updates the manifest, or deletes the superseded input SSTables from S3.
+
+| # | Task | Size | Root Cause / Gap | Success Criteria | Tests |
+|---|------|------|-----------------|-----------------|-------|
+| C7.1 | Enqueue `UploadTask::SSTable` for compaction output in `poll_compactions` | S | `poll_compactions` opens and swaps the output SSTable locally but never submits an upload task to `upload_manager` | After `poll_compactions` succeeds, compacted SSTable components appear in S3 bucket. `upload_manager` metrics show task submitted. | `compaction_output_uploaded_to_s3` |
+| C7.2 | Update manifest after compaction upload confirmed | M | Manifest is only updated on flush path (`sync_to_s3`). After compaction swap, manifest still lists input SSTables, not the output. | After upload confirmed: manifest removes input entries, adds output entry. CAS retry handles concurrent flushes during compaction. | `manifest_updated_after_compaction`, `manifest_compaction_concurrent_flush` |
+| C7.3 | Delete input SSTable files from S3 after manifest update (1-hour grace period) | M | Input SSTables never deleted from S3 after compaction — unbounded S3 growth | Input SSTable files enqueued for deletion 1 hour after manifest update confirms output. Deletion task is idempotent (404 is not an error). | `compaction_inputs_deleted_from_s3_after_grace` |
+| C7.4 | Delete input SSTable files from local disk after S3 deletion confirmed | S | Local disk growth: compacted inputs not cleaned up from `data_dir` after compaction swap | Input directories removed from local disk after S3 deletion and local cache eviction. `local_cache.evict()` called for each input. | `compaction_inputs_evicted_locally` |
+| C7.5 | Compaction S3 round-trip: Cassandra 5.1 reads compacted SSTable from S3 | M | C5 validates flush output; compaction output must also pass Cassandra reader (separate code path through `execute_task`) | Cassandra reads compacted SSTable (2 input SSTables merged, written via `SSTableWriter`). All cell types preserved. Token order correct. | `cassandra_reads_compacted_sstable_from_s3` |
+| C7.6 | Compaction observability: Prometheus metrics for S3 upload and deletion | S | No metrics for compaction S3 operations — cannot distinguish compaction from flush in dashboards | `ferrosa_compaction_s3_uploads_total`, `ferrosa_compaction_s3_deletes_total`, `ferrosa_compaction_input_bytes_reclaimed` counters present and accurate. | `compaction_s3_metrics_accurate` |
+| C7.7 | Compaction end-to-end test: write 4 SSTables → compact → verify S3 → verify manifest → verify Cassandra reads | M | No integration test covers the full flush+compact+S3+manifest+Cassandra-reader pipeline | Single test exercises: 4 flush cycles (creates 4 SSTables), STCS triggers compact (merges to 1), upload confirms, manifest updated, old files deleted, Cassandra reader reads from S3. | `compaction_end_to_end_pipeline` |
+
+**Refactoring required:**
+- `ferrosa-storage/src/engine.rs`: Add `upload_manager` call in `poll_compactions` after successful swap
+- `ferrosa-storage/src/engine.rs`: Add manifest update in `poll_compactions` (analogous to flush path)
+- `ferrosa-storage/src/upload/manager.rs`: Add `UploadTask::DeleteSSTable` variant with grace-period delay
+
+---
+
+## Sprint C8: Full CQL Driver Compatibility
+
+**Duration:** 1–2 weeks
+**Gate:** All six CQL drivers execute a full compatibility smoke test against a live 3-node cluster without errors. `ferrosa-jepsen run --tier standard` passes with all 6 drivers. No driver-specific linearizability failures.
+
+| # | Task | Size | Description | Success Criteria | Tests |
+|---|------|------|------------|-----------------|-------|
+| C8.1 | Python driver (`cassandra-driver`) compatibility smoke | S | Run `tests/drivers/python/test_cassandra_cql_examples.py` against live 3-node cluster (not standalone). Fix any cluster-mode regressions. | All Python smoke tests pass. 81.8%+ of CQL examples execute without error. | `python_driver_cluster_smoke` |
+| C8.2 | Go driver (`gocql`) compatibility smoke | S | Run gocql smoke suite against 3-node cluster. Fix any cluster-mode regressions (peer topology, system tables, token-aware routing). | gocql connects, authenticates, executes DML, handles pagination. | `go_driver_cluster_smoke` |
+| C8.3 | Java driver compatibility smoke | S | Run java-driver smoke suite (DML, prepared statements, batch, LWT) against 3-node cluster. | Java driver executes all statement types without error. | `java_driver_cluster_smoke` |
+| C8.4 | Node.js driver (datastax) compatibility smoke | S | Run Node.js workload generator against 3-node cluster. | Node driver executes register and bank workloads end-to-end. | `node_driver_cluster_smoke` |
+| C8.5 | C# driver compatibility smoke | S | Run C# driver workload against 3-node cluster. | C# driver connects, executes DML, handles LWT responses. | `csharp_driver_cluster_smoke` |
+| C8.6 | Token-aware routing: all drivers route writes to correct coordinator | M | Each driver should send writes to the token-owner node, not always to node 1. Verify via `system.peers` and token ring metadata accuracy. | Each driver demonstrates token-aware routing in logs. No "wrong node" errors. | `token_aware_routing_all_drivers` |
+| C8.7 | Prepared statement cache invalidation on schema change | M | All drivers cache prepared statements. After `ALTER TABLE`, cached statements must be invalidated and re-prepared correctly. | `ALTER TABLE ADD COLUMN` followed by prepared INSERT with new column succeeds for all 6 drivers. No stale metadata errors. | `prepared_stmt_cache_invalidation_all_drivers` |
+| C8.8 | Fix any new CQL bugs surfaced by C8.1–C8.5 | L | Each driver test run is expected to surface 1–3 new protocol edge cases not covered by BUG-021–026 | All surfaced bugs fixed and covered by regression tests. CI gate green for all 6 drivers. | Per-bug regression tests |
+| C8.9 | All-drivers Jepsen standard tier | L | Run `ferrosa-jepsen run --tier standard` with all 6 drivers simultaneously (not just Rust). Each driver runs workloads concurrently, all hitting the same cluster. | Zero anomalies across all 6 drivers. No driver-specific linearizability failures. Cross-driver invariants hold. | `jepsen_standard_tier_all_drivers` |
+
+---
+
 ## Compiled Task Order and Dependencies
 
 ```
-C1 (Bug fixes) ─────────────────────────────────────────┐
-                                                         ↓
-C2 (P0 storage) ──────────────────────────────────────→ C4 (Jepsen T1+T2 validation)
-                                                         ↑
-C3 (Jepsen infra) ───────────────────────────────────────┘
+C1 (Bug fixes) ──────────────────────────────────────────────────┐
+                                                                  ↓
+C2 (P0 storage) ───────────────────────────────────────────────→ C4 (Jepsen T1+T2)
+                                                                  ↑
+C3 (Jepsen infra) ────────────────────────────────────────────────┘
 
 C5 (SSTable compat) ─── parallel with C4, no dependency
+                    ──→ feeds C7 (need compat tests before validating compaction output)
 
-C6 (Accord under failures) ─── requires C4 passing (needs working Jepsen infra + C2 fixes)
+C6 (Accord under failures) ─── requires C4 (needs working Jepsen + C2 fixes)
+
+C7 (Compaction S3) ─── requires C2 (S3 upload confirmation), C5 (Cassandra reader test)
+
+C8 (CQL driver compat) ─── requires C3 (Jepsen infra), C4 (cluster working)
+                        ─── parallel with C6, C7
 ```
 
-C1 and C2 are strict prerequisites for C4. C3 can begin in parallel with C2. C5 is independent and can be parallelized. C6 requires C4 to establish a working Jepsen baseline first.
+C1 and C2 are strict prerequisites for C4. C3 can begin in parallel with C2. C5 is independent and can be parallelized with C4. C6 requires C4 as a baseline. C7 requires C2 and C5. C8 can begin once C3 and C4 are passing and runs in parallel with C6 and C7.
 
 ---
 
@@ -214,8 +266,10 @@ C1 and C2 are strict prerequisites for C4. C3 can begin in parallel with C2. C5 
 | C4 | ~40 | 76 | Standard tier passes (T1+T2) |
 | C5 | ~16 | 92 | Cassandra reader CI gate green |
 | C6 | ~20 | 112 | Accord correctness assertions pass all nemeses |
+| C7 | ~10 | 122 | Compaction S3 round-trip + Cassandra reader |
+| C8 | ~15 | 137 | All 6 drivers pass cluster smoke + Jepsen standard tier |
 
-**Total: 112 new tests across 6 sprints (~10–12 weeks)**
+**Total: ~137 new tests across 8 sprints (~12–14 weeks)**
 
 ---
 
@@ -223,13 +277,15 @@ C1 and C2 are strict prerequisites for C4. C3 can begin in parallel with C2. C5 
 
 This batch of work is complete when:
 
-1. `ferrosa-jepsen run --tier standard` reports zero anomalies on a healthy 3-node and 5-node single-DC cluster
-2. `tests/sstable-compat/` CI gate passes: Cassandra 5.1 reads all ferrosa-written SSTable cell types from S3
-3. All 6 C6 Accord correctness assertions pass across all 16 nemeses
-4. BUG-021 through BUG-026 are closed with regression tests
-5. P0 hazards (C2.1–C2.3) are closed with durability tests
+1. `ferrosa-jepsen run --tier standard` reports zero anomalies on a healthy 3-node and 5-node single-DC cluster with **all 6 drivers simultaneously**
+2. `tests/sstable-compat/` CI gate passes: Cassandra 5.1 reads all ferrosa-written SSTable cell types — from both flush output and compaction output — fetched from S3
+3. All C6 Accord correctness assertions pass across all 16 nemeses
+4. The full flush → compact → S3 upload → manifest update → input deletion lifecycle completes without orphaned files or data loss
+5. BUG-021 through BUG-026 are closed with regression tests
+6. P0 hazards (C2.1–C2.3) are closed with durability tests
+7. All six drivers pass cluster smoke tests and token-aware routing verification
 
-After this, the project is ready to proceed to T3 (3+3 dual-DC) and T4 (tri-DC) Jepsen topologies per the unified project plan (sprints A6–A7), with confidence that the single-DC foundation is correct.
+At this point ferrosa is a **fully correct single-datacenter distributed database**: multi-node clustering works, compaction drains S3 correctly, and every CQL driver can run production workloads. The project is then ready to proceed to T3 (3+3 dual-DC) topologies per the unified project plan, with high confidence the single-DC foundation holds.
 
 ---
 
