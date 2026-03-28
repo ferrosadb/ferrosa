@@ -3931,16 +3931,22 @@ mod tests {
         let (engine, store, prefix, tid) = make_engine_with_pending_compaction(&dir).await;
 
         // poll_compactions integrates the compaction result, uploads to S3,
-        // and updates the manifest.
-        engine.poll_compactions().await;
-
-        // The output SSTable must appear in the manifest.
-        let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
-            .await
-            .unwrap();
-
+        // and updates the manifest. Retry until the channel result is consumed:
+        // the compaction thread may write output files to disk slightly before
+        // it sends the result on the channel, so a single poll may race.
         let tid_str = tid.to_string();
-        let entries = manifest.sstables.get(&tid_str).cloned().unwrap_or_default();
+        let mut entries = vec![];
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+                .await
+                .unwrap();
+            entries = manifest.sstables.get(&tid_str).cloned().unwrap_or_default();
+            if !entries.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         // Exactly one entry: the merged output.
         assert_eq!(
@@ -4221,16 +4227,25 @@ mod tests {
             sstable_dir
         );
 
-        // Run compaction + local eviction.
-        engine.poll_compactions().await;
-
-        // The Data.db files for input generations must now be gone.
-        let data_files_after: Vec<std::path::PathBuf> = std::fs::read_dir(&sstable_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().map(|e| e == "db").unwrap_or(false))
-            .collect();
+        // Run compaction + local eviction. Retry until the channel result is
+        // consumed: the compaction thread writes files before sending on the
+        // channel, so a single poll may miss the result under parallel load.
+        let mut data_files_after = vec![];
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            data_files_after = std::fs::read_dir(&sstable_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file() && p.extension().map(|e| e == "db").unwrap_or(false)
+                })
+                .collect();
+            if data_files_after.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         // All input SSTable component files must have been evicted.
         // The sstable_dir may be empty or contain only output-generation files
@@ -4288,8 +4303,20 @@ mod tests {
         );
 
         // Run compaction: merges 2 SSTables → 1 output, uploads to S3,
-        // updates manifest, enqueues 2 input deletions.
-        engine.poll_compactions().await;
+        // updates manifest, enqueues 2 input deletions. Retry until the channel
+        // result is consumed (compaction thread writes files before channel send).
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            if engine
+                .compaction_metrics
+                .s3_uploads_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         // Exactly 1 upload (the compacted output SSTable).
         assert_eq!(
