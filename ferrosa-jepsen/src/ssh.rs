@@ -205,9 +205,17 @@ mod tests {
     }
 
     /// Requires a pre-provisioned VM with SSH running and the test key.
+    /// Run scripts/lima-fc-setup.sh first, then set FERROSA_TEST_FIRECRACKER=1.
     #[tokio::test]
-    #[ignore]
     async fn ssh_execute_command() {
+        if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+            && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+        {
+            panic!(
+                "Firecracker VM not available — run scripts/lima-fc-setup.sh, \
+                 then re-run with FERROSA_TEST_FIRECRACKER=1"
+            );
+        }
         let ssh = SshClient::connect("172.16.0.2", 22, "root", Path::new("rootfs/test_key"))
             .await
             .unwrap();
@@ -218,9 +226,17 @@ mod tests {
     }
 
     /// Requires a pre-provisioned VM with SSH running and the test key.
+    /// Run scripts/lima-fc-setup.sh first, then set FERROSA_TEST_FIRECRACKER=1.
     #[tokio::test]
-    #[ignore]
     async fn ssh_upload_file() {
+        if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+            && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+        {
+            panic!(
+                "Firecracker VM not available — run scripts/lima-fc-setup.sh, \
+                 then re-run with FERROSA_TEST_FIRECRACKER=1"
+            );
+        }
         let ssh = SshClient::connect("172.16.0.2", 22, "root", Path::new("rootfs/test_key"))
             .await
             .unwrap();

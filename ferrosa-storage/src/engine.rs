@@ -2121,6 +2121,25 @@ mod tests {
     use ferrosa_common::schema::ColumnDefinition;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
 
+    /// Return "docker" or "podman" — whichever container runtime is in PATH.
+    /// Panics if neither is found.
+    fn container_runtime() -> &'static str {
+        for candidate in &["docker", "podman"] {
+            if std::process::Command::new(candidate)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                return Box::leak((*candidate).to_string().into_boxed_str());
+            }
+        }
+        panic!(
+            "no container runtime found — install Podman Desktop (macOS) or Docker Desktop \
+             before running container-dependent tests"
+        );
+    }
+
     fn test_schema() -> TableSchema {
         TableSchema {
             keyspace: "test_ks".to_string(),
@@ -4372,10 +4391,16 @@ mod tests {
     ///   3. Cassandra 5.1 mounts the MinIO-backed data directory and scans the table.
     ///   4. All original rows and cell types are present in the Cassandra output.
     ///
-    /// Skipped unless a Docker daemon is available (MinIO + Cassandra containers).
+    /// Requires MinIO + Cassandra 5.1 containers (Docker or Podman).
+    /// Set FERROSA_TEST_CONTAINERS=1 after starting the compose stack.
     #[tokio::test]
-    #[ignore = "requires docker"]
     async fn cassandra_reads_compacted_sstable_from_s3() {
+        if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
+            panic!(
+                "FERROSA_TEST_CONTAINERS not set — start MinIO+Cassandra containers \
+                 (docker/podman compose up -d) then re-run with FERROSA_TEST_CONTAINERS=1"
+            );
+        }
         use std::process::Command;
 
         // ── Step 1: build engine, flush 2 SSTables with varied cell types ──
@@ -4507,7 +4532,7 @@ mod tests {
         //
         // This test validates the protocol contract: ferrosa writes BTI-format
         // SSTables; Cassandra 5.1 must read them without errors.
-        let cassandra_up = Command::new("docker")
+        let cassandra_up = Command::new(container_runtime())
             .args(["compose", "-f", "tests/docker/compaction-cassandra.yml", "up", "-d"])
             .status()
             .map(|s| s.success())
@@ -4522,7 +4547,7 @@ mod tests {
         let mut cassandra_ready = false;
         for _ in 0..60 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let status = Command::new("docker")
+            let status = Command::new(container_runtime())
                 .args([
                     "exec",
                     "ferrosa-cassandra-test",
@@ -4540,7 +4565,7 @@ mod tests {
         assert!(cassandra_ready, "Cassandra did not become ready within 60 s");
 
         // ── Step 4: query Cassandra and verify rows ──
-        let cql_output = Command::new("docker")
+        let cql_output = Command::new(container_runtime())
             .args([
                 "exec",
                 "ferrosa-cassandra-test",
@@ -4563,7 +4588,7 @@ mod tests {
         );
 
         // Cleanup containers.
-        let _ = Command::new("docker")
+        let _ = Command::new(container_runtime())
             .args(["compose", "-f", "tests/docker/compaction-cassandra.yml", "down", "-v"])
             .status();
     }
@@ -4578,10 +4603,16 @@ mod tests {
     ///   → input SSTable files deleted locally
     ///   → Cassandra 5.1 reads all 4 partition keys from compacted SSTable
     ///
-    /// Skipped unless a Docker daemon is available.
+    /// Requires MinIO + Cassandra 5.1 containers (Docker or Podman).
+    /// Set FERROSA_TEST_CONTAINERS=1 after starting the compose stack.
     #[tokio::test]
-    #[ignore = "requires docker"]
     async fn compaction_end_to_end_pipeline() {
+        if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
+            panic!(
+                "FERROSA_TEST_CONTAINERS not set — start MinIO+Cassandra containers \
+                 (docker/podman compose up -d) then re-run with FERROSA_TEST_CONTAINERS=1"
+            );
+        }
         use std::process::Command;
 
         let dir = tempfile::tempdir().unwrap();
@@ -4685,7 +4716,7 @@ mod tests {
         }
 
         // ── Docker: Cassandra 5.1 reads the compacted SSTable from MinIO ──
-        let cassandra_up = Command::new("docker")
+        let cassandra_up = Command::new(container_runtime())
             .args([
                 "compose",
                 "-f",
@@ -4706,7 +4737,7 @@ mod tests {
         let mut cassandra_ready = false;
         for _ in 0..60 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let status = Command::new("docker")
+            let status = Command::new(container_runtime())
                 .args(["exec", "ferrosa-cassandra-test", "nodetool", "status"])
                 .status()
                 .map(|s| s.success())
@@ -4719,7 +4750,7 @@ mod tests {
         assert!(cassandra_ready, "Cassandra did not become ready within 60 s");
 
         // Verify all 4 partition keys are readable from the compacted SSTable.
-        let cql_output = Command::new("docker")
+        let cql_output = Command::new(container_runtime())
             .args([
                 "exec",
                 "ferrosa-cassandra-test",
@@ -4739,7 +4770,7 @@ mod tests {
         }
 
         // Cleanup.
-        let _ = Command::new("docker")
+        let _ = Command::new(container_runtime())
             .args([
                 "compose",
                 "-f",

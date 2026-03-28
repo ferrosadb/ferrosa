@@ -320,10 +320,16 @@ mod tests {
         assert_eq!(cfg.tap_device, "tap0");
     }
 
-    /// Requires firecracker binary, root privileges, and a built rootfs.
+    /// Requires Firecracker binary, root privileges, and a built rootfs.
+    /// Set FERROSA_TEST_FIRECRACKER=1 to run (see scripts/lima-fc-setup.sh).
     #[tokio::test]
-    #[ignore]
     async fn provision_single_vm() {
+        if std::env::var("FERROSA_TEST_FIRECRACKER").is_err() {
+            panic!(
+                "FERROSA_TEST_FIRECRACKER not set — run scripts/lima-fc-setup.sh first, \
+                 then re-run with FERROSA_TEST_FIRECRACKER=1"
+            );
+        }
         let mut vm = FirecrackerVm::create(VmConfig::default_test())
             .await
             .unwrap();
