@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -150,10 +151,7 @@ async fn create_snapshot(
 ///
 /// Returns `204 No Content` on success, `404` if not found, `503` if S3
 /// is not configured.
-async fn delete_snapshot(
-    State(state): State<WebAppState>,
-    Path(name): Path<String>,
-) -> (StatusCode, Json<Value>) {
+async fn delete_snapshot(State(state): State<WebAppState>, Path(name): Path<String>) -> Response {
     let engine = &state.storage;
     let (os_config, store) = match engine.object_store_and_config() {
         Ok(pair) => pair,
@@ -161,7 +159,8 @@ async fn delete_snapshot(
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "error": "S3 not configured" })),
-            );
+            )
+                .into_response();
         }
     };
 
@@ -170,16 +169,17 @@ async fn delete_snapshot(
         .delete_snapshot_with_store(&name, store, &prefix)
         .await
     {
-        Ok(()) => (StatusCode::NO_CONTENT, Json(json!({}))),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("does not exist") {
-                (StatusCode::NOT_FOUND, Json(json!({ "error": msg })))
+                (StatusCode::NOT_FOUND, Json(json!({ "error": msg }))).into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": msg })),
                 )
+                    .into_response()
             }
         }
     }

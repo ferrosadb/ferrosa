@@ -81,6 +81,54 @@ No data loss under any condition. This is the #1 requirement.
 | S3 upload verification | S3 matches local | Checksum comparison |
 | Cold start from S3 | Serves correctly with no local data | Wipe local, restart |
 
+### SSTable Fuzz Testing
+
+Property-based fuzz tests using `proptest` verify that the SSTable writer and reader handle all cell types correctly and never panic on malformed input. Located in `ferrosa-sstable/tests/property_tests.rs`.
+
+| Test | Category | Validates |
+|------|----------|-----------|
+| `live_cell_roundtrip` | Cell roundtrip | Random value + timestamp survives write/read |
+| `tombstone_cell_roundtrip` | Cell roundtrip | Tombstone timestamp + LDT survives write/read |
+| `expiring_cell_roundtrip` | Cell roundtrip | TTL + LDT + value survives write/read |
+| `mixed_cell_types_in_one_partition` | Cell roundtrip | Live, tombstone, and expiring cells coexist in one partition |
+| `random_bytes_never_panic` | Reader resilience | Arbitrary byte sequences produce `Ok` or `Err`, never panic |
+| `random_bytes_with_clustering_never_panic` | Reader resilience | Random bytes with clustering-column header never panic |
+| `valid_prefix_then_garbage_never_panic` | Reader resilience | Truncated partition header + garbage (simulates crash during flush) |
+| `corrupt_single_byte_never_panic` | Corruption | Valid SSTable with one random byte flipped never panics |
+| `corrupt_expiring_cell_never_panic` | Corruption | Valid expiring-cell SSTable with one random byte flipped never panics |
+
+Each test runs 1000+ generated inputs per `cargo test` invocation. The invariant is simple: the reader must return `Ok` or `Err` for any input — a panic is always a bug.
+
+Additional leaf-component property tests (varint unsigned/signed round-trip, LZ4/Zstd compression round-trip, Bloom filter false-negative freedom, byte-comparable round-trip and ordering preservation) bring the total to 16 property-based tests across the crate.
+
+### Cassandra Cross-Compatibility Fixtures
+
+A Java-based fixture generator uses Cassandra's `CQLSSTableWriter` to produce reference SSTables with known data. The generator runs inside a Docker container built from the Cassandra 5.1 submodule, ensuring binary-level compatibility.
+
+| Component | Location |
+|-----------|----------|
+| Dockerfile | `tests/sstable-compat/Dockerfile` |
+| Java fixture generator | `tests/sstable-compat/CassandraSSTableWriter.java` |
+| Generate script | `tests/sstable-compat/generate.sh` |
+| Output fixtures | `ferrosa-sstable/tests/fixtures/cassandra_generated/` |
+
+**Fixtures generated:**
+
+| Fixture | Contents | Validates |
+|---------|----------|-----------|
+| `normal_cells` | Multi-partition, multi-row text data | Standard cell read path |
+| `ttl_cells` | Rows with 60s, 1hr, 1day TTL | Expiring cell metadata parsing |
+| `edge_cases` | Empty string, null value, 200-char partition key | Boundary conditions |
+| `many_partitions` | 100 partitions, 1 row each | Partition index iteration |
+| `wide_partition` | 1 partition, 500 rows | Clustering key ordering, row iteration |
+
+```bash
+# Generate fixtures (requires Docker)
+./tests/sstable-compat/generate.sh
+```
+
+The Docker build compiles Cassandra from source (`ant build`), compiles the Java generator against Cassandra's `CQLSSTableWriter` classes, then runs the generator in a slim JRE image. Output is volume-mounted to the fixture directory for use by Rust integration tests.
+
 ## Suite 2: Performance Baselines
 
 YCSB workloads on identical Sprite hardware:
@@ -115,6 +163,37 @@ Sprites are ideal — Firecracker VMs with fast spin-up/kill.
 - **DML**: INSERT, UPDATE, DELETE, SELECT at all CL levels
 - **Types**: All CQL types including collections, UDTs, tuples
 - **cqlsh**: Connects and operates normally
+
+### Python Wire-Level CQL Tests
+
+A Python test harness using the DataStax `cassandra-driver` executes Cassandra's official CQL documentation examples over the wire against a live Ferrosa instance. This validates both parsing and execution, not just parsing.
+
+| Component | Location |
+|-----------|----------|
+| Test harness | `tests/drivers/python/test_cassandra_cql_examples.py` |
+| Docker Compose | `tests/drivers/docker-compose.drivers.yml` |
+| CQL examples source | `cassandra/doc/modules/cassandra/examples/CQL/` |
+
+**How it works:**
+
+1. Collects all `.cql` files from the Cassandra submodule's documentation examples
+2. Splits each file into individual CQL statements
+3. Filters out cqlsh-only commands (`SOURCE`, `DESCRIBE`, `COPY`, etc.) and non-CQL fragments (UDF bodies, code snippets)
+4. Executes each remaining statement against Ferrosa via the Python driver
+5. Reports pass/fail/skip counts and overall coverage percentage
+
+**Current coverage:** 81.8% of 707 executable CQL statements (864 total, 157 filtered as cqlsh commands or non-CQL fragments).
+
+```bash
+# Via Docker
+docker compose -f tests/drivers/docker-compose.drivers.yml run python-tests \
+    pytest -v test_cassandra_cql_examples.py
+
+# Locally (with ferrosa running on 9042)
+pytest -v tests/drivers/python/test_cassandra_cql_examples.py
+```
+
+The test is currently informational — it reports coverage without failing the suite. The CQL parser's own doc test (`cassandra_cql_examples.rs`) enforces parse-level coverage separately.
 
 ## Suite 5: Secondary Index Tests
 
@@ -191,6 +270,83 @@ Ferrosa includes a built-in Jepsen-style testing framework (not the external Jep
 | Fast path ratio | % fast vs slow path | Verify low-contention fast path dominance |
 | Contention scaling | Throughput under N concurrent txns | Identify contention knee |
 | Regression suite | Automated comparison vs baseline | Prevent performance regressions |
+
+## Suite 7: End-to-End Accord Verification (ferrosa-jepsen)
+
+Real multi-node cluster testing with real CQL drivers, real failure injection, and formal linearizability verification. Unlike Suite 6 (in-process deterministic), Suite 7 tests the full stack from CQL socket to disk under real network failures.
+
+See [ferrosa-jepsen spec](jepsen-e2e-test-plan.md) for full details.
+
+### Infrastructure
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| Local clusters | Firecracker VMs | Sub-second boot, real kernel isolation, tc/netem per-link |
+| Geo-distributed | Fly.io (iad/cdg/nrt) | Real multi-region latency, WAN chaos proxy |
+| Formal verification | Jepsen + Knossos/Elle | NP-complete linearizability proof, G0-G2 anomaly detection |
+| Fast verification | Rust `LinearizabilityChecker` | O(n log n) inline checker for immediate feedback |
+| CQL drivers | Python, Go, Node, Java, C#, Rust | All 6 drivers hit the same cluster simultaneously |
+
+### Topology Progression
+
+| Phase | Nodes | RF | Focus |
+|-------|-------|----|-------|
+| T1 | 3 single-DC | 3 | Basic quorum, all failure modes |
+| T2 | 5 single-DC | 5 | Fast/slow quorum paths |
+| T3 | 3+3 dual-DC | 3/DC | LOCAL_SERIAL vs SERIAL, DC partition |
+| T4 | 3+3+3 tri-DC | 3/DC | Electorate reconfiguration, geo-failures |
+
+### Nemesis Matrix (21 nemeses + 5 composed)
+
+**Network:** partition-halves, partition-ring, partition-one, slow-network, jitter-network, packet-loss, packet-corrupt, packet-reorder
+
+**Process:** kill-minority, kill-majority, pause-node
+
+**Clock:** clock-skew-small (+/-100ms), clock-skew-large (+/-5s), clock-strobe (NTP jumps)
+
+**Disk:** disk-slow (dm-flakey delay), disk-fail (dm-flakey drop)
+
+**WAN (T3/T4):** dc-partition, dc-slow, dc-asymmetric, dc-flap, dc-lossy
+
+**Composed:** partition+clock, kill+jitter, pause+loss, dc-partition+kill, all-random
+
+### LWT Pattern Coverage (16 patterns)
+
+All patterns run under every nemesis, at 3 concurrency levels (12/60/300 concurrent clients), with all 6 CQL drivers:
+
+| # | Pattern | Invariant |
+|---|---------|-----------|
+| 1 | INSERT IF NOT EXISTS | Exactly one winner per key |
+| 2 | INSERT IF NOT EXISTS + TTL | No insert during unexpired TTL window |
+| 3 | UPDATE IF col = ? | Final value = count of successful CAS |
+| 4 | UPDATE IF col1 = ? AND col2 = ? | Only valid state transitions |
+| 5 | UPDATE IF EXISTS | Fails on non-existent row |
+| 6 | DELETE IF col = ? | Only matching rows deleted |
+| 7 | DELETE IF EXISTS | Exactly one delete succeeds |
+| 8 | BATCH mixed IF | Atomic all-or-nothing |
+| 9 | BATCH multi-row same partition | All-or-nothing across clustering keys |
+| 10 | LWT + counters | Monotonic, threshold respected |
+| 11 | LWT + collections | Set grows monotonically |
+| 12 | LWT + TTL | No phantom CAS on expired row |
+| 13 | LWT + static columns | CAS serialized across partition |
+| 14 | LWT result set format | Wire format matches Cassandra spec |
+| 15 | SERIAL/LOCAL_SERIAL reads | Reads see latest committed write |
+| 16 | BEGIN TRANSACTION | Cross-partition balance invariant |
+
+### Execution Tiers
+
+| Tier | Duration | Scope |
+|------|----------|-------|
+| Smoke | ~5 min | T1, 3 nemeses, Rust driver, low concurrency |
+| Standard | ~45 min | T1+T2, all nemeses, all drivers, low+medium |
+| Full | ~4 hours | All topologies, all nemeses, all drivers, all concurrency |
+| Endurance | 24 hours | T4 tri-DC on Fly.io, continuous random nemesis |
+
+### Full Test Matrix
+
+```
+4 topologies x 16 nemeses x 16 LWT patterns x 6 drivers x 3 concurrency = 18,432 combinations
+```
 
 ## Pre-1.0 Test Backlog
 
