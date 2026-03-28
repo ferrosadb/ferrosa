@@ -88,6 +88,25 @@ Source under `cassandra/src/java/org/apache/cassandra/`:
 - **`specs/`** — Architecture specs, threat models, status docs. Not publicly served.
 - **`.github/workflows/docs.yml`** — Deploys `docs/` to GitHub Pages. Must ONLY deploy from `docs/`. Never deploy rustdoc (`target/doc/`) or any generated content to Pages.
 
+## Test Policy — Non-Negotiable Rules for All Agents
+
+These rules apply to every agent working in this repository. They cannot be overridden by task instructions.
+
+- **No `#[ignore]`** — Never add `#[ignore]` to a test. There are zero legitimately ignored tests in this codebase.
+- **No silent returns** — Never write `if condition { return; }` in a test body to make a test appear to pass when it didn't run. A test that returns early shows as `ok` but ran nothing. This is forbidden.
+- **Panic on missing infrastructure** — If a test requires infrastructure (Firecracker, Podman/Docker, cluster nodes), it must `panic!` with a clear message explaining what to set up. Example:
+  ```rust
+  if std::env::var("FERROSA_TEST_FIRECRACKER").is_err() {
+      panic!("FERROSA_TEST_FIRECRACKER not set — run scripts/lima-fc-setup.sh first");
+  }
+  ```
+- **Infrastructure env vars**:
+  - `FERROSA_TEST_FIRECRACKER=1` — Firecracker VMs, SSH, cluster provisioning tests
+  - `FERROSA_TEST_CLUSTER_NODES=<addr>` — pre-provisioned cluster
+  - `FERROSA_TEST_CONTAINERS=1` — Docker/Podman compose cluster (MinIO + Cassandra compat tests)
+- **Container runtime** — Use `container_runtime()` helper (auto-detects `docker` or `podman`) not hardcoded `"docker"`. macOS uses Podman Desktop.
+- **Goal: `cargo test` with full infrastructure = zero failures, zero ignored.** Without infrastructure, tests fail loudly with setup instructions.
+
 ## Key Design Decisions
 
 - **Storage**: Write-behind async S3 — local ephemeral disk as cache, S3 as durable store
