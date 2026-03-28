@@ -8,7 +8,6 @@
 //! across `await` points (network round-trips).  The actor exclusively owns
 //! [`LaneState`], so no mutex is needed.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -174,7 +173,11 @@ pub(crate) struct ActorReconnectContext {
     pub(crate) lane: Lane,
     pub(crate) config: Arc<NetConfig>,
     pub(crate) local_host_id: Uuid,
-    pub(crate) peer_addr: SocketAddr,
+    /// Peer address as a hostname:port or IP:port string.
+    /// Stored as a string (not a resolved `SocketAddr`) so DNS is re-resolved on
+    /// every reconnect attempt, allowing container restarts with new IPs to
+    /// reconnect without requiring a restart on this side.
+    pub(crate) peer_host: String,
     pub(crate) tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
     pub(crate) handle: LaneHandle,
 }
@@ -190,7 +193,7 @@ impl ActorReconnectContext {
             let result = connect_with_retry(
                 Arc::clone(&ctx.config),
                 ctx.local_host_id,
-                ctx.peer_addr,
+                &ctx.peer_host,
                 ctx.lane,
                 ctx.tls_connector.clone(),
             )
@@ -399,7 +402,7 @@ mod tests {
             lane: Lane::Raft,
             config: Arc::new(NetConfig::default()),
             local_host_id: Uuid::new_v4(),
-            peer_addr: "127.0.0.1:9999".parse().unwrap(),
+            peer_host: "127.0.0.1:9999".to_owned(),
             tls_connector: None,
             handle: h,
         });
@@ -458,7 +461,7 @@ mod tests {
                 lane: Lane::Data,
                 config: Arc::new(NetConfig::default()),
                 local_host_id: Uuid::new_v4(),
-                peer_addr: "127.0.0.1:9999".parse().unwrap(),
+                peer_host: "127.0.0.1:9999".to_owned(),
                 tls_connector: None,
                 handle: h,
             },
@@ -501,7 +504,7 @@ mod tests {
                 lane: Lane::Bulk,
                 config: Arc::new(NetConfig::default()),
                 local_host_id: Uuid::new_v4(),
-                peer_addr: "127.0.0.1:9999".parse().unwrap(),
+                peer_host: "127.0.0.1:9999".to_owned(),
                 tls_connector: None,
                 handle: h,
             },
@@ -529,7 +532,7 @@ mod tests {
             lane: Lane::Raft,
             config: Arc::new(NetConfig::default()),
             local_host_id: Uuid::new_v4(),
-            peer_addr: "127.0.0.1:9999".parse().unwrap(),
+            peer_host: "127.0.0.1:9999".to_owned(),
             tls_connector: None,
             handle: h,
         });
