@@ -6,11 +6,21 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```no_run
+//! use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+//! use ferrosa_sstable::statistics::SerializationHeader;
+//! use ferrosa_sstable::Partition;
+//! # let header = SerializationHeader {
+//! #     min_timestamp: 0, min_local_deletion_time: i32::MAX, min_ttl: 0,
+//! #     key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+//! #     clustering_types: vec![], static_columns: vec![], regular_columns: vec![],
+//! # };
+//! # let partitions: Vec<Partition> = vec![];
 //! let mut writer = SSTableWriter::new(WriteOptions::default(), header);
-//! writer.add_partition(&partition1)?;
-//! writer.add_partition(&partition2)?;
-//! let output = writer.finish()?;
+//! for partition in &partitions {
+//!     writer.add_partition(partition).unwrap();
+//! }
+//! let output = writer.finish().unwrap();
 //! ```
 //!
 //! Partitions must be added in token order. The writer currently handles

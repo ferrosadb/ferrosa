@@ -4005,18 +4005,23 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(before_count, 0, "manifest should be empty before poll_compactions");
 
-        // Integrate compaction result.
-        engine.poll_compactions().await;
-
-        // Re-load manifest and verify.
-        let (after_manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
-            .await
-            .unwrap();
-        let entries = after_manifest
-            .sstables
-            .get(&tid_str)
-            .cloned()
-            .unwrap_or_default();
+        // Integrate compaction result. Retry until the channel result is consumed.
+        let mut entries = vec![];
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            let (after_manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+                .await
+                .unwrap();
+            entries = after_manifest
+                .sstables
+                .get(&tid_str)
+                .cloned()
+                .unwrap_or_default();
+            if !entries.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         assert_eq!(
             entries.len(),
