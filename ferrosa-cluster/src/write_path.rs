@@ -131,13 +131,13 @@ impl WritePath {
                 "pair mode: primary unavailable, writes rejected until operator promotes".into(),
             )),
             Self::Pair(coordinator) => {
-                let mutation = Mutation {
-                    keyspace: table_id.keyspace.clone(),
-                    table: table_id.table.clone(),
-                    key: key.clone(),
-                    rows: vec![row],
+                let mutation = Mutation::new(
+                    table_id.keyspace.clone(),
+                    table_id.table.clone(),
+                    key.clone(),
+                    vec![row],
                     timestamp,
-                };
+                );
                 coordinator
                     .coordinate_write(&mutation)
                     .await

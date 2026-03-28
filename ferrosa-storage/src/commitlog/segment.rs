@@ -491,6 +491,7 @@ mod tests {
     /// Helper to create a simple mutation for testing.
     fn simple_mutation() -> Mutation {
         Mutation {
+            mutation_id: [0x14u8; 16],
             keyspace: "test_ks".to_string(),
             table: "test_table".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),

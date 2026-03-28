@@ -356,6 +356,7 @@ mod tests {
         use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
         use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
         Mutation {
+            mutation_id: [0x11u8; 16],
             keyspace: ks.to_string(),
             table: table.to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),

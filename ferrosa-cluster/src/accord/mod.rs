@@ -4,6 +4,7 @@
 //! protocol-level testing of the Accord (EPaxos-family) consensus protocol.
 
 pub mod chaos_minority_kill;
+pub mod clock;
 pub mod clock_validation;
 pub mod coordinator;
 pub mod cross_shard;
@@ -45,7 +46,11 @@ pub use epoch_drain::{DrainCheckResult, EpochDrain, TxnDrainStatus};
 pub use leaseholder::{LeaseAssignment, LeaseError, LeaseholderManager};
 pub use linearizable_read::{LinearizableReadManager, ReadError, ReadResult};
 pub use metrics::AccordMetrics;
-pub use recovery::{RecoverOKResponse, RecoveryCoordinator, RecoveryDecision};
+pub use clock::{ClockError, ClockValidator};
+pub use recovery::{
+    AccordNodeState, AccordPhase, AccordTxn, InflightResolution, NodeId, NodeRecoveryCoordinator,
+    RecoverOKResponse, RecoveryCoordinator, RecoveryDecision,
+};
 pub use reorder_buffer::ReorderBuffer;
 pub use state_machine::{AccordStateMachine, SmResponse};
 pub use test_cluster::{TestCluster, TestMessage, TestMessagePayload, TestReplica};

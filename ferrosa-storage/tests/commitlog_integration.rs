@@ -42,6 +42,7 @@ fn test_config(dir: &Path) -> CommitLogConfig {
 /// Creates a simple mutation for testing.
 fn make_mutation(ks: &str, table: &str, key: &[u8], value: &[u8], ts: i64) -> Mutation {
     Mutation {
+        mutation_id: [0x61u8; 16],
         keyspace: ks.to_string(),
         table: table.to_string(),
         key: DecoratedKey::new(PartitionKey::new(key.to_vec())),

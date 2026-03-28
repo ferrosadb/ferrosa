@@ -128,6 +128,13 @@ pub enum Message {
     PairDdlForward(Bytes),
     /// DDL acknowledgment.
     PairDdlAck(Bytes),
+    /// Atomic batch forwarded between pair nodes.
+    ///
+    /// Payload layout: `batch_id:[u8;16] | mutation_count:u32 | mutations…`
+    /// where each mutation is serialized with a 4-byte (u32 BE) length prefix.
+    PairBatchForward(Bytes),
+    /// Acknowledgment for a [`PairBatchForward`](Self::PairBatchForward).
+    PairBatchAck(Bytes),
 
     // Batchlog
     /// Batchlog write request (serialized BatchlogEntry).
@@ -185,6 +192,8 @@ impl Message {
             Self::PairSchemaSync(_) => MsgType::PairSchemaSync,
             Self::PairDdlForward(_) => MsgType::PairDdlForward,
             Self::PairDdlAck(_) => MsgType::PairDdlAck,
+            Self::PairBatchForward(_) => MsgType::PairBatchForward,
+            Self::PairBatchAck(_) => MsgType::PairBatchAck,
             Self::BatchlogWrite(_) => MsgType::BatchlogWrite,
             Self::BatchlogDelete(_) => MsgType::BatchlogDelete,
             Self::BatchlogReplay(_) => MsgType::BatchlogReplay,
@@ -285,6 +294,8 @@ impl Message {
             | Self::PairSchemaSync(b)
             | Self::PairDdlForward(b)
             | Self::PairDdlAck(b)
+            | Self::PairBatchForward(b)
+            | Self::PairBatchAck(b)
             | Self::BatchlogWrite(b)
             | Self::BatchlogDelete(b)
             | Self::BatchlogReplay(b)
@@ -413,6 +424,10 @@ impl Message {
             MsgType::PairSchemaSync => Self::PairSchemaSync(body.split_to(body.remaining())),
             MsgType::PairDdlForward => Self::PairDdlForward(body.split_to(body.remaining())),
             MsgType::PairDdlAck => Self::PairDdlAck(body.split_to(body.remaining())),
+            MsgType::PairBatchForward => {
+                Self::PairBatchForward(body.split_to(body.remaining()))
+            }
+            MsgType::PairBatchAck => Self::PairBatchAck(body.split_to(body.remaining())),
             MsgType::BatchlogWrite => Self::BatchlogWrite(body.split_to(body.remaining())),
             MsgType::BatchlogDelete => Self::BatchlogDelete(body.split_to(body.remaining())),
             MsgType::BatchlogReplay => Self::BatchlogReplay(body.split_to(body.remaining())),

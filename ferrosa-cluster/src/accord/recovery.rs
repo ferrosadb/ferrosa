@@ -16,7 +16,10 @@
 use ferrosa_common::accord::{
     AcceptedBallot, BallotGenerator, BallotNumber, Timestamp, TxnId, TxnPhase, TxnState,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// Node identifier (same as `openraft::NodeId`).
+pub type NodeId = u64;
 
 // ---------------------------------------------------------------------------
 // RecoveryDecision
@@ -197,6 +200,156 @@ impl RecoveryCoordinator {
     /// Number of responses collected so far.
     pub fn response_count(&self) -> usize {
         self.responses.len()
+    }
+
+    // -----------------------------------------------------------------------
+    // T-023: Cluster-level recovery coordinator election
+    // -----------------------------------------------------------------------
+
+    /// Elect a recovery coordinator from a set of live peers using a simple
+    /// deterministic rule: the node with the **lowest NodeId** among the live
+    /// peers becomes the coordinator.
+    ///
+    /// # Returns
+    ///
+    /// `Some(node_id)` of the elected coordinator, or `None` if `peers` is
+    /// empty (no live peers means no election is possible).
+    ///
+    /// # Algorithm
+    ///
+    /// Lowest-ID election is deterministic and requires no additional message
+    /// rounds — every node can compute the result independently given the same
+    /// live-peer list, breaking ties predictably without a random oracle.
+    pub fn elect(peers: &[NodeId], _local_id: NodeId) -> Option<NodeId> {
+        peers.iter().copied().min()
+    }
+
+    /// Returns `true` if this node is the elected recovery coordinator for
+    /// the given set of live peers.
+    ///
+    /// A node is the coordinator when it is the lowest-ID node among the
+    /// live peers (see [`Self::elect`]).
+    pub fn is_recovery_coordinator(&self, live_peers: &[NodeId]) -> bool {
+        Self::elect(live_peers, self.cluster_size as NodeId) == Some(self.txn_id.0.node)
+    }
+}
+
+// ===========================================================================
+// T-023: Node-level in-flight transaction tracking
+// ===========================================================================
+
+/// The Accord phase of a node's in-flight transaction record.
+///
+/// Used by [`NodeRecoveryCoordinator`] to decide whether a transaction
+/// can be committed or must be aborted during recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccordPhase {
+    /// Transaction is in the PreAccept phase — not yet accepted by a majority.
+    PreAccept,
+    /// Transaction has been accepted by a quorum.
+    Accepted,
+    /// Transaction is already committed.
+    Committed,
+}
+
+/// A simplified in-flight Accord transaction record tracked by the node
+/// recovery coordinator.
+#[derive(Debug, Clone)]
+pub struct AccordTxn {
+    /// Transaction identifier.
+    pub txn_id: TxnId,
+    /// Current phase.
+    pub phase: AccordPhase,
+    /// Number of accept votes received (used in recovery decisions).
+    pub accept_votes: usize,
+    /// Total cluster size (used to determine if accept quorum was reached).
+    pub cluster_size: usize,
+}
+
+impl AccordTxn {
+    /// Returns `true` if this transaction has a quorum of Accept votes.
+    pub fn has_accept_quorum(&self) -> bool {
+        assert!(self.cluster_size > 0, "cluster_size must be positive");
+        self.accept_votes > self.cluster_size / 2
+    }
+}
+
+/// Liveness state of a peer node as seen by the recovery coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccordNodeState {
+    /// Node is reachable and participating.
+    Alive,
+    /// Node is unreachable (suspected failure or network partition).
+    Unreachable,
+}
+
+/// Outcome of a [`NodeRecoveryCoordinator::resolve_inflight`] call for one
+/// transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InflightResolution {
+    /// Transaction was committed.
+    Committed,
+    /// Transaction was aborted.
+    Aborted,
+}
+
+/// Node-level recovery coordinator that tracks all in-flight transactions
+/// for a node and resolves them after a majority failure.
+///
+/// This is distinct from the per-transaction [`RecoveryCoordinator`] (which
+/// drives the ballot/accept phases for a single transaction).  The
+/// `NodeRecoveryCoordinator` sits one level above: once a node determines
+/// it is the recovery coordinator (via [`RecoveryCoordinator::elect`]), it
+/// calls [`resolve_inflight`](Self::resolve_inflight) for each transaction
+/// that was in-flight when the failure occurred.
+pub struct NodeRecoveryCoordinator {
+    /// This node's ID.
+    pub node_id: NodeId,
+    /// In-flight transactions at the time of the majority failure.
+    pub inflight: HashMap<TxnId, AccordTxn>,
+    /// Current liveness state of each peer node.
+    pub peer_states: HashMap<NodeId, AccordNodeState>,
+}
+
+impl NodeRecoveryCoordinator {
+    /// Create a new node recovery coordinator.
+    pub fn new(node_id: NodeId) -> Self {
+        Self {
+            node_id,
+            inflight: HashMap::new(),
+            peer_states: HashMap::new(),
+        }
+    }
+
+    /// Resolve an in-flight transaction: commit if it has an Accept quorum,
+    /// abort it otherwise.
+    ///
+    /// # Rules
+    ///
+    /// - If the transaction is already `Committed` → returns
+    ///   [`InflightResolution::Committed`] immediately.
+    /// - If the transaction is `Accepted` with a quorum of accept votes →
+    ///   commits it.
+    /// - Otherwise (PreAccept without a majority, or no record) → aborts.
+    ///
+    /// The resolved transaction is removed from `inflight`.
+    pub fn resolve_inflight(&mut self, txn_id: TxnId) -> InflightResolution {
+        match self.inflight.remove(&txn_id) {
+            Some(txn) => match txn.phase {
+                AccordPhase::Committed => InflightResolution::Committed,
+                AccordPhase::Accepted if txn.has_accept_quorum() => {
+                    InflightResolution::Committed
+                }
+                _ => InflightResolution::Aborted,
+            },
+            None => InflightResolution::Aborted,
+        }
+    }
+
+    /// Returns `true` if this node is the elected recovery coordinator for
+    /// the given set of live peers.
+    pub fn is_recovery_coordinator(&self, live_peers: &[NodeId]) -> bool {
+        RecoveryCoordinator::elect(live_peers, self.node_id) == Some(self.node_id)
     }
 }
 

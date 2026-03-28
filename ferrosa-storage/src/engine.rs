@@ -431,7 +431,25 @@ impl StorageEngine {
     /// have been registered via [`register_table`](Self::register_table).
     /// Mutations for unregistered tables are silently skipped.
     pub fn replay_mutations(&self, mutations: Vec<Mutation>) -> ferrosa_common::Result<()> {
+        // Deduplicate by mutation_id to make replay idempotent.
+        //
+        // If the process crashed during a previous replay (after some rows were
+        // written to the memtable but before a flush checkpoint was saved), the
+        // next startup will present the same mutations again.  We track all
+        // non-zero ids we have already applied and skip duplicates.
+        //
+        // Zero ids are the legacy sentinel for segments written before the
+        // mutation_id field was added — they are always re-applied (LWW
+        // timestamp semantics keeps them safe).
+        let mut seen: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+
         for mutation in mutations {
+            // Skip duplicate non-zero ids.
+            if !mutation.has_legacy_id() && !seen.insert(mutation.mutation_id) {
+                // Already applied this mutation in this replay pass — skip.
+                continue;
+            }
+
             let table_id = TableId::new(&mutation.keyspace, &mutation.table);
             let tables = self.tables.read();
             if let Some(state) = tables.get(&table_id) {
@@ -807,13 +825,13 @@ impl StorageEngine {
         timestamp: i64,
     ) -> ferrosa_common::Result<()> {
         // 1. Append to commit log for durability.
-        let mutation = Mutation {
-            keyspace: table_id.keyspace.clone(),
-            table: table_id.table.clone(),
-            key: key.clone(),
-            rows: vec![row.clone()],
+        let mutation = Mutation::new(
+            table_id.keyspace.clone(),
+            table_id.table.clone(),
+            key.clone(),
+            vec![row.clone()],
             timestamp,
-        };
+        );
         self.commit_log.append(&mutation)?;
 
         // 2. Write to the table's memtable.
@@ -847,13 +865,13 @@ impl StorageEngine {
 
         // Collect committed mutations for observer dispatch after each write.
         for (key, row, timestamp) in mutations {
-            let mutation = Mutation {
-                keyspace: table_id.keyspace.clone(),
-                table: table_id.table.clone(),
-                key: key.clone(),
-                rows: vec![row.clone()],
+            let mutation = Mutation::new(
+                table_id.keyspace.clone(),
+                table_id.table.clone(),
+                key.clone(),
+                vec![row.clone()],
                 timestamp,
-            };
+            );
 
             // Append to commit log.
             self.commit_log.append(&mutation)?;
@@ -3091,6 +3109,7 @@ mod tests {
 
         let mutations = vec![
             Mutation {
+                mutation_id: [0xA1u8; 16],
                 keyspace: "ks".to_string(),
                 table: "tbl_a".to_string(),
                 key: DecoratedKey {
@@ -3106,6 +3125,7 @@ mod tests {
                 timestamp: 100,
             },
             Mutation {
+                mutation_id: [0xA2u8; 16],
                 keyspace: "ks".to_string(),
                 table: "tbl_b".to_string(),
                 key: DecoratedKey {

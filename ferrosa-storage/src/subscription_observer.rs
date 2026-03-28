@@ -154,6 +154,7 @@ mod tests {
             tables: vec![TableId::new("ks", "users")],
         });
         let mutation = Mutation {
+            mutation_id: [0x21u8; 16],
             keyspace: "ks".to_string(),
             table: "users".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
