@@ -23,14 +23,17 @@ set -euo pipefail
 LIMA="${LIMA_INSTANCE:-mvm}"
 
 # aarch64 kernel from Firecracker's CI asset bucket.
-# Firecracker v1.15 was tested with kernel 6.1; this URL is pinned to that
-# version.  Check https://github.com/firecracker-microvm/firecracker/releases
-# for updated kernel URLs if this download fails.
+# Check https://github.com/firecracker-microvm/firecracker/releases for updated URLs.
 KERNEL_URL="${FC_KERNEL_URL:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.11/aarch64/vmlinux-6.1.bin}"
 KERNEL_NAME="vmlinux-6.1.bin"
+ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine/v3.19"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FERROSA_BIN="$REPO_ROOT/target/release/ferrosa"
+SETUP_GUEST="$REPO_ROOT/ferrosa-jepsen/rootfs/setup-guest.sh"
+# SSH key lives at the workspace root so both lima-fc-setup.sh and the tests
+# can find it at a stable path.
+KEY_PATH="$REPO_ROOT/rootfs/test_key"
 
 echo "=== Firecracker Asset Setup ==="
 echo "  Lima instance : $LIMA"
@@ -49,6 +52,19 @@ if [[ ! -f "$FERROSA_BIN" ]]; then
     echo "  Run: cargo build --release"
     exit 1
 fi
+
+# ── 0. Generate SSH key on macOS if missing ────────────────────────────────
+# Generate on macOS (not in Lima) because Lima mounts the repo read-only.
+mkdir -p "$REPO_ROOT/rootfs"
+if [[ ! -f "${KEY_PATH}" ]]; then
+    echo "--- Generating SSH test key pair ---"
+    ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" -C "ferrosa-jepsen-test"
+    echo "Generated: $KEY_PATH"
+else
+    echo "--- SSH key already exists: $KEY_PATH ---"
+fi
+chmod 600 "$KEY_PATH"
+PUB_KEY="$(cat "${KEY_PATH}.pub")"
 
 # ── 1. Download kernel (inside Lima) ──────────────────────────────────────
 if [[ "${SKIP_KERNEL:-0}" == "1" ]]; then
@@ -75,26 +91,107 @@ if [[ "${SKIP_ROOTFS:-0}" == "1" ]]; then
     echo "--- Skipping rootfs build (SKIP_ROOTFS=1) ---"
 else
     echo ""
-    echo "--- Building rootfs (requires sudo inside Lima) ---"
-    echo "    This takes ~2-3 minutes (Alpine package install + chroot setup)"
+    echo "--- Building rootfs in Lima ---"
+    echo "    Writing to /tmp/fc-build/ (Lima's writable space)"
+    echo "    This takes ~2-3 minutes (Alpine package bootstrap)"
 
-    # Lima auto-mounts the macOS home directory, so the ferrosa repo is
-    # accessible inside Lima at the same absolute path.
-    BUILD_SH="$REPO_ROOT/ferrosa-jepsen/rootfs/build.sh"
+    # Lima mounts the macOS repo read-only, so build.sh cannot write there.
+    # We pass all paths explicitly and run fully in Lima's writable /tmp.
+    # The ferrosa binary and setup-guest.sh are read via the ro mount.
 
-    limactl shell "$LIMA" -- sudo bash "$BUILD_SH"
+    limactl shell "$LIMA" -- sudo bash -s "$FERROSA_BIN" "$SETUP_GUEST" "$PUB_KEY" << 'LIMA_BUILD'
+set -euo pipefail
+FERROSA_BIN="$1"
+SETUP_GUEST="$2"
+PUB_KEY="$3"
 
-    # Move the built image to the assets directory.
-    BUILT_IMAGE="$REPO_ROOT/ferrosa-jepsen/rootfs/rootfs.ext4"
+ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine/v3.19"
+BUILD_DIR="/tmp/fc-build"
+IMAGE="$BUILD_DIR/rootfs.ext4"
+MOUNT_DIR="$BUILD_DIR/mnt"
+
+rm -rf "$BUILD_DIR"
+mkdir -p "$MOUNT_DIR"
+
+echo "Creating 1GB ext4 image at $IMAGE..."
+dd if=/dev/zero of="$IMAGE" bs=1M count=1024 status=progress
+mkfs.ext4 -F "$IMAGE"
+
+mount -o loop "$IMAGE" "$MOUNT_DIR"
+cleanup() { umount "$MOUNT_DIR" 2>/dev/null || true; }
+trap cleanup EXIT
+
+echo "Bootstrapping Alpine Linux..."
+if ! command -v apk &>/dev/null; then
+    APK_TOOLS_URL="${ALPINE_MIRROR}/main/aarch64"
+    APK_PKG=$(curl -s "${APK_TOOLS_URL}/" | grep -oP 'apk-tools-static-[0-9][^"]*\.apk' | head -1)
+    curl -sL "${APK_TOOLS_URL}/${APK_PKG}" -o /tmp/apk-tools-static.apk
+    tar -xzf /tmp/apk-tools-static.apk -C /tmp sbin/apk.static
+    APK_CMD="/tmp/sbin/apk.static"
+else
+    APK_CMD="apk"
+fi
+
+$APK_CMD add --root "$MOUNT_DIR" --initdb \
+    --repository "${ALPINE_MIRROR}/main" \
+    --repository "${ALPINE_MIRROR}/community" \
+    --no-cache --allow-untrusted \
+    alpine-base openssh-server bash iproute2 iptables libfaketime curl
+
+echo "Configuring SSH..."
+mkdir -p "$MOUNT_DIR/root/.ssh"
+chmod 700 "$MOUNT_DIR/root/.ssh"
+echo "$PUB_KEY" > "$MOUNT_DIR/root/.ssh/authorized_keys"
+chmod 600 "$MOUNT_DIR/root/.ssh/authorized_keys"
+ssh-keygen -A -f "$MOUNT_DIR"
+
+cat > "$MOUNT_DIR/etc/ssh/sshd_config" <<'SSHD'
+Port 22
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+Subsystem sftp /usr/lib/ssh/sftp-server
+SSHD
+
+echo "Writing init script..."
+# Named rcS so lima-fc-setup.sh's boot_args (init=/etc/init.d/rcS) work.
+# IP is hardcoded to 172.16.0.2/gateway 172.16.0.1; the cluster-up script
+# overwrites this script in per-node rootfs copies with the correct IPs.
+mkdir -p "$MOUNT_DIR/etc/init.d"
+cat > "$MOUNT_DIR/etc/init.d/rcS" <<'INIT'
+#!/bin/bash
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+ip link set lo up
+ip link set eth0 up
+ip addr add 172.16.0.2/24 dev eth0
+ip route add default via 172.16.0.1
+/usr/sbin/sshd -D &
+exec /bin/bash
+INIT
+chmod +x "$MOUNT_DIR/etc/init.d/rcS"
+
+echo "Copying ferrosa binary..."
+cp "$FERROSA_BIN" "$MOUNT_DIR/usr/local/bin/ferrosa"
+chmod +x "$MOUNT_DIR/usr/local/bin/ferrosa"
+
+echo "Copying setup-guest.sh..."
+cp "$SETUP_GUEST" "$MOUNT_DIR/setup-guest.sh"
+chmod +x "$MOUNT_DIR/setup-guest.sh"
+
+echo "Image size: $(du -sh "$IMAGE" | cut -f1)"
+echo "Done."
+LIMA_BUILD
+
+    # Copy the image to the assets directory.
     limactl shell "$LIMA" -- bash -c "
         mkdir -p \"\$HOME/firecracker-assets\"
-        if [ -f '$BUILT_IMAGE' ]; then
-            cp '$BUILT_IMAGE' \"\$HOME/firecracker-assets/rootfs.ext4\"
-            echo \"Rootfs copied to ~/firecracker-assets/rootfs.ext4\"
-        else
-            echo 'ERROR: build.sh did not produce $BUILT_IMAGE'
-            exit 1
-        fi
+        cp /tmp/fc-build/rootfs.ext4 \"\$HOME/firecracker-assets/rootfs.ext4\"
+        echo \"Rootfs copied to ~/firecracker-assets/rootfs.ext4\"
+        ls -lh \"\$HOME/firecracker-assets/rootfs.ext4\"
     "
 fi
 
@@ -102,14 +199,14 @@ fi
 echo ""
 echo "--- Verifying assets ---"
 limactl shell "$LIMA" -- bash -c "
-    ls -lh \"\$HOME/firecracker-assets/\"
+    echo 'Assets in ~/firecracker-assets/:'
+    ls -lh \"\$HOME/firecracker-assets/\" 2>/dev/null || echo '  (empty)'
     echo ''
-    echo 'Required files:'
-    for f in vmlinux-6.1.bin rootfs.ext4; do
+    for f in '$KERNEL_NAME' rootfs.ext4; do
         if [ -f \"\$HOME/firecracker-assets/\$f\" ]; then
-            echo \"  ✓ \$f\"
+            echo \"  OK  \$f\"
         else
-            echo \"  ✗ \$f  <-- MISSING\"
+            echo \"  MISSING  \$f\"
         fi
     done
 "
@@ -125,6 +222,3 @@ echo "  FERROSA_TEST_FIRECRACKER=1 cargo test -p ferrosa-jepsen"
 echo ""
 echo "3-node cluster tests:"
 echo "  scripts/lima-fc-cluster-up.sh"
-echo "  FERROSA_TEST_CLUSTER_NODES=127.0.0.1:9042,127.0.0.1:9043,127.0.0.1:9044 \\"
-echo "  FERROSA_TEST_VM_KEY=$(pwd)/rootfs/test_key \\"
-echo "  cargo test -p ferrosa-jepsen --test nemesis_correctness"

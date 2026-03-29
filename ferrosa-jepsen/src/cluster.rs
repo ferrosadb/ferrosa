@@ -224,6 +224,20 @@ mod tests {
                  or run scripts/lima-fc-cluster-up.sh and set FERROSA_TEST_FIRECRACKER=1"
             );
         }
+        // Firecracker only runs on Linux — this test must execute from inside Lima.
+        if std::env::var("FERROSA_TEST_FIRECRACKER").is_ok()
+            && std::process::Command::new("which")
+                .arg("firecracker")
+                .output()
+                .map(|o| !o.status.success())
+                .unwrap_or(true)
+        {
+            panic!(
+                "firecracker binary not found in PATH — this test must run from inside the Lima VM\n\
+                 Run: limactl shell mvm\n\
+                 Then: FERROSA_TEST_FIRECRACKER=1 cargo test -p ferrosa-jepsen provision_t1_cluster"
+            );
+        }
         let cluster = FerrosCluster::provision(Topology::T1).await.unwrap();
         assert_eq!(cluster.nodes().len(), 3);
         cluster.wait_ready(Duration::from_secs(60)).await.unwrap();

@@ -1,7 +1,7 @@
 version: '3.8'
 services:
   cassandra:
-    image: cassandra:5.1
+    image: cassandra:5
     ports:
       - "9043:9042"  # Use 9043 to avoid conflict with ferrosa on 9042
     environment:

@@ -1886,4 +1886,139 @@ mod tests {
             ),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // BUG-021 regression tests — bind values in QUERY frames must not be
+    // silently ignored. Each test exercises substitute_bound_values() for one
+    // DML statement type so any future regression is caught immediately.
+    // -----------------------------------------------------------------------
+
+    /// BUG-021 / bind_values_select: a SELECT with WHERE pk = ? and a VARCHAR
+    /// bind value must produce a StringLiteral in the WHERE clause, not a
+    /// BindMarker.
+    #[test]
+    fn bind_values_select() {
+        let plan = make_plan(
+            "SELECT v FROM ks.t WHERE pk = ?",
+            vec![("pk", CqlType::Varchar)],
+        );
+
+        let pk_val = b"partition-key-1";
+        let payload = encode_values(&[pk_val]);
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+
+        if let Statement::Select(s) = &result {
+            assert_eq!(s.where_clauses.len(), 1, "expected one WHERE clause");
+            assert!(
+                matches!(&s.where_clauses[0].value, Term::StringLiteral(v) if v == "partition-key-1"),
+                "BUG-021: WHERE value should be StringLiteral(\"partition-key-1\"), got {:?}",
+                s.where_clauses[0].value
+            );
+        } else {
+            panic!("expected Select statement");
+        }
+    }
+
+    /// BUG-021 / bind_values_insert: an INSERT with VALUES (?, ?) and two bind
+    /// values must substitute both placeholders. A BindMarker in the result
+    /// means the values were silently ignored.
+    #[test]
+    fn bind_values_insert() {
+        let plan = make_plan(
+            "INSERT INTO ks.t (pk, v) VALUES (?, ?)",
+            vec![("pk", CqlType::Int), ("v", CqlType::Varchar)],
+        );
+
+        let pk_val = 7i32.to_be_bytes();
+        let v_val = b"hello";
+        let payload = encode_values(&[&pk_val, v_val]);
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+
+        if let Statement::Insert(i) = &result {
+            assert_eq!(i.values.len(), 2, "expected two INSERT values");
+            assert!(
+                matches!(&i.values[0], Term::IntegerLiteral(7)),
+                "BUG-021: first value should be IntegerLiteral(7), got {:?}",
+                i.values[0]
+            );
+            assert!(
+                matches!(&i.values[1], Term::StringLiteral(s) if s == "hello"),
+                "BUG-021: second value should be StringLiteral(\"hello\"), got {:?}",
+                i.values[1]
+            );
+        } else {
+            panic!("expected Insert statement");
+        }
+    }
+
+    /// BUG-021 / bind_values_update: an UPDATE with SET v = ? WHERE pk = ? and
+    /// two bind values must substitute both — the assignment and the WHERE
+    /// predicate.
+    #[test]
+    fn bind_values_update() {
+        let plan = make_plan(
+            "UPDATE ks.t SET v = ? WHERE pk = ?",
+            vec![("v", CqlType::Varchar), ("pk", CqlType::Int)],
+        );
+
+        let v_val = b"updated";
+        let pk_val = 42i32.to_be_bytes();
+        let payload = encode_values(&[v_val, &pk_val]);
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+
+        if let Statement::Update(u) = &result {
+            assert_eq!(u.assignments.len(), 1, "expected one assignment");
+            assert_eq!(u.where_clauses.len(), 1, "expected one WHERE clause");
+
+            // Assignment value must be substituted.
+            if let Assignment::Simple { value, .. } = &u.assignments[0] {
+                assert!(
+                    matches!(value, Term::StringLiteral(s) if s == "updated"),
+                    "BUG-021: assignment value should be StringLiteral(\"updated\"), got {:?}",
+                    value
+                );
+            } else {
+                panic!("expected Simple assignment");
+            }
+
+            // WHERE clause value must be substituted.
+            assert!(
+                matches!(&u.where_clauses[0].value, Term::IntegerLiteral(42)),
+                "BUG-021: WHERE value should be IntegerLiteral(42), got {:?}",
+                u.where_clauses[0].value
+            );
+        } else {
+            panic!("expected Update statement");
+        }
+    }
+
+    /// BUG-021 / bind_values_delete: a DELETE with WHERE pk = ? and a bind
+    /// value must substitute the placeholder so the delete targets the correct
+    /// partition.
+    #[test]
+    fn bind_values_delete() {
+        let plan = make_plan(
+            "DELETE FROM ks.t WHERE pk = ?",
+            vec![("pk", CqlType::Int)],
+        );
+
+        let pk_val = 99i32.to_be_bytes();
+        let payload = encode_values(&[&pk_val]);
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+
+        if let Statement::Delete(d) = &result {
+            assert_eq!(d.where_clauses.len(), 1, "expected one WHERE clause");
+            assert!(
+                matches!(&d.where_clauses[0].value, Term::IntegerLiteral(99)),
+                "BUG-021: WHERE value should be IntegerLiteral(99), got {:?}",
+                d.where_clauses[0].value
+            );
+        } else {
+            panic!("expected Delete statement");
+        }
+    }
 }

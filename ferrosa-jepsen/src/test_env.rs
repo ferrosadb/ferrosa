@@ -74,11 +74,16 @@ impl TestClusterEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate environment variables — Rust runs tests in
+    // parallel threads by default, and detect() reads CLUSTER_NODES before
+    // FIRECRACKER, so concurrent mutation causes a false firecracker_provision=false.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn detect_returns_none_without_env() {
-        // Ensure neither env var is set for this assertion.
-        // (CI and local dev should not have these set during unit tests.)
+        let _g = ENV_MUTEX.lock().unwrap();
         if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
             && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
         {
@@ -89,8 +94,7 @@ mod tests {
 
     #[test]
     fn detect_cluster_nodes_from_env() {
-        // Temporarily set the env var in-process — safe because tests run sequentially
-        // within each binary and this env var is only read, not mutated by other code.
+        let _g = ENV_MUTEX.lock().unwrap();
         unsafe {
             std::env::set_var("FERROSA_TEST_CLUSTER_NODES", "10.0.0.1:9042,10.0.0.2:9042");
         }
@@ -106,12 +110,20 @@ mod tests {
 
     #[test]
     fn detect_firecracker_from_env() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        // Also clear FERROSA_TEST_CLUSTER_NODES in case another test set it before
+        // we acquired the lock (e.g. if the lock wasn't held during the set).
+        let saved_cluster = std::env::var("FERROSA_TEST_CLUSTER_NODES").ok();
         unsafe {
+            std::env::remove_var("FERROSA_TEST_CLUSTER_NODES");
             std::env::set_var("FERROSA_TEST_FIRECRACKER", "1");
         }
         let env = TestClusterEnv::detect();
         unsafe {
             std::env::remove_var("FERROSA_TEST_FIRECRACKER");
+            if let Some(v) = saved_cluster {
+                std::env::set_var("FERROSA_TEST_CLUSTER_NODES", v);
+            }
         }
         let env = env.expect("should detect Firecracker from FERROSA_TEST_FIRECRACKER");
         assert!(env.firecracker_provision);

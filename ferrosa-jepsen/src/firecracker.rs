@@ -330,6 +330,19 @@ mod tests {
                  then re-run with FERROSA_TEST_FIRECRACKER=1"
             );
         }
+        // Firecracker only runs on Linux — this test must execute from inside Lima.
+        if std::process::Command::new("which")
+            .arg("firecracker")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            panic!(
+                "firecracker binary not found in PATH — this test must run from inside the Lima VM\n\
+                 Run: limactl shell mvm\n\
+                 Then: FERROSA_TEST_FIRECRACKER=1 cargo test -p ferrosa-jepsen provision_single_vm"
+            );
+        }
         let mut vm = FirecrackerVm::create(VmConfig::default_test())
             .await
             .unwrap();

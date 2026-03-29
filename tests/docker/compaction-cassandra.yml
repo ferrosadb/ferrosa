@@ -16,7 +16,7 @@ services:
   # the containerised Cassandra.
 
   cassandra:
-    image: cassandra:5.1
+    image: cassandra:5
     container_name: ferrosa-cassandra-test
     environment:
       CASSANDRA_CLUSTER_NAME: ferrosa-compat-test
@@ -27,6 +27,14 @@ services:
       HEAP_NEWSIZE: 128M
     ports:
       - "9043:9042"  # Expose on 9043 to avoid clashing with ferrosa on 9042.
+    # Enable BTI SSTable format so Cassandra reads ferrosa's BTI-format SSTables.
+    # storage_compatibility_mode must be NONE (not CASSANDRA_4) to unlock BTI.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        sed -i 's/^storage_compatibility_mode: CASSANDRA_4/storage_compatibility_mode: NONE/' /etc/cassandra/cassandra.yaml
+        printf '\nsstable:\n  selected_format: bti\n' >> /etc/cassandra/cassandra.yaml
+        exec /usr/local/bin/docker-entrypoint.sh cassandra -f
     volumes:
       - sstable-import:/var/lib/cassandra/import
     healthcheck:

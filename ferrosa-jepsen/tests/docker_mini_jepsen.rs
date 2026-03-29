@@ -12,25 +12,26 @@ use std::process::Command;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Return "docker" or "podman" — whichever container runtime is in PATH.
+/// Return "docker" or "podman" — whichever container runtime is running.
 ///
-/// Panics if neither is available.
+/// Uses `docker info` / `podman info` (not just `--version`) to confirm the
+/// daemon is actually reachable, not just that the binary is installed.
+/// On macOS, Docker Desktop may be installed but not started; Podman Desktop
+/// is usually running. Panics if neither daemon is reachable.
 fn container_runtime() -> &'static str {
-    // Podman Desktop on macOS installs a docker shim, so docker is usually
-    // present. Prefer it for compatibility; fall back to podman explicitly.
     for candidate in &["docker", "podman"] {
-        if Command::new(candidate)
-            .arg("--version")
+        let ok = Command::new(candidate)
+            .arg("info")
             .output()
             .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        if ok {
             // Leak is fine — this runs at most once per test binary.
             return Box::leak((*candidate).to_string().into_boxed_str());
         }
     }
     panic!(
-        "no container runtime found — install Podman Desktop (macOS) or Docker Desktop \
+        "no container runtime daemon reachable — start Podman Desktop (macOS) or Docker Desktop \
          and start the ferrosa-memory compose cluster before running these tests"
     );
 }
@@ -38,15 +39,15 @@ fn container_runtime() -> &'static str {
 /// Assert that FERROSA_TEST_CONTAINERS=1 is set; panic with setup instructions otherwise.
 fn require_container_cluster() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
-        let rt = if Command::new("docker")
-            .arg("--version")
+        let rt = if Command::new("podman")
+            .arg("info")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
         {
-            "docker"
-        } else {
             "podman"
+        } else {
+            "docker"
         };
         panic!(
             "FERROSA_TEST_CONTAINERS not set.\n\
@@ -80,7 +81,7 @@ fn cqlsh(port: u16, query: &str) -> Result<String, String> {
             "--rm",
             "--network",
             &network,
-            "cassandra:5.1",
+            "cassandra:5",
             "cqlsh",
             service,
             "9042",

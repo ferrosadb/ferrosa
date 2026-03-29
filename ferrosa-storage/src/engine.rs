@@ -2194,14 +2194,18 @@ mod tests {
     use ferrosa_common::cell::CellValue;
     use ferrosa_common::key::PartitionKey;
     use ferrosa_common::schema::ColumnDefinition;
+    use ferrosa_sstable::statistics::{CompactionMetadata, StatsMetadata};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
 
     /// Return "docker" or "podman" — whichever container runtime is in PATH.
     /// Panics if neither is found.
     fn container_runtime() -> &'static str {
-        for candidate in &["docker", "podman"] {
+        // Use `info` (not `--version`) to confirm the daemon is actually running,
+        // not just that the binary is installed. On macOS, Docker Desktop may be
+        // installed but not started; Podman Desktop is typically running.
+        for candidate in &["podman", "docker"] {
             if std::process::Command::new(candidate)
-                .arg("--version")
+                .arg("info")
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false)
@@ -2210,9 +2214,188 @@ mod tests {
             }
         }
         panic!(
-            "no container runtime found — install Podman Desktop (macOS) or Docker Desktop \
+            "no container runtime daemon reachable — start Podman Desktop (macOS) or Docker Desktop \
              before running container-dependent tests"
         );
+    }
+
+    /// Returns the absolute path to a file under the workspace root.
+    ///
+    /// `CARGO_MANIFEST_DIR` points to the crate directory at compile time.
+    /// The workspace root is one level up.
+    fn workspace_path(relative: &str) -> std::path::PathBuf {
+        let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = crate_dir.parent().expect("crate has a parent workspace dir");
+        workspace_root.join(relative)
+    }
+
+    /// CompactionMetadata (component 1) bytes from a real Cassandra 5.0.7 nb-format
+    /// Statistics.db (test_ks.test_table with pk text + ck int + val text).
+    /// 19 bytes — HyperLogLog cardinality estimate for a minimal table.
+    const CASSANDRA_COMPACTION_METADATA_HEX: &str =
+        "0000000ffffffffe0d190102deb87192a7b71c";
+
+    /// StatsMetadata (component 2) bytes from a Cassandra 5 BTI-format (da) SSTable
+    /// (test_ks.test_table with pk text + ck int + val text, 2-row table).
+    /// 4628 bytes — BTI format has 52 extra bytes vs Big format.
+    /// These are schema-independent; Cassandra does not validate histogram
+    /// contents against actual SSTable data during `nodetool import`.
+    const CASSANDRA_STATS_METADATA_HEX: &str = "0000009c000000000000000100000000000000000000000000000001000000000000000000000000000000020000000000000000000000000000000300000000000000000000000000000004000000000000000000000000000000050000000000000000000000000000000600000000000000000000000000000007000000000000000000000000000000080000000000000000000000000000000a0000000000000000000000000000000c0000000000000000000000000000000e0000000000000000000000000000001100000000000000000000000000000014000000000000000100000000000000180000000000000001000000000000001d000000000000000000000000000000230000000000000000000000000000002a000000000000000000000000000000320000000000000000000000000000003c0000000000000000000000000000004800000000000000000000000000000056000000000000000000000000000000670000000000000000000000000000007c00000000000000000000000000000095000000000000000000000000000000b3000000000000000000000000000000d7000000000000000000000000000001020000000000000000000000000000013600000000000000000000000000000174000000000000000000000000000001be0000000000000000000000000000021700000000000000000000000000000282000000000000000000000000000003020000000000000000000000000000039c00000000000000000000000000000455000000000000000000000000000005330000000000000000000000000000063d0000000000000000000000000000077c000000000000000000000000000008fb00000000000000000000000000000ac700000000000000000000000000000cef00000000000000000000000000000f85000000000000000000000000000012a00000000000000000000000000000165a00000000000000000000000000001ad20000000000000000000000000000202f0000000000000000000000000000269f00000000000000000000000000002e580000000000000000000000000000379d000000000000000000000000000042bc00000000000000000000000000005015000000000000000000000000000060190000000000000000000000000000735100000000000000000000000000008a610000000000000000000000000000a60e0000000000000000000000000000c7440000000000000000000000000000ef1e00000000000000000000000000011ef10000000000000000000000000001585400000000000000000000000000019d320000000000000000000000000001efd6000000000000000000000000000253010000000000000000000000000002ca01000000000000000000000000000358ce0000000000000000000000000004042a0000000000000000000000000004d1cc0000000000000000000000000005c88e0000000000000000000000000006f0aa000000000000000000000000000853ff0000000000000000000000000009fe65000000000000000000000000000bfe13000000000000000000000000000e6417000000000000000000000000001144e80000000000000000000000000014b9160000000000000000000000000018de1a000000000000000000000000001dd7520000000000000000000000000023cf2f000000000000000000000000002af89f000000000000000000000000003390bf000000000000000000000000003de0e5000000000000000000000000004a411300000000000000000000000000591ae4000000000000000000000000006aed1200000000000000000000000000804faf0000000000000000000000000099f93800000000000000000000000000b8c4aa00000000000000000000000000ddb8cc000000000000000000000000010a10f5000000000000000000000000013f478c000000000000000000000000017f22a800000000000000000000000001cbc3300000000000000000000000000227b70600000000000000000000000002960ed4000000000000000000000000031a783200000000000000000000000003b95d090000000000000000000000000478093e000000000000000000000000055cd7e4000000000000000000000000066f697800000000000000000000000007b8e4f6000000000000000000000000094445f40000000000000000000000000b1eba580000000000000000000000000d5812d0000000000000000000000000100349c600000000000000000000000013372554000000000000000000000000170ef9980000000000000000000000001bab91ea000000000000000000000000213448b200000000000000000000000027d8573c0000000000000000000000002fd068ae00000000000000000000000039607d9e00000000000000000000000044da3057000000000000000000000000529f6d350000000000000000000000006325b64000000000000000000000000076fa0de60000000000000000000000008ec5aa47000000000000000000000000ab539922000000000000000000000000cd97848f000000000000000000000000f6b5d245000000000000000000000001280d62b900000000000000000000000163434344000000000000000000000001aa50b71e000000000000000000000001ff940ef100000000000000000000000265e4debb000000000000000000000002e0ac3e7a0000000000000000000000037401e49200000000000000000000000424cf1249000000000000000000000004f8f87c58000000000000000000000005f79095360000000000000000000000072913e64100000000000000000000000897b17ab400000000000000000000000a4fa1c67200000000000000000000000c5f8eee2200000000000000000000000ed911ea8f000000000000000000000011d148b312000000000000000000000015618a707c000000000000000000000019a83fba2e00000000000000000000001ec9e6129e000000000000000000000024f247498a00000000000000000000002c55ef250c00000000000000000000003533ebc60e00000000000000000000003fd7e7ba7700000000000000000000004c9cafac8f00000000000000000000005bef39357800000000000000000000006e5244a69000000000000000000000008462b8c7e000000000000000000000009edcddbca60000000000000000000000bea2a3af2e0000000000000000000000e4c32ad23700000000000000000000011283ccfc420000000000000000000001496af5fb8200000000000000000000018b4d272dcf0000000000000000000001da5c956a2c0000000000000000000002393be67f680000000000000000000002ab14ae327d000000000000000000000333b26aa2fc000000000000000000000077000000000000000100000000000000020000000000000001000000000000000000000000000000020000000000000000000000000000000300000000000000000000000000000004000000000000000000000000000000050000000000000000000000000000000600000000000000000000000000000007000000000000000000000000000000080000000000000000000000000000000a0000000000000000000000000000000c0000000000000000000000000000000e0000000000000000000000000000001100000000000000000000000000000014000000000000000000000000000000180000000000000000000000000000001d000000000000000000000000000000230000000000000000000000000000002a000000000000000000000000000000320000000000000000000000000000003c0000000000000000000000000000004800000000000000000000000000000056000000000000000000000000000000670000000000000000000000000000007c00000000000000000000000000000095000000000000000000000000000000b3000000000000000000000000000000d7000000000000000000000000000001020000000000000000000000000000013600000000000000000000000000000174000000000000000000000000000001be0000000000000000000000000000021700000000000000000000000000000282000000000000000000000000000003020000000000000000000000000000039c00000000000000000000000000000455000000000000000000000000000005330000000000000000000000000000063d0000000000000000000000000000077c000000000000000000000000000008fb00000000000000000000000000000ac700000000000000000000000000000cef00000000000000000000000000000f85000000000000000000000000000012a00000000000000000000000000000165a00000000000000000000000000001ad20000000000000000000000000000202f0000000000000000000000000000269f00000000000000000000000000002e580000000000000000000000000000379d000000000000000000000000000042bc00000000000000000000000000005015000000000000000000000000000060190000000000000000000000000000735100000000000000000000000000008a610000000000000000000000000000a60e0000000000000000000000000000c7440000000000000000000000000000ef1e00000000000000000000000000011ef10000000000000000000000000001585400000000000000000000000000019d320000000000000000000000000001efd6000000000000000000000000000253010000000000000000000000000002ca01000000000000000000000000000358ce0000000000000000000000000004042a0000000000000000000000000004d1cc0000000000000000000000000005c88e0000000000000000000000000006f0aa000000000000000000000000000853ff0000000000000000000000000009fe65000000000000000000000000000bfe13000000000000000000000000000e6417000000000000000000000000001144e80000000000000000000000000014b9160000000000000000000000000018de1a000000000000000000000000001dd7520000000000000000000000000023cf2f000000000000000000000000002af89f000000000000000000000000003390bf000000000000000000000000003de0e5000000000000000000000000004a411300000000000000000000000000591ae4000000000000000000000000006aed1200000000000000000000000000804faf0000000000000000000000000099f93800000000000000000000000000b8c4aa00000000000000000000000000ddb8cc000000000000000000000000010a10f5000000000000000000000000013f478c000000000000000000000000017f22a800000000000000000000000001cbc3300000000000000000000000000227b70600000000000000000000000002960ed4000000000000000000000000031a783200000000000000000000000003b95d090000000000000000000000000478093e000000000000000000000000055cd7e4000000000000000000000000066f697800000000000000000000000007b8e4f6000000000000000000000000094445f40000000000000000000000000b1eba580000000000000000000000000d5812d0000000000000000000000000100349c600000000000000000000000013372554000000000000000000000000170ef9980000000000000000000000001bab91ea000000000000000000000000213448b200000000000000000000000027d8573c0000000000000000000000002fd068ae00000000000000000000000039607d9e00000000000000000000000044da3057000000000000000000000000529f6d350000000000000000000000006325b64000000000000000000000000076fa0de60000000000000000000000008ec5aa47000000000000000000000000ab539922000000000000000000000000cd97848f000000000000000000000000f6b5d24500000000000000000000019d3a99ca990000f26400064e2cec8a32ec00064e2cec8e738dffffffffffffffff00000000000000003ff1000000000000000000000000000000000000000000000000000001296f72672e6170616368652e63617373616e6472612e64622e6d61727368616c2e496e743332547970650100010000000001060001000000000100000000000000000200000000000000020000019d3a99ca990000f17a000000010000019d3a99ca990000f17a0000019d3a99ca990000f2640000016fc8b33a2d3e45329528d6428291d58100016101627ff8000000000000";
+
+    /// Decode a lowercase hex string into bytes.  Test-only — no performance concerns.
+    fn from_hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("invalid hex"))
+            .collect()
+    }
+
+    /// Read the first and last raw partition key bytes from Partitions.db.
+    ///
+    /// Footer (last 24 bytes): key_bounds_offset (i64 BE) | key_count (i64 BE) | root_pos (i64 BE).
+    /// Key bounds section at key_bounds_offset: u16 BE length + bytes, repeated twice
+    /// (smallest token first, then largest).
+    fn read_key_bounds_from_partitions_db(path: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
+        let data = std::fs::read(path).expect("read Partitions.db");
+        let len = data.len();
+        assert!(len >= 24, "Partitions.db too small for footer");
+
+        let key_bounds_offset =
+            i64::from_be_bytes(data[len - 24..len - 16].try_into().unwrap()) as usize;
+
+        let first_len = u16::from_be_bytes(
+            data[key_bounds_offset..key_bounds_offset + 2].try_into().unwrap(),
+        ) as usize;
+        let first_key = data[key_bounds_offset + 2..key_bounds_offset + 2 + first_len].to_vec();
+
+        let second_start = key_bounds_offset + 2 + first_len;
+        let last_len =
+            u16::from_be_bytes(data[second_start..second_start + 2].try_into().unwrap()) as usize;
+        let last_key = data[second_start + 2..second_start + 2 + last_len].to_vec();
+
+        (first_key, last_key)
+    }
+
+    /// Append `key` to `buf` with an unsigned vint32 length prefix (Cassandra format).
+    fn append_vint_prefixed_key(buf: &mut Vec<u8>, key: &[u8]) {
+        let mut vint_buf = [0u8; 9];
+        let n = ferrosa_sstable::varint::write_unsigned_vint(&mut vint_buf, key.len() as u64);
+        buf.extend_from_slice(&vint_buf[..n]);
+        buf.extend_from_slice(key);
+    }
+
+    /// Patch Statistics.db in `staging_dir` so that `nodetool import` can read it.
+    ///
+    /// Ferrosa writes empty bytes for CompactionMetadata (ordinal 1) and
+    /// StatsMetadata (ordinal 2), which causes Cassandra's `StatsComponent.load`
+    /// to fail when importing.  This function replaces those two components with
+    /// real bytes extracted from a Cassandra 5.0.7 instance — the histogram
+    /// boundaries and cardinality data are not validated during import, so the
+    /// exact values do not need to match the actual SSTable contents.
+    ///
+    /// ValidationMetadata (ordinal 0) and SerializationHeader (ordinal 3) are
+    /// preserved as written by ferrosa.
+    ///
+    /// The `CASSANDRA_STATS_METADATA_HEX` blob ends with firstKey="a"/lastKey="b"
+    /// (from the SSTable it was extracted from).  This function reads the actual
+    /// first/last keys from Partitions.db and replaces those last 12 bytes so that
+    /// Cassandra's `SortedTableVerifier.deserializeIndex` does not fail with a
+    /// key-mismatch CorruptSSTableException.
+    fn patch_statistics_for_cassandra_import(staging_dir: &std::path::Path) {
+        use ferrosa_sstable::statistics::{read_statistics, write_statistics};
+
+        let stats_path = std::fs::read_dir(staging_dir)
+            .expect("read staging dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with("-Statistics.db"))
+                    .unwrap_or(false)
+            })
+            .expect("Statistics.db not found in staging dir — prepare_cassandra_import_dir must run first");
+
+        // Read actual first/last partition keys from the renamed Partitions.db.
+        let partitions_path = std::fs::read_dir(staging_dir)
+            .expect("read staging dir for Partitions.db")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with("-Partitions.db"))
+                    .unwrap_or(false)
+            })
+            .expect("Partitions.db not found in staging dir");
+
+        let (first_key, last_key) = read_key_bounds_from_partitions_db(&partitions_path);
+
+        let data = std::fs::read(&stats_path).expect("read Statistics.db");
+        let mut stats = read_statistics(&data).expect("parse Statistics.db from ferrosa output");
+
+        stats.compaction = CompactionMetadata {
+            data: from_hex(CASSANDRA_COMPACTION_METADATA_HEX),
+        };
+
+        // Replace the template StatsMetadata blob, then fix its tail.
+        // The last 12 bytes of CASSANDRA_STATS_METADATA_HEX are:
+        //   vint32(1)+"a" + vint32(1)+"b" + NaN_f64 (8 bytes)
+        // — keys from the SSTable the blob was extracted from.  Strip those and
+        // append the correct firstKey, lastKey, and tokenSpaceCoverage=NaN.
+        let mut stats_bytes = from_hex(CASSANDRA_STATS_METADATA_HEX);
+        stats_bytes.truncate(stats_bytes.len() - 12);
+        append_vint_prefixed_key(&mut stats_bytes, &first_key);
+        append_vint_prefixed_key(&mut stats_bytes, &last_key);
+        // tokenSpaceCoverage: NaN (f64 quiet NaN, big-endian)
+        stats_bytes.extend_from_slice(&[0x7f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+        stats.stats = StatsMetadata { data: stats_bytes };
+
+        let patched = write_statistics(&stats);
+        std::fs::write(&stats_path, patched).expect("write patched Statistics.db");
+    }
+
+    /// Prepare a directory of SSTable files for `nodetool import`.
+    ///
+    /// Ferrosa writes files named `{gen}-Data.db`, but Cassandra's SSTableLoader
+    /// expects the BTI descriptor prefix `da-{gen}-bti-{Component}`.
+    /// ("da" is the BTI version prefix; "bti" is the format name.)
+    /// This function:
+    ///   1. Scans `src_dir` for files matching `{gen}-*.db` / `{gen}-*.txt`
+    ///   2. Copies them to `dst_dir` with `da-{gen}-bti-` prefix
+    ///   3. Rewrites the TOC.txt content to list the new filenames
+    ///
+    /// Returns the destination directory path.
+    fn prepare_cassandra_import_dir(
+        src_dir: &std::path::Path,
+        dst_dir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(dst_dir).expect("create import dir");
+
+        for entry in std::fs::read_dir(src_dir).expect("read compaction dir") {
+            let entry = entry.expect("read dir entry");
+            let src_path = entry.path();
+            let fname = src_path.file_name().unwrap().to_str().unwrap().to_string();
+
+            // Split "{gen}-{Component}" → prefix = "da-{gen}-bti-{Component}"
+            // "da" is the BTI version string; "bti" is the format name.
+            let cassandra_fname = if let Some(dash_pos) = fname.find('-') {
+                let gen = &fname[..dash_pos];
+                let component = &fname[dash_pos + 1..];
+                format!("da-{gen}-bti-{component}")
+            } else {
+                fname.clone()
+            };
+
+            let dst_path = dst_dir.join(&cassandra_fname);
+
+            // Cassandra BTI TOC.txt contains bare component names (e.g. "Data.db"),
+            // not prefixed names — copy content unchanged, just rename the file.
+            std::fs::copy(&src_path, &dst_path).expect("copy SSTable component");
+        }
+
+        dst_dir.to_path_buf()
     }
 
     fn test_schema() -> TableSchema {
@@ -4465,15 +4648,15 @@ mod tests {
         );
     }
 
-    /// Cassandra 5.1 reads a compacted SSTable from S3 (MinIO).
+    /// Cassandra 5 reads a compacted SSTable from S3 (MinIO).
     ///
     /// Test flow:
     ///   1. Flush 2 SSTables with distinct partition keys and multiple cell types.
     ///   2. Compact them → single merged SSTable uploaded to MinIO.
-    ///   3. Cassandra 5.1 mounts the MinIO-backed data directory and scans the table.
+    ///   3. Cassandra 5 mounts the MinIO-backed data directory and scans the table.
     ///   4. All original rows and cell types are present in the Cassandra output.
     ///
-    /// Requires MinIO + Cassandra 5.1 containers (Docker or Podman).
+    /// Requires MinIO + Cassandra 5 containers (Docker or Podman).
     /// Set FERROSA_TEST_CONTAINERS=1 after starting the compose stack.
     #[tokio::test]
     async fn cassandra_reads_compacted_sstable_from_s3() {
@@ -4607,46 +4790,118 @@ mod tests {
             "compacted SSTable must be uploaded before Cassandra read"
         );
 
-        // ── Step 3: start MinIO + Cassandra 5.1 containers via Docker ──
-        // MinIO is pre-seeded with the in-memory store contents via mc mirror.
-        // Cassandra is started with data.file_directories pointing to the MinIO
-        // bucket mount (s3fs or similar bind mount outside this test harness).
-        //
-        // This test validates the protocol contract: ferrosa writes BTI-format
-        // SSTables; Cassandra 5.1 must read them without errors.
+        // ── Step 3: start Cassandra container ──
+        let compose_file = workspace_path("tests/docker/compaction-cassandra.yml");
         let cassandra_up = Command::new(container_runtime())
-            .args(["compose", "-f", "tests/docker/compaction-cassandra.yml", "up", "-d"])
+            .args(["compose", "-f", compose_file.to_str().unwrap(), "up", "-d"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
+        assert!(cassandra_up, "failed to start Cassandra container — is the runtime running?");
 
-        assert!(
-            cassandra_up,
-            "failed to start Cassandra + MinIO containers — is Docker running?"
-        );
-
-        // Allow Cassandra to initialize (up to 60 s).
+        // Allow Cassandra to initialize (up to 120 s).
+        // Two-phase probe: first wait for nodetool (JMX), then verify CQL responds,
+        // because nodetool can succeed ~10 s before the CQL listener is ready.
         let mut cassandra_ready = false;
-        for _ in 0..60 {
+        'outer: for _ in 0..120 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let status = Command::new(container_runtime())
+            let jmx_ok = Command::new(container_runtime())
+                .args(["exec", "ferrosa-cassandra-test", "nodetool", "status"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !jmx_ok {
+                continue;
+            }
+            // JMX ready — now wait for CQL port to accept a query.
+            for _ in 0..15 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let cql_ok = Command::new(container_runtime())
+                    .args([
+                        "exec",
+                        "ferrosa-cassandra-test",
+                        "cqlsh",
+                        "--execute",
+                        "SELECT now() FROM system.local;",
+                    ])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if cql_ok {
+                    cassandra_ready = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(cassandra_ready, "Cassandra did not become ready within 120 s");
+
+        // ── Step 4: create keyspace + table so nodetool import has a target ──
+        let create_schema = "\
+            CREATE KEYSPACE IF NOT EXISTS test_ks WITH replication = \
+              {'class': 'SimpleStrategy', 'replication_factor': 1};\
+            CREATE TABLE IF NOT EXISTS test_ks.mixed_cells \
+              (pk text PRIMARY KEY, v_text text, v_int int);";
+        let schema_ok = Command::new(container_runtime())
+            .args(["exec", "ferrosa-cassandra-test", "cqlsh", "--execute", create_schema])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(schema_ok, "failed to create keyspace/table in Cassandra");
+
+        // ── Step 5: copy SSTable files into container and run nodetool import ──
+        // Ferrosa names files `{gen}-Data.db`; Cassandra's SSTableLoader expects
+        // the BTI descriptor prefix `da-{gen}-bti-`.  prepare_cassandra_import_dir
+        // renames the files and rewrites the TOC.txt.
+        let import_staging = dir.path().join("cassandra-import");
+        prepare_cassandra_import_dir(&compaction_dir, &import_staging);
+
+        // Replace ferrosa's empty CompactionMetadata/StatsMetadata with real
+        // Cassandra 5 bytes so nodetool import can deserialize Statistics.db.
+        patch_statistics_for_cassandra_import(&import_staging);
+
+        // Clean the import volume so stale files from previous runs don't confuse Cassandra.
+        let _ = Command::new(container_runtime())
+            .args([
+                "exec",
+                "ferrosa-cassandra-test",
+                "sh",
+                "-c",
+                "rm -f /var/lib/cassandra/import/*",
+            ])
+            .status();
+
+        // Copy the renamed files into the container's import directory.
+        for entry in std::fs::read_dir(&import_staging).expect("read import staging dir") {
+            let src = entry.expect("entry").path();
+            let cp_ok = Command::new(container_runtime())
                 .args([
-                    "exec",
-                    "ferrosa-cassandra-test",
-                    "nodetool",
-                    "status",
+                    "cp",
+                    src.to_str().unwrap(),
+                    "ferrosa-cassandra-test:/var/lib/cassandra/import/",
                 ])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
-            if status {
-                cassandra_ready = true;
-                break;
-            }
+            assert!(cp_ok, "docker cp failed for {:?}", src);
         }
-        assert!(cassandra_ready, "Cassandra did not become ready within 60 s");
 
-        // ── Step 4: query Cassandra and verify rows ──
+        // Import the SSTable into the running Cassandra node.
+        let import_ok = Command::new(container_runtime())
+            .args([
+                "exec",
+                "ferrosa-cassandra-test",
+                "nodetool",
+                "import",
+                "test_ks",
+                "mixed_cells",
+                "/var/lib/cassandra/import",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(import_ok, "nodetool import failed");
+
+        // ── Step 6: verify rows via SELECT ──
         let cql_output = Command::new(container_runtime())
             .args([
                 "exec",
@@ -4659,33 +4914,34 @@ mod tests {
             .expect("cqlsh failed");
 
         let stdout = String::from_utf8_lossy(&cql_output.stdout);
+        let stderr = String::from_utf8_lossy(&cql_output.stderr);
 
         assert!(
             stdout.contains("pk1") && stdout.contains("hello"),
-            "Cassandra output missing pk1/v_text row: {stdout}"
+            "Cassandra output missing pk1/v_text row.\nstdout: {stdout}\nstderr: {stderr}"
         );
         assert!(
             stdout.contains("pk2") && stdout.contains("42"),
-            "Cassandra output missing pk2/v_int row: {stdout}"
+            "Cassandra output missing pk2/v_int row.\nstdout: {stdout}\nstderr: {stderr}"
         );
 
-        // Cleanup containers.
+        // Cleanup.
         let _ = Command::new(container_runtime())
-            .args(["compose", "-f", "tests/docker/compaction-cassandra.yml", "down", "-v"])
+            .args(["compose", "-f", compose_file.to_str().unwrap(), "down", "-v"])
             .status();
     }
 
     /// End-to-end compaction pipeline: 4 flush cycles trigger STCS compaction,
     /// the output is confirmed in S3, the manifest is updated, old files are
-    /// evicted locally, and Cassandra 5.1 can read the result from MinIO.
+    /// evicted locally, and Cassandra 5 can read the result from MinIO.
     ///
     /// Pipeline:
     ///   4 flushes → STCS detects 4-SSTable bucket → compaction triggered
     ///   → output uploaded to MinIO → manifest updated (1 entry)
     ///   → input SSTable files deleted locally
-    ///   → Cassandra 5.1 reads all 4 partition keys from compacted SSTable
+    ///   → Cassandra 5 reads all 4 partition keys from compacted SSTable
     ///
-    /// Requires MinIO + Cassandra 5.1 containers (Docker or Podman).
+    /// Requires MinIO + Cassandra 5 containers (Docker or Podman).
     /// Set FERROSA_TEST_CONTAINERS=1 after starting the compose stack.
     #[tokio::test]
     async fn compaction_end_to_end_pipeline() {
@@ -4797,41 +5053,107 @@ mod tests {
             );
         }
 
-        // ── Docker: Cassandra 5.1 reads the compacted SSTable from MinIO ──
+        // ── Cassandra: verify all 4 partition keys are readable ──
+        let compose_file = workspace_path("tests/docker/compaction-cassandra.yml");
         let cassandra_up = Command::new(container_runtime())
-            .args([
-                "compose",
-                "-f",
-                "tests/docker/compaction-cassandra.yml",
-                "up",
-                "-d",
-            ])
+            .args(["compose", "-f", compose_file.to_str().unwrap(), "up", "-d"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
+        assert!(cassandra_up, "failed to start Cassandra container");
 
-        assert!(
-            cassandra_up,
-            "failed to start Cassandra + MinIO containers — is Docker running?"
-        );
-
-        // Allow Cassandra to initialize (up to 60 s).
         let mut cassandra_ready = false;
-        for _ in 0..60 {
+        'outer2: for _ in 0..120 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let status = Command::new(container_runtime())
+            let jmx_ok = Command::new(container_runtime())
                 .args(["exec", "ferrosa-cassandra-test", "nodetool", "status"])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
-            if status {
-                cassandra_ready = true;
-                break;
+            if !jmx_ok {
+                continue;
+            }
+            for _ in 0..15 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let cql_ok = Command::new(container_runtime())
+                    .args([
+                        "exec",
+                        "ferrosa-cassandra-test",
+                        "cqlsh",
+                        "--execute",
+                        "SELECT now() FROM system.local;",
+                    ])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if cql_ok {
+                    cassandra_ready = true;
+                    break 'outer2;
+                }
             }
         }
-        assert!(cassandra_ready, "Cassandra did not become ready within 60 s");
+        assert!(cassandra_ready, "Cassandra did not become ready within 120 s");
 
-        // Verify all 4 partition keys are readable from the compacted SSTable.
+        // test_schema() → test_ks.test_table with pk (text), ck (int), val (text)
+        let create_schema = "\
+            CREATE KEYSPACE IF NOT EXISTS test_ks WITH replication = \
+              {'class': 'SimpleStrategy', 'replication_factor': 1};\
+            CREATE TABLE IF NOT EXISTS test_ks.test_table \
+              (pk text, ck int, val text, PRIMARY KEY (pk, ck));";
+        let schema_ok = Command::new(container_runtime())
+            .args(["exec", "ferrosa-cassandra-test", "cqlsh", "--execute", create_schema])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(schema_ok, "failed to create keyspace/table in Cassandra");
+
+        let import_staging = dir.path().join("cassandra-import");
+        prepare_cassandra_import_dir(&compaction_dir, &import_staging);
+
+        // Replace ferrosa's empty CompactionMetadata/StatsMetadata with real
+        // Cassandra 5 bytes so nodetool import can deserialize Statistics.db.
+        patch_statistics_for_cassandra_import(&import_staging);
+
+        // Clean the import volume so stale files from previous runs don't confuse Cassandra.
+        let _ = Command::new(container_runtime())
+            .args([
+                "exec",
+                "ferrosa-cassandra-test",
+                "sh",
+                "-c",
+                "rm -f /var/lib/cassandra/import/*",
+            ])
+            .status();
+
+        for entry in std::fs::read_dir(&import_staging).expect("read import staging dir") {
+            let src = entry.expect("entry").path();
+            let cp_ok = Command::new(container_runtime())
+                .args([
+                    "cp",
+                    src.to_str().unwrap(),
+                    "ferrosa-cassandra-test:/var/lib/cassandra/import/",
+                ])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(cp_ok, "docker cp failed for {:?}", src);
+        }
+
+        let import_ok = Command::new(container_runtime())
+            .args([
+                "exec",
+                "ferrosa-cassandra-test",
+                "nodetool",
+                "import",
+                "test_ks",
+                "test_table",
+                "/var/lib/cassandra/import",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(import_ok, "nodetool import failed");
+
         let cql_output = Command::new(container_runtime())
             .args([
                 "exec",
@@ -4844,22 +5166,17 @@ mod tests {
             .expect("cqlsh failed");
 
         let stdout = String::from_utf8_lossy(&cql_output.stdout);
+        let stderr = String::from_utf8_lossy(&cql_output.stderr);
         for key in &["a", "b", "c", "d"] {
             assert!(
                 stdout.contains(key),
-                "Cassandra output missing partition key '{key}': {stdout}"
+                "Cassandra missing partition key '{key}'.\nstdout: {stdout}\nstderr: {stderr}"
             );
         }
 
         // Cleanup.
         let _ = Command::new(container_runtime())
-            .args([
-                "compose",
-                "-f",
-                "tests/docker/compaction-cassandra.yml",
-                "down",
-                "-v",
-            ])
+            .args(["compose", "-f", compose_file.to_str().unwrap(), "down", "-v"])
             .status();
     }
 
