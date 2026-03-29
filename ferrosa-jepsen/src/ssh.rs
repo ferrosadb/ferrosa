@@ -227,14 +227,18 @@ mod tests {
         assert_eq!(output.stdout.trim(), "hello");
     }
 
-    /// SSH into a Firecracker VM (via Lima port-forward) and run `echo hello`.
-    ///
-    /// Setup: run `scripts/lima-fc-setup.sh` to boot a VM with SSH and
-    /// forward its port to localhost:2022.
-    /// Run: `cargo test -p ferrosa-jepsen -- --include-ignored ssh_execute_command`
+    /// Requires a pre-provisioned VM with SSH running and the test key.
+    /// Run scripts/lima-fc-setup.sh first, then set FERROSA_TEST_FIRECRACKER=1.
     #[tokio::test]
-    #[ignore = "requires Firecracker VM with SSH; run scripts/lima-fc-setup.sh first"]
     async fn ssh_execute_command() {
+        if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+            && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+        {
+            panic!(
+                "Firecracker VM not available — run scripts/lima-fc-setup.sh, \
+                 then re-run with FERROSA_TEST_FIRECRACKER=1"
+            );
+        }
         let ssh = SshClient::connect(&vm_host(), vm_port(), "root", &vm_key())
             .await
             .expect("SSH connect failed — is the Lima VM running? Run scripts/lima-fc-setup.sh");
@@ -244,10 +248,18 @@ mod tests {
         assert_eq!(output.exit_code, 0);
     }
 
-    /// SSH into a Firecracker VM, upload a file, verify contents survive.
+    /// Requires a pre-provisioned VM with SSH running and the test key.
+    /// Run scripts/lima-fc-setup.sh first, then set FERROSA_TEST_FIRECRACKER=1.
     #[tokio::test]
-    #[ignore = "requires Firecracker VM with SSH; run scripts/lima-fc-setup.sh first"]
     async fn ssh_upload_file() {
+        if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+            && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+        {
+            panic!(
+                "Firecracker VM not available — run scripts/lima-fc-setup.sh, \
+                 then re-run with FERROSA_TEST_FIRECRACKER=1"
+            );
+        }
         let ssh = SshClient::connect(&vm_host(), vm_port(), "root", &vm_key())
             .await
             .expect("SSH connect failed — is the Lima VM running? Run scripts/lima-fc-setup.sh");

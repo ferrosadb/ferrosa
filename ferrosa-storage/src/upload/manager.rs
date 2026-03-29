@@ -20,6 +20,34 @@ pub enum UploadTask {
         sstable_id: String,
         /// Component files: (component_name, data).
         files: Vec<(String, Bytes)>,
+        /// Notified when all component files have been uploaded successfully.
+        ///
+        /// `Some(tx)` causes the upload loop to send `Ok(())` after all files
+        /// are written to S3, or `Err(message)` if any PUT fails.  The caller
+        /// awaits the paired `Receiver` before updating the manifest, closing
+        /// the crash window where the manifest could be updated before S3
+        /// confirms the upload.
+        ///
+        /// `None` = fire-and-forget.
+        on_complete: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    },
+    /// Delete SSTable component files from object storage after a grace period.
+    ///
+    /// Sleeps for `grace_period` before issuing DELETE requests, allowing
+    /// in-flight reads that hold a reference to the SSTable to complete.
+    /// 404 / NotFound responses are treated as success (idempotent).
+    DeleteSSTable {
+        /// Table identifier (e.g., "ks.table").
+        table_id: String,
+        /// SSTable identifier to delete.
+        sstable_id: String,
+        /// How long to wait before issuing DELETE requests.
+        grace_period: Duration,
+        /// Notified when all component DELETE requests have completed.
+        ///
+        /// `Some(tx)` sends `Ok(())` on success or `Err(message)` on failure.
+        /// `None` = fire-and-forget.
+        on_complete: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     },
     /// Upload index files for an SSTable.
     IndexFiles {
@@ -70,12 +98,14 @@ impl UploadManager {
                         table_id,
                         sstable_id,
                         files,
+                        on_complete,
                     } => {
                         // Distribute across 256 S3 prefixes for parallelism.
                         // S3 partitions by prefix — using the first 2 hex chars
                         // of a hash of the sstable_id gives even distribution
                         // and avoids the 3,500 PUT/s per-prefix limit.
                         let hex_prefix = hex_prefix_for(&sstable_id);
+                        let mut upload_err: Option<String> = None;
                         for (name, data) in files {
                             let path = ObjectPath::from(format!(
                                 "{prefix}/{hex_prefix}/{table_id}/{sstable_id}/{name}"
@@ -83,8 +113,68 @@ impl UploadManager {
                             if let Err(e) =
                                 Self::put_with_retry(&store, &path, data.clone(), 5).await
                             {
-                                tracing_or_eprintln(format!("upload failed for {path}: {e}"));
+                                let msg = format!("upload failed for {path}: {e}");
+                                tracing_or_eprintln(msg.clone());
+                                // Record first error; continue so all files are attempted.
+                                if upload_err.is_none() {
+                                    upload_err = Some(msg);
+                                }
                             }
+                        }
+                        // Notify caller of upload outcome when a completion channel
+                        // was provided.  Receiver drop is silently ignored — the
+                        // caller may have timed out or crashed.
+                        if let Some(tx) = on_complete {
+                            let result = match upload_err {
+                                None => Ok(()),
+                                Some(msg) => Err(msg),
+                            };
+                            let _ = tx.send(result);
+                        }
+                    }
+                    UploadTask::DeleteSSTable {
+                        table_id,
+                        sstable_id,
+                        grace_period,
+                        on_complete,
+                    } => {
+                        // Wait for in-flight reads to drain before deleting.
+                        tokio::time::sleep(grace_period).await;
+
+                        let hex_prefix = hex_prefix_for(&sstable_id);
+                        // Standard SSTable component filenames.
+                        let components = [
+                            "Data.db",
+                            "Index.db",
+                            "Filter.db",
+                            "Statistics.db",
+                            "TOC.txt",
+                        ];
+                        let mut delete_err: Option<String> = None;
+                        for component in &components {
+                            let path = ObjectPath::from(format!(
+                                "{prefix}/{hex_prefix}/{table_id}/{sstable_id}/{component}"
+                            ));
+                            match store.delete(&path).await {
+                                Ok(_) => {}
+                                Err(object_store::Error::NotFound { .. }) => {
+                                    // 404 is success — already gone.
+                                }
+                                Err(e) => {
+                                    let msg = format!("delete failed for {path}: {e}");
+                                    tracing_or_eprintln(msg.clone());
+                                    if delete_err.is_none() {
+                                        delete_err = Some(msg);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(tx) = on_complete {
+                            let result = match delete_err {
+                                None => Ok(()),
+                                Some(msg) => Err(msg),
+                            };
+                            let _ = tx.send(result);
                         }
                     }
                     UploadTask::IndexFiles {
@@ -254,6 +344,7 @@ mod tests {
                     table_id: "ks.table".into(),
                     sstable_id: "abc123".into(),
                     files: vec![("Data.db".into(), data.clone())],
+                    on_complete: None,
                 })
                 .await
                 .unwrap();
@@ -290,6 +381,7 @@ mod tests {
                         ("Index.db".into(), Bytes::from_static(b"index")),
                         ("Filter.db".into(), Bytes::from_static(b"filter")),
                     ],
+                    on_complete: None,
                 })
                 .await
                 .unwrap();
