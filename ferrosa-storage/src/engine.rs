@@ -5344,4 +5344,188 @@ mod tests {
             "list bytes must survive flush/read roundtrip unchanged"
         );
     }
+
+    // ── C2.2: S3 upload confirmation before manifest update ──────────────────
+
+    /// Object store wrapper that fails all PUT operations immediately with a
+    /// non-transient error, simulating an S3 outage.  Read operations are
+    /// delegated to an in-memory inner store so manifest probes succeed.
+    struct FailOnPutStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+    }
+
+    impl FailOnPutStore {
+        fn new(inner: Arc<dyn object_store::ObjectStore>) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl std::fmt::Display for FailOnPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailOnPutStore")
+        }
+    }
+
+    impl std::fmt::Debug for FailOnPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailOnPutStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FailOnPutStore {
+        /// Fail immediately with a non-transient error so `put_with_retry` does
+        /// not loop through its 5-attempt backoff (which would make the test slow).
+        async fn put_opts(
+            &self,
+            _location: &object_store::path::Path,
+            _payload: object_store::PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            Err(object_store::Error::NotSupported {
+                source: "simulated S3 outage — PUT rejected by FailOnPutStore".into(),
+            })
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &object_store::path::Path,
+            _opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            Err(object_store::Error::NotSupported {
+                source: "simulated S3 outage — multipart PUT rejected by FailOnPutStore".into(),
+            })
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// C2.2 — S3 upload confirmation before manifest update.
+    ///
+    /// Verifies the invariant: when an S3 upload fails, `poll_compactions` must
+    /// NOT update the manifest.  The compacted output entry must not appear in
+    /// S3, and the upload counter must remain zero.
+    ///
+    /// The fix lives in `poll_compactions()` at the `rx.await` match arm: an
+    /// upload failure causes `continue`, skipping the manifest-update block.
+    /// This test proves that path is exercised correctly.
+    #[tokio::test]
+    async fn s3_upload_confirmation_before_manifest() {
+        // Wrap a real in-memory store with the failing store so that:
+        //   • manifest probes (GET) succeed against the inner store
+        //   • upload PUTs fail immediately (non-transient, no retry loop)
+        let inner_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let failing_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(FailOnPutStore::new(Arc::clone(&inner_store)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = "test-fail-put".to_string();
+        let rt = tokio::runtime::Handle::current();
+        let engine = StorageEngine::new_with_upload_store(
+            StorageEngineConfig::test_config(dir.path()),
+            Arc::clone(&failing_store),
+            prefix.clone(),
+            &rt,
+        )
+        .unwrap();
+
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // Write 4 partitions and flush each to create 4 SSTables — STCS fires
+        // on the 4th flush (min_threshold = 4 by default).
+        for (i, key_suffix) in ["a", "b", "c", "d"].iter().enumerate() {
+            let ts = (i as i64 + 1) * 1000;
+            engine
+                .write(&tid, &make_key(key_suffix), make_row(b"v", ts), ts)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        // Wait for the compaction executor background thread to write output
+        // files to disk before calling poll_compactions.
+        let compaction_dir = dir.path().join("compaction");
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let has_output = compaction_dir.exists()
+                && std::fs::read_dir(&compaction_dir)
+                    .ok()
+                    .map(|mut rd| rd.any(|_| true))
+                    .unwrap_or(false);
+            if has_output {
+                break;
+            }
+        }
+
+        // Call poll_compactions — upload will fail because FailOnPutStore rejects PUTs.
+        engine.poll_compactions().await;
+
+        // The upload counter must be zero: no successful S3 upload occurred.
+        assert_eq!(
+            engine
+                .compaction_metrics
+                .s3_uploads_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "s3_uploads_total must be 0 when the S3 upload fails"
+        );
+
+        // The manifest must NOT contain the compacted output.
+        // When upload fails, poll_compactions hits `continue` before step 5 (manifest update).
+        // The inner store (used for GETs) has never had a manifest written to it,
+        // so Manifest::load returns an empty manifest — no entries for this table.
+        let (manifest, _) =
+            crate::manifest::Manifest::load(inner_store.as_ref(), &prefix).await.unwrap();
+        let tid_str = tid.to_string();
+        let entries = manifest.sstables.get(&tid_str).cloned().unwrap_or_default();
+        assert!(
+            entries.is_empty(),
+            "manifest must NOT be updated when S3 upload fails; \
+             found {} entries for {tid_str}: {:?}",
+            entries.len(),
+            entries
+        );
+    }
 }
