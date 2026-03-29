@@ -100,10 +100,7 @@ async fn smoke_tier_end_to_end() {
 
     let dir = tempfile::tempdir().expect("create temp output dir");
 
-    let run_id = format!(
-        "smoke-e2e-{}",
-        &uuid::Uuid::new_v4().to_string()[..8],
-    );
+    let run_id = format!("smoke-e2e-{}", &uuid::Uuid::new_v4().to_string()[..8],);
 
     let config = RunConfig {
         tier: Tier::Smoke,
@@ -140,7 +137,9 @@ async fn smoke_tier_end_to_end() {
                 "  {}/{}: {}",
                 f.workload,
                 f.nemesis,
-                f.invariant_error.as_deref().unwrap_or("linearizability violation")
+                f.invariant_error
+                    .as_deref()
+                    .unwrap_or("linearizability violation")
             ))
             .collect::<Vec<_>>()
             .join("\n"),

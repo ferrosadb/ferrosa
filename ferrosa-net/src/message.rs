@@ -424,9 +424,7 @@ impl Message {
             MsgType::PairSchemaSync => Self::PairSchemaSync(body.split_to(body.remaining())),
             MsgType::PairDdlForward => Self::PairDdlForward(body.split_to(body.remaining())),
             MsgType::PairDdlAck => Self::PairDdlAck(body.split_to(body.remaining())),
-            MsgType::PairBatchForward => {
-                Self::PairBatchForward(body.split_to(body.remaining()))
-            }
+            MsgType::PairBatchForward => Self::PairBatchForward(body.split_to(body.remaining())),
             MsgType::PairBatchAck => Self::PairBatchAck(body.split_to(body.remaining())),
             MsgType::BatchlogWrite => Self::BatchlogWrite(body.split_to(body.remaining())),
             MsgType::BatchlogDelete => Self::BatchlogDelete(body.split_to(body.remaining())),

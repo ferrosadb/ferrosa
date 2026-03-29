@@ -17,7 +17,10 @@ pub struct ScyllaCqlSession {
 impl ScyllaCqlSession {
     /// Connect to the cluster at the given contact points (e.g. `["127.0.0.1:9042"]`).
     pub async fn connect(contact_points: &[String]) -> Result<Self> {
-        assert!(!contact_points.is_empty(), "contact_points must not be empty");
+        assert!(
+            !contact_points.is_empty(),
+            "contact_points must not be empty"
+        );
         let session = SessionBuilder::new()
             .known_nodes(contact_points)
             .build()
@@ -137,22 +140,13 @@ mod tests {
     #[test]
     fn cql_value_to_string_conversions() {
         assert_eq!(cql_value_to_string(None), "null");
-        assert_eq!(
-            cql_value_to_string(Some(CqlValue::Int(42))),
-            "42"
-        );
+        assert_eq!(cql_value_to_string(Some(CqlValue::Int(42))), "42");
         assert_eq!(
             cql_value_to_string(Some(CqlValue::Text("hello".into()))),
             "hello"
         );
-        assert_eq!(
-            cql_value_to_string(Some(CqlValue::Boolean(true))),
-            "true"
-        );
-        assert_eq!(
-            cql_value_to_string(Some(CqlValue::BigInt(-1))),
-            "-1"
-        );
+        assert_eq!(cql_value_to_string(Some(CqlValue::Boolean(true))), "true");
+        assert_eq!(cql_value_to_string(Some(CqlValue::BigInt(-1))), "-1");
     }
 
     #[test]

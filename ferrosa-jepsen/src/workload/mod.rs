@@ -43,6 +43,12 @@ pub struct WorkloadRegistry {
     workloads: Vec<Box<dyn Workload>>,
 }
 
+impl Default for WorkloadRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkloadRegistry {
     pub fn new() -> Self {
         Self {
@@ -117,6 +123,12 @@ pub mod testutil {
         lwt_toggle: Arc<AtomicBool>,
     }
 
+    impl Default for MockCqlSession {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockCqlSession {
         pub fn new() -> Self {
             Self {
@@ -151,10 +163,7 @@ pub mod testutil {
             // LWT: any mutation containing "IF" (at word boundary in upper-case form).
             if q.contains(" IF ") || q.ends_with(" IF EXISTS") || q.ends_with(" IF NOT EXISTS") {
                 let applied = self.lwt_toggle.fetch_xor(true, Ordering::Relaxed);
-                return Ok(vec![vec![(
-                    "[applied]".to_string(),
-                    applied.to_string(),
-                )]]);
+                return Ok(vec![vec![("[applied]".to_string(), applied.to_string())]]);
             }
 
             // Plain mutation (INSERT without IF, UPDATE without IF): success, no rows.

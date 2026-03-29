@@ -173,7 +173,10 @@ impl FerrosCluster {
             })
             .collect();
 
-        let seed_ips = cluster_nodes.first().map(|n| vec![n.ip]).unwrap_or_default();
+        let seed_ips = cluster_nodes
+            .first()
+            .map(|n| vec![n.ip])
+            .unwrap_or_default();
 
         Ok(Self {
             topology: Topology::T1,

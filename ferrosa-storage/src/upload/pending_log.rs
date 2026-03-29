@@ -47,11 +47,7 @@ impl PendingUploadsLog {
     /// after this call returns — a fundamental requirement for closing the
     /// manifest-before-S3 crash window.
     pub fn add_entry(&self, table_id: &str, sstable_id: &str) -> std::io::Result<()> {
-        let encoded = format!(
-            "{}\t{}\n",
-            url_encode(table_id),
-            url_encode(sstable_id),
-        );
+        let encoded = format!("{}\t{}\n", url_encode(table_id), url_encode(sstable_id),);
         let mut file = OpenOptions::new().append(true).open(&self.path)?;
         file.write_all(encoded.as_bytes())?;
         file.flush()?;

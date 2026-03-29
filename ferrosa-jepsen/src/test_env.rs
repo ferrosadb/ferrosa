@@ -36,8 +36,8 @@ impl TestClusterEnv {
             .and_then(|s| s.parse().ok())
             .unwrap_or(2022);
 
-        let ssh_host = std::env::var("FERROSA_TEST_VM_HOST")
-            .unwrap_or_else(|_| "127.0.0.1".to_string());
+        let ssh_host =
+            std::env::var("FERROSA_TEST_VM_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
         if let Ok(nodes) = std::env::var("FERROSA_TEST_CLUSTER_NODES") {
             let cql_nodes = nodes.split(',').map(str::to_string).collect();

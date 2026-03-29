@@ -97,6 +97,12 @@ pub struct NemesisRegistry {
     nemeses: std::collections::HashMap<String, Box<dyn NemesisAction>>,
 }
 
+impl Default for NemesisRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NemesisRegistry {
     pub fn new() -> Self {
         Self {
@@ -178,7 +184,12 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec!["clock-skew-small", "kill-minority", "noop", "partition-halves"]
+            vec![
+                "clock-skew-small",
+                "kill-minority",
+                "noop",
+                "partition-halves"
+            ]
         );
     }
 

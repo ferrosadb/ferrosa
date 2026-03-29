@@ -131,10 +131,7 @@ mod tests {
     // Helper: run the register workload against a mock session
     // ---------------------------------------------------------------------------
 
-    async fn run_register_workload_with_mock(
-        val: i64,
-        duration: Duration,
-    ) -> (PathBuf, History) {
+    async fn run_register_workload_with_mock(val: i64, duration: Duration) -> (PathBuf, History) {
         let dir = tempfile::tempdir().expect("create temp dir");
         let config = DriverConfig {
             kind: DriverKind::Rust,
@@ -235,15 +232,11 @@ mod tests {
     #[tokio::test]
     async fn rust_driver_register_history_roundtrip() {
         // Run with a very short duration so the test finishes quickly.
-        let (path, history) =
-            run_register_workload_with_mock(42, Duration::from_millis(50)).await;
+        let (path, history) = run_register_workload_with_mock(42, Duration::from_millis(50)).await;
 
         // 1. File must be non-empty.
         let metadata = std::fs::metadata(&path).expect("stat jsonl file");
-        assert!(
-            metadata.len() > 0,
-            "output JSONL must be non-empty"
-        );
+        assert!(metadata.len() > 0, "output JSONL must be non-empty");
 
         // 2. No placeholder "test" keys.
         for op in &history.operations {
@@ -300,7 +293,7 @@ mod tests {
     #[tokio::test]
     async fn rust_driver_unknown_workload_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let config = DriverConfig {
+        let _config = DriverConfig {
             kind: DriverKind::Rust,
             contact_points: vec!["127.0.0.1:9042".into()],
             workload: "does-not-exist".into(),

@@ -57,9 +57,14 @@ async fn disk_fail_no_phantom_commits() {
     };
 
     let registry = NemesisRegistry::phase2();
-    let disk_nemesis = registry.get("disk-slow").expect("disk-slow nemesis registered");
+    let disk_nemesis = registry
+        .get("disk-slow")
+        .expect("disk-slow nemesis registered");
 
-    disk_nemesis.inject(&ctx).await.expect("inject disk failure");
+    disk_nemesis
+        .inject(&ctx)
+        .await
+        .expect("inject disk failure");
     disk_nemesis.heal(&ctx).await.expect("heal disk");
 
     for node in cluster.nodes() {
@@ -216,13 +221,10 @@ async fn nemesis_partition_halves_docker() {
     // Construct context from env (FERROSA_TEST_CONTAINERS is set, so a real
     // cluster may be available), falling back to mock IPs if the cluster node
     // list is not provided.
-    let node_ips: Vec<String> =
-        std::env::var("FERROSA_TEST_CLUSTER_NODES")
-            .ok()
-            .map(|s| s.split(',').map(|ip| ip.trim().to_string()).collect())
-            .unwrap_or_else(|| {
-                vec!["127.0.0.1".into(), "127.0.0.2".into(), "127.0.0.3".into()]
-            });
+    let node_ips: Vec<String> = std::env::var("FERROSA_TEST_CLUSTER_NODES")
+        .ok()
+        .map(|s| s.split(',').map(|ip| ip.trim().to_string()).collect())
+        .unwrap_or_else(|| vec!["127.0.0.1".into(), "127.0.0.2".into(), "127.0.0.3".into()]);
 
     let ctx = NemesisContext {
         node_ips,
@@ -303,8 +305,7 @@ async fn nemesis_kill_minority_docker() {
         .unwrap_or_else(|e| eprintln!("kill-minority inject error (expected on mock): {e}"));
 
     let heal_result = nemesis.heal(&ctx).await;
-    heal_result
-        .unwrap_or_else(|e| eprintln!("kill-minority heal error (expected on mock): {e}"));
+    heal_result.unwrap_or_else(|e| eprintln!("kill-minority heal error (expected on mock): {e}"));
 }
 
 /// Container-gated: verify that the `clock-skew-small` nemesis is registered in
@@ -337,7 +338,12 @@ async fn nemesis_clock_skew_docker() {
     names.sort();
     assert_eq!(
         names,
-        vec!["clock-skew-small", "kill-minority", "noop", "partition-halves"],
+        vec![
+            "clock-skew-small",
+            "kill-minority",
+            "noop",
+            "partition-halves"
+        ],
         "Phase 1 registry must contain exactly the 4 expected nemeses"
     );
 

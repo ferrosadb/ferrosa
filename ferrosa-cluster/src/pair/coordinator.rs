@@ -129,11 +129,7 @@ impl PairCoordinator {
     /// The `batch_id` is used by the primary to enable idempotent application
     /// if the secondary retries after an ACK is lost (future: track applied
     /// batch_ids in a small LRU).
-    pub async fn coordinate_batch(
-        &self,
-        mutations: Vec<Mutation>,
-        batch_id: Uuid,
-    ) -> Result<()> {
+    pub async fn coordinate_batch(&self, mutations: Vec<Mutation>, batch_id: Uuid) -> Result<()> {
         match **self.role.load() {
             PairRole::Primary => {
                 // Apply locally as an atomic batch.
@@ -142,24 +138,16 @@ impl PairCoordinator {
                     .map_err(ClusterError::Storage)?;
                 // Best-effort replicate batch to peer.
                 if let Err(e) = self.replicate_batch_to_peer(&mutations, batch_id).await {
-                    tracing::warn!(
-                        "pair batch replication failed (write succeeded locally): {e}"
-                    );
+                    tracing::warn!("pair batch replication failed (write succeeded locally): {e}");
                 }
                 Ok(())
             }
-            PairRole::Secondary => {
-                self.forward_batch_to_primary(&mutations, batch_id).await
-            }
+            PairRole::Secondary => self.forward_batch_to_primary(&mutations, batch_id).await,
         }
     }
 
     /// Replicate an atomic batch to the peer (primary → secondary).
-    async fn replicate_batch_to_peer(
-        &self,
-        mutations: &[Mutation],
-        batch_id: Uuid,
-    ) -> Result<()> {
+    async fn replicate_batch_to_peer(&self, mutations: &[Mutation], batch_id: Uuid) -> Result<()> {
         let body = encode_batch(batch_id, mutations)?;
         let resp = self
             .peer_manager
@@ -182,11 +170,7 @@ impl PairCoordinator {
     }
 
     /// Forward a batch to the primary (secondary → primary).
-    async fn forward_batch_to_primary(
-        &self,
-        mutations: &[Mutation],
-        batch_id: Uuid,
-    ) -> Result<()> {
+    async fn forward_batch_to_primary(&self, mutations: &[Mutation], batch_id: Uuid) -> Result<()> {
         let body = encode_batch(batch_id, mutations)?;
         let resp = self
             .peer_manager
@@ -289,13 +273,17 @@ pub fn decode_batch(body: &[u8]) -> Result<(Uuid, Vec<Mutation>)> {
     let mut mutations = Vec::with_capacity(count);
     for _ in 0..count {
         if pos + 4 > body.len() {
-            return Err(ClusterError::Internal("batch truncated at length prefix".into()));
+            return Err(ClusterError::Internal(
+                "batch truncated at length prefix".into(),
+            ));
         }
-        let len = u32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]])
-            as usize;
+        let len =
+            u32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
         pos += 4;
         if pos + len > body.len() {
-            return Err(ClusterError::Internal("batch truncated at mutation body".into()));
+            return Err(ClusterError::Internal(
+                "batch truncated at mutation body".into(),
+            ));
         }
         let m = Mutation::deserialize_from(&body[pos..pos + len])
             .map_err(|e| ClusterError::Internal(format!("batch mutation decode: {e}")))?;
@@ -416,11 +404,7 @@ mod tests {
         let peer_id = Uuid::new_v4();
 
         let config = Arc::new(NetConfig::default());
-        let peer_manager = Arc::new(PeerManager::new(
-            config,
-            local_id,
-            Arc::new(NoopListener),
-        ));
+        let peer_manager = Arc::new(PeerManager::new(config, local_id, Arc::new(NoopListener)));
 
         // add_peer_entry inserts a pool-less entry — send_with_timeout on it
         // returns Err(NetError::Protocol("no connection pool")), which is the
@@ -441,8 +425,7 @@ mod tests {
     #[tokio::test]
     async fn pair_write_confirmed_after_secondary_ack() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (coordinator, _peer_id) =
-            primary_coordinator_with_unreachable_peer(dir.path()).await;
+        let (coordinator, _peer_id) = primary_coordinator_with_unreachable_peer(dir.path()).await;
 
         let mutation = test_mutation();
         let result = coordinator.coordinate_write(&mutation).await;
@@ -477,8 +460,7 @@ mod tests {
     #[tokio::test]
     async fn pair_write_survives_primary_crash() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (coordinator, _peer_id) =
-            primary_coordinator_with_unreachable_peer(dir.path()).await;
+        let (coordinator, _peer_id) = primary_coordinator_with_unreachable_peer(dir.path()).await;
 
         let mutation = test_mutation();
 
@@ -535,8 +517,7 @@ mod tests {
     #[tokio::test]
     async fn pair_replication_timeout_returns_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (coordinator, _peer_id) =
-            primary_coordinator_with_unreachable_peer(dir.path()).await;
+        let (coordinator, _peer_id) = primary_coordinator_with_unreachable_peer(dir.path()).await;
 
         let mutation = test_mutation();
         let result = coordinator.coordinate_write(&mutation).await;

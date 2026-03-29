@@ -64,9 +64,7 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
         // no-op cluster (placeholder) so the orchestrator can still run
         // unit-level combinations without container infrastructure.
         let cluster_opt: Option<ClusterInfo> =
-            if std::env::var("FERROSA_TEST_CONTAINERS").is_ok()
-                && topology.node_count() <= 3
-            {
+            if std::env::var("FERROSA_TEST_CONTAINERS").is_ok() && topology.node_count() <= 3 {
                 match provision_docker_cluster(*topology).await {
                     Ok(c) => Some(c),
                     Err(e) => {
@@ -321,10 +319,7 @@ mod tests {
         assert_eq!(result.nemesis, "noop");
         assert_eq!(result.driver, "rust");
         // History file should exist.
-        let history_path = dir
-            .path()
-            .join("test-run")
-            .join("T1-noop-register.jsonl");
+        let history_path = dir.path().join("test-run").join("T1-noop-register.jsonl");
         assert!(history_path.exists(), "history JSONL must be written");
     }
 }

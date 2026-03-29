@@ -405,7 +405,9 @@ mod tests {
         // Two concurrent tasks each add a distinct SSTable entry.
         let store_a = Arc::clone(&store);
         let task_a = tokio::spawn(async move {
-            let (mut m, _) = Manifest::load(store_a.as_ref(), "concurrent").await.unwrap();
+            let (mut m, _) = Manifest::load(store_a.as_ref(), "concurrent")
+                .await
+                .unwrap();
             m.add_sstable("ks.t", sample_entry("flush-a"));
             m.save_with_retry(store_a.as_ref(), "concurrent")
                 .await
@@ -414,7 +416,9 @@ mod tests {
 
         let store_b = Arc::clone(&store);
         let task_b = tokio::spawn(async move {
-            let (mut m, _) = Manifest::load(store_b.as_ref(), "concurrent").await.unwrap();
+            let (mut m, _) = Manifest::load(store_b.as_ref(), "concurrent")
+                .await
+                .unwrap();
             m.add_sstable("ks.t", sample_entry("flush-b"));
             m.save_with_retry(store_b.as_ref(), "concurrent")
                 .await
@@ -444,10 +448,7 @@ mod tests {
         manifest.add_sstable("ks.table", sample_entry("sst1"));
 
         // save_with_retry should work on a fresh store (no conflicts).
-        manifest
-            .save_with_retry(&store, "test")
-            .await
-            .unwrap();
+        manifest.save_with_retry(&store, "test").await.unwrap();
 
         // Verify it was actually persisted.
         let (loaded, _) = Manifest::load(&store, "test").await.unwrap();

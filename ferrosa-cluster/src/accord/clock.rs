@@ -157,9 +157,15 @@ mod tests {
         let max = 5_000_000_i64;
 
         let result = v.validate_timestamp(local + max + 1, local);
-        assert!(matches!(result, Err(ClockError::TooFarInFuture { skew_ms: 5_000_001 })));
+        assert!(matches!(
+            result,
+            Err(ClockError::TooFarInFuture { skew_ms: 5_000_001 })
+        ));
 
         let result = v.validate_timestamp(local - max - 1, local);
-        assert!(matches!(result, Err(ClockError::TooFarInPast { skew_ms: 5_000_001 })));
+        assert!(matches!(
+            result,
+            Err(ClockError::TooFarInPast { skew_ms: 5_000_001 })
+        ));
     }
 }

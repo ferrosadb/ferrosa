@@ -274,9 +274,18 @@ mod tests {
     fn cluster_info_assert_node_count_passes() {
         let cluster = ClusterInfo {
             nodes: vec![
-                NodeInfo { host: "localhost", cql_port: 19042 },
-                NodeInfo { host: "localhost", cql_port: 19043 },
-                NodeInfo { host: "localhost", cql_port: 19044 },
+                NodeInfo {
+                    host: "localhost",
+                    cql_port: 19042,
+                },
+                NodeInfo {
+                    host: "localhost",
+                    cql_port: 19043,
+                },
+                NodeInfo {
+                    host: "localhost",
+                    cql_port: 19044,
+                },
             ],
             compose_file: PathBuf::from("/tmp/fake.yml"),
         };

@@ -431,10 +431,16 @@ fn sstable_compat_simple_types() {
             clustering: vec![],
             cells: vec![
                 (0, CellValue::live(b"hello".to_vec(), ts)),
-                (1, CellValue::live(vec![0x01], ts)),          // boolean true
+                (1, CellValue::live(vec![0x01], ts)), // boolean true
                 (2, CellValue::live(42i64.to_be_bytes().to_vec(), ts)),
-                (3, CellValue::live((3.14f32).to_bits().to_be_bytes().to_vec(), ts)),
-                (4, CellValue::live((2.718_281_828f64).to_bits().to_be_bytes().to_vec(), ts)),
+                (
+                    3,
+                    CellValue::live((3.25f32).to_bits().to_be_bytes().to_vec(), ts),
+                ),
+                (
+                    4,
+                    CellValue::live((2.75f64).to_bits().to_be_bytes().to_vec(), ts),
+                ),
                 (5, CellValue::live(vec![0xDE, 0xAD, 0xBE, 0xEF], ts)),
             ],
             deletion: DeletionTime::LIVE,
@@ -489,8 +495,8 @@ fn sstable_compat_simple_types() {
     let float_bytes = cell.value.as_deref().expect("v_float value");
     let float_bits = u32::from_be_bytes(float_bytes.try_into().unwrap());
     assert!(
-        (f32::from_bits(float_bits) - 3.14f32).abs() < 1e-5,
-        "v_float should be ~3.14, got {}",
+        (f32::from_bits(float_bits) - 3.25f32).abs() < 1e-5,
+        "v_float should be ~3.25, got {}",
         f32::from_bits(float_bits)
     );
 
@@ -500,8 +506,8 @@ fn sstable_compat_simple_types() {
     let double_bytes = cell.value.as_deref().expect("v_double value");
     let double_bits = u64::from_be_bytes(double_bytes.try_into().unwrap());
     assert!(
-        (f64::from_bits(double_bits) - 2.718_281_828f64).abs() < 1e-9,
-        "v_double should be ~2.718281828, got {}",
+        (f64::from_bits(double_bits) - 2.75f64).abs() < 1e-9,
+        "v_double should be ~2.75, got {}",
         f64::from_bits(double_bits)
     );
 

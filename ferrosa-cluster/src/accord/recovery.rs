@@ -337,9 +337,7 @@ impl NodeRecoveryCoordinator {
         match self.inflight.remove(&txn_id) {
             Some(txn) => match txn.phase {
                 AccordPhase::Committed => InflightResolution::Committed,
-                AccordPhase::Accepted if txn.has_accept_quorum() => {
-                    InflightResolution::Committed
-                }
+                AccordPhase::Accepted if txn.has_accept_quorum() => InflightResolution::Committed,
                 _ => InflightResolution::Aborted,
             },
             None => InflightResolution::Aborted,

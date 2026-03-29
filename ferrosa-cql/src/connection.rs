@@ -1846,17 +1846,6 @@ mod tests {
         buf
     }
 
-    /// Build CQL v4+ wire-format bytes for a list<text> or set<text>.
-    fn encode_cql_sequence(elements: &[&[u8]]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&(elements.len() as i32).to_be_bytes());
-        for elem in elements {
-            buf.extend_from_slice(&(elem.len() as i32).to_be_bytes());
-            buf.extend_from_slice(elem);
-        }
-        buf
-    }
-
     #[test]
     fn map_bind_value_roundtrip() {
         // Given: map<text,int> type and wire bytes for {'key': 42}
@@ -2000,10 +1989,7 @@ mod tests {
     /// partition.
     #[test]
     fn bind_values_delete() {
-        let plan = make_plan(
-            "DELETE FROM ks.t WHERE pk = ?",
-            vec![("pk", CqlType::Int)],
-        );
+        let plan = make_plan("DELETE FROM ks.t WHERE pk = ?", vec![("pk", CqlType::Int)]);
 
         let pk_val = 99i32.to_be_bytes();
         let payload = encode_values(&[&pk_val]);
@@ -2056,8 +2042,8 @@ mod tests {
         let test_uuid = uuid::Uuid::parse_str(uuid_str).unwrap();
         let uuid_val = *test_uuid.as_bytes();
         let ts_val = 1_700_000_000_000i64.to_be_bytes();
-        let float_val = 3.14f32.to_bits().to_be_bytes();
-        let double_val = 2.718281828f64.to_bits().to_be_bytes();
+        let float_val = 3.25f32.to_bits().to_be_bytes();
+        let double_val = 2.75f64.to_bits().to_be_bytes();
         let blob_val = [0xDE, 0xAD, 0xBE, 0xEF];
         let inet_val = [192u8, 168, 1, 1];
 
@@ -2110,20 +2096,20 @@ mod tests {
                 i.values[5]
             );
             // Float decodes to f64 via f32::from_bits → as f64
-            let expected_float = 3.14f32 as f64;
+            let expected_float = 3.25f32 as f64;
             assert!(
                 matches!(&i.values[6], Term::FloatLiteral(f) if (*f - expected_float).abs() < 1e-6),
-                "c_float should be FloatLiteral(~3.14), got {:?}",
+                "c_float should be FloatLiteral(~3.25), got {:?}",
                 i.values[6]
             );
-            let expected_double = 2.718281828f64;
+            let expected_double = 2.75f64;
             assert!(
                 matches!(&i.values[7], Term::FloatLiteral(f) if (*f - expected_double).abs() < 1e-9),
-                "c_double should be FloatLiteral(~2.718), got {:?}",
+                "c_double should be FloatLiteral(~2.75), got {:?}",
                 i.values[7]
             );
             assert!(
-                matches!(&i.values[8], Term::BlobLiteral(b) if b.as_slice() == &[0xDE, 0xAD, 0xBE, 0xEF]),
+                matches!(&i.values[8], Term::BlobLiteral(b) if b.as_slice() == [0xDE, 0xAD, 0xBE, 0xEF]),
                 "c_blob should be BlobLiteral([DE AD BE EF]), got {:?}",
                 i.values[8]
             );

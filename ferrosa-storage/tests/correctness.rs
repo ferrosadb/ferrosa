@@ -105,9 +105,7 @@ fn commitlog_replay_idempotent() {
     let m = make_mutation(mutation_id, "pk1", b"hello", 1_000);
 
     // Simulate crash-then-replay: present the same mutation twice.
-    engine
-        .replay_mutations(vec![m.clone(), m.clone()])
-        .unwrap();
+    engine.replay_mutations(vec![m.clone(), m.clone()]).unwrap();
 
     // Only one row should exist.
     let result = engine.read(&table_id(), &make_key("pk1")).unwrap();
@@ -187,9 +185,7 @@ fn commitlog_legacy_zero_id_always_replayed() {
     let m = make_mutation(zero_id, "pk_legacy", b"legacy_val", 2_000);
 
     // Two copies — both must be applied without errors.
-    engine
-        .replay_mutations(vec![m.clone(), m.clone()])
-        .unwrap();
+    engine.replay_mutations(vec![m.clone(), m.clone()]).unwrap();
 
     let result = engine.read(&table_id(), &make_key("pk_legacy")).unwrap();
     assert!(

@@ -1458,7 +1458,9 @@ impl StorageEngine {
             let pending_log_result = crate::upload::PendingUploadsLog::open(&pending_log_path);
             if let Ok(ref pending_log) = pending_log_result {
                 if let Err(e) = pending_log.add_entry(&table_id_str, &sstable_id) {
-                    eprintln!("[compaction] failed to write pending-log entry for {sstable_id}: {e}");
+                    eprintln!(
+                        "[compaction] failed to write pending-log entry for {sstable_id}: {e}"
+                    );
                 }
             }
 
@@ -1509,18 +1511,9 @@ impl StorageEngine {
 
             // Step 5: update manifest — load fresh copy, remove inputs, add output, save.
             // Keep full input metadata for local eviction after manifest update.
-            let input_ids: Vec<String> = result
-                .task
-                .inputs
-                .iter()
-                .map(|i| i.id.clone())
-                .collect();
-            let input_paths: Vec<std::path::PathBuf> = result
-                .task
-                .inputs
-                .iter()
-                .map(|i| i.path.clone())
-                .collect();
+            let input_ids: Vec<String> = result.task.inputs.iter().map(|i| i.id.clone()).collect();
+            let input_paths: Vec<std::path::PathBuf> =
+                result.task.inputs.iter().map(|i| i.path.clone()).collect();
 
             // Compute total input bytes for metrics (used after manifest update).
             // If the metadata carries a non-zero size we use it directly;
@@ -1528,12 +1521,8 @@ impl StorageEngine {
             // (sstable_metadata() currently returns size_bytes = 0 as a
             // known placeholder — scanning disk gives the accurate value).
             let input_bytes_total: i64 = {
-                let from_metadata: i64 = result
-                    .task
-                    .inputs
-                    .iter()
-                    .map(|i| i.size_bytes as i64)
-                    .sum();
+                let from_metadata: i64 =
+                    result.task.inputs.iter().map(|i| i.size_bytes as i64).sum();
                 if from_metadata > 0 {
                     from_metadata
                 } else {
@@ -1552,7 +1541,9 @@ impl StorageEngine {
                         .flat_map(|input| {
                             component_suffixes.iter().map(move |suffix| {
                                 let path = input.path.join(format!("{}-{suffix}", input.id));
-                                std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0)
+                                std::fs::metadata(&path)
+                                    .map(|m| m.len() as i64)
+                                    .unwrap_or(0)
                             })
                         })
                         .sum()
@@ -1573,10 +1564,7 @@ impl StorageEngine {
                             max_timestamp: result.output.max_timestamp,
                         },
                     );
-                    if let Err(e) = manifest
-                        .save_with_retry(store.as_ref(), &prefix)
-                        .await
-                    {
+                    if let Err(e) = manifest.save_with_retry(store.as_ref(), &prefix).await {
                         eprintln!("[compaction] manifest save failed for {sstable_id}: {e}");
                     } else {
                         eprintln!(
@@ -1772,9 +1760,7 @@ impl StorageEngine {
     ///
     /// In test builds, checks `upload_store_override` first so that tests
     /// can inject an `InMemory` store without a real S3 endpoint.
-    fn resolve_store_and_prefix(
-        &self,
-    ) -> Option<(Arc<dyn object_store::ObjectStore>, String)> {
+    fn resolve_store_and_prefix(&self) -> Option<(Arc<dyn object_store::ObjectStore>, String)> {
         #[cfg(test)]
         if let Some((store, prefix)) = &self.upload_store_override {
             return Some((Arc::clone(store), prefix.clone()));
@@ -1873,9 +1859,7 @@ impl StorageEngine {
 
         if uploaded > 0 {
             // Save updated manifest.
-            manifest
-                .save_with_retry(store.as_ref(), &prefix)
-                .await?;
+            manifest.save_with_retry(store.as_ref(), &prefix).await?;
             eprintln!("[s3-sync] uploaded {uploaded} SSTables, manifest saved");
         }
 
@@ -2023,9 +2007,7 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("failed to create data dir: {e}"))
         })?;
         std::fs::create_dir_all(&config.commit_log.log_dir).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to create commitlog dir: {e}"
-            ))
+            ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
         })?;
 
         let commit_log = CommitLog::new(config.commit_log.clone())?;
@@ -2225,15 +2207,16 @@ mod tests {
     /// The workspace root is one level up.
     fn workspace_path(relative: &str) -> std::path::PathBuf {
         let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace_root = crate_dir.parent().expect("crate has a parent workspace dir");
+        let workspace_root = crate_dir
+            .parent()
+            .expect("crate has a parent workspace dir");
         workspace_root.join(relative)
     }
 
     /// CompactionMetadata (component 1) bytes from a real Cassandra 5.0.7 nb-format
     /// Statistics.db (test_ks.test_table with pk text + ck int + val text).
     /// 19 bytes — HyperLogLog cardinality estimate for a minimal table.
-    const CASSANDRA_COMPACTION_METADATA_HEX: &str =
-        "0000000ffffffffe0d190102deb87192a7b71c";
+    const CASSANDRA_COMPACTION_METADATA_HEX: &str = "0000000ffffffffe0d190102deb87192a7b71c";
 
     /// StatsMetadata (component 2) bytes from a Cassandra 5 BTI-format (da) SSTable
     /// (test_ks.test_table with pk text + ck int + val text, 2-row table).
@@ -2264,7 +2247,9 @@ mod tests {
             i64::from_be_bytes(data[len - 24..len - 16].try_into().unwrap()) as usize;
 
         let first_len = u16::from_be_bytes(
-            data[key_bounds_offset..key_bounds_offset + 2].try_into().unwrap(),
+            data[key_bounds_offset..key_bounds_offset + 2]
+                .try_into()
+                .unwrap(),
         ) as usize;
         let first_key = data[key_bounds_offset + 2..key_bounds_offset + 2 + first_len].to_vec();
 
@@ -4146,13 +4131,9 @@ mod tests {
 
         let config = StorageEngineConfig::test_config(dir.path());
         let rt = tokio::runtime::Handle::current();
-        let engine = StorageEngine::new_with_upload_store(
-            config,
-            Arc::clone(&store),
-            prefix.clone(),
-            &rt,
-        )
-        .unwrap();
+        let engine =
+            StorageEngine::new_with_upload_store(config, Arc::clone(&store), prefix.clone(), &rt)
+                .unwrap();
         engine.register_table(test_schema()).unwrap();
 
         let tid = table_id();
@@ -4263,7 +4244,10 @@ mod tests {
             .get(&tid_str)
             .map(|v| v.len())
             .unwrap_or(0);
-        assert_eq!(before_count, 0, "manifest should be empty before poll_compactions");
+        assert_eq!(
+            before_count, 0,
+            "manifest should be empty before poll_compactions"
+        );
 
         // Integrate compaction result. Retry until the channel result is consumed.
         let mut entries = vec![];
@@ -4288,8 +4272,14 @@ mod tests {
             1,
             "manifest should have exactly 1 SSTable entry (the output) after compaction"
         );
-        assert!(entries[0].size > 0, "output SSTable entry must have non-zero size");
-        assert!(!entries[0].id.is_empty(), "output SSTable id must be non-empty");
+        assert!(
+            entries[0].size > 0,
+            "output SSTable entry must have non-zero size"
+        );
+        assert!(
+            !entries[0].id.is_empty(),
+            "output SSTable id must be non-empty"
+        );
     }
 
     #[tokio::test]
@@ -4304,13 +4294,8 @@ mod tests {
         let config = StorageEngineConfig::test_config(dir.path());
         let rt = tokio::runtime::Handle::current();
         let engine = std::sync::Arc::new(
-            StorageEngine::new_with_upload_store(
-                config,
-                Arc::clone(&store),
-                prefix.clone(),
-                &rt,
-            )
-            .unwrap(),
+            StorageEngine::new_with_upload_store(config, Arc::clone(&store), prefix.clone(), &rt)
+                .unwrap(),
         );
         engine.register_table(test_schema()).unwrap();
 
@@ -4374,10 +4359,9 @@ mod tests {
 
         // Both operations completed without panic.
         // Manifest must have at least one SSTable entry.
-        let (final_manifest, _) =
-            crate::manifest::Manifest::load(store.as_ref(), &prefix)
-                .await
-                .unwrap();
+        let (final_manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+            .await
+            .unwrap();
         let tid_str = tid.to_string();
         let entries = final_manifest
             .sstables
@@ -4416,7 +4400,13 @@ mod tests {
         let table_id_str = "test_ks.test_table";
         let input_id = "input_sst_1";
         let hex = crate::upload::manager::hex_prefix_for(input_id);
-        for component in &["Data.db", "Index.db", "Filter.db", "Statistics.db", "TOC.txt"] {
+        for component in &[
+            "Data.db",
+            "Index.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+        ] {
             let path = object_store::path::Path::from(format!(
                 "{prefix}/{hex}/{table_id_str}/{input_id}/{component}"
             ));
@@ -4429,12 +4419,8 @@ mod tests {
         // Submit a zero-grace DeleteSSTable task directly to verify idempotency.
         let (tx, rx) = tokio::sync::oneshot::channel();
         let rt = tokio::runtime::Handle::current();
-        let mgr = crate::upload::UploadManager::new(
-            Arc::clone(&store),
-            prefix.to_string(),
-            16,
-            &rt,
-        );
+        let mgr =
+            crate::upload::UploadManager::new(Arc::clone(&store), prefix.to_string(), 16, &rt);
         mgr.submit(crate::upload::UploadTask::DeleteSSTable {
             table_id: table_id_str.to_string(),
             sstable_id: input_id.to_string(),
@@ -4446,12 +4432,22 @@ mod tests {
 
         // Wait for deletion to complete.
         let result = rx.await.unwrap();
-        assert!(result.is_ok(), "deletion should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "deletion should succeed: {:?}",
+            result.err()
+        );
 
         mgr.shutdown().await;
 
         // All five component files must be gone from S3.
-        for component in &["Data.db", "Index.db", "Filter.db", "Statistics.db", "TOC.txt"] {
+        for component in &[
+            "Data.db",
+            "Index.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+        ] {
             let path = object_store::path::Path::from(format!(
                 "{prefix}/{hex}/{table_id_str}/{input_id}/{component}"
             ));
@@ -4465,12 +4461,8 @@ mod tests {
         // Idempotency: deleting again (already-gone objects) must not error.
         let (tx2, rx2) = tokio::sync::oneshot::channel();
         let rt2 = tokio::runtime::Handle::current();
-        let mgr2 = crate::upload::UploadManager::new(
-            Arc::clone(&store),
-            prefix.to_string(),
-            16,
-            &rt2,
-        );
+        let mgr2 =
+            crate::upload::UploadManager::new(Arc::clone(&store), prefix.to_string(), 16, &rt2);
         mgr2.submit(crate::upload::UploadTask::DeleteSSTable {
             table_id: table_id_str.to_string(),
             sstable_id: input_id.to_string(),
@@ -4480,7 +4472,11 @@ mod tests {
         .await
         .unwrap();
         let result2 = rx2.await.unwrap();
-        assert!(result2.is_ok(), "idempotent deletion must not error: {:?}", result2.err());
+        assert!(
+            result2.is_ok(),
+            "idempotent deletion must not error: {:?}",
+            result2.err()
+        );
         mgr2.shutdown().await;
     }
 
@@ -4489,8 +4485,7 @@ mod tests {
         // After poll_compactions() the input SSTable component files must be deleted
         // from the table directory, while the compaction output directory must still exist.
         let dir = tempfile::tempdir().unwrap();
-        let (engine, _store, _prefix, tid) =
-            make_engine_with_pending_compaction(&dir).await;
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
 
         let tid_str = tid.to_string();
 
@@ -4521,9 +4516,7 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| {
-                    p.is_file() && p.extension().map(|e| e == "db").unwrap_or(false)
-                })
+                .filter(|p| p.is_file() && p.extension().map(|e| e == "db").unwrap_or(false))
                 .collect();
             if data_files_after.is_empty() {
                 break;
@@ -4557,8 +4550,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_s3_metrics_accurate() {
         let dir = tempfile::tempdir().unwrap();
-        let (engine, _store, _prefix, _tid) =
-            make_engine_with_pending_compaction(&dir).await;
+        let (engine, _store, _prefix, _tid) = make_engine_with_pending_compaction(&dir).await;
 
         // Before poll_compactions: all counters must be zero.
         assert_eq!(
@@ -4721,10 +4713,7 @@ mod tests {
         let int_bytes = 42i32.to_be_bytes().to_vec();
         let row2 = ferrosa_sstable::types::Row {
             clustering: vec![],
-            cells: vec![(
-                1,
-                ferrosa_common::cell::CellValue::live(int_bytes, 2000),
-            )],
+            cells: vec![(1, ferrosa_common::cell::CellValue::live(int_bytes, 2000))],
             deletion: ferrosa_sstable::types::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
         };
@@ -4797,7 +4786,10 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert!(cassandra_up, "failed to start Cassandra container — is the runtime running?");
+        assert!(
+            cassandra_up,
+            "failed to start Cassandra container — is the runtime running?"
+        );
 
         // Allow Cassandra to initialize (up to 120 s).
         // Two-phase probe: first wait for nodetool (JMX), then verify CQL responds,
@@ -4833,7 +4825,10 @@ mod tests {
                 }
             }
         }
-        assert!(cassandra_ready, "Cassandra did not become ready within 120 s");
+        assert!(
+            cassandra_ready,
+            "Cassandra did not become ready within 120 s"
+        );
 
         // ── Step 4: create keyspace + table so nodetool import has a target ──
         let create_schema = "\
@@ -4842,7 +4837,13 @@ mod tests {
             CREATE TABLE IF NOT EXISTS test_ks.mixed_cells \
               (pk text PRIMARY KEY, v_text text, v_int int);";
         let schema_ok = Command::new(container_runtime())
-            .args(["exec", "ferrosa-cassandra-test", "cqlsh", "--execute", create_schema])
+            .args([
+                "exec",
+                "ferrosa-cassandra-test",
+                "cqlsh",
+                "--execute",
+                create_schema,
+            ])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -4927,7 +4928,13 @@ mod tests {
 
         // Cleanup.
         let _ = Command::new(container_runtime())
-            .args(["compose", "-f", compose_file.to_str().unwrap(), "down", "-v"])
+            .args([
+                "compose",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "down",
+                "-v",
+            ])
             .status();
     }
 
@@ -4961,13 +4968,9 @@ mod tests {
 
         // Use min_threshold=4 (default STCS) so 4 flushes trigger compaction.
         let config = StorageEngineConfig::test_config(dir.path());
-        let engine = StorageEngine::new_with_upload_store(
-            config,
-            Arc::clone(&store),
-            prefix.clone(),
-            &rt,
-        )
-        .unwrap();
+        let engine =
+            StorageEngine::new_with_upload_store(config, Arc::clone(&store), prefix.clone(), &rt)
+                .unwrap();
         engine.register_table(test_schema()).unwrap();
         let tid = table_id();
 
@@ -5092,7 +5095,10 @@ mod tests {
                 }
             }
         }
-        assert!(cassandra_ready, "Cassandra did not become ready within 120 s");
+        assert!(
+            cassandra_ready,
+            "Cassandra did not become ready within 120 s"
+        );
 
         // test_schema() → test_ks.test_table with pk (text), ck (int), val (text)
         let create_schema = "\
@@ -5101,7 +5107,13 @@ mod tests {
             CREATE TABLE IF NOT EXISTS test_ks.test_table \
               (pk text, ck int, val text, PRIMARY KEY (pk, ck));";
         let schema_ok = Command::new(container_runtime())
-            .args(["exec", "ferrosa-cassandra-test", "cqlsh", "--execute", create_schema])
+            .args([
+                "exec",
+                "ferrosa-cassandra-test",
+                "cqlsh",
+                "--execute",
+                create_schema,
+            ])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -5176,7 +5188,13 @@ mod tests {
 
         // Cleanup.
         let _ = Command::new(container_runtime())
-            .args(["compose", "-f", compose_file.to_str().unwrap(), "down", "-v"])
+            .args([
+                "compose",
+                "-f",
+                compose_file.to_str().unwrap(),
+                "down",
+                "-v",
+            ])
             .status();
     }
 
@@ -5252,8 +5270,16 @@ mod tests {
         engine.write(&tid, &key, row, 1000).unwrap();
 
         engine.flush(&tid).unwrap();
-        assert_eq!(engine.sstable_count(&tid), 1, "flush should have written 1 SSTable");
-        assert_eq!(engine.memtable_size(&tid), 0, "memtable should be empty after flush");
+        assert_eq!(
+            engine.sstable_count(&tid),
+            1,
+            "flush should have written 1 SSTable"
+        );
+        assert_eq!(
+            engine.memtable_size(&tid),
+            0,
+            "memtable should be empty after flush"
+        );
 
         let result = engine.read(&tid, &key).unwrap();
         assert!(result.is_some(), "row must be readable after flush");
@@ -5292,8 +5318,16 @@ mod tests {
         engine.write(&tid, &key, row, 2000).unwrap();
 
         engine.flush(&tid).unwrap();
-        assert_eq!(engine.sstable_count(&tid), 1, "flush should have written 1 SSTable");
-        assert_eq!(engine.memtable_size(&tid), 0, "memtable should be empty after flush");
+        assert_eq!(
+            engine.sstable_count(&tid),
+            1,
+            "flush should have written 1 SSTable"
+        );
+        assert_eq!(
+            engine.memtable_size(&tid),
+            0,
+            "memtable should be empty after flush"
+        );
 
         let result = engine.read(&tid, &key).unwrap();
         assert!(result.is_some(), "row must be readable after flush");
@@ -5332,8 +5366,16 @@ mod tests {
         engine.write(&tid, &key, row, 3000).unwrap();
 
         engine.flush(&tid).unwrap();
-        assert_eq!(engine.sstable_count(&tid), 1, "flush should have written 1 SSTable");
-        assert_eq!(engine.memtable_size(&tid), 0, "memtable should be empty after flush");
+        assert_eq!(
+            engine.sstable_count(&tid),
+            1,
+            "flush should have written 1 SSTable"
+        );
+        assert_eq!(
+            engine.memtable_size(&tid),
+            0,
+            "memtable should be empty after flush"
+        );
 
         let result = engine.read(&tid, &key).unwrap();
         assert!(result.is_some(), "row must be readable after flush");
@@ -5418,10 +5460,7 @@ mod tests {
         }
 
         // Verify at least one .db file exists on disk before restart.
-        let table_dir = dir
-            .path()
-            .join("sstables")
-            .join(tid.to_string());
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
         let db_files: Vec<_> = std::fs::read_dir(&table_dir)
             .expect("sstables table dir must exist after flush")
             .filter_map(|e| e.ok())
@@ -5681,8 +5720,9 @@ mod tests {
         // When upload fails, poll_compactions hits `continue` before step 5 (manifest update).
         // The inner store (used for GETs) has never had a manifest written to it,
         // so Manifest::load returns an empty manifest — no entries for this table.
-        let (manifest, _) =
-            crate::manifest::Manifest::load(inner_store.as_ref(), &prefix).await.unwrap();
+        let (manifest, _) = crate::manifest::Manifest::load(inner_store.as_ref(), &prefix)
+            .await
+            .unwrap();
         let tid_str = tid.to_string();
         let entries = manifest.sstables.get(&tid_str).cloned().unwrap_or_default();
         assert!(

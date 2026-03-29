@@ -1414,8 +1414,6 @@ mod tests {
     /// Run with: cargo test -p ferrosa-sstable partitions_db_pk1_pk2_hex_dump -- --nocapture
     #[test]
     fn partitions_db_pk1_pk2_hex_dump() {
-        use ferrosa_common::Token;
-
         let header = SerializationHeader {
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
@@ -1424,11 +1422,21 @@ mod tests {
             clustering_types: vec![],
             static_columns: vec![],
             regular_columns: vec![
-                (b"v_text".to_vec(), "org.apache.cassandra.db.marshal.UTF8Type".into()),
-                (b"v_int".to_vec(), "org.apache.cassandra.db.marshal.Int32Type".into()),
+                (
+                    b"v_text".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"v_int".to_vec(),
+                    "org.apache.cassandra.db.marshal.Int32Type".into(),
+                ),
             ],
         };
-        let options = WriteOptions { compression: None, bloom_fp_chance: 0.01, chunk_size: 65536 };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
 
         let dk1 = DecoratedKey::new(PartitionKey::from(b"pk1".as_slice()));
         let dk2 = DecoratedKey::new(PartitionKey::from(b"pk2".as_slice()));
@@ -1479,37 +1487,58 @@ mod tests {
         // Decode footer (last 24 bytes)
         let len = partitions_db.len();
         assert!(len >= 24, "Partitions.db too small");
-        let key_bounds_offset = i64::from_be_bytes(partitions_db[len-24..len-16].try_into().unwrap());
-        let key_count = i64::from_be_bytes(partitions_db[len-16..len-8].try_into().unwrap());
-        let root_pos = i64::from_be_bytes(partitions_db[len-8..len].try_into().unwrap());
+        let key_bounds_offset =
+            i64::from_be_bytes(partitions_db[len - 24..len - 16].try_into().unwrap());
+        let key_count = i64::from_be_bytes(partitions_db[len - 16..len - 8].try_into().unwrap());
+        let root_pos = i64::from_be_bytes(partitions_db[len - 8..len].try_into().unwrap());
         eprintln!("Footer: key_bounds_offset={key_bounds_offset}, key_count={key_count}, root_pos={root_pos}");
 
         // Decode key bounds
         let kb_off = key_bounds_offset as usize;
-        let first_len = u16::from_be_bytes(partitions_db[kb_off..kb_off+2].try_into().unwrap()) as usize;
-        let first_key = &partitions_db[kb_off+2..kb_off+2+first_len];
+        let first_len =
+            u16::from_be_bytes(partitions_db[kb_off..kb_off + 2].try_into().unwrap()) as usize;
+        let first_key = &partitions_db[kb_off + 2..kb_off + 2 + first_len];
         let second_start = kb_off + 2 + first_len;
-        let last_len = u16::from_be_bytes(partitions_db[second_start..second_start+2].try_into().unwrap()) as usize;
-        let last_key = &partitions_db[second_start+2..second_start+2+last_len];
+        let last_len = u16::from_be_bytes(
+            partitions_db[second_start..second_start + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let last_key = &partitions_db[second_start + 2..second_start + 2 + last_len];
         eprintln!("Key bounds: first={:?} last={:?}", first_key, last_key);
-        eprintln!("Key bounds: first={} last={}",
+        eprintln!(
+            "Key bounds: first={} last={}",
             std::str::from_utf8(first_key).unwrap_or("?"),
-            std::str::from_utf8(last_key).unwrap_or("?"));
+            std::str::from_utf8(last_key).unwrap_or("?")
+        );
 
         // Hex dump of full Partitions.db
         eprintln!("Partitions.db hex dump:");
         for (i, chunk) in partitions_db.chunks(16).enumerate() {
-            let hex: String = chunk.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
-            let ascii: String = chunk.iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '.' }).collect();
+            let hex: String = chunk
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ascii: String = chunk
+                .iter()
+                .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+                .collect();
             eprintln!("  {:04x}: {:<48}  {}", i * 16, hex, ascii);
         }
 
         // Verify that the key bounds ordering matches the write order
         let write_first = partitions[0].key.key.as_bytes();
-        let write_last = partitions[partitions.len()-1].key.key.as_bytes();
-        assert_eq!(first_key, write_first,
-            "key bounds first={:?} should match token-sorted first={:?}", first_key, write_first);
-        assert_eq!(last_key, write_last,
-            "key bounds last={:?} should match token-sorted last={:?}", last_key, write_last);
+        let write_last = partitions[partitions.len() - 1].key.key.as_bytes();
+        assert_eq!(
+            first_key, write_first,
+            "key bounds first={:?} should match token-sorted first={:?}",
+            first_key, write_first
+        );
+        assert_eq!(
+            last_key, write_last,
+            "key bounds last={:?} should match token-sorted last={:?}",
+            last_key, write_last
+        );
     }
 }

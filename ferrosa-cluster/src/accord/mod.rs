@@ -30,6 +30,7 @@ pub mod test_cluster;
 pub mod two_phase_ddl;
 pub mod uda_integration;
 
+pub use clock::{ClockError, ClockValidator};
 pub use clock_validation::{
     validate_timestamp_drift, ClockDriftRejection, DEFAULT_MAX_CLOCK_DRIFT_NS,
 };
@@ -46,7 +47,6 @@ pub use epoch_drain::{DrainCheckResult, EpochDrain, TxnDrainStatus};
 pub use leaseholder::{LeaseAssignment, LeaseError, LeaseholderManager};
 pub use linearizable_read::{LinearizableReadManager, ReadError, ReadResult};
 pub use metrics::AccordMetrics;
-pub use clock::{ClockError, ClockValidator};
 pub use recovery::{
     AccordNodeState, AccordPhase, AccordTxn, InflightResolution, NodeId, NodeRecoveryCoordinator,
     RecoverOKResponse, RecoveryCoordinator, RecoveryDecision,

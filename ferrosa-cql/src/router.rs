@@ -9229,10 +9229,8 @@ mod tests {
         route(
             &state,
             &ctx_ks,
-            crate::parser::parse(
-                "CREATE TABLE bug024.t (pk text PRIMARY KEY, a int, b text)",
-            )
-            .unwrap(),
+            crate::parser::parse("CREATE TABLE bug024.t (pk text PRIMARY KEY, a int, b text)")
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -9263,7 +9261,11 @@ mod tests {
         match result {
             crate::connection::HandleResult::Reply(opcode, body) => {
                 assert_eq!(opcode, crate::frame::Opcode::Result);
-                assert_eq!(&body[0..4], &0x0004i32.to_be_bytes(), "result kind must be Prepared");
+                assert_eq!(
+                    &body[0..4],
+                    &0x0004i32.to_be_bytes(),
+                    "result kind must be Prepared"
+                );
                 let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
                 let mut off = 6 + id_len;
                 let _bind_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
@@ -9372,7 +9374,11 @@ mod tests {
         match result {
             crate::connection::HandleResult::Reply(opcode, body) => {
                 assert_eq!(opcode, crate::frame::Opcode::Result);
-                assert_eq!(&body[0..4], &0x0004i32.to_be_bytes(), "result kind must be Prepared");
+                assert_eq!(
+                    &body[0..4],
+                    &0x0004i32.to_be_bytes(),
+                    "result kind must be Prepared"
+                );
 
                 // kind(4) + id_len(2) + id(16) = 22 bytes before bind metadata
                 let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
@@ -9422,16 +9428,15 @@ mod tests {
                     // advance past any type parameters
                     match type_id {
                         0x0020 | 0x0022 => pos += 2, // List or Set: 1 extra u16
-                        0x0021 => pos += 4,           // Map: 2 extra u16s
-                        _ => {}                        // simple types: nothing extra
+                        0x0021 => pos += 4,          // Map: 2 extra u16s
+                        _ => {}                      // simple types: nothing extra
                     }
                 }
 
                 // --- Result metadata ---
                 let result_flags = i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap());
                 pos += 4;
-                let result_col_count =
-                    i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap());
+                let result_col_count = i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap());
 
                 // Result must NOT use No_metadata (0x0004) — SELECT always has columns
                 assert_ne!(

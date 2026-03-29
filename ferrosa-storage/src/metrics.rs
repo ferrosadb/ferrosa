@@ -31,7 +31,8 @@ impl CompactionMetrics {
 
     /// Adds `bytes` to the input bytes reclaimed gauge.
     pub fn add_bytes_reclaimed(&self, bytes: i64) {
-        self.input_bytes_reclaimed.fetch_add(bytes, Ordering::Relaxed);
+        self.input_bytes_reclaimed
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Renders metrics in Prometheus exposition text format.
