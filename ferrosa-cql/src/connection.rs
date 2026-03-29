@@ -1292,6 +1292,28 @@ fn cql_value_to_term(v: &CqlValue) -> Term {
     }
 }
 
+/// Convert raw CQL wire-format bytes for a bind value into a parser-level [`Term`].
+///
+/// For scalar types, parses the bytes to the appropriate typed `Term`.
+/// For collection types (`Map`, `List`, `Set`), the bytes are passed through
+/// as a [`Term::BlobLiteral`] so that they are stored verbatim in the SSTable
+/// cell. The storage layer and read path both use the CQL wire format for
+/// collections, so parsing them into structured Terms and re-serializing would
+/// risk format drift (BUG-025 / BUG-026).
+fn raw_bytes_to_term(cql_type: &CqlType, bytes: &[u8]) -> Term {
+    match cql_type {
+        // Collection types: pass bytes through unchanged for storage fidelity.
+        CqlType::Map(_, _) | CqlType::List(_) | CqlType::Set(_) => {
+            Term::BlobLiteral(bytes.to_vec())
+        }
+        // All other types: decode to a typed CqlValue, then convert to Term.
+        _ => match decode_value(cql_type, bytes) {
+            Ok(cql_value) => cql_value_to_term(&cql_value),
+            Err(_) => Term::BlobLiteral(bytes.to_vec()),
+        },
+    }
+}
+
 /// Parse bound values from the EXECUTE frame cursor and substitute them
 /// into the prepared statement AST, replacing `BindMarker` nodes with
 /// literal `Term` values.
@@ -1345,8 +1367,7 @@ fn substitute_bound_values(plan: &PreparedPlan, mut cursor: &[u8]) -> Result<Sta
                 &CqlType::Blob
             };
 
-            let cql_value = decode_value(cql_type, val_bytes)?;
-            bound_terms.push(cql_value_to_term(&cql_value));
+            bound_terms.push(raw_bytes_to_term(cql_type, val_bytes));
         }
     }
 
@@ -1803,6 +1824,66 @@ mod tests {
             );
         } else {
             panic!("expected Select");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // raw_bytes_to_term tests (BUG-025 / BUG-026)
+    // -----------------------------------------------------------------------
+
+    /// Build CQL v4+ wire-format bytes for a map<text,int> with one entry.
+    ///
+    /// Format: [4-byte BE count][4-byte BE key_len][key_bytes][4-byte BE val_len][val_bytes]
+    fn encode_cql_map(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(entries.len() as i32).to_be_bytes());
+        for (k, v) in entries {
+            buf.extend_from_slice(&(k.len() as i32).to_be_bytes());
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            buf.extend_from_slice(v);
+        }
+        buf
+    }
+
+    /// Build CQL v4+ wire-format bytes for a list<text> or set<text>.
+    fn encode_cql_sequence(elements: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(elements.len() as i32).to_be_bytes());
+        for elem in elements {
+            buf.extend_from_slice(&(elem.len() as i32).to_be_bytes());
+            buf.extend_from_slice(elem);
+        }
+        buf
+    }
+
+    #[test]
+    fn map_bind_value_roundtrip() {
+        // Given: map<text,int> type and wire bytes for {'key': 42}
+        let map_type = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Int));
+        let key_bytes = b"key";
+        let val_bytes = 42i32.to_be_bytes();
+        let wire_bytes = encode_cql_map(&[(key_bytes, &val_bytes)]);
+
+        // When: we call raw_bytes_to_term
+        let term = raw_bytes_to_term(&map_type, &wire_bytes);
+
+        // Then: the result must be a BlobLiteral that preserves all wire bytes,
+        // NOT a truncated blob of 4 bytes (what the old fallthrough would produce).
+        match &term {
+            Term::BlobLiteral(b) => {
+                assert_eq!(
+                    b.as_slice(),
+                    wire_bytes.as_slice(),
+                    "map bind value must roundtrip as opaque wire bytes, got {} bytes expected {}",
+                    b.len(),
+                    wire_bytes.len()
+                );
+            }
+            other => panic!(
+                "map bind value should be BlobLiteral for storage passthrough, got {:?}",
+                other
+            ),
         }
     }
 }

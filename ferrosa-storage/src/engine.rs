@@ -3514,4 +3514,169 @@ mod tests {
             r_old.err()
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Collection flush readback tests (BUG-026)
+    // -----------------------------------------------------------------------
+
+    /// Encode CQL v4+ wire-format bytes for a map.
+    ///
+    /// Format: [4-byte BE count][4-byte BE key_len][key][4-byte BE val_len][val]...
+    fn encode_cql_map(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(entries.len() as i32).to_be_bytes());
+        for (k, v) in entries {
+            buf.extend_from_slice(&(k.len() as i32).to_be_bytes());
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            buf.extend_from_slice(v);
+        }
+        buf
+    }
+
+    /// Encode CQL v4+ wire-format bytes for a list or set.
+    fn encode_cql_sequence(elements: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(elements.len() as i32).to_be_bytes());
+        for elem in elements {
+            buf.extend_from_slice(&(elem.len() as i32).to_be_bytes());
+            buf.extend_from_slice(elem);
+        }
+        buf
+    }
+
+    fn collection_schema(ks: &str, table: &str, col_type: &str) -> TableSchema {
+        TableSchema {
+            keyspace: ks.to_string(),
+            table: table.to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "col".to_string(),
+                type_name: col_type.to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn collection_map_flush_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = collection_schema(
+            "test_ks",
+            "map_table",
+            "org.apache.cassandra.db.marshal.MapType(\
+             org.apache.cassandra.db.marshal.UTF8Type,\
+             org.apache.cassandra.db.marshal.Int32Type)",
+        );
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new("test_ks", "map_table");
+        let key = make_key("pk1");
+        let map_bytes = encode_cql_map(&[(b"key", &42i32.to_be_bytes())]);
+
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(map_bytes.clone(), 1000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key, row, 1000).unwrap();
+
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 1, "flush should have written 1 SSTable");
+        assert_eq!(engine.memtable_size(&tid), 0, "memtable should be empty after flush");
+
+        let result = engine.read(&tid, &key).unwrap();
+        assert!(result.is_some(), "row must be readable after flush");
+        let partition = result.unwrap();
+        assert_eq!(
+            partition.rows[0].cells[0].1.value.as_deref(),
+            Some(map_bytes.as_slice()),
+            "map bytes must survive flush/read roundtrip unchanged"
+        );
+    }
+
+    #[test]
+    fn collection_set_flush_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = collection_schema(
+            "test_ks",
+            "set_table",
+            "org.apache.cassandra.db.marshal.SetType(\
+             org.apache.cassandra.db.marshal.UTF8Type)",
+        );
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new("test_ks", "set_table");
+        let key = make_key("pk2");
+        let set_bytes = encode_cql_sequence(&[b"alpha", b"beta"]);
+
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(set_bytes.clone(), 2000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
+        };
+        engine.write(&tid, &key, row, 2000).unwrap();
+
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 1, "flush should have written 1 SSTable");
+        assert_eq!(engine.memtable_size(&tid), 0, "memtable should be empty after flush");
+
+        let result = engine.read(&tid, &key).unwrap();
+        assert!(result.is_some(), "row must be readable after flush");
+        let partition = result.unwrap();
+        assert_eq!(
+            partition.rows[0].cells[0].1.value.as_deref(),
+            Some(set_bytes.as_slice()),
+            "set bytes must survive flush/read roundtrip unchanged"
+        );
+    }
+
+    #[test]
+    fn collection_list_flush_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = collection_schema(
+            "test_ks",
+            "list_table",
+            "org.apache.cassandra.db.marshal.ListType(\
+             org.apache.cassandra.db.marshal.UTF8Type)",
+        );
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new("test_ks", "list_table");
+        let key = make_key("pk3");
+        let list_bytes = encode_cql_sequence(&[b"first", b"second", b"third"]);
+
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(list_bytes.clone(), 3000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(3000),
+        };
+        engine.write(&tid, &key, row, 3000).unwrap();
+
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 1, "flush should have written 1 SSTable");
+        assert_eq!(engine.memtable_size(&tid), 0, "memtable should be empty after flush");
+
+        let result = engine.read(&tid, &key).unwrap();
+        assert!(result.is_some(), "row must be readable after flush");
+        let partition = result.unwrap();
+        assert_eq!(
+            partition.rows[0].cells[0].1.value.as_deref(),
+            Some(list_bytes.as_slice()),
+            "list bytes must survive flush/read roundtrip unchanged"
+        );
+    }
 }
