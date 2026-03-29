@@ -1,0 +1,43 @@
+services:
+  # Cassandra 5.1 node used to verify that Ferrosa-compacted SSTables are
+  # readable by a real Cassandra instance.
+  #
+  # The test (ferrosa-storage::engine::tests::cassandra_reads_compacted_sstable_from_s3
+  # and compaction_end_to_end_pipeline) does:
+  #   1. Compact SSTables → writes files to a local temp dir + in-memory S3 store.
+  #   2. Starts this compose stack.
+  #   3. docker exec ferrosa-cassandra-test nodetool status  (readiness probe)
+  #   4. docker exec ferrosa-cassandra-test cqlsh --execute "SELECT ..."
+  #
+  # SSTable import: the test must copy compacted .db/.Index/.Summary files into
+  # the shared sstable-import volume before querying, then run:
+  #   nodetool import test_ks test_table /var/lib/cassandra/import
+  # This volume-based handoff is the bridge between the in-process engine and
+  # the containerised Cassandra.
+
+  cassandra:
+    image: cassandra:5.1
+    container_name: ferrosa-cassandra-test
+    environment:
+      CASSANDRA_CLUSTER_NAME: ferrosa-compat-test
+      CASSANDRA_NUM_TOKENS: 1
+      CASSANDRA_ENDPOINT_SNITCH: SimpleSnitch
+      # Keep heap small so it starts fast in CI / dev environments.
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+    ports:
+      - "9043:9042"  # Expose on 9043 to avoid clashing with ferrosa on 9042.
+    volumes:
+      - sstable-import:/var/lib/cassandra/import
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool status 2>/dev/null | grep -q 'UN'"]
+      interval: 10s
+      timeout: 15s
+      retries: 12
+      start_period: 60s
+
+volumes:
+  sstable-import:
+    # Named volume shared between the host test runner and Cassandra.
+    # The test places compacted SSTable files here; Cassandra reads them via
+    # `nodetool import`.

@@ -58,12 +58,37 @@ fn require_container_cluster() {
     }
 }
 
-/// Execute a CQL query via cqlsh and return stdout.
+/// Execute a CQL query via a transient cassandra:5.1 container on the
+/// ferrosa-memory compose network.  No host-side cqlsh install required.
+///
+/// The network name defaults to `ferrosa-memory_default` (Compose default for
+/// the `~/src/ferrosa-memory` project) and can be overridden with
+/// `FERROSA_MEMORY_NETWORK`.
 fn cqlsh(port: u16, query: &str) -> Result<String, String> {
-    let output = Command::new("cqlsh")
-        .args(["localhost", &port.to_string(), "-e", query])
+    // Map macOS host port → compose service name (internal CQL port is always 9042).
+    let service = match port {
+        19042 => "node1",
+        19043 => "node2",
+        19044 => "node3",
+        p => return Err(format!("unknown ferrosa-memory CQL port {p}")),
+    };
+    let network = std::env::var("FERROSA_MEMORY_NETWORK")
+        .unwrap_or_else(|_| "ferrosa-memory_default".to_string());
+    let output = Command::new(container_runtime())
+        .args([
+            "run",
+            "--rm",
+            "--network",
+            &network,
+            "cassandra:5.1",
+            "cqlsh",
+            service,
+            "9042",
+            "-e",
+            query,
+        ])
         .output()
-        .map_err(|e| format!("cqlsh failed: {e}"))?;
+        .map_err(|e| format!("cqlsh container run failed: {e}"))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
