@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::chaos::NemesisRegistry;
 use crate::checker::{check_linearizability, CheckResult};
 use crate::config::{Concurrency, RunConfig, Tier, Topology};
+use crate::docker_provision::{provision_docker_cluster, teardown_docker_cluster, ClusterInfo};
 use crate::driver::DriverRegistry;
 use crate::history::{HistoryRecorder, Op, OpResult};
 use crate::report::RunReport;
@@ -56,6 +57,30 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
     for topology in &topologies {
         tracing::info!(?topology, "Provisioning cluster");
 
+        // Provision the cluster for this topology.
+        // For single-DC topologies (T1/T2) we use Docker Compose when
+        // FERROSA_TEST_CONTAINERS is set; otherwise we fall back to a
+        // no-op cluster (placeholder) so the orchestrator can still run
+        // unit-level combinations without container infrastructure.
+        let cluster_opt: Option<ClusterInfo> =
+            if std::env::var("FERROSA_TEST_CONTAINERS").is_ok()
+                && topology.node_count() <= 3
+            {
+                match provision_docker_cluster(*topology).await {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::error!(
+                            ?topology,
+                            error = %e,
+                            "Docker cluster provisioning failed; skipping topology"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
         for concurrency in &concurrency_levels {
             for driver_name in &driver_names {
                 for nemesis_name in &nemesis_names {
@@ -67,6 +92,7 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
                             driver_name,
                             *concurrency,
                             config,
+                            cluster_opt.as_ref(),
                         )
                         .await;
 
@@ -97,6 +123,13 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
                         }
                     }
                 }
+            }
+        }
+
+        // Tear down the cluster after all combinations for this topology.
+        if let Some(cluster) = cluster_opt {
+            if let Err(e) = teardown_docker_cluster(cluster).await {
+                tracing::warn!(?topology, error = %e, "cluster teardown failed");
             }
         }
     }
@@ -130,6 +163,9 @@ fn resolve_driver_registry(tier: Tier) -> DriverRegistry {
 }
 
 /// Run a single workload+nemesis combination.
+///
+/// `cluster` is `Some` when a real Docker cluster has been provisioned for
+/// this topology; `None` in unit-test / placeholder mode.
 async fn run_single_combination(
     topology: Topology,
     nemesis_name: &str,
@@ -137,6 +173,7 @@ async fn run_single_combination(
     driver_name: &str,
     concurrency: Concurrency,
     _config: &RunConfig,
+    _cluster: Option<&ClusterInfo>,
 ) -> Result<CombinationResult> {
     let start = Instant::now();
 
@@ -253,6 +290,7 @@ mod tests {
             "rust",
             Concurrency::Low,
             &config,
+            None,
         )
         .await
         .unwrap();

@@ -8,6 +8,7 @@ pub mod checker;
 pub mod cluster;
 pub mod config;
 pub mod cql_session;
+pub mod docker_provision;
 pub mod driver;
 pub mod endurance;
 pub mod firecracker;
