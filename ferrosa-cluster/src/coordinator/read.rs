@@ -33,7 +33,10 @@ use std::collections::BTreeMap;
 use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
 use crate::pair::coordinator::encode_mutation;
-use crate::raft::handlers::{partition_from_wire, ReadRequestPayload, ReadResponsePayload};
+use crate::raft::handlers::{
+    partition_from_wire, RangeReadRequestPayload, RangeReadResponsePayload, ReadRequestPayload,
+    ReadResponsePayload,
+};
 use crate::raft::IndexNodeStatus;
 
 use super::ClusterCoordinator;
@@ -660,6 +663,115 @@ impl ClusterCoordinator {
         // the effective replica set and required count.
         self.coordinate_read_with(table_id, key, cl, effective_replicas.len())
             .await
+    }
+
+    /// Scatter a full-table range read to every node in the ring.
+    ///
+    /// Each node returns its locally-stored partitions for `table_id`.  The
+    /// coordinator deduplicates partitions that appear on multiple nodes
+    /// (e.g. due to replication or token overlap) by merging replicas with
+    /// the same partition key using last-write-wins cell semantics.
+    pub async fn coordinate_range_read(
+        &self,
+        table_id: &TableId,
+    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+        let ring = self.ring.load();
+        let node_ids = ring.node_ids();
+
+        // Collect (node_id, host_id) pairs while the ring guard is held.
+        let nodes: Vec<(u64, Option<uuid::Uuid>)> = node_ids
+            .iter()
+            .map(|&id| (id, ring.get_node(id).map(|n| n.host_id)))
+            .collect();
+        drop(ring);
+
+        let req_payload = RangeReadRequestPayload {
+            keyspace: table_id.keyspace.clone(),
+            table: table_id.table.clone(),
+        };
+        let req_body = Bytes::from(bincode::serialize(&req_payload).unwrap_or_default());
+
+        // Fan out to all nodes concurrently.
+        let local_id = self.local_node_id;
+        let storage = self.storage.clone();
+        let peer_manager = self.peer_manager.clone();
+        let table_id_clone = table_id.clone();
+
+        let mut futs: FuturesUnordered<_> = nodes
+            .into_iter()
+            .map(|(node_id, host_id)| {
+                let storage = storage.clone();
+                let peer_manager = peer_manager.clone();
+                let table_id = table_id_clone.clone();
+                let req_body = req_body.clone();
+
+                async move {
+                    if node_id == local_id {
+                        storage
+                            .read_range(&table_id, None, None, 1_000_000)
+                            .unwrap_or_default()
+                    } else {
+                        match host_id {
+                            None => vec![],
+                            Some(hid) => {
+                                match peer_manager
+                                    .send(
+                                        hid,
+                                        ferrosa_net::message::Message::RangeReadRequest(req_body),
+                                        Lane::Data,
+                                    )
+                                    .await
+                                {
+                                    Ok(ferrosa_net::message::Message::RangeReadResponse(b)) => {
+                                        match bincode::deserialize::<RangeReadResponsePayload>(&b) {
+                                            Ok(resp) => resp
+                                                .partitions
+                                                .into_iter()
+                                                .map(partition_from_wire)
+                                                .collect(),
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "coordinate_range_read: \
+                                                     failed to decode response: {e}"
+                                                );
+                                                vec![]
+                                            }
+                                        }
+                                    }
+                                    _ => vec![],
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        // Collect all partitions.
+        let mut all_partitions: Vec<ferrosa_sstable::types::Partition> = Vec::new();
+        while let Some(batch) = futs.next().await {
+            all_partitions.extend(batch);
+        }
+
+        // Deduplicate: group by token, merge replicas with the same partition key.
+        use std::collections::BTreeMap;
+        let mut by_token: BTreeMap<i64, Vec<ferrosa_sstable::types::Partition>> = BTreeMap::new();
+        for p in all_partitions {
+            by_token.entry(p.key.token.0).or_default().push(p);
+        }
+
+        let deduped: Vec<ferrosa_sstable::types::Partition> = by_token
+            .into_values()
+            .map(|group| {
+                if group.len() == 1 {
+                    group.into_iter().next().unwrap()
+                } else {
+                    ferrosa_storage::merge::merge_partitions(group)
+                }
+            })
+            .collect();
+
+        Ok(deduped)
     }
 }
 

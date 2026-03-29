@@ -165,6 +165,9 @@ pub struct RequestContext<'a> {
     pub serial_consistency: Option<ConsistencyLevel>,
     /// Pagination parameters from the QUERY/EXECUTE frame.
     pub paging: crate::paging::PagingParams,
+    /// Remote peer address (e.g. "10.0.0.1:54321"), used by the query tracker
+    /// for the `client_address` column in `system_observability.active_queries`.
+    pub client_address: String,
 }
 
 /// Result of routing a statement.
@@ -197,12 +200,12 @@ pub async fn route(
     let _guard = state.query_tracker.begin_guarded(
         &query_desc,
         keyspace,
-        "",             // client address not yet available in RequestContext
-        &ctx.auth.role, // authenticated role name
+        &ctx.client_address,
+        &ctx.auth.role,
     );
 
     match stmt {
-        Statement::Select(s) => route_select(state, ctx, s).map(RouteResult::Result),
+        Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
         Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
         Statement::Update(u) => route_update(state, ctx, u).await.map(RouteResult::Result),
         Statement::Delete(d) => route_delete(state, ctx, d).await.map(RouteResult::Result),
@@ -378,7 +381,7 @@ pub async fn route(
 
 // ── SELECT ───────────────────────────────────────────────────────────────
 
-fn route_select(
+async fn route_select(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: SelectStatement,
@@ -863,12 +866,12 @@ fn route_select(
             }
 
             // User table: permission check + bridge + storage
-            route_select_user_table(state, ctx, ks, &s)
+            route_select_user_table(state, ctx, ks, &s).await
         }
     }
 }
 
-fn route_select_user_table(
+async fn route_select_user_table(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     ks: &str,
@@ -1027,8 +1030,7 @@ fn route_select_user_table(
                 // values that can't be coerced to the PK column type) but
                 // the planner still sees Eq predicates on all PK columns.
                 // Fall through to a full scan rather than panicking.
-                let scan_limit = 10_000;
-                let partitions = state.engine.read_range(&table_id, None, None, scan_limit)?;
+                let partitions = state.write_path.load().range_read(&table_id).await;
                 let mut all_rows = Vec::new();
                 for partition in &partitions {
                     let mut prows = bridge::partition_to_rows(
@@ -1100,8 +1102,7 @@ fn route_select_user_table(
                 // may not be wired yet (Sprint I-3). Fall back to full scan so
                 // queries still return correct results.
                 let partitions = if partitions.is_empty() {
-                    let scan_limit = 10_000;
-                    state.engine.read_range(&table_id, None, None, scan_limit)?
+                    state.write_path.load().range_read(&table_id).await
                 } else {
                     partitions
                 };
@@ -1162,8 +1163,7 @@ fn route_select_user_table(
                         .read_by_index(&table_id, first_idx_name, &index_key)?;
 
                 let partitions = if partitions.is_empty() {
-                    let scan_limit = 10_000;
-                    state.engine.read_range(&table_id, None, None, scan_limit)?
+                    state.write_path.load().range_read(&table_id).await
                 } else {
                     partitions
                 };
@@ -1223,8 +1223,7 @@ fn route_select_user_table(
 
                 // Use a large scan window — LIMIT is applied *after* filtering,
                 // not before, to avoid cutting off matching rows (FRSA-BUG-003).
-                let scan_limit = 10_000;
-                let partitions = state.engine.read_range(&table_id, None, None, scan_limit)?;
+                let partitions = state.write_path.load().range_read(&table_id).await;
                 let mut all_rows = Vec::new();
                 for partition in &partitions {
                     let mut prows = bridge::partition_to_rows(
@@ -5956,6 +5955,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         }
     }
 
@@ -5968,6 +5968,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // CREATE KEYSPACE
@@ -6017,6 +6018,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse("USE my_ks").unwrap();
         match route(&state, &ctx, stmt).await.unwrap() {
@@ -6037,6 +6039,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -6068,6 +6071,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -6123,6 +6127,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse("SELECT * FROM users WHERE id = 1").unwrap();
         assert!(route(&state, &ctx, stmt).await.is_err());
@@ -6137,6 +6142,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         // Build a batch statement with > 500 entries programmatically
         let stmts: Vec<Statement> = (0..501)
@@ -6169,6 +6175,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.peers").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -6187,6 +6194,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system_schema.keyspaces").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -6249,6 +6257,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let _ = route(&state, &ctx, stmt).await;
@@ -6264,6 +6273,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace and table first
@@ -6351,6 +6361,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse("SELECT * FROM test_ks.test_vtable").unwrap();
@@ -6424,6 +6435,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace
@@ -6478,6 +6490,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace + table + hash index
@@ -6528,6 +6541,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace first
@@ -6569,6 +6583,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace + type
@@ -6608,6 +6623,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace + type
@@ -6640,6 +6656,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace
@@ -6664,6 +6681,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace + type
@@ -6695,6 +6713,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace + type
@@ -6727,6 +6746,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace first (with explicit ks in statement)
@@ -6754,6 +6774,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // CREATE TYPE without keyspace and no session keyspace
@@ -6771,6 +6792,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace + type
@@ -6801,6 +6823,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace but no type
@@ -6830,6 +6853,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -6863,6 +6887,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -6896,6 +6921,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -6930,6 +6956,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -6948,6 +6975,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -6974,6 +7002,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -7000,6 +7029,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -7026,6 +7056,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -7159,6 +7190,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt =
             crate::parser::parse("SELECT schema_version FROM system.local WHERE key = 'local'")
@@ -7189,6 +7221,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local WHERE key = 'local'").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -7213,6 +7246,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system.peers_v2").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -7239,6 +7273,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt =
             crate::parser::parse("SELECT cluster_name, release_version FROM system.local").unwrap();
@@ -7266,6 +7301,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt =
             crate::parser::parse("SELECT peer, host_id, schema_version FROM system.peers").unwrap();
@@ -7293,6 +7329,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7305,6 +7342,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE TYPE temporal.serialized_event_batch (encoding_type text, version int, data blob)",
@@ -7327,6 +7365,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7339,6 +7378,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text)").unwrap();
         route(&state, &ctx_ks, stmt).await.unwrap();
@@ -7374,6 +7414,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7386,6 +7427,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt =
             crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text, extra blob)")
@@ -7413,6 +7455,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         // Create keyspace and table
         let stmt = crate::parser::parse(
@@ -7426,6 +7469,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt =
             crate::parser::parse("CREATE TABLE ks.t (k text PRIMARY KEY, v text, n int)").unwrap();
@@ -7519,6 +7563,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7531,6 +7576,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE temporal.t (k int PRIMARY KEY) WITH COMPACTION = { 'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy' }",
@@ -7558,6 +7604,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7570,6 +7617,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create the UDT first
@@ -7599,6 +7647,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7611,6 +7660,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -7642,6 +7692,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace and table with 2 columns
@@ -7656,6 +7707,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt =
             crate::parser::parse("CREATE TABLE ks.cluster_metadata (k int PRIMARY KEY, data blob)")
@@ -7720,6 +7772,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7732,6 +7785,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.meta (p int, name text, data blob, version bigint, PRIMARY KEY (p, name))",
@@ -7785,6 +7839,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7797,6 +7852,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.queue_metadata (queue_type int PRIMARY KEY, cluster_ack_level map<text, bigint>, version bigint)",
@@ -7838,6 +7894,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7850,6 +7907,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
@@ -7878,6 +7936,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7890,6 +7949,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
@@ -7923,6 +7983,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -7935,6 +7996,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.coll (k int PRIMARY KEY, ids set<uuid>, events list<text>)",
@@ -7961,6 +8023,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Setup: create keyspace and table
@@ -8031,6 +8094,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Setup
@@ -8062,6 +8126,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -8111,6 +8176,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Setup: table with an index on `email` but NOT on `name`
@@ -8168,6 +8234,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -8208,6 +8275,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -8253,6 +8321,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Setup: table with composite key (pk, ck) and a value column
@@ -8396,6 +8465,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse("SELECT * FROM system_observability.connections").unwrap();
         let result = route(&state, &ctx, stmt).await;
@@ -8420,6 +8490,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt =
             crate::parser::parse("SELECT * FROM system_observability.active_queries").unwrap();
@@ -8451,6 +8522,7 @@ mod tests {
                 consistency: ConsistencyLevel::One,
                 serial_consistency: None,
                 paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
             },
             use_stmt,
         )
@@ -8472,6 +8544,7 @@ mod tests {
                 consistency: ConsistencyLevel::One,
                 serial_consistency: None,
                 paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
             },
             sel_stmt,
         )
@@ -8514,6 +8587,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace
@@ -8562,6 +8636,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace
@@ -8619,6 +8694,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace
@@ -8655,6 +8731,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace
@@ -8694,6 +8771,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace and function
@@ -8746,6 +8824,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE cur_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -8761,6 +8840,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let hex_body = hex_encode(&minimal_wasm_component());
@@ -8794,6 +8874,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace
@@ -8840,6 +8921,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -8896,6 +8978,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -8952,6 +9035,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         let stmt = crate::parser::parse(
@@ -9013,6 +9097,7 @@ mod tests {
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
         };
 
         // Create keyspace and table

@@ -179,6 +179,7 @@ pub fn spawn_subscription_poll(
                         consistency: ferrosa_cluster::consistency::ConsistencyLevel::One,
                         serial_consistency: None,
                         paging: crate::paging::PagingParams::default(),
+                        client_address: String::new(),
                     };
                     match crate::router::route(&state, &ctx, inner.clone()).await {
                         Ok(RouteResult::Result(body)) => {

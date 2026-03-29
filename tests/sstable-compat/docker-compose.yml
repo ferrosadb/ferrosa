@@ -1,0 +1,21 @@
+version: '3.8'
+services:
+  cassandra:
+    image: cassandra:5.1
+    ports:
+      - "9043:9042"  # Use 9043 to avoid conflict with ferrosa on 9042
+    environment:
+      CASSANDRA_CLUSTER_NAME: compat-test
+      CASSANDRA_NUM_TOKENS: 1
+      CASSANDRA_ENDPOINT_SNITCH: SimpleSnitch
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+      - ./import:/import  # directory for SSTable files to import
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+volumes:
+  cassandra-data:

@@ -772,8 +772,8 @@ function renderSnapshotTable(snapshots) {
       "<td>" + expiresAt + "</td>" +
       sizeCells +
       '<td>' +
-        '<button class="btn btn-restore" onclick="openRestoreModal(' + JSON.stringify(snap.name) + ')" title="Restore from ' + name + '">Restore</button>' +
-        ' <button class="btn btn-danger" onclick="deleteSnapshot(' + JSON.stringify(snap.name) + ')" title="Delete ' + name + '">Delete</button>' +
+        '<button class="btn btn-restore" onclick="openRestoreModal(' + escHtml(JSON.stringify(snap.name)) + ')" title="Restore from ' + name + '">Restore</button>' +
+        ' <button class="btn btn-danger" onclick="deleteSnapshot(' + escHtml(JSON.stringify(snap.name)) + ')" title="Delete ' + name + '">Delete</button>' +
       '</td>' +
       "</tr>"
     );

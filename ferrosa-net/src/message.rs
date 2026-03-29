@@ -102,6 +102,8 @@ pub enum Message {
     ReadRequest(Bytes),
     ReadResponse(Bytes),
     RepairWrite(Bytes),
+    RangeReadRequest(Bytes),
+    RangeReadResponse(Bytes),
 
     // Streaming — opaque payloads
     StreamStart(Bytes),
@@ -170,6 +172,8 @@ impl Message {
             Self::ReadRequest(_) => MsgType::ReadRequest,
             Self::ReadResponse(_) => MsgType::ReadResponse,
             Self::RepairWrite(_) => MsgType::RepairWrite,
+            Self::RangeReadRequest(_) => MsgType::RangeReadRequest,
+            Self::RangeReadResponse(_) => MsgType::RangeReadResponse,
             Self::StreamStart(_) => MsgType::StreamStart,
             Self::StreamChunk(_) => MsgType::StreamChunk,
             Self::StreamEnd(_) => MsgType::StreamEnd,
@@ -270,6 +274,8 @@ impl Message {
             | Self::ReadRequest(b)
             | Self::ReadResponse(b)
             | Self::RepairWrite(b)
+            | Self::RangeReadRequest(b)
+            | Self::RangeReadResponse(b)
             | Self::StreamStart(b)
             | Self::StreamChunk(b)
             | Self::StreamEnd(b)
@@ -394,6 +400,8 @@ impl Message {
             MsgType::ReadRequest => Self::ReadRequest(body.split_to(body.remaining())),
             MsgType::ReadResponse => Self::ReadResponse(body.split_to(body.remaining())),
             MsgType::RepairWrite => Self::RepairWrite(body.split_to(body.remaining())),
+            MsgType::RangeReadRequest => Self::RangeReadRequest(body.split_to(body.remaining())),
+            MsgType::RangeReadResponse => Self::RangeReadResponse(body.split_to(body.remaining())),
             MsgType::StreamStart => Self::StreamStart(body.split_to(body.remaining())),
             MsgType::StreamChunk => Self::StreamChunk(body.split_to(body.remaining())),
             MsgType::StreamEnd => Self::StreamEnd(body.split_to(body.remaining())),

@@ -1678,16 +1678,40 @@ impl crate::virtual_tables::StorageStatsProvider for StorageEngine {
         let tables = self.tables.read();
         tables
             .iter()
-            .map(|(table_id, state)| crate::virtual_tables::StorageStats {
-                keyspace: table_id.keyspace().to_string(),
-                table_name: table_id.table().to_string(),
-                memtable_size_bytes: state.store.memtable_size() as i64,
-                memtable_count: 1, // One active memtable per table
-                sstable_count: state.store.sstable_count() as i32,
-                sstable_size_bytes: 0,  // Exact tracking not yet implemented
-                s3_object_count: 0,     // S3 stats not yet tracked per-table
-                s3_bytes: 0,            // S3 stats not yet tracked per-table
-                pending_compactions: 0, // Per-table pending count not yet exposed
+            .map(|(table_id, state)| {
+                let sstable_count = state.store.sstable_count() as i32;
+
+                // Sum on-disk SSTable file sizes for this table.
+                let table_dir = self
+                    .config
+                    .data_dir
+                    .join("sstables")
+                    .join(table_id.to_string());
+                let sstable_size_bytes: i64 = std::fs::read_dir(&table_dir)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.metadata().ok().map(|m| m.len() as i64))
+                    .sum();
+
+                // Approximate S3 stats: each SSTable has ~5 component files
+                // (Data.db, Index.db, Filter.db, Statistics.db, CompressionInfo.db).
+                // S3 bytes approximates sstable_size_bytes since flushed SSTables
+                // are uploaded to S3.
+                let s3_object_count = sstable_count.saturating_mul(5);
+                let s3_bytes = sstable_size_bytes;
+
+                crate::virtual_tables::StorageStats {
+                    keyspace: table_id.keyspace().to_string(),
+                    table_name: table_id.table().to_string(),
+                    memtable_size_bytes: state.store.memtable_size() as i64,
+                    memtable_count: 1, // One active memtable per table
+                    sstable_count,
+                    sstable_size_bytes,
+                    s3_object_count,
+                    s3_bytes,
+                    pending_compactions: 0, // Per-table pending count not yet exposed
+                }
             })
             .collect()
     }
@@ -1712,12 +1736,47 @@ impl crate::virtual_tables::ArchiveStatusProvider for StorageEngine {
     }
 }
 
-/// Snapshot listing requires async S3 access which cannot be called from
-/// the synchronous `VirtualTable::read` method. Returns an empty list
-/// until a background cache is implemented.
 impl crate::virtual_tables::SnapshotInfoProvider for StorageEngine {
     fn snapshot_info(&self) -> Vec<crate::virtual_tables::SnapshotInfoRow> {
-        Vec::new()
+        // Snapshot listing requires async S3 access. Bridge the sync/async
+        // boundary by spawning a blocking thread that drives the future on
+        // the current tokio Handle. Returns an empty list when S3 is not
+        // configured or the runtime is unavailable.
+        let (os_config, store) = match self.object_store_and_config() {
+            Ok(pair) => pair,
+            Err(_) => return Vec::new(),
+        };
+        let prefix = os_config.prefix.clone();
+
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return Vec::new(),
+        };
+
+        // Run the async list on a dedicated thread to avoid blocking the
+        // tokio worker. The thread borrows the handle and blocks on it.
+        let result = std::thread::spawn(move || {
+            let manager = crate::snapshot::SnapshotManager::new(store, prefix);
+            handle.block_on(manager.list_snapshots())
+        })
+        .join();
+
+        let snapshots: Vec<crate::snapshot::metadata::SnapshotMetadata> = match result {
+            Ok(Ok(snaps)) => snaps,
+            _ => return Vec::new(),
+        };
+
+        snapshots
+            .into_iter()
+            .map(|meta| crate::virtual_tables::SnapshotInfoRow {
+                name: meta.name,
+                created_at: meta.created_at,
+                expires_at: meta.expires_at,
+                commit_log_segment: meta.commit_log_position.segment_id as i64,
+                commit_log_offset: meta.commit_log_position.offset as i64,
+                node_id: meta.node_id,
+            })
+            .collect()
     }
 }
 

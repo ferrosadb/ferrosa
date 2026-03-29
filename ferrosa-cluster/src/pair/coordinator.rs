@@ -40,6 +40,12 @@ impl PairCoordinator {
         }
     }
 
+    /// Return the local storage engine (used by `WritePath::range_read` for
+    /// pair mode full-table scans — both pair nodes hold a full copy).
+    pub(crate) fn local_storage(&self) -> &Arc<StorageEngine> {
+        &self.storage
+    }
+
     /// Route a write based on current role.
     ///
     /// On the primary: writes locally first (always succeeds), then

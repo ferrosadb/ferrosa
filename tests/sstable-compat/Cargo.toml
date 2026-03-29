@@ -1,0 +1,20 @@
+[package]
+name = "ferrosa-sstable-compat"
+version = "0.1.0"
+edition = "2021"
+
+# This crate is intentionally excluded from the workspace (it is a standalone
+# test tool).  Add it to the workspace only if CI needs to build it as part of
+# the normal `cargo build` step.
+
+[[bin]]
+name = "write-sstable"
+path = "src/write_sstable.rs"
+
+[dependencies]
+ferrosa-sstable = { path = "../../ferrosa-sstable" }
+ferrosa-common = { path = "../../ferrosa-common" }
+anyhow = "1"
+tempfile = "3"
+
+[dev-dependencies]

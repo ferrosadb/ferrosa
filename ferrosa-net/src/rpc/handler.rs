@@ -61,6 +61,28 @@ impl HandlerRegistry {
     }
 }
 
+/// Handler for inbound Ping messages. Replies with Pong, stamping the local
+/// wall-clock time as `ping_recv_at` and `sent_at`.
+pub struct PingHandler;
+
+#[async_trait::async_trait]
+impl RpcHandler for PingHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let Message::Ping { nonce, .. } = msg else {
+            return None;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Some(Message::Pong {
+            nonce,
+            ping_recv_at: now,
+            sent_at: now,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

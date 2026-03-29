@@ -203,6 +203,7 @@ pub async fn handle_connection<S>(
                     auth_disabled,
                     &maybe_frame,
                     &mut pending_compression,
+                    peer,
                 )
                 .await
                 {
@@ -418,6 +419,7 @@ pub(crate) enum HandleResult {
 }
 
 /// Dispatch a single frame based on the current connection phase.
+#[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     phase: &mut ConnectionPhase,
     auth_context: &mut Option<AuthContext>,
@@ -426,6 +428,7 @@ async fn handle_frame(
     auth_disabled: bool,
     frame: &CqlFrame,
     pending_compression: &mut Option<Compression>,
+    peer: SocketAddr,
 ) -> HandleResult {
     match phase {
         ConnectionPhase::AwaitingStartup => match frame.header.opcode {
@@ -452,12 +455,16 @@ async fn handle_frame(
             }
         },
         ConnectionPhase::Ready => match frame.header.opcode {
-            Opcode::Query => handle_query(auth_context, current_keyspace, state, &frame.body).await,
+            Opcode::Query => {
+                handle_query(auth_context, current_keyspace, state, &frame.body, peer).await
+            }
             Opcode::Prepare => handle_prepare(auth_context, current_keyspace, state, &frame.body),
             Opcode::Execute => {
-                handle_execute(auth_context, current_keyspace, state, &frame.body).await
+                handle_execute(auth_context, current_keyspace, state, &frame.body, peer).await
             }
-            Opcode::Batch => handle_batch(auth_context, current_keyspace, state, &frame.body).await,
+            Opcode::Batch => {
+                handle_batch(auth_context, current_keyspace, state, &frame.body, peer).await
+            }
             Opcode::Register => handle_register(),
             Opcode::Options => handle_options(),
             _ => {
@@ -643,6 +650,7 @@ async fn handle_query(
     current_keyspace: &mut Option<String>,
     state: &SharedState,
     body: &Bytes,
+    peer: SocketAddr,
 ) -> HandleResult {
     // Parse the query string: [int length][bytes query][short consistency][byte flags]...
     if body.len() < 4 {
@@ -710,7 +718,7 @@ async fn handle_query(
     }
 
     // Build an auth context for routing (use a default if auth was disabled).
-    let ctx = build_request_context(auth_context, current_keyspace, cl);
+    let ctx = build_request_context(auth_context, current_keyspace, cl, peer);
 
     match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
@@ -818,6 +826,7 @@ async fn handle_execute(
     current_keyspace: &mut Option<String>,
     state: &SharedState,
     body: &Bytes,
+    peer: SocketAddr,
 ) -> HandleResult {
     // Parse the prepared ID: [short id_len][bytes id]
     if body.len() < 2 {
@@ -862,7 +871,7 @@ async fn handle_execute(
         }
     };
 
-    let ctx = build_request_context(auth_context, current_keyspace, cl);
+    let ctx = build_request_context(auth_context, current_keyspace, cl, peer);
 
     match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
@@ -886,6 +895,7 @@ async fn handle_batch(
     current_keyspace: &mut Option<String>,
     state: &SharedState,
     body: &Bytes,
+    peer: SocketAddr,
 ) -> HandleResult {
     // Parse batch: [byte batch_type][short n_statements]
     if body.len() < 3 {
@@ -993,7 +1003,7 @@ async fn handle_batch(
 
     // Route each statement.
     for stmt in statements {
-        let ctx = build_request_context(auth_context, current_keyspace, cl);
+        let ctx = build_request_context(auth_context, current_keyspace, cl, peer);
         match crate::router::route(state, &ctx, stmt).await {
             Ok(RouteResult::SetKeyspace(ks, _)) => {
                 *current_keyspace = Some(ks);
@@ -1023,6 +1033,7 @@ fn build_request_context<'a>(
     auth_context: &'a mut Option<AuthContext>,
     current_keyspace: &'a Option<String>,
     consistency: ferrosa_cluster::consistency::ConsistencyLevel,
+    peer: std::net::SocketAddr,
 ) -> RequestContext<'a> {
     // If auth was disabled, we need a default auth context.
     if auth_context.is_none() {
@@ -1038,6 +1049,7 @@ fn build_request_context<'a>(
         consistency,
         serial_consistency: None,
         paging: crate::paging::PagingParams::default(),
+        client_address: peer.to_string(),
     }
 }
 

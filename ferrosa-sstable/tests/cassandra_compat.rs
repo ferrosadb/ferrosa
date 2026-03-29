@@ -309,6 +309,216 @@ fn ferrosa_write_read_roundtrip_all_cell_types() {
 }
 
 #[test]
+/// The compat test infrastructure files must exist before a Docker run is
+/// attempted.  This test acts as a quick smoke-check: if the files are
+/// missing the CI step that calls `compat_test.sh` would fail with a
+/// confusing error.
+fn cassandra_reader_container_starts() {
+    // docker-compose.yml
+    assert!(
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/sstable-compat/docker-compose.yml"
+        ))
+        .exists(),
+        "tests/sstable-compat/docker-compose.yml must exist"
+    );
+
+    // compat_test.sh
+    assert!(
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/sstable-compat/compat_test.sh"
+        ))
+        .exists(),
+        "tests/sstable-compat/compat_test.sh must exist"
+    );
+
+    // write-sstable Cargo.toml
+    assert!(
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/sstable-compat/Cargo.toml"
+        ))
+        .exists(),
+        "tests/sstable-compat/Cargo.toml must exist"
+    );
+
+    // write_sstable.rs binary source
+    assert!(
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/sstable-compat/src/write_sstable.rs"
+        ))
+        .exists(),
+        "tests/sstable-compat/src/write_sstable.rs must exist"
+    );
+}
+
+#[test]
+/// Rust-side round-trip for all simple CQL types through SSTableWriter +
+/// DataReader.  This validates the on-disk encoding without Docker.  The
+/// Cassandra-side import is handled by `compat_test.sh`.
+///
+/// Schema:
+///   compat.simple_types (id int PRIMARY KEY, v_text text, v_bool boolean,
+///     v_bigint bigint, v_float float, v_double double, v_blob blob)
+fn sstable_compat_simple_types() {
+    use ferrosa_common::CellValue;
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+
+    // Column index -> type mapping (same ordering used in write_sstable.rs):
+    //   0 v_text   UTF8Type
+    //   1 v_bool   BooleanType
+    //   2 v_bigint LongType
+    //   3 v_float  FloatType
+    //   4 v_double DoubleType
+    //   5 v_blob   BytesType
+    let header = SerializationHeader {
+        min_timestamp: 1_000_000,
+        min_local_deletion_time: i32::MAX,
+        min_ttl: 0,
+        key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
+        clustering_types: vec![],
+        static_columns: vec![],
+        regular_columns: vec![
+            (
+                b"v_text".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            ),
+            (
+                b"v_bool".to_vec(),
+                "org.apache.cassandra.db.marshal.BooleanType".into(),
+            ),
+            (
+                b"v_bigint".to_vec(),
+                "org.apache.cassandra.db.marshal.LongType".into(),
+            ),
+            (
+                b"v_float".to_vec(),
+                "org.apache.cassandra.db.marshal.FloatType".into(),
+            ),
+            (
+                b"v_double".to_vec(),
+                "org.apache.cassandra.db.marshal.DoubleType".into(),
+            ),
+            (
+                b"v_blob".to_vec(),
+                "org.apache.cassandra.db.marshal.BytesType".into(),
+            ),
+        ],
+    };
+    let options = WriteOptions {
+        compression: None,
+        bloom_fp_chance: 0.01,
+        chunk_size: 65536,
+    };
+
+    let ts = 1_743_120_000_000_000i64;
+
+    // Partition key: id = 1 encoded as big-endian i32.
+    let pk_bytes: [u8; 4] = 1i32.to_be_bytes();
+    let partition = ferrosa_sstable::types::Partition {
+        key: ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::from(
+            pk_bytes.as_slice(),
+        )),
+        deletion: DeletionTime::LIVE,
+        static_row: None,
+        rows: vec![Row {
+            clustering: vec![],
+            cells: vec![
+                (0, CellValue::live(b"hello".to_vec(), ts)),
+                (1, CellValue::live(vec![0x01], ts)),          // boolean true
+                (2, CellValue::live(42i64.to_be_bytes().to_vec(), ts)),
+                (3, CellValue::live((3.14f32).to_bits().to_be_bytes().to_vec(), ts)),
+                (4, CellValue::live((2.718_281_828f64).to_bits().to_be_bytes().to_vec(), ts)),
+                (5, CellValue::live(vec![0xDE, 0xAD, 0xBE, 0xEF], ts)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        }],
+    };
+
+    let mut writer = SSTableWriter::new(options, header.clone());
+    writer.add_partition(&partition).unwrap();
+    let output = writer.finish().unwrap();
+
+    // Read back with DataReader and verify every cell.
+    let mut reader = DataReader::new(&output.data, &header, 0);
+    let p = reader
+        .read_partition()
+        .unwrap()
+        .expect("expected one partition");
+
+    assert_eq!(p.key.key.as_bytes(), pk_bytes.as_slice(), "partition key");
+    assert!(p.deletion.is_live(), "partition deletion must be live");
+    assert_eq!(p.rows.len(), 1, "one row");
+
+    let row = &p.rows[0];
+    assert!(row.clustering.is_empty(), "no clustering columns");
+    assert_eq!(row.primary_key_liveness.timestamp, ts);
+    assert_eq!(row.cells.len(), 6, "six regular columns");
+
+    // col 0: v_text = "hello"
+    let (idx, ref cell) = row.cells[0];
+    assert_eq!(idx, 0);
+    assert!(cell.is_live());
+    assert_eq!(cell.value.as_deref(), Some(b"hello".as_slice()), "v_text");
+
+    // col 1: v_bool = 0x01 (true)
+    let (idx, ref cell) = row.cells[1];
+    assert_eq!(idx, 1);
+    assert_eq!(cell.value.as_deref(), Some([0x01].as_slice()), "v_bool");
+
+    // col 2: v_bigint = 42
+    let (idx, ref cell) = row.cells[2];
+    assert_eq!(idx, 2);
+    let bigint_bytes = cell.value.as_deref().expect("v_bigint value");
+    assert_eq!(
+        i64::from_be_bytes(bigint_bytes.try_into().unwrap()),
+        42i64,
+        "v_bigint"
+    );
+
+    // col 3: v_float = 3.14
+    let (idx, ref cell) = row.cells[3];
+    assert_eq!(idx, 3);
+    let float_bytes = cell.value.as_deref().expect("v_float value");
+    let float_bits = u32::from_be_bytes(float_bytes.try_into().unwrap());
+    assert!(
+        (f32::from_bits(float_bits) - 3.14f32).abs() < 1e-5,
+        "v_float should be ~3.14, got {}",
+        f32::from_bits(float_bits)
+    );
+
+    // col 4: v_double = 2.718281828
+    let (idx, ref cell) = row.cells[4];
+    assert_eq!(idx, 4);
+    let double_bytes = cell.value.as_deref().expect("v_double value");
+    let double_bits = u64::from_be_bytes(double_bytes.try_into().unwrap());
+    assert!(
+        (f64::from_bits(double_bits) - 2.718_281_828f64).abs() < 1e-9,
+        "v_double should be ~2.718281828, got {}",
+        f64::from_bits(double_bits)
+    );
+
+    // col 5: v_blob = 0xDEADBEEF
+    let (idx, ref cell) = row.cells[5];
+    assert_eq!(idx, 5);
+    assert_eq!(
+        cell.value.as_deref(),
+        Some([0xDE, 0xAD, 0xBE, 0xEF].as_slice()),
+        "v_blob"
+    );
+
+    // No more partitions.
+    assert!(reader.read_partition().unwrap().is_none());
+}
+
+#[test]
 /// Read SSTable fixtures generated by Cassandra's CQLSSTableWriter.
 /// These test that ferrosa can read SSTables produced by real Cassandra code.
 /// Run `tests/sstable-compat/generate.sh` to create the fixtures.

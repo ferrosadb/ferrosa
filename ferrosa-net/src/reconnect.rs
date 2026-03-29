@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,11 +93,14 @@ pub(crate) fn spawn_alive_watcher(
 
 /// Attempt to open a single connection, retrying with exponential backoff.
 ///
+/// `peer_host` is resolved via DNS on every attempt so that container restarts
+/// that assign a new IP are handled transparently.
+///
 /// Returns `None` when `MAX_RECONNECT_ATTEMPTS` is reached.
 pub(crate) async fn connect_with_retry(
     config: Arc<NetConfig>,
     local_host_id: Uuid,
-    peer_addr: SocketAddr,
+    peer_host: &str,
     lane: Lane,
     tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
 ) -> Option<RpcClient> {
@@ -110,10 +112,31 @@ pub(crate) async fn connect_with_retry(
             ?lane,
             attempt,
             ?delay,
-            peer = %peer_addr,
+            peer = peer_host,
             "reconnecting lane"
         );
         tokio::time::sleep(delay).await;
+
+        // Re-resolve on every attempt so a container restart (new IP) is handled
+        // without requiring a node restart on the connecting side.
+        let peer_addr = match tokio::net::lookup_host(peer_host).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => addr,
+                None => {
+                    tracing::warn!(
+                        ?lane,
+                        attempt,
+                        peer = peer_host,
+                        "DNS resolved no addresses"
+                    );
+                    continue;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(?lane, attempt, peer = peer_host, error = %e, "DNS resolution failed");
+                continue;
+            }
+        };
 
         let result = RpcClient::connect_with_tls(
             config.clone(),
@@ -125,16 +148,20 @@ pub(crate) async fn connect_with_retry(
 
         match result {
             Ok(client) => {
-                tracing::info!(?lane, attempt, peer = %peer_addr, "lane reconnected");
+                tracing::info!(?lane, attempt, peer = peer_host, %peer_addr, "lane reconnected");
                 return Some(client);
             }
             Err(e) => {
-                tracing::warn!(?lane, attempt, peer = %peer_addr, error = %e, "reconnect attempt failed");
+                tracing::warn!(?lane, attempt, peer = peer_host, error = %e, "reconnect attempt failed");
             }
         }
     }
 
-    tracing::error!(?lane, peer = %peer_addr, "lane reconnection exhausted all attempts");
+    tracing::error!(
+        ?lane,
+        peer = peer_host,
+        "lane reconnection exhausted all attempts"
+    );
     None
 }
 

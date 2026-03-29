@@ -550,6 +550,83 @@ impl RpcHandler for ReadRequestHandler {
 }
 
 // ---------------------------------------------------------------------------
+// RangeReadHandler
+// ---------------------------------------------------------------------------
+
+/// Payload for a remote range-read request (full-table scan on one node).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangeReadRequestPayload {
+    /// Keyspace name.
+    pub keyspace: String,
+    /// Table name.
+    pub table: String,
+}
+
+/// Payload for a remote range-read response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangeReadResponsePayload {
+    /// All partitions held locally for this table, in token order.
+    pub partitions: Vec<PartitionWire>,
+}
+
+/// Handles inbound `RangeReadRequest` RPCs from remote coordinators.
+///
+/// Returns all partitions stored locally for the requested table.  The
+/// coordinator that sent the request collects responses from all nodes,
+/// deduplicates, and aggregates — enabling correct `SELECT COUNT(*)` and
+/// other full-table operations on distributed data.
+pub struct RangeReadHandler {
+    storage: Arc<StorageEngine>,
+}
+
+impl RangeReadHandler {
+    pub fn new(storage: Arc<StorageEngine>) -> Self {
+        Self { storage }
+    }
+}
+
+#[async_trait]
+impl RpcHandler for RangeReadHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let bytes = match msg {
+            Message::RangeReadRequest(b) => b,
+            _ => return None,
+        };
+
+        let req: RangeReadRequestPayload = bincode::deserialize(&bytes)
+            .map_err(|e| {
+                tracing::warn!("RangeReadHandler: failed to deserialize request: {e}");
+                e
+            })
+            .ok()?;
+
+        let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
+
+        let partitions = match self.storage.read_range(&table_id, None, None, 1_000_000) {
+            Ok(ps) => ps,
+            Err(e) => {
+                tracing::warn!("RangeReadHandler: read_range failed: {e}");
+                return None;
+            }
+        };
+
+        let wire_partitions = partitions.into_iter().map(partition_to_wire).collect();
+        let payload = RangeReadResponsePayload {
+            partitions: wire_partitions,
+        };
+
+        let resp_bytes = bincode::serialize(&payload)
+            .map_err(|e| {
+                tracing::warn!("RangeReadHandler: failed to serialize response: {e}");
+                e
+            })
+            .ok()?;
+
+        Some(Message::RangeReadResponse(Bytes::from(resp_bytes)))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
