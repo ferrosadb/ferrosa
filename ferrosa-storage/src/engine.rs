@@ -204,7 +204,7 @@ impl StorageEngine {
             )
         };
 
-        Ok(Self {
+        let engine = Self {
             config,
             tables: RwLock::new(HashMap::new()),
             commit_log,
@@ -224,7 +224,10 @@ impl StorageEngine {
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             #[cfg(test)]
             upload_store_override: None,
-        })
+        };
+
+        engine.load_local_schema_if_present();
+        Ok(engine)
     }
 
     /// Probe the configured object store for conditional put support.
@@ -585,6 +588,56 @@ impl StorageEngine {
     pub fn unregister_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         self.tables.write().remove(table_id);
         Ok(())
+    }
+
+    /// Persists all registered table schemas to `data_dir/schema.json` so a
+    /// clean restart can recover all table schemas without needing to re-run the
+    /// S3 bootstrap that was gated on `local_empty`.
+    fn persist_schema_locally(&self) -> ferrosa_common::Result<()> {
+        let schema_path = self.config.data_dir.join("schema.json");
+        let tables = self.tables.read();
+        let schemas: Vec<&TableSchema> = tables.values().map(|s| &s.schema).collect();
+        let json = serde_json::to_string_pretty(&schemas).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("schema serialization failed: {e}"))
+        })?;
+        drop(tables);
+        std::fs::write(&schema_path, json).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to write {}: {e}",
+                schema_path.display()
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Loads table schemas from `data_dir/schema.json` (if it exists) and
+    /// registers any tables not already registered.
+    ///
+    /// Called during all `StorageEngine` constructors before any other work.
+    /// By running unconditionally (not gated on SSTable presence) this fixes
+    /// BUG-022: schema was lost on binary upgrades where the data directory
+    /// was non-empty and the S3 bootstrap path was skipped.
+    fn load_local_schema_if_present(&self) {
+        let schema_path = self.config.data_dir.join("schema.json");
+        let data = match std::fs::read_to_string(&schema_path) {
+            Ok(d) => d,
+            Err(_) => return, // No schema.json yet — first run.
+        };
+        let schemas: Vec<TableSchema> = match serde_json::from_str(&data) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to parse schema.json at {}: {e}",
+                    schema_path.display()
+                );
+                return;
+            }
+        };
+        for schema in schemas {
+            if let Err(e) = self.register_table_inner(schema, vec![]) {
+                tracing::warn!("failed to re-register table from schema.json: {e}");
+            }
+        }
     }
 
     /// Registers a secondary index on a table.
@@ -1244,6 +1297,12 @@ impl StorageEngine {
 
         // Check for compaction after flush.
         self.maybe_compact(table_id, state);
+
+        // Persist registered table schemas so the next restart can recover without
+        // re-running S3 bootstrap (BUG-022).
+        if let Err(e) = self.persist_schema_locally() {
+            tracing::warn!("failed to persist schema.json: {e}");
+        }
 
         Ok(())
     }
@@ -4804,6 +4863,7 @@ mod tests {
                 "-v",
             ])
             .status();
+    }
 
     // -----------------------------------------------------------------------
     // Collection flush readback tests (BUG-026)
