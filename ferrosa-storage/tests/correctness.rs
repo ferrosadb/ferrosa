@@ -5,7 +5,7 @@
 //! C6.3  — CQL BATCH is all-or-nothing under kill-coordinator.
 //!
 //! The C6.1 unit tests run without a live cluster.  The C6.2 / C6.3 integration
-//! tests are marked `#[ignore]` — they need a running Ferrosa cluster.
+//! tests panic with setup instructions when cluster infrastructure is not available.
 
 use std::path::Path;
 use std::time::Duration;
@@ -205,13 +205,18 @@ fn commitlog_legacy_zero_id_always_replayed() {
 /// Transaction T1 that depends on T2 never applies before T2's effects are
 /// visible.  This invariant requires a live Accord cluster to verify.
 ///
-/// Run manually with:
-/// ```
-/// cargo test -p ferrosa-storage -- --ignored dep_wait_ordering_under_partition
-/// ```
+/// Requires a live Accord cluster. Set FERROSA_TEST_CLUSTER_NODES to run.
 #[tokio::test]
-#[ignore = "requires Accord cluster — run manually with FERROSA_DATA_DIR set"]
 async fn dep_wait_ordering_under_partition() {
+    if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+        && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+    {
+        panic!(
+            "dep_wait_ordering_under_partition requires a live Accord cluster — \
+             set FERROSA_TEST_CLUSTER_NODES or run scripts/lima-fc-cluster-up.sh \
+             and set FERROSA_TEST_FIRECRACKER=1"
+        );
+    }
     todo!("requires live Accord cluster")
 }
 
@@ -222,12 +227,17 @@ async fn dep_wait_ordering_under_partition() {
 /// A BATCH of 3 rows: if the coordinator is killed after the first row is
 /// written, the surviving nodes see either all 3 rows or none.
 ///
-/// Run manually with:
-/// ```
-/// cargo test -p ferrosa-storage -- --ignored batch_atomicity_kill_coordinator
-/// ```
+/// Requires a live Accord cluster. Set FERROSA_TEST_CLUSTER_NODES to run.
 #[tokio::test]
-#[ignore = "requires Accord cluster — run manually with FERROSA_DATA_DIR set"]
 async fn batch_atomicity_kill_coordinator() {
+    if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+        && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+    {
+        panic!(
+            "batch_atomicity_kill_coordinator requires a live Accord cluster — \
+             set FERROSA_TEST_CLUSTER_NODES or run scripts/lima-fc-cluster-up.sh \
+             and set FERROSA_TEST_FIRECRACKER=1"
+        );
+    }
     todo!("requires live cluster with fault injection")
 }

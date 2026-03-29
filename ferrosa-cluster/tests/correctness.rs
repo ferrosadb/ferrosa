@@ -1,7 +1,8 @@
 //! Correctness tests for T-022 / C6.3: batch atomicity under kill-coordinator.
 //!
 //! Unit tests verify the `encode_batch` / `decode_batch` round-trip and the
-//! correctness of `coordinate_batch` wiring.  Integration tests are `#[ignore]`.
+//! correctness of `coordinate_batch` wiring.  Integration tests panic with setup
+//! instructions when cluster infrastructure is not available.
 
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::{CellValue, Token};
@@ -128,13 +129,18 @@ fn batch_payload_starts_with_batch_id() {
 /// C6.3: A BATCH of 3 rows — if the coordinator is killed after the first row
 /// is written, the surviving nodes see either all 3 rows or none.
 ///
-/// Run manually with:
-/// ```
-/// cargo test -p ferrosa-cluster -- --ignored batch_atomicity_kill_coordinator
-/// ```
+/// Requires a live Accord cluster. Set FERROSA_TEST_CLUSTER_NODES to run.
 #[tokio::test]
-#[ignore = "requires Accord cluster — run manually with FERROSA_DATA_DIR set"]
 async fn batch_atomicity_kill_coordinator() {
+    if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+        && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+    {
+        panic!(
+            "batch_atomicity_kill_coordinator requires a live Accord cluster — \
+             set FERROSA_TEST_CLUSTER_NODES or run scripts/lima-fc-cluster-up.sh \
+             and set FERROSA_TEST_FIRECRACKER=1"
+        );
+    }
     todo!("requires live cluster with fault injection and FERROSA_DATA_DIR set")
 }
 
@@ -145,8 +151,16 @@ async fn batch_atomicity_kill_coordinator() {
 /// C6.4: After killing majority of nodes, recovery coordinator gets elected,
 /// takes over inflight transactions, and commits or aborts each one.
 #[tokio::test]
-#[ignore = "requires live 3-node cluster; run with FERROSA_TEST_CLUSTER set"]
 async fn recovery_coordinator_activation() {
+    if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+        && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+    {
+        panic!(
+            "recovery_coordinator_activation requires a live 3-node cluster — \
+             set FERROSA_TEST_CLUSTER_NODES or run scripts/lima-fc-cluster-up.sh \
+             and set FERROSA_TEST_FIRECRACKER=1"
+        );
+    }
     // Setup: mock 3-node cluster with NodeId 1, 2, 3
     // Kill nodes 2 and 3 (majority dead)
     // Node 1 calls RecoveryCoordinator::elect([1], 1) → Some(1) (it's the coordinator)
@@ -159,8 +173,16 @@ async fn recovery_coordinator_activation() {
 /// C6.5: A txn that was killed mid-Accord round (after PreAccept but before Accept)
 /// is recovered by the coordinator: either committed if quorum Accept exists, else aborted.
 #[tokio::test]
-#[ignore = "requires live 3-node cluster; run with FERROSA_TEST_CLUSTER set"]
 async fn recovery_coordinator_resolves_inflight() {
+    if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+        && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+    {
+        panic!(
+            "recovery_coordinator_resolves_inflight requires a live 3-node cluster — \
+             set FERROSA_TEST_CLUSTER_NODES or run scripts/lima-fc-cluster-up.sh \
+             and set FERROSA_TEST_FIRECRACKER=1"
+        );
+    }
     // 3 nodes. Inject a partition after PreAccept is sent but before Accept responses.
     // Recovery coordinator resolves: txn is aborted (no Accept quorum).
     // Verify: no phantom write, no stuck transaction.
@@ -203,8 +225,16 @@ fn clock_skew_large_preaccept_rejection() {
 /// C6.6: SIGSTOP a node for 30s, SIGCONT; the Accord state machine converges.
 /// No phantom writes, no stuck transactions.
 #[tokio::test]
-#[ignore = "requires live 3-node cluster with SIGSTOP/SIGCONT capability"]
 async fn pause_resume_state_convergence() {
+    if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+        && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+    {
+        panic!(
+            "pause_resume_state_convergence requires a live 3-node cluster — \
+             set FERROSA_TEST_CLUSTER_NODES or run scripts/lima-fc-cluster-up.sh \
+             and set FERROSA_TEST_FIRECRACKER=1"
+        );
+    }
     // 3 nodes. SIGSTOP node 2 for 30s.
     // Continue writing to nodes 1 and 3 (quorum = 2).
     // SIGCONT node 2.
