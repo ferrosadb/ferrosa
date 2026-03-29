@@ -9184,4 +9184,267 @@ mod tests {
             other => panic!("expected Timestamp, got {:?}", other),
         }
     }
+
+    // ── BUG-024: PREPARE metadata must reflect ALTER TABLE changes ─────────
+
+    /// BUG-024 Step 2: After ALTER TABLE ADD, PREPARE sees the new column.
+    ///
+    /// Table starts with (pk text, a int, b text). ALTER TABLE ADD c boolean.
+    /// PREPARE of INSERT (pk, a, b, c) must report 4 bound columns, not 3.
+    #[tokio::test]
+    async fn prepare_after_alter_table_add_column() {
+        use bytes::{BufMut, BytesMut};
+
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE bug024 WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("bug024".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // CREATE TABLE with 3 columns (pk, a, b)
+        route(
+            &state,
+            &ctx_ks,
+            crate::parser::parse(
+                "CREATE TABLE bug024.t (pk text PRIMARY KEY, a int, b text)",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // ALTER TABLE ADD c boolean
+        route(
+            &state,
+            &ctx_ks,
+            crate::parser::parse("ALTER TABLE bug024.t ADD c boolean").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // PREPARE INSERT with all 4 columns (including the added one)
+        let query = "INSERT INTO bug024.t (pk, a, b, c) VALUES (?, ?, ?, ?)";
+        let query_bytes = query.as_bytes();
+        let mut body = BytesMut::new();
+        body.put_i32(query_bytes.len() as i32);
+        body.put_slice(query_bytes);
+
+        let result = crate::connection::handle_prepare(
+            &mut None,
+            &mut Some("bug024".into()),
+            &state,
+            &body.freeze(),
+        );
+
+        match result {
+            crate::connection::HandleResult::Reply(opcode, body) => {
+                assert_eq!(opcode, crate::frame::Opcode::Result);
+                assert_eq!(&body[0..4], &0x0004i32.to_be_bytes(), "result kind must be Prepared");
+                let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+                let mut off = 6 + id_len;
+                let _bind_flags = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                off += 4;
+                let bind_col_count = i32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+                assert_eq!(
+                    bind_col_count, 4,
+                    "PREPARE must see 4 bound columns after ALTER TABLE ADD c; got {bind_col_count}"
+                );
+            }
+            _ => panic!("expected Reply from handle_prepare"),
+        }
+    }
+
+    /// BUG-024 Step 4: After ALTER TABLE DROP, PREPARE does not include the
+    /// dropped column in result metadata.
+    ///
+    /// Table (pk text, a int, b text, c boolean) → DROP c → PREPARE SELECT
+    /// pk, a, b must report 3 result columns (not 4) and 1 bound column for
+    /// the WHERE pk = ? predicate.
+    ///
+    /// Prepared result wire layout (CQL native protocol v4+):
+    ///   [i32 kind=0x0004]
+    ///   [u16 id_len=16][16 bytes id]
+    ///   Bind metadata:
+    ///     [i32 flags]       — 0x0001 = Global_tables_spec
+    ///     [i32 col_count]
+    ///     [i32 pk_count]    — number of pk_indexes that follow
+    ///     pk_count × [i16 pk_index]
+    ///     If flags & 0x0001: [u16 ks_len][ks][u16 tbl_len][tbl]
+    ///     col_count × ([u16 name_len][name][u16 type_id][type_params...])
+    ///   Result metadata:
+    ///     [i32 flags]
+    ///     [i32 col_count]
+    ///     If flags & 0x0001: [u16 ks_len][ks][u16 tbl_len][tbl]
+    ///     col_count × ([u16 name_len][name][u16 type_id][type_params...])
+    #[tokio::test]
+    async fn prepare_after_alter_table_drop_column() {
+        use bytes::{BufMut, BytesMut};
+
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE bug024b WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("bug024b".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // CREATE TABLE with 4 columns including c
+        route(
+            &state,
+            &ctx_ks,
+            crate::parser::parse(
+                "CREATE TABLE bug024b.t (pk text PRIMARY KEY, a int, b text, c boolean)",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // ALTER TABLE DROP c
+        route(
+            &state,
+            &ctx_ks,
+            crate::parser::parse("ALTER TABLE bug024b.t DROP c").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // PREPARE SELECT pk, a, b (does not reference dropped column c)
+        let query = "SELECT pk, a, b FROM bug024b.t WHERE pk = ?";
+        let query_bytes = query.as_bytes();
+        let mut body = BytesMut::new();
+        body.put_i32(query_bytes.len() as i32);
+        body.put_slice(query_bytes);
+
+        let result = crate::connection::handle_prepare(
+            &mut None,
+            &mut Some("bug024b".into()),
+            &state,
+            &body.freeze(),
+        );
+
+        match result {
+            crate::connection::HandleResult::Reply(opcode, body) => {
+                assert_eq!(opcode, crate::frame::Opcode::Result);
+                assert_eq!(&body[0..4], &0x0004i32.to_be_bytes(), "result kind must be Prepared");
+
+                // kind(4) + id_len(2) + id(16) = 22 bytes before bind metadata
+                let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+                let mut pos = 6 + id_len; // skip kind + id_len + id
+
+                // --- Bind metadata ---
+                let bind_flags = i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                let bind_col_count = i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                assert_eq!(
+                    bind_col_count, 1,
+                    "SELECT pk, a, b WHERE pk = ? must have 1 bound column; got {bind_col_count}"
+                );
+
+                // pk_count + pk_indexes (CQL protocol v4+ addition)
+                let pk_count = i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                pos += pk_count as usize * 2; // each pk_index is i16
+
+                // global_tables_spec: ks + table strings
+                if bind_flags & 0x0001 != 0 {
+                    let ks_len =
+                        u16::from_be_bytes(body[pos..pos + 2].try_into().unwrap()) as usize;
+                    pos += 2 + ks_len;
+                    let tbl_len =
+                        u16::from_be_bytes(body[pos..pos + 2].try_into().unwrap()) as usize;
+                    pos += 2 + tbl_len;
+                }
+
+                // skip each bound column spec: [u16 name_len][name][u16 type_id][type_params]
+                for _ in 0..bind_col_count {
+                    if bind_flags & 0x0001 == 0 {
+                        // per-column ks + table when no global spec
+                        let ks_len =
+                            u16::from_be_bytes(body[pos..pos + 2].try_into().unwrap()) as usize;
+                        pos += 2 + ks_len;
+                        let tbl_len =
+                            u16::from_be_bytes(body[pos..pos + 2].try_into().unwrap()) as usize;
+                        pos += 2 + tbl_len;
+                    }
+                    let name_len =
+                        u16::from_be_bytes(body[pos..pos + 2].try_into().unwrap()) as usize;
+                    pos += 2 + name_len;
+                    let type_id = u16::from_be_bytes(body[pos..pos + 2].try_into().unwrap());
+                    pos += 2;
+                    // advance past any type parameters
+                    match type_id {
+                        0x0020 | 0x0022 => pos += 2, // List or Set: 1 extra u16
+                        0x0021 => pos += 4,           // Map: 2 extra u16s
+                        _ => {}                        // simple types: nothing extra
+                    }
+                }
+
+                // --- Result metadata ---
+                let result_flags = i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                let result_col_count =
+                    i32::from_be_bytes(body[pos..pos + 4].try_into().unwrap());
+
+                // Result must NOT use No_metadata (0x0004) — SELECT always has columns
+                assert_ne!(
+                    result_flags & 0x0004,
+                    0x0004,
+                    "SELECT result metadata must not use No_metadata flag"
+                );
+                assert_eq!(
+                    result_col_count, 3,
+                    "SELECT pk, a, b must produce 3 result columns after DROP c; got {result_col_count}"
+                );
+            }
+            _ => panic!("expected Reply from handle_prepare"),
+        }
+    }
 }
