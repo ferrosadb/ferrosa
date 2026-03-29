@@ -56,6 +56,7 @@ fn test_mutation() -> ferrosa_storage::Mutation {
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
     ferrosa_storage::Mutation {
+        mutation_id: [0x80u8; 16],
         keyspace: "test_ks".to_string(),
         table: "test_tbl".to_string(),
         key: DecoratedKey {

@@ -507,6 +507,7 @@ mod tests {
         // Simulate a write with a double value (8 bytes, big-endian).
         let value_bytes = 42.0_f64.to_be_bytes().to_vec();
         let mutation = Mutation {
+            mutation_id: [0x50u8; 16],
             keyspace: "ks".to_string(),
             table: "sensor_1s".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"sensor-1".to_vec())),
@@ -550,6 +551,7 @@ mod tests {
         let aggregator = TimeSeriesAggregator::new(config, table_id.clone(), vec![0], tx);
 
         let make_mutation = |ts: i64, val: f64| Mutation {
+            mutation_id: [0x51u8; 16],
             keyspace: "ks".to_string(),
             table: "sensor_1s".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"s1".to_vec())),
@@ -863,6 +865,7 @@ mod tests {
         let aggregator = TimeSeriesAggregator::new(config, table_id.clone(), vec![0], tx);
 
         let make_mutation = |ts: i64, val: f64| Mutation {
+            mutation_id: [0x53u8; 16],
             keyspace: "ks".to_string(),
             table: "sensor".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"s1".to_vec())),
@@ -917,6 +920,7 @@ mod tests {
         use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
         let make_mutation = |ts: i64, val: f64| Mutation {
+            mutation_id: [0x52u8; 16],
             keyspace: "ks".to_string(),
             table: "sensor_1s".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"s1".to_vec())),
@@ -1026,6 +1030,7 @@ mod tests {
         // Send a mutation with non-decodable bytes (3 bytes -- not 4 or 8).
         let bad_bytes = vec![0xDE, 0xAD, 0xFF];
         let mutation = Mutation {
+            mutation_id: [0x54u8; 16],
             keyspace: "ks".to_string(),
             table: "sensor".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
@@ -1080,6 +1085,7 @@ mod tests {
         // Encode a float32 value (42.5f32).
         let float_bytes = 42.5_f32.to_be_bytes().to_vec();
         let mutation = Mutation {
+            mutation_id: [0x55u8; 16],
             keyspace: "ks".to_string(),
             table: "sensor".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),

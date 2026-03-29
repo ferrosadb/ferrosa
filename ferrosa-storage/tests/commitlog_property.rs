@@ -72,13 +72,22 @@ fn arb_mutation() -> impl Strategy<Value = Mutation> {
         arb_decorated_key(),
         prop::collection::vec(arb_row(), 0..8),
         1i64..1_000_000,
+        prop::collection::vec(proptest::prelude::any::<u8>(), 16..=16),
     )
-        .prop_map(|(keyspace, table, key, rows, timestamp)| Mutation {
-            keyspace,
-            table,
-            key,
-            rows,
-            timestamp,
+        .prop_map(|(keyspace, table, key, rows, timestamp, id_vec)| {
+            let mut mutation_id = [0u8; 16];
+            mutation_id.copy_from_slice(&id_vec);
+            if mutation_id == [0u8; 16] {
+                mutation_id[0] = 1;
+            }
+            Mutation {
+                mutation_id,
+                keyspace,
+                table,
+                key,
+                rows,
+                timestamp,
+            }
         })
 }
 
@@ -195,6 +204,7 @@ fn cas_allocation_non_overlapping() {
                 let mut positions = Vec::new();
                 for i in 0..appends_per_thread {
                     let m = Mutation {
+                        mutation_id: [0x70u8; 16],
                         keyspace: "ks".to_string(),
                         table: "tbl".to_string(),
                         key: ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
@@ -359,6 +369,7 @@ proptest! {
         let mut positions_b = Vec::new();
         for i in 0..20 {
             let ma = Mutation {
+                mutation_id: [0x71u8; 16],
                 keyspace: "ks".to_string(),
                 table: "table_a".to_string(),
                 key: ferrosa_common::DecoratedKey::new(
@@ -378,6 +389,7 @@ proptest! {
             }
 
             let mb = Mutation {
+                mutation_id: [0x72u8; 16],
                 keyspace: "ks".to_string(),
                 table: "table_b".to_string(),
                 key: ferrosa_common::DecoratedKey::new(
@@ -474,6 +486,7 @@ proptest! {
         let mut positions = Vec::new();
         for i in 0..num_mutations {
             let m = Mutation {
+                mutation_id: [0x73u8; 16],
                 keyspace: "ks".to_string(),
                 table: "tbl".to_string(),
                 key: ferrosa_common::DecoratedKey::new(
@@ -607,6 +620,7 @@ proptest! {
 
             for i in 0..15 {
                 let ma = Mutation {
+                    mutation_id: [0x74u8; 16],
                     keyspace: "ks".to_string(),
                     table: "table_a".to_string(),
                     key: ferrosa_common::DecoratedKey::new(
@@ -626,6 +640,7 @@ proptest! {
                 }
 
                 let mb = Mutation {
+                    mutation_id: [0x75u8; 16],
                     keyspace: "ks".to_string(),
                     table: "table_b".to_string(),
                     key: ferrosa_common::DecoratedKey::new(
@@ -748,6 +763,7 @@ proptest! {
         let mut positions = Vec::new();
         for i in 0..num_mutations {
             let m = Mutation {
+                mutation_id: [0x76u8; 16],
                 keyspace: "ks".to_string(),
                 table: "tbl".to_string(),
                 key: ferrosa_common::DecoratedKey::new(

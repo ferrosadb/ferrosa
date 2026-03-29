@@ -122,6 +122,94 @@ impl PairCoordinator {
         }
     }
 
+    /// Forward a batch of mutations atomically.
+    ///
+    /// On the primary: writes all locally first via `write_atomic_batch`, then
+    /// best-effort replicates the whole batch to the peer as a single message.
+    /// On the secondary: forwards the whole batch to the primary as a single RPC.
+    ///
+    /// The `batch_id` is used by the primary to enable idempotent application
+    /// if the secondary retries after an ACK is lost (future: track applied
+    /// batch_ids in a small LRU).
+    pub async fn coordinate_batch(
+        &self,
+        mutations: Vec<Mutation>,
+        batch_id: Uuid,
+    ) -> Result<()> {
+        match **self.role.load() {
+            PairRole::Primary => {
+                // Apply locally as an atomic batch.
+                self.storage
+                    .write_atomic_batch(mutations.clone())
+                    .map_err(ClusterError::Storage)?;
+                // Best-effort replicate batch to peer.
+                if let Err(e) = self.replicate_batch_to_peer(&mutations, batch_id).await {
+                    tracing::warn!(
+                        "pair batch replication failed (write succeeded locally): {e}"
+                    );
+                }
+                Ok(())
+            }
+            PairRole::Secondary => {
+                self.forward_batch_to_primary(&mutations, batch_id).await
+            }
+        }
+    }
+
+    /// Replicate an atomic batch to the peer (primary → secondary).
+    async fn replicate_batch_to_peer(
+        &self,
+        mutations: &[Mutation],
+        batch_id: Uuid,
+    ) -> Result<()> {
+        let body = encode_batch(batch_id, mutations)?;
+        let resp = self
+            .peer_manager
+            .send_with_timeout(
+                self.peer_host_id,
+                Message::PairBatchForward(body),
+                Lane::Data,
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(ClusterError::Net)?;
+
+        match resp {
+            Message::PairBatchAck(_) => Ok(()),
+            other => Err(ClusterError::ReplicationFailed(format!(
+                "expected PairBatchAck, got {:?}",
+                other.msg_type()
+            ))),
+        }
+    }
+
+    /// Forward a batch to the primary (secondary → primary).
+    async fn forward_batch_to_primary(
+        &self,
+        mutations: &[Mutation],
+        batch_id: Uuid,
+    ) -> Result<()> {
+        let body = encode_batch(batch_id, mutations)?;
+        let resp = self
+            .peer_manager
+            .send_with_timeout(
+                self.peer_host_id,
+                Message::PairBatchForward(body),
+                Lane::Data,
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(ClusterError::Net)?;
+
+        match resp {
+            Message::PairBatchAck(_) => Ok(()),
+            other => Err(ClusterError::ReplicationFailed(format!(
+                "expected PairBatchAck, got {:?}",
+                other.msg_type()
+            ))),
+        }
+    }
+
     /// Get current role.
     pub fn role(&self) -> PairRole {
         **self.role.load()
@@ -147,6 +235,79 @@ pub fn decode_mutation(body: &[u8]) -> Result<Mutation> {
         .map_err(|e| ClusterError::Internal(format!("mutation decode: {e}")))
 }
 
+/// Encode a batch of mutations with a `batch_id` prefix for atomic pair replication.
+///
+/// Wire layout: `batch_id:[u8;16] | mutation_count:u32 | (len:u32 | mutation)*`
+pub fn encode_batch(batch_id: Uuid, mutations: &[Mutation]) -> Result<Bytes> {
+    let count = u32::try_from(mutations.len())
+        .map_err(|_| ClusterError::Internal("batch too large".into()))?;
+
+    // Compute total size: 16 (batch_id) + 4 (count) + sum(4 + serialized_size)
+    let mutations_bytes: usize = mutations.iter().map(|m| 4 + m.serialized_size()).sum();
+    let total = 16 + 4 + mutations_bytes;
+
+    let mut buf = vec![0u8; total];
+    let mut pos = 0;
+
+    // batch_id
+    buf[pos..pos + 16].copy_from_slice(batch_id.as_bytes());
+    pos += 16;
+
+    // mutation_count
+    buf[pos..pos + 4].copy_from_slice(&count.to_be_bytes());
+    pos += 4;
+
+    // mutations: each prefixed with 4-byte length
+    for m in mutations {
+        let size = m.serialized_size();
+        let len = u32::try_from(size)
+            .map_err(|_| ClusterError::Internal("mutation too large to encode".into()))?;
+        buf[pos..pos + 4].copy_from_slice(&len.to_be_bytes());
+        pos += 4;
+        m.serialize_into(&mut buf[pos..pos + size]);
+        pos += size;
+    }
+
+    Ok(Bytes::from(buf))
+}
+
+/// Decode a batch payload encoded by [`encode_batch`].
+///
+/// Returns `(batch_id, mutations)`.
+pub fn decode_batch(body: &[u8]) -> Result<(Uuid, Vec<Mutation>)> {
+    if body.len() < 20 {
+        return Err(ClusterError::Internal("batch payload too short".into()));
+    }
+
+    // batch_id
+    let mut id_bytes = [0u8; 16];
+    id_bytes.copy_from_slice(&body[0..16]);
+    let batch_id = Uuid::from_bytes(id_bytes);
+
+    // mutation_count
+    let count = u32::from_be_bytes([body[16], body[17], body[18], body[19]]) as usize;
+    let mut pos = 20;
+
+    let mut mutations = Vec::with_capacity(count);
+    for _ in 0..count {
+        if pos + 4 > body.len() {
+            return Err(ClusterError::Internal("batch truncated at length prefix".into()));
+        }
+        let len = u32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]])
+            as usize;
+        pos += 4;
+        if pos + len > body.len() {
+            return Err(ClusterError::Internal("batch truncated at mutation body".into()));
+        }
+        let m = Mutation::deserialize_from(&body[pos..pos + len])
+            .map_err(|e| ClusterError::Internal(format!("batch mutation decode: {e}")))?;
+        mutations.push(m);
+        pos += len;
+    }
+
+    Ok((batch_id, mutations))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +326,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
         Mutation {
+            mutation_id: [0x82u8; 16],
             keyspace: "test_ks".to_string(),
             table: "test_tbl".to_string(),
             key,

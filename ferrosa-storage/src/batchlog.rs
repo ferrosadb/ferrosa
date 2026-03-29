@@ -223,6 +223,7 @@ mod tests {
         use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
         let m1 = Mutation {
+            mutation_id: [0x30u8; 16],
             keyspace: "ks1".to_string(),
             table: "tbl1".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
@@ -235,6 +236,7 @@ mod tests {
             timestamp: 1000,
         };
         let m2 = Mutation {
+            mutation_id: [0x31u8; 16],
             keyspace: "ks1".to_string(),
             table: "tbl2".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk2".to_vec())),

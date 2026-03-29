@@ -492,6 +492,7 @@ mod tests {
         );
 
         let mutations = vec![Mutation {
+            mutation_id: [0x92u8; 16],
             keyspace: "test_ks".to_string(),
             table: "test_tbl".to_string(),
             key: test_key(),
@@ -580,6 +581,7 @@ mod tests {
             id: Uuid::new_v4(),
             created_at: 1000,
             mutations: vec![Mutation {
+                mutation_id: [0x93u8; 16],
                 keyspace: "test_ks".to_string(),
                 table: "test_tbl".to_string(),
                 key: test_key(),
@@ -615,6 +617,7 @@ mod tests {
                 id: batch_id,
                 created_at: 0,
                 mutations: vec![Mutation {
+                    mutation_id: [0x94u8; 16],
                     keyspace: "test_ks".to_string(),
                     table: "test_tbl".to_string(),
                     key: test_key(),

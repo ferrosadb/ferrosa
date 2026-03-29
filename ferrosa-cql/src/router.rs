@@ -2346,33 +2346,33 @@ async fn route_logged_batch(
         match stmt {
             Statement::Insert(s) => {
                 let (table_id, key, row, ts) = materialize_insert(state, ctx, s, batch_timestamp)?;
-                mutations.push(Mutation {
-                    keyspace: table_id.keyspace.clone(),
-                    table: table_id.table.clone(),
+                mutations.push(Mutation::new(
+                    table_id.keyspace.clone(),
+                    table_id.table.clone(),
                     key,
-                    rows: vec![row],
-                    timestamp: ts,
-                });
+                    vec![row],
+                    ts,
+                ));
             }
             Statement::Update(s) => {
                 let (table_id, key, row, ts) = materialize_update(state, ctx, s, batch_timestamp)?;
-                mutations.push(Mutation {
-                    keyspace: table_id.keyspace.clone(),
-                    table: table_id.table.clone(),
+                mutations.push(Mutation::new(
+                    table_id.keyspace.clone(),
+                    table_id.table.clone(),
                     key,
-                    rows: vec![row],
-                    timestamp: ts,
-                });
+                    vec![row],
+                    ts,
+                ));
             }
             Statement::Delete(s) => {
                 let (table_id, key, row, ts) = materialize_delete(state, ctx, s, batch_timestamp)?;
-                mutations.push(Mutation {
-                    keyspace: table_id.keyspace.clone(),
-                    table: table_id.table.clone(),
+                mutations.push(Mutation::new(
+                    table_id.keyspace.clone(),
+                    table_id.table.clone(),
                     key,
-                    rows: vec![row],
-                    timestamp: ts,
-                });
+                    vec![row],
+                    ts,
+                ));
             }
             _ => {
                 return Err(CqlError::Invalid(

@@ -131,6 +131,7 @@ mod tests {
         assert_eq!(observer.count(), 0);
 
         let mutation = Mutation {
+            mutation_id: [0x20u8; 16],
             keyspace: "ks".to_string(),
             table: "tbl".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
