@@ -2021,4 +2021,156 @@ mod tests {
             panic!("expected Delete statement");
         }
     }
+
+    /// Exercise all 10 CQL scalar types as bind values in a single INSERT.
+    ///
+    /// Each of the 10 columns maps to one wire-format encoding:
+    /// text → UTF-8, int → 4B BE, bigint → 8B BE, boolean → 1B,
+    /// uuid → 16B, timestamp → 8B BE, float → 4B BE, double → 8B BE,
+    /// blob → raw bytes, inet → 4B IPv4.
+    #[test]
+    fn bind_values_ten_types() {
+        let plan = make_plan(
+            "INSERT INTO ks.t (c_text, c_int, c_bigint, c_bool, c_uuid, \
+             c_ts, c_float, c_double, c_blob, c_inet) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                ("c_text", CqlType::Varchar),
+                ("c_int", CqlType::Int),
+                ("c_bigint", CqlType::Bigint),
+                ("c_bool", CqlType::Boolean),
+                ("c_uuid", CqlType::Uuid),
+                ("c_ts", CqlType::Timestamp),
+                ("c_float", CqlType::Float),
+                ("c_double", CqlType::Double),
+                ("c_blob", CqlType::Blob),
+                ("c_inet", CqlType::Inet),
+            ],
+        );
+
+        let text_val = b"hello";
+        let int_val = 42i32.to_be_bytes();
+        let bigint_val = 9_000_000_000i64.to_be_bytes();
+        let bool_val = [1u8];
+        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+        let test_uuid = uuid::Uuid::parse_str(uuid_str).unwrap();
+        let uuid_val = *test_uuid.as_bytes();
+        let ts_val = 1_700_000_000_000i64.to_be_bytes();
+        let float_val = 3.14f32.to_bits().to_be_bytes();
+        let double_val = 2.718281828f64.to_bits().to_be_bytes();
+        let blob_val = [0xDE, 0xAD, 0xBE, 0xEF];
+        let inet_val = [192u8, 168, 1, 1];
+
+        let payload = encode_values(&[
+            text_val,
+            &int_val,
+            &bigint_val,
+            &bool_val,
+            &uuid_val,
+            &ts_val,
+            &float_val,
+            &double_val,
+            &blob_val,
+            &inet_val,
+        ]);
+
+        let result = substitute_bound_values(&plan, &payload).unwrap();
+
+        if let Statement::Insert(i) = &result {
+            assert_eq!(i.values.len(), 10, "expected 10 INSERT values");
+
+            assert!(
+                matches!(&i.values[0], Term::StringLiteral(s) if s == "hello"),
+                "c_text should be StringLiteral(\"hello\"), got {:?}",
+                i.values[0]
+            );
+            assert!(
+                matches!(&i.values[1], Term::IntegerLiteral(42)),
+                "c_int should be IntegerLiteral(42), got {:?}",
+                i.values[1]
+            );
+            assert!(
+                matches!(&i.values[2], Term::IntegerLiteral(9_000_000_000)),
+                "c_bigint should be IntegerLiteral(9000000000), got {:?}",
+                i.values[2]
+            );
+            assert!(
+                matches!(&i.values[3], Term::BoolLiteral(true)),
+                "c_bool should be BoolLiteral(true), got {:?}",
+                i.values[3]
+            );
+            assert!(
+                matches!(&i.values[4], Term::UuidLiteral(u) if *u == test_uuid),
+                "c_uuid should be UuidLiteral({uuid_str}), got {:?}",
+                i.values[4]
+            );
+            assert!(
+                matches!(&i.values[5], Term::IntegerLiteral(1_700_000_000_000)),
+                "c_ts should be IntegerLiteral(1700000000000), got {:?}",
+                i.values[5]
+            );
+            // Float decodes to f64 via f32::from_bits → as f64
+            let expected_float = 3.14f32 as f64;
+            assert!(
+                matches!(&i.values[6], Term::FloatLiteral(f) if (*f - expected_float).abs() < 1e-6),
+                "c_float should be FloatLiteral(~3.14), got {:?}",
+                i.values[6]
+            );
+            let expected_double = 2.718281828f64;
+            assert!(
+                matches!(&i.values[7], Term::FloatLiteral(f) if (*f - expected_double).abs() < 1e-9),
+                "c_double should be FloatLiteral(~2.718), got {:?}",
+                i.values[7]
+            );
+            assert!(
+                matches!(&i.values[8], Term::BlobLiteral(b) if b.as_slice() == &[0xDE, 0xAD, 0xBE, 0xEF]),
+                "c_blob should be BlobLiteral([DE AD BE EF]), got {:?}",
+                i.values[8]
+            );
+            // Inet 192.168.1.1 → StringLiteral("192.168.1.1")
+            assert!(
+                matches!(&i.values[9], Term::StringLiteral(s) if s == "192.168.1.1"),
+                "c_inet should be StringLiteral(\"192.168.1.1\"), got {:?}",
+                i.values[9]
+            );
+        } else {
+            panic!("expected Insert statement");
+        }
+    }
+
+    /// A 4-byte blob value bound to a map<text,bigint> column must NOT be
+    /// misinterpreted as a partial map — it must round-trip as a BlobLiteral
+    /// containing all 4 bytes.
+    ///
+    /// This is the Cassandra-compat case: the driver has already encoded the map
+    /// in wire format; we must store it verbatim for the storage layer to decode.
+    #[test]
+    fn map_bind_value_cassandra_compat() {
+        // Given: map<text,bigint> type and a tiny 4-byte blob that could be
+        // misread as a 4-byte "count" field if the code mistakenly parses it.
+        let map_type = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Bigint));
+        let tiny_blob: &[u8] = &[0x00, 0x00, 0x00, 0x01];
+
+        // When: we call raw_bytes_to_term with the Map type annotation
+        let term = raw_bytes_to_term(&map_type, tiny_blob);
+
+        // Then: the result must be a BlobLiteral containing ALL 4 bytes, not a
+        // truncated blob or an error — map bytes are passed through unchanged.
+        match &term {
+            Term::BlobLiteral(b) => {
+                assert_eq!(
+                    b.as_slice(),
+                    tiny_blob,
+                    "4-byte map bind value must be preserved as-is, \
+                     got {} bytes: {:?}",
+                    b.len(),
+                    b
+                );
+            }
+            other => panic!(
+                "map<text,bigint> bind value should be BlobLiteral, got {:?}",
+                other
+            ),
+        }
+    }
 }

@@ -5345,6 +5345,171 @@ mod tests {
         );
     }
 
+    // ── Schema persistence across restarts ──────────────────────────────────
+
+    /// Verify that a table schema registered before a flush survives an engine
+    /// restart — `load_local_schema_if_present` reads the `schema.json` written
+    /// by `flush` and re-registers all tables so that the new engine can write
+    /// and read without calling `register_table` again.
+    #[test]
+    fn schema_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "test_table");
+
+        // First engine: register, write, flush (flush writes schema.json).
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            let key = make_key("restart_key");
+            engine
+                .write(&tid, &key, make_row(b"restart_val", 1000), 1000)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+            // engine drops here — schema.json is now on disk
+        }
+
+        // Second engine at the SAME directory: must NOT call register_table.
+        let config2 = StorageEngineConfig::test_config(dir.path());
+        let engine2 = StorageEngine::new(config2, None).unwrap();
+
+        // Write succeeds only if the table was re-registered from schema.json.
+        let key2 = make_key("restart_key2");
+        let write_result = engine2.write(&tid, &key2, make_row(b"after_restart", 2000), 2000);
+        assert!(
+            write_result.is_ok(),
+            "write after restart must succeed — schema must have been loaded \
+             from schema.json; got: {:?}",
+            write_result.err()
+        );
+
+        // Data written before restart is readable too.
+        let key1 = make_key("restart_key");
+        let read_result = engine2.read(&tid, &key1).unwrap();
+        assert!(
+            read_result.is_some(),
+            "row written before restart must be readable after restart"
+        );
+        assert_eq!(
+            read_result.unwrap().rows[0].cells[0].1.value.as_deref(),
+            Some(b"restart_val".as_slice()),
+            "row value must be unchanged after restart"
+        );
+    }
+
+    /// Like `schema_survives_restart` but explicitly confirms SSTable files
+    /// are present on disk before the restart — this exercises the "non-empty
+    /// data directory" code path where the old S3 bootstrap was gated.
+    #[test]
+    fn schema_survives_binary_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "test_table");
+
+        // First engine: register, write, flush.
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            let key = make_key("upgrade_key");
+            engine
+                .write(&tid, &key, make_row(b"upgrade_val", 5000), 5000)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        // Verify at least one .db file exists on disk before restart.
+        let table_dir = dir
+            .path()
+            .join("sstables")
+            .join(tid.to_string());
+        let db_files: Vec<_> = std::fs::read_dir(&table_dir)
+            .expect("sstables table dir must exist after flush")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "db").unwrap_or(false))
+            .collect();
+        assert!(
+            !db_files.is_empty(),
+            "at least one .db SSTable file must exist on disk before restart"
+        );
+
+        // Second engine: schema must be present without calling register_table.
+        let config2 = StorageEngineConfig::test_config(dir.path());
+        let engine2 = StorageEngine::new(config2, None).unwrap();
+
+        // The pre-restart row must be readable.
+        let key = make_key("upgrade_key");
+        let result = engine2.read(&tid, &key).unwrap();
+        assert!(
+            result.is_some(),
+            "row written before binary upgrade must be readable after restart"
+        );
+        assert_eq!(
+            result.unwrap().rows[0].cells[0].1.value.as_deref(),
+            Some(b"upgrade_val".as_slice()),
+            "row value must survive binary upgrade restart"
+        );
+    }
+
+    /// Test that a map<text,int> encoded in CQL v4+ wire format (as gocql would
+    /// send it) survives the full write→flush→read cycle without any byte loss
+    /// or reinterpretation.
+    ///
+    /// Wire format: 4B BE count, then for each entry:
+    ///   4B BE key_len + key_bytes + 4B BE val_len + val_bytes.
+    #[test]
+    fn collection_via_gocql_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = collection_schema(
+            "test_ks",
+            "gocql_map_table",
+            "org.apache.cassandra.db.marshal.MapType(\
+             org.apache.cassandra.db.marshal.UTF8Type,\
+             org.apache.cassandra.db.marshal.Int32Type)",
+        );
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new("test_ks", "gocql_map_table");
+        let key = make_key("gocql_pk");
+
+        // Encode {'hello': 42, 'world': 99} as CQL v4+ wire format.
+        let map_bytes = encode_cql_map(&[
+            (b"hello", &42i32.to_be_bytes()),
+            (b"world", &99i32.to_be_bytes()),
+        ]);
+
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(map_bytes.clone(), 7000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(7000),
+        };
+        engine.write(&tid, &key, row, 7000).unwrap();
+
+        engine.flush(&tid).unwrap();
+        assert_eq!(
+            engine.sstable_count(&tid),
+            1,
+            "flush should have written 1 SSTable"
+        );
+        assert_eq!(
+            engine.memtable_size(&tid),
+            0,
+            "memtable should be empty after flush"
+        );
+
+        let result = engine.read(&tid, &key).unwrap();
+        assert!(result.is_some(), "map row must be readable after flush");
+        let partition = result.unwrap();
+        assert_eq!(
+            partition.rows[0].cells[0].1.value.as_deref(),
+            Some(map_bytes.as_slice()),
+            "gocql map bytes must survive write→flush→read unchanged"
+        );
+    }
+
     // ── C2.2: S3 upload confirmation before manifest update ──────────────────
 
     /// Object store wrapper that fails all PUT operations immediately with a
