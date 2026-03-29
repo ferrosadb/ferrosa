@@ -56,7 +56,9 @@ echo ""
 echo "=== Waiting for Ferrosa CQL port (9042) ==="
 MAX_WAIT=120
 for i in $(seq 1 "$MAX_WAIT"); do
-    if "$RUNTIME" compose -f "$COMPOSE_FILE" exec -T ferrosa sh -c "nc -z 127.0.0.1 9042" 2>/dev/null; then
+    # Check from inside the container using bash /dev/tcp (no nc needed).
+    # Falls back to checking the compose healthcheck status.
+    if "$RUNTIME" compose -f "$COMPOSE_FILE" exec -T ferrosa bash -c 'echo > /dev/tcp/127.0.0.1/9042' 2>/dev/null; then
         echo "Ferrosa ready after ${i}s"
         break
     fi
