@@ -81,6 +81,76 @@ impl WorkloadRegistry {
 }
 
 #[cfg(test)]
+pub mod testutil {
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use super::CqlSession;
+
+    /// Minimal mock CQL session for unit tests.
+    ///
+    /// Behaviour rules (applied in order):
+    /// - DDL (CREATE KEYSPACE / TABLE / TYPE): empty result set.
+    /// - Seed inserts without IF: empty result set.
+    /// - SELECT queries: return a single row whose column name is derived from
+    ///   the first column in the SELECT list, with value "1000".
+    /// - LWT mutations (queries containing "IF"): return `[applied]=true` on
+    ///   the first call, then alternate true/false to simulate contention.
+    /// - Other mutations (UPDATE … without IF): empty result set.
+    pub struct MockCqlSession {
+        /// Flips between true/false for LWT applied responses.
+        lwt_toggle: Arc<AtomicBool>,
+    }
+
+    impl MockCqlSession {
+        pub fn new() -> Self {
+            Self {
+                lwt_toggle: Arc::new(AtomicBool::new(true)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CqlSession for MockCqlSession {
+        async fn execute(&self, query: &str) -> Result<Vec<Vec<(String, String)>>> {
+            let q = query.trim_start().to_ascii_uppercase();
+
+            // DDL: CREATE KEYSPACE / TABLE / TYPE
+            if q.starts_with("CREATE") {
+                return Ok(vec![]);
+            }
+
+            // SELECT: return a single-row, single-column result.
+            // Column name is taken from the first token after SELECT and before FROM.
+            if q.starts_with("SELECT") {
+                // Extract the column name from the original (case-preserved) query.
+                let col = query
+                    .trim_start()
+                    .split(' ')
+                    .nth(1)
+                    .unwrap_or("val")
+                    .trim_end_matches(',');
+                return Ok(vec![vec![(col.to_string(), "1000".to_string())]]);
+            }
+
+            // LWT: any mutation containing "IF" (at word boundary in upper-case form).
+            if q.contains(" IF ") || q.ends_with(" IF EXISTS") || q.ends_with(" IF NOT EXISTS") {
+                let applied = self.lwt_toggle.fetch_xor(true, Ordering::Relaxed);
+                return Ok(vec![vec![(
+                    "[applied]".to_string(),
+                    applied.to_string(),
+                )]]);
+            }
+
+            // Plain mutation (INSERT without IF, UPDATE without IF): success, no rows.
+            Ok(vec![])
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
