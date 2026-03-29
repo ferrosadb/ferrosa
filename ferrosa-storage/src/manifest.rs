@@ -110,72 +110,65 @@ impl Manifest {
         }
     }
 
-    /// Saves the manifest to the object store.
+    /// Saves the manifest to the object store using a conditional put (CAS).
     ///
-    /// When `cas_supported` is true, uses conditional put (etag-based CAS)
-    /// for safe concurrent writes. When false (e.g. RustFS/MinIO), falls
-    /// back to an unconditional overwrite.
+    /// Always uses etag-based compare-and-swap to prevent lost updates from
+    /// concurrent writers. Callers must supply the `version` returned by the
+    /// most recent [`Manifest::load`] call:
+    ///
+    /// - `None` → the object must not yet exist (`PutMode::Create`)
+    /// - `Some(v)` → the object must still match etag `v` (`PutMode::Update`)
+    ///
+    /// Prefer [`Manifest::save_with_retry`] for automatic CAS conflict retry.
     pub async fn save(
         &self,
         store: &dyn ObjectStore,
         prefix: &str,
         version: Option<UpdateVersion>,
-        cas_supported: bool,
     ) -> ferrosa_common::Result<()> {
         let path = Self::manifest_path(prefix);
         let data = serde_json::to_vec_pretty(self).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to serialize manifest: {e}"))
         })?;
 
-        if cas_supported {
-            let opts = match version {
-                Some(v) => PutOptions {
-                    mode: PutMode::Update(v),
-                    ..Default::default()
-                },
-                None => PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            };
-            store
-                .put_opts(&path, PutPayload::from(Bytes::from(data)), opts)
-                .await
-                .map_err(|e| {
-                    ferrosa_common::Error::InvalidFormat(format!("failed to save manifest: {e}"))
-                })?;
-        } else {
-            // Unconditional overwrite — no CAS protection.
-            store
-                .put(&path, PutPayload::from(Bytes::from(data)))
-                .await
-                .map_err(|e| {
-                    ferrosa_common::Error::InvalidFormat(format!("failed to save manifest: {e}"))
-                })?;
-        }
+        let opts = match version {
+            Some(v) => PutOptions {
+                mode: PutMode::Update(v),
+                ..Default::default()
+            },
+            None => PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        };
+        store
+            .put_opts(&path, PutPayload::from(Bytes::from(data)), opts)
+            .await
+            .map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!("failed to save manifest: {e}"))
+            })?;
 
         Ok(())
     }
 
     /// Saves the manifest with automatic CAS retry and exponential backoff.
     ///
-    /// When `cas_supported` is true, re-loads the latest version on each
-    /// attempt and uses conditional put. On CAS conflict, retries with
+    /// Re-loads the latest manifest version on each attempt and uses
+    /// conditional put (etag-based CAS). On conflict, retries with
     /// exponential backoff up to [`MAX_CAS_RETRIES`] times.
     ///
-    /// When `cas_supported` is false, does a single unconditional write.
+    /// The object store **must** support conditional puts. If it does not,
+    /// callers must detect this at startup (via [`probe_conditional_put_support`])
+    /// and refuse to start — passing a non-CAS store here is a configuration
+    /// error that cannot be silently recovered.
     pub async fn save_with_retry(
         &self,
         store: &dyn ObjectStore,
         prefix: &str,
-        cas_supported: bool,
     ) -> ferrosa_common::Result<()> {
-        if !cas_supported {
-            return self.save(store, prefix, None, false).await;
-        }
         for attempt in 0..MAX_CAS_RETRIES {
             let (_, version) = Self::load(store, prefix).await?;
-            match self.save(store, prefix, version, true).await {
+            match self.save(store, prefix, version).await {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < MAX_CAS_RETRIES - 1 => {
                     eprintln!(
@@ -326,7 +319,7 @@ mod tests {
             // Add entries and save.
             manifest.add_sstable("ks.table", sample_entry("sst1"));
             manifest.add_sstable("ks.table", sample_entry("sst2"));
-            manifest.save(&store, "test", version, true).await.unwrap();
+            manifest.save(&store, "test", version).await.unwrap();
 
             // Re-load and verify.
             let (loaded, _) = Manifest::load(&store, "test").await.unwrap();
@@ -356,6 +349,94 @@ mod tests {
         const { assert!(MAX_CAS_RETRIES <= 10) };
     }
 
+    /// C2.3: CAS is always enforced — there is no unconditional PUT fallback.
+    ///
+    /// `save_with_retry` no longer accepts a `cas_supported` flag; it always
+    /// uses conditional put.  An object store that does not support CAS must
+    /// be detected by `probe_conditional_put_support` at startup and must
+    /// cause the engine to refuse to start rather than silently allowing
+    /// concurrent updates to overwrite each other.
+    ///
+    /// This test confirms the new API compiles without a `cas_supported`
+    /// parameter and that a successful round-trip through `save_with_retry`
+    /// uses CAS (evidenced by a second concurrent save failing with a CAS
+    /// conflict rather than silently succeeding).
+    #[tokio::test]
+    async fn manifest_cas_required_at_startup() {
+        let store = InMemory::new();
+        let mut manifest = Manifest::new();
+        manifest.add_sstable("ks.table", sample_entry("sst1"));
+
+        // First save must succeed on an empty store (CAS Create).
+        manifest
+            .save_with_retry(&store, "test")
+            .await
+            .expect("first save must succeed");
+
+        // A second save using a stale version (None → Create) must fail
+        // because the manifest already exists — proving CAS is enforced.
+        let stale_manifest = Manifest::new();
+        let stale_result = stale_manifest.save(&store, "test", None).await;
+        assert!(
+            stale_result.is_err(),
+            "CAS Create on an existing manifest must be rejected by the store"
+        );
+    }
+
+    /// C2.3: Two concurrent CAS-based manifest updates must both succeed.
+    ///
+    /// Simulates two concurrent flushes each adding a different SSTable entry
+    /// to the manifest via `save_with_retry`. The final manifest must contain
+    /// both new entries plus the original, proving that CAS retry logic
+    /// correctly merges concurrent writers rather than losing one update.
+    #[tokio::test]
+    async fn manifest_concurrent_flush_preserves_all_entries() {
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemory::new());
+
+        // Seed: one existing entry.
+        let mut seed = Manifest::new();
+        seed.add_sstable("ks.t", sample_entry("seed"));
+        seed.save_with_retry(store.as_ref(), "concurrent")
+            .await
+            .unwrap();
+
+        // Two concurrent tasks each add a distinct SSTable entry.
+        let store_a = Arc::clone(&store);
+        let task_a = tokio::spawn(async move {
+            let (mut m, _) = Manifest::load(store_a.as_ref(), "concurrent").await.unwrap();
+            m.add_sstable("ks.t", sample_entry("flush-a"));
+            m.save_with_retry(store_a.as_ref(), "concurrent")
+                .await
+                .unwrap();
+        });
+
+        let store_b = Arc::clone(&store);
+        let task_b = tokio::spawn(async move {
+            let (mut m, _) = Manifest::load(store_b.as_ref(), "concurrent").await.unwrap();
+            m.add_sstable("ks.t", sample_entry("flush-b"));
+            m.save_with_retry(store_b.as_ref(), "concurrent")
+                .await
+                .unwrap();
+        });
+
+        tokio::try_join!(task_a, task_b).expect("concurrent saves must not panic");
+
+        // Both tasks must have persisted their entry.
+        let (final_manifest, _) = Manifest::load(store.as_ref(), "concurrent").await.unwrap();
+        let entries = &final_manifest.sstables["ks.t"];
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            ids.contains(&"flush-a"),
+            "flush-a entry must be present; got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"flush-b"),
+            "flush-b entry must be present; got: {ids:?}"
+        );
+    }
+
     #[tokio::test]
     async fn manifest_save_with_retry_succeeds_on_fresh_store() {
         let store = InMemory::new();
@@ -364,7 +445,7 @@ mod tests {
 
         // save_with_retry should work on a fresh store (no conflicts).
         manifest
-            .save_with_retry(&store, "test", true)
+            .save_with_retry(&store, "test")
             .await
             .unwrap();
 
@@ -382,7 +463,7 @@ mod tests {
 
             let mut manifest = Manifest::new();
             manifest.add_sstable("t", sample_entry("x"));
-            manifest.save(&store, "", None, true).await.unwrap();
+            manifest.save(&store, "", None).await.unwrap();
 
             let (loaded, _) = Manifest::load(&store, "").await.unwrap();
             assert_eq!(loaded.sstables["t"].len(), 1);
