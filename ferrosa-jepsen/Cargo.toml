@@ -23,6 +23,7 @@ russh = "0.46"
 russh-keys = "0.46"
 rand = "0.8"
 dirs-next = "2"
+scylla = "1.5.0"
 
 [dev-dependencies]
 tempfile = "3"
