@@ -152,6 +152,19 @@ impl RunConfig {
             ClusterBackend::Firecracker
         }
     }
+
+    /// Workload run duration in seconds, based on tier.
+    ///
+    /// Smoke: short runs to verify correctness, not endurance.
+    /// Endurance: 24-hour continuous cycling.
+    pub fn run_duration_secs(&self) -> u64 {
+        match self.tier {
+            Tier::Smoke => 5,
+            Tier::Standard => 30,
+            Tier::Full => 60,
+            Tier::Endurance => 86_400,
+        }
+    }
 }
 
 #[cfg(test)]

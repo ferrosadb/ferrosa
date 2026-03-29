@@ -3,6 +3,10 @@ name = "ferrosa-jepsen"
 version.workspace = true
 edition = "2021"
 
+[lib]
+name = "ferrosa_jepsen"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ferrosa-jepsen"
 path = "src/main.rs"

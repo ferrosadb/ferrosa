@@ -80,6 +80,19 @@ impl WorkloadRegistry {
     }
 }
 
+/// A `CqlSession` that accepts any query and returns empty results.
+///
+/// Used in unit tests and in-process orchestrator runs where a real CQL
+/// cluster is not available. Queries execute instantly without I/O.
+pub struct MockCqlSession;
+
+#[async_trait]
+impl CqlSession for MockCqlSession {
+    async fn execute(&self, _query: &str) -> Result<Vec<Vec<(String, String)>>> {
+        Ok(vec![])
+    }
+}
+
 #[cfg(test)]
 pub mod testutil {
     use anyhow::Result;
@@ -162,5 +175,12 @@ mod tests {
         assert!(reg.get("bank").is_some());
         assert!(reg.get("lwt-1-insert-if-not-exists").is_some());
         assert!(reg.get("lwt-16-multi-statement").is_some());
+    }
+
+    #[tokio::test]
+    async fn mock_session_accepts_any_query() {
+        let session = MockCqlSession;
+        let result = session.execute("SELECT * FROM system.local").await.unwrap();
+        assert!(result.is_empty());
     }
 }

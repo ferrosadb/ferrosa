@@ -2,9 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
-
 use ferrosa_jepsen::config::{Concurrency, RunConfig, Tier, Topology};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "ferrosa-jepsen")]
