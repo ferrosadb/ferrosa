@@ -1,29 +1,10 @@
-// Scaffold phase: types are defined before their consumers exist.
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-mod alert;
-mod archive;
-mod chaos;
-mod checker;
-mod cluster;
-mod config;
-mod driver;
-mod endurance;
-mod firecracker;
-mod flyio;
-mod history;
-mod orchestrator;
-mod report;
-mod ssh;
-mod workload;
-
-use config::{Concurrency, RunConfig, Tier, Topology};
+use ferrosa_jepsen::config::{Concurrency, RunConfig, Tier, Topology};
 
 #[derive(Parser)]
 #[command(name = "ferrosa-jepsen")]
@@ -155,7 +136,7 @@ async fn main() -> Result<()> {
                 "Starting Jepsen run"
             );
 
-            let report = orchestrator::run(&config).await?;
+            let report = ferrosa_jepsen::orchestrator::run(&config).await?;
 
             if config.output_json {
                 println!("{}", serde_json::to_string_pretty(&report)?);

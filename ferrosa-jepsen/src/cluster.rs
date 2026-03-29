@@ -146,6 +146,42 @@ impl FerrosCluster {
         self.nodes[idx].cql_address()
     }
 
+    /// Connect to a pre-existing cluster using the given CQL contact addresses.
+    ///
+    /// Each entry in `nodes` should be a "host:port" string.
+    /// Returns a `FerrosCluster` with no associated VMs (vm = None).
+    pub async fn from_nodes(nodes: &[String]) -> Result<Self> {
+        let cluster_nodes: Vec<ClusterNode> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                let ip: IpAddr = addr
+                    .rsplit_once(':')
+                    .and_then(|(host, _)| host.parse().ok())
+                    .unwrap_or_else(|| "127.0.0.1".parse().unwrap());
+                let cql_port: u16 = addr
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse().ok())
+                    .unwrap_or(9042);
+                ClusterNode {
+                    id: i,
+                    ip,
+                    cql_port,
+                    internode_port: 7000,
+                    vm: None,
+                }
+            })
+            .collect();
+
+        let seed_ips = cluster_nodes.first().map(|n| vec![n.ip]).unwrap_or_default();
+
+        Ok(Self {
+            topology: Topology::T1,
+            nodes: cluster_nodes,
+            seed_ips,
+        })
+    }
+
     /// Teardown the cluster by destroying all backing VMs.
     pub async fn teardown(mut self) -> Result<()> {
         info!("tearing down cluster");

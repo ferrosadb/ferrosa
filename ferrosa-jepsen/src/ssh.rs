@@ -239,6 +239,7 @@ mod tests {
                  then re-run with FERROSA_TEST_FIRECRACKER=1"
             );
         }
+
         let ssh = SshClient::connect(&vm_host(), vm_port(), "root", &vm_key())
             .await
             .expect("SSH connect failed — is the Lima VM running? Run scripts/lima-fc-setup.sh");
@@ -260,6 +261,7 @@ mod tests {
                  then re-run with FERROSA_TEST_FIRECRACKER=1"
             );
         }
+
         let ssh = SshClient::connect(&vm_host(), vm_port(), "root", &vm_key())
             .await
             .expect("SSH connect failed — is the Lima VM running? Run scripts/lima-fc-setup.sh");
