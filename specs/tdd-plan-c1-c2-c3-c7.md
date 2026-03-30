@@ -1,10 +1,11 @@
 # TDD Plan: C1 + C2 + C3 + C7 Correctness Sprint Closure
 
 > Created: 2026-03-29
-> Status: Active
+> Status: **COMPLETE** — all 40 tests verified on `main` at `3f384ac` (2026-03-29)
 > Scope: Close BUG-021–026, C2 P0 hazards, C3 Jepsen infrastructure, C7 compaction S3 tests.
 > Runner: `cargo test`, `FERROSA_TEST_CONTAINERS=1 cargo test`
 > TDD cycle: Red → Green → Refactor. One failing test at a time.
+> PR: bkearns/ferrosa#84 (merged)
 
 ---
 

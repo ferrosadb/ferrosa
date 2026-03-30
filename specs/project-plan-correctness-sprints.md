@@ -1,10 +1,25 @@
 # Correctness Sprint Plan — Single-DC Jepsen + S3 + Accord
 
 > Created: 2026-03-28
-> Updated: 2026-03-29 (PR #84 merged — C1+C2+C3+C7 complete)
-> Status: In Progress — C1/C2/C3/C7 complete, C4/C5/C6/C8 remaining
+> Updated: 2026-03-29 (PR #84 merged — all tests verified on main)
+> Status: In Progress — C1/C2/C3/C5/C6/C7 complete, C4 run tasks + C8 driver compat remaining
 > Focus: Single-datacenter N-node correctness validation, S3/SSTable Cassandra format verification, Accord transaction correctness under all Jepsen failure modes, compaction S3 integration, and full CQL driver compatibility.
 > Predecessor: [project-plan-unified.md](project-plan-unified.md) (Accord S1–S7)
+
+---
+
+## Sprint Status (verified on `main` at `3f384ac`, 2026-03-29)
+
+| Sprint | Status | Tests on main | Notes |
+|--------|--------|---------------|-------|
+| **C1** Bug Fixes | **COMPLETE** | 16/16 pass | BUG-021–026 all closed |
+| **C2** P0 Storage | **COMPLETE** | 6/6 pass | Pair ACK, S3 confirm, CAS removal |
+| **C3** Jepsen Infra | **COMPLETE** | 11/12 pass (1 infra panic) | Driver, provisioning, workloads, nemeses, smoke tier |
+| **C4** Jepsen Runs | **CODE COMPLETE** | 0 unit / 6 infra panics | Run tasks — need live cluster with `FERROSA_TEST_CLUSTER_NODES` |
+| **C5** SSTable Compat | **COMPLETE** | 11/11 pass | Cassandra reader, all cell types, round-trips |
+| **C6** Accord Failures | **COMPLETE** | 9/13 pass (4 infra panics) | Unit tests pass; live-cluster tests need `FERROSA_TEST_FIRECRACKER` |
+| **C7** Compaction S3 | **COMPLETE** | 6/8 pass (2 container panics) | Pipeline verified; Cassandra import tests need `FERROSA_TEST_CONTAINERS` |
+| **C8** CQL Drivers | **PARTIAL** | 4/4 pass (invariant checkers only) | T-032 (all-drivers Jepsen standard) not started |
 
 ---
 

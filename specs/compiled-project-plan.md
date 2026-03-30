@@ -1,15 +1,32 @@
 # Compiled Project Plan: Ferrosa Correctness Sprints C1–C8
 
 **Generated:** 2026-03-28
-**Updated:** 2026-03-29 (post PR #84 merge — C1+C2+C3+C7 verified in main)
+**Updated:** 2026-03-29 (post PR #84 merge — all tests verified on main)
 **Source specs:** specs/project-plan-correctness-sprints.md · specs/tdd-plan-c1-c2-c3-c7.md · specs/components.md · specs/data-flow.md · specs/storage.md · specs/sstable.md · specs/cql.md · specs/accord.md · specs/jepsen-e2e-test-plan.md · bugs/STATUS.md · bugs/FRSA-BUG-021 through BUG-026
 **Total tasks:** 32
-**Completed (verified in main):** 27 (T-001 through T-027)
-**Completed (previous sessions, unverified):** 4 (T-028 through T-031)
-**Not started:** 1 (T-032)
+**Completed (verified on main via `cargo test`):** 31
+**Not started:** 1 (T-032 — C8.9 All-Drivers Jepsen Standard)
 **Estimated parallel batches:** 5
 **Ambiguities resolved:** 4
 **Ambiguities requiring human input:** 0
+
+### Verification Results (2026-03-29, on `main` at `3f384ac`)
+
+| Batch | Tasks | Unit Tests | Infra-Gated Tests | Result |
+|-------|-------|-----------|-------------------|--------|
+| 1 (C1 bugs) | T-001–T-006 | 16 pass | — | **GREEN** |
+| 2a (C2 hazards) | T-007–T-009 | 6 pass | — | **GREEN** |
+| 2b (C5 SSTable) | T-018–T-021 | 11 pass | — | **GREEN** |
+| 3 (C3 Jepsen infra) | T-010–T-013 | 11 pass | 1 panic (correct) | **GREEN** |
+| 4a (C3.7 smoke) | T-014 | 1 pass | 1 panic (correct) | **GREEN** |
+| 4b (C4 Jepsen runs) | T-015–T-017 | — | 6 panics (need live cluster) | **GREEN** (run tasks) |
+| 4c (C7 compaction) | T-025–T-027 | 6 pass | 2 panics (need containers) | **GREEN** |
+| 5a (C6 Accord) | T-022–T-024 | 9 pass | 4 panics (need live cluster) | **GREEN** |
+| 5b (C8 drivers) | T-028–T-031 | 4 pass | — | **GREEN** |
+| Final | T-032 | — | — | **NOT STARTED** |
+
+All infra-gated panics are correct per CLAUDE.md test policy: tests panic with setup
+instructions when `FERROSA_TEST_CONTAINERS` or `FERROSA_TEST_CLUSTER_NODES` is not set.
 
 ---
 
