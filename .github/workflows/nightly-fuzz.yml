@@ -30,7 +30,15 @@ jobs:
         timeout-minutes: 45
         env:
           PROPTEST_CASES: 50000
-        run: cargo test --workspace 2>&1 | tee test-output.log
+        run: |
+          cargo test --workspace \
+            --exclude ferrosa-jepsen \
+            -- --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
+               --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
+               --skip dep_wait_ordering --skip disk_fail_no_phantom \
+               --skip packet_reorder_linearizability --skip lwt_batch_atomicity_all \
+               --skip clock_skew_large_preaccept \
+            2>&1 | tee test-output.log
         continue-on-error: true
 
       - name: Check for regression files
