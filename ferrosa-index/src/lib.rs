@@ -21,6 +21,7 @@
 pub mod btree;
 pub mod composite;
 pub mod filtered;
+pub mod fulltext;
 pub mod hash;
 pub mod phonetic;
 pub mod vector;
@@ -102,6 +103,7 @@ pub enum IndexType {
     Phonetic,
     Filtered,
     Vector,
+    FullText,
 }
 
 impl fmt::Display for IndexType {
@@ -113,6 +115,7 @@ impl fmt::Display for IndexType {
             IndexType::Phonetic => write!(f, "phonetic"),
             IndexType::Vector => write!(f, "vector"),
             IndexType::Filtered => write!(f, "filtered"),
+            IndexType::FullText => write!(f, "fulltext"),
         }
     }
 }

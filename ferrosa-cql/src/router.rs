@@ -816,6 +816,7 @@ async fn route_select(
                         IndexType::Phonetic => "CUSTOM",
                         IndexType::Filtered => "CUSTOM",
                         IndexType::Vector => "CUSTOM",
+                        IndexType::FullText => "CUSTOM",
                     };
                     // Format options as a simple comma-separated key=value string
                     // (avoiding a serde_json dependency in this crate).
@@ -3297,6 +3298,7 @@ fn resolve_index_type(
         Some("phonetic") => Ok(IndexType::Phonetic),
         Some("filtered") => Ok(IndexType::Filtered),
         Some("vector") => Ok(IndexType::Vector),
+        Some("fulltext") | Some("fts") => Ok(IndexType::FullText),
         Some(other) => Err(CqlError::Invalid(format!("unknown index type: {other}"))),
     }
 }
@@ -6424,6 +6426,21 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), IndexType::Composite);
+    }
+
+    #[test]
+    fn create_fulltext_index_accepted() {
+        let result =
+            resolve_index_type(Some("fulltext"), &["body".to_string()], &HashMap::new());
+        assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
+        assert_eq!(result.unwrap(), IndexType::FullText);
+    }
+
+    #[test]
+    fn create_fulltext_index_fts_alias_accepted() {
+        let result = resolve_index_type(Some("fts"), &["body".to_string()], &HashMap::new());
+        assert!(result.is_ok(), "expected Ok for 'fts' alias but got: {:?}", result.err());
+        assert_eq!(result.unwrap(), IndexType::FullText);
     }
 
     #[tokio::test]

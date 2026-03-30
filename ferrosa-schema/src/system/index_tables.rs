@@ -68,6 +68,7 @@ fn index_type_kind(index_type: &IndexType) -> &'static str {
         IndexType::Phonetic => "phonetic",
         IndexType::Filtered => "filtered",
         IndexType::Vector => "vector",
+        IndexType::FullText => "fulltext",
     }
 }
 
