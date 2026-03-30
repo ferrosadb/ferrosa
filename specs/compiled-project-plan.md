@@ -1,8 +1,12 @@
 # Compiled Project Plan: Ferrosa Correctness Sprints C1–C8
 
 **Generated:** 2026-03-28
-**Source specs:** specs/project-plan-correctness-sprints.md · specs/components.md · specs/data-flow.md · specs/storage.md · specs/sstable.md · specs/cql.md · specs/accord.md · specs/jepsen-e2e-test-plan.md · bugs/STATUS.md · bugs/FRSA-BUG-021 through BUG-026
+**Updated:** 2026-03-29 (post PR #84 merge — C1+C2+C3+C7 verified in main)
+**Source specs:** specs/project-plan-correctness-sprints.md · specs/tdd-plan-c1-c2-c3-c7.md · specs/components.md · specs/data-flow.md · specs/storage.md · specs/sstable.md · specs/cql.md · specs/accord.md · specs/jepsen-e2e-test-plan.md · bugs/STATUS.md · bugs/FRSA-BUG-021 through BUG-026
 **Total tasks:** 32
+**Completed (verified in main):** 27 (T-001 through T-027)
+**Completed (previous sessions, unverified):** 4 (T-028 through T-031)
+**Not started:** 1 (T-032)
 **Estimated parallel batches:** 5
 **Ambiguities resolved:** 4
 **Ambiguities requiring human input:** 0
