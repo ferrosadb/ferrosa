@@ -9606,6 +9606,7 @@ mod tests {
                 name: "body".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
 

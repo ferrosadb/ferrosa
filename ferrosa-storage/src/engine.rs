@@ -2770,10 +2770,10 @@ mod tests {
             }],
             static_columns: vec![],
             regular_columns: vec![ColumnDefinition {
-                extensions: Default::default(),
                 name: "val".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         }
     }
 
@@ -3123,10 +3123,10 @@ mod tests {
             }],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
-            extensions: Default::default(),
                 name: "result".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
 
@@ -3190,10 +3190,10 @@ mod tests {
             }],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
-            extensions: Default::default(),
                 name: "result".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
 
@@ -4055,10 +4055,10 @@ mod tests {
                 clustering_columns: vec![],
                 static_columns: vec![],
                 regular_columns: vec![ColumnDefinition {
-                    extensions: Default::default(),
                     name: "val".to_string(),
                     type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
                 }],
+                extensions: Default::default(),
             };
             engine.register_table(schema).unwrap();
         }
@@ -4181,7 +4181,6 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![
-            extensions: Default::default(),
                 ferrosa_common::ColumnDefinition {
                     name: "cluster_ack_level".into(),
                     type_name: "org.apache.cassandra.db.marshal.MapType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.LongType)".into(),
@@ -4191,6 +4190,7 @@ mod tests {
                     type_name: "org.apache.cassandra.db.marshal.LongType".into(),
                 },
             ],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
 
@@ -4268,10 +4268,10 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
-                extensions: Default::default(),
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
         let tid = TableId::new("test_ks", "resilience");
@@ -4325,10 +4325,10 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
-                extensions: Default::default(),
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
         let tid = TableId::new("test_ks", "zero_data");
@@ -4381,10 +4381,10 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
-                extensions: Default::default(),
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
         let tid = TableId::new("test_ks", "evolving");
@@ -4442,10 +4442,10 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
-                extensions: Default::default(),
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
         let tid = TableId::new("test_ks", "survive");
@@ -5066,7 +5066,6 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![
-            extensions: Default::default(),
                 ferrosa_common::schema::ColumnDefinition {
                     name: "v_text".into(),
                     type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
@@ -5076,6 +5075,7 @@ mod tests {
                     type_name: "org.apache.cassandra.db.marshal.Int32Type".into(),
                 },
             ],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
         let tid = TableId::new("test_ks", "mixed_cells");
@@ -5124,7 +5124,6 @@ mod tests {
                     clustering_columns: vec![],
                     static_columns: vec![],
                     regular_columns: vec![
-                    extensions: Default::default(),
                         ferrosa_common::schema::ColumnDefinition {
                             name: "v_text".into(),
                             type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
@@ -5134,6 +5133,7 @@ mod tests {
                             type_name: "org.apache.cassandra.db.marshal.Int32Type".into(),
                         },
                     ],
+                    extensions: Default::default(),
                 },
                 table_id: tid.clone(),
             };
@@ -5623,10 +5623,10 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![ColumnDefinition {
-                extensions: Default::default(),
                 name: "col".to_string(),
                 type_name: col_type.to_string(),
             }],
+            extensions: Default::default(),
         }
     }
 
