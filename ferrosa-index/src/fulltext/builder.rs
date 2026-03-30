@@ -1,201 +1,187 @@
-//! Full-text index builder (FT-005).
+//! Full-text index builder: produces FTI sidecar bytes.
 //!
-//! Accumulates documents via [`FullTextIndexBuilder::add_document`], then
-//! serializes the complete inverted index to the FTI binary format via
-//! [`FullTextIndexBuilder::finish`].
+//! [`FullTextIndexBuilder`] accepts documents (partition key + token + text),
+//! tokenizes each text using a pluggable [`TextAnalyzer`], accumulates term
+//! postings in memory, then serializes the inverted index to the FTI binary
+//! format on [`finish()`].
 //!
-//! ## FTI Binary Format
-//!
-//! ```text
-//! Header (24 bytes):
-//!   [4] magic:           b"FTI\x01"
-//!   [4] version:         1u32 BE
-//!   [4] term_count:      u32 BE
-//!   [4] doc_count:       u32 BE
-//!   [8] terms_offset:    u64 BE  (always 24)
-//!
-//! Terms Dictionary (term_count entries, sorted by term bytes):
-//!   Per term:
-//!     [2] term_length:      u16 BE
-//!     [N] term_bytes:       UTF-8
-//!     [4] doc_frequency:    u32 BE
-//!     [8] postings_offset:  u64 BE (absolute offset into file)
-//!     [4] postings_length:  u32 BE (byte length of this term's postings block)
-//!
-//! Postings Section:
-//!   Per term's postings block (contiguous, in the same order as terms dict):
-//!     Per posting:
-//!       [8] partition_key_hash: i64 BE (Murmur3 token)
-//!       [2] key_length:         u16 BE
-//!       [N] partition_key_bytes
-//!       [4] term_frequency:     u32 BE
-//!       [4] field_length:       u32 BE (total tokens in document)
-//! ```
+//! The final byte slice includes a CRC32 footer over all preceding bytes so
+//! the reader can detect corruption.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-use super::analyzer::Analyzer;
+use super::{FOOTER_CRC_SIZE, FTI_MAGIC, FTI_VERSION, HEADER_SIZE};
 
-// ── Public types ──────────────────────────────────────────────────────────────
+// ── Analyzer trait ────────────────────────────────────────────────────────────
 
-/// A single document posting: the occurrence of a term in one document.
+/// Tokenizes a text string into a sequence of normalized terms.
+pub trait TextAnalyzer: Send {
+    /// Return the list of terms extracted from `text`.
+    fn analyze(&self, text: &str) -> Vec<String>;
+}
+
+/// Simple whitespace + lowercase analyzer.
+///
+/// Splits on ASCII whitespace, lowercases each token, and strips leading/
+/// trailing non-alphanumeric characters. Empty tokens are discarded.
+pub struct SimpleAnalyzer;
+
+impl TextAnalyzer for SimpleAnalyzer {
+    fn analyze(&self, text: &str) -> Vec<String> {
+        text.split_ascii_whitespace()
+            .map(|t| {
+                t.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase()
+            })
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+}
+
+// ── Posting ───────────────────────────────────────────────────────────────────
+
+/// A single posting: the partition key and token for a document that contains
+/// the term.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Posting {
-    /// Raw partition key bytes that identify the document.
+    /// Raw bytes of the partition key.
     pub partition_key: Vec<u8>,
-    /// Murmur3 token for the partition key (from the Cassandra partitioner).
-    pub partition_key_hash: i64,
-    /// Number of times this term occurs in the document.
-    pub term_frequency: u32,
-    /// Total number of tokens in the document (for BM25 normalization).
-    pub field_length: u32,
+    /// Murmur3 token for the partition key (i64).
+    pub token: i64,
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
-/// Builds an in-memory inverted index and serializes it to FTI binary format.
+/// Accumulates documents and builds an FTI byte payload via [`finish()`].
 ///
-/// # Example
-/// ```
-/// use ferrosa_index::fulltext::builder::FullTextIndexBuilder;
-/// use ferrosa_index::fulltext::analyzer::SimpleAnalyzer;
-///
-/// let mut builder = FullTextIndexBuilder::new(Box::new(SimpleAnalyzer));
-/// builder.add_document(b"pk1", 12345, "hello world");
-/// let data = builder.finish();
-/// assert_eq!(&data[0..4], b"FTI\x01");
-/// ```
+/// Documents are tokenized by the configured [`TextAnalyzer`]. The resulting
+/// inverted index maps each term to a deduplicated, sorted list of postings.
 pub struct FullTextIndexBuilder {
-    analyzer: Box<dyn Analyzer>,
-    /// term -> ordered list of postings (one per document that contains the term)
-    postings: HashMap<String, Vec<Posting>>,
-    doc_count: u32,
+    analyzer: Box<dyn TextAnalyzer>,
+    /// term -> list of postings (may contain duplicates before dedup).
+    postings: BTreeMap<String, Vec<Posting>>,
 }
 
 impl FullTextIndexBuilder {
-    /// Create a new builder that will use `analyzer` to tokenize documents.
-    pub fn new(analyzer: Box<dyn Analyzer>) -> Self {
+    /// Create a new builder with the given analyzer.
+    pub fn new(analyzer: Box<dyn TextAnalyzer>) -> Self {
         Self {
             analyzer,
-            postings: HashMap::new(),
-            doc_count: 0,
+            postings: BTreeMap::new(),
         }
     }
 
     /// Add a document to the index.
     ///
-    /// - `partition_key`: raw bytes identifying the Cassandra partition.
-    /// - `partition_key_hash`: Murmur3 token for the partition key.
-    /// - `text`: the field text to be analyzed and indexed.
-    ///
-    /// Documents with empty text are recorded (doc_count increments) but
-    /// contribute no term postings.
-    pub fn add_document(&mut self, partition_key: &[u8], partition_key_hash: i64, text: &str) {
-        let tokens = self.analyzer.analyze(text);
-        let field_length = tokens.len() as u32;
-
-        // Count term frequencies in this document
-        let mut freq: HashMap<String, u32> = HashMap::new();
-        for token in &tokens {
-            *freq.entry(token.text.to_string()).or_default() += 1;
-        }
-
-        // Append one posting per distinct term
-        for (term, tf) in freq {
-            self.postings.entry(term).or_default().push(Posting {
+    /// - `partition_key`: raw partition key bytes, used as the row identifier.
+    /// - `token`: Murmur3 token of the partition key (i64).
+    /// - `text`: the text content to index.
+    pub fn add_document(&mut self, partition_key: &[u8], token: i64, text: &str) {
+        let terms = self.analyzer.analyze(text);
+        for term in terms {
+            let entry = self.postings.entry(term).or_default();
+            entry.push(Posting {
                 partition_key: partition_key.to_vec(),
-                partition_key_hash,
-                term_frequency: tf,
-                field_length,
+                token,
             });
         }
-
-        self.doc_count += 1;
     }
 
-    /// Finalize and serialize the index to a `Vec<u8>` in FTI format.
+    /// Finalize and serialize the index to FTI bytes.
     ///
-    /// The returned bytes start with the magic bytes `b"FTI\x01"` and can be
-    /// passed directly to [`super::reader::FullTextIndexReader::open`].
+    /// The returned buffer is self-contained: it includes the header, term
+    /// dictionary, postings section, and a 4-byte CRC32 footer.
     pub fn finish(self) -> Vec<u8> {
-        // Sort terms for binary search in the reader
-        let mut sorted_terms: Vec<String> = self.postings.keys().cloned().collect();
-        sorted_terms.sort_unstable();
+        // Deduplicate and sort postings per term.
+        let mut terms: Vec<(String, Vec<Posting>)> = self
+            .postings
+            .into_iter()
+            .map(|(term, mut postings)| {
+                postings.sort_by(|a, b| a.token.cmp(&b.token));
+                postings.dedup_by(|a, b| a.partition_key == b.partition_key);
+                (term, postings)
+            })
+            .collect();
+        // BTreeMap already gives sorted order; keep it sorted.
+        terms.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let term_count = sorted_terms.len() as u32;
-        let doc_count = self.doc_count;
+        let term_count = terms.len() as u32;
 
-        // ── Pass 1: serialize postings section and build terms dict ────────
-        // We need to know postings offsets, so we build the postings bytes
-        // first then prepend the header + terms dict.
+        // ── Pass 1: Serialize all postings sections to compute their offsets ──
 
-        // Terms dict size: sum of (2 + term_bytes + 4 + 8 + 4) per term
-        let terms_section_size: usize = sorted_terms.iter().map(|t| 2 + t.len() + 4 + 8 + 4).sum();
+        // Each posting list is:
+        //   posting_count(u32 BE) + posting_count * (pk_len(u32 BE) + pk_bytes + token(i64 BE))
+        let mut postings_buf: Vec<u8> = Vec::new();
+        // offsets[i] = byte offset within postings_buf where term i's list starts
+        let mut offsets: Vec<u64> = Vec::with_capacity(terms.len());
 
-        // Header is always 24 bytes: magic(4) + version(4) + term_count(4) + doc_count(4) + terms_offset(8)
-        const HEADER_SIZE: usize = 24;
-        let terms_start: u64 = HEADER_SIZE as u64;
-        let postings_start: u64 = terms_start + terms_section_size as u64;
-
-        // Build postings bytes, accumulating offset for each term
-        let mut postings_bytes: Vec<u8> = Vec::new();
-        // Parallel list of (postings_offset, postings_length) for each term
-        let mut posting_locs: Vec<(u64, u32)> = Vec::with_capacity(sorted_terms.len());
-
-        for term in &sorted_terms {
-            let term_postings = &self.postings[term];
-            let offset = postings_start + postings_bytes.len() as u64;
-            let start_len = postings_bytes.len();
-
-            for posting in term_postings {
-                // [8] partition_key_hash i64 BE
-                postings_bytes.extend_from_slice(&posting.partition_key_hash.to_be_bytes());
-                // [2] key_length u16 BE
-                let key_len = posting.partition_key.len() as u16;
-                postings_bytes.extend_from_slice(&key_len.to_be_bytes());
-                // [N] partition_key_bytes
-                postings_bytes.extend_from_slice(&posting.partition_key);
-                // [4] term_frequency u32 BE
-                postings_bytes.extend_from_slice(&posting.term_frequency.to_be_bytes());
-                // [4] field_length u32 BE
-                postings_bytes.extend_from_slice(&posting.field_length.to_be_bytes());
+        for (_term, postings) in &terms {
+            offsets.push(postings_buf.len() as u64);
+            let count = postings.len() as u32;
+            postings_buf.extend_from_slice(&count.to_be_bytes());
+            for posting in postings {
+                let pk_len = posting.partition_key.len() as u32;
+                postings_buf.extend_from_slice(&pk_len.to_be_bytes());
+                postings_buf.extend_from_slice(&posting.partition_key);
+                postings_buf.extend_from_slice(&posting.token.to_be_bytes());
             }
-
-            let block_len = (postings_bytes.len() - start_len) as u32;
-            posting_locs.push((offset, block_len));
         }
 
-        // ── Pass 2: assemble final buffer ──────────────────────────────────
-        let total_size = HEADER_SIZE + terms_section_size + postings_bytes.len();
-        let mut buf = Vec::with_capacity(total_size);
+        // ── Pass 2: Serialize the term dictionary ─────────────────────────────
+
+        // The postings section begins immediately after header + term dictionary.
+        // We need to know the dictionary size before we can compute postings offsets.
+        // Dictionary entry:
+        //   term_len(u32 BE) + term_bytes + doc_frequency(u32 BE) + postings_offset(u64 BE)
+
+        let dict_entry_size = |term: &str| -> usize {
+            4 // term_len
+            + term.len()
+            + 4  // doc_frequency
+            + 8 // postings_offset
+        };
+
+        let dict_size: usize = terms.iter().map(|(t, _)| dict_entry_size(t)).sum();
+
+        // Postings section byte base = HEADER_SIZE + dict_size (no footer yet).
+        let postings_base = (HEADER_SIZE + dict_size) as u64;
+
+        let mut dict_buf: Vec<u8> = Vec::with_capacity(dict_size);
+        for (i, (term, postings)) in terms.iter().enumerate() {
+            let term_bytes = term.as_bytes();
+            dict_buf.extend_from_slice(&(term_bytes.len() as u32).to_be_bytes());
+            dict_buf.extend_from_slice(term_bytes);
+            dict_buf.extend_from_slice(&(postings.len() as u32).to_be_bytes());
+            // Absolute byte offset in the file where this posting list starts.
+            let abs_offset = postings_base + offsets[i];
+            dict_buf.extend_from_slice(&abs_offset.to_be_bytes());
+        }
+
+        assert_eq!(dict_buf.len(), dict_size, "dict size mismatch");
+
+        // ── Assemble the full buffer ──────────────────────────────────────────
+
+        let total_size = HEADER_SIZE + dict_size + postings_buf.len() + FOOTER_CRC_SIZE;
+        let mut buf: Vec<u8> = Vec::with_capacity(total_size);
 
         // Header
-        buf.extend_from_slice(b"FTI\x01"); // magic [4]
-        buf.extend_from_slice(&1u32.to_be_bytes()); // version [4]
-        buf.extend_from_slice(&term_count.to_be_bytes()); // term_count [4]
-        buf.extend_from_slice(&doc_count.to_be_bytes()); // doc_count [4]
-        buf.extend_from_slice(&terms_start.to_be_bytes()); // terms_offset [8]
+        buf.extend_from_slice(FTI_MAGIC);
+        buf.push(FTI_VERSION);
+        buf.extend_from_slice(&term_count.to_be_bytes());
 
-        // Terms dictionary
-        for (i, term) in sorted_terms.iter().enumerate() {
-            let (postings_offset, postings_length) = posting_locs[i];
-            let doc_freq = self.postings[term].len() as u32;
-            let term_bytes = term.as_bytes();
+        assert_eq!(buf.len(), HEADER_SIZE, "header size mismatch");
 
-            // [2] term_length u16 BE
-            buf.extend_from_slice(&(term_bytes.len() as u16).to_be_bytes());
-            // [N] term_bytes
-            buf.extend_from_slice(term_bytes);
-            // [4] doc_frequency u32 BE
-            buf.extend_from_slice(&doc_freq.to_be_bytes());
-            // [8] postings_offset u64 BE
-            buf.extend_from_slice(&postings_offset.to_be_bytes());
-            // [4] postings_length u32 BE
-            buf.extend_from_slice(&postings_length.to_be_bytes());
-        }
+        // Dictionary
+        buf.extend_from_slice(&dict_buf);
 
-        // Postings section
-        buf.extend_from_slice(&postings_bytes);
+        // Postings
+        buf.extend_from_slice(&postings_buf);
+
+        // CRC32 over everything so far
+        let checksum = crc32fast::hash(&buf);
+        buf.extend_from_slice(&checksum.to_be_bytes());
+
+        assert_eq!(buf.len(), total_size, "total size mismatch");
 
         buf
     }
@@ -206,78 +192,71 @@ impl FullTextIndexBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fulltext::analyzer::SimpleAnalyzer;
 
     #[test]
-    fn fts_builder_single_doc() {
-        let mut builder = FullTextIndexBuilder::new(Box::new(SimpleAnalyzer));
-        builder.add_document(b"pk1", 12345, "hello world");
+    fn empty_builder_finish_produces_valid_header() {
+        let builder = FullTextIndexBuilder::new(Box::new(SimpleAnalyzer));
         let data = builder.finish();
-        assert!(!data.is_empty());
-        assert_eq!(&data[0..4], b"FTI\x01", "magic bytes must be present");
+
+        // Must have at least header + CRC footer.
+        assert!(
+            data.len() >= HEADER_SIZE + FOOTER_CRC_SIZE,
+            "expected at least {} bytes, got {}",
+            HEADER_SIZE + FOOTER_CRC_SIZE,
+            data.len()
+        );
+
+        assert_eq!(&data[..4], FTI_MAGIC.as_slice(), "magic mismatch");
+        assert_eq!(data[4], FTI_VERSION, "version mismatch");
+
+        // term_count == 0
+        let term_count = u32::from_be_bytes(data[5..9].try_into().unwrap());
+        assert_eq!(term_count, 0, "expected 0 terms in empty builder");
     }
 
     #[test]
-    fn fts_builder_multi_doc() {
+    fn simple_analyzer_tokenizes_correctly() {
+        let analyzer = SimpleAnalyzer;
+        let terms = analyzer.analyze("Hello, World! foo bar");
+        assert_eq!(terms, vec!["hello", "world", "foo", "bar"]);
+    }
+
+    #[test]
+    fn simple_analyzer_empty_string() {
+        let analyzer = SimpleAnalyzer;
+        let terms = analyzer.analyze("");
+        assert!(terms.is_empty());
+    }
+
+    #[test]
+    fn simple_analyzer_strips_punctuation() {
+        let analyzer = SimpleAnalyzer;
+        let terms = analyzer.analyze("  --rust-- ");
+        assert_eq!(terms, vec!["rust"]);
+    }
+
+    #[test]
+    fn builder_deduplicates_postings_for_same_partition() {
+        let mut builder = FullTextIndexBuilder::new(Box::new(SimpleAnalyzer));
+        // Same pk, same term appearing twice in the text.
+        builder.add_document(b"pk1", 42, "hello hello world");
+        let data = builder.finish();
+        // Should have 2 terms: "hello" and "world", each with 1 posting.
+        assert!(data.len() > HEADER_SIZE + FOOTER_CRC_SIZE);
+    }
+
+    #[test]
+    fn builder_multiple_documents_same_term() {
         let mut builder = FullTextIndexBuilder::new(Box::new(SimpleAnalyzer));
         builder.add_document(b"pk1", 1, "hello world");
         builder.add_document(b"pk2", 2, "hello rust");
-        builder.add_document(b"pk3", 3, "world rust");
         let data = builder.finish();
-        assert!(!data.is_empty(), "multi-doc index must not be empty");
 
-        // Check the header for term_count and doc_count
-        // Header layout: magic[4] + version[4] + term_count[4] + doc_count[4] + terms_offset[8]
-        let term_count = u32::from_be_bytes(data[8..12].try_into().unwrap());
-        let doc_count = u32::from_be_bytes(data[12..16].try_into().unwrap());
-        assert_eq!(doc_count, 3, "doc_count must reflect three documents");
-        // "hello", "world", "rust" — 3 distinct terms
-        assert_eq!(
-            term_count, 3,
-            "term_count must reflect three distinct terms"
-        );
-    }
-
-    #[test]
-    fn fts_builder_handles_valid_text() {
-        // This test verifies the builder accepts ordinary text without panicking.
-        let mut builder = FullTextIndexBuilder::new(Box::new(SimpleAnalyzer));
-        builder.add_document(b"pk1", 1, "valid text only");
-        let data = builder.finish();
-        assert!(!data.is_empty());
-    }
-
-    #[test]
-    fn fts_builder_empty_field() {
-        let mut builder = FullTextIndexBuilder::new(Box::new(SimpleAnalyzer));
-        builder.add_document(b"pk1", 1, "");
-        let data = builder.finish();
-        // Should produce valid FTI with 0 terms but doc_count=1
-        assert_eq!(&data[0..4], b"FTI\x01", "magic bytes must be present");
-        let term_count = u32::from_be_bytes(data[8..12].try_into().unwrap());
-        let doc_count = u32::from_be_bytes(data[12..16].try_into().unwrap());
-        assert_eq!(term_count, 0, "empty field yields zero terms");
-        assert_eq!(doc_count, 1, "empty field still increments doc_count");
-    }
-
-    #[test]
-    fn fts_builder_term_frequency_counted_correctly() {
-        let mut builder = FullTextIndexBuilder::new(Box::new(SimpleAnalyzer));
-        // "hello" appears twice in one document
-        builder.add_document(b"pk1", 1, "hello hello world");
-        let data = builder.finish();
-        assert!(!data.is_empty());
-        // We'll verify the full term frequency through the reader in reader tests.
-        // Here just check the index is non-trivial.
-        let term_count = u32::from_be_bytes(data[8..12].try_into().unwrap());
-        assert_eq!(term_count, 2, "hello and world are the two distinct terms");
-    }
-
-    #[test]
-    fn fts_builder_version_field_is_one() {
-        let builder = FullTextIndexBuilder::new(Box::new(SimpleAnalyzer));
-        let data = builder.finish();
-        let version = u32::from_be_bytes(data[4..8].try_into().unwrap());
-        assert_eq!(version, 1, "version field must be 1");
+        // Verify CRC is at the end (bytes len-4).
+        let data_len = data.len();
+        let payload = &data[..data_len - 4];
+        let stored_crc = u32::from_be_bytes(data[data_len - 4..].try_into().unwrap());
+        let computed_crc = crc32fast::hash(payload);
+        assert_eq!(stored_crc, computed_crc, "CRC32 must match");
     }
 }

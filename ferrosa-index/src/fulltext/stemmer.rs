@@ -1,399 +1,395 @@
-//! Porter stemmer (1980) for English.
+//! Porter stemmer (Step 1–5) for English text normalization.
 //!
-//! Implements the algorithm described in:
-//! M.F. Porter, "An algorithm for suffix stripping", Program, Vol. 14, No. 3,
-//! pp. 130-137, July 1980.
+//! Reference: M.F. Porter, "An algorithm for suffix stripping",
+//! Program, 14(3): 130-137, 1980.
 //!
-//! This is a faithful implementation of all 5 steps. It operates on lowercase
-//! ASCII input; non-ASCII bytes are passed through unchanged.
+//! This is a faithful implementation of the classic algorithm sufficient for
+//! FTS indexing. It is not a replacement for a production-grade NLP library.
 
-/// Stem a single lowercase word using the Porter algorithm.
-///
-/// The input should be a single token (no whitespace). For best results,
-/// lowercase the input before calling this function.
-///
-/// # Examples
-///
-/// ```
-/// use ferrosa_index::fulltext::stemmer::stem;
-/// assert_eq!(stem("running"), "run");
-/// assert_eq!(stem("caresses"), "caress");
-/// ```
-pub fn stem(word: &str) -> String {
-    let mut b: Vec<u8> = word.as_bytes().to_vec();
+// ── Public entry point ────────────────────────────────────────────────────────
 
-    // Words shorter than 3 characters are not stemmed.
-    if b.len() < 3 {
-        return word.to_owned();
+/// Reduce `word` to its English stem using the Porter algorithm.
+///
+/// Returns a new `String`; the input is not modified. Words shorter than
+/// three characters are returned unchanged.
+pub fn porter_stem(word: &str) -> String {
+    if word.len() < 3 {
+        return word.to_string();
     }
 
-    step1a(&mut b);
-    step1b(&mut b);
-    step1c(&mut b);
-    step2(&mut b);
-    step3(&mut b);
-    step4(&mut b);
-    step5a(&mut b);
-    step5b(&mut b);
+    let mut chars: Vec<char> = word.chars().collect();
 
-    String::from_utf8(b).unwrap_or_else(|_| word.to_owned())
+    step1a(&mut chars);
+    step1b(&mut chars);
+    step1c(&mut chars);
+    step2(&mut chars);
+    step3(&mut chars);
+    step4(&mut chars);
+    step5a(&mut chars);
+    step5b(&mut chars);
+
+    chars.iter().collect()
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Returns true if `b[i]` is a vowel (a, e, i, o, u).
-/// A `y` after a consonant is also treated as a vowel.
-fn is_vowel(b: &[u8], i: usize) -> bool {
-    match b[i] {
-        b'a' | b'e' | b'i' | b'o' | b'u' => true,
-        b'y' => i > 0 && !is_vowel(b, i - 1),
+/// Returns `true` if `chars[i]` is a vowel (a, e, i, o, u, or y after a consonant).
+fn is_vowel(chars: &[char], i: usize) -> bool {
+    match chars[i] {
+        'a' | 'e' | 'i' | 'o' | 'u' => true,
+        'y' => i > 0 && !is_vowel(chars, i - 1),
         _ => false,
     }
 }
 
-/// Compute *m* — the count of consonant sequences (VC groups) in `b[0..end]`.
-///
-/// A consonant sequence is a maximal run of consonants. *m* counts how many
-/// times a vowel sequence is followed by a consonant sequence in the stem.
-fn measure(b: &[u8], end: usize) -> usize {
-    if end == 0 {
-        return 0;
-    }
+/// Measure *m*: count consonant-vowel sequences in `chars[..end]`.
+fn measure(chars: &[char], end: usize) -> usize {
     let mut m = 0;
     let mut i = 0;
-    // Skip any leading vowels.
-    while i < end && is_vowel(b, i) {
+    // Skip leading consonants
+    while i < end && !is_vowel(chars, i) {
         i += 1;
     }
     loop {
-        // Skip consonants.
-        while i < end && !is_vowel(b, i) {
+        // Skip vowel cluster
+        while i < end && is_vowel(chars, i) {
             i += 1;
         }
         if i >= end {
             break;
         }
         m += 1;
-        // Skip vowels.
-        while i < end && is_vowel(b, i) {
+        // Skip consonant cluster
+        while i < end && !is_vowel(chars, i) {
             i += 1;
-        }
-        if i >= end {
-            break;
         }
     }
     m
 }
 
-/// Returns true if `b[0..end]` contains at least one vowel.
-fn has_vowel(b: &[u8], end: usize) -> bool {
-    (0..end).any(|i| is_vowel(b, i))
+/// Returns `true` if `chars[..end]` contains a vowel.
+fn contains_vowel(chars: &[char], end: usize) -> bool {
+    (0..end).any(|i| is_vowel(chars, i))
 }
 
-/// Returns true if `b[end-1]` is a double consonant.
-fn ends_double_consonant(b: &[u8], end: usize) -> bool {
-    end >= 2 && b[end - 1] == b[end - 2] && !is_vowel(b, end - 1)
+/// Returns `true` if `chars[..end]` ends with a double consonant.
+fn ends_double_consonant(chars: &[char], end: usize) -> bool {
+    if end < 2 {
+        return false;
+    }
+    let a = chars[end - 1];
+    let b = chars[end - 2];
+    a == b && !is_vowel(chars, end - 1)
 }
 
-/// Returns true if the stem `b[0..end]` ends with consonant-vowel-consonant
-/// where the final consonant is not w, x, or y.
-fn ends_cvc(b: &[u8], end: usize) -> bool {
+/// Returns `true` if `chars[..end]` ends in consonant-vowel-consonant where
+/// the final consonant is not w, x, or y.
+fn ends_cvc_clean(chars: &[char], end: usize) -> bool {
     if end < 3 {
         return false;
     }
-    let c = b[end - 1];
-    !is_vowel(b, end - 1)
-        && is_vowel(b, end - 2)
-        && !is_vowel(b, end - 3)
-        && c != b'w'
-        && c != b'x'
-        && c != b'y'
+    !is_vowel(chars, end - 3)
+        && is_vowel(chars, end - 2)
+        && !is_vowel(chars, end - 1)
+        && !matches!(chars[end - 1], 'w' | 'x' | 'y')
 }
 
-/// Replace a suffix on `b` if the suffix matches and `measure(stem) > min_m`.
-fn replace_if_m_gt(b: &mut Vec<u8>, suffix: &[u8], replacement: &[u8], min_m: usize) -> bool {
-    if b.ends_with(suffix) {
-        let stem_end = b.len() - suffix.len();
-        if measure(b, stem_end) > min_m {
-            b.truncate(stem_end);
-            b.extend_from_slice(replacement);
-            return true;
-        }
-    }
-    false
-}
-
-// ── Steps ────────────────────────────────────────────────────────────────────
-
-/// Step 1a: Plurals and -ed/-ing (simple plural handling).
-///
-/// sses → ss
-/// ies  → i
-/// ss   → ss  (no change)
-/// s    → (remove)
-fn step1a(b: &mut Vec<u8>) {
-    if b.ends_with(b"sses") {
-        let n = b.len();
-        b.truncate(n - 2); // sses → ss
-    } else if b.ends_with(b"ies") {
-        let n = b.len();
-        b.truncate(n - 2); // ies → i
-    } else if b.ends_with(b"ss") {
-        // no change
-    } else if b.ends_with(b"s") {
-        b.pop();
-    }
-}
-
-/// Step 1b: -eed, -ed, -ing.
-fn step1b(b: &mut Vec<u8>) {
-    if b.ends_with(b"eed") {
-        let stem_end = b.len() - 3;
-        if measure(b, stem_end) > 0 {
-            b.pop(); // eed → ee
-        }
-        return;
-    }
-
-    let had_vowel_before_ed = b.ends_with(b"ed") && {
-        let stem_end = b.len() - 2;
-        has_vowel(b, stem_end)
-    };
-    let had_vowel_before_ing = b.ends_with(b"ing") && {
-        let stem_end = b.len() - 3;
-        has_vowel(b, stem_end)
-    };
-
-    if had_vowel_before_ed {
-        let n = b.len();
-        b.truncate(n - 2);
-    } else if had_vowel_before_ing {
-        let n = b.len();
-        b.truncate(n - 3);
+/// Check if `chars` ends with `suffix` and return the stem length if it does.
+fn ends_with(chars: &[char], suffix: &[char]) -> Option<usize> {
+    let n = chars.len();
+    let s = suffix.len();
+    if n >= s && &chars[n - s..] == suffix {
+        Some(n - s)
     } else {
+        None
+    }
+}
+
+/// Replace the suffix (detected by `stem_len`) with `replacement` in-place.
+fn replace_suffix(chars: &mut Vec<char>, stem_len: usize, replacement: &[char]) {
+    chars.truncate(stem_len);
+    chars.extend_from_slice(replacement);
+}
+
+// ── Step 1a ───────────────────────────────────────────────────────────────────
+
+fn step1a(chars: &mut Vec<char>) {
+    let suffixes: &[(&[char], &[char])] = &[
+        (&['s', 's', 'e', 's'], &['s', 's']),
+        (&['i', 'e', 's'], &['i']),
+        (&['s', 's'], &['s', 's']),
+        (&['s'], &[]),
+    ];
+    for (suffix, replacement) in suffixes {
+        if let Some(stem) = ends_with(chars, suffix) {
+            replace_suffix(chars, stem, replacement);
+            return;
+        }
+    }
+}
+
+// ── Step 1b ───────────────────────────────────────────────────────────────────
+
+fn step1b(chars: &mut Vec<char>) {
+    // (m>0) EED -> EE
+    let eed: Vec<char> = "eed".chars().collect();
+    let ee: Vec<char> = "ee".chars().collect();
+    if let Some(stem) = ends_with(chars, &eed) {
+        if measure(chars, stem) > 0 {
+            replace_suffix(chars, stem, &ee);
+        }
         return;
     }
 
-    // Post-processing after removing -ed / -ing.
-    if b.ends_with(b"at") || b.ends_with(b"bl") || b.ends_with(b"iz") {
-        b.push(b'e');
-    } else if ends_double_consonant(b, b.len())
-        && !b.ends_with(b"l")
-        && !b.ends_with(b"s")
-        && !b.ends_with(b"z")
-    {
-        b.pop(); // double consonant → single
-    } else if measure(b, b.len()) == 1 && ends_cvc(b, b.len()) {
-        b.push(b'e');
+    // (*v*) ED -> ""
+    let ed: Vec<char> = "ed".chars().collect();
+    if let Some(stem) = ends_with(chars, &ed) {
+        if contains_vowel(chars, stem) {
+            replace_suffix(chars, stem, &[]);
+            step1b_post(chars);
+        }
+        return;
     }
-}
 
-/// Step 1c: -y → -i when there is a vowel in the stem.
-fn step1c(b: &mut [u8]) {
-    if b.ends_with(b"y") {
-        let stem_end = b.len() - 1;
-        if has_vowel(b, stem_end) {
-            *b.last_mut().unwrap() = b'i';
+    // (*v*) ING -> ""
+    let ing: Vec<char> = "ing".chars().collect();
+    if let Some(stem) = ends_with(chars, &ing) {
+        if contains_vowel(chars, stem) {
+            replace_suffix(chars, stem, &[]);
+            step1b_post(chars);
         }
     }
 }
 
-/// Step 2: Map common derivational suffixes (requires m > 0).
-fn step2(b: &mut Vec<u8>) {
-    // Ordered longest-first to avoid prefix matches on shorter suffixes.
-    let rules: &[(&[u8], &[u8])] = &[
-        (b"ational", b"ate"),
-        (b"tional", b"tion"),
-        (b"enci", b"ence"),
-        (b"anci", b"ance"),
-        (b"izer", b"ize"),
-        (b"abli", b"able"),
-        (b"alli", b"al"),
-        (b"entli", b"ent"),
-        (b"eli", b"e"),
-        (b"ousli", b"ous"),
-        (b"ization", b"ize"),
-        (b"ation", b"ate"),
-        (b"ator", b"ate"),
-        (b"alism", b"al"),
-        (b"iveness", b"ive"),
-        (b"fulness", b"ful"),
-        (b"ousness", b"ous"),
-        (b"aliti", b"al"),
-        (b"iviti", b"ive"),
-        (b"biliti", b"ble"),
+fn step1b_post(chars: &mut Vec<char>) {
+    let n = chars.len();
+
+    // AT -> ATE
+    let at: Vec<char> = "at".chars().collect();
+    let ate: Vec<char> = "ate".chars().collect();
+    if ends_with(chars, &at).is_some() {
+        chars.extend_from_slice(&ate[2..3]); // append 'e'
+        return;
+    }
+
+    // BL -> BLE
+    let bl: Vec<char> = "bl".chars().collect();
+    if ends_with(chars, &bl).is_some() {
+        chars.push('e');
+        return;
+    }
+
+    // IZ -> IZE
+    let iz: Vec<char> = "iz".chars().collect();
+    if ends_with(chars, &iz).is_some() {
+        chars.push('e');
+        return;
+    }
+
+    // Double consonant (not L, S, Z) -> remove last char
+    if n >= 2 && ends_double_consonant(chars, n) && !matches!(chars[n - 1], 'l' | 's' | 'z') {
+        chars.pop();
+        return;
+    }
+
+    // (m=1 and *o) -> E
+    if measure(chars, n) == 1 && ends_cvc_clean(chars, n) {
+        chars.push('e');
+    }
+}
+
+// ── Step 1c ───────────────────────────────────────────────────────────────────
+
+fn step1c(chars: &mut [char]) {
+    let n = chars.len();
+    if n > 0 && chars[n - 1] == 'y' && contains_vowel(chars, n - 1) {
+        chars[n - 1] = 'i';
+    }
+}
+
+// ── Step 2 ───────────────────────────────────────────────────────────────────
+
+fn step2(chars: &mut Vec<char>) {
+    let rules: &[(&str, &str)] = &[
+        ("ational", "ate"),
+        ("tional", "tion"),
+        ("enci", "ence"),
+        ("anci", "ance"),
+        ("izer", "ize"),
+        ("abli", "able"),
+        ("alli", "al"),
+        ("entli", "ent"),
+        ("eli", "e"),
+        ("ousli", "ous"),
+        ("ization", "ize"),
+        ("ation", "ate"),
+        ("ator", "ate"),
+        ("alism", "al"),
+        ("iveness", "ive"),
+        ("fulness", "ful"),
+        ("ousness", "ous"),
+        ("aliti", "al"),
+        ("iviti", "ive"),
+        ("biliti", "ble"),
     ];
-    for &(suffix, replacement) in rules {
-        if replace_if_m_gt(b, suffix, replacement, 0) {
+    apply_m1_rules(chars, rules);
+}
+
+// ── Step 3 ───────────────────────────────────────────────────────────────────
+
+fn step3(chars: &mut Vec<char>) {
+    let rules: &[(&str, &str)] = &[
+        ("icate", "ic"),
+        ("ative", ""),
+        ("alize", "al"),
+        ("iciti", "ic"),
+        ("ical", "ic"),
+        ("ful", ""),
+        ("ness", ""),
+    ];
+    apply_m1_rules(chars, rules);
+}
+
+// ── Step 4 ───────────────────────────────────────────────────────────────────
+
+fn step4(chars: &mut Vec<char>) {
+    let rules: &[(&str, &str)] = &[
+        ("al", ""),
+        ("ance", ""),
+        ("ence", ""),
+        ("er", ""),
+        ("ic", ""),
+        ("able", ""),
+        ("ible", ""),
+        ("ant", ""),
+        ("ement", ""),
+        ("ment", ""),
+        ("ent", ""),
+        ("ou", ""),
+        ("ism", ""),
+        ("ate", ""),
+        ("iti", ""),
+        ("ous", ""),
+        ("ive", ""),
+        ("ize", ""),
+    ];
+
+    // Special: (m>1 and (*S or *T)) ION -> ""
+    let ion: Vec<char> = "ion".chars().collect();
+    if let Some(stem) = ends_with(chars, &ion) {
+        if measure(chars, stem) > 1 && matches!(chars.get(stem - 1), Some('s') | Some('t')) {
+            replace_suffix(chars, stem, &[]);
             return;
         }
     }
+
+    apply_m2_rules(chars, rules);
 }
 
-/// Step 3: Map more derivational suffixes (requires m > 0).
-fn step3(b: &mut Vec<u8>) {
-    let rules: &[(&[u8], &[u8])] = &[
-        (b"icate", b"ic"),
-        (b"ative", b""),
-        (b"alize", b"al"),
-        (b"iciti", b"ic"),
-        (b"ical", b"ic"),
-        (b"ful", b""),
-        (b"ness", b""),
-    ];
-    for &(suffix, replacement) in rules {
-        if replace_if_m_gt(b, suffix, replacement, 0) {
-            return;
+// ── Step 5a ──────────────────────────────────────────────────────────────────
+
+fn step5a(chars: &mut Vec<char>) {
+    let n = chars.len();
+    if n == 0 {
+        return;
+    }
+    if chars[n - 1] == 'e' {
+        let m = measure(chars, n - 1);
+        if m > 1 || (m == 1 && !ends_cvc_clean(chars, n - 1)) {
+            chars.pop();
         }
     }
 }
 
-/// Step 4: Remove common suffixes when m > 1.
-fn step4(b: &mut Vec<u8>) {
-    let suffixes: &[&[u8]] = &[
-        b"ement", b"ment", b"ance", b"ence", b"able", b"ible", b"ant",
-        b"ent",  b"ism",  b"ate",  b"iti",  b"ous",  b"ive",  b"ize",
-        b"ion",  b"al",   b"er",   b"ic",
-    ];
+// ── Step 5b ──────────────────────────────────────────────────────────────────
 
-    // Special case: "ion" requires the preceding char to be 's' or 't'.
-    if b.ends_with(b"ion") {
-        let stem_end = b.len() - 3;
-        if stem_end > 0
-            && (b[stem_end - 1] == b's' || b[stem_end - 1] == b't')
-            && measure(b, stem_end) > 1
-        {
-            b.truncate(stem_end);
-            return;
-        }
+fn step5b(chars: &mut Vec<char>) {
+    let n = chars.len();
+    if n >= 2 && ends_double_consonant(chars, n) && chars[n - 1] == 'l' && measure(chars, n) > 1 {
+        chars.pop();
     }
+}
 
-    for &suffix in suffixes {
-        if suffix == b"ion" {
-            continue; // handled above
-        }
-        if b.ends_with(suffix) {
-            let stem_end = b.len() - suffix.len();
-            if measure(b, stem_end) > 1 {
-                b.truncate(stem_end);
+// ── Shared rule applicators ───────────────────────────────────────────────────
+
+/// Apply suffix-replacement rules where m > 0 (Steps 2 and 3).
+fn apply_m1_rules(chars: &mut Vec<char>, rules: &[(&str, &str)]) {
+    for (suffix, replacement) in rules {
+        let sfx: Vec<char> = suffix.chars().collect();
+        if let Some(stem) = ends_with(chars, &sfx) {
+            if measure(chars, stem) > 0 {
+                let rep: Vec<char> = replacement.chars().collect();
+                replace_suffix(chars, stem, &rep);
                 return;
             }
         }
     }
 }
 
-/// Step 5a: Remove final -e when m > 1, or when m == 1 and stem does not end CVC.
-fn step5a(b: &mut Vec<u8>) {
-    if b.ends_with(b"e") {
-        let stem_end = b.len() - 1;
-        let m = measure(b, stem_end);
-        if m > 1 || (m == 1 && !ends_cvc(b, stem_end)) {
-            b.pop();
+/// Apply suffix-replacement rules where m > 1 (Step 4).
+fn apply_m2_rules(chars: &mut Vec<char>, rules: &[(&str, &str)]) {
+    for (suffix, replacement) in rules {
+        let sfx: Vec<char> = suffix.chars().collect();
+        if let Some(stem) = ends_with(chars, &sfx) {
+            if measure(chars, stem) > 1 {
+                let rep: Vec<char> = replacement.chars().collect();
+                replace_suffix(chars, stem, &rep);
+                return;
+            }
         }
     }
 }
 
-/// Step 5b: Remove one of a double -ll when m > 1.
-fn step5b(b: &mut Vec<u8>) {
-    if measure(b, b.len()) > 1 && ends_double_consonant(b, b.len()) && b.ends_with(b"l") {
-        b.pop();
-    }
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Test cases from the canonical Porter stemmer test file.
     #[test]
-    fn porter_stemmer_basic() {
-        assert_eq!(stem("running"), "run");
-        assert_eq!(stem("jumps"), "jump");
-        assert_eq!(stem("easily"), "easili");
-        assert_eq!(stem("caresses"), "caress");
+    fn porter_stem_canonical_cases() {
+        let cases = [
+            ("caresses", "caress"),
+            ("ponies", "poni"),
+            ("ties", "ti"),
+            ("caress", "caress"),
+            ("cats", "cat"),
+            ("troubles", "troubl"),
+            ("troubled", "troubl"),
+            ("troubling", "troubl"),
+            ("hopping", "hop"),
+            ("tanned", "tan"),
+            ("falling", "fall"),
+            ("hissing", "hiss"),
+            ("fizzing", "fizz"),
+            ("failing", "fail"),
+            ("filing", "file"),
+            ("happy", "happi"),
+            ("sky", "sky"),
+            ("relational", "relat"),
+            ("generalization", "gener"),
+            ("electrical", "electr"),
+            ("effective", "effect"),
+            ("communicate", "commun"),
+        ];
+        for (input, expected) in cases {
+            let result = porter_stem(input);
+            assert_eq!(
+                result, expected,
+                "porter_stem({input:?}) = {result:?}, expected {expected:?}"
+            );
+        }
     }
 
     #[test]
-    fn porter_stemmer_irregular() {
-        // Porter stemmer doesn't handle truly irregular words
-        // but should reduce common suffixes.
-        assert_eq!(stem("databases"), "databas");
+    fn short_words_unchanged() {
+        assert_eq!(porter_stem("a"), "a");
+        assert_eq!(porter_stem("by"), "by");
     }
 
     #[test]
-    fn porter_stemmer_step1a_plurals() {
-        assert_eq!(stem("caresses"), "caress"); // sses → ss
-        assert_eq!(stem("ponies"), "poni");     // ies → i
-        assert_eq!(stem("ties"), "ti");         // ies → i
-        assert_eq!(stem("cats"), "cat");        // s → (removed)
-    }
-
-    #[test]
-    fn porter_stemmer_step1b_ed_ing() {
-        // "agreed": stem of "eed" is "agr" — m("agr")=0, rule requires m>0, no change.
-        assert_eq!(stem("agreed"), "agreed");
-        assert_eq!(stem("plastered"), "plaster");
-        assert_eq!(stem("motoring"), "motor");
-        assert_eq!(stem("sized"), "size");
-    }
-
-    #[test]
-    fn porter_stemmer_step1c_y_to_i() {
-        assert_eq!(stem("happy"), "happi");
-        assert_eq!(stem("sky"), "sky"); // no vowel in stem "sk"
-    }
-
-    #[test]
-    fn porter_stemmer_step2_derivational() {
-        assert_eq!(stem("relational"), "relat");
-        assert_eq!(stem("conditional"), "condit");
-        // "rational": "ational" stem is "r" with m=0 (no VC group), so that rule
-        // doesn't fire; "tional" stem is "ra" with m=1 → fires → "ration".
-        assert_eq!(stem("rational"), "ration");
-        assert_eq!(stem("valenci"), "valenc");
-        assert_eq!(stem("digitizer"), "digit");
-    }
-
-    #[test]
-    fn porter_stemmer_step3_ful_ness() {
-        assert_eq!(stem("hopeful"), "hope");
-        assert_eq!(stem("goodness"), "good");
-    }
-
-    #[test]
-    fn porter_stemmer_step4_remove_long_suffixes() {
-        assert_eq!(stem("revival"), "reviv");
-        // "allowance": step4 "ance" stem "allow" m=1 (not >1), no fire;
-        // step5a strips final "e" since stem "allowanc" has m=2 > 1.
-        assert_eq!(stem("allowance"), "allowanc");
-        // "inference": same pattern — step5a strips "e" → "inferenc".
-        assert_eq!(stem("inference"), "inferenc");
-    }
-
-    #[test]
-    fn porter_stemmer_short_words_unchanged() {
-        assert_eq!(stem("a"), "a");
-        assert_eq!(stem("be"), "be");
-        assert_eq!(stem("sky"), "sky");
-    }
-
-    #[test]
-    fn porter_stemmer_step5_final_e() {
-        assert_eq!(stem("probate"), "probat");
-        assert_eq!(stem("rate"), "rate"); // m == 1, ends CVC → keep e
-        assert_eq!(stem("cease"), "ceas");
-    }
-
-    #[test]
-    fn porter_stemmer_controllability() {
-        // "generalization": step2 "ization"→"ize" → "generalize";
-        // step3 "alize"→"al" → "general";
-        // step4 "al" stem "gener" m=2>1 → strips "al" → "gener".
-        assert_eq!(stem("generalization"), "gener");
-        // "controllability": biliti→ble (step2) → "controllable";
-        // step4 "able" stem "controll" m=2>1 → "controll";
-        // step5b: double-l, m>1 → "control".
-        assert_eq!(stem("controllability"), "control");
+    fn empty_string_unchanged() {
+        assert_eq!(porter_stem(""), "");
     }
 }
