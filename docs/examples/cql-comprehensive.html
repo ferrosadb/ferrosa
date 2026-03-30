@@ -271,6 +271,27 @@ UPDATE collection_types SET scores = scores - {10} WHERE id = 1;
 -- Map put and remove</code></pre>
 </div>
 </div>
+<div class="sect2">
+<h4 id="_collection_bind_values">Collection Bind Values</h4>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Prepared statements with collection bind values
+-- Map, set, and list values bound via EXECUTE are stored in
+-- Cassandra-compatible wire format and survive flush + compaction.
+
+-- Insert with map bind value
+PREPARE insert_with_map FROM
+  'INSERT INTO collection_types (id, props) VALUES (?, ?)';
+-- EXECUTE insert_with_map USING 10, {'color': 'blue', 'size': 'large'};
+
+-- Update set with bind value
+PREPARE add_to_set FROM
+  'UPDATE collection_types SET scores = scores + ? WHERE id = ?';
+-- EXECUTE add_to_set USING {60, 70}, 1;
+</code></pre>
+</div>
+</div>
+</div>
 </div>
 </div>
 <div class="sect1">

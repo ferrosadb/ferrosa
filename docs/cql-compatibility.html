@@ -309,6 +309,8 @@
     </tbody>
   </table>
 
+  <p>Collection bind values in prepared statements are fully supported. Map, set, and list values bound via <code>EXECUTE</code> are stored in Cassandra-compatible wire format and survive flush, compaction, and S3 upload without format loss.</p>
+
   <!-- ── DDL ── -->
   <h2 id="ddl">DDL Statements</h2>
 
@@ -329,6 +331,8 @@
       <tr><td>CREATE FUNCTION / AGGREGATE</td><td><span class="check">Supported</span></td><td>CREATE/DROP FUNCTION (WASM), CREATE/DROP AGGREGATE — full DDL lifecycle with cluster replication</td></tr>
     </tbody>
   </table>
+
+  <p class="note">Prepared statements remain valid after <code>ALTER TABLE ADD</code> or <code>DROP</code> column — the schema snapshot updates atomically and subsequent <code>PREPARE</code> calls reflect the current column set.</p>
 
   <h3>Example</h3>
   <pre><span class="kw">CREATE KEYSPACE</span> <span class="type">social</span> <span class="kw">WITH</span> replication = {
@@ -376,6 +380,8 @@
 
   <h3>Prepared statements</h3>
   <p>Full PREPARE/EXECUTE support with positional bind values. PREPARE responses include <code>pk_count</code> metadata for driver routing. The prepared statement cache uses moka with W-TinyLFU eviction (64 MB default). Bind markers (<code>?</code>) and named bind markers (<code>:name</code>) are both supported.</p>
+
+  <p>Bind values are fully supported in <code>QUERY</code> frames — positional (<code>?</code>) and named (<code>:name</code>) markers work in all statement types: SELECT, INSERT, UPDATE, DELETE. Collection-typed bind values (map, set, list) are passed through in Cassandra wire format for correct round-trip storage.</p>
 
   <pre><span class="cm">-- Prepare</span>
 <span class="kw">PREPARE</span> stmt <span class="kw">FROM</span> <span class="str">'SELECT * FROM social.users WHERE user_id = ?'</span>;

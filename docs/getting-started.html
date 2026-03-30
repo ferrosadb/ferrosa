@@ -556,6 +556,19 @@ session.execute(<span class="str">"""
     upload queue depth and alert on sustained failures.
   </div>
 
+  <h3>Schema Durability</h3>
+  <p>Ferrosa persists all schema changes (keyspaces, tables, indexes, types, functions) to local disk on every flush and to S3 during periodic sync. When a node restarts — even after a binary upgrade with preserved data — the schema is restored automatically. No manual DDL replay is needed.</p>
+
+  <h3>Compaction and S3</h3>
+  <p>The storage pipeline handles compaction end-to-end:</p>
+  <ol>
+    <li>Memtable flushes to local SSTable</li>
+    <li>Size-Tiered Compaction merges SSTables when a bucket reaches threshold</li>
+    <li>Compacted output uploads to S3 with confirmation before manifest update</li>
+    <li>Manifest uses compare-and-swap to prevent concurrent update loss</li>
+    <li>Superseded input SSTables are deleted from S3 and local disk</li>
+  </ol>
+
   <h3>Multi-Node Cluster (Experimental)</h3>
   <p>Three-node cluster mode (<code>FERROSA_CLUSTER_MODE=cluster</code>) uses Raft consensus for
     metadata and tunable consistency for data. Current limitations:</p>

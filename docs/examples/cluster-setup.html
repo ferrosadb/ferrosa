@@ -452,6 +452,15 @@ On Linux, if you see a "permission denied" error, you may need to add your user 
 </table>
 </div>
 </div>
+<div class="sect2">
+<h3 id="_pair_mode_write_durability">Pair Mode Write Durability</h3>
+<div class="paragraph">
+<p>In pair mode, writes are confirmed to the client only after both the primary and secondary replica acknowledge the mutation. If the secondary is unreachable, the write returns an error rather than silently succeeding on only one node. This prevents data loss when the primary crashes before replicating an acknowledged write.</p>
+</div>
+<div class="paragraph">
+<p>The S3 manifest uses compare-and-swap operations to prevent concurrent flush or compaction updates from silently overwriting each other.</p>
+</div>
+</div>
 </div>
 </div>
 <div class="sect1">
