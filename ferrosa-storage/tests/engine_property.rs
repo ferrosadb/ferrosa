@@ -29,6 +29,7 @@ fn test_schema() -> TableSchema {
             name: "val".to_string(),
             type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
         }],
+        extensions: Default::default(),
     }
 }
 

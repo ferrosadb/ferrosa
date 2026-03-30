@@ -136,6 +136,8 @@ struct TableState {
     #[allow(dead_code)]
     schema: TableSchema,
     store: TableStore<FileFlushTarget>,
+    /// Derived from `schema.extensions` — controls S3 upload and cache pinning.
+    pin_config: ferrosa_common::schema::PinConfig,
 }
 
 /// SSTable reader type alias for file-backed SSTables.
@@ -573,7 +575,8 @@ impl StorageEngine {
                 .register_index(table_id.keyspace(), table_id.table(), index_name);
         }
 
-        let state = TableState { schema, store };
+        let pin_config = schema.pin_config();
+        let state = TableState { schema, store, pin_config };
         self.tables.write().insert(table_id, state);
         Ok(())
     }
@@ -1264,6 +1267,13 @@ impl StorageEngine {
 
         state.store.flush()?;
 
+        // NV-005: pin the flushed SSTable in LocalCache if the table is NVMe-pinned.
+        // Pinned SSTables are never evicted from local disk and never uploaded to S3.
+        if state.pin_config.is_pinned() {
+            let gen = state.store.last_flush_generation();
+            self.local_cache.pin(&gen.to_string());
+        }
+
         // Eager index build: submit high-priority index rebuild for the newly
         // flushed SSTable. This keeps the MemtableIndex (Layer 4) bounded to
         // 0-1 entries in steady state by ensuring sidecar indexes are current.
@@ -1410,6 +1420,20 @@ impl StorageEngine {
                 result.output.path.clone(),
                 result.output.size_bytes,
             );
+
+            // NV-004/NV-005: if the table is NVMe-pinned, pin the compaction output
+            // in LocalCache and skip the S3 upload entirely.
+            {
+                let tables = self.tables.read();
+                let is_pinned = tables
+                    .get(table_id)
+                    .map(|s| s.pin_config.is_pinned())
+                    .unwrap_or(false);
+                if is_pinned {
+                    self.local_cache.pin(&result.output.id);
+                    continue;
+                }
+            }
 
             // ── Crash-safe S3 upload + manifest update ─────────────────────
             //
@@ -1784,8 +1808,9 @@ impl StorageEngine {
     /// files for each generation, uploads them via UploadManager, and
     /// updates the S3 manifest with new entries.
     pub async fn sync_sstables_to_s3(&self) -> ferrosa_common::Result<usize> {
-        let (os_config, store) = self.object_store_and_config()?;
-        let prefix = os_config.prefix.clone();
+        let (store, prefix) = self.resolve_store_and_prefix().ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat("S3 not configured".into())
+        })?;
         let upload_mgr = self.upload_manager.as_ref().ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat("UploadManager not initialized".into())
         })?;
@@ -1796,20 +1821,24 @@ impl StorageEngine {
 
         let mut uploaded = 0usize;
 
-        // Collect table IDs and directories under the lock, then release
+        // Collect table IDs, directories, and pin status under the lock, then release
         // before any .await (RwLockReadGuard is !Send).
-        let table_dirs: Vec<(String, std::path::PathBuf)> = {
+        let table_dirs: Vec<(String, std::path::PathBuf, bool)> = {
             let tables = self.tables.read();
             tables
-                .keys()
-                .map(|id| {
+                .iter()
+                .map(|(id, state)| {
                     let dir = self.config.data_dir.join("sstables").join(id.to_string());
-                    (id.to_string(), dir)
+                    (id.to_string(), dir, state.pin_config.is_pinned())
                 })
                 .collect()
         };
 
-        for (table_id_str, table_dir) in &table_dirs {
+        for (table_id_str, table_dir, is_pinned) in &table_dirs {
+            // NV-003: skip S3 upload for NVMe-pinned tables entirely.
+            if *is_pinned {
+                continue;
+            }
             if !table_dir.exists() {
                 continue;
             }
@@ -2397,6 +2426,7 @@ mod tests {
                 name: "val".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         }
     }
 
@@ -2749,6 +2779,7 @@ mod tests {
                 name: "result".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
 
@@ -2815,6 +2846,7 @@ mod tests {
                 name: "result".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
 
@@ -3679,6 +3711,7 @@ mod tests {
                     name: "val".to_string(),
                     type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
                 }],
+                extensions: Default::default(),
             };
             engine.register_table(schema).unwrap();
         }
@@ -3810,6 +3843,7 @@ mod tests {
                     type_name: "org.apache.cassandra.db.marshal.LongType".into(),
                 },
             ],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
 
@@ -3890,6 +3924,7 @@ mod tests {
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
         let tid = TableId::new("test_ks", "resilience");
@@ -3946,6 +3981,7 @@ mod tests {
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
         let tid = TableId::new("test_ks", "zero_data");
@@ -4001,6 +4037,7 @@ mod tests {
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
         let tid = TableId::new("test_ks", "evolving");
@@ -4061,6 +4098,7 @@ mod tests {
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
         let tid = TableId::new("test_ks", "survive");
@@ -4690,6 +4728,7 @@ mod tests {
                     type_name: "org.apache.cassandra.db.marshal.Int32Type".into(),
                 },
             ],
+            extensions: Default::default(),
         };
         engine.register_table(schema).unwrap();
         let tid = TableId::new("test_ks", "mixed_cells");
@@ -4747,6 +4786,7 @@ mod tests {
                             type_name: "org.apache.cassandra.db.marshal.Int32Type".into(),
                         },
                     ],
+                    extensions: Default::default(),
                 },
                 table_id: tid.clone(),
             };
@@ -5239,6 +5279,7 @@ mod tests {
                 name: "col".to_string(),
                 type_name: col_type.to_string(),
             }],
+            extensions: Default::default(),
         }
     }
 
@@ -5732,5 +5773,201 @@ mod tests {
             entries.len(),
             entries
         );
+    }
+
+    // ── NV-003 / NV-004 / NV-005: NVMe-pinned table tests ───────────────────
+
+    /// Returns a `TableSchema` with `storage.pin = nvme` in extensions.
+    fn pinned_schema() -> TableSchema {
+        let mut extensions = std::collections::HashMap::new();
+        extensions.insert("storage.pin".to_string(), "nvme".to_string());
+        TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "pinned_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions,
+        }
+    }
+
+    fn pinned_table_id() -> TableId {
+        TableId::new("test_ks", "pinned_table")
+    }
+
+    /// NV-003: flush on a pinned table must NOT submit any objects to the
+    /// upload store.  `sync_sstables_to_s3` skips tables whose `pin_config`
+    /// reports `is_pinned()`.
+    #[tokio::test]
+    async fn pinned_table_skips_s3_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "ferrosa-test".to_string();
+        let rt = tokio::runtime::Handle::current();
+        let engine =
+            StorageEngine::new_with_upload_store(config_with_prefix(dir.path()), Arc::clone(&store), prefix.clone(), &rt)
+                .unwrap();
+
+        engine.register_table(pinned_schema()).unwrap();
+        let tid = pinned_table_id();
+
+        // Write a row and flush — produces an SSTable on local disk.
+        engine.write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000).unwrap();
+        engine.flush(&tid).unwrap();
+
+        // sync_sstables_to_s3 must upload ZERO objects for the pinned table.
+        let uploaded = engine.sync_sstables_to_s3().await.unwrap();
+        assert_eq!(uploaded, 0, "pinned table must not upload to S3");
+
+        // The manifest must have no entries for the pinned table.
+        let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+            .await
+            .unwrap();
+        let tid_str = tid.to_string();
+        let manifest_entries = manifest.sstables.get(&tid_str).cloned().unwrap_or_default();
+        assert!(
+            manifest_entries.is_empty(),
+            "manifest must have no entries for a pinned table; found {} entries: {:?}",
+            manifest_entries.len(),
+            manifest_entries
+        );
+
+        // compaction_metrics.s3_uploads_total must remain 0.
+        assert_eq!(
+            engine.compaction_metrics.s3_uploads_total.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "s3_uploads_total must be 0 for a pinned table"
+        );
+    }
+
+    /// NV-003 negative: an unpinned table still uploads to S3.
+    #[tokio::test]
+    async fn unpinned_table_still_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "ferrosa-test".to_string();
+        let rt = tokio::runtime::Handle::current();
+        let engine =
+            StorageEngine::new_with_upload_store(config_with_prefix(dir.path()), Arc::clone(&store), prefix.clone(), &rt)
+                .unwrap();
+
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        engine.write(&tid, &make_key("k1"), make_row(b"v1", 1000), 1000).unwrap();
+        engine.flush(&tid).unwrap();
+
+        let uploaded = engine.sync_sstables_to_s3().await.unwrap();
+        assert!(uploaded > 0, "unpinned table must upload at least one SSTable; got {uploaded}");
+    }
+
+    /// NV-004: compaction output for a pinned table must not be uploaded to S3.
+    #[tokio::test]
+    async fn pinned_compaction_skips_s3() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "ferrosa-test".to_string();
+        let rt = tokio::runtime::Handle::current();
+        let engine =
+            StorageEngine::new_with_upload_store(config_with_prefix(dir.path()), Arc::clone(&store), prefix.clone(), &rt)
+                .unwrap();
+
+        engine.register_table(pinned_schema()).unwrap();
+        let tid = pinned_table_id();
+
+        // Flush 4 SSTables to cross the STCS min_threshold and trigger compaction.
+        for i in 0u8..4 {
+            engine
+                .write(&tid, &make_key(&format!("k{i}")), make_row(&[i], i as i64 * 1000 + 1000), i as i64 * 1000 + 1000)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        // Drive compaction to completion.
+        let compaction_dir = dir.path().join("compaction");
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let has_output = compaction_dir.exists()
+                && std::fs::read_dir(&compaction_dir)
+                    .ok()
+                    .map(|mut rd| rd.any(|_| true))
+                    .unwrap_or(false);
+            if has_output {
+                break;
+            }
+        }
+
+        // poll_compactions integrates the result; must NOT upload for a pinned table.
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(
+            engine.compaction_metrics.s3_uploads_total.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "compaction output must not be uploaded for a pinned table"
+        );
+
+        // The manifest must have no entries for the pinned table.
+        let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+            .await
+            .unwrap();
+        let tid_str = tid.to_string();
+        let manifest_entries = manifest.sstables.get(&tid_str).cloned().unwrap_or_default();
+        assert!(
+            manifest_entries.is_empty(),
+            "manifest must have no entries for a pinned table after compaction; found {} entries: {:?}",
+            manifest_entries.len(),
+            manifest_entries
+        );
+    }
+
+    /// NV-005: SSTable IDs pinned in LocalCache via `pin()` survive eviction.
+    #[test]
+    fn pinned_sstables_never_evicted() {
+        use std::collections::HashSet;
+
+        // Small cache (150 bytes) with two entries totalling 200 bytes.
+        let cache = crate::cache::LocalCache::new(std::path::PathBuf::from("/tmp"), 150);
+        cache.register("pinned_id", std::path::PathBuf::from("/tmp/pinned"), 100);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cache.register("unpinned_id", std::path::PathBuf::from("/tmp/unpinned"), 100);
+
+        // Pin one entry via the internal pin() API.
+        cache.pin("pinned_id");
+        assert!(cache.is_pinned("pinned_id"), "entry must be pinned after pin()");
+        assert!(!cache.is_pinned("unpinned_id"), "other entry must not be pinned");
+
+        // Evict using an empty external pinned set — internal pin should still protect.
+        let removed = cache.evict_if_needed(&HashSet::new());
+
+        assert_eq!(removed.len(), 1, "exactly one entry should be evicted");
+        assert_eq!(
+            removed[0],
+            std::path::PathBuf::from("/tmp/unpinned"),
+            "unpinned entry must be evicted, not the pinned one"
+        );
+        assert!(cache.contains("pinned_id"), "pinned entry must survive eviction");
+        assert!(!cache.contains("unpinned_id"), "unpinned entry must be gone");
+
+        // After unpin, the entry becomes evictable again.
+        cache.unpin("pinned_id");
+        assert!(!cache.is_pinned("pinned_id"), "entry must not be pinned after unpin()");
+    }
+
+    /// Helper: `StorageEngineConfig` with a specific prefix for upload tests.
+    fn config_with_prefix(base: &std::path::Path) -> StorageEngineConfig {
+        StorageEngineConfig::test_config(base)
     }
 }

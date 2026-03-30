@@ -259,6 +259,7 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![],
+            extensions: Default::default(),
         }
     }
 

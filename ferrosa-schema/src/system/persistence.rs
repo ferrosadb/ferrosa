@@ -344,6 +344,7 @@ pub fn keyspaces_table_schema() -> TableSchema {
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             },
         ],
+        extensions: Default::default(),
     }
 }
 
@@ -362,6 +363,7 @@ pub fn tables_table_schema() -> TableSchema {
             name: "id".to_string(),
             type_name: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
         }],
+        extensions: Default::default(),
     }
 }
 
@@ -400,6 +402,7 @@ pub fn columns_table_schema() -> TableSchema {
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             },
         ],
+        extensions: Default::default(),
     }
 }
 
@@ -425,6 +428,7 @@ pub fn roles_table_schema() -> TableSchema {
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             },
         ],
+        extensions: Default::default(),
     }
 }
 
@@ -440,6 +444,7 @@ pub fn role_members_table_schema() -> TableSchema {
         }],
         static_columns: vec![],
         regular_columns: vec![],
+        extensions: Default::default(),
     }
 }
 
@@ -458,6 +463,7 @@ pub fn role_permissions_table_schema() -> TableSchema {
             name: "permissions".to_string(),
             type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
         }],
+        extensions: Default::default(),
     }
 }
 

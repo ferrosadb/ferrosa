@@ -304,6 +304,7 @@ mod tests {
             }],
             static_columns: vec![],
             regular_columns: vec![],
+            extensions: Default::default(),
         }
     }
 
