@@ -451,8 +451,6 @@ impl IndexBuildScheduler {
         data_dir: &std::path::Path,
     ) {
         use crate::index::sidecar::SidecarWriter;
-        use ferrosa_index::fulltext::builder::{FullTextIndexBuilder, SimpleAnalyzer};
-        use ferrosa_index::IndexType;
 
         while !stop.load(Ordering::Acquire) {
             let job = {
@@ -465,49 +463,18 @@ impl IndexBuildScheduler {
                     let (keyspace, table) = &job.table;
                     match backend.build(&job) {
                         Ok(result) => {
-                            if job.index_type == IndexType::FullText {
-                                // Build FTI sidecar from text entries.
-                                for (index_name, entries) in &result.sidecar_entries {
-                                    if entries.is_empty() {
-                                        continue;
-                                    }
-                                    let path = data_dir.join(format!(
-                                        "{}-FTI-{}.db",
-                                        job.sstable_id, index_name
-                                    ));
-                                    let mut fti_builder = FullTextIndexBuilder::new(
-                                        Box::new(SimpleAnalyzer),
-                                    );
-                                    for (key, pos) in entries {
-                                        // key.0 holds the raw cell bytes; interpret as UTF-8.
-                                        let text = String::from_utf8_lossy(&key.0);
-                                        // Use a zero token since we only have pk bytes here.
-                                        fti_builder.add_document(&pos.partition_key, 0, &text);
-                                    }
-                                    let fti_bytes = fti_builder.finish();
-                                    if let Err(e) = std::fs::write(&path, &fti_bytes) {
-                                        eprintln!(
-                                            "[index-build] failed to write FTI {}: {e}",
-                                            path.display()
-                                        );
-                                    }
+                            // Write sidecar files.
+                            for (index_name, entries) in &result.sidecar_entries {
+                                if entries.is_empty() {
+                                    continue;
                                 }
-                            } else {
-                                // Write standard sidecar files for non-fulltext indexes.
-                                for (index_name, entries) in &result.sidecar_entries {
-                                    if entries.is_empty() {
-                                        continue;
-                                    }
-                                    let path = data_dir.join(format!(
-                                        "{}-{}.sidecar",
-                                        job.sstable_id, index_name
-                                    ));
-                                    if let Err(e) = SidecarWriter::write(&path, entries) {
-                                        eprintln!(
-                                            "[index-build] failed to write sidecar {}: {e}",
-                                            path.display()
-                                        );
-                                    }
+                                let path = data_dir
+                                    .join(format!("{}-{}.sidecar", job.sstable_id, index_name));
+                                if let Err(e) = SidecarWriter::write(&path, entries) {
+                                    eprintln!(
+                                        "[index-build] failed to write sidecar {}: {e}",
+                                        path.display()
+                                    );
                                 }
                             }
                             tracker.mark_indexed(keyspace, table, &job.index_name, &job.sstable_id);
@@ -1178,207 +1145,6 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
 
         assert_eq!(callback_count.load(Ordering::SeqCst), 3);
-        scheduler.shutdown();
-    }
-
-    // ── FT-008: FullText index wired into IndexBuildScheduler ─────────────────
-
-    /// FT-008: A FullText index job routes through worker_loop_full and produces
-    /// an FTI sidecar file (not a .sidecar file) when the index type is FullText.
-    #[test]
-    fn fts_sidecar_created_on_flush() {
-        use ferrosa_index::fulltext::reader::FullTextIndexReader;
-        use ferrosa_index::{IndexKey, RowPosition};
-
-        let dir = tempfile::tempdir().unwrap();
-        let fti_dir = dir.path().to_path_buf();
-
-        // A mock backend that returns text bytes as IndexKey values,
-        // simulating what LocalBackend would do for a text column.
-        struct TextBackend;
-        impl IndexBuildBackend for TextBackend {
-            fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
-                let mut sidecar_entries = HashMap::new();
-                let entries: Vec<(IndexKey, RowPosition)> = vec![
-                    (
-                        IndexKey(b"hello world rust".to_vec()),
-                        RowPosition {
-                            partition_key: b"pk1".to_vec(),
-                            clustering_key: vec![],
-                        },
-                    ),
-                    (
-                        IndexKey(b"rust programming language".to_vec()),
-                        RowPosition {
-                            partition_key: b"pk2".to_vec(),
-                            clustering_key: vec![],
-                        },
-                    ),
-                    (
-                        IndexKey(b"hello database storage".to_vec()),
-                        RowPosition {
-                            partition_key: b"pk3".to_vec(),
-                            clustering_key: vec![],
-                        },
-                    ),
-                ];
-                sidecar_entries.insert(job.index_name.clone(), entries);
-                Ok(IndexBuildResult {
-                    sstable_id: job.sstable_id.clone(),
-                    sidecar_entries,
-                    build_duration: Duration::from_millis(1),
-                })
-            }
-        }
-
-        let tracker = Arc::new(IndexStateTracker::new());
-        tracker.register_index("ks", "docs", "body_fti");
-        tracker.mark_pending("ks", "docs", "body_fti", "1", 100);
-
-        let backend: Arc<dyn IndexBuildBackend> = Arc::new(TextBackend);
-        let scheduler = IndexBuildScheduler::with_backend_and_data_dir(
-            1,
-            Arc::clone(&tracker),
-            backend,
-            fti_dir.clone(),
-        );
-
-        scheduler
-            .submit(IndexBuildJob {
-                sstable_id: "1".to_string(),
-                index_name: "body_fti".to_string(),
-                index_type: IndexType::FullText,
-                table: ("ks".to_string(), "docs".to_string()),
-                priority: BuildPriority::High,
-                enqueued_at: Instant::now(),
-                column_position: 0,
-            })
-            .unwrap();
-
-        std::thread::sleep(Duration::from_millis(500));
-
-        // Verify the FTI file was written (not a .sidecar file).
-        let fti_path = fti_dir.join("1-FTI-body_fti.db");
-        assert!(
-            fti_path.exists(),
-            "FTI sidecar file should exist at {}, files in dir: {:?}",
-            fti_path.display(),
-            std::fs::read_dir(&fti_dir)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-        );
-
-        // Verify no .sidecar file was written.
-        let sidecar_path = fti_dir.join("1-body_fti.sidecar");
-        assert!(
-            !sidecar_path.exists(),
-            "FullText jobs must not write .sidecar files"
-        );
-
-        // Verify the FTI file is valid and contains the expected terms.
-        let fti_bytes = std::fs::read(&fti_path).unwrap();
-        let reader = FullTextIndexReader::open(fti_bytes)
-            .expect("FTI file must parse without error");
-
-        // "hello" appears in pk1 and pk3.
-        let entry = reader
-            .lookup_term("hello")
-            .expect("'hello' must be in FTI index");
-        assert_eq!(
-            entry.doc_frequency, 2,
-            "expected 'hello' in 2 documents, got {}",
-            entry.doc_frequency
-        );
-
-        // "rust" appears in pk1 and pk2.
-        let entry = reader
-            .lookup_term("rust")
-            .expect("'rust' must be in FTI index");
-        assert_eq!(entry.doc_frequency, 2);
-
-        // Verify tracker state is Current.
-        let state = tracker.get_state("ks", "docs", "body_fti").unwrap();
-        assert!(
-            matches!(state.status, IndexStatus::Current),
-            "expected Current after FTI build, got {:?}",
-            state.status
-        );
-
-        scheduler.shutdown();
-    }
-
-    /// FT-008b: Standard (non-FullText) jobs still produce .sidecar files,
-    /// confirming the branch condition is correctly gated.
-    #[test]
-    fn non_fulltext_jobs_still_produce_sidecar_files() {
-        use ferrosa_index::{IndexKey, RowPosition};
-
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().to_path_buf();
-
-        struct BtreeBackend;
-        impl IndexBuildBackend for BtreeBackend {
-            fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
-                let mut sidecar_entries = HashMap::new();
-                sidecar_entries.insert(
-                    job.index_name.clone(),
-                    vec![(
-                        IndexKey(b"value1".to_vec()),
-                        RowPosition {
-                            partition_key: b"pk1".to_vec(),
-                            clustering_key: vec![],
-                        },
-                    )],
-                );
-                Ok(IndexBuildResult {
-                    sstable_id: job.sstable_id.clone(),
-                    sidecar_entries,
-                    build_duration: Duration::from_millis(1),
-                })
-            }
-        }
-
-        let tracker = Arc::new(IndexStateTracker::new());
-        tracker.register_index("ks", "tbl", "val_idx");
-        tracker.mark_pending("ks", "tbl", "val_idx", "42", 100);
-
-        let backend: Arc<dyn IndexBuildBackend> = Arc::new(BtreeBackend);
-        let scheduler = IndexBuildScheduler::with_backend_and_data_dir(
-            1,
-            Arc::clone(&tracker),
-            backend,
-            out_dir.clone(),
-        );
-
-        scheduler
-            .submit(IndexBuildJob {
-                sstable_id: "42".to_string(),
-                index_name: "val_idx".to_string(),
-                index_type: IndexType::BTree,
-                table: ("ks".to_string(), "tbl".to_string()),
-                priority: BuildPriority::Normal,
-                enqueued_at: Instant::now(),
-                column_position: 0,
-            })
-            .unwrap();
-
-        std::thread::sleep(Duration::from_millis(500));
-
-        // BTree -> .sidecar, not .db
-        let sidecar_path = out_dir.join("42-val_idx.sidecar");
-        assert!(
-            sidecar_path.exists(),
-            "BTree job must produce a .sidecar file at {}",
-            sidecar_path.display()
-        );
-
-        // No FTI file should be produced.
-        let fti_path = out_dir.join("42-FTI-val_idx.db");
-        assert!(!fti_path.exists(), "BTree job must not produce an FTI file");
-
         scheduler.shutdown();
     }
 }

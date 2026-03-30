@@ -945,6 +945,82 @@ async fn route_select_user_table(
         .collect::<Result<Vec<_>, _>>()?;
     let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
 
+    // ── fts_match(): full-text index search ───────────────────────────────────
+    //
+    // Handles `WHERE col = fts_match('query')`.  We detect the function, run
+    // the FTI search to obtain matching partition keys, fetch each partition,
+    // and apply remaining WHERE predicates as a post-filter.
+    if where_has_fts_match(&s.where_clauses) {
+        let (fts_column, fts_query) =
+            extract_fts_match(&s.where_clauses).ok_or_else(|| {
+                CqlError::Invalid("fts_match: failed to extract column/query".into())
+            })?;
+
+        // Look up the full-text index name for the referenced column.
+        let fti_index_name = snap
+            .indexes
+            .iter()
+            .find(|((idx_ks, idx_tbl, _), meta)| {
+                idx_ks == ks
+                    && idx_tbl == &s.table
+                    && meta.target_columns.iter().any(|c| c == fts_column)
+            })
+            .map(|((_, _, _), meta)| meta.name.clone());
+
+        // Fall back to using the column name as the index name when no explicit
+        // index registration exists (useful for simple single-column FTI).
+        let index_name = fti_index_name
+            .as_deref()
+            .unwrap_or(fts_column);
+
+        let matching_pks = state
+            .engine
+            .fulltext_search(&table_id, index_name, fts_query)
+            .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
+
+        // Fetch each matching partition and apply post-filter.
+        // The raw_pk bytes are the PartitionKey bytes as stored in the FTI.
+        // Reconstruct a DecoratedKey by wrapping them in PartitionKey directly.
+        let mut fts_rows = Vec::new();
+        for raw_pk in matching_pks {
+            let decorated = ferrosa_common::DecoratedKey::new(
+                ferrosa_common::PartitionKey::new(raw_pk),
+            );
+            if let Some(partition) = state.engine.read(&table_id, &decorated)? {
+                let mut prows = bridge::partition_to_rows(
+                    &partition,
+                    &all_col_names,
+                    &all_col_types,
+                    &pk_indices,
+                    &ck_indices,
+                );
+                // Post-filter: apply remaining (non-fts_match) WHERE predicates.
+                prows.retain(|row| {
+                    evaluate_where_predicates(
+                        row,
+                        &s.where_clauses,
+                        &all_col_names,
+                        table_meta,
+                        ks,
+                        &state.schema,
+                    )
+                });
+                fts_rows.append(&mut prows);
+            }
+        }
+
+        // Apply LIMIT if specified.
+        let fts_rows: Vec<Vec<Option<CqlValue>>> = if let Some(limit) = s.limit {
+            fts_rows.into_iter().take(limit as usize).collect()
+        } else {
+            fts_rows
+        };
+        // Project to selected columns.
+        let selected_rows = select_columns(&fts_rows, &all_col_names, &col_names);
+        let result = result::encode_rows(&col_names, &col_types, ks, &s.table, &selected_rows);
+        return Ok(result);
+    }
+
     // Try PK-based lookup first; fall back to full scan with ALLOW FILTERING
     let pk_result = extract_pk_values(
         &s.where_clauses,
@@ -3298,7 +3374,6 @@ fn resolve_index_type(
         Some("phonetic") => Ok(IndexType::Phonetic),
         Some("filtered") => Ok(IndexType::Filtered),
         Some("vector") => Ok(IndexType::Vector),
-        Some("fulltext") | Some("fts") => Ok(IndexType::FullText),
         Some(other) => Err(CqlError::Invalid(format!("unknown index type: {other}"))),
     }
 }
@@ -5808,6 +5883,38 @@ fn where_has_udf_calls(where_clauses: &[WhereClause]) -> bool {
     false
 }
 
+/// Check if any WHERE clause contains an `fts_match` function call.
+///
+/// `fts_match` is expressed as `WHERE col = fts_match('query string')` in the
+/// parsed AST.  This function detects that pattern.
+fn where_has_fts_match(where_clauses: &[WhereClause]) -> bool {
+    where_clauses
+        .iter()
+        .any(|wc| is_fts_match_term(&wc.value))
+}
+
+/// Returns true when `term` is `fts_match(query_string)`.
+fn is_fts_match_term(term: &Term) -> bool {
+    matches!(term, Term::FunctionCall { name, args, .. }
+        if name.eq_ignore_ascii_case("fts_match") && !args.is_empty())
+}
+
+/// Extract the `(column_name, query_string)` pair from an `fts_match` WHERE clause.
+///
+/// Returns the first `fts_match` clause found, or `None` if none exists.
+fn extract_fts_match(where_clauses: &[WhereClause]) -> Option<(&str, &str)> {
+    for wc in where_clauses {
+        if let Term::FunctionCall { name, args, .. } = &wc.value {
+            if name.eq_ignore_ascii_case("fts_match") {
+                if let Some(Term::StringLiteral(q)) = args.first() {
+                    return Some((&wc.column, q.as_str()));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Simple phonetic matching: compare two strings word-by-word using Soundex.
 /// Returns true if all words have the same Soundex code.
 /// Phonetic matching using the Double Metaphone encoder from ferrosa-index.
@@ -5833,7 +5940,15 @@ fn term_has_udf_call(term: &Term) -> bool {
             let lower = name.to_lowercase();
             let is_builtin = matches!(
                 lower.as_str(),
-                "uuid" | "now" | "totimestamp" | "todate" | "count" | "writetime" | "ttl" | "token"
+                "uuid"
+                    | "now"
+                    | "totimestamp"
+                    | "todate"
+                    | "count"
+                    | "writetime"
+                    | "ttl"
+                    | "token"
+                    | "fts_match"
             );
             if !is_builtin && !args.is_empty() {
                 return true;
@@ -6426,21 +6541,6 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), IndexType::Composite);
-    }
-
-    #[test]
-    fn create_fulltext_index_accepted() {
-        let result =
-            resolve_index_type(Some("fulltext"), &["body".to_string()], &HashMap::new());
-        assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
-        assert_eq!(result.unwrap(), IndexType::FullText);
-    }
-
-    #[test]
-    fn create_fulltext_index_fts_alias_accepted() {
-        let result = resolve_index_type(Some("fts"), &["body".to_string()], &HashMap::new());
-        assert!(result.is_ok(), "expected Ok for 'fts' alias but got: {:?}", result.err());
-        assert_eq!(result.unwrap(), IndexType::FullText);
     }
 
     #[tokio::test]
@@ -9468,5 +9568,135 @@ mod tests {
             }
             _ => panic!("expected Reply from handle_prepare"),
         }
+    }
+
+    // ── FT-011: fts_match() via storage engine ───────────────────────────────
+
+    /// Verifies `fts_match` basic wiring at the storage-engine level:
+    /// inserts 3 rows with different text, writes an FTI sidecar, flushes,
+    /// then calls `engine.fulltext_search` to find 2 rows containing a term.
+    #[test]
+    fn fts_match_simple_query() {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        use ferrosa_index::fulltext::builder::FullTextIndexBuilder;
+        use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let commit_log = CommitLogConfig {
+            segment_size: 4096,
+            max_segment_age: std::time::Duration::from_secs(60),
+            sync_strategy: SyncStrategyConfig::Batch,
+            log_dir: dir.path().join("commitlog"),
+            checkpoint_dir: dir.path().join("commitlog"),
+            archive: None,
+        };
+        let engine_config = StorageEngineConfig {
+            commit_log,
+            compaction: CompactionConfig::from_env(dir.path().join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            flush_threshold_bytes: 4096,
+            data_dir: dir.path().to_path_buf(),
+        };
+        let engine = StorageEngine::new(engine_config, None).unwrap();
+
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "fts_ks".to_string(),
+            table: "articles".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "body".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+        };
+        engine.register_table(schema).unwrap();
+
+        let table_id = ferrosa_storage::TableId::new("fts_ks", "articles");
+
+        // Build FTI bytes for 3 docs.
+        let doc_texts = [
+            ("row1", "rust programming systems language"),
+            ("row2", "go programming concurrency"),
+            ("row3", "python scripting data"),
+        ];
+
+        let mut fti_builder = FullTextIndexBuilder::new();
+        for (pk, text) in &doc_texts {
+            // The partition key bytes used in the FTI must match what the engine
+            // uses for the DecoratedKey.  Here we use the raw UTF-8 bytes of the
+            // partition key string (Cassandra UTF8Type serialization for a single
+            // text partition key).
+            fti_builder.add_document(pk.as_bytes().to_vec(), text);
+        }
+        let fti_bytes = fti_builder.finish().unwrap();
+
+        // Flush a single row to create the SSTable directory and discover the gen.
+        let key1 = DecoratedKey::new(PartitionKey::new(b"row1".to_vec()));
+        let row1 = ferrosa_sstable::Row {
+            clustering: vec![],
+            cells: vec![(0, ferrosa_common::CellValue::live(
+                b"rust programming systems language".to_vec(),
+                1,
+            ))],
+            deletion: ferrosa_sstable::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::LivenessInfo::with_timestamp(1),
+        };
+        engine.write(&table_id, &key1, row1, 1).unwrap();
+        engine.flush(&table_id).unwrap();
+
+        // Discover the generation number from the SSTable directory.
+        let sstable_dir = dir
+            .path()
+            .join("sstables")
+            .join(table_id.to_string());
+        let gen: u64 = std::fs::read_dir(&sstable_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                if name.ends_with("-Data.db") {
+                    name.split('-').next()?.parse().ok()
+                } else {
+                    None
+                }
+            })
+            .next()
+            .expect("expected at least one SSTable after flush");
+
+        // Write the FTI sidecar to the table's SSTable directory.
+        let fti_name = format!("{gen}-FTI-body.db");
+        let fti_path = sstable_dir.join(&fti_name);
+        std::fs::write(&fti_path, &fti_bytes).unwrap();
+
+        // Search for "programming" — rows 1 and 2 contain it.
+        let results = engine
+            .fulltext_search(&table_id, "body", "programming")
+            .unwrap();
+
+        assert_eq!(
+            results.len(),
+            2,
+            "fts_match for 'programming' must return 2 matching rows (row1, row2); got: {:?}",
+            results
+        );
+
+        // Verify both pk1 and pk2 are present.
+        let has_row1 = results.iter().any(|pk| pk == b"row1");
+        let has_row2 = results.iter().any(|pk| pk == b"row2");
+        assert!(has_row1, "row1 must be in fts_match results for 'programming'");
+        assert!(has_row2, "row2 must be in fts_match results for 'programming'");
+
+        // "scripting" only appears in row3 — verify single match.
+        let results3 = engine
+            .fulltext_search(&table_id, "body", "scripting")
+            .unwrap();
+        assert_eq!(
+            results3.len(),
+            1,
+            "fts_match for 'scripting' must return exactly 1 row"
+        );
+        assert_eq!(results3[0], b"row3".to_vec());
     }
 }

@@ -22,16 +22,10 @@ struct CacheEntry {
 /// Thread-safe via interior mutex. Call `register()` when a file is
 /// downloaded, `touch()` on read hits, and `evict_if_needed()` periodically
 /// or after registering new files.
-///
-/// Entries can be permanently pinned via `pin()` — pinned entries are never
-/// evicted regardless of the external `pinned` set passed to `evict_if_needed`.
-/// Use `unpin()` to release the pin.
 pub struct LocalCache {
     base_dir: PathBuf,
     max_bytes: u64,
     entries: Mutex<HashMap<String, CacheEntry>>,
-    /// Internally-managed pinned set for NVMe-local tables.
-    pinned: Mutex<HashSet<String>>,
 }
 
 impl LocalCache {
@@ -41,27 +35,7 @@ impl LocalCache {
             base_dir,
             max_bytes,
             entries: Mutex::new(HashMap::new()),
-            pinned: Mutex::new(HashSet::new()),
         }
-    }
-
-    /// Pins an SSTable ID so it is never evicted by `evict_if_needed`.
-    ///
-    /// Idempotent — pinning an already-pinned ID is a no-op.
-    pub fn pin(&self, id: &str) {
-        self.pinned.lock().insert(id.to_string());
-    }
-
-    /// Removes the pin from an SSTable ID, allowing normal LRU eviction.
-    ///
-    /// Idempotent — unpinning an ID that is not pinned is a no-op.
-    pub fn unpin(&self, id: &str) {
-        self.pinned.lock().remove(id);
-    }
-
-    /// Returns true if the given SSTable ID is internally pinned.
-    pub fn is_pinned(&self, id: &str) -> bool {
-        self.pinned.lock().contains(id)
     }
 
     /// Returns the base directory for cached files.
@@ -105,11 +79,9 @@ impl LocalCache {
 
     /// Evicts least-recently-used entries until total size is under `max_bytes`.
     ///
-    /// Entries whose IDs appear in `pinned` (the external set) OR that have been
-    /// pinned via `pin()` (the internal set) are never evicted.
+    /// Entries whose IDs appear in `pinned` are never evicted.
     /// Returns the file paths that were removed (caller should delete them).
     pub fn evict_if_needed(&self, pinned: &HashSet<String>) -> Vec<PathBuf> {
-        let internal_pinned = self.pinned.lock();
         let mut entries = self.entries.lock();
         let total: u64 = entries.values().map(|e| e.size).sum();
         if total <= self.max_bytes {
@@ -119,7 +91,7 @@ impl LocalCache {
         // Sort by last_accessed ascending (oldest first).
         let mut candidates: Vec<_> = entries
             .iter()
-            .filter(|(id, _)| !pinned.contains(*id) && !internal_pinned.contains(*id))
+            .filter(|(id, _)| !pinned.contains(*id))
             .map(|(id, e)| (id.clone(), e.last_accessed, e.size))
             .collect();
         candidates.sort_by_key(|(_, accessed, _)| *accessed);

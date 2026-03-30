@@ -124,6 +124,82 @@ impl Default for PitrMetrics {
     }
 }
 
+/// Prometheus-compatible metrics for NVMe pin/unpin operations.
+pub struct PinMetrics {
+    /// Number of tables currently pinned to NVMe (gauge).
+    pub pinned_tables: AtomicI64,
+    /// Total bytes occupied by pinned SSTables (gauge).
+    pub pinned_bytes: AtomicI64,
+    /// Total number of SSTable evictions caused by max_bytes enforcement (counter).
+    pub pin_evictions_total: std::sync::atomic::AtomicU64,
+}
+
+impl PinMetrics {
+    pub fn new() -> Self {
+        Self {
+            pinned_tables: AtomicI64::new(0),
+            pinned_bytes: AtomicI64::new(0),
+            pin_evictions_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Increments the pinned table gauge by 1.
+    pub fn inc_pinned_tables(&self) {
+        self.pinned_tables.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrements the pinned table gauge by 1.
+    pub fn dec_pinned_tables(&self) {
+        self.pinned_tables.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Adds `bytes` to the pinned bytes gauge.
+    pub fn add_pinned_bytes(&self, bytes: i64) {
+        self.pinned_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Subtracts `bytes` from the pinned bytes gauge.
+    pub fn sub_pinned_bytes(&self, bytes: i64) {
+        self.pinned_bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    /// Sets the pinned bytes gauge to an absolute value.
+    pub fn set_pinned_bytes(&self, bytes: i64) {
+        self.pinned_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Increments the pin eviction counter by 1.
+    pub fn inc_pin_evictions(&self) {
+        self.pin_evictions_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Renders metrics in Prometheus exposition text format.
+    pub fn to_prometheus_text(&self) -> String {
+        format!(
+            "# HELP ferrosa_nvme_pinned_tables Number of tables pinned to NVMe\n\
+             # TYPE ferrosa_nvme_pinned_tables gauge\n\
+             ferrosa_nvme_pinned_tables {}\n\
+             # HELP ferrosa_nvme_pinned_bytes Total bytes occupied by pinned SSTables\n\
+             # TYPE ferrosa_nvme_pinned_bytes gauge\n\
+             ferrosa_nvme_pinned_bytes {}\n\
+             # HELP ferrosa_nvme_pin_evictions_total SSTables evicted by max_bytes enforcement\n\
+             # TYPE ferrosa_nvme_pin_evictions_total counter\n\
+             ferrosa_nvme_pin_evictions_total {}\n",
+            self.pinned_tables.load(Ordering::Relaxed),
+            self.pinned_bytes.load(Ordering::Relaxed),
+            self.pin_evictions_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+impl Default for PinMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +244,47 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(m.archive_segments_uploaded.load(Ordering::Relaxed), 1000);
+    }
+
+    #[test]
+    fn pin_metrics_default_zero() {
+        let m = PinMetrics::new();
+        let text = m.to_prometheus_text();
+        assert!(text.contains("ferrosa_nvme_pinned_tables 0"));
+        assert!(text.contains("ferrosa_nvme_pinned_bytes 0"));
+        assert!(text.contains("ferrosa_nvme_pin_evictions_total 0"));
+    }
+
+    #[test]
+    fn pin_metrics_increment_and_render() {
+        let m = PinMetrics::new();
+        m.inc_pinned_tables();
+        m.inc_pinned_tables();
+        m.add_pinned_bytes(4096);
+        m.inc_pin_evictions();
+        let text = m.to_prometheus_text();
+        assert!(text.contains("ferrosa_nvme_pinned_tables 2"));
+        assert!(text.contains("ferrosa_nvme_pinned_bytes 4096"));
+        assert!(text.contains("ferrosa_nvme_pin_evictions_total 1"));
+    }
+
+    #[test]
+    fn pin_metrics_decrement() {
+        let m = PinMetrics::new();
+        m.inc_pinned_tables();
+        m.add_pinned_bytes(2048);
+        m.dec_pinned_tables();
+        m.sub_pinned_bytes(2048);
+        let text = m.to_prometheus_text();
+        assert!(text.contains("ferrosa_nvme_pinned_tables 0"));
+        assert!(text.contains("ferrosa_nvme_pinned_bytes 0"));
+    }
+
+    #[test]
+    fn pin_metrics_set_pinned_bytes() {
+        let m = PinMetrics::new();
+        m.set_pinned_bytes(99999);
+        let text = m.to_prometheus_text();
+        assert!(text.contains("ferrosa_nvme_pinned_bytes 99999"));
     }
 }

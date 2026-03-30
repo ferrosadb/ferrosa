@@ -1,33 +1,29 @@
-//! BM25 scoring for full-text index queries.
+//! BM25 relevance scoring for full-text search.
 //!
-//! BM25 (Best Match 25) is the industry-standard probabilistic relevance
-//! ranking function used by Elasticsearch, Lucene, and most modern search
-//! engines. It extends TF-IDF with document-length normalization.
+//! Implements Okapi BM25 (Best Match 25), the industry-standard probabilistic
+//! ranking function used by Lucene/Elasticsearch and SAI in Cassandra 5.
 //!
-//! # Formula
+//! ## Formula
+//!
+//! For a query term `q` and document `d`:
 //!
 //! ```text
-//! BM25(q, d) = Σ IDF(t) * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * |d| / avgdl))
+//! score(d, q) = IDF(q) * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl/avgdl))
 //! ```
 //!
 //! Where:
-//! - `tf` = term frequency in the document
-//! - `IDF(t)` = log((N - df + 0.5) / (df + 0.5) + 1)
-//! - `N` = total number of documents in the collection
-//! - `df` = document frequency of the term
-//! - `|d|` = length of the document field
-//! - `avgdl` = average document field length
-//! - `k1` = term saturation parameter (default 1.2)
-//! - `b` = length normalization parameter (default 0.75)
+//! - `tf`    — term frequency in document
+//! - `IDF`   — inverse document frequency: `ln((N - df + 0.5) / (df + 0.5) + 1)`
+//! - `dl`    — document length (token count)
+//! - `avgdl` — average document length across corpus
+//! - `k1`    — term saturation parameter (default 1.2)
+//! - `b`     — length normalization parameter (default 0.75)
 
-/// Parameters that control BM25 scoring behaviour.
-#[derive(Debug, Clone, PartialEq)]
+/// BM25 parameters.
 pub struct Bm25Params {
-    /// Term frequency saturation parameter. Higher values give more weight to
-    /// repeated terms. Typical range: 1.2–2.0. Default: 1.2.
+    /// Term saturation factor. Higher values give more weight to TF.
     pub k1: f64,
-    /// Field-length normalization factor. 0.0 = no normalization, 1.0 = full
-    /// normalization. Default: 0.75.
+    /// Length normalization factor. 0 = no normalization, 1 = full normalization.
     pub b: f64,
 }
 
@@ -37,60 +33,47 @@ impl Default for Bm25Params {
     }
 }
 
-/// Compute the BM25 relevance score for a single term in a single document.
+/// Compute BM25 score for one `(query_term, document)` pair.
 ///
 /// # Arguments
 ///
-/// - `term_frequency` — how many times the term appears in this document's field
-/// - `doc_frequency` — how many documents in the collection contain the term
-/// - `total_docs` — total number of documents in the collection
-/// - `field_length` — length (in tokens) of the field in this document
-/// - `avg_field_length` — average field length across the collection
-/// - `params` — BM25 tuning parameters
+/// * `tf`    — term frequency in the document.
+/// * `df`    — number of documents containing the term.
+/// * `n`     — total number of documents in the corpus.
+/// * `dl`    — length of the document in tokens.
+/// * `avgdl` — average document length across the corpus.
+/// * `params` — BM25 tuning parameters (use `Default::default()` for standard values).
 ///
-/// # Returns
-///
-/// A non-negative relevance score. Higher means more relevant.
-///
-/// # Panics
-///
-/// Does not panic. Returns 0.0 when `doc_frequency >= total_docs` (IDF would
-/// be negative or zero, which BM25+ avoids via the `+1` inside the log).
-pub fn bm25_score(
-    term_frequency: u32,
-    doc_frequency: u32,
-    total_docs: u32,
-    field_length: u32,
-    avg_field_length: f64,
-    params: &Bm25Params,
-) -> f64 {
-    // Guard: trivial cases that would produce meaningless scores.
-    if total_docs == 0 || doc_frequency == 0 || term_frequency == 0 {
+/// Returns 0.0 when `n == 0` or `df == 0` to avoid divide-by-zero.
+pub fn bm25_score(tf: u32, df: u64, n: u64, dl: u32, avgdl: f64, params: &Bm25Params) -> f64 {
+    assert!(
+        avgdl >= 0.0,
+        "avgdl must be non-negative, got {avgdl}"
+    );
+
+    // Guard against degenerate inputs before checking df <= n invariant.
+    if n == 0 || df == 0 || avgdl == 0.0 {
         return 0.0;
     }
 
-    // Ensure avg_field_length is positive to avoid division by zero.
-    let avgdl = if avg_field_length > 0.0 {
-        avg_field_length
-    } else {
-        1.0
-    };
+    assert!(
+        df <= n,
+        "df ({df}) must not exceed n ({n})"
+    );
 
-    // IDF component: Lucene's smooth IDF variant (BM25+), always >= 0.
-    let n = total_docs as f64;
-    let df = doc_frequency as f64;
-    let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+    let tf_f = tf as f64;
+    let df_f = df as f64;
+    let n_f = n as f64;
+    let dl_f = dl as f64;
 
-    // TF-norm component.
-    let tf = term_frequency as f64;
-    let dl = field_length as f64;
-    let k1 = params.k1;
-    let b = params.b;
+    // IDF component: smooth variant that avoids negative scores.
+    let idf = ((n_f - df_f + 0.5) / (df_f + 0.5) + 1.0).ln();
 
-    let numerator = tf * (k1 + 1.0);
-    let denominator = tf + k1 * (1.0 - b + b * dl / avgdl);
+    // TF normalization component.
+    let tf_norm = tf_f * (params.k1 + 1.0)
+        / (tf_f + params.k1 * (1.0 - params.b + params.b * dl_f / avgdl));
 
-    idf * (numerator / denominator)
+    idf * tf_norm
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -100,57 +83,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bm25_single_term() {
-        let score = bm25_score(2, 10, 1000, 50, 100.0, &Bm25Params::default());
-        assert!(score > 0.0);
-    }
-
-    #[test]
-    fn bm25_multi_term_ranking() {
+    fn bm25_score_zero_n_returns_zero() {
         let params = Bm25Params::default();
-        // Doc with higher TF should score higher (same collection, same doc length).
-        let score_high = bm25_score(5, 10, 1000, 50, 100.0, &params);
-        let score_low = bm25_score(1, 10, 1000, 50, 100.0, &params);
-        assert!(score_high > score_low);
-    }
-
-    #[test]
-    fn bm25_rare_term_scores_higher() {
-        let params = Bm25Params::default();
-        // Rare term (df=2) should score higher than common term (df=500).
-        let score_rare = bm25_score(1, 2, 1000, 50, 100.0, &params);
-        let score_common = bm25_score(1, 500, 1000, 50, 100.0, &params);
-        assert!(score_rare > score_common);
-    }
-
-    #[test]
-    fn bm25_zero_term_frequency_returns_zero() {
-        let score = bm25_score(0, 10, 1000, 50, 100.0, &Bm25Params::default());
+        let score = bm25_score(5, 2, 0, 10, 0.0, &params);
         assert_eq!(score, 0.0);
     }
 
     #[test]
-    fn bm25_zero_total_docs_returns_zero() {
-        let score = bm25_score(1, 1, 0, 50, 100.0, &Bm25Params::default());
+    fn bm25_score_zero_df_returns_zero() {
+        let params = Bm25Params::default();
+        let score = bm25_score(5, 0, 100, 10, 15.0, &params);
         assert_eq!(score, 0.0);
     }
 
     #[test]
-    fn bm25_long_doc_scores_lower_than_short_doc() {
+    fn bm25_score_higher_tf_gives_higher_score() {
         let params = Bm25Params::default();
-        // Same TF, but long doc should score lower after length normalization.
-        let score_short = bm25_score(2, 10, 1000, 20, 100.0, &params);
-        let score_long = bm25_score(2, 10, 1000, 200, 100.0, &params);
-        assert!(score_short > score_long);
+        let low = bm25_score(1, 5, 100, 10, 10.0, &params);
+        let high = bm25_score(5, 5, 100, 10, 10.0, &params);
+        assert!(
+            high > low,
+            "score with tf=5 ({high}) should exceed score with tf=1 ({low})"
+        );
     }
 
     #[test]
-    fn bm25_no_length_normalization_when_b_zero() {
-        let params = Bm25Params { k1: 1.2, b: 0.0 };
-        // With b=0, field length has no effect — scores must be equal.
-        let score_short = bm25_score(2, 10, 1000, 20, 100.0, &params);
-        let score_long = bm25_score(2, 10, 1000, 200, 100.0, &params);
-        let diff = (score_short - score_long).abs();
-        assert!(diff < 1e-12, "b=0 should eliminate length penalty, diff={diff}");
+    fn bm25_score_rarer_term_scores_higher() {
+        let params = Bm25Params::default();
+        // Term appearing in 2/100 docs (rare) vs 50/100 (common).
+        let rare = bm25_score(2, 2, 100, 10, 10.0, &params);
+        let common = bm25_score(2, 50, 100, 10, 10.0, &params);
+        assert!(
+            rare > common,
+            "rare term ({rare}) should score higher than common term ({common})"
+        );
+    }
+
+    #[test]
+    fn bm25_score_shorter_doc_scores_higher_same_tf() {
+        let params = Bm25Params::default();
+        // Same tf, same df, but shorter document.
+        let short = bm25_score(2, 5, 100, 5, 10.0, &params);
+        let long = bm25_score(2, 5, 100, 20, 10.0, &params);
+        assert!(
+            short > long,
+            "shorter doc ({short}) should score higher than longer doc ({long})"
+        );
+    }
+
+    #[test]
+    fn bm25_score_positive_for_matching_term() {
+        let params = Bm25Params::default();
+        let score = bm25_score(3, 10, 1000, 15, 20.0, &params);
+        assert!(score > 0.0, "BM25 score must be positive: got {score}");
     }
 }
