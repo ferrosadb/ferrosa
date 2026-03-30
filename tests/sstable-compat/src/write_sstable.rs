@@ -89,6 +89,7 @@ fn write_simple_types_sstable(output_dir: &str) -> anyhow::Result<()> {
                 "org.apache.cassandra.db.marshal.BytesType".into(),
             ),
         ],
+        extensions: Default::default(),
     };
 
     let options = WriteOptions {

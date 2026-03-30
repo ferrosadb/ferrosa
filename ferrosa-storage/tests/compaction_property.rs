@@ -42,6 +42,7 @@ fn test_table_schema() -> TableSchema {
         clustering_columns: vec![],
         static_columns: vec![],
         regular_columns: vec![],
+        extensions: Default::default(),
     }
 }
 

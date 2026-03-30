@@ -239,6 +239,7 @@ impl TableMetadata {
             clustering_columns,
             static_columns,
             regular_columns,
+            extensions: Default::default(),
         }
     }
 }

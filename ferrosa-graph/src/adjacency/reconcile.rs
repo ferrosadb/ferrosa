@@ -505,6 +505,7 @@ mod tests {
             }],
             static_columns: vec![],
             regular_columns: vec![],
+            extensions: Default::default(),
         };
         storage.register_table(edge_storage_schema).unwrap();
 
@@ -532,6 +533,7 @@ mod tests {
                 name: "edge_table".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
         storage.register_table(adj_storage_schema).unwrap();
     }

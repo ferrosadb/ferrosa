@@ -686,6 +686,7 @@ mod tests {
                 name: "val".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         // Build two partitions with distinct values.

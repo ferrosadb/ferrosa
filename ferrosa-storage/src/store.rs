@@ -772,6 +772,7 @@ mod tests {
                 name: "val".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         }
     }
 
@@ -1012,6 +1013,7 @@ mod tests {
                 name: "email".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         // Create store with an index on "email" (regular column index 0)
@@ -1065,6 +1067,7 @@ mod tests {
                 name: "city".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         let store = TableStore::new_with_indexes(
@@ -1125,6 +1128,7 @@ mod tests {
                 name: "val".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         let store = TableStore::new_with_indexes(
@@ -1175,6 +1179,7 @@ mod tests {
                 name: "email".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         let store = TableStore::new_with_indexes(
@@ -1293,6 +1298,7 @@ mod tests {
                 name: "email".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         let store = TableStore::new_with_indexes(
@@ -1353,6 +1359,7 @@ mod tests {
                 name: "city".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         let store = TableStore::new_with_indexes(
@@ -1430,6 +1437,7 @@ mod tests {
                 name: "status".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         let store = TableStore::new_with_indexes(
@@ -1477,6 +1485,7 @@ mod tests {
                 name: "tag".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         let store = TableStore::new_with_indexes(
@@ -1529,6 +1538,7 @@ mod tests {
                 name: "email".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         let store = TableStore::new_with_indexes(
@@ -1585,6 +1595,7 @@ mod tests {
                     type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
                 },
             ],
+            extensions: Default::default(),
         };
 
         // Index on "email" (column position 0), but row only has "name" (position 1)
@@ -1637,6 +1648,7 @@ mod tests {
                 name: "city".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         let store = TableStore::new_with_indexes(
@@ -1699,6 +1711,7 @@ mod tests {
                 name: "city".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
+            extensions: Default::default(),
         };
 
         let store = TableStore::new_with_indexes(
