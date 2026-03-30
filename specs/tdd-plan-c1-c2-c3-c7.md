@@ -14,23 +14,20 @@ Before writing any test, note what the codebase exploration confirmed:
 
 | Item | Code Status | Tests |
 |------|-------------|-------|
-| BUG-021 (bind values in QUERY) | Fixed — `handle_query` calls `substitute_bound_values` | Missing |
-| BUG-022 (schema lost on restart) | Fixed — `persist_schema_locally` / `load_local_schema` added | Missing |
-| BUG-023 (phonetic index lost) | Fixed — `apply_snapshot` now restores indexes/types/functions | Missing |
-| BUG-024 (PREPARE after ALTER TABLE) | Root cause in PREPARE handler, likely NOT fixed | Missing |
-| BUG-025 (map bind value as blob) | NOT fixed — `raw_bytes_to_term()` falls through to blob | Missing |
-| BUG-026 (collection read-back fails) | NOT fixed — consequence of BUG-025 wire-format loss | Missing |
-| C2.1 (pair replication ACK) | NOT fixed — fire-and-forget in `coordinate_write` | Missing |
-| C2.2 (S3 upload before manifest) | Fixed — `poll_compactions` awaits `rx` before manifest update | Missing |
-| C2.3 (manifest CAS fallback) | NOT removed — unconditional PUT still in `manifest.rs:147` | Missing |
-| C7.1 S3 upload in poll_compactions | Done | Missing |
-| C7.2 Manifest update after compact | Done | Missing |
-| C7.3 Input S3 deletion (grace) | Done (fire-and-forget) | Missing |
-| C7.4 Local disk eviction | Done | Missing |
-| C7.5 Cassandra reads compacted SST | Bugs fixed (CRC.db, firstKey/lastKey) | Exists (container) |
-| C7.6 Prometheus metrics | Counters exist, not exported | Missing |
-| C7.7 End-to-end pipeline | Bugs fixed | Exists (container) |
-| C3 Jepsen infrastructure | All stubbed | Missing |
+| BUG-021 (bind values in QUERY) | **DONE** | 5 regression tests |
+| BUG-022 (schema lost on restart) | **DONE** | 2 tests |
+| BUG-023 (phonetic index lost) | **DONE** | 1 regression test |
+| BUG-024 (PREPARE after ALTER TABLE) | **DONE** (ArcSwap) | 2 regression tests |
+| BUG-025 (map bind value as blob) | **DONE** | 2 tests |
+| BUG-026 (collection read-back fails) | **DONE** | 4 tests |
+| C2.1 (pair replication ACK) | **DONE** | 3 tests |
+| C2.2 (S3 upload before manifest) | **DONE** | 1 test (FailOnPutStore) |
+| C2.3 (manifest CAS fallback) | **DONE** | 2 tests |
+| C7.1-C7.4 Compaction S3 pipeline | **DONE** | 5 tests |
+| C7.5 Cassandra reads compacted SST | **DONE** | Container test |
+| C7.6 Prometheus metrics | **DONE** | 1 test |
+| C7.7 End-to-end pipeline | **DONE** | Container test |
+| C3.1-C3.7 Jepsen infrastructure | **DONE** | 12 tests |
 
 ---
 
@@ -40,55 +37,55 @@ Check off as each test goes from red → green.
 
 ### C1: Open Bug Fixes
 
-- [ ] `collection_map_flush_readback` (C1.6 / BUG-026)
-- [ ] `collection_set_flush_readback` (C1.6 / BUG-026)
-- [ ] `collection_list_flush_readback` (C1.6 / BUG-026)
-- [ ] `collection_via_gocql_roundtrip` (C1.6 / BUG-026)
-- [ ] `map_bind_value_roundtrip` (C1.5 / BUG-025)
-- [ ] `map_bind_value_cassandra_compat` (C1.5 / BUG-025)
-- [ ] `bind_values_select` (C1.1 / BUG-021)
-- [ ] `bind_values_insert` (C1.1 / BUG-021)
-- [ ] `bind_values_update` (C1.1 / BUG-021)
-- [ ] `bind_values_delete` (C1.1 / BUG-021)
-- [ ] `bind_values_ten_types` (C1.1 / BUG-021)
-- [ ] `schema_survives_restart` (C1.2 / BUG-022)
-- [ ] `schema_survives_binary_upgrade` (C1.2 / BUG-022)
-- [ ] `phonetic_index_survives_restore` (C1.3 / BUG-023)
-- [ ] `prepare_after_alter_table_add_column` (C1.4 / BUG-024)
-- [ ] `prepare_after_alter_table_drop_column` (C1.4 / BUG-024)
+- [x] `collection_map_flush_readback` (C1.6 / BUG-026)
+- [x] `collection_set_flush_readback` (C1.6 / BUG-026)
+- [x] `collection_list_flush_readback` (C1.6 / BUG-026)
+- [x] `collection_via_gocql_roundtrip` (C1.6 / BUG-026)
+- [x] `map_bind_value_roundtrip` (C1.5 / BUG-025)
+- [x] `map_bind_value_cassandra_compat` (C1.5 / BUG-025)
+- [x] `bind_values_select` (C1.1 / BUG-021)
+- [x] `bind_values_insert` (C1.1 / BUG-021)
+- [x] `bind_values_update` (C1.1 / BUG-021)
+- [x] `bind_values_delete` (C1.1 / BUG-021)
+- [x] `bind_values_ten_types` (C1.1 / BUG-021)
+- [x] `schema_survives_restart` (C1.2 / BUG-022)
+- [x] `schema_survives_binary_upgrade` (C1.2 / BUG-022)
+- [x] `phonetic_index_survives_restore` (C1.3 / BUG-023)
+- [x] `prepare_after_alter_table_add_column` (C1.4 / BUG-024)
+- [x] `prepare_after_alter_table_drop_column` (C1.4 / BUG-024)
 
 ### C2: P0 Storage Hazards
 
-- [ ] `manifest_cas_required_at_startup` (C2.3)
-- [ ] `manifest_concurrent_flush_preserves_all_entries` (C2.3)
-- [ ] `pair_write_confirmed_after_secondary_ack` (C2.1)
-- [ ] `pair_write_survives_primary_crash` (C2.1)
-- [ ] `pair_replication_timeout_returns_error` (C2.1)
+- [x] `manifest_cas_required_at_startup` (C2.3)
+- [x] `manifest_concurrent_flush_preserves_all_entries` (C2.3)
+- [x] `pair_write_confirmed_after_secondary_ack` (C2.1)
+- [x] `pair_write_survives_primary_crash` (C2.1)
+- [x] `pair_replication_timeout_returns_error` (C2.1)
 
 ### C7: Compaction S3 Integration (non-container tests)
 
-- [ ] `compaction_output_uploaded_to_s3` (C7.1)
-- [ ] `manifest_updated_after_compaction` (C7.2)
-- [ ] `manifest_compaction_concurrent_flush` (C7.2)
-- [ ] `compaction_inputs_enqueued_for_s3_deletion` (C7.3)
-- [ ] `compaction_inputs_evicted_locally` (C7.4)
-- [ ] `compaction_s3_metrics_accurate` (C7.6)
+- [x] `compaction_output_uploaded_to_s3` (C7.1)
+- [x] `manifest_updated_after_compaction` (C7.2)
+- [x] `manifest_compaction_concurrent_flush` (C7.2)
+- [x] `compaction_inputs_enqueued_for_s3_deletion` (C7.3)
+- [x] `compaction_inputs_evicted_locally` (C7.4)
+- [x] `compaction_s3_metrics_accurate` (C7.6)
 
 ### C3: Jepsen Infrastructure
 
-- [ ] `rust_driver_connects_to_cluster` (C3.1)
-- [ ] `rust_driver_register_history_roundtrip` (C3.1)
-- [ ] `orchestrator_docker_cluster_provision` (C3.2) — `FERROSA_TEST_CONTAINERS=1`
-- [ ] `orchestrator_cluster_teardown` (C3.2) — `FERROSA_TEST_CONTAINERS=1`
-- [ ] `bank_workload_executes` (C3.3) — `FERROSA_TEST_CONTAINERS=1`
-- [ ] `lwt_insert_if_not_exists_executes` (C3.3) — `FERROSA_TEST_CONTAINERS=1`
-- [ ] `lwt_cas_counter_executes` (C3.3) — `FERROSA_TEST_CONTAINERS=1`
-- [ ] `bank_invariant_total_balance` (C3.4)
-- [ ] `register_invariant_every_read_valid` (C3.4)
-- [ ] `nemesis_partition_halves_docker` (C3.5) — `FERROSA_TEST_CONTAINERS=1`
-- [ ] `nemesis_kill_minority_docker` (C3.5) — `FERROSA_TEST_CONTAINERS=1`
-- [ ] `nemesis_clock_skew_docker` (C3.6) — `FERROSA_TEST_CONTAINERS=1`
-- [ ] `smoke_tier_end_to_end` (C3.7) — `FERROSA_TEST_CONTAINERS=1`
+- [x] `rust_driver_connects_to_cluster` (C3.1)
+- [x] `rust_driver_register_history_roundtrip` (C3.1)
+- [x] `orchestrator_docker_cluster_provision` (C3.2) — `FERROSA_TEST_CONTAINERS=1`
+- [x] `orchestrator_cluster_teardown` (C3.2) — `FERROSA_TEST_CONTAINERS=1`
+- [x] `bank_workload_executes` (C3.3) — `FERROSA_TEST_CONTAINERS=1`
+- [x] `lwt_insert_if_not_exists_executes` (C3.3) — `FERROSA_TEST_CONTAINERS=1`
+- [x] `lwt_cas_counter_executes` (C3.3) — `FERROSA_TEST_CONTAINERS=1`
+- [x] `bank_invariant_total_balance` (C3.4)
+- [x] `register_invariant_every_read_valid` (C3.4)
+- [x] `nemesis_partition_halves_docker` (C3.5) — `FERROSA_TEST_CONTAINERS=1`
+- [x] `nemesis_kill_minority_docker` (C3.5) — `FERROSA_TEST_CONTAINERS=1`
+- [x] `nemesis_clock_skew_docker` (C3.6) — `FERROSA_TEST_CONTAINERS=1`
+- [x] `smoke_tier_end_to_end` (C3.7) — `FERROSA_TEST_CONTAINERS=1`
 
 ---
 

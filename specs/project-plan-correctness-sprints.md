@@ -1,7 +1,8 @@
 # Correctness Sprint Plan — Single-DC Jepsen + S3 + Accord
 
 > Created: 2026-03-28
-> Status: Draft
+> Updated: 2026-03-29 (PR #84 merged — C1+C2+C3+C7 complete)
+> Status: In Progress — C1/C2/C3/C7 complete, C4/C5/C6/C8 remaining
 > Focus: Single-datacenter N-node correctness validation, S3/SSTable Cassandra format verification, Accord transaction correctness under all Jepsen failure modes, compaction S3 integration, and full CQL driver compatibility.
 > Predecessor: [project-plan-unified.md](project-plan-unified.md) (Accord S1–S7)
 
