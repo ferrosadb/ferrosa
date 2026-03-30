@@ -210,23 +210,19 @@ mod tests {
     #[test]
     fn parse_explicit_and() {
         let q = parse_fts_query("rust AND cargo").unwrap();
-        assert!(
-            matches!(&q, FtsQuery::And(l, r) if
-                **l == FtsQuery::Term("rust".into()) &&
-                **r == FtsQuery::Term("cargo".into())
-            )
-        );
+        assert!(matches!(&q, FtsQuery::And(l, r) if
+            **l == FtsQuery::Term("rust".into()) &&
+            **r == FtsQuery::Term("cargo".into())
+        ));
     }
 
     #[test]
     fn parse_explicit_or() {
         let q = parse_fts_query("rust OR go").unwrap();
-        assert!(
-            matches!(&q, FtsQuery::Or(l, r) if
-                **l == FtsQuery::Term("rust".into()) &&
-                **r == FtsQuery::Term("go".into())
-            )
-        );
+        assert!(matches!(&q, FtsQuery::Or(l, r) if
+            **l == FtsQuery::Term("rust".into()) &&
+            **r == FtsQuery::Term("go".into())
+        ));
     }
 
     #[test]

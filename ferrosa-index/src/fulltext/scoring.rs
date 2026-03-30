@@ -46,20 +46,14 @@ impl Default for Bm25Params {
 ///
 /// Returns 0.0 when `n == 0` or `df == 0` to avoid divide-by-zero.
 pub fn bm25_score(tf: u32, df: u64, n: u64, dl: u32, avgdl: f64, params: &Bm25Params) -> f64 {
-    assert!(
-        avgdl >= 0.0,
-        "avgdl must be non-negative, got {avgdl}"
-    );
+    assert!(avgdl >= 0.0, "avgdl must be non-negative, got {avgdl}");
 
     // Guard against degenerate inputs before checking df <= n invariant.
     if n == 0 || df == 0 || avgdl == 0.0 {
         return 0.0;
     }
 
-    assert!(
-        df <= n,
-        "df ({df}) must not exceed n ({n})"
-    );
+    assert!(df <= n, "df ({df}) must not exceed n ({n})");
 
     let tf_f = tf as f64;
     let df_f = df as f64;
@@ -70,8 +64,8 @@ pub fn bm25_score(tf: u32, df: u64, n: u64, dl: u32, avgdl: f64, params: &Bm25Pa
     let idf = ((n_f - df_f + 0.5) / (df_f + 0.5) + 1.0).ln();
 
     // TF normalization component.
-    let tf_norm = tf_f * (params.k1 + 1.0)
-        / (tf_f + params.k1 * (1.0 - params.b + params.b * dl_f / avgdl));
+    let tf_norm =
+        tf_f * (params.k1 + 1.0) / (tf_f + params.k1 * (1.0 - params.b + params.b * dl_f / avgdl));
 
     idf * tf_norm
 }

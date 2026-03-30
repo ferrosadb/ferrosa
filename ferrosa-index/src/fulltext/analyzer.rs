@@ -32,10 +32,9 @@ impl StandardAnalyzer {
     /// Create a new `StandardAnalyzer` with default English stop words.
     pub fn new() -> Self {
         let defaults = [
-            "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "for",
-            "from", "has", "he", "in", "is", "it", "its", "of", "on", "or", "that",
-            "the", "their", "there", "they", "this", "to", "was", "were", "will",
-            "with",
+            "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "for", "from", "has",
+            "he", "in", "is", "it", "its", "of", "on", "or", "that", "the", "their", "there",
+            "they", "this", "to", "was", "were", "will", "with",
         ];
         Self {
             stop_words: defaults.iter().map(|s| (*s).to_string()).collect(),
@@ -145,7 +144,10 @@ mod tests {
     fn standard_analyzer_removes_stop_words() {
         let a = StandardAnalyzer::new();
         let tokens = a.analyze("the quick brown fox");
-        assert!(!tokens.contains(&"the".to_string()), "stop word 'the' should be removed");
+        assert!(
+            !tokens.contains(&"the".to_string()),
+            "stop word 'the' should be removed"
+        );
         assert!(tokens.contains(&"quick".to_string()));
         assert!(tokens.contains(&"brown".to_string()));
         assert!(tokens.contains(&"fox".to_string()));
@@ -161,9 +163,18 @@ mod tests {
         let analyzer = analyzer_from_options(&options);
         let tokens = analyzer.analyze("Rust is a cargo crate system");
         // Custom stops should be removed.
-        assert!(!tokens.contains(&"rust".to_string()), "custom stop 'rust' must be absent");
-        assert!(!tokens.contains(&"cargo".to_string()), "custom stop 'cargo' must be absent");
-        assert!(!tokens.contains(&"crate".to_string()), "custom stop 'crate' must be absent");
+        assert!(
+            !tokens.contains(&"rust".to_string()),
+            "custom stop 'rust' must be absent"
+        );
+        assert!(
+            !tokens.contains(&"cargo".to_string()),
+            "custom stop 'cargo' must be absent"
+        );
+        assert!(
+            !tokens.contains(&"crate".to_string()),
+            "custom stop 'crate' must be absent"
+        );
         // Non-stop words must remain.
         assert!(tokens.contains(&"system".to_string()));
     }
@@ -171,8 +182,7 @@ mod tests {
     #[test]
     fn fts_language_analyzer() {
         // analyzer=none maps to default (standard); explicitly test keyword for no-stemming.
-        let options: HashMap<String, String> =
-            [("analyzer".into(), "keyword".into())].into();
+        let options: HashMap<String, String> = [("analyzer".into(), "keyword".into())].into();
         let analyzer = analyzer_from_options(&options);
         let tokens = analyzer.analyze("Hello World");
         // KeywordAnalyzer preserves the whole string as one token.
@@ -213,8 +223,7 @@ mod tests {
 
     #[test]
     fn analyzer_from_options_simple() {
-        let options: HashMap<String, String> =
-            [("analyzer".into(), "simple".into())].into();
+        let options: HashMap<String, String> = [("analyzer".into(), "simple".into())].into();
         let a = analyzer_from_options(&options);
         let tokens = a.analyze("Hello World");
         assert_eq!(tokens, vec!["hello".to_string(), "world".to_string()]);

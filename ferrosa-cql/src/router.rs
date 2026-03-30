@@ -951,10 +951,8 @@ async fn route_select_user_table(
     // the FTI search to obtain matching partition keys, fetch each partition,
     // and apply remaining WHERE predicates as a post-filter.
     if where_has_fts_match(&s.where_clauses) {
-        let (fts_column, fts_query) =
-            extract_fts_match(&s.where_clauses).ok_or_else(|| {
-                CqlError::Invalid("fts_match: failed to extract column/query".into())
-            })?;
+        let (fts_column, fts_query) = extract_fts_match(&s.where_clauses)
+            .ok_or_else(|| CqlError::Invalid("fts_match: failed to extract column/query".into()))?;
 
         // Look up the full-text index name for the referenced column.
         let fti_index_name = snap
@@ -969,9 +967,7 @@ async fn route_select_user_table(
 
         // Fall back to using the column name as the index name when no explicit
         // index registration exists (useful for simple single-column FTI).
-        let index_name = fti_index_name
-            .as_deref()
-            .unwrap_or(fts_column);
+        let index_name = fti_index_name.as_deref().unwrap_or(fts_column);
 
         let matching_pks = state
             .engine
@@ -983,9 +979,8 @@ async fn route_select_user_table(
         // Reconstruct a DecoratedKey by wrapping them in PartitionKey directly.
         let mut fts_rows = Vec::new();
         for raw_pk in matching_pks {
-            let decorated = ferrosa_common::DecoratedKey::new(
-                ferrosa_common::PartitionKey::new(raw_pk),
-            );
+            let decorated =
+                ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(raw_pk));
             if let Some(partition) = state.engine.read(&table_id, &decorated)? {
                 let mut prows = bridge::partition_to_rows(
                     &partition,
@@ -5888,9 +5883,7 @@ fn where_has_udf_calls(where_clauses: &[WhereClause]) -> bool {
 /// `fts_match` is expressed as `WHERE col = fts_match('query string')` in the
 /// parsed AST.  This function detects that pattern.
 fn where_has_fts_match(where_clauses: &[WhereClause]) -> bool {
-    where_clauses
-        .iter()
-        .any(|wc| is_fts_match_term(&wc.value))
+    where_clauses.iter().any(|wc| is_fts_match_term(&wc.value))
 }
 
 /// Returns true when `term` is `fts_match(query_string)`.
@@ -9579,7 +9572,10 @@ mod tests {
     fn fts_match_simple_query() {
         use ferrosa_common::{DecoratedKey, PartitionKey};
         use ferrosa_index::fulltext::builder::FullTextIndexBuilder;
-        use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig};
+        use ferrosa_storage::{
+            CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig,
+            SyncStrategyConfig,
+        };
 
         let dir = tempfile::TempDir::new().unwrap();
         let commit_log = CommitLogConfig {
@@ -9636,10 +9632,10 @@ mod tests {
         let key1 = DecoratedKey::new(PartitionKey::new(b"row1".to_vec()));
         let row1 = ferrosa_sstable::Row {
             clustering: vec![],
-            cells: vec![(0, ferrosa_common::CellValue::live(
-                b"rust programming systems language".to_vec(),
-                1,
-            ))],
+            cells: vec![(
+                0,
+                ferrosa_common::CellValue::live(b"rust programming systems language".to_vec(), 1),
+            )],
             deletion: ferrosa_sstable::DeletionTime::LIVE,
             primary_key_liveness: ferrosa_sstable::LivenessInfo::with_timestamp(1),
         };
@@ -9647,10 +9643,7 @@ mod tests {
         engine.flush(&table_id).unwrap();
 
         // Discover the generation number from the SSTable directory.
-        let sstable_dir = dir
-            .path()
-            .join("sstables")
-            .join(table_id.to_string());
+        let sstable_dir = dir.path().join("sstables").join(table_id.to_string());
         let gen: u64 = std::fs::read_dir(&sstable_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -9685,8 +9678,14 @@ mod tests {
         // Verify both pk1 and pk2 are present.
         let has_row1 = results.iter().any(|pk| pk == b"row1");
         let has_row2 = results.iter().any(|pk| pk == b"row2");
-        assert!(has_row1, "row1 must be in fts_match results for 'programming'");
-        assert!(has_row2, "row2 must be in fts_match results for 'programming'");
+        assert!(
+            has_row1,
+            "row1 must be in fts_match results for 'programming'"
+        );
+        assert!(
+            has_row2,
+            "row2 must be in fts_match results for 'programming'"
+        );
 
         // "scripting" only appears in row3 — verify single match.
         let results3 = engine

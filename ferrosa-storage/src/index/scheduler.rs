@@ -683,6 +683,7 @@ mod tests {
             }],
             static_columns: vec![],
             regular_columns: vec![ColumnDefinition {
+                extensions: Default::default(),
                 name: "val".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],

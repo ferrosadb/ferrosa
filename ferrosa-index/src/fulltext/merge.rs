@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use super::builder::{serialize_fti, FullTextIndex, TermEntry, Posting};
+use super::builder::{serialize_fti, FullTextIndex, Posting, TermEntry};
 use super::reader::deserialize_fti;
 
 /// Merge two FTI byte buffers into one.
@@ -191,8 +191,14 @@ mod tests {
         let reader = FullTextIndexReader::open(merged).unwrap();
 
         assert_eq!(reader.doc_count(), 2);
-        assert!(!reader.lookup("rust").is_empty(), "term 'rust' must survive merge");
-        assert!(!reader.lookup("concurrency").is_empty(), "term 'concurrency' must survive merge");
+        assert!(
+            !reader.lookup("rust").is_empty(),
+            "term 'rust' must survive merge"
+        );
+        assert!(
+            !reader.lookup("concurrency").is_empty(),
+            "term 'concurrency' must survive merge"
+        );
     }
 
     #[test]

@@ -572,9 +572,7 @@ impl StorageEngine {
         let (old_was_pinned, pinned_ids) = {
             let tables = self.tables.read();
             let state = tables.get(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!(
-                    "table not registered: {table_id}"
-                ))
+                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
             })?;
             let was_pinned = state.pin_config.is_some();
             let ids: Vec<String> = state
@@ -591,9 +589,7 @@ impl StorageEngine {
         {
             let mut tables = self.tables.write();
             let state = tables.get_mut(table_id).ok_or_else(|| {
-                ferrosa_common::Error::InvalidFormat(format!(
-                    "table not registered: {table_id}"
-                ))
+                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
             })?;
             state.pin_config = new_config;
             if !now_pinned {
@@ -607,9 +603,8 @@ impl StorageEngine {
             (false, true) => self.pin_metrics.inc_pinned_tables(),
             (true, false) => {
                 self.pin_metrics.dec_pinned_tables();
-                self.pin_metrics.set_pinned_bytes(
-                    self.compute_pinned_bytes(table_id),
-                );
+                self.pin_metrics
+                    .set_pinned_bytes(self.compute_pinned_bytes(table_id));
             }
             _ => {}
         }
@@ -1190,7 +1185,11 @@ impl StorageEngine {
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
         use std::collections::HashMap;
 
-        let table_dir = self.config.data_dir.join("sstables").join(table_id.to_string());
+        let table_dir = self
+            .config
+            .data_dir
+            .join("sstables")
+            .join(table_id.to_string());
         let fti_suffix = format!("-FTI-{index_name}.db");
 
         let fti_files: Vec<std::path::PathBuf> = std::fs::read_dir(&table_dir)
@@ -1199,7 +1198,11 @@ impl StorageEngine {
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let name = e.file_name().to_str()?.to_string();
-                if name.ends_with(&fti_suffix) { Some(e.path()) } else { None }
+                if name.ends_with(&fti_suffix) {
+                    Some(e.path())
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -1207,21 +1210,31 @@ impl StorageEngine {
         for fti_path in fti_files {
             let bytes = match std::fs::read(&fti_path) {
                 Ok(b) => b,
-                Err(e) => { tracing::warn!(path = %fti_path.display(), "failed to read FTI: {e}"); continue; }
+                Err(e) => {
+                    tracing::warn!(path = %fti_path.display(), "failed to read FTI: {e}");
+                    continue;
+                }
             };
             let reader = match FullTextIndexReader::open(bytes) {
                 Ok(r) => r,
-                Err(e) => { tracing::warn!(path = %fti_path.display(), "bad FTI: {e}"); continue; }
+                Err(e) => {
+                    tracing::warn!(path = %fti_path.display(), "bad FTI: {e}");
+                    continue;
+                }
             };
             let hits = match reader.search_str(query) {
                 Ok(h) => h,
                 Err(e) => {
-                    return Err(ferrosa_common::Error::InvalidFormat(format!("fts_match query error: {e}")));
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "fts_match query error: {e}"
+                    )));
                 }
             };
             for hit in hits {
                 let entry = score_map.entry(hit.partition_key).or_insert(0.0);
-                if hit.score > *entry { *entry = hit.score; }
+                if hit.score > *entry {
+                    *entry = hit.score;
+                }
             }
         }
 
@@ -1446,9 +1459,11 @@ impl StorageEngine {
             if let Some(ref scheduler) = self.index_scheduler {
                 let gen = state.store.last_flush_generation();
                 for (index_name, col_pos) in state.store.indexed_columns() {
-                    let tracker_state =
-                        self.index_tracker
-                            .get_state(table_id.keyspace(), table_id.table(), index_name);
+                    let tracker_state = self.index_tracker.get_state(
+                        table_id.keyspace(),
+                        table_id.table(),
+                        index_name,
+                    );
                     // Only submit if the index needs building (not already current).
                     if let Some(idx_state) = tracker_state {
                         if !idx_state.indexed_sstables.contains(&format!("{gen}")) {
@@ -1493,7 +1508,11 @@ impl StorageEngine {
                 let mut tables = self.tables.write();
                 if let Some(state) = tables.get_mut(table_id) {
                     // Only append if this gen isn't already tracked (idempotent).
-                    if !state.pinned_sstables.iter().any(|(id, _)| *id == sstable_id) {
+                    if !state
+                        .pinned_sstables
+                        .iter()
+                        .any(|(id, _)| *id == sstable_id)
+                    {
                         state.pinned_sstables.push((sstable_id.clone(), size));
                     }
                 }
@@ -2023,7 +2042,10 @@ impl StorageEngine {
                     Some(s) => s,
                     None => break,
                 };
-                if let Some(pos) = state.pinned_sstables.iter().position(|(id, _)| *id == evict_id)
+                if let Some(pos) = state
+                    .pinned_sstables
+                    .iter()
+                    .position(|(id, _)| *id == evict_id)
                 {
                     let (_, bytes) = state.pinned_sstables.remove(pos);
                     bytes
@@ -2044,11 +2066,7 @@ impl StorageEngine {
 
     /// Enqueues S3 uploads for SSTables that were previously skipped due to
     /// pin mode. Called when a table transitions from pinned → unpinned.
-    async fn upload_previously_pinned_sstables(
-        &self,
-        table_id: &TableId,
-        sstable_ids: &[String],
-    ) {
+    async fn upload_previously_pinned_sstables(&self, table_id: &TableId, sstable_ids: &[String]) {
         let table_dir = self
             .config
             .data_dir
@@ -2752,6 +2770,7 @@ mod tests {
             }],
             static_columns: vec![],
             regular_columns: vec![ColumnDefinition {
+                extensions: Default::default(),
                 name: "val".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             }],
@@ -3104,6 +3123,7 @@ mod tests {
             }],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
+            extensions: Default::default(),
                 name: "result".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
@@ -3170,6 +3190,7 @@ mod tests {
             }],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
+            extensions: Default::default(),
                 name: "result".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
@@ -4034,6 +4055,7 @@ mod tests {
                 clustering_columns: vec![],
                 static_columns: vec![],
                 regular_columns: vec![ColumnDefinition {
+                    extensions: Default::default(),
                     name: "val".to_string(),
                     type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
                 }],
@@ -4159,6 +4181,7 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![
+            extensions: Default::default(),
                 ferrosa_common::ColumnDefinition {
                     name: "cluster_ack_level".into(),
                     type_name: "org.apache.cassandra.db.marshal.MapType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.LongType)".into(),
@@ -4245,6 +4268,7 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
+                extensions: Default::default(),
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
@@ -4301,6 +4325,7 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
+                extensions: Default::default(),
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
@@ -4356,6 +4381,7 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
+                extensions: Default::default(),
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
@@ -4416,6 +4442,7 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![ferrosa_common::ColumnDefinition {
+                extensions: Default::default(),
                 name: "v".into(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             }],
@@ -5039,6 +5066,7 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![
+            extensions: Default::default(),
                 ferrosa_common::schema::ColumnDefinition {
                     name: "v_text".into(),
                     type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
@@ -5096,6 +5124,7 @@ mod tests {
                     clustering_columns: vec![],
                     static_columns: vec![],
                     regular_columns: vec![
+                    extensions: Default::default(),
                         ferrosa_common::schema::ColumnDefinition {
                             name: "v_text".into(),
                             type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
@@ -5594,6 +5623,7 @@ mod tests {
             clustering_columns: vec![],
             static_columns: vec![],
             regular_columns: vec![ColumnDefinition {
+                extensions: Default::default(),
                 name: "col".to_string(),
                 type_name: col_type.to_string(),
             }],
@@ -6109,10 +6139,7 @@ mod tests {
         // Register the table in pin mode with a tiny cap.
         // 1-byte cap guarantees every flush after the first triggers an eviction.
         engine
-            .register_table_pinned(
-                test_schema(),
-                PinConfig { max_bytes: Some(1) },
-            )
+            .register_table_pinned(test_schema(), PinConfig { max_bytes: Some(1) })
             .unwrap();
 
         let tid = table_id();
@@ -6242,10 +6269,7 @@ mod tests {
         );
 
         // Unpin the table — this should enqueue S3 uploads for the skipped SSTables.
-        engine
-            .update_table_pin_config(&tid, None)
-            .await
-            .unwrap();
+        engine.update_table_pin_config(&tid, None).await.unwrap();
 
         // pinned_tables gauge must decrement.
         assert_eq!(

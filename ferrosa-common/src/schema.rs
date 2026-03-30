@@ -38,7 +38,10 @@ impl PinConfig {
     /// Build a `PinConfig` from a raw extensions map (e.g. from `WITH extensions`).
     pub fn from_extensions(extensions: &HashMap<String, String>) -> Self {
         Self {
-            nvme: extensions.get("storage.pin").map(|v| v == "nvme").unwrap_or(false),
+            nvme: extensions
+                .get("storage.pin")
+                .map(|v| v == "nvme")
+                .unwrap_or(false),
         }
     }
 }
@@ -48,7 +51,7 @@ impl PinConfig {
 /// Column ordering: static columns first (by position in `static_columns`),
 /// then regular columns (by position in `regular_columns`). This matches
 /// Cassandra's internal column index assignment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TableSchema {
     pub keyspace: String,
     pub table: String,
