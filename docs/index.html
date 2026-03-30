@@ -1003,8 +1003,8 @@
         Python, Java, Go, Rust (cdrs-tokio), and Node.js drivers connect without code changes.
         DDL, DML, prepared statements, batch operations, lightweight transactions
         (IF NOT EXISTS, IF conditions), system keyspaces, ALLOW FILTERING,
-        toJson(), counter increment/decrement, and collection
-        UPDATE +/- operators — all there.
+        toJson(), counter increment/decrement, collection types (map, set, list)
+        with full UPDATE +/- operators and collection bind values in prepared statements — all there.
       </p>
       <span class="metric">protocol v4/v5 · cdrs-tokio · 0 driver changes required</span>
     </div>
@@ -1114,6 +1114,7 @@
           protocol for safe membership changes.
         </p>
         <span class="metric">Accord protocol · strict serializable · 1-RTT fast path · Jepsen-verified</span>
+        <p style="margin-top: 0.75rem; font-size: 0.875rem; color: var(--text-secondary);">Verified with Jepsen-style chaos testing across partition, kill, pause, and clock-skew fault injection.</p>
       </div>
       <div class="code-demo" style="margin: 0; border: none;">
         <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- Lightweight transactions (Cassandra-compatible)</span>
@@ -1551,10 +1552,10 @@ user = session.execute(stmt, [user_id])
           <td>Full (AWS)</td>
         </tr>
         <tr>
-          <td>Open Source</td>
+          <td>Source Available</td>
           <td class="ferrosa-col">Coming Soon</td>
           <td><span class="check">✓</span></td>
-          <td>Partial (AGPL)</td>
+          <td>Partial</td>
           <td><span class="cross">✗</span></td>
           <td><span class="cross">✗</span></td>
         </tr>
