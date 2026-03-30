@@ -1,6 +1,6 @@
 # SSTable Format Specification
 
-> Last updated: 2026-03-22 (sign-bit fix, range tombstone skip, overflow fixes)
+> Last updated: 2026-03-30 (sign-bit fix, range tombstone skip, overflow fixes, FTI sidecar)
 > Status: Approved
 
 ## Overview
@@ -563,6 +563,19 @@ The column type names and delta-encoding minimums from this header are required 
 ### TOC (TOC.txt)
 
 Plain text file listing all component filenames, one per line. Used to enumerate the SSTable's files for deletion, upload, or verification.
+
+### FTI Sidecar Files
+
+Full-text index sidecar: `{gen}-FTI-{index_name}.db`
+
+Not listed in TOC.txt (secondary index, not core component). Built during flush by `FullTextIndexBuilder`, merged during compaction.
+
+Format:
+- Header: `FTIX` magic (4 bytes) + version u8 + doc_count u32 LE
+- Term section: term_count u32 LE, then sorted terms with postings
+- Corpus stats: total_doc_len u64 LE
+
+Uploaded to S3 alongside SSTable components. Rebuilt from SSTable data if missing.
 
 ## On-Disk Trie Format
 

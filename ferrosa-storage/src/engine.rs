@@ -806,6 +806,26 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Register a full-text index on a table.
+    ///
+    /// After registration, each `flush()` will build an FTI sidecar file
+    /// (`{gen}-FTI-{index_name}.db`) alongside the SSTable.
+    pub fn add_fulltext_index(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        column_position: usize,
+    ) -> ferrosa_common::Result<()> {
+        let mut tables = self.tables.write();
+        let state = tables.get_mut(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state
+            .store
+            .add_fulltext_index(index_name.to_string(), column_position);
+        Ok(())
+    }
+
     /// Scans a table directory for existing SSTable files and sidecar index files,
     /// opening both.
     ///
@@ -1635,6 +1655,36 @@ impl StorageEngine {
                 result.output.path.clone(),
                 result.output.size_bytes,
             );
+
+            // ── Skip S3 upload for pinned tables ────────────────────────────
+            //
+            // Pinned tables keep SSTables on local NVMe only. Track the
+            // compacted output the same way flush does.
+            let is_compaction_pinned = {
+                let tables = self.tables.read();
+                tables
+                    .get(table_id)
+                    .is_some_and(|s| s.pin_config.is_some())
+            };
+            if is_compaction_pinned {
+                let size = result.output.size_bytes;
+                let sstable_id = result.output.id.clone();
+                {
+                    let mut tables = self.tables.write();
+                    if let Some(state) = tables.get_mut(table_id) {
+                        if !state
+                            .pinned_sstables
+                            .iter()
+                            .any(|(id, _)| *id == sstable_id)
+                        {
+                            state.pinned_sstables.push((sstable_id, size));
+                        }
+                    }
+                }
+                self.pin_metrics.add_pinned_bytes(size as i64);
+                self.enforce_pin_max_bytes(table_id);
+                continue;
+            }
 
             // ── Crash-safe S3 upload + manifest update ─────────────────────
             //
@@ -6349,6 +6399,106 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 >= 0,
             "pinned_bytes must be non-negative after flush while pinned"
+        );
+    }
+
+    // ── FT-018: FTI sidecar created on flush ─────────────────────────────────
+
+    /// Verifies that flushing a table with a fulltext index produces an FTI
+    /// sidecar file alongside the SSTable, and that the FTI is queryable.
+    #[test]
+    fn fts_sidecar_created_on_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // Register a fulltext index on column 0.
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        // Write 3 rows with text content in column 0.
+        for (key, text) in [("r1", "rust distributed database"), ("r2", "cassandra storage"), ("r3", "hello world")] {
+            engine
+                .write(
+                    &tid,
+                    &make_key(key),
+                    make_row(text.as_bytes(), 1000),
+                    1000,
+                )
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+
+        // Check that an FTI sidecar file was created.
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let fti_files: Vec<_> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("FTI-idx_body")
+            })
+            .collect();
+        assert_eq!(
+            fti_files.len(),
+            1,
+            "exactly one FTI sidecar file must exist after flush"
+        );
+
+        // Verify the FTI is valid and queryable.
+        let fti_bytes = std::fs::read(fti_files[0].path()).unwrap();
+        let reader = ferrosa_index::fulltext::reader::FullTextIndexReader::open(fti_bytes).unwrap();
+        assert_eq!(reader.doc_count(), 3);
+
+        let hits = reader.search_str("rust").unwrap();
+        assert!(!hits.is_empty(), "search for 'rust' must return results");
+    }
+
+    // ── FT-019: FTS end-to-end insert → flush → query ──────────────────────
+
+    #[test]
+    fn fts_end_to_end_insert_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        // Insert rows with different text.
+        let docs = [
+            ("r1", "rust is a fast distributed database language"),
+            ("r2", "cassandra is a distributed database"),
+            ("r3", "hello world"),
+            ("r4", "distributed systems are complex"),
+            ("r5", "database normalization theory"),
+        ];
+        for (key, text) in &docs {
+            engine
+                .write(&tid, &make_key(key), make_row(text.as_bytes(), 1000), 1000)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+
+        // Query for rows with BOTH "distributed" AND "database".
+        let results = engine
+            .fulltext_search(&tid, "idx_body", "distributed AND database")
+            .unwrap();
+        let result_keys: Vec<String> = results
+            .iter()
+            .map(|pk| String::from_utf8_lossy(pk).to_string())
+            .collect();
+
+        assert!(result_keys.contains(&"r1".to_string()), "r1 has both terms");
+        assert!(result_keys.contains(&"r2".to_string()), "r2 has both terms");
+        assert!(
+            !result_keys.contains(&"r3".to_string()),
+            "r3 has neither term"
         );
     }
 }

@@ -1,6 +1,6 @@
 # System Overview
 
-> Last updated: 2026-03-22
+> Last updated: 2026-03-30
 > Status: Approved
 
 ## Overview
@@ -123,6 +123,8 @@ Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analys
 | Partitioner | Murmur3Partitioner | Cassandra SSTable compatibility |
 | Driver compat | Protocol v4 + v5 negotiation | cdrs-tokio and other standard CQL drivers work out of the box |
 | Embeddings | `vector<float, N>` CQL type | Native vector storage for AI/ML workloads; ANN query support via vector indexes |
+| NVMe Table Pinning | Per-table `storage.pin = nvme` | Pins SSTables to local disk, bypassing S3 for sub-millisecond reads |
+| Full-Text Search | Inverted index sidecars + `fts_match()` | BM25-scored full-text queries via CQL function; `CREATE INDEX ... USING 'fulltext'` |
 
 ## AWS Lock-in Flags
 

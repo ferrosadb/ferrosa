@@ -1,7 +1,7 @@
 # Unified Project Plan — Ferrosa Ecosystem
 
-> Last updated: 2026-03-21
-> Status: Draft
+> Last updated: 2026-03-30
+> Status: Active — Accord A1-A7 complete, correctness sprints C1-C7 complete, NVMe+FTS implemented, C4/C8 remaining
 > Priority order: ferrosa (core DB) → ferrosa-memory → ferrosa-dbaas → Temporal compatibility
 > Strategy: Accord-first — no throwaway LWT; build CAS semantics on Accord
 

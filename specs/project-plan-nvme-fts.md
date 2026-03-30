@@ -1,7 +1,8 @@
 # Project Plan: NVMe Table Pinning + Full-Text Indexing
 
 > Created: 2026-03-29
-> Status: Draft
+> Updated: 2026-03-30
+> Status: NV1 Complete, FT1 Complete, FT2 Complete — all core implementation and tests passing
 > Architecture: [nvme-pinning-architecture.md](nvme-pinning-architecture.md), [fulltext-index-architecture.md](fulltext-index-architecture.md)
 
 ---

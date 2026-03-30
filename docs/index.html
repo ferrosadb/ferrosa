@@ -1057,21 +1057,24 @@
     <div class="feature-card highlight">
       <div>
         <div class="feature-icon index">◎</div>
-        <h3>Pluggable Secondary Indexes</h3>
+        <h3>11 Built-In Index Types</h3>
         <p>
-          Eight index types behind a single trait: B-tree for range scans, hash for O(1) lookups,
+          Eleven index types behind a single trait: B-tree for range scans, hash for O(1) lookups,
           composite for multi-column queries, phonetic for fuzzy string matching (Soundex,
-          Metaphone, Double Metaphone, Caverphone), and two vector index methods for
-          approximate nearest neighbor search. Native <code>vector&lt;float, N&gt;</code> CQL type
-          for embedding storage and ANN search — store and query high-dimensional vectors directly.
+          Metaphone, Double Metaphone, Caverphone), two vector methods for approximate nearest
+          neighbor search, filtered indexes with predicates, and <strong>full-text search</strong> with
+          BM25 ranked retrieval. Native <code>vector&lt;float, N&gt;</code> CQL type
+          for embedding storage — store and query high-dimensional vectors directly.
         </p>
         <p style="margin-top: 0.75rem;">
           Indexes are storage-attached — built asynchronously after SSTable flush with zero
-          impact on the write path. Per-index staleness tracking and operational metrics
+          impact on the write path. Full-text indexes use inverted-index sidecar files with
+          a pluggable analyzer pipeline (tokenizer, stop words, Porter stemmer).
+          Per-index staleness tracking and operational metrics
           via <code>system_views.secondary_indexes</code> let you monitor build progress
           and lag in real time. CQL-compatible DDL with standard <code>CREATE INDEX ... USING 'type'</code> syntax.
         </p>
-        <span class="metric">B-tree · Hash · Composite · Phonetic · Vector (HNSW) · Vector (IVFFlat)</span>
+        <span class="metric">B-tree · Hash · Composite · Phonetic · Filtered · Vector (HNSW) · Vector (IVFFlat) · Full-Text</span>
       </div>
       <div class="code-demo" style="margin: 0; border: none;">
         <pre class="code-block active" style="display: block; font-size: 0.8125rem;"><span class="cm">-- B-tree index for range queries</span>
@@ -1088,6 +1091,13 @@
   <span class="kw">USING</span> <span class="str">'vector'</span>
   <span class="kw">WITH OPTIONS</span> = {<span class="str">'method'</span>: <span class="str">'hnsw'</span>,
     <span class="str">'metric'</span>: <span class="str">'cosine'</span>, <span class="str">'dimensions'</span>: <span class="str">'768'</span>};
+
+<span class="cm">-- Full-text search with BM25 ranking</span>
+<span class="kw">CREATE INDEX</span> idx_body <span class="kw">ON</span> articles (body)
+  <span class="kw">USING</span> <span class="str">'fulltext'</span>;
+
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> articles
+  <span class="kw">WHERE</span> fts_match(body, <span class="str">'distributed AND database'</span>);
 
 <span class="cm">-- Nearest neighbor query</span>
 <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> documents
@@ -1135,6 +1145,35 @@
     <span class="kw">WHERE</span> id = <span class="str">'acct-2'</span>;
 <span class="kw">COMMIT TRANSACTION</span>;</pre>
       </div>
+    </div>
+
+    <!-- NVMe Table Pinning -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(120, 200, 255, 0.12);">⚙</div>
+      <h3>NVMe Table Pinning</h3>
+      <p>
+        Pin hot tables to local NVMe for sub-millisecond reads. A single table attribute
+        (<code>storage.pin = nvme</code>) keeps SSTables on local disk, bypassing S3 entirely.
+        Ideal for session caches, materialized views, and lookup tables that tolerate node loss.
+        Optional <code>pin_max_bytes</code> cap evicts oldest SSTables when the budget is exceeded.
+        <code>ALTER TABLE</code> toggles pin mode on live tables — unpinning automatically uploads
+        existing SSTables to S3.
+      </p>
+      <span class="metric">sub-ms reads · per-table config · max_bytes cap · ALTER TABLE toggle</span>
+    </div>
+
+    <!-- Full-Text Search -->
+    <div class="feature-card">
+      <div class="feature-icon" style="background: rgba(255, 200, 100, 0.12);">🔍</div>
+      <h3>Full-Text Search</h3>
+      <p>
+        Built-in inverted index with BM25 ranked retrieval — no external search engine needed.
+        Create a full-text index on any text column and query with boolean operators
+        (AND, OR, NOT), phrase matching, and prefix wildcards. Pluggable analyzer pipeline:
+        tokenizer, stop-word filter, Porter stemmer. Sidecar index files are built on flush
+        and merged during compaction — zero write-path overhead.
+      </p>
+      <span class="metric">BM25 ranking · AND/OR/NOT/prefix · pluggable analyzers · zero write overhead</span>
     </div>
 
     <!-- Lock-free -->
@@ -1456,8 +1495,24 @@ user = session.execute(stmt, [user_id])
           <td><span class="cross">✗</span></td>
         </tr>
         <tr>
+          <td>Full-Text Search</td>
+          <td class="ferrosa-col"><span class="check">✓</span> BM25 + analyzers</td>
+          <td>SASI (deprecated)</td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
+          <td>NVMe Table Pinning</td>
+          <td class="ferrosa-col"><span class="check">✓</span> per-table</td>
+          <td><span class="cross">✗</span></td>
+          <td><span class="cross">✗</span></td>
+          <td>DAX (cache)</td>
+          <td><span class="cross">✗</span></td>
+        </tr>
+        <tr>
           <td>Secondary Indexes</td>
-          <td class="ferrosa-col">8 types</td>
+          <td class="ferrosa-col">11 types (incl. FTS)</td>
           <td>SAI / 2i</td>
           <td>SI</td>
           <td>GSI / LSI</td>

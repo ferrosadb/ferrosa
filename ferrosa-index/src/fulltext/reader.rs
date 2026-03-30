@@ -164,6 +164,54 @@ impl FullTextIndexReader {
                 self.eval_query(left, scores);
                 self.eval_query(right, scores);
             }
+            FtsQuery::Prefix(prefix) => {
+                self.eval_prefix(prefix, scores);
+            }
+            FtsQuery::Not(inner) => {
+                // NOT: collect all documents, then remove those matching inner.
+                let mut all_scores: HashMap<Vec<u8>, f64> = HashMap::new();
+                for entry in self.index.terms.values() {
+                    for posting in &entry.postings {
+                        all_scores
+                            .entry(posting.partition_key.clone())
+                            .or_insert(1.0);
+                    }
+                }
+                let mut excluded: HashMap<Vec<u8>, f64> = HashMap::new();
+                self.eval_query(inner, &mut excluded);
+                for pk in excluded.keys() {
+                    all_scores.remove(pk);
+                }
+                for (pk, s) in all_scores {
+                    scores.entry(pk).or_insert(s);
+                }
+            }
+        }
+    }
+
+    /// Maximum number of terms a prefix wildcard can expand to.
+    const MAX_WILDCARD_EXPANSION: usize = 10_000;
+
+    /// Evaluate a prefix wildcard query, expanding to matching terms with a cap.
+    fn eval_prefix(&self, prefix: &str, scores: &mut HashMap<Vec<u8>, f64>) {
+        // Collect matching terms and their doc frequencies.
+        let mut matching: Vec<(&str, u32)> = self
+            .index
+            .terms
+            .iter()
+            .filter(|(term, _)| term.starts_with(prefix))
+            .map(|(term, entry)| (term.as_str(), entry.doc_freq))
+            .collect();
+
+        // If exceeds cap, keep terms with highest doc frequency.
+        if matching.len() > Self::MAX_WILDCARD_EXPANSION {
+            matching.sort_by(|a, b| b.1.cmp(&a.1));
+            matching.truncate(Self::MAX_WILDCARD_EXPANSION);
+        }
+
+        // Score all postings from matching terms.
+        for (term, _) in matching {
+            self.score_term(term, scores);
         }
     }
 
@@ -391,6 +439,56 @@ mod tests {
         let pks: Vec<_> = hits.iter().map(|h| h.partition_key.clone()).collect();
         assert!(pks.contains(&b"pk1".to_vec()), "pk1 must be in OR result");
         assert!(pks.contains(&b"pk3".to_vec()), "pk3 must be in OR result");
+    }
+
+    #[test]
+    fn search_prefix_query() {
+        let reader = make_reader(&[
+            (b"pk1", "rustacean rust programming"),
+            (b"pk2", "python scripting"),
+            (b"pk3", "rustic furniture"),
+        ]);
+        let hits = reader.search_str("rust*").unwrap();
+        let pks: Vec<_> = hits.iter().map(|h| h.partition_key.as_slice()).collect();
+        assert!(pks.contains(&b"pk1".as_slice()), "pk1 has 'rustacean' and 'rust'");
+        assert!(pks.contains(&b"pk3".as_slice()), "pk3 has 'rustic'");
+        assert!(!pks.contains(&b"pk2".as_slice()), "pk2 has no rust* term");
+    }
+
+    #[test]
+    fn search_not_query() {
+        let reader = make_reader(&[
+            (b"pk1", "rust programming"),
+            (b"pk2", "go programming"),
+            (b"pk3", "python scripting"),
+        ]);
+        let hits = reader.search_str("NOT rust").unwrap();
+        let pks: Vec<_> = hits.iter().map(|h| h.partition_key.as_slice()).collect();
+        assert!(!pks.contains(&b"pk1".as_slice()), "pk1 has 'rust' — excluded");
+        assert!(pks.contains(&b"pk2".as_slice()), "pk2 should remain");
+        assert!(pks.contains(&b"pk3".as_slice()), "pk3 should remain");
+    }
+
+    #[test]
+    fn fts_wildcard_bare_star_rejected() {
+        let reader = make_reader(&[(b"pk1", "hello world")]);
+        let result = reader.search_str("*");
+        assert!(result.is_err(), "bare star must be rejected");
+    }
+
+    #[test]
+    fn fts_wildcard_expansion_capped() {
+        // Create index with many unique terms starting with "a".
+        let mut builder = FullTextIndexBuilder::new();
+        for i in 0..500 {
+            builder.add_document(format!("pk{i}").into_bytes(), &format!("a{i:05} other"));
+        }
+        let bytes = builder.finish().unwrap();
+        let reader = FullTextIndexReader::open(bytes).unwrap();
+        // Prefix search should work without OOM.
+        let hits = reader.search_str("a*").unwrap();
+        assert!(!hits.is_empty(), "prefix search must return results");
+        assert!(hits.len() <= 500, "must not exceed doc count");
     }
 
     #[test]

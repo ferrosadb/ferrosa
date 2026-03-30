@@ -1,8 +1,9 @@
 # NVMe Table Pinning — Architecture Spec
 
 > Created: 2026-03-29
-> Status: Draft
-> Crate scope: ferrosa-schema, ferrosa-storage, ferrosa-cql
+> Updated: 2026-03-30
+> Status: Implemented — PinConfig, LocalCache pinned set, S3 skip on flush/compaction, max_bytes enforcement, ALTER TABLE pin/unpin, metrics
+> Crate scope: ferrosa-storage (pin_config.rs, engine.rs, cache.rs, metrics.rs)
 
 ---
 
