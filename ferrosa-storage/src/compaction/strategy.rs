@@ -106,9 +106,16 @@ impl SizeTieredStrategy {
 
         for sst in &sorted[1..] {
             let median = bucket_median(&current_bucket);
-            let ratio = sst.size_bytes as f64 / median;
+            // When median is 0 (size not yet tracked), group all zero-size SSTables
+            // together — they are homogeneous and should compact as one bucket.
+            let in_bucket = if median == 0.0 {
+                sst.size_bytes == 0
+            } else {
+                let ratio = sst.size_bytes as f64 / median;
+                ratio >= self.config.bucket_low && ratio <= self.config.bucket_high
+            };
 
-            if ratio >= self.config.bucket_low && ratio <= self.config.bucket_high {
+            if in_bucket {
                 current_bucket.push(sst);
             } else {
                 buckets.push(std::mem::take(&mut current_bucket));

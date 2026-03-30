@@ -1,5 +1,65 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
+/// Prometheus-compatible metrics for compaction S3 operations.
+pub struct CompactionMetrics {
+    /// Number of compacted SSTables successfully uploaded to S3.
+    pub s3_uploads_total: AtomicI64,
+    /// Number of input SSTables deleted from S3 after compaction.
+    pub s3_deletes_total: AtomicI64,
+    /// Total input bytes freed by completed compactions (gauge).
+    pub input_bytes_reclaimed: AtomicI64,
+}
+
+impl CompactionMetrics {
+    pub fn new() -> Self {
+        Self {
+            s3_uploads_total: AtomicI64::new(0),
+            s3_deletes_total: AtomicI64::new(0),
+            input_bytes_reclaimed: AtomicI64::new(0),
+        }
+    }
+
+    /// Increments the S3 upload counter by 1.
+    pub fn inc_s3_uploads(&self) {
+        self.s3_uploads_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments the S3 delete counter by 1.
+    pub fn inc_s3_deletes(&self) {
+        self.s3_deletes_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Adds `bytes` to the input bytes reclaimed gauge.
+    pub fn add_bytes_reclaimed(&self, bytes: i64) {
+        self.input_bytes_reclaimed
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Renders metrics in Prometheus exposition text format.
+    pub fn to_prometheus_text(&self) -> String {
+        format!(
+            "# HELP ferrosa_compaction_s3_uploads_total Compacted SSTables uploaded to S3\n\
+             # TYPE ferrosa_compaction_s3_uploads_total counter\n\
+             ferrosa_compaction_s3_uploads_total {}\n\
+             # HELP ferrosa_compaction_s3_deletes_total Input SSTables deleted from S3 after compaction\n\
+             # TYPE ferrosa_compaction_s3_deletes_total counter\n\
+             ferrosa_compaction_s3_deletes_total {}\n\
+             # HELP ferrosa_compaction_input_bytes_reclaimed Total bytes freed by completed compactions\n\
+             # TYPE ferrosa_compaction_input_bytes_reclaimed gauge\n\
+             ferrosa_compaction_input_bytes_reclaimed {}\n",
+            self.s3_uploads_total.load(Ordering::Relaxed),
+            self.s3_deletes_total.load(Ordering::Relaxed),
+            self.input_bytes_reclaimed.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl Default for CompactionMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Prometheus-compatible metrics for PITR archiving and snapshots.
 pub struct PitrMetrics {
     pub archive_segments_uploaded: AtomicI64,

@@ -207,8 +207,11 @@ impl Workload for BankWorkload {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::history::Operation;
+    use crate::workload::testutil::MockCqlSession;
 
     fn make_op(client: &str, invoke: u64, complete: u64, op: Op, result: OpResult) -> Operation {
         Operation {
@@ -217,6 +220,38 @@ mod tests {
             complete_us: complete,
             op,
             result,
+        }
+    }
+
+    /// Verify that BankWorkload.setup() and run() execute against a mock
+    /// CQL session without panicking and produce a non-empty history.
+    #[tokio::test]
+    async fn bank_workload_executes() {
+        let session = MockCqlSession::new();
+        let workload = BankWorkload;
+
+        workload.setup(&session).await.unwrap();
+
+        let mut recorder = HistoryRecorder::new("test");
+        // Short duration to keep the test fast; the loop will still execute
+        // multiple iterations before the clock fires.
+        workload
+            .run(&session, &mut recorder, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        let history = recorder.finish();
+        assert!(
+            !history.operations.is_empty(),
+            "run() should have recorded at least one operation"
+        );
+
+        // Every recorded operation must have a completed result — no pending ops.
+        for op in &history.operations {
+            assert!(
+                !matches!(op.result, OpResult::Timeout),
+                "unexpected Timeout result in mock run"
+            );
         }
     }
 

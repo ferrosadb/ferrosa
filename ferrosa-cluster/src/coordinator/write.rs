@@ -75,13 +75,13 @@ impl ClusterCoordinator {
             });
         }
 
-        let mutation = Mutation {
-            keyspace: table_id.keyspace.clone(),
-            table: table_id.table.clone(),
-            key: key.clone(),
-            rows: vec![row.clone()],
+        let mutation = Mutation::new(
+            table_id.keyspace.clone(),
+            table_id.table.clone(),
+            key.clone(),
+            vec![row.clone()],
             timestamp,
-        };
+        );
         let body = encode_mutation(&mutation);
 
         // Collect (replica_id, Option<host_id>) before dropping the ring guard
@@ -236,13 +236,13 @@ impl ClusterCoordinator {
         }
 
         // Build the mutation payload.
-        let mutation = Mutation {
-            keyspace: table_id.keyspace.clone(),
-            table: table_id.table.clone(),
-            key: key.clone(),
-            rows: vec![row.clone()],
+        let mutation = Mutation::new(
+            table_id.keyspace.clone(),
+            table_id.table.clone(),
+            key.clone(),
+            vec![row.clone()],
             timestamp,
-        };
+        );
         let body = encode_mutation(&mutation);
 
         let replica_targets: Vec<(u64, Option<uuid::Uuid>, String)> = replicas

@@ -282,11 +282,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Create StorageEngine
     let storage_config = ferrosa_storage::StorageEngineConfig::from_env()?;
     let rt = tokio::runtime::Handle::current();
-    let mut storage = ferrosa_storage::StorageEngine::new(storage_config, Some(&rt))?;
+    let storage = ferrosa_storage::StorageEngine::new(storage_config, Some(&rt))?;
     // Probe object store for conditional put support (CAS).
-    // RustFS/MinIO don't support etag-based conditional writes, so we
-    // detect this once and fall back to unconditional manifest writes.
-    storage.probe_s3_cas().await;
+    // RustFS/MinIO may not support etag-based conditional writes — log a
+    // warning but continue. The manifest CAS retry loop will still attempt
+    // conditional puts and fall back gracefully.
+    if let Err(e) = storage.probe_s3_cas().await {
+        tracing::warn!("S3 CAS probe failed (non-fatal): {e}");
+    }
     let storage = Arc::new(storage);
 
     // 4. Create Schema
@@ -746,7 +749,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 _ = compact_interval.tick() => {
-                    maintenance_engine.poll_compactions();
+                    maintenance_engine.poll_compactions().await;
                 }
                 _ = schema_sync_interval.tick() => {
                     let snap = maintenance_schema.snapshot();

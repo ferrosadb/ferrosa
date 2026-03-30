@@ -69,9 +69,38 @@ pub struct NemesisSchedule {
     pub cycles: usize,
 }
 
+/// No-op nemesis — injects and heals without doing anything.
+///
+/// Used as a baseline: a healthy cluster with no fault injection must pass
+/// linearizability checks. If it doesn't, the workload or checker is broken.
+pub struct NoOp;
+
+#[async_trait]
+impl NemesisAction for NoOp {
+    fn name(&self) -> &str {
+        "noop"
+    }
+
+    async fn inject(&self, _ctx: &NemesisContext) -> Result<()> {
+        tracing::debug!("noop nemesis: inject (nothing to do)");
+        Ok(())
+    }
+
+    async fn heal(&self, _ctx: &NemesisContext) -> Result<()> {
+        tracing::debug!("noop nemesis: heal (nothing to do)");
+        Ok(())
+    }
+}
+
 /// Registry of available nemeses.
 pub struct NemesisRegistry {
     nemeses: std::collections::HashMap<String, Box<dyn NemesisAction>>,
+}
+
+impl Default for NemesisRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NemesisRegistry {
@@ -97,6 +126,7 @@ impl NemesisRegistry {
     /// Create a registry with all Phase 1 nemeses pre-registered.
     pub fn phase1() -> Self {
         let mut reg = Self::new();
+        reg.register(Box::new(NoOp));
         reg.register(Box::new(network::PartitionHalves));
         reg.register(Box::new(process::KillMinority));
         reg.register(Box::new(clock::ClockSkewSmall));
@@ -154,7 +184,12 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec!["clock-skew-small", "kill-minority", "partition-halves"]
+            vec![
+                "clock-skew-small",
+                "kill-minority",
+                "noop",
+                "partition-halves"
+            ]
         );
     }
 
@@ -163,7 +198,7 @@ mod tests {
         let reg = NemesisRegistry::phase2();
         let mut names = reg.names();
         names.sort();
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 15);
         assert_eq!(
             names,
             vec![
@@ -175,6 +210,7 @@ mod tests {
                 "jitter-network",
                 "kill-majority",
                 "kill-minority",
+                "noop",
                 "packet-loss",
                 "partition-halves",
                 "partition-one",
@@ -189,7 +225,7 @@ mod tests {
     fn nemesis_registry_full() {
         let reg = NemesisRegistry::full();
         let names = reg.names();
-        assert!(names.len() >= 24); // 14 phase2 + 5 WAN + 5 composed
+        assert!(names.len() >= 25); // 15 phase2 + 5 WAN + 5 composed
         assert!(names.contains(&"dc-partition".to_string()));
         assert!(names.contains(&"partition+kill".to_string()));
     }

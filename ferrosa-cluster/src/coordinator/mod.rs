@@ -395,6 +395,7 @@ mod tests {
         let handler = MutationForwardHandler::new(storage.clone());
 
         let mutation = Mutation {
+            mutation_id: [0x90u8; 16],
             keyspace: "test_ks".to_string(),
             table: "test_tbl".to_string(),
             key: test_key(),
@@ -460,6 +461,7 @@ mod tests {
         let handler = super::RepairWriteHandler::new(storage.clone(), metrics.clone());
 
         let mutation = Mutation {
+            mutation_id: [0x91u8; 16],
             keyspace: "test_ks".to_string(),
             table: "test_tbl".to_string(),
             key: test_key(),

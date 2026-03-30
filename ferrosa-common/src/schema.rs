@@ -5,8 +5,10 @@
 //! depend on ferrosa-sstable — conversion to `SerializationHeader` lives
 //! in ferrosa-storage::flush to avoid circular dependencies.
 
+use serde::{Deserialize, Serialize};
+
 /// A single column definition within a table schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDefinition {
     /// Column name.
     pub name: String,
@@ -19,7 +21,7 @@ pub struct ColumnDefinition {
 /// Column ordering: static columns first (by position in `static_columns`),
 /// then regular columns (by position in `regular_columns`). This matches
 /// Cassandra's internal column index assignment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchema {
     pub keyspace: String,
     pub table: String,

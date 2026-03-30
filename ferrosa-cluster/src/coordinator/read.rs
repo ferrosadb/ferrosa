@@ -795,18 +795,18 @@ async fn send_repair_writes(
     partition: &Partition,
     stale_host_ids: &[uuid::Uuid],
 ) {
-    let mutation = Mutation {
-        keyspace: table_id.keyspace.clone(),
-        table: table_id.table.clone(),
-        key: partition.key.clone(),
-        rows: partition.rows.clone(),
-        timestamp: partition
+    let mutation = Mutation::new(
+        table_id.keyspace.clone(),
+        table_id.table.clone(),
+        partition.key.clone(),
+        partition.rows.clone(),
+        partition
             .rows
             .iter()
             .flat_map(|r| r.cells.iter().map(|(_, c)| c.timestamp))
             .max()
             .unwrap_or(0),
-    };
+    );
     let body = encode_mutation(&mutation);
 
     for &host_id in stale_host_ids {

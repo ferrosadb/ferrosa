@@ -1299,8 +1299,11 @@ impl Workload for LwtMultiStatement {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::history::Operation;
+    use crate::workload::testutil::MockCqlSession;
 
     fn make_op(client: &str, invoke: u64, complete: u64, op: Op, result: OpResult) -> Operation {
         Operation {
@@ -1310,6 +1313,65 @@ mod tests {
             op,
             result,
         }
+    }
+
+    /// Pattern 1: INSERT IF NOT EXISTS executes against a mock session and
+    /// records InsertIfNotExists ops in the history.
+    #[tokio::test]
+    async fn lwt_insert_if_not_exists_executes() {
+        let session = MockCqlSession::new();
+        let workload = LwtInsertIfNotExists;
+
+        workload.setup(&session).await.unwrap();
+
+        let mut recorder = HistoryRecorder::new("test");
+        workload
+            .run(&session, &mut recorder, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        let history = recorder.finish();
+        assert!(
+            !history.operations.is_empty(),
+            "should have executed at least one InsertIfNotExists operation"
+        );
+        assert!(
+            history
+                .operations
+                .iter()
+                .any(|op| matches!(op.op, Op::InsertIfNotExists { .. })),
+            "history must contain InsertIfNotExists ops"
+        );
+    }
+
+    /// Pattern 7 (LwtIncrementIf) acts as a CAS counter workload.
+    /// Verify it executes against a mock session and produces Applied results.
+    #[tokio::test]
+    async fn lwt_cas_counter_executes() {
+        let session = MockCqlSession::new();
+        let workload = LwtIncrementIf;
+
+        workload.setup(&session).await.unwrap();
+
+        let mut recorder = HistoryRecorder::new("test");
+        workload
+            .run(&session, &mut recorder, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        let history = recorder.finish();
+        assert!(
+            !history.operations.is_empty(),
+            "should have executed at least one CAS operation"
+        );
+        // At minimum one Applied result must be present (first toggle = true).
+        assert!(
+            history
+                .operations
+                .iter()
+                .any(|op| matches!(op.result, OpResult::Applied(_))),
+            "history must contain Applied results from CAS operations"
+        );
     }
 
     #[test]

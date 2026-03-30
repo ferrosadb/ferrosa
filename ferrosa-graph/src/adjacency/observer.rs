@@ -136,13 +136,13 @@ pub(crate) fn make_adjacency_mutation(
         primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
     };
 
-    Mutation {
-        keyspace: adj_keyspace.to_string(),
-        table: "adjacency".to_string(),
+    Mutation::new(
+        adj_keyspace.to_string(),
+        "adjacency".to_string(),
         key,
-        rows: vec![row],
+        vec![row],
         timestamp,
-    }
+    )
 }
 
 #[cfg(test)]

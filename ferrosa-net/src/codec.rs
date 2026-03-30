@@ -80,6 +80,10 @@ pub enum MsgType {
     PairSchemaSync = 0x45,
     PairDdlForward = 0x46,
     PairDdlAck = 0x47,
+    /// Atomic batch forwarded between pair nodes (batch_id prefix + all mutations).
+    PairBatchForward = 0x48,
+    /// Acknowledgment for a PairBatchForward.
+    PairBatchAck = 0x49,
     // Batchlog
     BatchlogWrite = 0x50,
     BatchlogDelete = 0x51,
@@ -132,6 +136,8 @@ impl TryFrom<u8> for MsgType {
             0x45 => Ok(Self::PairSchemaSync),
             0x46 => Ok(Self::PairDdlForward),
             0x47 => Ok(Self::PairDdlAck),
+            0x48 => Ok(Self::PairBatchForward),
+            0x49 => Ok(Self::PairBatchAck),
             0x50 => Ok(Self::BatchlogWrite),
             0x51 => Ok(Self::BatchlogDelete),
             0x52 => Ok(Self::BatchlogReplay),

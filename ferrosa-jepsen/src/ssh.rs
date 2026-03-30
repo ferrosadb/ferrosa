@@ -193,6 +193,29 @@ impl SshClient {
 mod tests {
     use super::*;
 
+    /// Read VM connection settings from env vars, falling back to defaults for
+    /// a Firecracker VM behind Lima port-forwarding.
+    ///
+    /// Set up with: `scripts/lima-fc-setup.sh`
+    /// Env vars:
+    ///   FERROSA_TEST_VM_HOST  — defaults to 127.0.0.1 (Lima-forwarded)
+    ///   FERROSA_TEST_VM_PORT  — defaults to 2022 (Lima-forwarded SSH)
+    ///   FERROSA_TEST_VM_KEY   — defaults to rootfs/test_key (Ed25519)
+    fn vm_host() -> String {
+        std::env::var("FERROSA_TEST_VM_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
+    }
+    fn vm_port() -> u16 {
+        std::env::var("FERROSA_TEST_VM_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2022)
+    }
+    fn vm_key() -> std::path::PathBuf {
+        std::env::var("FERROSA_TEST_VM_KEY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("rootfs/test_key"))
+    }
+
     #[test]
     fn command_output_default_values() {
         let output = CommandOutput {
@@ -205,12 +228,21 @@ mod tests {
     }
 
     /// Requires a pre-provisioned VM with SSH running and the test key.
+    /// Run scripts/lima-fc-setup.sh first, then set FERROSA_TEST_FIRECRACKER=1.
     #[tokio::test]
-    #[ignore]
     async fn ssh_execute_command() {
-        let ssh = SshClient::connect("172.16.0.2", 22, "root", Path::new("rootfs/test_key"))
+        if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+            && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+        {
+            panic!(
+                "Firecracker VM not available — run scripts/lima-fc-setup.sh, \
+                 then re-run with FERROSA_TEST_FIRECRACKER=1"
+            );
+        }
+
+        let ssh = SshClient::connect(&vm_host(), vm_port(), "root", &vm_key())
             .await
-            .unwrap();
+            .expect("SSH connect failed — is the Lima VM running? Run scripts/lima-fc-setup.sh");
 
         let output = ssh.exec("echo hello").await.unwrap();
         assert_eq!(output.stdout.trim(), "hello");
@@ -218,14 +250,22 @@ mod tests {
     }
 
     /// Requires a pre-provisioned VM with SSH running and the test key.
+    /// Run scripts/lima-fc-setup.sh first, then set FERROSA_TEST_FIRECRACKER=1.
     #[tokio::test]
-    #[ignore]
     async fn ssh_upload_file() {
-        let ssh = SshClient::connect("172.16.0.2", 22, "root", Path::new("rootfs/test_key"))
-            .await
-            .unwrap();
+        if std::env::var("FERROSA_TEST_CLUSTER_NODES").is_err()
+            && std::env::var("FERROSA_TEST_FIRECRACKER").is_err()
+        {
+            panic!(
+                "Firecracker VM not available — run scripts/lima-fc-setup.sh, \
+                 then re-run with FERROSA_TEST_FIRECRACKER=1"
+            );
+        }
 
-        // Create a temporary file to upload.
+        let ssh = SshClient::connect(&vm_host(), vm_port(), "root", &vm_key())
+            .await
+            .expect("SSH connect failed — is the Lima VM running? Run scripts/lima-fc-setup.sh");
+
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"test content").unwrap();
 

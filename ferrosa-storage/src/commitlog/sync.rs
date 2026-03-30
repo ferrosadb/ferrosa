@@ -249,10 +249,19 @@ impl SyncStrategy for GroupSync {
         // Record the generation before we add our pending write.
         let my_gen = self.state.generation.load(Ordering::Acquire);
 
-        // Increment pending count and signal the flush thread.
-        self.state.pending.fetch_add(1, Ordering::AcqRel);
+        // Increment pending while holding writer_signal.lock.
+        //
+        // The flush thread holds this same lock when it checks `pending == 0`
+        // before calling wait_for(). Holding the lock here closes the race:
+        // either we increment before the flush thread checks (it sees > 0 and
+        // skips the wait), or we increment while the flush thread is already
+        // sleeping in wait_for (our notify_one wakes it). Without the lock,
+        // a notification sent between the check and the wait is lost, causing
+        // the flush thread to sleep the full max_wait before flushing.
         {
-            let (_lock, cvar) = &self.state.writer_signal;
+            let (lock, cvar) = &self.state.writer_signal;
+            let _guard = lock.lock();
+            self.state.pending.fetch_add(1, Ordering::AcqRel);
             cvar.notify_one();
         }
 
@@ -260,11 +269,17 @@ impl SyncStrategy for GroupSync {
         let (lock, cvar) = &self.state.flush_complete;
         let mut guard = lock.lock();
         while self.state.generation.load(Ordering::Acquire) <= my_gen {
-            // Avoid infinite wait — use a generous timeout.
-            let result = cvar.wait_for(&mut guard, Duration::from_secs(5));
+            let result = cvar.wait_for(&mut guard, Duration::from_secs(30));
             if result.timed_out() {
-                // Safety valve: don't block forever if the thread died.
-                break;
+                // The flush thread has not advanced the generation in 30 seconds.
+                // This indicates the thread has died or the disk is unresponsive.
+                // Panic rather than silently returning — a caller that thinks the
+                // write is durable when it is not would cause data loss.
+                panic!(
+                    "GroupSync flush thread stalled for 30s (generation stuck at {}); \
+                     commit log is unresponsive",
+                    my_gen
+                );
             }
         }
     }
@@ -364,6 +379,7 @@ mod tests {
     /// Helper to create a simple mutation for testing.
     fn simple_mutation() -> Mutation {
         Mutation {
+            mutation_id: [0x10u8; 16],
             keyspace: "test_ks".to_string(),
             table: "test_table".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),

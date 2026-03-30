@@ -6,11 +6,21 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```no_run
+//! use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+//! use ferrosa_sstable::statistics::SerializationHeader;
+//! use ferrosa_sstable::Partition;
+//! # let header = SerializationHeader {
+//! #     min_timestamp: 0, min_local_deletion_time: i32::MAX, min_ttl: 0,
+//! #     key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+//! #     clustering_types: vec![], static_columns: vec![], regular_columns: vec![],
+//! # };
+//! # let partitions: Vec<Partition> = vec![];
 //! let mut writer = SSTableWriter::new(WriteOptions::default(), header);
-//! writer.add_partition(&partition1)?;
-//! writer.add_partition(&partition2)?;
-//! let output = writer.finish()?;
+//! for partition in &partitions {
+//!     writer.add_partition(partition).unwrap();
+//! }
+//! let output = writer.finish().unwrap();
 //! ```
 //!
 //! Partitions must be added in token order. The writer currently handles
@@ -481,8 +491,10 @@ impl SSTableWriter {
                 toc::TOC,
             ])
         } else {
+            // Omit CRC.db for uncompressed SSTables — Cassandra treats it as
+            // optional; listing it in TOC without writing the file causes
+            // CorruptSSTableException on import.
             toc::write_toc(&[
-                toc::CRC,
                 toc::DATA,
                 toc::FILTER,
                 toc::PARTITIONS,
@@ -1087,8 +1099,9 @@ mod tests {
         // Verify TOC
         let toc_entries = crate::toc::read_toc(&output.toc).unwrap();
         assert!(!toc_entries.is_empty());
-        // No compression, should have CRC entry
-        assert!(toc_entries.iter().any(|e| e == toc::CRC));
+        // No compression — CRC.db is omitted from TOC (listing it without
+        // writing the file causes CorruptSSTableException on Cassandra import).
+        assert!(!toc_entries.iter().any(|e| e == toc::CRC));
 
         // Verify Partitions.db can be opened as a PartitionIndex
         let pi = crate::partition_index::PartitionIndex::open(output.partitions).unwrap();
@@ -1392,6 +1405,140 @@ mod tests {
             cell.value.as_deref(),
             Some(b"hello_ttl".as_slice()),
             "value must roundtrip"
+        );
+    }
+
+    /// Diagnostic: dump Partitions.db structure for the exact 2-key scenario
+    /// used in the cassandra_reads_compacted_sstable_from_s3 integration test.
+    ///
+    /// Run with: cargo test -p ferrosa-sstable partitions_db_pk1_pk2_hex_dump -- --nocapture
+    #[test]
+    fn partitions_db_pk1_pk2_hex_dump() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"v_text".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"v_int".to_vec(),
+                    "org.apache.cassandra.db.marshal.Int32Type".into(),
+                ),
+            ],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let dk1 = DecoratedKey::new(PartitionKey::from(b"pk1".as_slice()));
+        let dk2 = DecoratedKey::new(PartitionKey::from(b"pk2".as_slice()));
+        eprintln!("token(pk1) = {}", dk1.token.0);
+        eprintln!("token(pk2) = {}", dk2.token.0);
+
+        let mut partitions = vec![
+            Partition {
+                key: dk1.clone(),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                }],
+            },
+            Partition {
+                key: dk2.clone(),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: vec![],
+                    cells: vec![(1, CellValue::live(42i32.to_be_bytes().to_vec(), 2000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(2000),
+                }],
+            },
+        ];
+        // Sort by token order, exactly like the compaction executor
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        eprintln!("Write order (token-sorted):");
+        for p in &partitions {
+            eprintln!("  key={:?} token={}", p.key.key.as_bytes(), p.key.token.0);
+        }
+
+        let mut writer = SSTableWriter::new(options, header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        let partitions_db = &output.partitions;
+        eprintln!("Partitions.db total bytes: {}", partitions_db.len());
+
+        // Decode footer (last 24 bytes)
+        let len = partitions_db.len();
+        assert!(len >= 24, "Partitions.db too small");
+        let key_bounds_offset =
+            i64::from_be_bytes(partitions_db[len - 24..len - 16].try_into().unwrap());
+        let key_count = i64::from_be_bytes(partitions_db[len - 16..len - 8].try_into().unwrap());
+        let root_pos = i64::from_be_bytes(partitions_db[len - 8..len].try_into().unwrap());
+        eprintln!("Footer: key_bounds_offset={key_bounds_offset}, key_count={key_count}, root_pos={root_pos}");
+
+        // Decode key bounds
+        let kb_off = key_bounds_offset as usize;
+        let first_len =
+            u16::from_be_bytes(partitions_db[kb_off..kb_off + 2].try_into().unwrap()) as usize;
+        let first_key = &partitions_db[kb_off + 2..kb_off + 2 + first_len];
+        let second_start = kb_off + 2 + first_len;
+        let last_len = u16::from_be_bytes(
+            partitions_db[second_start..second_start + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let last_key = &partitions_db[second_start + 2..second_start + 2 + last_len];
+        eprintln!("Key bounds: first={:?} last={:?}", first_key, last_key);
+        eprintln!(
+            "Key bounds: first={} last={}",
+            std::str::from_utf8(first_key).unwrap_or("?"),
+            std::str::from_utf8(last_key).unwrap_or("?")
+        );
+
+        // Hex dump of full Partitions.db
+        eprintln!("Partitions.db hex dump:");
+        for (i, chunk) in partitions_db.chunks(16).enumerate() {
+            let hex: String = chunk
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ascii: String = chunk
+                .iter()
+                .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+                .collect();
+            eprintln!("  {:04x}: {:<48}  {}", i * 16, hex, ascii);
+        }
+
+        // Verify that the key bounds ordering matches the write order
+        let write_first = partitions[0].key.key.as_bytes();
+        let write_last = partitions[partitions.len() - 1].key.key.as_bytes();
+        assert_eq!(
+            first_key, write_first,
+            "key bounds first={:?} should match token-sorted first={:?}",
+            first_key, write_first
+        );
+        assert_eq!(
+            last_key, write_last,
+            "key bounds last={:?} should match token-sorted last={:?}",
+            last_key, write_last
         );
     }
 }

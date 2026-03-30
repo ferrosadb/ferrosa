@@ -21,6 +21,7 @@ use ferrosa_storage::TableId;
 
 fn make_mutation(table: &str, pk: &[u8], ts: i64, value: f64) -> ferrosa_storage::Mutation {
     ferrosa_storage::Mutation {
+        mutation_id: [0x60u8; 16],
         keyspace: "ks".to_string(),
         table: table.to_string(),
         key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),

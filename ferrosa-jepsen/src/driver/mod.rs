@@ -75,6 +75,12 @@ pub struct DriverRegistry {
     drivers: Vec<Box<dyn DriverRunner>>,
 }
 
+impl Default for DriverRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DriverRegistry {
     pub fn new() -> Self {
         Self {

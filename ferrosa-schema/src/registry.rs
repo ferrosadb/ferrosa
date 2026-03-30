@@ -2881,6 +2881,83 @@ mod tests {
         assert_eq!(snap.indexes[&idx_key].index_type, IndexType::Phonetic);
     }
 
+    /// BUG-023: phonetic index must survive a full snapshot round-trip.
+    ///
+    /// Regression test for the missing restoration loops in `apply_snapshot()`.
+    /// Steps: create index → take snapshot → restore into fresh registry → assert index present.
+    #[test]
+    fn phonetic_index_survives_restore() {
+        use crate::metadata::index::IndexMetadata;
+        use ferrosa_index::IndexType;
+
+        // Step 1: build a snapshot containing a phonetic index.
+        let idx_key = (
+            "test_ks".to_string(),
+            "users".to_string(),
+            "name_phonetic_idx".to_string(),
+        );
+        let mut snapshot = SchemaSnapshot {
+            version: Uuid::new_v4(),
+            keyspaces: HashMap::new(),
+            tables: HashMap::new(),
+            indexes: HashMap::new(),
+            roles: HashMap::new(),
+            grants: HashMap::new(),
+            types: HashMap::new(),
+            functions: HashMap::new(),
+            aggregates: HashMap::new(),
+        };
+        snapshot.keyspaces.insert(
+            "test_ks".to_string(),
+            KeyspaceMetadata {
+                name: "test_ks".to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+                },
+            },
+        );
+        snapshot.indexes.insert(
+            idx_key.clone(),
+            IndexMetadata {
+                keyspace: "test_ks".to_string(),
+                table: "users".to_string(),
+                name: "name_phonetic_idx".to_string(),
+                index_type: IndexType::Phonetic,
+                target_columns: vec!["full_name".to_string()],
+                filter_predicate: None,
+                options: HashMap::new(),
+            },
+        );
+
+        // Snapshot must record the index.
+        assert!(
+            snapshot.indexes.contains_key(&idx_key),
+            "snapshot must contain the phonetic index before apply"
+        );
+
+        // Step 2: restore into a fresh registry and verify the index survived.
+        let fresh = test_schema();
+        fresh.apply_snapshot(snapshot).unwrap();
+
+        let restored = fresh.snapshot();
+        assert!(
+            restored.indexes.contains_key(&idx_key),
+            "phonetic index lost after apply_snapshot (BUG-023)"
+        );
+        assert_eq!(
+            restored.indexes[&idx_key].index_type,
+            IndexType::Phonetic,
+            "restored index must have Phonetic type"
+        );
+        assert_eq!(
+            restored.indexes[&idx_key].target_columns,
+            vec!["full_name".to_string()],
+            "restored index must have correct target columns"
+        );
+    }
+
     // ---- Internal method tests (pair mode replication) ----
 
     #[test]

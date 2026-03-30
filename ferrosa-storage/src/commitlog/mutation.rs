@@ -13,7 +13,8 @@
 //! # Binary Layout
 //!
 //! ```text
-//! Mutation: keyspace_len:u16 | keyspace | table_len:u16 | table
+//! Mutation: mutation_id:[u8;16]
+//!         | keyspace_len:u16 | keyspace | table_len:u16 | table
 //!         | key_len:u16 | key_bytes | token:i64 | timestamp:i64
 //!         | row_count:u16 | rows...
 //!
@@ -27,13 +28,31 @@
 //! ```
 //!
 //! All multi-byte integers are big-endian.
+//!
+//! # Backward Compatibility
+//!
+//! The `mutation_id` field (16 bytes) was added in format v2.  Old segments
+//! that lack it are detected by the commit-log reader, which fills
+//! `mutation_id` with all-zeros.  A zero `mutation_id` is **never** used for
+//! deduplication — mutations with a zero id are always re-applied on replay.
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use uuid::Uuid;
 
 /// A mutation: one or more row writes targeting a single table.
 #[derive(Debug, Clone)]
 pub struct Mutation {
+    /// Globally-unique mutation identifier (UUID v4 stored as 16 raw bytes).
+    ///
+    /// Generated at write time via [`Mutation::new`].  Used during commit-log
+    /// replay to deduplicate mutations that were written more than once (e.g.
+    /// because a crash occurred during a previous replay).
+    ///
+    /// A zero value (`[0u8; 16]`) is the legacy sentinel for mutations read
+    /// from old commit-log segments that pre-date this field.  Zero ids are
+    /// **not** deduplicated — they are always re-applied.
+    pub mutation_id: [u8; 16],
     /// Keyspace name.
     pub keyspace: String,
     /// Table name.
@@ -44,6 +63,34 @@ pub struct Mutation {
     pub rows: Vec<Row>,
     /// Mutation timestamp (microseconds since epoch).
     pub timestamp: i64,
+}
+
+impl Mutation {
+    /// Creates a new mutation with a freshly-generated UUID.
+    pub fn new(
+        keyspace: String,
+        table: String,
+        key: DecoratedKey,
+        rows: Vec<Row>,
+        timestamp: i64,
+    ) -> Self {
+        Self {
+            mutation_id: Uuid::new_v4().into_bytes(),
+            keyspace,
+            table,
+            key,
+            rows,
+            timestamp,
+        }
+    }
+
+    /// Returns `true` if this mutation carries the legacy zero `mutation_id`.
+    ///
+    /// Zero ids must never be used for deduplication: they are always
+    /// re-applied during replay for backward compatibility with old segments.
+    pub fn has_legacy_id(&self) -> bool {
+        self.mutation_id == [0u8; 16]
+    }
 }
 
 /// Errors that can occur during deserialization.
@@ -248,6 +295,8 @@ impl Mutation {
     /// Use this to allocate a buffer before calling [`serialize_into()`](Self::serialize_into).
     pub fn serialized_size(&self) -> usize {
         let mut size = 0;
+        // mutation_id: [u8; 16]
+        size += 16;
         // keyspace: len:u16 + bytes
         size += string_size(&self.keyspace);
         // table: len:u16 + bytes
@@ -281,6 +330,9 @@ impl Mutation {
         );
 
         let mut w = WriteCursor::new(buf);
+
+        // mutation_id: 16 raw bytes (UUID)
+        w.write_bytes(&self.mutation_id);
 
         // Mutation header
         w.write_string(&self.keyspace);
@@ -341,6 +393,11 @@ impl Mutation {
     pub fn deserialize_from(buf: &[u8]) -> Result<Self> {
         let mut r = ReadCursor::new(buf);
 
+        // mutation_id: 16 raw bytes (UUID v4, or all-zeros for legacy entries)
+        let id_bytes = r.read_bytes(16, "mutation_id")?;
+        let mut mutation_id = [0u8; 16];
+        mutation_id.copy_from_slice(id_bytes);
+
         let keyspace = r.read_string("keyspace")?;
         let table = r.read_string("table")?;
         let key_bytes = r.read_byte_vec("key")?;
@@ -359,6 +416,7 @@ impl Mutation {
         }
 
         Ok(Mutation {
+            mutation_id,
             keyspace,
             table,
             key,
@@ -433,6 +491,7 @@ mod tests {
     /// Helper to create a simple mutation for testing.
     fn simple_mutation() -> Mutation {
         Mutation {
+            mutation_id: [1u8; 16],
             keyspace: "test_ks".to_string(),
             table: "test_table".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk1".to_vec())),
@@ -447,6 +506,7 @@ mod tests {
     }
 
     fn assert_mutations_equal(a: &Mutation, b: &Mutation) {
+        assert_eq!(a.mutation_id, b.mutation_id);
         assert_eq!(a.keyspace, b.keyspace);
         assert_eq!(a.table, b.table);
         assert_eq!(a.key, b.key);
@@ -476,6 +536,7 @@ mod tests {
     #[test]
     fn round_trip_tombstone() {
         let m = Mutation {
+            mutation_id: [2u8; 16],
             keyspace: "ks".to_string(),
             table: "tbl".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
@@ -502,6 +563,7 @@ mod tests {
     #[test]
     fn round_trip_expiring() {
         let m = Mutation {
+            mutation_id: [3u8; 16],
             keyspace: "ks".to_string(),
             table: "tbl".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
@@ -532,6 +594,7 @@ mod tests {
     #[test]
     fn round_trip_empty_rows() {
         let m = Mutation {
+            mutation_id: [4u8; 16],
             keyspace: "ks".to_string(),
             table: "tbl".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"key".to_vec())),
@@ -550,6 +613,7 @@ mod tests {
     #[test]
     fn round_trip_multiple_rows() {
         let m = Mutation {
+            mutation_id: [5u8; 16],
             keyspace: "ks".to_string(),
             table: "tbl".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"multi".to_vec())),
@@ -656,13 +720,23 @@ mod prop_tests {
             arb_decorated_key(),
             prop::collection::vec(arb_row(), 0..8),
             1i64..1_000_000,
+            prop::collection::vec(any::<u8>(), 16..=16),
         )
-            .prop_map(|(keyspace, table, key, rows, timestamp)| Mutation {
-                keyspace,
-                table,
-                key,
-                rows,
-                timestamp,
+            .prop_map(|(keyspace, table, key, rows, timestamp, id_vec)| {
+                let mut mutation_id = [0u8; 16];
+                mutation_id.copy_from_slice(&id_vec);
+                // Ensure non-zero id to avoid the legacy-sentinel path in tests.
+                if mutation_id == [0u8; 16] {
+                    mutation_id[0] = 1;
+                }
+                Mutation {
+                    mutation_id,
+                    keyspace,
+                    table,
+                    key,
+                    rows,
+                    timestamp,
+                }
             })
     }
 
@@ -673,6 +747,7 @@ mod prop_tests {
             let mut buf = vec![0u8; size];
             mutation.serialize_into(&mut buf);
             let deserialized = Mutation::deserialize_from(&buf).unwrap();
+            prop_assert_eq!(mutation.mutation_id, deserialized.mutation_id);
             prop_assert_eq!(&mutation.keyspace, &deserialized.keyspace);
             prop_assert_eq!(&mutation.table, &deserialized.table);
             prop_assert_eq!(&mutation.key, &deserialized.key);

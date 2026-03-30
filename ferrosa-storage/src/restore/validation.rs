@@ -104,6 +104,7 @@ mod tests {
     /// Creates a minimal Mutation with the given timestamp.
     fn make_mutation(timestamp: i64) -> Mutation {
         Mutation {
+            mutation_id: [0x40u8; 16],
             keyspace: "ks".to_string(),
             table: "t".to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),
@@ -115,6 +116,7 @@ mod tests {
     /// Creates a minimal Mutation for a specific (keyspace, table) with the given timestamp.
     fn make_mutation_for(keyspace: &str, table: &str, timestamp: i64) -> Mutation {
         Mutation {
+            mutation_id: [0x41u8; 16],
             keyspace: keyspace.to_string(),
             table: table.to_string(),
             key: DecoratedKey::new(PartitionKey::new(b"k".to_vec())),

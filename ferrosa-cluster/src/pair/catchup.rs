@@ -170,6 +170,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(ts),
         };
         Mutation {
+            mutation_id: [0x81u8; 16],
             keyspace: "ks".to_string(),
             table: "tbl".to_string(),
             key,
