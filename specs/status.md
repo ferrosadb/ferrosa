@@ -145,9 +145,9 @@ jepsen         ██████   █████░  ████░░   █
   - [x] ~~DDL validation rules~~ (table name, PK, RF constraints)
   - [x] ~~UDT (user-defined type) support~~ — `UserTypeMetadata`, `system_schema.types` virtual table, schema registry integration
   - [x] ~~BACKUP permission for snapshot operations~~ (PITR Sprint P-4)
-  - [ ] System table persistence to SSTable
-  - [ ] Role hierarchy with inheritance
-  - [ ] Audit sink composition
+  - [x] ~~System table persistence to SSTable~~ — system_schema.* and system_auth.* persisted via SystemTableWriter
+  - [x] ~~Role hierarchy with inheritance~~ — recursive has_permission_recursive() with cycle detection, member_of in role_members
+  - [x] ~~Audit sink composition~~ — CompositeSink fans out to multiple Arc<dyn AuditSink> (Log, SystemTable, Test)
 
 ### ferrosa-index — Complete (11 index types)
 
