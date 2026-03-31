@@ -141,6 +141,11 @@ impl<R: ReadAt> PartitionIndex<R> {
         self.key_count
     }
 
+    /// Returns the file size of the partition index in bytes.
+    pub fn file_size(&self) -> u64 {
+        self.reader.len().unwrap_or(0)
+    }
+
     /// Returns the smallest key in the index (raw bytes, short-length-prefixed value).
     pub fn smallest_key(&self) -> &[u8] {
         &self.smallest_key

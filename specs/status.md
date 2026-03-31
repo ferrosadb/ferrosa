@@ -124,7 +124,8 @@ jepsen         ██████   █████░  ████░░   █
   - [x] ~~SSTable read resilience~~ — skip corrupt partitions with warning, never crash
   - [x] ~~S3 CAS probe~~ — detect stores without conditional put (RustFS/MinIO), fallback to unconditional writes
   - [x] ~~FMEA corruption resilience tests~~ — truncated/zero/evolved/corrupt Data.db files
-  - [ ] LCS and TWCS compaction strategies
+  - [x] ~~UCS (Unified Compaction Strategy)~~ — density-based levels, per-table DDL config, fan factor
+  - [ ] TWCS (Time-Window) compaction — future; UCS with TTL-aware levels could subsume
   - [ ] Disk backpressure
   - [ ] `io_uring` I/O backend
 

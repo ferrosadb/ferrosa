@@ -2997,7 +2997,7 @@ async fn route_create_table(
                 (name.clone(), schema_order)
             })
             .collect(),
-        params: TableParams::default(),
+        params: parse_table_params(&s.table_options),
         flags: HashSet::new(),
         extensions: s
             .extensions
@@ -3810,6 +3810,64 @@ fn route_truncate(
 // ── Helper functions ─────────────────────────────────────────────────────
 
 /// Resolve an explicit keyspace or fall back to the session's current keyspace.
+/// Parse DDL `table_options` into `TableParams`, populating compaction,
+/// compression, comment, and other recognized options from the stringified
+/// map values. Unrecognized options are silently ignored.
+fn parse_table_params(options: &[(String, String)]) -> TableParams {
+    let mut params = TableParams::default();
+    for (key, value) in options {
+        match key.to_lowercase().as_str() {
+            "compaction" => {
+                params.compaction = parse_stringified_map(value);
+            }
+            "compression" => {
+                params.compression = parse_stringified_map(value);
+            }
+            "comment" => {
+                params.comment = value.clone();
+            }
+            "default_time_to_live" => {
+                if let Ok(ttl) = value.parse::<i32>() {
+                    params.default_time_to_live = ttl;
+                }
+            }
+            "gc_grace_seconds" => {
+                if let Ok(gc) = value.parse::<i32>() {
+                    params.gc_grace_seconds = gc;
+                }
+            }
+            "bloom_filter_fp_chance" => {
+                if let Ok(fp) = value.parse::<f64>() {
+                    params.bloom_filter_fp_chance = fp;
+                }
+            }
+            _ => {} // Ignore unrecognized options
+        }
+    }
+    params
+}
+
+/// Parse a stringified CQL map literal like `{'key': 'value', 'k2': 'v2'}`
+/// back into a HashMap. Handles the format produced by `parse_option_value()`.
+fn parse_stringified_map(s: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let trimmed = s.trim().trim_start_matches('{').trim_end_matches('}');
+    if trimmed.is_empty() {
+        return map;
+    }
+    for pair in trimmed.split(',') {
+        let pair = pair.trim();
+        if let Some((k, v)) = pair.split_once(':') {
+            let k = k.trim().trim_matches('\'').trim_matches('"').to_string();
+            let v = v.trim().trim_matches('\'').trim_matches('"').to_string();
+            if !k.is_empty() {
+                map.insert(k, v);
+            }
+        }
+    }
+    map
+}
+
 fn resolve_keyspace<'a>(
     explicit: &'a Option<String>,
     current: &'a Option<String>,
@@ -7712,6 +7770,60 @@ mod tests {
             result.is_ok(),
             "CREATE TABLE WITH COMPACTION must succeed, got: {:?}",
             result.err()
+        );
+    }
+
+    /// WP-005: CREATE TABLE WITH compaction = {map} must persist params
+    /// into TableMetadata so strategy_for_table() can read them.
+    #[tokio::test]
+    async fn create_table_with_compaction_persists_params() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ucs WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE ucs.t (id int PRIMARY KEY, v text) \
+             WITH compaction = {'class': 'UnifiedCompactionStrategy', 'fan_factor': '4'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Verify the compaction params are persisted in the schema
+        let snap = state.schema.snapshot();
+        let table = snap
+            .tables
+            .get(&("ucs".to_string(), "t".to_string()))
+            .expect("table should exist");
+        assert!(
+            !table.params.compaction.is_empty(),
+            "compaction params should be populated from DDL, got empty HashMap"
+        );
+        assert_eq!(
+            table.params.compaction.get("class").map(|s| s.as_str()),
+            Some("UnifiedCompactionStrategy"),
+            "compaction class should be 'UnifiedCompactionStrategy'"
+        );
+        assert_eq!(
+            table
+                .params
+                .compaction
+                .get("fan_factor")
+                .map(|s| s.as_str()),
+            Some("4"),
+            "fan_factor should be '4'"
         );
     }
 

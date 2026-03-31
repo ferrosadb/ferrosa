@@ -430,7 +430,8 @@ session.execute(<span class="str">"""
     </tbody>
   </table>
 
-  <h3>Compaction (STCS)</h3>
+  <h3>Compaction (STCS — default)</h3>
+  <p>Size-Tiered Compaction is the default strategy when no per-table configuration is specified.</p>
   <table>
     <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
     <tbody>
@@ -438,6 +439,22 @@ session.execute(<span class="str">"""
       <tr><td><code>FERROSA_COMPACTION_MAX_THRESHOLD</code></td><td><code>32</code></td><td>Max SSTables per compaction task</td></tr>
       <tr><td><code>FERROSA_COMPACTION_BUCKET_LOW</code></td><td><code>0.5</code></td><td>Lower size ratio for bucket membership</td></tr>
       <tr><td><code>FERROSA_COMPACTION_BUCKET_HIGH</code></td><td><code>1.5</code></td><td>Upper size ratio for bucket membership</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Compaction (UCS — per-table)</h3>
+  <p>Unified Compaction Strategy (Cassandra 5.0) uses density-based levels with a configurable fan factor.
+     Configure per-table via DDL:</p>
+  <pre><span class="kw">CREATE TABLE</span> ks.events (id <span class="kw">uuid PRIMARY KEY</span>, data <span class="kw">text</span>)
+  <span class="kw">WITH</span> compaction = {
+    <span class="str">'class'</span>: <span class="str">'UnifiedCompactionStrategy'</span>,
+    <span class="str">'fan_factor'</span>: <span class="str">'4'</span>
+  };</pre>
+  <table>
+    <thead><tr><th>Parameter</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>fan_factor</code></td><td><code>4</code></td><td>SSTables per level before compaction triggers (W=2 aggressive, W=32 lazy)</td></tr>
+      <tr><td><code>min_sstable_size</code></td><td><code>104857600</code></td><td>Minimum SSTable size (bytes) for density calculation</td></tr>
     </tbody>
   </table>
 
@@ -499,7 +516,7 @@ session.execute(<span class="str">"""
     </div>
     <div class="card">
       <h4>ferrosa-storage</h4>
-      <p>Memtable, commit log with CDC, STCS compaction, S3 upload manager, local LRU cache.</p>
+      <p>Memtable, commit log with CDC, STCS + UCS compaction, S3 upload manager, NVMe pinning, local LRU cache.</p>
     </div>
     <div class="card">
       <h4>ferrosa-schema</h4>
@@ -563,7 +580,7 @@ session.execute(<span class="str">"""
   <p>The storage pipeline handles compaction end-to-end:</p>
   <ol>
     <li>Memtable flushes to local SSTable</li>
-    <li>Size-Tiered Compaction merges SSTables when a bucket reaches threshold</li>
+    <li>Compaction strategy (STCS default, or UCS per-table) selects SSTables to merge</li>
     <li>Compacted output uploads to S3 with confirmation before manifest update</li>
     <li>Manifest uses compare-and-swap to prevent concurrent update loss</li>
     <li>Superseded input SSTables are deleted from S3 and local disk</li>

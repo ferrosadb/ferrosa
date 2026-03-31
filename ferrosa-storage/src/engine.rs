@@ -31,7 +31,8 @@ use crate::commitlog::config::{CommitLogConfig, CommitLogPosition, TableId};
 use crate::commitlog::mutation::Mutation;
 use crate::commitlog::CommitLog;
 use crate::compaction::executor::CompactionExecutor;
-use crate::compaction::strategy::{CompactionConfig, CompactionStrategy, SizeTieredStrategy};
+use crate::compaction::strategy::{CompactionConfig, SizeTieredStrategy};
+use crate::compaction::CompactionStrategy;
 use crate::flush::FileFlushTarget;
 use crate::store::TableStore;
 use crate::upload::{ObjectStoreConfig, UploadManager};
@@ -1973,12 +1974,39 @@ impl StorageEngine {
     /// Checks if compaction should be triggered after a flush.
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) {
         let metadata = self.collect_sstable_metadata(table_id, state);
-        let strategy = SizeTieredStrategy::new(self.config.compaction.clone());
+        let strategy = self.strategy_for_table(state);
         let tasks = strategy.select(&metadata, &state.schema, table_id);
         for task in tasks {
             if let Err(e) = self.compaction_executor.submit(task) {
                 eprintln!("[storage-engine] compaction submit failed for {table_id}: {e}");
             }
+        }
+    }
+
+    /// Select the compaction strategy for a table based on its extensions.
+    ///
+    /// Tables with `compaction.class` containing "Unified" or "UCS" use the
+    /// Unified Compaction Strategy. All others default to STCS.
+    fn strategy_for_table(&self, state: &TableState) -> Box<dyn CompactionStrategy> {
+        let extensions = &state.schema.extensions;
+        let class = extensions.get("compaction.class").map(|s| s.as_str());
+        match class {
+            Some(c) if c.contains("Unified") || c.contains("UCS") => {
+                // Collect compaction.* extensions into a params HashMap
+                let params: std::collections::HashMap<String, String> = extensions
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        k.strip_prefix("compaction.")
+                            .map(|k| (k.to_string(), v.clone()))
+                    })
+                    .collect();
+                let config = crate::compaction::strategy_ucs::UcsConfig::from_params(
+                    &params,
+                    self.config.compaction.output_dir.clone(),
+                );
+                Box::new(crate::compaction::UnifiedCompactionStrategy::new(config))
+            }
+            _ => Box::new(SizeTieredStrategy::new(self.config.compaction.clone())),
         }
     }
 

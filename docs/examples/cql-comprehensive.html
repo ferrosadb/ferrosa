@@ -346,6 +346,41 @@ SELECT * FROM composite_pk WHERE tenant = 'acme' AND region = 'us-east' LIMIT 1;
 <code>DESC</code> on <code>event_time</code> means the most recent events are read first, which avoids reversing results at query time.</p>
 </div>
 </div>
+<div class="sect2">
+<h3 id="_compaction_strategy">Compaction strategy</h3>
+<div class="paragraph">
+<p>Per-table compaction strategy via <code>WITH compaction = {map}</code>.
+The default is Size-Tiered (STCS). Unified Compaction Strategy (UCS) uses density-based levels
+with a configurable fan factor: W=2 is LCS-like (aggressive), W=4 is balanced, W=32 is STCS-like (lazy).</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Default: STCS (no compaction clause needed)
+CREATE TABLE IF NOT EXISTS stcs_table (
+    id int PRIMARY KEY,
+    data text
+);
+
+-- UCS: density-based compaction with fan factor 4
+CREATE TABLE IF NOT EXISTS ucs_table (
+    id int PRIMARY KEY,
+    data text
+) WITH compaction = {
+    'class': 'UnifiedCompactionStrategy',
+    'fan_factor': '4'
+};
+
+-- UCS with aggressive compaction (LCS-like)
+CREATE TABLE IF NOT EXISTS ucs_aggressive (
+    id int PRIMARY KEY,
+    data text
+) WITH compaction = {
+    'class': 'UnifiedCompactionStrategy',
+    'fan_factor': '2'
+};</code></pre>
+</div>
+</div>
+</div>
 </div>
 </div>
 <div class="sect1">

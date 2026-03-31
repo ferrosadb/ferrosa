@@ -323,13 +323,24 @@ pub trait CompactionStrategy: Send + Sync {
 }
 ```
 
-**Size-Tiered Compaction Strategy (STCS)** — the only strategy currently implemented:
+Two strategies are implemented, selectable per-table via `CREATE TABLE ... WITH compaction = {'class': '...'}`:
+
+**Size-Tiered Compaction Strategy (STCS)** — default when no strategy is specified:
 
 - Groups SSTables into buckets by similar size (within `[bucket_low, bucket_high]` ratio of bucket median)
 - Triggers compaction when a bucket reaches `min_threshold` SSTables
 - Configuration from `FERROSA_COMPACTION_*` environment variables:
   - `min_threshold` (default 4), `max_threshold` (default 32)
   - `bucket_low` (default 0.5), `bucket_high` (default 1.5)
+
+**Unified Compaction Strategy (UCS)** — Cassandra 5.0 CEP-26, density-based:
+
+- Computes SSTable density = `size_bytes / token_share` (fraction of token ring covered)
+- Assigns SSTables to levels by density: level N = density in `[base × W^N, base × W^(N+1))`
+- Triggers compaction when any level has more than `fan_factor` (W) SSTables
+- Fan factor controls behavior: W=2 (LCS-like), W=4 (balanced default), W=32 (STCS-like)
+- Per-table DDL: `WITH compaction = {'class': 'UnifiedCompactionStrategy', 'fan_factor': '4'}`
+- See [UCS Architecture](ucs-compaction-architecture.md) for full spec
 
 **CompactionExecutor:**
 
@@ -776,7 +787,7 @@ pub struct StorageStats {
 | **Manifest CAS loop** | Manifest load/save is implemented, but the retry loop on conflict isn't wired into the flush/upload pipeline | S3 upload wiring |
 | **Recovery (`open()`)** | Load manifest from S3, ensure local cache has SSTables, replay commit log into memtables | Manifest, upload wiring |
 | **Commit log S3 shipping** | Segments are flushed to local disk but not yet uploaded to S3 | UploadManager integration |
-| **LCS / TWCS** | Only STCS is implemented. Leveled and Time-Window strategies are future | CompactionStrategy trait is ready |
+| **TWCS** | STCS and UCS are implemented. Time-Window strategy is future (UCS with TTL-aware levels could subsume) | CompactionStrategy trait + UCS density engine ready |
 | **Disk backpressure** | `flush_if_needed()` uses memtable size threshold but doesn't monitor local disk usage | Monitoring infrastructure |
 | **Grace period GC** | Safe deletion protocol for superseded SSTables (1-hour grace period) | Manifest, S3 integration |
 | **Orphan cleanup** | Periodic sweep of S3 objects not referenced by any manifest | Manifest |

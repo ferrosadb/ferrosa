@@ -125,6 +125,8 @@ Track 1 (Java analysis) informs Track 2 (Rust implementation). Track 1 is analys
 | Embeddings | `vector<float, N>` CQL type | Native vector storage for AI/ML workloads; ANN query support via vector indexes |
 | NVMe Table Pinning | Per-table `storage.pin = nvme` | Pins SSTables to local disk, bypassing S3 for sub-millisecond reads |
 | Full-Text Search | Inverted index sidecars + `fts_match()` | BM25-scored full-text queries via CQL function; `CREATE INDEX ... USING 'fulltext'` |
+| Compaction | STCS (default) + UCS (density-based) | UCS (Cassandra 5.0 CEP-26) subsumes LCS/STCS via fan factor; per-table DDL config |
+| Phonetic Search | `SOUNDS LIKE` operator + phonetic indexes | Double Metaphone matching for fuzzy name lookups |
 
 ## AWS Lock-in Flags
 

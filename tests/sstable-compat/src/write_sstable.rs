@@ -60,6 +60,7 @@ fn write_simple_types_sstable(output_dir: &str) -> anyhow::Result<()> {
         min_timestamp: 1_000_000,
         min_local_deletion_time: i32::MAX,
         min_ttl: 0,
+        max_timestamp: i64::MAX,
         key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
         clustering_types: vec![],
         static_columns: vec![],

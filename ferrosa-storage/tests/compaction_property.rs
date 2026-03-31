@@ -1,4 +1,4 @@
-//! Property tests for STCS compaction strategy.
+//! Property tests for STCS and UCS compaction strategies.
 
 use std::path::PathBuf;
 
@@ -9,6 +9,7 @@ use ferrosa_storage::compaction::metadata::SSTableMetadata;
 use ferrosa_storage::compaction::strategy::{
     CompactionConfig, CompactionStrategy, SizeTieredStrategy,
 };
+use ferrosa_storage::compaction::UnifiedCompactionStrategy;
 use ferrosa_storage::TableId;
 
 fn default_config() -> CompactionConfig {
@@ -185,4 +186,88 @@ fn different_sizes_separate_buckets() {
         tasks.is_empty(),
         "groups of 3 shouldn't trigger with min_threshold=4"
     );
+}
+
+// ── UCS property tests ──────────────────────────────────────────────────
+
+fn ucs_strategy(fan_factor: u32) -> UnifiedCompactionStrategy {
+    UnifiedCompactionStrategy::new(ferrosa_storage::compaction::UcsConfig::from_params(
+        &[("fan_factor".to_string(), fan_factor.to_string())]
+            .into_iter()
+            .collect(),
+        PathBuf::from("/tmp/compaction"),
+    ))
+}
+
+fn make_ucs_metadata(id: &str, size: u64, min_tok: i64, max_tok: i64) -> SSTableMetadata {
+    SSTableMetadata {
+        id: id.to_string(),
+        path: PathBuf::from(format!("/tmp/{id}")),
+        size_bytes: size,
+        min_token: min_tok,
+        max_token: max_tok,
+        min_timestamp: 0,
+        max_timestamp: 1000,
+        partition_count: 100,
+    }
+}
+
+// Property: UCS is deterministic — same input always produces same output.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn ucs_deterministic(
+        sizes in prop::collection::vec(1_000u64..10_000_000, 2..=15),
+    ) {
+        let strategy = ucs_strategy(4);
+
+        let sstables: Vec<_> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| make_ucs_metadata(&format!("sst_{i}"), size, 0, 1_000_000))
+            .collect();
+
+        let tasks1 = strategy.select(&sstables, &test_table_schema(), &test_table_id());
+        let tasks2 = strategy.select(&sstables, &test_table_schema(), &test_table_id());
+
+        prop_assert_eq!(tasks1.len(), tasks2.len(), "UCS must be deterministic");
+        for (t1, t2) in tasks1.iter().zip(tasks2.iter()) {
+            let ids1: Vec<_> = t1.inputs.iter().map(|m| &m.id).collect();
+            let ids2: Vec<_> = t2.inputs.iter().map(|m| &m.id).collect();
+            prop_assert_eq!(ids1, ids2);
+        }
+    }
+}
+
+// Property: UCS tasks only reference SSTables from the input set.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn ucs_tasks_subset_of_input(
+        sizes in prop::collection::vec(1_000u64..10_000_000, 2..=15),
+    ) {
+        let strategy = ucs_strategy(3);
+
+        let sstables: Vec<_> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| make_ucs_metadata(&format!("sst_{i}"), size, 0, 1_000_000))
+            .collect();
+
+        let all_ids: std::collections::HashSet<_> =
+            sstables.iter().map(|m| &m.id).collect();
+
+        let tasks = strategy.select(&sstables, &test_table_schema(), &test_table_id());
+        for task in &tasks {
+            for input in &task.inputs {
+                prop_assert!(
+                    all_ids.contains(&input.id),
+                    "UCS task references unknown SSTable: {}",
+                    input.id
+                );
+            }
+        }
+    }
 }

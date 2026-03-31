@@ -169,6 +169,29 @@ impl<R: ReadAt> SSTableReader<R> {
         self.compression_info.as_ref()
     }
 
+    /// Returns the approximate total size of this SSTable in bytes.
+    ///
+    /// Sums the sizes of the data file and the partition index. For
+    /// in-memory readers (tests), this is the byte count of the `Vec<u8>`
+    /// buffers. For file-backed readers, it reflects the actual file sizes.
+    pub fn total_size(&self) -> u64 {
+        let data_len = self.data.len().unwrap_or(0);
+        let partitions_len = self.partition_index.file_size();
+        data_len + partitions_len
+    }
+
+    /// Returns the smallest key stored in the partition index as raw
+    /// byte-comparable encoded bytes. Decode with `byte_comparable::decode`.
+    pub fn smallest_key_bytes(&self) -> &[u8] {
+        self.partition_index.smallest_key()
+    }
+
+    /// Returns the largest key stored in the partition index as raw
+    /// byte-comparable encoded bytes. Decode with `byte_comparable::decode`.
+    pub fn largest_key_bytes(&self) -> &[u8] {
+        self.partition_index.largest_key()
+    }
+
     /// Read all partitions from this SSTable in storage order.
     ///
     /// Scans the Data.db file sequentially from position 0, reading each
@@ -220,6 +243,7 @@ mod tests {
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
+            max_timestamp: i64::MAX,
             key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
             static_columns: vec![],
