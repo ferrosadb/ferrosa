@@ -654,4 +654,747 @@ mod tests {
         let back: AllCheckResults = serde_json::from_str(&json).unwrap();
         assert!(back.linearizability.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // JP-002: Checker correctness logic unit tests
+    // -----------------------------------------------------------------------
+
+    // --- Known-good histories (checker should pass) ---
+
+    /// A single write with no reads is trivially linearizable.
+    #[test]
+    fn linearizable_single_write() {
+        let history = History {
+            operations: vec![make_op(
+                "c1",
+                100,
+                200,
+                Op::Write {
+                    key: "x".into(),
+                    value: 42,
+                },
+                OpResult::Ok,
+            )],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].valid, "single write must be linearizable");
+        assert_eq!(results[0].total_ops, 1);
+    }
+
+    /// A read of None from an unwritten key is linearizable.
+    #[test]
+    fn linearizable_read_none_before_write() {
+        let history = History {
+            operations: vec![make_op(
+                "c1",
+                100,
+                200,
+                Op::Read { key: "x".into() },
+                OpResult::Value(None),
+            )],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].valid,
+            "reading None from unwritten register must be linearizable"
+        );
+    }
+
+    /// Multiple independent keys should each be checked independently.
+    #[test]
+    fn linearizable_multi_key_independent() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "y".into(),
+                        value: 2,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c2",
+                    300,
+                    400,
+                    Op::Read { key: "x".into() },
+                    OpResult::Value(Some(1)),
+                ),
+                make_op(
+                    "c2",
+                    300,
+                    400,
+                    Op::Read { key: "y".into() },
+                    OpResult::Value(Some(2)),
+                ),
+            ],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 2, "should produce one result per key");
+        assert!(
+            results.iter().all(|r| r.valid),
+            "both keys should be independently linearizable"
+        );
+    }
+
+    /// CAS that fails (not applied) because the expected value does not match.
+    #[test]
+    fn linearizable_cas_fails_correctly() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 5,
+                    },
+                    OpResult::Ok,
+                ),
+                // CAS expects 0 but value is 5, so it fails.
+                make_op(
+                    "c2",
+                    300,
+                    400,
+                    Op::Cas {
+                        key: "x".into(),
+                        expected: 0,
+                        value: 10,
+                    },
+                    OpResult::Applied(false),
+                ),
+                // Value is still 5.
+                make_op(
+                    "c1",
+                    500,
+                    600,
+                    Op::Read { key: "x".into() },
+                    OpResult::Value(Some(5)),
+                ),
+            ],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].valid,
+            "failed CAS followed by read of original value should be linearizable"
+        );
+    }
+
+    /// All operations are timeouts/errors -- always linearizable.
+    #[test]
+    fn linearizable_all_timeouts() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 1,
+                    },
+                    OpResult::Timeout,
+                ),
+                make_op(
+                    "c2",
+                    300,
+                    400,
+                    Op::Read { key: "x".into() },
+                    OpResult::Timeout,
+                ),
+                make_op(
+                    "c1",
+                    500,
+                    600,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 2,
+                    },
+                    OpResult::Err("connection lost".into()),
+                ),
+            ],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].valid,
+            "all timeout/error operations should be trivially linearizable"
+        );
+    }
+
+    /// SerialRead variant works the same as Read for the checker.
+    #[test]
+    fn linearizable_serial_read() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 7,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c2",
+                    300,
+                    400,
+                    Op::SerialRead { key: "x".into() },
+                    OpResult::Value(Some(7)),
+                ),
+            ],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].valid, "serial read of last write should pass");
+    }
+
+    /// Multiple concurrent overlapping writes with reads that see either value.
+    #[test]
+    fn linearizable_concurrent_writes_either_order() {
+        // w(x,1) at [100, 400], w(x,2) at [200, 500]
+        // r(x)=1 at [600, 700] -- linearize as w(2) then w(1)
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    400,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c2",
+                    200,
+                    500,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 2,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c1",
+                    600,
+                    700,
+                    Op::Read { key: "x".into() },
+                    OpResult::Value(Some(1)),
+                ),
+            ],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 1);
+        // Linearization: w(2) at t=250, w(1) at t=350 -> read sees 1. Valid.
+        assert!(
+            results[0].valid,
+            "concurrent overlapping writes allow either final value"
+        );
+    }
+
+    // --- Known-bad histories (checker should detect violation) ---
+
+    /// Read returns a value that was never written.
+    #[test]
+    fn not_linearizable_phantom_read() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c2",
+                    300,
+                    400,
+                    Op::Read { key: "x".into() },
+                    OpResult::Value(Some(99)),
+                ),
+            ],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].valid,
+            "reading a never-written value must fail linearizability"
+        );
+        assert!(results[0].counterexample.is_some());
+    }
+
+    /// CAS succeeds but the expected value doesn't match the model.
+    #[test]
+    fn not_linearizable_impossible_cas_success() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 5,
+                    },
+                    OpResult::Ok,
+                ),
+                // CAS expects 0, but value is 5. This should fail, but claims success.
+                make_op(
+                    "c2",
+                    300,
+                    400,
+                    Op::Cas {
+                        key: "x".into(),
+                        expected: 0,
+                        value: 10,
+                    },
+                    OpResult::Applied(true),
+                ),
+                // If CAS actually applied, value should be 10. But we read 5.
+                make_op(
+                    "c1",
+                    500,
+                    600,
+                    Op::Read { key: "x".into() },
+                    OpResult::Value(Some(5)),
+                ),
+            ],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].valid,
+            "CAS that claims success with wrong precondition + contradictory read should fail"
+        );
+    }
+
+    /// Two sequential reads see values in impossible order.
+    #[test]
+    fn not_linearizable_backward_read() {
+        // w(x,1), w(x,2) both sequential. Then r(x)=2, r(x)=1 both sequential.
+        // The second read is after the first and must also see 2 or later.
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c1",
+                    300,
+                    400,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 2,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c2",
+                    500,
+                    600,
+                    Op::Read { key: "x".into() },
+                    OpResult::Value(Some(2)),
+                ),
+                make_op(
+                    "c2",
+                    700,
+                    800,
+                    Op::Read { key: "x".into() },
+                    OpResult::Value(Some(1)),
+                ),
+            ],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].valid,
+            "reading older value after newer value in sequential order should fail"
+        );
+    }
+
+    /// Read returns None after a successful sequential write.
+    #[test]
+    fn not_linearizable_read_none_after_write() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c1",
+                    300,
+                    400,
+                    Op::Read { key: "x".into() },
+                    OpResult::Value(None),
+                ),
+            ],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].valid,
+            "reading None after a successful write should fail linearizability"
+        );
+    }
+
+    // --- Edge cases ---
+
+    /// One key is linearizable, another is not -- results are per-key.
+    #[test]
+    fn mixed_keys_partial_failure() {
+        let history = History {
+            operations: vec![
+                // Key "a": linearizable
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "a".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c1",
+                    300,
+                    400,
+                    Op::Read { key: "a".into() },
+                    OpResult::Value(Some(1)),
+                ),
+                // Key "b": NOT linearizable (phantom read)
+                make_op(
+                    "c2",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "b".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c2",
+                    300,
+                    400,
+                    Op::Read { key: "b".into() },
+                    OpResult::Value(Some(99)),
+                ),
+            ],
+        };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 2);
+
+        let a_result = results.iter().find(|r| r.key == "a").unwrap();
+        let b_result = results.iter().find(|r| r.key == "b").unwrap();
+        assert!(a_result.valid, "key 'a' should be linearizable");
+        assert!(!b_result.valid, "key 'b' should NOT be linearizable");
+    }
+
+    /// CheckResult and Counterexample serialize/deserialize correctly.
+    #[test]
+    fn check_result_serialization() {
+        let result = CheckResult {
+            valid: false,
+            key: "x".into(),
+            total_ops: 3,
+            counterexample: Some(Counterexample {
+                operations: vec![make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                )],
+                explanation: "stale read".into(),
+            }),
+            check_duration_ms: 42,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let back: CheckResult = serde_json::from_str(&json).unwrap();
+        assert!(!back.valid);
+        assert_eq!(back.key, "x");
+        assert_eq!(back.total_ops, 3);
+        assert!(back.counterexample.is_some());
+        assert_eq!(back.counterexample.unwrap().explanation, "stale read");
+    }
+
+    /// UnifiedChecker produces per-key results.
+    #[test]
+    fn unified_checker_detects_violation() {
+        let checker = UnifiedChecker::new();
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c1",
+                    300,
+                    400,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 2,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c2",
+                    500,
+                    600,
+                    Op::Read { key: "x".into() },
+                    OpResult::Value(Some(1)),
+                ),
+            ],
+        };
+        let results = checker.check_all(&history);
+        assert_eq!(results.linearizability.len(), 1);
+        assert!(
+            !results.linearizability[0].valid,
+            "UnifiedChecker should detect stale read violation"
+        );
+    }
+
+    /// UnifiedChecker passes on a known-good history.
+    #[test]
+    fn unified_checker_passes_good_history() {
+        let checker = UnifiedChecker::new();
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "x".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c1",
+                    300,
+                    400,
+                    Op::Read { key: "x".into() },
+                    OpResult::Value(Some(1)),
+                ),
+            ],
+        };
+        let results = checker.check_all(&history);
+        assert_eq!(results.linearizability.len(), 1);
+        assert!(results.linearizability[0].valid);
+    }
+
+    /// UnifiedChecker with_jepsen_dir stores the path for future use.
+    #[test]
+    fn unified_checker_with_jepsen_dir() {
+        let checker = UnifiedChecker::with_jepsen_dir("/tmp/jepsen");
+        assert_eq!(
+            checker.jepsen_dir,
+            Some(std::path::PathBuf::from("/tmp/jepsen"))
+        );
+        // Still works without external checkers.
+        let history = History { operations: vec![] };
+        let results = checker.check_all(&history);
+        assert!(results.linearizability.is_empty());
+        assert!(results.knossos.is_none());
+        assert!(results.elle.is_none());
+    }
+
+    /// Keys are extracted in sorted order (BTreeSet).
+    #[test]
+    fn extract_keys_sorted_order() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "z".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c1",
+                    200,
+                    300,
+                    Op::Write {
+                        key: "a".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c1",
+                    300,
+                    400,
+                    Op::Write {
+                        key: "m".into(),
+                        value: 1,
+                    },
+                    OpResult::Ok,
+                ),
+            ],
+        };
+        let keys = extract_keys(&history);
+        assert_eq!(keys, vec!["a", "m", "z"]);
+    }
+
+    /// Transaction ops collect keys from nested statements.
+    #[test]
+    fn extract_keys_from_transaction() {
+        let history = History {
+            operations: vec![make_op(
+                "c1",
+                100,
+                200,
+                Op::Transaction {
+                    statements: vec![
+                        Op::Write {
+                            key: "x".into(),
+                            value: 1,
+                        },
+                        Op::Read { key: "y".into() },
+                    ],
+                },
+                OpResult::Ok,
+            )],
+        };
+        let keys = extract_keys(&history);
+        assert_eq!(keys, vec!["x", "y"]);
+    }
+
+    /// InsertIfNotExists/UpdateIf/DeleteIf ops do not contribute keys
+    /// (they use table/pk addressing, not the key field).
+    #[test]
+    fn extract_keys_ignores_lwt_ops() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::InsertIfNotExists {
+                        table: "t1".into(),
+                        pk: "pk-0".into(),
+                        values: vec![],
+                    },
+                    OpResult::Applied(true),
+                ),
+                make_op(
+                    "c1",
+                    200,
+                    300,
+                    Op::UpdateIf {
+                        table: "t1".into(),
+                        pk: "pk-0".into(),
+                        condition: "val = 0".into(),
+                        assignments: vec![],
+                    },
+                    OpResult::Applied(true),
+                ),
+                make_op(
+                    "c1",
+                    300,
+                    400,
+                    Op::DeleteIf {
+                        table: "t1".into(),
+                        pk: "pk-0".into(),
+                        condition: "EXISTS".into(),
+                    },
+                    OpResult::Applied(true),
+                ),
+            ],
+        };
+        let keys = extract_keys(&history);
+        assert!(
+            keys.is_empty(),
+            "LWT ops (InsertIfNotExists, UpdateIf, DeleteIf) should not contribute keys"
+        );
+    }
+
+    /// Many concurrent operations on the same key -- stress the backtracking.
+    #[test]
+    fn linearizable_many_concurrent_writes_and_reads() {
+        // 5 concurrent writes at overlapping times, then a read of the last value.
+        let mut ops = Vec::new();
+        for i in 0..5 {
+            ops.push(make_op(
+                &format!("c{i}"),
+                100 + i * 10,
+                500,
+                Op::Write {
+                    key: "x".into(),
+                    value: i as i64,
+                },
+                OpResult::Ok,
+            ));
+        }
+        // After all writes complete, read sees value 4 (last writer wins in some linearization).
+        ops.push(make_op(
+            "reader",
+            600,
+            700,
+            Op::Read { key: "x".into() },
+            OpResult::Value(Some(4)),
+        ));
+
+        let history = History { operations: ops };
+        let results = check_linearizability(&history);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].valid,
+            "any value from the concurrent writers is valid if it's the last in some linearization"
+        );
+    }
 }

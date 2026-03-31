@@ -192,4 +192,136 @@ mod tests {
         let result = session.execute("SELECT * FROM system.local").await.unwrap();
         assert!(result.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // JP-001: Workload operation generation unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn workload_registry_get_returns_none_for_unknown() {
+        let reg = WorkloadRegistry::phase1();
+        assert!(reg.get("nonexistent-workload").is_none());
+    }
+
+    #[test]
+    fn workload_registry_empty_has_no_workloads() {
+        let reg = WorkloadRegistry::new();
+        assert!(reg.names().is_empty());
+        assert!(reg.get("register").is_none());
+    }
+
+    #[test]
+    fn workload_registry_register_and_retrieve() {
+        let mut reg = WorkloadRegistry::new();
+        reg.register(Box::new(register::RegisterWorkload));
+        assert_eq!(reg.names(), vec!["register"]);
+        assert!(reg.get("register").is_some());
+        assert_eq!(reg.get("register").unwrap().name(), "register");
+    }
+
+    #[test]
+    fn workload_registry_phase1_names_are_unique() {
+        let reg = WorkloadRegistry::phase1();
+        let names = reg.names();
+        let mut deduped = names.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            names.len(),
+            deduped.len(),
+            "phase1 registry must have unique workload names"
+        );
+    }
+
+    #[test]
+    fn workload_registry_phase1_all_names_non_empty() {
+        let reg = WorkloadRegistry::phase1();
+        for name in reg.names() {
+            assert!(!name.is_empty(), "workload names must not be empty strings");
+        }
+    }
+
+    #[test]
+    fn workload_registry_phase1_has_register_and_bank() {
+        let reg = WorkloadRegistry::phase1();
+        let names = reg.names();
+        assert!(
+            names.contains(&"register".to_string()),
+            "phase1 must include register workload"
+        );
+        assert!(
+            names.contains(&"bank".to_string()),
+            "phase1 must include bank workload"
+        );
+    }
+
+    #[test]
+    fn workload_registry_phase1_has_all_lwt_patterns() {
+        let reg = WorkloadRegistry::phase1();
+        let names = reg.names();
+        // Verify all 16 LWT patterns are present.
+        let lwt_count = names.iter().filter(|n| n.starts_with("lwt-")).count();
+        assert_eq!(lwt_count, 16, "phase1 must include all 16 LWT workloads");
+    }
+
+    #[test]
+    fn workload_registry_phase1_lwt_names_follow_pattern() {
+        let reg = WorkloadRegistry::phase1();
+        let names = reg.names();
+        let lwt_names: Vec<&String> = names.iter().filter(|n| n.starts_with("lwt-")).collect();
+        // Each LWT name should start with "lwt-N-" where N is 1..=16.
+        for name in &lwt_names {
+            let parts: Vec<&str> = name.splitn(3, '-').collect();
+            assert!(
+                parts.len() >= 3,
+                "LWT name should have format lwt-N-desc: {name}"
+            );
+            let num: usize = parts[1]
+                .parse()
+                .unwrap_or_else(|_| panic!("LWT name second segment should be a number: {name}"));
+            assert!(
+                (1..=16).contains(&num),
+                "LWT pattern number should be 1..=16, got {num} in {name}"
+            );
+        }
+    }
+
+    /// All Phase 1 workloads should successfully execute setup + run against the
+    /// mock CQL session and produce a history (possibly empty for very short runs).
+    #[tokio::test]
+    async fn all_phase1_workloads_run_against_mock() {
+        use std::time::Duration;
+        use testutil::MockCqlSession;
+
+        let reg = WorkloadRegistry::phase1();
+        let session = MockCqlSession::new();
+
+        for name in reg.names() {
+            let wl = reg.get(&name).unwrap();
+            wl.setup(&session)
+                .await
+                .unwrap_or_else(|e| panic!("setup failed for workload '{name}': {e}"));
+
+            let mut recorder = crate::history::HistoryRecorder::new("test");
+            wl.run(&session, &mut recorder, Duration::from_millis(20))
+                .await
+                .unwrap_or_else(|e| panic!("run failed for workload '{name}': {e}"));
+
+            let history = recorder.finish();
+            // Most workloads should produce at least one operation in 20ms.
+            // We don't assert non-empty because some workloads may need more
+            // than one iteration to get through their setup queries.
+            // Instead, verify that the history is structurally valid.
+            for op in &history.operations {
+                assert!(
+                    op.invoke_us <= op.complete_us,
+                    "workload '{name}' produced operation with invoke > complete"
+                );
+                assert!(
+                    !op.client_id.is_empty(),
+                    "workload '{name}' produced operation with empty client_id"
+                );
+            }
+        }
+    }
 }

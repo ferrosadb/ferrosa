@@ -358,16 +358,16 @@ cargo test --workspace --exclude ferrosa-cluster --exclude ferrosa-jepsen
 
 | WP | Task IDs | Status | Verified |
 |----|----------|--------|----------|
-| WP-001 | U-001 | pending | |
-| WP-002 | U-002 | pending | |
-| WP-003 | U-003 | pending | |
-| WP-004 | U-004 | pending | |
-| WP-005 | U-005 | pending | |
-| WP-006 | U-006, U-010 | pending | |
-| WP-007 | U-007 | pending | |
-| WP-008 | U-008 | pending | |
-| WP-009 | U-009 | pending | |
-| WP-010 | U-011, U-012 | pending | |
-| WP-011 | U-013, U-014 | pending | |
-| WP-012 | U-015, U-016 | pending | |
-| WP-013 | U-017–U-022 | pending | |
+| WP-001 | U-001 | complete | sstable_metadata_reports_nonzero_size |
+| WP-002 | U-002 | complete | sstable_metadata_reports_token_range |
+| WP-003 | U-003 | complete | sstable_metadata_reports_max_timestamp |
+| WP-004 | U-004 | complete | table_params_compaction_roundtrip |
+| WP-005 | U-005 | complete | create_table_with_compaction_persists_params |
+| WP-006 | U-006, U-010 | complete | ucs_config_* (3 tests) |
+| WP-007 | U-007 | complete | density_* (3 tests) |
+| WP-008 | U-008 | complete | level_assignment_* (4 tests) |
+| WP-009 | U-009 | complete | ucs_select_* (8 tests) |
+| WP-010 | U-011, U-012 | complete | ucs_deterministic, ucs_tasks_subset_of_input (proptest) |
+| WP-011 | U-013, U-014 | complete | strategy_for_table dispatch wired in engine.rs |
+| WP-012 | U-015, U-016 | complete | Covered by unit tests + DDL persistence |
+| WP-013 | U-017–U-022 | complete | W=2, W=32, single, empty, W=1000, same-density |
