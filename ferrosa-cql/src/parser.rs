@@ -1513,9 +1513,15 @@ impl<'input> Parser<'input> {
                             Ok(GrantResource::AllKeyspaces)
                         } else if ident.eq_ignore_ascii_case("roles") {
                             Ok(GrantResource::AllRoles)
+                        } else if ident.eq_ignore_ascii_case("functions") {
+                            // ALL FUNCTIONS IN KEYSPACE ks
+                            self.lexer.expect(&TokenKind::Keyword(Keyword::In))?;
+                            self.lexer.expect(&TokenKind::Keyword(Keyword::Keyspace))?;
+                            let ks = self.parse_ident()?;
+                            Ok(GrantResource::AllFunctions { keyspace: Some(ks) })
                         } else {
                             Err(CqlError::SyntaxError(format!(
-                                "expected KEYSPACES or ROLES after ALL, got '{}'",
+                                "expected KEYSPACES, ROLES, or FUNCTIONS after ALL, got '{}'",
                                 ident
                             )))
                         }
@@ -1531,6 +1537,31 @@ impl<'input> Parser<'input> {
                 self.lexer.next_token()?;
                 let role = self.parse_ident()?;
                 Ok(GrantResource::Role(role))
+            }
+            TokenKind::Keyword(Keyword::Function) => {
+                self.lexer.next_token()?;
+                // FUNCTION [ks.]name(arg_type, ...)
+                let (ks, name) = self.parse_table_ref()?;
+                // Parse argument types in parentheses
+                let arg_types = if self.lexer.eat(&TokenKind::LParen)? {
+                    if self.lexer.eat(&TokenKind::RParen)? {
+                        vec![]
+                    } else {
+                        let mut types = vec![self.parse_cql_type_name()?];
+                        while self.lexer.eat(&TokenKind::Comma)? {
+                            types.push(self.parse_cql_type_name()?);
+                        }
+                        self.lexer.expect(&TokenKind::RParen)?;
+                        types
+                    }
+                } else {
+                    vec![]
+                };
+                Ok(GrantResource::Function {
+                    keyspace: ks,
+                    name,
+                    arg_types,
+                })
             }
             _ => {
                 // Table resource: [ks.]table

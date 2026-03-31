@@ -198,9 +198,9 @@ jepsen         ██████   █████░  ████░░   █
   - [x] ~~Aggregate UDF (UDA) support~~ — CREATE/DROP AGGREGATE with state/final functions
   - [x] ~~DdlOperation::CreateFunction/DropFunction for cluster replication~~
   - [x] ~~Val encoding for all 26 CQL types~~ (recursive Val::Variant encoding, wit-bindgen not usable due to recursive type limitation)
-  - [ ] Function calls in SELECT expressions (requires expression executor)
-  - [ ] GRANT/REVOKE on function resources
-  - [ ] Aggregate state/final function orchestration in query path
+  - [x] ~~Function calls in SELECT expressions~~ — built-in (uuid, now, toTimestamp, writetime, ttl, toJson) + scalar UDFs per-row
+  - [x] ~~GRANT/REVOKE on function resources~~ — FUNCTION and ALL FUNCTIONS IN KEYSPACE resources with EXECUTE permission
+  - [x] ~~Aggregate state/final function orchestration~~ — execute_uda() calls state func per-row, final func once at end
 
 ### ferrosa-cql — Complete (Parts A-D + Compression + Accord + Temporal compat)
 
