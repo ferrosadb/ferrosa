@@ -1170,4 +1170,346 @@ mod tests {
         assert!(body.contains("host=\"node1\""));
         assert!(body.contains("5"));
     }
+
+    // =========================================================================
+    // BT-001: Web API endpoint smoke tests
+    //
+    // Each GET endpoint must return 200 with a valid JSON body.
+    // =========================================================================
+
+    /// BT-001a: GET /api/connections returns 200 + JSON array.
+    #[tokio::test]
+    async fn bt001_api_connections_returns_200_json() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/connections")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/connections must return 200"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("GET /api/connections must return valid JSON");
+        assert!(
+            parsed.is_array(),
+            "GET /api/connections must return a JSON array, got: {parsed}"
+        );
+    }
+
+    /// BT-001b: GET /api/storage_stats returns 200 + JSON array.
+    #[tokio::test]
+    async fn bt001_api_storage_stats_returns_200_json() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/storage_stats")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/storage_stats must return 200"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("GET /api/storage_stats must return valid JSON");
+        assert!(
+            parsed.is_array(),
+            "GET /api/storage_stats must return a JSON array, got: {parsed}"
+        );
+    }
+
+    /// BT-001c: GET /api/storage (alias) returns 200 + JSON array identical to
+    /// /api/storage_stats.
+    #[tokio::test]
+    async fn bt001_api_storage_alias_returns_200_json() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/storage")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/storage must return 200"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("GET /api/storage must return valid JSON");
+        assert!(
+            parsed.is_array(),
+            "GET /api/storage must return a JSON array, got: {parsed}"
+        );
+    }
+
+    /// BT-001d: GET /api/active_queries returns 200 + JSON array.
+    #[tokio::test]
+    async fn bt001_api_active_queries_returns_200_json() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/active_queries")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/active_queries must return 200"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("GET /api/active_queries must return valid JSON");
+        assert!(
+            parsed.is_array(),
+            "GET /api/active_queries must return a JSON array, got: {parsed}"
+        );
+    }
+
+    /// BT-001e: GET /api/queries (alias) returns 200 + JSON array.
+    #[tokio::test]
+    async fn bt001_api_queries_alias_returns_200_json() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/queries")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/queries must return 200"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("GET /api/queries must return valid JSON");
+        assert!(
+            parsed.is_array(),
+            "GET /api/queries must return a JSON array, got: {parsed}"
+        );
+    }
+
+    /// BT-001f: GET /api/tables returns 200 + JSON array of table names.
+    #[tokio::test]
+    async fn bt001_api_tables_returns_200_json() {
+        let mut state = make_state();
+        // Register at least one virtual table so /api/tables is non-empty.
+        let registry = VirtualTableRegistry::new();
+        registry.register(Arc::new(NamedStubTable {
+            table_name: "connections",
+        }));
+        registry.register(Arc::new(NamedStubTable {
+            table_name: "storage_stats",
+        }));
+        state.registry = Arc::new(registry);
+
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/tables")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/tables must return 200"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("GET /api/tables must return valid JSON");
+        let names = parsed
+            .as_array()
+            .expect("/api/tables must return a JSON array");
+        assert!(
+            names.len() >= 2,
+            "expected at least 2 tables registered, got: {names:?}"
+        );
+        let name_strs: Vec<&str> = names.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            name_strs.contains(&"connections"),
+            "table list must include 'connections', got: {name_strs:?}"
+        );
+        assert!(
+            name_strs.contains(&"storage_stats"),
+            "table list must include 'storage_stats', got: {name_strs:?}"
+        );
+    }
+
+    // =========================================================================
+    // BT-002: Cluster status endpoint test
+    // =========================================================================
+
+    /// BT-002: GET /api/cluster/status returns 200 + JSON with mode, role, host_id.
+    #[tokio::test]
+    async fn bt002_api_cluster_status_returns_200_json() {
+        let state = make_state();
+        let expected_host_id = state.host_id.to_string();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/cluster/status")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/cluster/status must return 200"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("GET /api/cluster/status must return valid JSON");
+
+        // Must contain "mode" field (string).
+        let mode = parsed
+            .get("mode")
+            .expect("cluster/status must have 'mode' field");
+        assert!(mode.is_string(), "'mode' must be a string, got: {mode}");
+
+        // Must contain "host_id" field matching the node's host_id.
+        let host_id = parsed
+            .get("host_id")
+            .expect("cluster/status must have 'host_id' field");
+        assert_eq!(
+            host_id.as_str().unwrap(),
+            expected_host_id,
+            "host_id must match the configured value"
+        );
+
+        // "role" field should be present (may be null in standalone mode).
+        assert!(
+            parsed.get("role").is_some(),
+            "cluster/status must have 'role' field (even if null)"
+        );
+    }
+
+    // =========================================================================
+    // BT-003: Prometheus /metrics endpoint test
+    // =========================================================================
+
+    /// BT-003: GET /metrics returns text/plain with ferrosa_ prefix metrics
+    /// when virtual tables with numeric columns are registered.
+    #[tokio::test]
+    async fn bt003_metrics_returns_ferrosa_prefix_metrics() {
+        let mut state = make_state();
+        // Register a virtual table with a numeric column so the metrics
+        // output contains at least one ferrosa_ prefixed line.
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![
+                VirtualColumnDef {
+                    name: "host".to_string(),
+                    data_type: DataType::Text,
+                },
+                VirtualColumnDef {
+                    name: "active_count".to_string(),
+                    data_type: DataType::Int,
+                },
+            ],
+            rows: vec![VirtualRow {
+                cells: vec![
+                    CellValue::live(b"node1".to_vec(), 1),
+                    CellValue::live(3i32.to_be_bytes().to_vec(), 1),
+                ],
+            }],
+        };
+        registry.register(Arc::new(table));
+        state.registry = Arc::new(registry);
+
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /metrics must return 200"
+        );
+
+        // Verify content type.
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("text/plain"),
+            "/metrics must return text/plain, got: {ct}"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+
+        // Body must contain at least one ferrosa_ prefixed metric.
+        assert!(
+            body_str.contains("ferrosa_"),
+            "/metrics body must contain ferrosa_ prefix metrics, got: {body_str}"
+        );
+        // Verify the specific metric from the stub table appears.
+        assert!(
+            body_str.contains("ferrosa_test_table_active_count"),
+            "/metrics must contain ferrosa_test_table_active_count, got: {body_str}"
+        );
+    }
+
+    /// BT-003b: GET /metrics with empty registry returns 200 + text/plain
+    /// (possibly empty body, but no error).
+    #[tokio::test]
+    async fn bt003_metrics_empty_registry_returns_200() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /metrics with empty registry must still return 200"
+        );
+
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("text/plain"),
+            "content-type must be text/plain even with empty registry, got: {ct}"
+        );
+    }
 }
