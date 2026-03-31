@@ -1,8 +1,9 @@
 # Full-Text Indexing — Architecture Spec
 
 > Created: 2026-03-29
-> Status: Draft
-> Crate scope: ferrosa-index, ferrosa-storage, ferrosa-cql, ferrosa-schema
+> Updated: 2026-03-30
+> Status: Implemented — analyzer pipeline, builder, reader, BM25 scoring, query parser (AND/OR/NOT/Prefix), merge, FTI sidecar on flush, CQL fts_match() wired
+> Crate scope: ferrosa-index (fulltext/), ferrosa-storage (engine.rs, store.rs, flush.rs), ferrosa-cql (router.rs)
 
 ---
 

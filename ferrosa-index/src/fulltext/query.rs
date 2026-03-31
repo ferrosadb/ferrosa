@@ -23,6 +23,10 @@ pub enum FtsQuery {
     Or(Box<FtsQuery>, Box<FtsQuery>),
     /// A conjunction of multiple terms (from a plain multi-word query).
     MultiTerm(Vec<String>),
+    /// Prefix wildcard: matches any term starting with the given prefix.
+    Prefix(String),
+    /// Negation: exclude documents matching the inner query.
+    Not(Box<FtsQuery>),
 }
 
 /// Parse a query string into an [`FtsQuery`].
@@ -69,6 +73,8 @@ enum RawToken {
     And,
     /// The `OR` boolean operator.
     Or,
+    /// The `NOT` boolean operator.
+    Not,
 }
 
 /// Tokenize a query string, respecting double-quoted phrases.
@@ -124,7 +130,25 @@ fn tokenize_query(input: &str) -> Result<Vec<RawToken>, String> {
                     match word.to_uppercase().as_str() {
                         "AND" => tokens.push(RawToken::And),
                         "OR" => tokens.push(RawToken::Or),
-                        _ => tokens.push(RawToken::Word(word.to_lowercase())),
+                        "NOT" => tokens.push(RawToken::Not),
+                        "*" => {
+                            return Err(
+                                "bare wildcard '*' is not allowed; use a prefix like 'term*'"
+                                    .into(),
+                            )
+                        }
+                        _ => {
+                            let lower = word.to_lowercase();
+                            if lower.ends_with('*') && lower.len() > 1 {
+                                // Prefix wildcard: "term*" → Prefix("term")
+                                tokens.push(RawToken::Word(format!(
+                                    "{}*",
+                                    &lower[..lower.len() - 1]
+                                )));
+                            } else {
+                                tokens.push(RawToken::Word(lower));
+                            }
+                        }
                     }
                 }
             }
@@ -140,7 +164,7 @@ fn tokenize_query(input: &str) -> Result<Vec<RawToken>, String> {
 /// terms without operators are emitted as a `MultiTerm` (implicit AND).
 fn build_expr(tokens: &[RawToken]) -> Result<FtsQuery, String> {
     // Check for boolean operators.
-    // Find the rightmost OR (lowest precedence), then AND.
+    // Find the rightmost OR (lowest precedence), then AND, then NOT (highest).
     let or_pos = tokens.iter().rposition(|t| t == &RawToken::Or);
     if let Some(pos) = or_pos {
         let left = build_expr(&tokens[..pos])?;
@@ -155,6 +179,15 @@ fn build_expr(tokens: &[RawToken]) -> Result<FtsQuery, String> {
         return Ok(FtsQuery::And(Box::new(left), Box::new(right)));
     }
 
+    // NOT is a unary prefix operator — must be at the start.
+    if let Some(RawToken::Not) = tokens.first() {
+        if tokens.len() < 2 {
+            return Err("NOT operator requires an operand".into());
+        }
+        let inner = build_expr(&tokens[1..])?;
+        return Ok(FtsQuery::Not(Box::new(inner)));
+    }
+
     // No operators — collect terms/phrases.
     let mut terms = Vec::new();
     let mut phrases = Vec::new();
@@ -162,7 +195,7 @@ fn build_expr(tokens: &[RawToken]) -> Result<FtsQuery, String> {
         match tok {
             RawToken::Word(w) => terms.push(w.clone()),
             RawToken::Phrase(words) => phrases.push(words.clone()),
-            RawToken::And | RawToken::Or => {
+            RawToken::And | RawToken::Or | RawToken::Not => {
                 return Err("unexpected operator token in expression".into())
             }
         }
@@ -184,8 +217,44 @@ fn build_expr(tokens: &[RawToken]) -> Result<FtsQuery, String> {
 
     match terms.len() {
         0 => Err("empty expression in query".into()),
-        1 => Ok(FtsQuery::Term(terms.remove(0))),
-        _ => Ok(FtsQuery::MultiTerm(terms)),
+        1 => {
+            let t = terms.remove(0);
+            if t.ends_with('*') {
+                Ok(FtsQuery::Prefix(t[..t.len() - 1].to_string()))
+            } else {
+                Ok(FtsQuery::Term(t))
+            }
+        }
+        _ => {
+            // Convert any prefix-wildcard terms in the list.
+            let queries: Vec<FtsQuery> = terms
+                .into_iter()
+                .map(|t| {
+                    if t.ends_with('*') {
+                        FtsQuery::Prefix(t[..t.len() - 1].to_string())
+                    } else {
+                        FtsQuery::Term(t)
+                    }
+                })
+                .collect();
+            // Check if any are prefix queries — if so, wrap in And chain.
+            if queries.iter().any(|q| matches!(q, FtsQuery::Prefix(_))) {
+                Ok(queries
+                    .into_iter()
+                    .reduce(|a, b| FtsQuery::And(Box::new(a), Box::new(b)))
+                    .unwrap())
+            } else {
+                // All plain terms — use MultiTerm.
+                let terms: Vec<String> = queries
+                    .into_iter()
+                    .map(|q| match q {
+                        FtsQuery::Term(t) => t,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                Ok(FtsQuery::MultiTerm(terms))
+            }
+        }
     }
 }
 
@@ -249,5 +318,37 @@ mod tests {
         assert!(matches!(q, FtsQuery::And(_, _)));
         let q2 = parse_fts_query("rust or cargo").unwrap();
         assert!(matches!(q2, FtsQuery::Or(_, _)));
+    }
+
+    #[test]
+    fn parse_prefix_query() {
+        let q = parse_fts_query("rust*").unwrap();
+        assert_eq!(q, FtsQuery::Prefix("rust".into()));
+    }
+
+    #[test]
+    fn parse_not_query() {
+        let q = parse_fts_query("NOT rust").unwrap();
+        assert_eq!(q, FtsQuery::Not(Box::new(FtsQuery::Term("rust".into()))));
+    }
+
+    #[test]
+    fn parse_bare_star_rejected() {
+        let result = parse_fts_query("*");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("bare wildcard"));
+    }
+
+    #[test]
+    fn parse_not_binds_tighter_than_and() {
+        // "a AND NOT b" → And(Term("a"), Not(Term("b")))
+        let q = parse_fts_query("a AND NOT b").unwrap();
+        match q {
+            FtsQuery::And(left, right) => {
+                assert_eq!(*left, FtsQuery::Term("a".into()));
+                assert_eq!(*right, FtsQuery::Not(Box::new(FtsQuery::Term("b".into()))));
+            }
+            _ => panic!("expected And, got {q:?}"),
+        }
     }
 }

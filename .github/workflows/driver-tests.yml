@@ -8,20 +8,9 @@ name: Driver Smoke Tests
 #   CONTAINER_RUNTIME=podman ./tests/drivers/run-all.sh
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'tests/drivers/**'
-      - 'Dockerfile'
-      - 'ferrosa-cql/**'
-      - 'ferrosa-common/**'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'tests/drivers/**'
-      - 'Dockerfile'
-      - 'ferrosa-cql/**'
-      - 'ferrosa-common/**'
+  schedule:
+    - cron: '30 3 * * *'  # 3:30 AM UTC daily (after nightly-fuzz at 3:00)
+  workflow_dispatch:  # manual trigger
 
 env:
   CARGO_TERM_COLOR: always

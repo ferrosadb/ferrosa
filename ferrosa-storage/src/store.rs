@@ -79,6 +79,9 @@ pub struct TableStore<F: FlushTarget> {
     /// Column position is the index into `Row.cells` by column ordinal
     /// (matching the `u16` tag in each cell tuple).
     indexed_columns: Vec<(String, usize)>,
+    /// Full-text index declarations: `(index_name, column_position)` pairs.
+    /// Built as FTI sidecar files during flush.
+    fulltext_indexes: Vec<(String, usize)>,
 }
 
 fn new_memtable() -> Arc<dyn Memtable> {
@@ -151,6 +154,7 @@ impl<F: FlushTarget> TableStore<F> {
             flush_target,
             options,
             indexed_columns,
+            fulltext_indexes: vec![],
         }
     }
 
@@ -214,6 +218,7 @@ impl<F: FlushTarget> TableStore<F> {
             flush_target,
             options,
             indexed_columns,
+            fulltext_indexes: vec![],
         }
     }
 
@@ -393,6 +398,46 @@ impl<F: FlushTarget> TableStore<F> {
         // Persist sidecar files to disk (no-op for in-memory flush targets).
         if let Err(e) = self.flush_target.write_sidecars(gen, &raw_sidecar_entries) {
             eprintln!("[store] sidecar persist failed for gen {gen}: {e}");
+        }
+
+        // Step 5c: Build FTI sidecar files for any full-text indexes.
+        for (index_name, col_pos) in &self.fulltext_indexes {
+            let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
+            for partition in &partitions {
+                let pk_bytes = partition.key.key.as_bytes().to_vec();
+                // Extract the text value from the target column.
+                let mut text = String::new();
+                for row in &partition.rows {
+                    for (col_idx, cell) in &row.cells {
+                        if *col_idx as usize == *col_pos {
+                            if let Some(ref val) = cell.value {
+                                if let Ok(s) = std::str::from_utf8(val) {
+                                    text.push_str(s);
+                                    text.push(' ');
+                                }
+                            }
+                        }
+                    }
+                }
+                if !text.is_empty() {
+                    fti_builder.add_document(pk_bytes, text.trim());
+                }
+            }
+            match fti_builder.finish() {
+                Ok(fti_bytes) => {
+                    if let Err(e) = self
+                        .flush_target
+                        .write_fti_sidecar(gen, index_name, &fti_bytes)
+                    {
+                        eprintln!(
+                            "[store] FTI sidecar write failed for {index_name} gen {gen}: {e}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[store] FTI build failed for {index_name} gen {gen}: {e}");
+                }
+            }
         }
 
         // Step 6: Prepend new SSTable and sidecar, clear flushing.
@@ -586,6 +631,18 @@ impl<F: FlushTarget> TableStore<F> {
     /// Returns the current secondary index declarations.
     pub fn indexed_columns(&self) -> &[(String, usize)] {
         &self.indexed_columns
+    }
+
+    /// Returns the current full-text index declarations.
+    pub fn fulltext_indexes(&self) -> &[(String, usize)] {
+        &self.fulltext_indexes
+    }
+
+    /// Register a full-text index for this table.
+    pub fn add_fulltext_index(&mut self, index_name: String, column_position: usize) {
+        if !self.fulltext_indexes.iter().any(|(n, _)| n == &index_name) {
+            self.fulltext_indexes.push((index_name, column_position));
+        }
     }
 
     /// Returns the generation number of the most recently flushed SSTable.

@@ -1,6 +1,6 @@
 # Data Flow
 
-> Last updated: 2026-03-22
+> Last updated: 2026-03-30
 > Status: Approved
 
 ## Overview
@@ -37,8 +37,21 @@ sequenceDiagram
 
     Note over R1,S3: Later: memtable flush
     R1->>R1: Flush memtable → SSTable (local)
-    R1-->>S3: Async: upload SSTable (priority queue)
+    R1->>R1: Build FTI sidecars (per registered FullText index)
+    alt pin_config.is_pinned()
+        R1->>R1: Pin SSTable in LocalCache (skip S3)
+    else not pinned
+        R1-->>S3: Async: upload SSTable (priority queue)
+    end
 ```
+
+### NVMe Pinning
+
+When `pin_config.is_pinned()` returns true for a table, flushed SSTables remain on local NVMe and are **not** uploaded to S3. The SSTable ID is added to the `LocalCache` pinned set. This is used for tables whose working set should never leave local storage (e.g., high-churn ephemeral data, node-local system tables).
+
+### FTI Sidecar Building
+
+After an SSTable is written during flush, for each registered FullText index on the table, a `FullTextIndexBuilder` processes the flushed partitions and writes a sidecar file named `{generation}-FTI-{index_name}.db` alongside the SSTable. These sidecars follow the same locality rules as the parent SSTable (pinned or uploaded to S3).
 
 ## Read Path
 
@@ -266,20 +279,36 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> Memtable: Client write
     Memtable --> LocalSSTable: Flush threshold
-    LocalSSTable --> S3SSTable: Async upload
-    S3SSTable --> Active: Manifest updated
+    LocalSSTable --> PinCheck: pin_mode?
+
+    state PinCheck <<choice>>
+    PinCheck --> PinnedLocal: NVMe pinned
+    PinCheck --> S3SSTable: Not pinned
+
+    PinnedLocal --> Active: Pin in LocalCache (skip S3)
+    S3SSTable --> Active: Async upload + manifest updated
 
     state "Compaction" as Compact {
         Active --> Reading: Compaction selects inputs
-        Reading --> Merging: Read input SSTables
+        Reading --> Merging: Read input SSTables + merge FTI sidecars
         Merging --> NewSSTable: Write merged output
-        NewSSTable --> Uploaded: Upload to S3
+        NewSSTable --> CompactPinCheck: pin_mode?
+        state CompactPinCheck <<choice>>
+        CompactPinCheck --> PinnedOutput: NVMe pinned
+        CompactPinCheck --> Uploaded: Not pinned → upload to S3
+        PinnedOutput --> CompactDone: Pin in LocalCache (skip S3)
+        Uploaded --> CompactDone: Upload complete
     }
 
-    Uploaded --> Active: New manifest written
+    CompactDone --> Active: New manifest written
     Active --> GracePeriod: Superseded by compaction
     GracePeriod --> Deleted: Grace period expires (1hr)
 ```
+
+### Compaction: NVMe Pinning and FTI Sidecar Merging
+
+- **Pinned tables**: When compaction produces output for a pinned table, the compacted SSTable stays on local NVMe and S3 upload is skipped, matching flush-path behavior.
+- **FTI sidecar merging**: FTI sidecars from the input SSTables are merged during compaction. The compaction output includes a new `{generation}-FTI-{index_name}.db` sidecar built from the merged index entries.
 
 ### Manifest
 

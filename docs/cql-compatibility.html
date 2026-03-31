@@ -543,6 +543,62 @@
   </table>
   <p>Supports up to 4,096 dimensions (f32) or 8,192 dimensions (f16 half-precision).</p>
 
+  <h3>Full-text search indexes</h3>
+  <p>Ferrosa includes built-in full-text search with inverted index sidecars and BM25 ranked retrieval. No external search engine required.</p>
+
+  <pre><span class="cm">-- Create a full-text index on a text column</span>
+<span class="kw">CREATE INDEX</span> idx_body <span class="kw">ON</span> <span class="type">articles</span> (body)
+  <span class="kw">USING</span> <span class="str">'fulltext'</span>;
+
+<span class="cm">-- Query with fts_match() — boolean operators, phrase, prefix</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="type">articles</span>
+  <span class="kw">WHERE</span> fts_match(body, <span class="str">'distributed AND database'</span>);
+
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="type">articles</span>
+  <span class="kw">WHERE</span> fts_match(body, <span class="str">'"S3 backed storage"'</span>);
+
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="type">articles</span>
+  <span class="kw">WHERE</span> fts_match(body, <span class="str">'compac*'</span>);
+
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="type">articles</span>
+  <span class="kw">WHERE</span> fts_match(body, <span class="str">'NOT deprecated'</span>);</pre>
+
+  <table>
+    <thead><tr><th>Query syntax</th><th>Example</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>Single term</td><td><code>'rust'</code></td><td>Match documents containing the analyzed term</td></tr>
+      <tr><td>AND</td><td><code>'rust AND database'</code></td><td>Both terms must be present</td></tr>
+      <tr><td>OR</td><td><code>'rust OR go'</code></td><td>Either term must be present</td></tr>
+      <tr><td>NOT</td><td><code>'NOT deprecated'</code></td><td>Exclude documents matching the term</td></tr>
+      <tr><td>Phrase</td><td><code>'"exact phrase"'</code></td><td>All words must appear (proximity approximation)</td></tr>
+      <tr><td>Prefix</td><td><code>'compac*'</code></td><td>Wildcard prefix expansion (capped at 10K terms)</td></tr>
+    </tbody>
+  </table>
+  <p>Results are ranked by BM25 relevance score. The default analyzer lowercases, removes English stop words, and applies Porter stemming. Custom stop words can be configured via index options.</p>
+
+  <h3>NVMe table pinning</h3>
+  <p>Pin hot tables to local NVMe storage for sub-millisecond reads, bypassing S3 entirely:</p>
+
+  <pre><span class="cm">-- Create a pinned table</span>
+<span class="kw">CREATE TABLE</span> <span class="type">session_cache</span> (
+  session_id <span class="type">uuid</span> <span class="kw">PRIMARY KEY</span>,
+  user_id <span class="type">uuid</span>,
+  data <span class="type">blob</span>
+) <span class="kw">WITH</span> extensions = {<span class="str">'storage.pin'</span>: <span class="str">'nvme'</span>};
+
+<span class="cm">-- Pin with size cap (evict oldest beyond 10 GB)</span>
+<span class="kw">CREATE TABLE</span> <span class="type">hot_lookups</span> (
+  key <span class="type">text</span> <span class="kw">PRIMARY KEY</span>,
+  value <span class="type">blob</span>
+) <span class="kw">WITH</span> extensions = {<span class="str">'storage.pin'</span>: <span class="str">'nvme'</span>,
+  <span class="str">'storage.pin_max_bytes'</span>: <span class="str">'10737418240'</span>};
+
+<span class="cm">-- Toggle pin on a live table</span>
+<span class="kw">ALTER TABLE</span> <span class="type">session_cache</span>
+  <span class="kw">WITH</span> extensions = {<span class="str">'storage.pin'</span>: <span class="str">'none'</span>};</pre>
+
+  <p>Pinned tables trade durability for latency — data is lost on node replacement unless replicated. Commit log still provides crash recovery within a single node.</p>
+
   <h3>Phonetic algorithms</h3>
   <table>
     <thead><tr><th>Algorithm</th><th>Value</th><th>Best for</th></tr></thead>

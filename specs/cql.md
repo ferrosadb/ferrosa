@@ -1,6 +1,6 @@
 # CQL Protocol Specification
 
-> Last updated: 2026-03-22 (vector type, LWT, counters, protocol v4 compat, Accord transactions, pagination)
+> Last updated: 2026-03-30 (vector type, LWT, counters, protocol v4 compat, Accord transactions, pagination, fts_match)
 > Status: Approved
 
 ## Overview
@@ -180,7 +180,7 @@ Input: &str → Lexer (Token stream) → Parser (AST) → Statement enum
 ```sql
 -- CREATE INDEX with pluggable type
 CREATE INDEX [IF NOT EXISTS] [index_name] ON [keyspace.]table (column [, column ...])
-    [USING 'btree' | 'hash' | 'composite' | 'phonetic' | 'vector']
+    [USING 'btree' | 'hash' | 'composite' | 'phonetic' | 'vector' | 'fulltext']
     [WITH OPTIONS = {'key': 'value', ...}];
 
 -- DROP INDEX
@@ -234,6 +234,31 @@ Enables full-table scan with post-filter evaluation of WHERE predicates. When a 
 | `min(column)` | Aggregate: minimum value |
 | `max(column)` | Aggregate: maximum value |
 | `sum(column)` | Aggregate: sum |
+| `fts_match(column, query)` | Full-text search predicate with BM25 ranking (see below) |
+
+### Full-Text Search (`fts_match`)
+
+```sql
+-- Single term
+SELECT * FROM articles WHERE fts_match(body, 'distributed');
+
+-- Boolean AND/OR
+SELECT * FROM articles WHERE fts_match(body, 'rust AND cassandra');
+
+-- Phrase
+SELECT * FROM articles WHERE fts_match(body, '"S3 backed storage"');
+
+-- Prefix wildcard
+SELECT * FROM articles WHERE fts_match(body, 'compac*');
+
+-- NOT
+SELECT * FROM articles WHERE fts_match(body, 'NOT deprecated');
+
+-- Combined with regular WHERE
+SELECT * FROM articles WHERE category = 'tech' AND fts_match(body, 'distributed') ALLOW FILTERING;
+```
+
+Requires a `CREATE INDEX ... USING 'fulltext'` on the target column. Results ranked by BM25 score.
 
 **Lightweight Transactions (LWT):**
 

@@ -184,6 +184,20 @@ pub trait FlushTarget {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Write a full-text index (FTI) sidecar file alongside the SSTable.
+    ///
+    /// Writes `{gen}-FTI-{index_name}.db` to the SSTable directory.
+    /// The default implementation is a no-op (in-memory targets do not
+    /// persist FTI sidecar files).
+    fn write_fti_sidecar(
+        &self,
+        _generation: u64,
+        _index_name: &str,
+        _fti_bytes: &[u8],
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// In-memory flush target for testing — wraps output as `SSTableComponents<Vec<u8>>`.
@@ -362,6 +376,14 @@ impl FlushTarget for FileFlushTarget {
                 eprintln!("[flush] failed to write sidecar {}: {e}", path.display());
             }
         }
+        Ok(())
+    }
+
+    fn write_fti_sidecar(&self, generation: u64, index_name: &str, fti_bytes: &[u8]) -> Result<()> {
+        let path = self
+            .base_dir
+            .join(format!("{generation}-FTI-{index_name}.db"));
+        std::fs::write(&path, fti_bytes)?;
         Ok(())
     }
 }

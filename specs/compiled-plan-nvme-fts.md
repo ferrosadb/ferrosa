@@ -1,6 +1,8 @@
 # Compiled Project Plan: NVMe Table Pinning + Full-Text Indexing
 
 **Generated:** 2026-03-29
+**Updated:** 2026-03-30
+**Status:** Complete — all NV1/FT1/FT2 tasks implemented and tests passing
 **Source specs:** specs/nvme-pinning-architecture.md, specs/fulltext-index-architecture.md, specs/project-plan-nvme-fts.md
 **Total tasks:** 26
 **Estimated parallel batches:** 6

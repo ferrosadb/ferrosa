@@ -1,6 +1,6 @@
 # Storage Engine
 
-> Last updated: 2026-03-22 (read_range SSTable merge, DELETE tombstones, commit log oversized entries)
+> Last updated: 2026-03-30 (NVMe table pinning, FTI sidecar integration, observability metrics)
 > Status: Approved
 
 ## Overview
@@ -402,6 +402,43 @@ pub struct LocalCache {
 - **Pinned entries** (referenced by current manifest) are never evicted
 - `register()` on download, `touch()` on read hit, `evict_if_needed()` after registration
 
+### NVMe Table Pinning
+
+Tables can be pinned to local NVMe storage, bypassing S3 entirely. This is configured via table extensions in the schema and managed by `ferrosa-storage/src/pin_config.rs`.
+
+**PinConfig from table extensions:**
+
+```sql
+ALTER TABLE ks.hot_table WITH extensions = {
+  'storage.pin': 'nvme',
+  'storage.pin_max_bytes': '10737418240'
+};
+```
+
+**PinMode enum:**
+
+```rust
+pub enum PinMode {
+    None,   // default — flush writes to local disk + S3 upload
+    NvMe,   // skip S3, pin SSTable in LocalCache pinned set
+}
+```
+
+**Behavior:**
+
+- When `PinMode::NvMe` is active for a table, `flush()` writes the SSTable to local disk but **skips the S3 upload submission**
+- SSTable IDs are added to the `LocalCache` pinned set, preventing LRU eviction
+- `max_bytes` enforcement: when pinned bytes for a table exceed `pin_max_bytes`, the oldest pinned SSTables are evicted from the pinned set (and become eligible for normal LRU eviction)
+
+**ALTER TABLE transitions:**
+
+- **pin → unpin**: Existing local SSTables are enqueued for S3 upload via `UploadManager`. Normal S3 lifecycle resumes.
+- **unpin → pin**: Pending S3 uploads for the table are cancelled. Existing S3 copies are retained but no new uploads are submitted.
+
+**Compaction:**
+
+`poll_compactions()` checks pinning state per table — compaction output SSTables for pinned tables skip S3 upload, matching the flush behavior.
+
 ### StorageEngine (Part C)
 
 ```rust
@@ -455,6 +492,24 @@ The `UploadTask` enum includes an `IndexFiles` variant so that index companion f
 **SecondaryIndexesVirtualTable:**
 
 Implements `VirtualTable` for `system_views.secondary_indexes`, exposing per-index operational metrics: index name, table, type, state (current/building/stale/failed), entry count, size bytes, build duration, and last build timestamp.
+
+### Full-Text Index Sidecars
+
+Full-text indexes are built as sidecar files alongside SSTable components during flush and merged during compaction.
+
+**Flush path** (integrated in `store.rs`):
+
+1. After SSTable output is written, `FullTextIndexBuilder` processes the flushed memtable partitions for each registered `FullText` index on the table
+2. Produces a sidecar file named `{gen}-FTI-{index_name}.db` alongside the SSTable component files
+3. Written via `FlushTarget::write_fti_sidecar()` — both `InMemoryFlushTarget` and `FileFlushTarget` implement this method
+
+**Compaction merge:**
+
+During compaction, FTI sidecars from input SSTables are merged via `ferrosa_index::fulltext::merge::merge_fti()`. The merged sidecar is written alongside the compaction output SSTable. Input sidecars are deleted with their parent SSTables after the grace period.
+
+**S3 lifecycle:**
+
+FTI sidecar files are uploaded to S3 as part of the SSTable component set (`UploadTask::IndexFiles`). They follow the same integrity, retry, and manifest tracking semantics as other SSTable components.
 
 ## Data Flow
 
@@ -690,6 +745,24 @@ pub struct StorageStats {
 | `s3_object_count` | `int` | `Manifest::sstables` entry count |
 | `s3_bytes` | `bigint` | `ManifestEntry::size` sum |
 | `pending_compactions` | `int` | `CompactionExecutor` queue depth |
+
+## Observability
+
+### Pin Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `ferrosa_storage_pinned_tables` | Gauge | Number of tables with `PinMode::NvMe` active |
+| `ferrosa_storage_pinned_bytes` | Gauge | Total bytes held in pinned SSTables across all tables |
+| `ferrosa_storage_pin_evictions_total` | Counter | Cumulative count of SSTables evicted from pinned set due to `pin_max_bytes` enforcement |
+
+### Compaction Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `ferrosa_compaction_s3_uploads_total` | Counter | SSTable components uploaded to S3 after compaction |
+| `ferrosa_compaction_s3_deletes_total` | Counter | Superseded SSTable components deleted from S3 after grace period |
+| `ferrosa_compaction_input_bytes_reclaimed` | Counter | Total bytes reclaimed by compaction (sum of input SSTable sizes minus output) |
 
 ## Follow-on Work
 

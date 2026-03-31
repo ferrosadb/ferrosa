@@ -1,36 +1,32 @@
 # Ferrosa Development Status
 
-> Last updated: 2026-03-23
+> Last updated: 2026-03-30
 > Status: Living document
 
 ## Overview
 
-Ferrosa is a **distributed CQL-compatible database** with graph
-query support, built-in observability, Accord consensus transactions, and S3-backed
-storage. The production cluster sprint is complete with Raft consensus, coordinated
-reads/writes, hinted handoff, node lifecycle (join/decommission/rebalance),
-reconnection, and integration tests. **Accord transactions** are fully implemented
-across 7 sprints (A1-A7): core consensus protocol (PreAccept/Accept/Commit/Execute),
-AccordStateMachine, AccordCoordinator (fast/slow path), LWT (INSERT IF NOT EXISTS, IF
-conditions on UPDATE/DELETE), BEGIN TRANSACTION/COMMIT/ROLLBACK, cross-shard conflict
-detection, Jepsen-style linearizability testing, electorate reconfiguration, crash
-recovery with `.accord` sidecar files, DurabilityService/ExclusiveSyncPoint, and 9
-observability metrics. UDT/UDF with WASM sandboxing is complete and integrated with
-Accord. Secondary and vector indexes are consolidated with a full query planner
-pipeline (MemtableIndex, sidecar files, EXPLAIN, IndexIntersection,
-VectorMemtableIndex). Point-in-time recovery is fully implemented: commit log archiving
-to S3, snapshot management, point-in-time restoration with timestamp filtering, CLI
-tooling, and web console integration with Backup & Restore dashboard. The graph engine
-is fully complete.
+Ferrosa is a **distributed CQL-compatible database** with graph query support,
+built-in observability, Accord consensus transactions, and S3-backed storage.
+
+**Completed milestones (2026-03-30):**
+
+- **Accord transactions** — 7 sprints (A1-A7) complete: PreAccept/Accept/Commit/Execute, LWT, BEGIN TRANSACTION, cross-shard conflict detection, crash recovery, electorate reconfiguration, 2,808+ tests
+- **Correctness sprints** — C1-C7 complete: BUG-021-026 fixed, P0 storage hazards closed, Jepsen infrastructure wired, SSTable Cassandra compat validated, Accord failure mode coverage, compaction S3 lifecycle complete. C4 (live Jepsen runs) and C8 (all-drivers compat) remain.
+- **NVMe table pinning** — Per-table `storage.pin = nvme` attribute: skip S3 upload, pin in local cache, max_bytes enforcement, ALTER TABLE pin/unpin transitions, Prometheus metrics
+- **Full-text indexing** — Inverted index pipeline: StandardAnalyzer (lowercase + stop words + Porter stemmer), FTI sidecar files built on flush, BM25 ranked search, AND/OR/NOT/Prefix queries, CQL `fts_match()` function, compaction merge
+- **Secondary + vector indexes** — BTree, Hash, Composite, Phonetic, Filtered, Vector (HNSW, IVFFlat), FullText — 11 index types with query planner integration
+- **PITR** — S3-native: commit log archiving, snapshot management, point-in-time restoration, CLI tooling
+- **Graph engine** — Complete: eval, aggregations, var-length paths, SUBSCRIBE, Bolt v5
 
 | Metric | Value |
 |--------|-------|
-| Crates | 12 (11 core + ferrosa-udf) |
-| Source files | ~300+ |
-| Source LOC | ~130,000+ |
-| Test functions | ~2,900+ |
-| Integration test files | 35+ |
+| Crates | 13 (12 core + ferrosa-jepsen) |
+| Source files | ~320+ |
+| Source LOC | ~140,000+ |
+| Test functions | ~3,100+ |
+| Integration test files | 40+ |
 | CQL parser coverage | 81.8% (707/864 Cassandra doc examples) |
+| Index types | 11 (BTree, Hash, Composite, Phonetic, Filtered, Vector HNSW/IVFFlat, FullText) |
 | SSTable fuzz cases | 9 property-based tests (1000+ inputs each) |
 
 ## Maturity Assessment
@@ -39,9 +35,9 @@ is fully complete.
                Spec'd   Coded   Tested   Prod-ready
 common         ██████   ██████  ██████   ████░░
 sstable        ██████   ██████  ██████   ████░░
-storage        ██████   ██████  █████▌   ████░░
+storage        ██████   ██████  ██████   ████░░
 schema         █████░   █████▌  █████░   ███░░░
-index          █████░   ██████  █████░   ██░░░░
+index+fts      ██████   ██████  ██████   ███░░░
 udf            █████░   █████░  ████░░   ███░░░
 cql            ██████   ██████  ██████   ████░░
 graph          ██████   ██████  ██████   ████░░
@@ -49,6 +45,7 @@ ctl            ██████   ██████  ████░░   █
 binary         ██████   ██████  ████░░   ████░░
 net            ██████   ██████  █████░   ███░░░
 cluster+accord ██████   ██████  ██████   ████░░
+jepsen         ██████   █████░  ████░░   ██░░░░
 ```
 
 ## Crate Status
@@ -88,9 +85,9 @@ cluster+accord ██████   ██████  ██████   █
   - [ ] Native Ferrosa SSTable format (behind feature flag)
   - [ ] `sstable-dump` / `sstable-import` CLI tools (migration tooling)
 
-### ferrosa-storage — Mostly Complete (Parts A/B/C + Accord)
+### ferrosa-storage — Complete (core engine + NVMe + compaction S3 + Accord)
 
-- **LOC:** ~12,000 (38 files) | **Tests:** ~280
+- **LOC:** ~14,000 (42 files) | **Tests:** ~520
 - **Modules:** `cache`, `commitlog` (7 submodules), `compaction` (3 submodules),
   `engine`, `flush`, `index` (tracker, scheduler, virtual_table), `manifest`,
   `memtable` (2 impls), `merge`, `observer`, `store`, `subscription_observer`,
@@ -151,11 +148,12 @@ cluster+accord ██████   ██████  ██████   █
   - [ ] Role hierarchy with inheritance
   - [ ] Audit sink composition
 
-### ferrosa-index — Phase 1 Complete (PR #44)
+### ferrosa-index — Complete (11 index types)
 
-- **LOC:** ~5,800 (14 files) | **Tests:** 110
+- **LOC:** ~7,500 (22 files) | **Tests:** 145+
 - **Modules:** `btree`, `hash`, `composite`, `filtered`, `phonetic` (soundex, metaphone,
-  double_metaphone, caverphone), `vector` (hnsw, ivfflat)
+  double_metaphone, caverphone), `vector` (hnsw, ivfflat), `fulltext` (analyzer, builder,
+  reader, query, scoring, merge, stemmer)
 - **What's done:** Pluggable secondary index framework with `IndexBuilder`/`IndexReader`/`IndexFactory`
   traits. 8 index types: B-tree (range scans), hash (O(1) equality), composite
   (multi-column), filtered (partial coverage), phonetic (Soundex, Metaphone, Double Metaphone,
