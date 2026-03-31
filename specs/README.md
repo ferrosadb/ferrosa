@@ -47,6 +47,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | [Secondary Index Pipeline](secondary-index-pipeline.md) | Query integration, sidecar persistence, vector indexes | Implemented |
 | [PITR](pitr.md) | Point-in-time restoration: S3-native snapshots, commit log archiving | Implemented |
 | [Graph Gap Closure](graph-gap-closure.md) | SUBSCRIBE, aggregations, var-length paths, Bolt v5 | Complete |
+| [UCS Compaction](ucs-compaction-architecture.md) | Unified Compaction Strategy: density-based levels, fan factor, per-table DDL | New |
 | [Jepsen E2E](jepsen-e2e-test-plan.md) | Accord transaction verification: topologies, nemeses, workloads | Approved |
 
 ## Threat Models
@@ -77,6 +78,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 | Spec | Scope | Status |
 |------|-------|--------|
 | [DSM — Accord](dsm-accord.md) | Fan-in/out, propagation cost for Accord integration | Complete |
+| [DSM + TM + FMEA — UCS](ucs-compaction-analysis.md) | Compaction subsystem: 15 modules, 10 STRIDE threats, 15 FMEA modes | New |
 
 ## Project Plans
 
@@ -84,6 +86,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 
 | Plan | Scope | Status |
 |------|-------|--------|
+| [UCS Compaction](project-plan-ucs-compaction.md) | 4 sprints: metadata, UCS strategy, integration, equivalence | New |
 | [Correctness Sprints](project-plan-correctness-sprints.md) | C1-C8: bugs, storage fixes, Jepsen, SSTable compat, Accord, compaction S3, drivers | C1-C7 Complete, C4/C8 remaining |
 | [Unified Plan](project-plan-unified.md) | Ferrosa ecosystem roadmap: core DB, memory, dbaas, Temporal | Active |
 
@@ -104,6 +107,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 |------|-------|--------|
 | [Compiled — Correctness](compiled-project-plan.md) | C1-C8 tasks with dependency DAG, 31/32 complete | Near-Complete |
 | [Compiled — NVMe + FTS](compiled-plan-nvme-fts.md) | 26 tasks across 6 batches | Complete |
+| [Compiled — UCS Compaction](compiled-plan-ucs-compaction.md) | 13 work packets, 4 batches, 22 tasks | New |
 
 ## TDD Plans
 
@@ -111,6 +115,7 @@ Architecture documentation for Ferrosa, a Rust reimplementation of Apache Cassan
 |------|-------|-------|--------|
 | [TDD — C1/C2/C3/C7](tdd-plan-c1-c2-c3-c7.md) | Bug fixes, P0 storage, Jepsen infra, compaction S3 | 40 | Complete |
 | [TDD — NVMe + FTS](tdd-plan-nvme-fts.md) | NVMe pinning + full-text indexing integration | 41 | Complete |
+| [TDD — UCS Compaction](tdd-plan-ucs-compaction.md) | Unified Compaction Strategy: density, levels, fan factor | 22 | New |
 
 ## Test Specs (Accord)
 

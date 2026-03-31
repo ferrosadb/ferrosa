@@ -232,6 +232,12 @@ impl TableMetadata {
             })
             .collect();
 
+        // Merge table extensions with compaction params (prefixed with "compaction.")
+        let mut extensions = self.extensions.clone();
+        for (k, v) in &self.params.compaction {
+            extensions.insert(format!("compaction.{k}"), v.clone());
+        }
+
         TableSchema {
             keyspace: self.keyspace.clone(),
             table: self.name.clone(),
@@ -239,7 +245,7 @@ impl TableMetadata {
             clustering_columns,
             static_columns,
             regular_columns,
-            extensions: Default::default(),
+            extensions,
         }
     }
 }
