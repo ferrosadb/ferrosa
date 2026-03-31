@@ -1,6 +1,6 @@
 //! Dump an SSTable to human-readable output.
 //!
-//! Usage: ferrosa-sstable-dump <path-to-data-component>
+//! Usage: `ferrosa-sstable-dump <path-to-data-component>`
 
 use std::path::Path;
 

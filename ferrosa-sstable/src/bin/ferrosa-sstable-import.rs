@@ -1,6 +1,6 @@
 //! Import data from a Cassandra SSTable into Ferrosa storage.
 //!
-//! Usage: ferrosa-sstable-import <path-to-sstable-dir> <target-data-dir>
+//! Usage: `ferrosa-sstable-import <path-to-sstable-dir> <target-data-dir>`
 
 use std::path::Path;
 
