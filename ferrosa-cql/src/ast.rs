@@ -163,6 +163,7 @@ pub enum ComparisonOp {
     Ne,
     Contains,
     ContainsKey,
+    SoundsLike,
 }
 
 #[derive(Debug, Clone, PartialEq)]

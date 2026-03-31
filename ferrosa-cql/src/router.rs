@@ -4133,6 +4133,13 @@ fn evaluate_where_predicates(
         if wc.token_fn {
             continue;
         }
+        // Skip fts_match() predicates — full-text search is handled by
+        // the FTI lookup path, not by post-filter row evaluation.
+        // term_to_cql_value cannot convert FunctionCall terms, so leaving
+        // these in causes every row to be silently rejected.
+        if is_fts_match_term(&wc.value) {
+            continue;
+        }
         let col_idx = match all_col_names.iter().position(|n| n == &wc.column) {
             Some(i) => i,
             None => return false,
@@ -4250,6 +4257,10 @@ fn evaluate_where_predicates(
             ComparisonOp::Lt => *actual < expected,
             ComparisonOp::Ge => *actual >= expected,
             ComparisonOp::Le => *actual <= expected,
+            ComparisonOp::SoundsLike => match (actual, &expected) {
+                (CqlValue::Text(a), CqlValue::Text(b)) => phonetic_match(a, b),
+                _ => false,
+            },
             ComparisonOp::In => unreachable!("IN handled above"),
             ComparisonOp::Contains | ComparisonOp::ContainsKey => {
                 unreachable!("CONTAINS/CONTAINS KEY handled above")
@@ -8259,6 +8270,188 @@ mod tests {
         );
     }
 
+    // ── ALLOW FILTERING returns correct filtered rows ────────────────
+    //
+    // Regression test: ALLOW FILTERING must actually filter rows and
+    // return only matching data, not just succeed without error.
+
+    #[tokio::test]
+    async fn allow_filtering_returns_correct_rows() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Setup: table with PK = id, non-indexed column = category
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE afr WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE afr.items (id int PRIMARY KEY, category text, score int)",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert 5 rows: 3 with category='tech', 2 with category='art'
+        for (id, cat, score) in [
+            (1, "tech", 10),
+            (2, "art", 20),
+            (3, "tech", 30),
+            (4, "art", 40),
+            (5, "tech", 50),
+        ] {
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO afr.items (id, category, score) VALUES ({id}, '{cat}', {score})"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // SELECT all rows (no filter) — should return 5
+        let stmt = crate::parser::parse("SELECT * FROM afr.items").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let all_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(all_count, 5, "should have 5 total rows");
+
+        // SELECT with ALLOW FILTERING on category='tech' — should return 3
+        let stmt =
+            crate::parser::parse("SELECT * FROM afr.items WHERE category = 'tech' ALLOW FILTERING")
+                .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let tech_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            tech_count, 3,
+            "ALLOW FILTERING on category='tech' should return 3 rows, got {tech_count}"
+        );
+
+        // SELECT with ALLOW FILTERING on score > 25 — should return 3
+        let stmt = crate::parser::parse("SELECT * FROM afr.items WHERE score > 25 ALLOW FILTERING")
+            .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let gt_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            gt_count, 3,
+            "ALLOW FILTERING on score > 25 should return 3 rows, got {gt_count}"
+        );
+
+        // SELECT with ALLOW FILTERING combining two predicates — should return 2
+        let stmt = crate::parser::parse(
+            "SELECT * FROM afr.items WHERE category = 'tech' AND score > 25 ALLOW FILTERING",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let combined_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(combined_count, 2, "ALLOW FILTERING on category='tech' AND score > 25 should return 2 rows, got {combined_count}");
+    }
+
+    // ── ALLOW FILTERING with UUID composite PK + non-PK column ──────
+    //
+    // Regression test for ferrosa-memory compatibility: composite UUID
+    // partition key queries with ALLOW FILTERING must correctly filter
+    // on non-PK columns.
+
+    #[tokio::test]
+    async fn allow_filtering_uuid_composite_pk() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Schema mirrors ferrosa-memory entity_store
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE agent WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse(
+            "CREATE TABLE agent.entity_store (
+                tenant_id uuid,
+                session_id uuid,
+                entity_id uuid,
+                entity_name text,
+                entity_type text,
+                confidence float,
+                PRIMARY KEY ((tenant_id, session_id), entity_id)
+            )",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let sid = "11111111-2222-3333-4444-555555555555";
+
+        // Insert 3 entities in same partition, different types
+        for (eid, name, etype) in [
+            ("00000001-0000-0000-0000-000000000001", "Alice", "person"),
+            ("00000002-0000-0000-0000-000000000002", "Rust", "concept"),
+            ("00000003-0000-0000-0000-000000000003", "Bob", "person"),
+        ] {
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO agent.entity_store \
+                 (tenant_id, session_id, entity_id, entity_name, entity_type, confidence) \
+                 VALUES ({tid}, {sid}, {eid}, '{name}', '{etype}', 0.9)"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // PK lookup — should return all 3
+        let stmt = crate::parser::parse(&format!(
+            "SELECT * FROM agent.entity_store WHERE tenant_id = {tid} AND session_id = {sid}"
+        ))
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let pk_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            pk_count, 3,
+            "PK lookup should return 3 rows, got {pk_count}"
+        );
+
+        // PK + filter on entity_type = 'person' — should return 2
+        let stmt = crate::parser::parse(&format!(
+            "SELECT * FROM agent.entity_store \
+             WHERE tenant_id = {tid} AND session_id = {sid} AND entity_type = 'person' \
+             ALLOW FILTERING"
+        ))
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let filtered_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            filtered_count, 2,
+            "ALLOW FILTERING on entity_type='person' should return 2 rows, got {filtered_count}"
+        );
+    }
+
     // ── ALLOW FILTERING rejection: exact Cassandra semantics ─────────
     //
     // Cassandra requires ALLOW FILTERING when ANY WHERE column is not
@@ -9698,5 +9891,401 @@ mod tests {
             "fts_match for 'scripting' must return exactly 1 row"
         );
         assert_eq!(results3[0], b"row3".to_vec());
+    }
+
+    // ── fts_match post-filter bug: FunctionCall in WHERE rejects all rows ──
+
+    /// Regression test: evaluate_where_predicates must skip fts_match()
+    /// WHERE clauses. term_to_cql_value cannot convert Term::FunctionCall
+    /// → Err → return false → every row rejected → 0 results.
+    #[tokio::test]
+    async fn evaluate_where_predicates_skips_fts_match_clauses() {
+        use crate::ast::{ComparisonOp, Term, WhereClause};
+        use ferrosa_common::cql_type::CqlValue;
+
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Create table via router (sets up schema properly)
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE fts_ks WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE fts_ks.articles (id text PRIMARY KEY, body text)")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let snap = state.schema.snapshot();
+        let table_meta = snap
+            .tables
+            .get(&("fts_ks".to_string(), "articles".to_string()))
+            .unwrap();
+
+        // A row: id='row1', body='rust programming language'
+        let row: Vec<Option<CqlValue>> = vec![
+            Some(CqlValue::Text("row1".to_string())),
+            Some(CqlValue::Text("rust programming language".to_string())),
+        ];
+        let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+
+        // WHERE clause with fts_match: body = fts_match('programming')
+        let fts_clause = WhereClause {
+            column: "body".to_string(),
+            op: ComparisonOp::Eq,
+            value: Term::FunctionCall {
+                keyspace: None,
+                name: "fts_match".to_string(),
+                args: vec![Term::StringLiteral("programming".to_string())],
+            },
+            token_fn: false,
+        };
+
+        // BUG: with only the fts_match clause, evaluate_where_predicates
+        // should return true (skip the fts_match clause), but currently
+        // returns false because term_to_cql_value can't convert FunctionCall.
+        let result = evaluate_where_predicates(
+            &row,
+            std::slice::from_ref(&fts_clause),
+            &all_col_names,
+            table_meta,
+            "fts_ks",
+            &state.schema,
+        );
+        assert!(
+            result,
+            "evaluate_where_predicates must skip fts_match() clauses; \
+             got false — FunctionCall term caused silent rejection"
+        );
+
+        // Also test: fts_match clause + a normal PK clause that matches
+        let pk_clause = WhereClause {
+            column: "id".to_string(),
+            op: ComparisonOp::Eq,
+            value: Term::StringLiteral("row1".to_string()),
+            token_fn: false,
+        };
+        let result2 = evaluate_where_predicates(
+            &row,
+            &[fts_clause, pk_clause],
+            &all_col_names,
+            table_meta,
+            "fts_ks",
+            &state.schema,
+        );
+        assert!(
+            result2,
+            "evaluate_where_predicates with fts_match + matching PK clause \
+             should return true"
+        );
+    }
+
+    // ── ferrosa_bugs: COUNT(*) column name ──────────────────────────────
+
+    /// COUNT(*) result column must be named "count" so drivers can access
+    /// it by name (r_by_name("count")). Cassandra returns "count" for
+    /// unaliased COUNT(*) queries.
+    #[tokio::test]
+    async fn count_star_column_named_count() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE cnt WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE cnt.t (id int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert 3 rows
+        for i in 1..=3 {
+            let stmt =
+                crate::parser::parse(&format!("INSERT INTO cnt.t (id, v) VALUES ({i}, 'val{i}')"))
+                    .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        let stmt = crate::parser::parse("SELECT COUNT(*) FROM cnt.t").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let (names, count) = match &result {
+            RouteResult::Result(b) => {
+                let names = extract_column_names(b);
+                let cnt = extract_row_count(b);
+                (names, cnt)
+            }
+            _ => panic!("expected Result"),
+        };
+
+        assert_eq!(
+            names,
+            vec!["count"],
+            "COUNT(*) column must be named 'count', got {names:?}"
+        );
+        assert_eq!(count, 1, "COUNT(*) should return exactly 1 row");
+    }
+
+    // ── ferrosa_bugs: phonetic match ────────────────────────────────────
+
+    /// With a phonetic index on a text column, WHERE col = 'Jon Smyth'
+    /// should match rows containing 'John Smith' via Double Metaphone.
+    #[tokio::test]
+    async fn phonetic_index_matches_similar_sounding_names() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE phon WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE phon.people (id int PRIMARY KEY, name text)")
+            .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Create phonetic index
+        let stmt =
+            crate::parser::parse("CREATE INDEX phon_name ON phon.people (name) USING 'phonetic'")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert 'John Smith'
+        let stmt =
+            crate::parser::parse("INSERT INTO phon.people (id, name) VALUES (1, 'John Smith')")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Query with phonetically similar 'Jon Smyth' — should match
+        let stmt = crate::parser::parse(
+            "SELECT * FROM phon.people WHERE id = 1 AND name = 'Jon Smyth' ALLOW FILTERING",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            count, 1,
+            "phonetic index should match 'Jon Smyth' to 'John Smith'"
+        );
+    }
+
+    // ── ferrosa_bugs: secondary index returns all matching rows ─────────
+
+    /// Secondary index queries must return ALL matching rows, not a
+    /// partial subset. When the memtable index has data, those results
+    /// should be correct and complete for in-memory data.
+    #[tokio::test]
+    async fn secondary_index_returns_all_matching_rows() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE sidx WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE sidx.items (id int PRIMARY KEY, category text)")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE INDEX sidx_cat ON sidx.items (category)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert 20 rows: 15 with category='a', 5 with category='b'
+        for i in 1..=20 {
+            let cat = if i <= 15 { "a" } else { "b" };
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO sidx.items (id, category) VALUES ({i}, '{cat}')"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // Full scan baseline
+        let stmt = crate::parser::parse("SELECT * FROM sidx.items").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let total = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(total, 20, "should have 20 total rows");
+
+        // Secondary index query for category='a' — must return 15
+        let stmt = crate::parser::parse("SELECT * FROM sidx.items WHERE category = 'a'").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let idx_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            idx_count, 15,
+            "secondary index query for category='a' should return 15 rows, got {idx_count}"
+        );
+
+        // Secondary index query for category='b' — must return 5
+        let stmt = crate::parser::parse("SELECT * FROM sidx.items WHERE category = 'b'").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let b_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            b_count, 5,
+            "secondary index query for category='b' should return 5 rows, got {b_count}"
+        );
+    }
+
+    // ── BUG-007: SOUNDS LIKE syntax parses ──────────────────────────────
+
+    /// SELECT ... WHERE col SOUNDS LIKE 'value' must parse without error.
+    #[test]
+    fn sounds_like_syntax_parses() {
+        let result = crate::parser::parse("SELECT * FROM ks.t WHERE name SOUNDS LIKE 'Smith'");
+        assert!(
+            result.is_ok(),
+            "SOUNDS LIKE syntax should parse, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// SOUNDS LIKE must execute correctly: find phonetically similar matches.
+    #[tokio::test]
+    async fn sounds_like_finds_phonetic_matches() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE sl WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE sl.t (id int PRIMARY KEY, name text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("INSERT INTO sl.t (id, name) VALUES (1, 'John Smith')").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("INSERT INTO sl.t (id, name) VALUES (2, 'Jane Doe')").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // SOUNDS LIKE should find 'John Smith' when querying 'Jon Smyth'
+        let stmt = crate::parser::parse(
+            "SELECT * FROM sl.t WHERE name SOUNDS LIKE 'Jon Smyth' ALLOW FILTERING",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            count, 1,
+            "SOUNDS LIKE 'Jon Smyth' should match 'John Smith' (1 row), got {count}"
+        );
+    }
+
+    // ── BUG-008: Logged batch atomicity ─────────────────────────────────
+
+    /// A logged batch where one statement targets a non-existent table
+    /// should not leave earlier statements committed.
+    #[tokio::test]
+    async fn logged_batch_rolls_back_on_partial_failure() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE bat WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE bat.t (id int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Logged batch: first stmt writes to existing table, second to
+        // non-existent table — the batch should fail atomically.
+        let stmt = crate::parser::parse(
+            "BEGIN BATCH \
+               INSERT INTO bat.t (id, v) VALUES (1, 'should-rollback'); \
+               INSERT INTO bat.nonexistent (id) VALUES (1); \
+             APPLY BATCH",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        // Batch should fail (second statement targets non-existent table)
+        assert!(result.is_err(), "batch with bad table should fail");
+
+        // The first statement's write must NOT be visible
+        let stmt = crate::parser::parse("SELECT * FROM bat.t WHERE id = 1").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            count, 0,
+            "logged batch rollback: first statement's write should not be visible \
+             after batch failure, but found {count} rows"
+        );
     }
 }

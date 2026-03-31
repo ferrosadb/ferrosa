@@ -1089,3 +1089,404 @@ async fn system_schema_types_queryable() {
         "system_schema.types should list field 'email'"
     );
 }
+
+// ── QUERY frame with bind values (filtering bug) ────────────────────────
+//
+// Regression test for ferrosa-memory bug: QUERY frames with bind values
+// (query_with_values) must correctly substitute bind markers and return
+// matching rows. This tests the exact code path that debug_dynamic_query_
+// with_bind_values and debug_query_bind_values_vs_inline exercise.
+
+/// Encode a CQL v4 QUERY frame body WITH bind values.
+///
+/// Frame format:
+///   [int query_len][bytes query][short consistency][byte flags][short n][value*]
+/// Each value: [int len][bytes data]
+fn encode_query_body_with_values(query: &str, values: &[&[u8]]) -> Vec<u8> {
+    let query_bytes = query.as_bytes();
+    let mut body = Vec::new();
+    // [int] query string length + bytes
+    body.extend_from_slice(&(query_bytes.len() as i32).to_be_bytes());
+    body.extend_from_slice(query_bytes);
+    // [short] consistency = ONE
+    body.extend_from_slice(&1u16.to_be_bytes());
+    // [byte] flags: bit 0 = values present
+    body.push(0x01);
+    // [short] number of values
+    body.extend_from_slice(&(values.len() as u16).to_be_bytes());
+    // Each value: [int len][bytes]
+    for val in values {
+        body.extend_from_slice(&(val.len() as i32).to_be_bytes());
+        body.extend_from_slice(val);
+    }
+    body
+}
+
+/// Extract row count from a CQL RESULT Rows frame body.
+fn extract_row_count_from_result(body: &[u8]) -> i32 {
+    assert!(body.len() >= 4, "result body too short");
+    let kind = i32::from_be_bytes(body[0..4].try_into().unwrap());
+    assert_eq!(kind, 0x0002, "expected Rows result kind, got {kind:#06x}");
+    // flags at offset 4..8
+    let _flags = i32::from_be_bytes(body[4..8].try_into().unwrap());
+    let col_count = i32::from_be_bytes(body[8..12].try_into().unwrap()) as usize;
+    let mut off = 12;
+    // Skip keyspace string
+    let ks_len = u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+    off += 2 + ks_len;
+    // Skip table string
+    let tbl_len = u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+    off += 2 + tbl_len;
+    // Skip column specs
+    for _ in 0..col_count {
+        let name_len = u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + name_len;
+        let type_id = u16::from_be_bytes(body[off..off + 2].try_into().unwrap());
+        off += 2;
+        match type_id {
+            0x0020 | 0x0022 => off += 2, // List/Set: element type_id
+            0x0021 => off += 4,          // Map: key + val type_ids
+            0x0031 => {
+                let n = u16::from_be_bytes(body[off..off + 2].try_into().unwrap()) as usize;
+                off += 2 + n * 2;
+            }
+            _ => {}
+        }
+    }
+    // row_count
+    i32::from_be_bytes(body[off..off + 4].try_into().unwrap())
+}
+
+#[tokio::test]
+async fn query_with_bind_values_returns_matching_rows() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Create keyspace + table
+    let body = encode_query_body(
+        "CREATE KEYSPACE bv WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let body = encode_query_body(
+        "CREATE TABLE bv.entities (\
+         tenant_id uuid, session_id uuid, entity_id uuid, \
+         entity_name text, entity_type text, \
+         PRIMARY KEY ((tenant_id, session_id), entity_id))",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let sid = "11111111-2222-3333-4444-555555555555";
+
+    // Insert 2 rows with inline values
+    for (eid, name, etype) in [
+        ("00000001-0000-0000-0000-000000000001", "Alice", "person"),
+        ("00000002-0000-0000-0000-000000000002", "Rust", "concept"),
+    ] {
+        let body = encode_query_body(&format!(
+            "INSERT INTO bv.entities \
+             (tenant_id, session_id, entity_id, entity_name, entity_type) \
+             VALUES ({tid}, {sid}, {eid}, '{name}', '{etype}')"
+        ));
+        send_raw_frame(&mut stream, Opcode::Query, &body).await;
+        let resp = read_frame(&mut stream).await;
+        assert_result(&resp);
+    }
+
+    // Query 1: inline values (baseline) — should return 2 rows
+    let body = encode_query_body(&format!(
+        "SELECT * FROM bv.entities \
+         WHERE tenant_id = {tid} AND session_id = {sid}"
+    ));
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let inline_count = extract_row_count_from_result(&resp.body);
+    assert_eq!(inline_count, 2, "inline query should return 2 rows");
+
+    // Query 2: bind values via QUERY frame — must also return 2 rows
+    let tid_uuid = uuid::Uuid::parse_str(tid).unwrap();
+    let sid_uuid = uuid::Uuid::parse_str(sid).unwrap();
+    let body = encode_query_body_with_values(
+        "SELECT * FROM bv.entities WHERE tenant_id = ? AND session_id = ?",
+        &[tid_uuid.as_bytes(), sid_uuid.as_bytes()],
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let bind_count = extract_row_count_from_result(&resp.body);
+    assert_eq!(
+        bind_count, 2,
+        "QUERY with bind values should return 2 rows (got {bind_count}); \
+         bind values in QUERY frame may not be substituted correctly"
+    );
+}
+
+/// Encode a CQL v4 QUERY frame body with bind values AND page_size
+/// (flags = 0x05 = VALUES | PAGE_SIZE), mimicking cdrs-tokio's default behavior.
+fn encode_query_body_with_values_and_page_size(
+    query: &str,
+    values: &[&[u8]],
+    page_size: i32,
+) -> Vec<u8> {
+    let query_bytes = query.as_bytes();
+    let mut body = Vec::new();
+    body.extend_from_slice(&(query_bytes.len() as i32).to_be_bytes());
+    body.extend_from_slice(query_bytes);
+    // [short] consistency = ONE
+    body.extend_from_slice(&1u16.to_be_bytes());
+    // [byte] flags: bit 0x01 = values, bit 0x04 = page_size
+    body.push(0x05);
+    // [short] number of values
+    body.extend_from_slice(&(values.len() as u16).to_be_bytes());
+    // Each value: [int len][bytes]
+    for val in values {
+        body.extend_from_slice(&(val.len() as i32).to_be_bytes());
+        body.extend_from_slice(val);
+    }
+    // [int] page_size
+    body.extend_from_slice(&page_size.to_be_bytes());
+    body
+}
+
+#[tokio::test]
+async fn query_with_bind_values_and_page_size_flag() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Create keyspace + table
+    let body = encode_query_body(
+        "CREATE KEYSPACE bvp WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let body = encode_query_body(
+        "CREATE TABLE bvp.items (\
+         tenant_id uuid, session_id uuid, entity_id uuid, \
+         entity_name text, \
+         PRIMARY KEY ((tenant_id, session_id), entity_id))",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let sid = "11111111-2222-3333-4444-555555555555";
+
+    // Insert 3 rows
+    for (eid, name) in [
+        ("00000001-0000-0000-0000-000000000001", "Alice"),
+        ("00000002-0000-0000-0000-000000000002", "Bob"),
+        ("00000003-0000-0000-0000-000000000003", "Carol"),
+    ] {
+        let body = encode_query_body(&format!(
+            "INSERT INTO bvp.items \
+             (tenant_id, session_id, entity_id, entity_name) \
+             VALUES ({tid}, {sid}, {eid}, '{name}')"
+        ));
+        send_raw_frame(&mut stream, Opcode::Query, &body).await;
+        let resp = read_frame(&mut stream).await;
+        assert_result(&resp);
+    }
+
+    // Send QUERY with bind values AND page_size flag (0x05), like cdrs-tokio does
+    let tid_uuid = uuid::Uuid::parse_str(tid).unwrap();
+    let sid_uuid = uuid::Uuid::parse_str(sid).unwrap();
+    let body = encode_query_body_with_values_and_page_size(
+        "SELECT * FROM bvp.items WHERE tenant_id = ? AND session_id = ?",
+        &[tid_uuid.as_bytes(), sid_uuid.as_bytes()],
+        5000, // page_size
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let count = extract_row_count_from_result(&resp.body);
+    assert_eq!(
+        count, 3,
+        "QUERY with bind values + page_size flag should return 3 rows, \
+         got {count} — page_size flag may be corrupting bind value parsing"
+    );
+}
+
+/// Exact ferrosa-memory entity_store scenario: composite UUID PK,
+/// bind values in QUERY frame, specific column selection.
+#[tokio::test]
+async fn query_with_bind_values_entity_store_scenario() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Create keyspace
+    let body = encode_query_body(
+        "CREATE KEYSPACE agent_memory WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // Create entity_store with same schema as ferrosa-memory DDL
+    let body = encode_query_body(
+        "CREATE TABLE agent_memory.entity_store (\
+         tenant_id uuid, entity_id uuid, session_id uuid, \
+         entity_name text, entity_type text, source_fold_id uuid, \
+         context_snippet text, confidence float, created_at timestamp, \
+         PRIMARY KEY ((tenant_id, session_id), entity_id))",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let sid = "11111111-2222-3333-4444-555555555555";
+    let eid = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+
+    // Insert via inline (known working path)
+    let body = encode_query_body(&format!(
+        "INSERT INTO agent_memory.entity_store \
+         (tenant_id, session_id, entity_id, entity_name, entity_type, \
+          context_snippet, confidence, created_at) \
+         VALUES ({tid}, {sid}, {eid}, 'test-entity', 'concept', \
+                 'test context', 1.0, 1711036800000)"
+    ));
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // Query 1: inline values (baseline)
+    let body = encode_query_body(&format!(
+        "SELECT entity_id, entity_name, entity_type, source_fold_id, \
+         context_snippet, confidence, created_at \
+         FROM agent_memory.entity_store \
+         WHERE tenant_id = {tid} AND session_id = {sid}"
+    ));
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let inline_count = extract_row_count_from_result(&resp.body);
+    assert_eq!(inline_count, 1, "inline query should return 1 row");
+
+    // Query 2: bind values (the path ferrosa-memory uses)
+    let tid_uuid = uuid::Uuid::parse_str(tid).unwrap();
+    let sid_uuid = uuid::Uuid::parse_str(sid).unwrap();
+    let body = encode_query_body_with_values(
+        "SELECT entity_id, entity_name, entity_type, source_fold_id, \
+         context_snippet, confidence, created_at \
+         FROM agent_memory.entity_store \
+         WHERE tenant_id = ? AND session_id = ?",
+        &[tid_uuid.as_bytes(), sid_uuid.as_bytes()],
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let bind_count = extract_row_count_from_result(&resp.body);
+    assert_eq!(
+        bind_count, 1,
+        "bind value QUERY should return 1 row, got {bind_count}"
+    );
+
+    // Query 3: bind values + ALLOW FILTERING (exact query from ferrosa_bugs.rs)
+    let body = encode_query_body_with_values(
+        "SELECT entity_id, entity_name, entity_type, source_fold_id, \
+         context_snippet, confidence, created_at \
+         FROM agent_memory.entity_store \
+         WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING",
+        &[tid_uuid.as_bytes(), sid_uuid.as_bytes()],
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let af_count = extract_row_count_from_result(&resp.body);
+    assert_eq!(
+        af_count, 1,
+        "bind value QUERY with ALLOW FILTERING should return 1 row, got {af_count}"
+    );
+
+    // Query 4: bind values + page_size flag (what cdrs-tokio actually sends)
+    let body = encode_query_body_with_values_and_page_size(
+        "SELECT entity_id, entity_name, entity_type, source_fold_id, \
+         context_snippet, confidence, created_at \
+         FROM agent_memory.entity_store \
+         WHERE tenant_id = ? AND session_id = ? ALLOW FILTERING",
+        &[tid_uuid.as_bytes(), sid_uuid.as_bytes()],
+        5000,
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let paged_count = extract_row_count_from_result(&resp.body);
+    assert_eq!(
+        paged_count, 1,
+        "bind value QUERY with ALLOW FILTERING + page_size should return 1 row, \
+         got {paged_count}"
+    );
+}
+
+#[tokio::test]
+async fn query_with_bind_values_allow_filtering() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    // Create keyspace + table with PK = id, non-PK = category
+    let body = encode_query_body(
+        "CREATE KEYSPACE bvf WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let body =
+        encode_query_body("CREATE TABLE bvf.items (id int PRIMARY KEY, category text, score int)");
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    // Insert 4 rows: 2 tech, 2 art
+    for (id, cat, score) in [
+        (1, "tech", 10),
+        (2, "art", 20),
+        (3, "tech", 30),
+        (4, "art", 40),
+    ] {
+        let body = encode_query_body(&format!(
+            "INSERT INTO bvf.items (id, category, score) VALUES ({id}, '{cat}', {score})"
+        ));
+        send_raw_frame(&mut stream, Opcode::Query, &body).await;
+        let resp = read_frame(&mut stream).await;
+        assert_result(&resp);
+    }
+
+    // Query with bind values on non-PK column + ALLOW FILTERING
+    // category = 'tech' as a CQL varchar bind value
+    let category_bytes = b"tech";
+    let body = encode_query_body_with_values(
+        "SELECT * FROM bvf.items WHERE category = ? ALLOW FILTERING",
+        &[category_bytes],
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    let filtered_count = extract_row_count_from_result(&resp.body);
+    assert_eq!(
+        filtered_count, 2,
+        "ALLOW FILTERING with bind value category='tech' should return 2 rows, \
+         got {filtered_count}"
+    );
+}
