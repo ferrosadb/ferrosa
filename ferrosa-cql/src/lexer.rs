@@ -129,6 +129,8 @@ pub enum Keyword {
     Transaction,
     Commit,
     Rollback,
+    Sounds,
+    Like,
 }
 
 /// Compile-time keyword map. Case-insensitive lookup is done by
@@ -248,6 +250,8 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "TRANSACTION" => Keyword::Transaction,
     "COMMIT" => Keyword::Commit,
     "ROLLBACK" => Keyword::Rollback,
+    "SOUNDS" => Keyword::Sounds,
+    "LIKE" => Keyword::Like,
 };
 
 /// Token kind produced by the lexer.

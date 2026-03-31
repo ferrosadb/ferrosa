@@ -1714,6 +1714,11 @@ impl<'input> Parser<'input> {
                     Ok(ComparisonOp::Contains)
                 }
             }
+            TokenKind::Keyword(Keyword::Sounds) => {
+                // SOUNDS LIKE — phonetic comparison operator
+                self.lexer.expect(&TokenKind::Keyword(Keyword::Like))?;
+                Ok(ComparisonOp::SoundsLike)
+            }
             _ => Err(CqlError::SyntaxError(format!(
                 "expected comparison operator, got {:?} at position {}",
                 tok.kind, tok.pos
@@ -2264,6 +2269,8 @@ impl<'input> Parser<'input> {
             Keyword::Transaction => "transaction",
             Keyword::Commit => "commit",
             Keyword::Rollback => "rollback",
+            Keyword::Sounds => "sounds",
+            Keyword::Like => "like",
         }
         .to_string()
     }
