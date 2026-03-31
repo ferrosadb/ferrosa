@@ -13,4 +13,4 @@ pub mod strategy_ucs;
 pub use executor::{CompactionExecutor, CompactionResult};
 pub use metadata::{CompactionTask, SSTableMetadata};
 pub use strategy::{CompactionConfig, CompactionStrategy, SizeTieredStrategy};
-pub use strategy_ucs::UnifiedCompactionStrategy;
+pub use strategy_ucs::{UcsConfig, UnifiedCompactionStrategy};
