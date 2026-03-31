@@ -1662,9 +1662,7 @@ impl StorageEngine {
             // compacted output the same way flush does.
             let is_compaction_pinned = {
                 let tables = self.tables.read();
-                tables
-                    .get(table_id)
-                    .is_some_and(|s| s.pin_config.is_some())
+                tables.get(table_id).is_some_and(|s| s.pin_config.is_some())
             };
             if is_compaction_pinned {
                 let size = result.output.size_bytes;
@@ -6419,14 +6417,13 @@ mod tests {
         engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
 
         // Write 3 rows with text content in column 0.
-        for (key, text) in [("r1", "rust distributed database"), ("r2", "cassandra storage"), ("r3", "hello world")] {
+        for (key, text) in [
+            ("r1", "rust distributed database"),
+            ("r2", "cassandra storage"),
+            ("r3", "hello world"),
+        ] {
             engine
-                .write(
-                    &tid,
-                    &make_key(key),
-                    make_row(text.as_bytes(), 1000),
-                    1000,
-                )
+                .write(&tid, &make_key(key), make_row(text.as_bytes(), 1000), 1000)
                 .unwrap();
         }
         engine.flush(&tid).unwrap();
@@ -6436,11 +6433,7 @@ mod tests {
         let fti_files: Vec<_> = std::fs::read_dir(&table_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains("FTI-idx_body")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains("FTI-idx_body"))
             .collect();
         assert_eq!(
             fti_files.len(),

@@ -450,7 +450,10 @@ mod tests {
         ]);
         let hits = reader.search_str("rust*").unwrap();
         let pks: Vec<_> = hits.iter().map(|h| h.partition_key.as_slice()).collect();
-        assert!(pks.contains(&b"pk1".as_slice()), "pk1 has 'rustacean' and 'rust'");
+        assert!(
+            pks.contains(&b"pk1".as_slice()),
+            "pk1 has 'rustacean' and 'rust'"
+        );
         assert!(pks.contains(&b"pk3".as_slice()), "pk3 has 'rustic'");
         assert!(!pks.contains(&b"pk2".as_slice()), "pk2 has no rust* term");
     }
@@ -464,7 +467,10 @@ mod tests {
         ]);
         let hits = reader.search_str("NOT rust").unwrap();
         let pks: Vec<_> = hits.iter().map(|h| h.partition_key.as_slice()).collect();
-        assert!(!pks.contains(&b"pk1".as_slice()), "pk1 has 'rust' — excluded");
+        assert!(
+            !pks.contains(&b"pk1".as_slice()),
+            "pk1 has 'rust' — excluded"
+        );
         assert!(pks.contains(&b"pk2".as_slice()), "pk2 should remain");
         assert!(pks.contains(&b"pk3".as_slice()), "pk3 should remain");
     }

@@ -425,9 +425,9 @@ impl<F: FlushTarget> TableStore<F> {
             }
             match fti_builder.finish() {
                 Ok(fti_bytes) => {
-                    if let Err(e) =
-                        self.flush_target
-                            .write_fti_sidecar(gen, index_name, &fti_bytes)
+                    if let Err(e) = self
+                        .flush_target
+                        .write_fti_sidecar(gen, index_name, &fti_bytes)
                     {
                         eprintln!(
                             "[store] FTI sidecar write failed for {index_name} gen {gen}: {e}"
@@ -640,13 +640,8 @@ impl<F: FlushTarget> TableStore<F> {
 
     /// Register a full-text index for this table.
     pub fn add_fulltext_index(&mut self, index_name: String, column_position: usize) {
-        if !self
-            .fulltext_indexes
-            .iter()
-            .any(|(n, _)| n == &index_name)
-        {
-            self.fulltext_indexes
-                .push((index_name, column_position));
+        if !self.fulltext_indexes.iter().any(|(n, _)| n == &index_name) {
+            self.fulltext_indexes.push((index_name, column_position));
         }
     }
 

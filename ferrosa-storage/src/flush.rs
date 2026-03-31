@@ -379,12 +379,7 @@ impl FlushTarget for FileFlushTarget {
         Ok(())
     }
 
-    fn write_fti_sidecar(
-        &self,
-        generation: u64,
-        index_name: &str,
-        fti_bytes: &[u8],
-    ) -> Result<()> {
+    fn write_fti_sidecar(&self, generation: u64, index_name: &str, fti_bytes: &[u8]) -> Result<()> {
         let path = self
             .base_dir
             .join(format!("{generation}-FTI-{index_name}.db"));
