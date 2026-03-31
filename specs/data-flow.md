@@ -289,7 +289,7 @@ stateDiagram-v2
     S3SSTable --> Active: Async upload + manifest updated
 
     state "Compaction" as Compact {
-        Active --> Reading: Compaction selects inputs
+        Active --> Reading: Strategy selects inputs (STCS or UCS per table)
         Reading --> Merging: Read input SSTables + merge FTI sidecars
         Merging --> NewSSTable: Write merged output
         NewSSTable --> CompactPinCheck: pin_mode?

@@ -309,6 +309,14 @@ SELECT * FROM users WHERE props CONTAINS KEY 'role';
 
 Collection element filtering operators for use in WHERE clauses (requires ALLOW FILTERING or a secondary index).
 
+**SOUNDS LIKE (phonetic comparison):**
+
+```sql
+SELECT * FROM people WHERE name SOUNDS LIKE 'Jon Smyth' ALLOW FILTERING;
+```
+
+Phonetic comparison using Double Metaphone encoding. Matches words that sound similar regardless of spelling (e.g., "John Smith" matches "Jon Smyth"). Works with or without a phonetic index on the column. Requires ALLOW FILTERING when used without a phonetic index.
+
 **SELECT DISTINCT:**
 
 ```sql
