@@ -35,6 +35,7 @@ pub fn build_serialization_header(
     partitions: &[Partition],
 ) -> SerializationHeader {
     let mut min_timestamp = NO_TIMESTAMP;
+    let mut max_timestamp = i64::MIN;
     let mut min_local_deletion_time = NO_DELETION_TIME;
     let mut min_ttl = NO_TTL;
 
@@ -62,13 +63,22 @@ pub fn build_serialization_header(
         }
     }
 
-    /// Scan a row's liveness info and deletion time for min values.
+    /// Update `max_timestamp` if `ts` is a real timestamp (not sentinel).
+    #[inline]
+    fn update_max_ts(max_ts: &mut i64, ts: i64) {
+        if ts != NO_TIMESTAMP && ts > *max_ts {
+            *max_ts = ts;
+        }
+    }
+
+    /// Scan a row's liveness info and deletion time for min/max values.
     /// The SSTable writer delta-encodes these against the header minimums,
     /// so we must account for them to prevent subtraction overflow.
     #[inline]
     fn scan_row_metadata(
         row: &ferrosa_sstable::types::Row,
         min_ts: &mut i64,
+        max_ts: &mut i64,
         min_ldt: &mut i32,
         min_ttl_val: &mut i32,
     ) {
@@ -76,6 +86,7 @@ pub fn build_serialization_header(
         // are delta-encoded in the writer.
         if row.primary_key_liveness.has_timestamp() {
             update_min_ts(min_ts, row.primary_key_liveness.timestamp);
+            update_max_ts(max_ts, row.primary_key_liveness.timestamp);
         }
         if row.primary_key_liveness.has_ttl() {
             update_min_ttl(min_ttl_val, row.primary_key_liveness.ttl);
@@ -86,6 +97,7 @@ pub fn build_serialization_header(
         // are delta-encoded in the writer.
         if !row.deletion.is_live() {
             update_min_ts(min_ts, row.deletion.marked_for_delete_at);
+            update_max_ts(max_ts, row.deletion.marked_for_delete_at);
             // DeletionTime.local_deletion_time is u32; cast to i32 for comparison
             // with the header field (i32). Values > i32::MAX are sentinel-like and
             // should not lower the minimum.
@@ -103,11 +115,13 @@ pub fn build_serialization_header(
             scan_row_metadata(
                 static_row,
                 &mut min_timestamp,
+                &mut max_timestamp,
                 &mut min_local_deletion_time,
                 &mut min_ttl,
             );
             for (_, cell) in &static_row.cells {
                 update_min_ts(&mut min_timestamp, cell.timestamp);
+                update_max_ts(&mut max_timestamp, cell.timestamp);
                 update_min_ldt(&mut min_local_deletion_time, cell.local_deletion_time);
                 update_min_ttl(&mut min_ttl, cell.ttl);
             }
@@ -118,21 +132,29 @@ pub fn build_serialization_header(
             scan_row_metadata(
                 row,
                 &mut min_timestamp,
+                &mut max_timestamp,
                 &mut min_local_deletion_time,
                 &mut min_ttl,
             );
             for (_, cell) in &row.cells {
                 update_min_ts(&mut min_timestamp, cell.timestamp);
+                update_max_ts(&mut max_timestamp, cell.timestamp);
                 update_min_ldt(&mut min_local_deletion_time, cell.local_deletion_time);
                 update_min_ttl(&mut min_ttl, cell.ttl);
             }
         }
     }
 
+    // If no real timestamps were found, use sentinel value
+    if max_timestamp == i64::MIN {
+        max_timestamp = i64::MAX;
+    }
+
     SerializationHeader {
         min_timestamp,
         min_local_deletion_time,
         min_ttl,
+        max_timestamp,
         key_type: schema.key_type.clone(),
         clustering_types: schema.clustering_types(),
         static_columns: schema

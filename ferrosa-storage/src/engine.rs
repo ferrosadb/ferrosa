@@ -1987,10 +1987,7 @@ impl StorageEngine {
     ///
     /// Tables with `compaction.class` containing "Unified" or "UCS" use the
     /// Unified Compaction Strategy. All others default to STCS.
-    fn strategy_for_table(
-        &self,
-        state: &TableState,
-    ) -> Box<dyn CompactionStrategy> {
+    fn strategy_for_table(&self, state: &TableState) -> Box<dyn CompactionStrategy> {
         let extensions = &state.schema.extensions;
         let class = extensions.get("compaction.class").map(|s| s.as_str());
         match class {

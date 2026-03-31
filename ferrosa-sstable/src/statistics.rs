@@ -65,6 +65,13 @@ pub struct SerializationHeader {
     pub min_timestamp: i64,
     pub min_local_deletion_time: i32,
     pub min_ttl: i32,
+    /// Maximum cell timestamp across all partitions in this SSTable.
+    ///
+    /// Computed during flush by scanning all cell timestamps. When reading
+    /// a Cassandra-produced SSTable (which does not store this in the
+    /// serialization header), defaults to `i64::MAX` as a conservative
+    /// sentinel. Not serialized to the binary Statistics.db format.
+    pub max_timestamp: i64,
     /// CQL type of the partition key, e.g. `"org.apache.cassandra.db.marshal.UTF8Type"`.
     pub key_type: String,
     /// CQL types of the clustering columns.
@@ -338,10 +345,22 @@ pub fn read_serialization_header(data: &[u8]) -> Result<SerializationHeader> {
         regular_columns.push((name, typ));
     }
 
+    // Ferrosa extension: max_timestamp appended after standard Cassandra
+    // fields. If the data has remaining bytes, read it; otherwise fall back
+    // to the sentinel value (when reading Cassandra-produced SSTables).
+    let max_timestamp = if pos < data.len() {
+        read_uvint_u64(data, &mut pos)
+            .ok()
+            .map_or(i64::MAX, |v| v as i64 + TIMESTAMP_EPOCH)
+    } else {
+        i64::MAX
+    };
+
     Ok(SerializationHeader {
         min_timestamp,
         min_local_deletion_time,
         min_ttl,
+        max_timestamp,
         key_type,
         clustering_types,
         static_columns,
@@ -396,6 +415,15 @@ pub fn write_serialization_header(h: &SerializationHeader) -> Vec<u8> {
     for (name, typ) in &h.regular_columns {
         write_vint_prefixed_bytes(&mut out, name);
         write_vint_prefixed_string(&mut out, typ);
+    }
+
+    // Ferrosa extension: max_timestamp, appended after standard Cassandra
+    // fields so that Cassandra-produced SSTables (which lack this field)
+    // can still be read.
+    if h.max_timestamp != i64::MAX {
+        let max_ts_delta = (h.max_timestamp - TIMESTAMP_EPOCH) as u64;
+        let n = varint::write_unsigned_vint(&mut vbuf, max_ts_delta);
+        out.extend_from_slice(&vbuf[..n]);
     }
 
     out
@@ -538,6 +566,7 @@ mod tests {
             min_timestamp: 1_700_000_000_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
+            max_timestamp: i64::MAX,
             key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
             static_columns: vec![(
@@ -600,6 +629,7 @@ mod tests {
             min_timestamp: TIMESTAMP_EPOCH,
             min_local_deletion_time: DELETION_TIME_EPOCH,
             min_ttl: 0,
+            max_timestamp: i64::MAX,
             key_type: "org.apache.cassandra.db.marshal.BytesType".into(),
             clustering_types: vec![],
             static_columns: vec![],
@@ -622,6 +652,7 @@ mod tests {
             min_timestamp: TIMESTAMP_EPOCH + 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
+            max_timestamp: i64::MAX,
             key_type: "T".into(),
             clustering_types: vec![],
             static_columns: vec![],
@@ -694,6 +725,7 @@ mod tests {
                 min_timestamp: TIMESTAMP_EPOCH,
                 min_local_deletion_time: DELETION_TIME_EPOCH,
                 min_ttl: 0,
+                max_timestamp: i64::MAX,
                 key_type: "K".into(),
                 clustering_types: vec![],
                 static_columns: vec![],

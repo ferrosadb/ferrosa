@@ -12,6 +12,7 @@
 //! use ferrosa_sstable::Partition;
 //! # let header = SerializationHeader {
 //! #     min_timestamp: 0, min_local_deletion_time: i32::MAX, min_ttl: 0,
+//! #     max_timestamp: i64::MAX,
 //! #     key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
 //! #     clustering_types: vec![], static_columns: vec![], regular_columns: vec![],
 //! # };
@@ -599,6 +600,7 @@ mod tests {
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
+            max_timestamp: i64::MAX,
             key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
             static_columns: vec![],
@@ -735,6 +737,7 @@ mod tests {
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
+            max_timestamp: i64::MAX,
             key_type: "org.apache.cassandra.db.marshal.CompositeType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.UTF8Type)".into(),
             clustering_types: vec![
                 "org.apache.cassandra.db.marshal.UUIDType".into(),
@@ -872,6 +875,7 @@ mod tests {
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
+            max_timestamp: i64::MAX,
             key_type: "org.apache.cassandra.db.marshal.CompositeType(\
                        org.apache.cassandra.db.marshal.UTF8Type,\
                        org.apache.cassandra.db.marshal.UTF8Type)"
@@ -1238,6 +1242,7 @@ mod tests {
             min_timestamp: 1_000_000,
             min_local_deletion_time: 0,
             min_ttl: 0,
+            max_timestamp: i64::MAX,
             key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
             static_columns: vec![],
@@ -1291,6 +1296,7 @@ mod tests {
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
+            max_timestamp: i64::MAX,
             key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
             clustering_types: vec![], // No clustering columns
             static_columns: vec![],
@@ -1349,6 +1355,7 @@ mod tests {
             min_timestamp: 1_000_000,
             min_local_deletion_time: 0,
             min_ttl: 0,
+            max_timestamp: i64::MAX,
             key_type: "org.apache.cassandra.db.marshal.Int32Type".into(),
             clustering_types: vec![],
             static_columns: vec![],
@@ -1418,6 +1425,7 @@ mod tests {
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
+            max_timestamp: i64::MAX,
             key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
             clustering_types: vec![],
             static_columns: vec![],

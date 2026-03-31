@@ -790,14 +790,25 @@ impl<F: FlushTarget> TableStore<F> {
             .enumerate()
             .map(|(i, sst)| {
                 let header = sst.header();
+
+                // WP-001: compute size from SSTable component buffers
+                let size_bytes = sst.total_size();
+
+                // WP-002: compute tokens from the smallest/largest raw key
+                // bytes stored in the partition index. SSTables are sorted
+                // by token, so first key = min token, last key = max token.
+                use ferrosa_common::Token;
+                let min_token = Token::from_key(sst.smallest_key_bytes()).0;
+                let max_token = Token::from_key(sst.largest_key_bytes()).0;
+
                 crate::compaction::metadata::SSTableMetadata {
                     id: format!("{}", i + 1),
                     path: table_dir.to_path_buf(),
-                    size_bytes: 0, // Approximate; exact tracking is a future optimization
-                    min_token: 0,
-                    max_token: 0,
+                    size_bytes,
+                    min_token,
+                    max_token,
                     min_timestamp: header.min_timestamp,
-                    max_timestamp: i64::MAX, // SerializationHeader only has min; sentinel until full stats tracking
+                    max_timestamp: header.max_timestamp,
                     partition_count: sst.key_count(),
                 }
             })
@@ -1820,5 +1831,118 @@ mod tests {
         let pks: Vec<&[u8]> = results.iter().map(|p| p.key.key.as_bytes()).collect();
         assert!(pks.contains(&b"user1".as_slice()));
         assert!(pks.contains(&b"user2".as_slice()));
+    }
+
+    // -------------------------------------------------------------------------
+    // WP-001: sstable_metadata reports nonzero size after flush
+    // -------------------------------------------------------------------------
+    #[test]
+    fn sstable_metadata_reports_nonzero_size() {
+        let store = test_store();
+        store.write(&make_key("k1"), make_row(b"v1", 1000)).unwrap();
+        store.write(&make_key("k2"), make_row(b"v2", 2000)).unwrap();
+        store.flush().unwrap();
+
+        let table_dir = std::path::Path::new("/tmp/test_sstables");
+        let metadata = store.sstable_metadata(table_dir);
+
+        assert_eq!(metadata.len(), 1, "expected one SSTable after flush");
+        assert!(
+            metadata[0].size_bytes > 0,
+            "size_bytes must be nonzero; got {}",
+            metadata[0].size_bytes
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // WP-002: sstable_metadata reports correct token range
+    // -------------------------------------------------------------------------
+    #[test]
+    fn sstable_metadata_reports_token_range() {
+        let store = test_store();
+
+        // Write multiple partitions with distinct keys to ensure different tokens
+        store
+            .write(&make_key("alpha"), make_row(b"v1", 1000))
+            .unwrap();
+        store
+            .write(&make_key("beta"), make_row(b"v2", 2000))
+            .unwrap();
+        store
+            .write(&make_key("gamma"), make_row(b"v3", 3000))
+            .unwrap();
+        store.flush().unwrap();
+
+        let table_dir = std::path::Path::new("/tmp/test_sstables");
+        let metadata = store.sstable_metadata(table_dir);
+
+        assert_eq!(metadata.len(), 1);
+        let m = &metadata[0];
+
+        // Tokens should not both be zero (the old stub value)
+        assert!(
+            m.min_token != 0 || m.max_token != 0,
+            "at least one token must be nonzero"
+        );
+
+        // min_token <= max_token for a multi-partition SSTable stored in
+        // token order (SSTables are sorted by token)
+        assert!(
+            m.min_token <= m.max_token,
+            "min_token ({}) must be <= max_token ({})",
+            m.min_token,
+            m.max_token
+        );
+
+        // Cross-check: compute tokens directly and verify they match
+        let dk_alpha = make_key("alpha");
+        let dk_beta = make_key("beta");
+        let dk_gamma = make_key("gamma");
+        let mut tokens = [dk_alpha.token.0, dk_beta.token.0, dk_gamma.token.0];
+        tokens.sort();
+        assert_eq!(
+            m.min_token, tokens[0],
+            "min_token should match smallest token"
+        );
+        assert_eq!(
+            m.max_token,
+            tokens[tokens.len() - 1],
+            "max_token should match largest token"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // WP-003: sstable_metadata reports correct max_timestamp
+    // -------------------------------------------------------------------------
+    #[test]
+    fn sstable_metadata_reports_max_timestamp() {
+        let store = test_store();
+        store.write(&make_key("k1"), make_row(b"v1", 5000)).unwrap();
+        store.write(&make_key("k2"), make_row(b"v2", 3000)).unwrap();
+        store.write(&make_key("k3"), make_row(b"v3", 7000)).unwrap();
+        store.flush().unwrap();
+
+        let table_dir = std::path::Path::new("/tmp/test_sstables");
+        let metadata = store.sstable_metadata(table_dir);
+
+        assert_eq!(metadata.len(), 1);
+        let m = &metadata[0];
+
+        // max_timestamp should be the maximum across all written cells
+        assert_eq!(
+            m.max_timestamp, 7000,
+            "max_timestamp should be 7000 (the highest written timestamp)"
+        );
+        // min_timestamp should be the minimum
+        assert_eq!(
+            m.min_timestamp, 3000,
+            "min_timestamp should be 3000 (the lowest written timestamp)"
+        );
+        // max_timestamp must not be the sentinel value
+        assert_ne!(
+            m.max_timestamp,
+            i64::MAX,
+            "max_timestamp must not be the sentinel i64::MAX"
+        );
     }
 }
