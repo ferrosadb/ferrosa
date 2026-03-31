@@ -87,8 +87,8 @@ jepsen         ██████   █████░  ████░░   █
 
 ### ferrosa-storage — Complete (core engine + NVMe + compaction S3 + Accord)
 
-- **LOC:** ~14,000 (42 files) | **Tests:** ~520
-- **Modules:** `cache`, `commitlog` (7 submodules), `compaction` (3 submodules),
+- **LOC:** ~33,500 (42 files) | **Tests:** 541+
+- **Modules:** `cache`, `commitlog` (7 submodules), `compaction` (4 submodules incl. UCS),
   `engine`, `flush`, `index` (tracker, scheduler, virtual_table), `manifest`,
   `memtable` (2 impls), `merge`, `observer`, `store`, `subscription_observer`,
   `upload`, `virtual_tables`, `accord` (sync_writer, write_gate, reorder_buffer,
@@ -129,9 +129,9 @@ jepsen         ██████   █████░  ████░░   █
   - [ ] Disk backpressure
   - [ ] `io_uring` I/O backend
 
-### ferrosa-schema — Mostly Complete (Chunk A)
+### ferrosa-schema — Complete
 
-- **LOC:** 7,348 (27 files) | **Tests:** 204
+- **LOC:** ~11,700 (27 files) | **Tests:** 297
 - **Modules:** `audit` (3 submodules), `auth` (4 submodules), `convert`, `error`,
   `metadata` (3 submodules), `registry`, `secrets`, `startup`, `system` (4 submodules),
   `virtual_registry`, `virtual_table`
@@ -141,7 +141,7 @@ jepsen         ██████   █████░  ████░░   █
   `apply_snapshot()`, idempotent `*_internal()` methods for pair mode. `IndexMetadata`
   for secondary index definitions, `system_schema.indexes` virtual table, cascade
   cleanup on `DROP TABLE` (removes associated indexes).
-- **Remaining (Chunks B-F):**
+- **Completed (Chunks B-F):**
   - [x] ~~DDL validation rules~~ (table name, PK, RF constraints)
   - [x] ~~UDT (user-defined type) support~~ — `UserTypeMetadata`, `system_schema.types` virtual table, schema registry integration
   - [x] ~~BACKUP permission for snapshot operations~~ (PITR Sprint P-4)
@@ -176,7 +176,7 @@ jepsen         ██████   █████░  ████░░   █
 
 ### ferrosa-udf — Done (WASM UDF/UDA)
 
-- **LOC:** ~1,800 (6 files) | **Tests:** ~68
+- **LOC:** ~2,400 (6 files) | **Tests:** 74
 - **Modules:** `executor`, `sandbox`, `error`, `convert`, `wit/ferrosa-udf.wit`
 - **What's done:** WIT contract defining CQL value types for WASM Component Model,
   `UdfExecutor` with moka compilation cache (256 entries) and real Wasmtime
@@ -204,7 +204,7 @@ jepsen         ██████   █████░  ████░░   █
 
 ### ferrosa-cql — Complete (Parts A-D + Compression + Accord + Temporal compat)
 
-- **LOC:** ~16,000 (26 files) | **Tests:** ~550 | **Largest crate**
+- **LOC:** ~30,400 (26 files) | **Tests:** 567+ | **Largest crate**
 - **Modules:** `ast`, `auth`, `bridge`, `client`, `connection`, `error`, `frame`,
   `lexer`, `parser`, `prepared`, `prometheus`, `result`, `router`, `server`,
   `subscribe`, `types`, `virtual_tables` (connections + active_queries), `pagination`,
@@ -484,7 +484,7 @@ The critical path from single-node to multi-node:
 1. ~~**ferrosa-cluster:** Pair mode — write forwarding, DDL replication, failover~~ (Done)
 1. ~~**ferrosa-cluster:** Raft metadata, ring topology, coordinator pattern~~ (Done — Phase 2)
 1. ~~**ferrosa-cluster:** End-to-end cluster wiring in binary~~ (Done — Phase 3)
-1. **ferrosa-schema:** System table persistence (Chunk B)
+1. ~~**ferrosa-schema:** System table persistence (Chunk B)~~ (Done — SystemTableWriter + persistence.rs)
 1. ~~**ferrosa-cluster:** Hinted handoff~~ (Done — Phase 3)
 1. **ferrosa-cluster:** NetworkTopologyStrategy (multi-DC)
 1. **Beta release**
