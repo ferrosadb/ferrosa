@@ -320,7 +320,7 @@
       <tr><td>CREATE KEYSPACE</td><td><span class="check">Supported</span></td><td>WITH replication, IF NOT EXISTS, DURABLE_WRITES</td></tr>
       <tr><td>ALTER KEYSPACE</td><td><span class="check">Supported</span></td><td>Change replication, durable_writes</td></tr>
       <tr><td>DROP KEYSPACE</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
-      <tr><td>CREATE TABLE</td><td><span class="check">Supported</span></td><td>Partition key, clustering key with order, IF NOT EXISTS, table options</td></tr>
+      <tr><td>CREATE TABLE</td><td><span class="check">Supported</span></td><td>Partition key, clustering key with order, IF NOT EXISTS, table options (compaction, compression, comment, TTL, gc_grace)</td></tr>
       <tr><td>ALTER TABLE</td><td><span class="check">Supported</span></td><td>ADD column, DROP column</td></tr>
       <tr><td>DROP TABLE</td><td><span class="check">Supported</span></td><td>IF EXISTS</td></tr>
       <tr><td>CREATE INDEX</td><td><span class="check">Supported</span></td><td>USING type, WITH OPTIONS, IF NOT EXISTS — <a href="#indexes">see below</a></td></tr>
@@ -347,7 +347,26 @@
   created_at <span class="type">timestamp</span>,
   tags <span class="type">set&lt;text&gt;</span>,
   <span class="kw">PRIMARY KEY</span> (user_id)
-);</pre>
+);
+
+<span class="cm">-- Per-table compaction strategy (default: STCS)</span>
+<span class="kw">CREATE TABLE</span> <span class="type">social.events</span> (
+  event_id <span class="type">uuid</span>,
+  payload <span class="type">text</span>,
+  <span class="kw">PRIMARY KEY</span> (event_id)
+) <span class="kw">WITH</span> compaction = {
+  <span class="str">'class'</span>: <span class="str">'UnifiedCompactionStrategy'</span>,
+  <span class="str">'fan_factor'</span>: <span class="str">'4'</span>
+};</pre>
+
+  <h3>Compaction Strategies</h3>
+  <table>
+    <thead><tr><th>Strategy</th><th>DDL Class Name</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td>STCS (default)</td><td><em>none required</em></td><td>Size-Tiered — groups SSTables by similar size</td></tr>
+      <tr><td>UCS</td><td><code>UnifiedCompactionStrategy</code></td><td>Density-based levels with fan factor: W=2 (LCS-like), W=4 (balanced), W=32 (STCS-like)</td></tr>
+    </tbody>
+  </table>
 
   <!-- ── DML ── -->
   <h2 id="dml">DML Statements</h2>
@@ -355,7 +374,7 @@
   <table>
     <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td>SELECT</td><td><span class="check">Supported</span></td><td>WHERE, ORDER BY, LIMIT, DISTINCT, bind markers (?), named bind markers (:name), IN clause, ALLOW FILTERING, token() function, CONTAINS / CONTAINS KEY</td></tr>
+      <tr><td>SELECT</td><td><span class="check">Supported</span></td><td>WHERE, ORDER BY, LIMIT, DISTINCT, bind markers (?), named bind markers (:name), IN clause, ALLOW FILTERING, token(), CONTAINS / CONTAINS KEY, SOUNDS LIKE, fts_match()</td></tr>
       <tr><td>INSERT</td><td><span class="check">Supported</span></td><td>IF NOT EXISTS (LWT), USING TTL, USING TIMESTAMP</td></tr>
       <tr><td>UPDATE</td><td><span class="check">Supported</span></td><td>SET, WHERE, IF conditions (LWT), collection +/- operators, counter increment/decrement</td></tr>
       <tr><td>DELETE</td><td><span class="check">Supported</span></td><td>WHERE, IF EXISTS / IF conditions (LWT), column-level delete, map element delete syntax</td></tr>
