@@ -91,7 +91,6 @@ impl LoadProfile {
             num_readers: 4,
             duration: Duration::from_secs(120),
             flush_threshold_bytes: 64 * 1024,
-            flush_max_age_secs: 300,
             local_cache_max_bytes: 10 * 1024 * 1024,
             target_data_size_bytes: u64::MAX,
             fan_factor: 4,
