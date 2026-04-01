@@ -747,6 +747,52 @@ impl ModeController {
     /// 1. Sled-backed Raft log store
     /// 2. Raft state machine with schema/storage side effects
     /// 3. Raft network factory bridging openraft to ferrosa-net
+    /// Transition from Pair to Forming: broadcast ClusterInvite and prepare
+    /// for mesh formation. Does NOT initialize Raft — that happens in
+    /// `transition_to_cluster` after all peers are connected.
+    fn transition_to_forming(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        let peer_manager = match &**self.peer_manager.load() {
+            Some(pm) => pm.clone(),
+            None => {
+                tracing::error!("cannot transition to forming: peer_manager not set");
+                return;
+            }
+        };
+
+        self.mode.store(Arc::new(DeploymentMode::Forming));
+        tracing::info!(
+            peer_count = peers.len(),
+            "mode transition: pair -> forming (broadcasting ClusterInvite)"
+        );
+
+        // Broadcast ClusterInvite to all connected peers so they discover each other.
+        let local_id = self.local_host_id;
+        let listen_addr = self.net_config.broadcast_addr;
+        let peers_for_invite = peers.clone();
+        let pm_clone = peer_manager.clone();
+        tokio::spawn(async move {
+            let invite = Message::ClusterInvite {
+                initiator: local_id,
+                peers: peers_for_invite
+                    .iter()
+                    .map(|(id, addr)| (*id, *addr))
+                    .chain(std::iter::once((local_id, listen_addr)))
+                    .collect(),
+            };
+
+            for (peer_id, _) in &peers_for_invite {
+                if let Err(e) = pm_clone.fire(*peer_id, invite.clone(), Lane::Raft).await {
+                    tracing::warn!(peer = %peer_id, %e, "failed to send ClusterInvite");
+                }
+            }
+        });
+
+        // Now proceed to cluster transition with all known peers.
+        // In the future, this will wait for mesh completion before Raft init.
+        // For now, proceed immediately (matches current behavior).
+        self.transition_to_cluster(peers);
+    }
+
     /// 4. TokenRing with deterministic initial token assignment
     /// 5. ClusterCoordinator for replica-aware writes
     /// 6. Swaps write path, DDL path, and cluster state atomically
@@ -1261,10 +1307,10 @@ impl PeerEventListener for ModeController {
                     );
                     return;
                 }
-                // 2nd peer connecting while in pair mode → transition to cluster
+                // 2nd peer connecting while in pair mode → enter forming state
                 let all_peers = self.connected_peers.lock().clone();
                 if all_peers.len() >= 2 {
-                    self.transition_to_cluster(all_peers);
+                    self.transition_to_forming(all_peers);
                 }
             }
             DeploymentMode::Cluster => {
