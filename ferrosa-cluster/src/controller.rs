@@ -135,6 +135,9 @@ pub struct ModeController {
     formation_epoch: std::sync::atomic::AtomicU64,
     /// Initiators already seen in this formation epoch. Deduplicates invites.
     seen_invite_initiators: Mutex<BTreeSet<Uuid>>,
+    /// Tracks all spawned background tasks. Replaces fire-and-forget spawns
+    /// so panics are detected and tasks can be cancelled on shutdown.
+    background_tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -211,6 +214,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
+            background_tasks: Mutex::new(tokio::task::JoinSet::new()),
         });
 
         let handles = ModeControllerHandles {
@@ -260,6 +264,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
+            background_tasks: Mutex::new(tokio::task::JoinSet::new()),
         })
     }
 
@@ -309,6 +314,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
+            background_tasks: Mutex::new(tokio::task::JoinSet::new()),
         })
     }
 
@@ -346,6 +352,16 @@ impl ModeController {
     /// Get local host_id.
     pub fn host_id(&self) -> Uuid {
         self.local_host_id
+    }
+
+    /// Spawn a tracked background task. Unlike bare `tokio::spawn`, panics
+    /// in these tasks are detectable via the JoinSet and tasks can be
+    /// cancelled on shutdown.
+    fn spawn_tracked<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.background_tasks.lock().spawn(future);
     }
 
     /// Get the Raft instance, if cluster mode initialization has completed.
@@ -661,7 +677,7 @@ impl ModeController {
             let local_id = self.local_host_id;
             let internode_port = self.net_config.bind_addr.port();
             let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
-            tokio::spawn(async move {
+            self.spawn_tracked(async move {
                 // Small delay to let peer's RPC server be ready.
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 match PriorityPool::connect(net_cfg, local_id, &reverse_addr.to_string()).await {
@@ -682,7 +698,7 @@ impl ModeController {
             let pm = peer_manager;
             let storage = self.storage.clone();
             let schema = self.schema.clone();
-            tokio::spawn(async move {
+            self.spawn_tracked(async move {
                 // Wait for reverse connection + peer pair transition + handler registration.
                 tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
@@ -788,7 +804,7 @@ impl ModeController {
         let listen_addr = self.net_config.broadcast_addr;
         let peers_for_invite = peers.clone();
         let pm_clone = peer_manager.clone();
-        tokio::spawn(async move {
+        self.spawn_tracked(async move {
             let invite = Message::ClusterInvite {
                 initiator: local_id,
                 peers: peers_for_invite
@@ -1035,7 +1051,7 @@ impl ModeController {
         let repair_metrics = repair_metrics_for_handler;
         let cluster_name = self.config.cluster_name.clone();
         let schema_for_replay = self.schema.clone();
-        tokio::spawn(async move {
+        self.spawn_tracked(async move {
             // Build openraft Config
             let raft_config = match (openraft::Config {
                 cluster_name,
@@ -1226,7 +1242,7 @@ impl ModeController {
         let raft_instance = self.raft_instance.clone();
         let config_clone = self.config.clone();
 
-        tokio::spawn(async move {
+        self.spawn_tracked(async move {
             // Check approval before touching Raft.
             if !config_clone.auto_join && !approved_nodes.contains(&host_id) {
                 tracing::warn!(
@@ -1409,7 +1425,7 @@ impl PeerEventListener for ModeController {
         let hint_store = self.hint_store.clone();
         let hint_config = self.hint_config.clone();
 
-        tokio::spawn(async move {
+        self.spawn_tracked(async move {
             HintDeliveryTask::run(peer_id, hint_store, peer_manager, &hint_config).await;
         });
     }
