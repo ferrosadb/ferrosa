@@ -131,8 +131,12 @@ pub struct FerrosStateMachine {
 impl FerrosStateMachine {
     /// Create a new state machine with empty state and no side-effect targets.
     pub fn new() -> Self {
+        // Default auto_join=true so initial cluster formation works without
+        // explicit approval. Production clusters override via UpdateConfig.
+        let mut state = RaftState::default();
+        state.config.auto_join = true;
         Self {
-            state: RaftState::default(),
+            state,
             last_applied: None,
             last_membership: StoredMembership::default(),
             current_snapshot: None,
@@ -577,12 +581,28 @@ impl FerrosStateMachine {
 
             // ---- Topology ----------------------------------------------
             RaftOp::JoinNode(node_info) => {
+                // Approval gate: if auto_join is disabled, verify the node was
+                // pre-approved via ApproveNode. This check is inside the state
+                // machine (not in the caller) to prevent TOCTOU races where
+                // approval is revoked between the check and the Raft commit.
+                if !self.state.config.auto_join
+                    && !self.state.approved_nodes.contains(&node_info.host_id)
+                {
+                    tracing::warn!(
+                        host_id = %node_info.host_id,
+                        "rejecting JoinNode — node not approved (auto_join=false)"
+                    );
+                    // Skip the join — do not add to members or ring.
+                    // The command is still committed to the Raft log (it's
+                    // already been replicated), but the state machine ignores it.
+                } else {
                 let node_id = super::uuid_to_node_id(node_info.host_id);
                 self.state.members.insert(node_id, node_info);
                 self.sync_ring();
                 // Mark the new node as Building for all existing indexes.
                 for statuses in self.state.index_state_map.values_mut() {
                     statuses.entry(node_id).or_insert(IndexNodeStatus::Building);
+                }
                 }
             }
             RaftOp::LeaveNode { node_id } => {
