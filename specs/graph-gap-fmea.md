@@ -1,7 +1,7 @@
 # FMEA — Graph Gap Closure
 
-> Last updated: 2026-03-16
-> Status: Draft
+> Last updated: 2026-03-30
+> Status: Complete — all 14 failure modes (F1-F14) mitigated and tested
 
 ## Scope
 

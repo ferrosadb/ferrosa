@@ -1667,4 +1667,300 @@ mod tests {
         let wl = LwtMultiStatement;
         assert!(wl.check_invariant(&history).is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // JP-001: LWT workload operation generation unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_lwt_workloads_returns_16() {
+        let workloads = all_lwt_workloads();
+        assert_eq!(
+            workloads.len(),
+            16,
+            "all_lwt_workloads() must return 16 patterns"
+        );
+    }
+
+    #[test]
+    fn all_lwt_workloads_names_are_unique() {
+        let workloads = all_lwt_workloads();
+        let names: Vec<String> = workloads.iter().map(|w| w.name().to_string()).collect();
+        let mut deduped = names.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            names.len(),
+            deduped.len(),
+            "all LWT workload names must be unique"
+        );
+    }
+
+    #[test]
+    fn all_lwt_workloads_names_start_with_lwt() {
+        let workloads = all_lwt_workloads();
+        for w in &workloads {
+            assert!(
+                w.name().starts_with("lwt-"),
+                "LWT workload name must start with 'lwt-', got: {}",
+                w.name()
+            );
+        }
+    }
+
+    #[test]
+    fn check_insert_exactly_one_winner_empty_history() {
+        let history = History { operations: vec![] };
+        assert!(
+            check_insert_exactly_one_winner(&history).is_ok(),
+            "empty history should pass insert-exactly-one-winner check"
+        );
+    }
+
+    #[test]
+    fn check_insert_exactly_one_winner_no_inserts() {
+        // History with only reads, no InsertIfNotExists operations.
+        let history = History {
+            operations: vec![make_op(
+                "c1",
+                100,
+                200,
+                Op::Read { key: "x".into() },
+                OpResult::Value(Some(1)),
+            )],
+        };
+        assert!(check_insert_exactly_one_winner(&history).is_ok());
+    }
+
+    #[test]
+    fn check_insert_exactly_one_winner_one_applied() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::InsertIfNotExists {
+                        table: "t1".into(),
+                        pk: "pk-0".into(),
+                        values: vec![("val".into(), "v0".into())],
+                    },
+                    OpResult::Applied(true),
+                ),
+                make_op(
+                    "c2",
+                    150,
+                    250,
+                    Op::InsertIfNotExists {
+                        table: "t1".into(),
+                        pk: "pk-0".into(),
+                        values: vec![("val".into(), "v1".into())],
+                    },
+                    OpResult::Applied(false),
+                ),
+            ],
+        };
+        assert!(check_insert_exactly_one_winner(&history).is_ok());
+    }
+
+    #[test]
+    fn check_insert_exactly_one_winner_two_applied_fails() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::InsertIfNotExists {
+                        table: "t1".into(),
+                        pk: "pk-0".into(),
+                        values: vec![("val".into(), "v0".into())],
+                    },
+                    OpResult::Applied(true),
+                ),
+                make_op(
+                    "c2",
+                    150,
+                    250,
+                    Op::InsertIfNotExists {
+                        table: "t1".into(),
+                        pk: "pk-0".into(),
+                        values: vec![("val".into(), "v1".into())],
+                    },
+                    OpResult::Applied(true),
+                ),
+            ],
+        };
+        assert!(
+            check_insert_exactly_one_winner(&history).is_err(),
+            "two applied inserts should violate the at-most-one-winner invariant"
+        );
+    }
+
+    #[test]
+    fn check_insert_exactly_one_winner_all_not_applied() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::InsertIfNotExists {
+                        table: "t1".into(),
+                        pk: "pk-0".into(),
+                        values: vec![("val".into(), "v0".into())],
+                    },
+                    OpResult::Applied(false),
+                ),
+                make_op(
+                    "c2",
+                    150,
+                    250,
+                    Op::InsertIfNotExists {
+                        table: "t1".into(),
+                        pk: "pk-0".into(),
+                        values: vec![("val".into(), "v1".into())],
+                    },
+                    OpResult::Applied(false),
+                ),
+            ],
+        };
+        // Zero winners is valid (at most one).
+        assert!(check_insert_exactly_one_winner(&history).is_ok());
+    }
+
+    /// All 16 LWT workloads should successfully setup + run against mock session.
+    #[tokio::test]
+    async fn all_lwt_workloads_run_against_mock() {
+        let workloads = all_lwt_workloads();
+        let session = MockCqlSession::new();
+
+        for wl in &workloads {
+            wl.setup(&session)
+                .await
+                .unwrap_or_else(|e| panic!("setup failed for LWT workload '{}': {e}", wl.name()));
+
+            let mut recorder = crate::history::HistoryRecorder::new("lwt-test");
+            wl.run(
+                &session,
+                &mut recorder,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("run failed for LWT workload '{}': {e}", wl.name()));
+
+            let history = recorder.finish();
+            // Verify structural validity of all recorded operations.
+            for op in &history.operations {
+                assert!(
+                    op.invoke_us <= op.complete_us,
+                    "workload '{}' produced operation with invoke > complete",
+                    wl.name()
+                );
+            }
+        }
+    }
+
+    /// LWT increment invariant: empty history is valid (no applied ops to check).
+    #[test]
+    fn lwt_increment_invariant_empty_history() {
+        let wl = LwtIncrementIf;
+        let history = History { operations: vec![] };
+        assert!(wl.check_invariant(&history).is_ok());
+    }
+
+    /// LWT increment invariant: monotonically increasing applied values pass.
+    #[test]
+    fn lwt_increment_invariant_monotonic() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::UpdateIf {
+                        table: "jepsen.lwt7".into(),
+                        pk: "pk-0".into(),
+                        condition: "val = 0".into(),
+                        assignments: vec![("val".into(), "1".into())],
+                    },
+                    OpResult::Applied(true),
+                ),
+                make_op(
+                    "c1",
+                    300,
+                    400,
+                    Op::UpdateIf {
+                        table: "jepsen.lwt7".into(),
+                        pk: "pk-0".into(),
+                        condition: "val = 1".into(),
+                        assignments: vec![("val".into(), "2".into())],
+                    },
+                    OpResult::Applied(true),
+                ),
+                make_op(
+                    "c1",
+                    500,
+                    600,
+                    Op::UpdateIf {
+                        table: "jepsen.lwt7".into(),
+                        pk: "pk-0".into(),
+                        condition: "val = 2".into(),
+                        assignments: vec![("val".into(), "3".into())],
+                    },
+                    OpResult::Applied(true),
+                ),
+            ],
+        };
+        let wl = LwtIncrementIf;
+        assert!(wl.check_invariant(&history).is_ok());
+    }
+
+    /// LWT increment invariant: non-applied ops are ignored in monotonicity check.
+    #[test]
+    fn lwt_increment_invariant_ignores_non_applied() {
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::UpdateIf {
+                        table: "jepsen.lwt7".into(),
+                        pk: "pk-0".into(),
+                        condition: "val = 0".into(),
+                        assignments: vec![("val".into(), "1".into())],
+                    },
+                    OpResult::Applied(true),
+                ),
+                // This one was not applied, so its value should be ignored.
+                make_op(
+                    "c2",
+                    150,
+                    250,
+                    Op::UpdateIf {
+                        table: "jepsen.lwt7".into(),
+                        pk: "pk-0".into(),
+                        condition: "val = 0".into(),
+                        assignments: vec![("val".into(), "1".into())],
+                    },
+                    OpResult::Applied(false),
+                ),
+                make_op(
+                    "c1",
+                    300,
+                    400,
+                    Op::UpdateIf {
+                        table: "jepsen.lwt7".into(),
+                        pk: "pk-0".into(),
+                        condition: "val = 1".into(),
+                        assignments: vec![("val".into(), "2".into())],
+                    },
+                    OpResult::Applied(true),
+                ),
+            ],
+        };
+        let wl = LwtIncrementIf;
+        assert!(wl.check_invariant(&history).is_ok());
+    }
 }

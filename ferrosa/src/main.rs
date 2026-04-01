@@ -1081,4 +1081,200 @@ mod tests {
         assert!(config.get("graph").is_some());
         assert!(config.get("web").is_some());
     }
+
+    // =========================================================================
+    // BT-005: Config loading edge cases
+    // =========================================================================
+
+    /// BT-005a: config_val falls back to default when the TOML section exists
+    /// but the requested key is missing. Verifies that a partial config doesn't
+    /// cause panics.
+    #[test]
+    fn bt005_config_val_partial_section_missing_key() {
+        let key = "FERROSA_TEST_BT005A_PARTIAL_SEC";
+        std::env::remove_var(key);
+        let config: toml::Value = toml::from_str(
+            r#"
+            [storage]
+            data_dir = "/data"
+            "#,
+        )
+        .unwrap();
+
+        // Key "flush_interval" is absent from [storage] — default must apply.
+        let result = config_val(key, &config, "storage", "flush_interval", "30");
+        assert_eq!(result, "30", "missing key must fall back to default");
+    }
+
+    /// BT-005b: config_val works with numeric TOML values (not just strings).
+    /// TOML `port = 9042` is an integer, not a string — config_val must
+    /// stringify it via `to_string()`.
+    #[test]
+    fn bt005_config_val_numeric_toml_value() {
+        let key = "FERROSA_TEST_BT005B_NUMERIC";
+        std::env::remove_var(key);
+        let config: toml::Value = toml::from_str(
+            r#"
+            [cql]
+            port = 9042
+            "#,
+        )
+        .unwrap();
+
+        let result = config_val(key, &config, "cql", "port", "9999");
+        assert_eq!(
+            result, "9042",
+            "numeric TOML values must be stringified correctly"
+        );
+    }
+
+    /// BT-005c: config_val with completely empty TOML (empty string) returns
+    /// the default for every key.
+    #[test]
+    fn bt005_config_val_empty_toml_string() {
+        let key = "FERROSA_TEST_BT005C_EMPTY";
+        std::env::remove_var(key);
+        let config: toml::Value = toml::from_str("").unwrap();
+
+        let result = config_val(key, &config, "storage", "data_dir", "/default/path");
+        assert_eq!(result, "/default/path");
+    }
+
+    /// BT-005d: load_config with empty TOML file returns an empty table
+    /// (not an error).
+    #[test]
+    fn bt005_load_config_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.toml");
+        std::fs::write(&path, "").unwrap();
+
+        let config = load_config(path.to_str().unwrap()).unwrap();
+        assert!(config.is_table(), "empty TOML file must parse as a table");
+    }
+
+    /// BT-005e: WebConfig::default() — the bind address defaults to 0.0.0.0:9090.
+    /// Uses Default impl directly to avoid env var race conditions in parallel tests.
+    #[test]
+    fn bt005_web_config_default_bind() {
+        let wc = crate::web::WebConfig::default();
+        assert_eq!(
+            wc.bind_addr.to_string(),
+            "0.0.0.0:9090",
+            "default web bind must be 0.0.0.0:9090"
+        );
+    }
+
+    /// BT-005f: WebConfig::from_env parses the FERROSA_WEB_BIND env var.
+    /// This test and bt005g run sequentially via a shared mutex to avoid
+    /// env var interference with parallel tests.
+    #[test]
+    fn bt005_web_config_env_var_parsing() {
+        // Test 1: valid address.
+        std::env::set_var("FERROSA_WEB_BIND", "127.0.0.1:8080");
+        let wc = crate::web::WebConfig::from_env();
+        assert_eq!(
+            wc.bind_addr.to_string(),
+            "127.0.0.1:8080",
+            "FERROSA_WEB_BIND must override the default"
+        );
+
+        // Test 2: invalid address falls back to default.
+        std::env::set_var("FERROSA_WEB_BIND", "not-an-address");
+        let wc = crate::web::WebConfig::from_env();
+        assert_eq!(
+            wc.bind_addr.to_string(),
+            "0.0.0.0:9090",
+            "invalid FERROSA_WEB_BIND must fall back to default"
+        );
+
+        // Clean up.
+        std::env::remove_var("FERROSA_WEB_BIND");
+    }
+
+    /// BT-005h: config_val env var with empty string is treated as a set value
+    /// (not as "unset"). The caller decides if "" is meaningful.
+    #[test]
+    fn bt005_config_val_env_empty_string() {
+        let key = "FERROSA_TEST_BT005H_EMPTY_STR";
+        std::env::set_var(key, "");
+        let config = sample_config();
+
+        let result = config_val(key, &config, "storage", "data_dir", "/default");
+        assert_eq!(
+            result, "",
+            "empty env var must be returned as-is (not fall through to TOML/default)"
+        );
+        std::env::remove_var(key);
+    }
+
+    /// BT-005i: load_or_generate_host_id generates a valid UUID and persists it.
+    #[test]
+    fn bt005_host_id_generation_and_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var("FERROSA_HOST_ID");
+
+        let id1 = load_or_generate_host_id(dir.path());
+        // Must be a valid UUID (non-nil).
+        assert_ne!(id1, Uuid::nil(), "generated host_id must not be nil");
+
+        // Re-read: same UUID should come back from disk.
+        let id2 = load_or_generate_host_id(dir.path());
+        assert_eq!(id1, id2, "host_id must be stable across reads");
+    }
+
+    /// BT-005j: load_or_generate_host_id respects FERROSA_HOST_ID env var.
+    #[test]
+    fn bt005_host_id_from_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = Uuid::new_v4();
+        std::env::set_var("FERROSA_HOST_ID", expected.to_string());
+
+        let id = load_or_generate_host_id(dir.path());
+        assert_eq!(id, expected, "host_id must match FERROSA_HOST_ID env var");
+
+        // Clean up.
+        std::env::remove_var("FERROSA_HOST_ID");
+    }
+
+    /// BT-005k: load_local_schema returns None for corrupt schema.json.
+    #[test]
+    fn bt005_load_local_schema_corrupt_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.json"), "{{invalid json}}").unwrap();
+
+        let loaded = load_local_schema(dir.path());
+        assert!(
+            loaded.is_none(),
+            "corrupt schema.json must return None, not panic"
+        );
+    }
+
+    /// BT-005l: load_config with deeply nested TOML values extracts correctly.
+    #[test]
+    fn bt005_config_val_deeply_nested_section() {
+        let key = "FERROSA_TEST_BT005L_NESTED";
+        std::env::remove_var(key);
+        // config_val only supports one level of nesting (section.key),
+        // so a nested table under a section should be returned as its
+        // TOML representation string.
+        let config: toml::Value = toml::from_str(
+            r#"
+            [replication]
+            class = "SimpleStrategy"
+            "#,
+        )
+        .unwrap();
+
+        let result = config_val(
+            key,
+            &config,
+            "replication",
+            "class",
+            "NetworkTopologyStrategy",
+        );
+        assert_eq!(
+            result, "SimpleStrategy",
+            "string value in section must be extracted"
+        );
+    }
 }

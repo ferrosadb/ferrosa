@@ -4826,12 +4826,31 @@ fn ast_resource_to_schema(
         }
         GrantResource::AllRoles => Ok(Resource::AllRoles),
         GrantResource::Role(name) => Ok(Resource::Role(name.clone())),
-        GrantResource::Function { .. } => Err(CqlError::Invalid(
-            "GRANT/REVOKE on functions not yet implemented".into(),
-        )),
-        GrantResource::AllFunctions { .. } => Err(CqlError::Invalid(
-            "GRANT/REVOKE on functions not yet implemented".into(),
-        )),
+        GrantResource::Function {
+            keyspace,
+            name,
+            arg_types,
+        } => {
+            let ks = keyspace
+                .as_deref()
+                .or(current_ks.as_deref())
+                .ok_or_else(|| CqlError::Invalid("no keyspace specified for function".into()))?;
+            let type_strings: Vec<String> = arg_types.iter().map(|t| format!("{t:?}")).collect();
+            Ok(Resource::Function(
+                ks.to_string(),
+                name.clone(),
+                type_strings,
+            ))
+        }
+        GrantResource::AllFunctions { keyspace } => {
+            let ks = keyspace
+                .as_deref()
+                .or(current_ks.as_deref())
+                .ok_or_else(|| {
+                    CqlError::Invalid("no keyspace specified for ALL FUNCTIONS".into())
+                })?;
+            Ok(Resource::AllFunctions(ks.to_string()))
+        }
     }
 }
 
@@ -10398,6 +10417,58 @@ mod tests {
             count, 0,
             "logged batch rollback: first statement's write should not be visible \
              after batch failure, but found {count} rows"
+        );
+    }
+
+    // ── GRANT/REVOKE on function resources ──────────────────────────
+
+    /// GRANT EXECUTE ON FUNCTION must succeed (not return "not yet implemented").
+    #[tokio::test]
+    async fn grant_execute_on_function() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Setup keyspace + function
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE grf WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Create a role to grant to
+        let stmt =
+            crate::parser::parse("CREATE ROLE fn_user WITH PASSWORD = 'pass' AND LOGIN = true")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // GRANT EXECUTE ON ALL FUNCTIONS IN KEYSPACE
+        let stmt =
+            crate::parser::parse("GRANT EXECUTE ON ALL FUNCTIONS IN KEYSPACE grf TO fn_user")
+                .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "GRANT EXECUTE ON ALL FUNCTIONS should succeed, got: {:?}",
+            result.err()
+        );
+
+        // REVOKE should also work
+        let stmt =
+            crate::parser::parse("REVOKE EXECUTE ON ALL FUNCTIONS IN KEYSPACE grf FROM fn_user")
+                .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "REVOKE EXECUTE ON ALL FUNCTIONS should succeed, got: {:?}",
+            result.err()
         );
     }
 }

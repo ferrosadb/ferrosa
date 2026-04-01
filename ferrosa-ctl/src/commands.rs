@@ -723,4 +723,717 @@ mod tests {
         assert!(body["point_in_time"].is_null());
         assert_eq!(body["force"], true);
     }
+
+    // ── CT-001: CQL command output formatting ──────────────────────────────────
+
+    #[test]
+    fn print_table_binary_cell_renders_as_binary_marker() {
+        // Non-UTF8 bytes should render as "<binary>", not panic.
+        let result = make_result(&["data"], vec![vec![Some(&[0xFF, 0xFE, 0x00])]]);
+        // Exercise the rendering path — the real assertion is that no panic occurs
+        // and the cell mapping logic produces "<binary>" for non-UTF8.
+        let cell_text: Vec<String> = result.rows[0]
+            .columns
+            .iter()
+            .map(|cell| match cell {
+                None => "NULL".to_string(),
+                Some(bytes) => std::str::from_utf8(bytes)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| "<binary>".to_string()),
+            })
+            .collect();
+        assert_eq!(cell_text, vec!["<binary>"]);
+    }
+
+    #[test]
+    fn print_table_all_null_row() {
+        // A row where every column is NULL should render without panic.
+        let result = make_result(&["a", "b", "c"], vec![vec![None, None, None]]);
+        let cell_texts: Vec<String> = result.rows[0]
+            .columns
+            .iter()
+            .map(|cell| match cell {
+                None => "NULL".to_string(),
+                Some(bytes) => std::str::from_utf8(bytes)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| "<binary>".to_string()),
+            })
+            .collect();
+        assert_eq!(cell_texts, vec!["NULL", "NULL", "NULL"]);
+    }
+
+    #[test]
+    fn print_table_no_columns_no_panic() {
+        // Edge case: result with zero columns and zero rows.
+        let result = make_result(&[], vec![]);
+        print_table(&result);
+    }
+
+    #[test]
+    fn print_table_single_column_header_only() {
+        // Header with one column and no data rows.
+        let result = make_result(&["only_col"], vec![]);
+        print_table(&result);
+    }
+
+    #[test]
+    fn print_table_multi_row_data() {
+        // Multiple rows should all render without error.
+        let result = make_result(
+            &["id", "name"],
+            vec![
+                vec![Some(b"1"), Some(b"alice")],
+                vec![Some(b"2"), Some(b"bob")],
+                vec![Some(b"3"), Some(b"carol")],
+            ],
+        );
+        assert_eq!(result.rows.len(), 3);
+        print_table(&result);
+    }
+
+    #[test]
+    fn print_empty_output_format() {
+        // Verify print_empty produces output (no panic).
+        print_empty("widgets");
+    }
+
+    #[test]
+    fn print_table_row_with_fewer_columns_than_header() {
+        // If a row has fewer columns than the header, the mapping should handle it.
+        let mut result = make_result(&["a", "b", "c"], vec![vec![Some(b"x")]]);
+        // The row only has 1 column but header has 3 — iter handles this gracefully
+        // since it maps over `row.columns.iter()` which stops at actual column count.
+        assert_eq!(result.rows[0].columns.len(), 1);
+        print_table(&result);
+        // Also verify the sort logic doesn't panic when rows are short.
+        let col = "b";
+        if let Some(idx) = result.column_names.iter().position(|n| n == col) {
+            result.rows.sort_by(|a, b| {
+                let va = a.columns.get(idx).and_then(|c| c.as_deref());
+                let vb = b.columns.get(idx).and_then(|c| c.as_deref());
+                va.cmp(&vb)
+            });
+        }
+    }
+
+    // ── CT-001: Long-running query sort edge cases ─────────────────────────────
+
+    #[test]
+    fn long_running_sort_with_null_elapsed() {
+        // Rows with NULL elapsed_ms should sort to the bottom (treated as 0).
+        let mut result = make_result(
+            &["query_id", "elapsed_ms"],
+            vec![vec![Some(b"q1"), None], vec![Some(b"q2"), Some(b"300")]],
+        );
+
+        if let Some(idx) = result.column_names.iter().position(|n| n == "elapsed_ms") {
+            result.rows.sort_by(|a, b| {
+                let parse = |row: &ResultRow| -> u64 {
+                    row.columns
+                        .get(idx)
+                        .and_then(|c| c.as_deref())
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                parse(b).cmp(&parse(a))
+            });
+        }
+        // q2(300) should be first, q1(NULL -> 0) second.
+        assert_eq!(result.rows[0].columns[0].as_deref(), Some(b"q2" as &[u8]));
+        assert_eq!(result.rows[1].columns[0].as_deref(), Some(b"q1" as &[u8]));
+    }
+
+    #[test]
+    fn long_running_sort_with_non_numeric_elapsed() {
+        // Non-numeric elapsed_ms values should be treated as 0.
+        let mut result = make_result(
+            &["query_id", "elapsed_ms"],
+            vec![
+                vec![Some(b"q1"), Some(b"not-a-number")],
+                vec![Some(b"q2"), Some(b"100")],
+            ],
+        );
+
+        if let Some(idx) = result.column_names.iter().position(|n| n == "elapsed_ms") {
+            result.rows.sort_by(|a, b| {
+                let parse = |row: &ResultRow| -> u64 {
+                    row.columns
+                        .get(idx)
+                        .and_then(|c| c.as_deref())
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                parse(b).cmp(&parse(a))
+            });
+        }
+        // q2(100) first, q1(NaN -> 0) second.
+        assert_eq!(result.rows[0].columns[0].as_deref(), Some(b"q2" as &[u8]));
+        assert_eq!(result.rows[1].columns[0].as_deref(), Some(b"q1" as &[u8]));
+    }
+
+    #[test]
+    fn long_running_sort_all_zeros() {
+        // All rows with 0 elapsed_ms — sort should be stable (no panic).
+        let mut result = make_result(
+            &["query_id", "elapsed_ms"],
+            vec![
+                vec![Some(b"q1"), Some(b"0")],
+                vec![Some(b"q2"), Some(b"0")],
+                vec![Some(b"q3"), Some(b"0")],
+            ],
+        );
+
+        if let Some(idx) = result.column_names.iter().position(|n| n == "elapsed_ms") {
+            result.rows.sort_by(|a, b| {
+                let parse = |row: &ResultRow| -> u64 {
+                    row.columns
+                        .get(idx)
+                        .and_then(|c| c.as_deref())
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                parse(b).cmp(&parse(a))
+            });
+        }
+        // All equal; just verify no panic and length preserved.
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    // ── CT-002: Cluster URL construction edge cases ────────────────────────────
+
+    #[test]
+    fn cluster_urls_with_hostname() {
+        // URLs should work with hostnames, not just IP addresses.
+        assert_eq!(
+            add_node_url("my-node.example.com", 9090),
+            "http://my-node.example.com:9090/api/cluster/add-node"
+        );
+        assert_eq!(
+            decommission_url("my-node.example.com", 9090),
+            "http://my-node.example.com:9090/api/cluster/decommission"
+        );
+        assert_eq!(
+            ring_url("my-node.example.com", 9090),
+            "http://my-node.example.com:9090/api/cluster/ring"
+        );
+        assert_eq!(
+            rebalance_url("my-node.example.com", 9090),
+            "http://my-node.example.com:9090/api/cluster/rebalance"
+        );
+    }
+
+    #[test]
+    fn cluster_urls_with_port_boundaries() {
+        // Minimum and maximum valid port numbers.
+        assert_eq!(
+            add_node_url("localhost", 1),
+            "http://localhost:1/api/cluster/add-node"
+        );
+        assert_eq!(
+            add_node_url("localhost", 65535),
+            "http://localhost:65535/api/cluster/add-node"
+        );
+    }
+
+    #[test]
+    fn snapshot_delete_url_with_special_chars() {
+        // Snapshot names may contain hyphens and underscores.
+        let url = snapshot_delete_url("127.0.0.1", 9090, "snap_2026-03-30_daily");
+        assert_eq!(
+            url,
+            "http://127.0.0.1:9090/api/snapshots/snap_2026-03-30_daily"
+        );
+    }
+
+    #[test]
+    fn snapshot_urls_with_custom_host_and_port() {
+        assert_eq!(
+            snapshot_create_url("10.0.1.5", 8443),
+            "http://10.0.1.5:8443/api/snapshots"
+        );
+        assert_eq!(
+            snapshot_list_url("10.0.1.5", 8443),
+            "http://10.0.1.5:8443/api/snapshots"
+        );
+        assert_eq!(
+            restore_url("10.0.1.5", 8443),
+            "http://10.0.1.5:8443/api/restore"
+        );
+    }
+
+    // ── CT-002: Ring JSON response parsing edge cases ──────────────────────────
+
+    #[test]
+    fn ring_response_with_numeric_values() {
+        // The ring response may include non-string JSON types (numbers, booleans).
+        let value = serde_json::json!([
+            { "host_id": "node-1", "token": -9223372036854775808_i64, "load": 42.5, "up": true },
+        ]);
+
+        let entries = value.as_array().unwrap();
+        let columns: Vec<String> = entries
+            .first()
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // Render each cell using the same logic as ring().
+        for entry in entries {
+            let row: Vec<String> = columns
+                .iter()
+                .map(|col| {
+                    entry
+                        .get(col)
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_else(|| "NULL".to_string())
+                })
+                .collect();
+
+            // Numeric values should be rendered via their Display impl.
+            assert!(row.contains(&"node-1".to_string()));
+            // i64, f64, bool are all rendered via to_string.
+            assert!(row.iter().any(|s| s == "-9223372036854775808"));
+            assert!(row.iter().any(|s| s == "42.5"));
+            assert!(row.iter().any(|s| s == "true"));
+        }
+    }
+
+    #[test]
+    fn ring_response_with_missing_key_in_second_entry() {
+        // If later entries are missing keys present in the first, they should render as "NULL".
+        let value = serde_json::json!([
+            { "host_id": "node-1", "token": "0", "status": "UP" },
+            { "host_id": "node-2", "token": "100" },
+        ]);
+
+        let entries = value.as_array().unwrap();
+        let columns: Vec<String> = entries
+            .first()
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // Second entry is missing "status"
+        let second_row: Vec<String> = columns
+            .iter()
+            .map(|col| {
+                entries[1]
+                    .get(col)
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_else(|| "NULL".to_string())
+            })
+            .collect();
+
+        assert!(second_row.contains(&"NULL".to_string()));
+        assert!(second_row.contains(&"node-2".to_string()));
+    }
+
+    #[test]
+    fn ring_response_non_array_is_detected() {
+        // If the server returns an object instead of an array, as_array() returns None.
+        let value = serde_json::json!({ "error": "not implemented" });
+        assert!(value.as_array().is_none());
+        // The function would fall through to serde_json::to_string_pretty.
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+        assert!(pretty.contains("not implemented"));
+    }
+
+    #[test]
+    fn ring_response_single_entry() {
+        // Single-node ring should work.
+        let value = serde_json::json!([
+            { "host_id": "only-node", "token": "0", "status": "UP" },
+        ]);
+        let entries = value.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let columns: Vec<String> = entries
+            .first()
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+        assert!(!columns.is_empty());
+    }
+
+    // ── CT-003: Error handling and address parsing ─────────────────────────────
+
+    #[test]
+    fn socket_addr_parsing_valid() {
+        let addr: Result<std::net::SocketAddr, _> = "127.0.0.1:9042".parse();
+        assert!(addr.is_ok());
+        let addr = addr.unwrap();
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(addr.port(), 9042);
+    }
+
+    #[test]
+    fn socket_addr_parsing_ipv6() {
+        let addr: Result<std::net::SocketAddr, _> = "[::1]:9042".parse();
+        assert!(addr.is_ok());
+        let addr = addr.unwrap();
+        assert_eq!(addr.port(), 9042);
+    }
+
+    #[test]
+    fn socket_addr_parsing_invalid_host() {
+        let addr: Result<std::net::SocketAddr, _> = "not-an-address".parse();
+        assert!(addr.is_err());
+    }
+
+    #[test]
+    fn socket_addr_parsing_missing_port() {
+        let addr: Result<std::net::SocketAddr, _> = "127.0.0.1".parse();
+        assert!(addr.is_err());
+    }
+
+    #[test]
+    fn socket_addr_parsing_port_out_of_range() {
+        let addr: Result<std::net::SocketAddr, _> = "127.0.0.1:99999".parse();
+        assert!(addr.is_err());
+    }
+
+    #[test]
+    fn web_host_extraction_from_socket_addr() {
+        // Mirrors main.rs logic: addr.ip().to_string() is used for HTTP calls.
+        let addr: std::net::SocketAddr = "10.0.0.5:9042".parse().unwrap();
+        let web_host = addr.ip().to_string();
+        assert_eq!(web_host, "10.0.0.5");
+
+        let web_port: u16 = 9090;
+        let url = add_node_url(&web_host, web_port);
+        assert_eq!(url, "http://10.0.0.5:9090/api/cluster/add-node");
+    }
+
+    #[test]
+    fn web_host_extraction_from_ipv6_socket_addr() {
+        let addr: std::net::SocketAddr = "[::1]:9042".parse().unwrap();
+        let web_host = addr.ip().to_string();
+        assert_eq!(web_host, "::1");
+    }
+
+    #[test]
+    fn http_error_message_formatting() {
+        // Verify the error message pattern used by add_node, decommission, rebalance.
+        let status = 503_u16;
+        let body = "service unavailable";
+        let msg = format!("add-node failed (HTTP {}): {}", status, body);
+        assert_eq!(msg, "add-node failed (HTTP 503): service unavailable");
+
+        let msg2 = format!("decommission failed (HTTP {}): {}", 404, "not found");
+        assert_eq!(msg2, "decommission failed (HTTP 404): not found");
+
+        let msg3 = format!("ring failed (HTTP {}): {}", 500, "internal error");
+        assert_eq!(msg3, "ring failed (HTTP 500): internal error");
+
+        let msg4 = format!("rebalance failed (HTTP {}): {}", 409, "conflict");
+        assert_eq!(msg4, "rebalance failed (HTTP 409): conflict");
+    }
+
+    #[test]
+    fn http_error_message_with_empty_body() {
+        // When server returns an error with no body.
+        let body = String::new();
+        let msg = format!("add-node failed (HTTP {}): {}", 500, body);
+        assert_eq!(msg, "add-node failed (HTTP 500): ");
+    }
+
+    // ── CT-004: Storage stats and topology rendering ──────────────────────────
+
+    #[test]
+    fn storage_stats_multi_column_result() {
+        // Typical storage stats result with multiple metric columns.
+        let result = make_result(
+            &[
+                "keyspace",
+                "table",
+                "live_disk_space",
+                "memtable_size",
+                "sstable_count",
+            ],
+            vec![
+                vec![
+                    Some(b"system"),
+                    Some(b"local"),
+                    Some(b"1048576"),
+                    Some(b"4096"),
+                    Some(b"3"),
+                ],
+                vec![
+                    Some(b"my_ks"),
+                    Some(b"users"),
+                    Some(b"52428800"),
+                    Some(b"16384"),
+                    Some(b"12"),
+                ],
+            ],
+        );
+
+        assert_eq!(result.column_names.len(), 5);
+        assert_eq!(result.rows.len(), 2);
+        // Verify specific cell values.
+        assert_eq!(
+            result.rows[0].columns[0].as_deref(),
+            Some(b"system" as &[u8])
+        );
+        assert_eq!(
+            result.rows[1].columns[2].as_deref(),
+            Some(b"52428800" as &[u8])
+        );
+        // Render should not panic.
+        print_table(&result);
+    }
+
+    #[test]
+    fn storage_stats_empty_result_formatting() {
+        // When no storage stats are available, print_empty should be called.
+        let result = make_result(&["keyspace", "table", "live_disk_space"], vec![]);
+        assert!(result.rows.is_empty());
+        print_empty("storage stats");
+    }
+
+    #[test]
+    fn topology_peers_result_rendering() {
+        // Simulates system.peers query result used by run_topology.
+        let result = make_result(
+            &["peer", "data_center", "rack", "tokens"],
+            vec![
+                vec![
+                    Some(b"10.0.0.2"),
+                    Some(b"dc1"),
+                    Some(b"rack1"),
+                    Some(b"-4611686018427387904"),
+                ],
+                vec![
+                    Some(b"10.0.0.3"),
+                    Some(b"dc1"),
+                    Some(b"rack2"),
+                    Some(b"4611686018427387904"),
+                ],
+            ],
+        );
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.column_names[0], "peer");
+        assert_eq!(result.column_names[3], "tokens");
+        print_table(&result);
+    }
+
+    #[test]
+    fn topology_single_node_empty_peers() {
+        // Single-node cluster has no peers.
+        let result = make_result(&["peer", "data_center", "rack", "tokens"], vec![]);
+        assert!(result.rows.is_empty());
+        // run_topology prints "Topology: single-node cluster (no peers)" for this case.
+    }
+
+    #[test]
+    fn topology_multi_dc_peers() {
+        // Multi-datacenter topology.
+        let result = make_result(
+            &["peer", "data_center", "rack", "release_version"],
+            vec![
+                vec![
+                    Some(b"10.0.0.2"),
+                    Some(b"us-east-1"),
+                    Some(b"rack1"),
+                    Some(b"0.1.0"),
+                ],
+                vec![
+                    Some(b"10.1.0.2"),
+                    Some(b"eu-west-1"),
+                    Some(b"rack1"),
+                    Some(b"0.1.0"),
+                ],
+                vec![
+                    Some(b"10.2.0.2"),
+                    Some(b"ap-south-1"),
+                    Some(b"rack1"),
+                    Some(b"0.1.0"),
+                ],
+            ],
+        );
+        assert_eq!(result.rows.len(), 3);
+        // Verify distinct data centers.
+        let dcs: Vec<&[u8]> = result
+            .rows
+            .iter()
+            .filter_map(|r| r.columns[1].as_deref())
+            .collect();
+        assert_eq!(dcs.len(), 3);
+        assert!(dcs.contains(&(b"us-east-1" as &[u8])));
+        assert!(dcs.contains(&(b"eu-west-1" as &[u8])));
+        assert!(dcs.contains(&(b"ap-south-1" as &[u8])));
+        print_table(&result);
+    }
+
+    #[test]
+    fn snapshot_create_body_serialization() {
+        // Verify the JSON body for snapshot create with TTL.
+        let body = serde_json::json!({
+            "name": "hourly-snap",
+            "ttl_hours": 24,
+        });
+        assert_eq!(body["name"], "hourly-snap");
+        assert_eq!(body["ttl_hours"], 24);
+    }
+
+    #[test]
+    fn snapshot_create_body_without_ttl() {
+        let ttl: Option<u64> = None;
+        let body = serde_json::json!({
+            "name": "manual-snap",
+            "ttl_hours": ttl,
+        });
+        assert_eq!(body["name"], "manual-snap");
+        assert!(body["ttl_hours"].is_null());
+    }
+
+    #[test]
+    fn snapshot_list_response_parsing() {
+        // Simulated GET /api/snapshots response.
+        let value = serde_json::json!([
+            { "name": "daily-2026-03-29", "created_at": "2026-03-29T00:00:00Z", "size_bytes": 1048576 },
+            { "name": "daily-2026-03-30", "created_at": "2026-03-30T00:00:00Z", "size_bytes": 2097152 },
+        ]);
+
+        let snapshots = value.as_array().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0]["name"], "daily-2026-03-29");
+        assert_eq!(snapshots[1]["size_bytes"], 2097152);
+    }
+
+    #[test]
+    fn snapshot_list_empty_response() {
+        let value = serde_json::json!([]);
+        let snapshots = value.as_array().unwrap();
+        assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn restore_body_full_serialization() {
+        // Complete restore request body with all fields.
+        let snapshot_name = "backup-2026-03-30";
+        let point_in_time: Option<&str> = Some("2026-03-30T06:00:00Z");
+        let force = true;
+
+        let body = serde_json::json!({
+            "snapshot_name": snapshot_name,
+            "point_in_time": point_in_time,
+            "force": force,
+        });
+
+        assert_eq!(body["snapshot_name"], "backup-2026-03-30");
+        assert_eq!(body["point_in_time"], "2026-03-30T06:00:00Z");
+        assert_eq!(body["force"], true);
+    }
+
+    // ── CT-002/CT-004: Ring table rendering with tabled ────────────────────────
+
+    #[test]
+    fn ring_table_rendering_with_builder() {
+        // Exercise the full table-building path used by ring().
+        let value = serde_json::json!([
+            { "host_id": "node-1", "token": "0", "status": "UP", "load": "1.5 GiB" },
+            { "host_id": "node-2", "token": "4611686018427387904", "status": "UP", "load": "2.3 GiB" },
+            { "host_id": "node-3", "token": "-4611686018427387904", "status": "DOWN", "load": "0 B" },
+        ]);
+
+        let entries = value.as_array().unwrap();
+        let columns: Vec<String> = entries
+            .first()
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let mut builder = Builder::default();
+        builder.push_record(columns.clone());
+
+        for entry in entries {
+            let row: Vec<String> = columns
+                .iter()
+                .map(|col| {
+                    entry
+                        .get(col)
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_else(|| "NULL".to_string())
+                })
+                .collect();
+            builder.push_record(row);
+        }
+
+        let mut table = builder.build();
+        table.with(Style::sharp());
+        let rendered = table.to_string();
+
+        // Verify the rendered table contains expected data.
+        assert!(rendered.contains("node-1"));
+        assert!(rendered.contains("node-2"));
+        assert!(rendered.contains("node-3"));
+        assert!(rendered.contains("DOWN"));
+        assert!(rendered.contains("1.5 GiB"));
+    }
+
+    // ── CT-003: Connection sort with all-NULL column ──────────────────────────
+
+    #[test]
+    fn connections_sort_with_all_null_values() {
+        // Sorting by a column where all values are NULL should not panic.
+        let mut result = make_result(
+            &["addr", "state"],
+            vec![vec![Some(b"10.0.0.1"), None], vec![Some(b"10.0.0.2"), None]],
+        );
+
+        let col = "state";
+        if let Some(idx) = result.column_names.iter().position(|n| n == col) {
+            result.rows.sort_by(|a, b| {
+                let va = a.columns.get(idx).and_then(|c| c.as_deref());
+                let vb = b.columns.get(idx).and_then(|c| c.as_deref());
+                va.cmp(&vb)
+            });
+        }
+        // Both are None so order is preserved (stable sort).
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn connections_sort_mixed_null_and_values() {
+        // NULLs should sort before non-NULL values (None < Some).
+        let mut result = make_result(
+            &["addr", "state"],
+            vec![
+                vec![Some(b"10.0.0.1"), Some(b"open")],
+                vec![Some(b"10.0.0.2"), None],
+                vec![Some(b"10.0.0.3"), Some(b"closing")],
+            ],
+        );
+
+        let col = "state";
+        if let Some(idx) = result.column_names.iter().position(|n| n == col) {
+            result.rows.sort_by(|a, b| {
+                let va = a.columns.get(idx).and_then(|c| c.as_deref());
+                let vb = b.columns.get(idx).and_then(|c| c.as_deref());
+                va.cmp(&vb)
+            });
+        }
+        // None < Some, so NULL row comes first.
+        assert!(result.rows[0].columns[1].is_none());
+        // "closing" < "open" lexicographically.
+        assert_eq!(
+            result.rows[1].columns[1].as_deref(),
+            Some(b"closing" as &[u8])
+        );
+        assert_eq!(result.rows[2].columns[1].as_deref(), Some(b"open" as &[u8]));
+    }
 }

@@ -241,4 +241,83 @@ mod tests {
         assert_eq!(ctx.majority_ips(), vec!["1", "2"]);
         assert_eq!(ctx.minority_ips(), vec!["3"]);
     }
+
+    #[test]
+    fn nemesis_context_5_node_partitioning() {
+        let ctx = NemesisContext {
+            node_ips: vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+            ssh_user: "root".into(),
+            ssh_key_path: PathBuf::from("/tmp/key"),
+            ssh_port: 22,
+        };
+        assert_eq!(ctx.majority_ips().len(), 3);
+        assert_eq!(ctx.minority_ips().len(), 2);
+    }
+
+    #[test]
+    fn nemesis_schedule_serializes() {
+        let sched = NemesisSchedule {
+            nemesis_name: "partition-halves".to_string(),
+            inject_duration: Duration::from_secs(10),
+            heal_duration: Duration::from_secs(30),
+            cycles: 5,
+        };
+        let json = serde_json::to_string(&sched).unwrap();
+        let back: NemesisSchedule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.nemesis_name, "partition-halves");
+        assert_eq!(back.cycles, 5);
+        assert_eq!(back.inject_duration, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn noop_nemesis_has_correct_name() {
+        let noop = NoOp;
+        assert_eq!(noop.name(), "noop");
+    }
+
+    #[test]
+    fn all_phase1_nemeses_have_unique_names() {
+        let reg = NemesisRegistry::phase1();
+        let names = reg.names();
+        let set: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(names.len(), set.len(), "duplicate nemesis names in phase1");
+    }
+
+    #[test]
+    fn all_full_nemeses_have_unique_names() {
+        let reg = NemesisRegistry::full();
+        let names = reg.names();
+        let set: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(
+            names.len(),
+            set.len(),
+            "duplicate nemesis names in full registry"
+        );
+    }
+
+    #[test]
+    fn registry_get_returns_registered_nemesis() {
+        let reg = NemesisRegistry::phase1();
+        assert!(reg.get("noop").is_some());
+        assert!(reg.get("partition-halves").is_some());
+        assert!(reg.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn individual_nemesis_names() {
+        assert_eq!(network::PartitionHalves.name(), "partition-halves");
+        assert_eq!(network::PartitionRing.name(), "partition-ring");
+        assert_eq!(network::PartitionOne.name(), "partition-one");
+        assert_eq!(network::SlowNetwork.name(), "slow-network");
+        assert_eq!(network::JitterNetwork.name(), "jitter-network");
+        assert_eq!(network::PacketLoss.name(), "packet-loss");
+        assert_eq!(process::KillMinority.name(), "kill-minority");
+        assert_eq!(process::KillMajority.name(), "kill-majority");
+        assert_eq!(process::PauseNode.name(), "pause-node");
+        assert_eq!(clock::ClockSkewSmall.name(), "clock-skew-small");
+        assert_eq!(clock::ClockSkewLarge.name(), "clock-skew-large");
+        assert_eq!(clock::ClockStrobe.name(), "clock-strobe");
+        assert_eq!(disk::DiskSlow.name(), "disk-slow");
+        assert_eq!(disk::DiskFail.name(), "disk-fail");
+    }
 }

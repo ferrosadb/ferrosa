@@ -357,3 +357,117 @@ async fn test_create_and_query_indexes() {
     // Cleanup — drop table (DROP KEYSPACE parser support is pending)
     client.query("DROP TABLE idx_test.users").await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// BT-004: Standalone mode startup / CQL serving / shutdown
+// ---------------------------------------------------------------------------
+
+/// BT-004: Boot a server in standalone mode, verify it serves CQL queries,
+/// and shut down cleanly. The CqlServer's start_background returns a
+/// JoinHandle-backed listener — dropping the state and client constitutes
+/// a clean shutdown (the server task ends when the last reference drops).
+#[tokio::test]
+async fn bt004_standalone_startup_cql_and_shutdown() {
+    // 1. Boot server and connect.
+    let (mut client, state, dir) = boot_and_connect().await;
+
+    // 2. Verify CQL is serving: query system.local.
+    let result = client
+        .query("SELECT * FROM system.local")
+        .await
+        .expect("CQL query on system.local must succeed in standalone mode");
+    assert!(
+        !result.rows.is_empty(),
+        "system.local must return at least one row"
+    );
+
+    // Verify essential columns exist.
+    assert!(
+        column_index(&result, "cluster_name").is_some(),
+        "system.local must have cluster_name column"
+    );
+    assert!(
+        column_index(&result, "data_center").is_some(),
+        "system.local must have data_center column"
+    );
+
+    // 3. Verify DDL works: create a keyspace and table.
+    client
+        .query("CREATE KEYSPACE bt004_ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}")
+        .await
+        .expect("CREATE KEYSPACE must succeed in standalone mode");
+    client
+        .query("CREATE TABLE bt004_ks.t (pk text PRIMARY KEY, val text)")
+        .await
+        .expect("CREATE TABLE must succeed in standalone mode");
+
+    // 4. Verify DML: insert and read back.
+    client
+        .query("INSERT INTO bt004_ks.t (pk, val) VALUES ('k1', 'hello')")
+        .await
+        .expect("INSERT must succeed");
+    let select = client
+        .query("SELECT * FROM bt004_ks.t WHERE pk = 'k1'")
+        .await
+        .expect("SELECT must succeed");
+    assert!(
+        !select.rows.is_empty(),
+        "SELECT must return the inserted row"
+    );
+    let val_idx = column_index(&select, "val").expect("'val' column not found");
+    let val = cell_as_str(&select.rows[0], val_idx);
+    assert_eq!(val.as_deref(), Some("hello"), "read-back value must match");
+
+    // 5. Verify multiple queries in sequence (server stays healthy).
+    for i in 0..5 {
+        let q = format!("INSERT INTO bt004_ks.t (pk, val) VALUES ('seq_{i}', 'val_{i}')");
+        client
+            .query(&q)
+            .await
+            .expect("sequential INSERT must succeed");
+    }
+    let count_result = client
+        .query("SELECT * FROM bt004_ks.t")
+        .await
+        .expect("SELECT * must succeed");
+    assert!(
+        count_result.rows.len() >= 6,
+        "expected at least 6 rows (1 + 5 sequential), got {}",
+        count_result.rows.len()
+    );
+
+    // 6. Clean shutdown: drop client and state.
+    drop(client);
+    drop(state);
+    drop(dir);
+    // If we reach here without panic/hang, startup+serve+shutdown is clean.
+}
+
+/// BT-004b: Multiple independent CQL connections can coexist and the server
+/// handles concurrent sessions correctly in standalone mode.
+#[tokio::test]
+async fn bt004_standalone_concurrent_sessions() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(), state.clone());
+    let addr = server.start_background().await.unwrap();
+
+    // Connect 3 clients.
+    let mut clients: Vec<CqlClient> = Vec::new();
+    for _ in 0..3 {
+        let c = CqlClient::connect(addr).await.unwrap();
+        assert!(c.is_ready(), "each client must be ready after connect");
+        clients.push(c);
+    }
+
+    // Each client queries independently.
+    for (i, client) in clients.iter_mut().enumerate() {
+        let result = client
+            .query("SELECT * FROM system.local")
+            .await
+            .unwrap_or_else(|e| panic!("client {i} query failed: {e:?}"));
+        assert!(
+            !result.rows.is_empty(),
+            "client {i} must get rows from system.local"
+        );
+    }
+}
