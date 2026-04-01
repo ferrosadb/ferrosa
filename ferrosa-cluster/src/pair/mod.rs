@@ -12,7 +12,7 @@ pub use node::PairNode;
 use std::net::SocketAddr;
 use uuid::Uuid;
 
-/// Role within a pair. Determined by host_id comparison.
+/// Role within a pair. Determined by connection direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairRole {
     Primary,
@@ -20,8 +20,26 @@ pub enum PairRole {
 }
 
 impl PairRole {
-    /// Determine this node's role by comparing host_ids.
-    /// The higher host_id becomes primary (deterministic, no consensus needed).
+    /// Determine role from connection direction.
+    ///
+    /// - `is_inbound = true`: this node received the connection (seed) → Primary.
+    ///   The seed has data and is the authority.
+    /// - `is_inbound = false`: this node initiated the connection (joiner) → Secondary.
+    ///   The joiner will receive data from the primary.
+    ///
+    /// This is deterministic from the TCP connection direction — no UUID comparison,
+    /// no consensus, no race conditions.
+    pub fn from_connection_direction(is_inbound: bool) -> Self {
+        if is_inbound {
+            Self::Primary
+        } else {
+            Self::Secondary
+        }
+    }
+
+    /// Legacy: Determine this node's role by comparing host_ids.
+    /// Deprecated in favor of [`from_connection_direction`].
+    #[deprecated(note = "use from_connection_direction — UUID election has race conditions")]
     pub fn elect(local_id: Uuid, peer_id: Uuid) -> Self {
         if local_id > peer_id {
             Self::Primary
@@ -80,7 +98,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn elect_primary_higher_id_wins() {
+    fn inbound_connection_becomes_primary() {
+        assert_eq!(
+            PairRole::from_connection_direction(true),
+            PairRole::Primary
+        );
+    }
+
+    #[test]
+    fn outbound_connection_becomes_secondary() {
+        assert_eq!(
+            PairRole::from_connection_direction(false),
+            PairRole::Secondary
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_elect_primary_higher_id_wins() {
         let high = Uuid::from_bytes([0xFF; 16]);
         let low = Uuid::from_bytes([0x00; 16]);
 

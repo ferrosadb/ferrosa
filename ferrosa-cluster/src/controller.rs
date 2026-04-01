@@ -545,15 +545,15 @@ impl ModeController {
             }
         };
 
-        // If this node was force-promoted, override UUID election — stay primary.
-        // If transitioning from standalone, this node is the authoritative source
-        // of data and must be primary regardless of UUID ordering.
+        // Role is determined by connection direction:
+        //   need_reverse = true  → inbound connection → this node is Primary (seed)
+        //   need_reverse = false → outbound connection → this node is Secondary (joiner)
+        // Force-promoted nodes always stay primary regardless of direction.
         let was_promoted = self.force_promoted.swap(false, Ordering::AcqRel);
-        let current_mode = **self.mode.load();
-        let role = if was_promoted || current_mode == DeploymentMode::Standalone {
+        let role = if was_promoted {
             PairRole::Primary
         } else {
-            PairRole::elect(self.local_host_id, peer_host_id)
+            PairRole::from_connection_direction(need_reverse)
         };
         let role_arc = Arc::new(ArcSwap::from_pointee(role));
 
@@ -1974,19 +1974,10 @@ mod tests {
         let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
         controller.set_peer_manager(pm);
 
-        // Connect a peer to enter pair mode (always Primary from standalone).
+        // Outbound connection (on_peer_connected) → this node is Secondary (joiner).
         let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
         controller.on_peer_connected((peer_id, peer_addr));
         assert_eq!(controller.mode(), DeploymentMode::Pair);
-        assert_eq!(controller.role(), Some(PairRole::Primary));
-
-        // Directly swap the role to Secondary to simulate the secondary's view.
-        {
-            let ctx = controller.pair_context.lock().unwrap();
-            let ctx = ctx.as_ref().expect("pair context must exist");
-            ctx.role.store(Arc::new(PairRole::Secondary));
-        }
-
         assert_eq!(controller.role(), Some(PairRole::Secondary));
         assert!(
             !controller.is_cql_ready(),
