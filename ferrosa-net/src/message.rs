@@ -89,6 +89,17 @@ pub enum Message {
         sent_at: u64,
     },
 
+    // Cluster formation
+    /// Invitation to join the cluster, carrying the full known peer list.
+    ClusterInvite {
+        initiator: Uuid,
+        peers: Vec<(Uuid, std::net::SocketAddr)>,
+    },
+    /// Acknowledgment of a ClusterInvite.
+    ClusterInviteAck {
+        host_id: Uuid,
+    },
+
     // Raft — opaque payloads, ferrosa-cluster interprets
     RaftAppendEntries(Bytes),
     RaftAppendResponse(Bytes),
@@ -169,6 +180,8 @@ impl Message {
             Self::HandshakeAck { .. } => MsgType::HandshakeAck,
             Self::Ping { .. } => MsgType::Ping,
             Self::Pong { .. } => MsgType::Pong,
+            Self::ClusterInvite { .. } => MsgType::ClusterInvite,
+            Self::ClusterInviteAck { .. } => MsgType::ClusterInviteAck,
             Self::RaftAppendEntries(_) => MsgType::RaftAppendEntries,
             Self::RaftAppendResponse(_) => MsgType::RaftAppendResponse,
             Self::RaftVote(_) => MsgType::RaftVote,
@@ -257,6 +270,20 @@ impl Message {
                 buf.put_u64(*nonce);
                 buf.put_u64(*ping_recv_at);
                 buf.put_u64(*sent_at);
+            }
+            Self::ClusterInvite { initiator, peers } => {
+                put_uuid(buf, initiator);
+                let count = u32::try_from(peers.len()).map_err(|_| {
+                    NetError::Protocol("cluster invite peer count exceeds u32::MAX".into())
+                })?;
+                buf.put_u32(count);
+                for (id, addr) in peers {
+                    put_uuid(buf, id);
+                    put_string(buf, &addr.to_string())?;
+                }
+            }
+            Self::ClusterInviteAck { host_id } => {
+                put_uuid(buf, host_id);
             }
             Self::PairCatchUp {
                 last_segment_id,
@@ -378,6 +405,29 @@ impl Message {
                     ping_recv_at: body.get_u64(),
                     sent_at: body.get_u64(),
                 }
+            }
+            MsgType::ClusterInvite => {
+                let initiator = get_uuid(body)?;
+                if body.remaining() < 4 {
+                    return Err(NetError::Protocol(
+                        "truncated cluster invite peer count".into(),
+                    ));
+                }
+                let count = body.get_u32() as usize;
+                let mut peers = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let id = get_uuid(body)?;
+                    let addr_str = get_string(body)?;
+                    let addr: std::net::SocketAddr = addr_str.parse().map_err(|_| {
+                        NetError::Protocol(format!("invalid socket address: {addr_str}"))
+                    })?;
+                    peers.push((id, addr));
+                }
+                Self::ClusterInvite { initiator, peers }
+            }
+            MsgType::ClusterInviteAck => {
+                let host_id = get_uuid(body)?;
+                Self::ClusterInviteAck { host_id }
             }
             MsgType::PairCatchUp => {
                 if body.remaining() < 12 {
@@ -571,6 +621,59 @@ mod tests {
         msg.encode(&mut buf).unwrap();
         let decoded = Message::decode(MsgType::IndexBuildComplete, &mut buf.freeze()).unwrap();
         assert_eq!(decoded, Message::IndexBuildComplete(payload));
+    }
+
+    #[test]
+    fn test_cluster_invite_encode_decode_roundtrip() {
+        let peers = vec![
+            (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap()),
+            (Uuid::new_v4(), "10.0.0.2:7000".parse().unwrap()),
+            (Uuid::new_v4(), "[::1]:7000".parse().unwrap()),
+        ];
+        let msg = Message::ClusterInvite {
+            initiator: Uuid::new_v4(),
+            peers: peers.clone(),
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::ClusterInvite, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_cluster_invite_ack_encode_decode_roundtrip() {
+        let host_id = Uuid::new_v4();
+        let msg = Message::ClusterInviteAck { host_id };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::ClusterInviteAck, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_cluster_invite_empty_peers() {
+        let msg = Message::ClusterInvite {
+            initiator: Uuid::new_v4(),
+            peers: vec![],
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::ClusterInvite, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_cluster_invite_msg_type() {
+        let msg = Message::ClusterInvite {
+            initiator: Uuid::new_v4(),
+            peers: vec![],
+        };
+        assert_eq!(msg.msg_type(), MsgType::ClusterInvite);
+
+        let msg = Message::ClusterInviteAck {
+            host_id: Uuid::new_v4(),
+        };
+        assert_eq!(msg.msg_type(), MsgType::ClusterInviteAck);
     }
 
     proptest! {
