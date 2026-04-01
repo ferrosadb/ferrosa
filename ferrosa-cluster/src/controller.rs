@@ -789,7 +789,7 @@ impl ModeController {
         self.mode.store(Arc::new(DeploymentMode::Forming));
         // Block DDL during formation — prevents schema divergence (FMEA F3, RPN 378).
         // DDL will be re-enabled after Raft leader election in transition_to_cluster.
-        self.ddl_path.store(Arc::new(DdlPath::Unavailable));
+        self.ddl_path.store(Arc::new(DdlPath::Blocked));
         self.formation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.seen_invite_initiators.lock().clear();

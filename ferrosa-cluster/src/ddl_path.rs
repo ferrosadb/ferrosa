@@ -45,6 +45,12 @@ pub enum DdlPath {
         /// the same up-to-date mapping without a separate sync mechanism.
         node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
     },
+    /// Blocked: cluster formation in progress (Forming state).
+    ///
+    /// DDL is rejected because the node has left Pair mode but Raft has not
+    /// yet elected a leader.  Any DDL applied now would use `Direct` path
+    /// and never replicate, causing silent schema divergence (FMEA F3).
+    Blocked,
     /// Degraded: peer lost, DDL rejected until operator promotes.
     Unavailable,
 }
@@ -109,6 +115,10 @@ impl DdlPath {
                     Err(other) => Err(other),
                 }
             }
+            Self::Blocked => Err(ClusterError::Internal(
+                "DDL unavailable: cluster formation in progress, retry after Raft leader election"
+                    .into(),
+            )),
             Self::Unavailable => Err(ClusterError::Internal(
                 "DDL unavailable: peer lost, wait for operator action".into(),
             )),
@@ -848,6 +858,18 @@ mod tests {
     /// This is a pure unit test that does NOT require a live Raft instance
     /// because openraft's `Raft::new` is async and needs a running cluster.
     /// We verify the message-type guard in the handler at the codec level.
+    #[tokio::test]
+    async fn test_blocked_ddl_path_returns_error() {
+        let ddl = DdlPath::Blocked;
+        let op = DdlOperation::CreateKeyspace(simple_keyspace("should_fail"));
+        let err = ddl.execute(op).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("formation in progress"),
+            "Blocked error must mention 'formation in progress', got: {msg}"
+        );
+    }
+
     #[test]
     fn ddl_operation_from_bytes_handles_malformed_payload() {
         // Confirm that a garbage payload produces an error, not a panic.
