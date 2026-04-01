@@ -1709,6 +1709,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promote_from_degraded_pair_restores_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let schema = test_schema();
+        let config = Arc::new(ClusterConfig::default());
+        let net_config = Arc::new(NetConfig::default());
+        let local_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) = ModeController::new(
+            config,
+            net_config.clone(),
+            local_id,
+            storage,
+            schema,
+            registry,
+        );
+
+        let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+        controller.set_peer_manager(pm);
+
+        // Enter pair mode via inbound connection (Primary)
+        let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        controller.on_inbound_peer((peer_id, peer_addr));
+        assert_eq!(controller.mode(), DeploymentMode::Pair);
+        assert_eq!(controller.role(), Some(PairRole::Primary));
+
+        // Peer disconnects → DegradedPair
+        controller.on_peer_disconnected((peer_id, peer_addr));
+        assert_eq!(controller.mode(), DeploymentMode::DegradedPair);
+        // Pair context preserved
+        assert!(controller.role().is_some());
+
+        // Operator promotes → Standalone Primary with direct writes
+        controller.force_promote().unwrap();
+        assert_eq!(controller.mode(), DeploymentMode::Standalone);
+        assert!(controller.force_promoted.load(Ordering::Acquire));
+        assert!(controller.is_cql_ready());
+
+        // When old primary reconnects (outbound), this node stays Primary
+        // because force_promoted flag overrides connection direction
+    }
+
+    #[tokio::test]
+    async fn degraded_pair_serves_stale_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let schema = test_schema();
+        let config = Arc::new(ClusterConfig::default());
+        let net_config = Arc::new(NetConfig::default());
+        let local_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+
+        let registry = Arc::new(HandlerRegistry::new());
+        let (controller, _handles) = ModeController::new(
+            config,
+            net_config.clone(),
+            local_id,
+            storage,
+            schema,
+            registry,
+        );
+
+        let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+        controller.set_peer_manager(pm);
+
+        // Enter pair mode
+        let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        controller.on_inbound_peer((peer_id, peer_addr));
+        assert_eq!(controller.mode(), DeploymentMode::Pair);
+
+        // Peer disconnects → DegradedPair
+        controller.on_peer_disconnected((peer_id, peer_addr));
+        assert_eq!(controller.mode(), DeploymentMode::DegradedPair);
+
+        // CQL is still ready (stale reads available)
+        assert!(controller.is_cql_ready());
+    }
+
+    #[tokio::test]
     async fn second_peer_transitions_to_cluster() {
         let dir = tempfile::tempdir().unwrap();
 
