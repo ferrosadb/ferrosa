@@ -1416,8 +1416,25 @@ impl PeerEventListener for ModeController {
             DeploymentMode::Forming => {
                 tracing::info!(peer = %host_id, "peer connected during formation");
             }
-            DeploymentMode::DegradedPair | DeploymentMode::DegradedCluster => {
-                tracing::info!(peer = %host_id, "peer connected in degraded mode");
+            DeploymentMode::DegradedPair => {
+                tracing::info!(peer = %host_id, "peer reconnected in degraded pair mode");
+            }
+            DeploymentMode::DegradedCluster => {
+                // Check if quorum is restored
+                let connected = self.connected_peers.lock().len();
+                let total = connected + 1;
+                let quorum = (total / 2) + 1;
+                if connected + 1 >= quorum {
+                    tracing::info!(
+                        connected,
+                        quorum,
+                        "quorum restored — transitioning back to Cluster"
+                    );
+                    self.mode.store(Arc::new(DeploymentMode::Cluster));
+                    // Raft will resume accepting writes once leader is re-elected.
+                    // Write path and DDL path are restored by the Raft leader
+                    // election callback (already in transition_to_cluster's async task).
+                }
             }
         }
     }
@@ -1433,10 +1450,35 @@ impl PeerEventListener for ModeController {
         }
 
         let current_mode = **self.mode.load();
-        if current_mode == DeploymentMode::Pair {
-            self.transition_to_degraded();
+        match current_mode {
+            DeploymentMode::Pair => {
+                self.transition_to_degraded();
+            }
+            DeploymentMode::Cluster => {
+                // Check if remaining connected peers can form a quorum.
+                // Quorum = (total_members / 2) + 1. If connected < quorum - 1
+                // (minus self), we've lost quorum.
+                let connected = self.connected_peers.lock().len();
+                // Total members = connected peers + self
+                let total = connected + 1;
+                let quorum = (total / 2) + 1;
+                // We need at least quorum - 1 connected peers (self counts as 1)
+                if connected + 1 < quorum {
+                    tracing::warn!(
+                        connected,
+                        total,
+                        quorum,
+                        "quorum lost — transitioning to DegradedCluster"
+                    );
+                    self.mode.store(Arc::new(DeploymentMode::DegradedCluster));
+                    self.write_path.store(Arc::new(WritePath::unavailable()));
+                    // DDL unavailable without quorum
+                    self.ddl_path.store(Arc::new(DdlPath::Unavailable));
+                }
+                // If quorum intact, Raft handles it — no mode change needed.
+            }
+            _ => {}
         }
-        // In Cluster mode, node departure is handled by Raft — no automatic downgrade.
     }
 
     fn on_peer_suspected(&self, peer: PeerId) {
