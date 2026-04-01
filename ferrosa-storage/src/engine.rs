@@ -60,6 +60,10 @@ pub struct StorageEngineConfig {
     pub object_store: Option<ObjectStoreConfig>,
     pub local_cache_max_bytes: u64,
     pub flush_threshold_bytes: u64,
+    /// Maximum age (seconds) of unflushed memtable data before a time-based
+    /// flush is triggered, regardless of size. Protects small/infrequent
+    /// tables from data loss on restart. Default: 30 seconds.
+    pub flush_max_age_secs: u64,
     pub data_dir: PathBuf,
 }
 
@@ -90,12 +94,18 @@ impl StorageEngineConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(64 * 1024 * 1024); // 64 MB default
 
+        let flush_max_age_secs = std::env::var("FERROSA_FLUSH_MAX_AGE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30); // 30 seconds default
+
         Ok(Self {
             commit_log,
             compaction,
             object_store,
             local_cache_max_bytes,
             flush_threshold_bytes,
+            flush_max_age_secs,
             data_dir,
         })
     }
@@ -109,6 +119,7 @@ impl StorageEngineConfig {
             object_store: None,
             local_cache_max_bytes: 1024 * 1024, // 1 MB
             flush_threshold_bytes: 4096,        // 4 KB — triggers flush quickly in tests
+            flush_max_age_secs: 5,              // 5s — fast age-based flush in tests
             data_dir: dir.to_path_buf(),
         }
     }
@@ -158,6 +169,11 @@ struct TableState {
     /// SSTable IDs that are currently pinned on NVMe, in oldest-first order.
     /// Each entry is `(sstable_id, size_bytes)`.
     pinned_sstables: Vec<(String, u64)>,
+    /// Timestamp of the first write to the current (unflushed) memtable.
+    /// Reset to `None` after each flush. Used by `flush_if_needed` to trigger
+    /// time-based flushes for small, infrequently-updated tables.
+    /// Behind `Mutex` so writers can update it under a read lock on `tables`.
+    first_unflushed_write_at: parking_lot::Mutex<Option<std::time::Instant>>,
     /// Latest commit log position written for this table. Updated on every
     /// write; passed to `commit_log.discard_completed()` after flush so that
     /// fully-flushed segments can be GC'd. Without this, closed segments
@@ -700,6 +716,7 @@ impl StorageEngine {
             store,
             pin_config: None,
             pinned_sstables: Vec::new(),
+            first_unflushed_write_at: parking_lot::Mutex::new(None),
             last_commit_log_position: parking_lot::Mutex::new(None),
         };
         self.tables.write().insert(table_id, state);
@@ -1056,6 +1073,7 @@ impl StorageEngine {
         })?;
         state.store.write(key, row)?;
         *state.last_commit_log_position.lock() = Some(cl_pos);
+        state.first_unflushed_write_at.lock().get_or_insert_with(std::time::Instant::now);
         drop(tables);
 
         // 3. Notify observers after successful commit log + memtable write.
@@ -1102,6 +1120,7 @@ impl StorageEngine {
                 })?;
                 state.store.write(&key, row)?;
                 *state.last_commit_log_position.lock() = Some(cl_pos);
+                state.first_unflushed_write_at.lock().get_or_insert_with(std::time::Instant::now);
             }
 
             // Notify observers after successful commit log + memtable write.
@@ -1151,6 +1170,7 @@ impl StorageEngine {
             }
             if let Some(&cl_pos) = positions.get(&table_id) {
                 *state.last_commit_log_position.lock() = Some(cl_pos);
+                state.first_unflushed_write_at.lock().get_or_insert_with(std::time::Instant::now);
             }
         }
         drop(tables);
@@ -1495,6 +1515,10 @@ impl StorageEngine {
 
             state.store.flush()?;
 
+            // Reset the unflushed-write timestamp so the next write starts a
+            // fresh age window. This must happen after flush() succeeds.
+            *state.first_unflushed_write_at.lock() = None;
+
             // Eager index build: submit high-priority index rebuild for the newly
             // flushed SSTable. This keeps the MemtableIndex (Layer 4) bounded to
             // 0-1 entries in steady state by ensuring sidecar indexes are current.
@@ -1583,13 +1607,23 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Flushes all tables that exceed the configured memtable size threshold.
+    /// Flushes tables that exceed the size threshold OR have unflushed data
+    /// older than `flush_max_age_secs`. The time-based trigger ensures small,
+    /// infrequently-updated tables are durable within a bounded window.
     pub fn flush_if_needed(&self) -> ferrosa_common::Result<()> {
+        let now = std::time::Instant::now();
+        let max_age = std::time::Duration::from_secs(self.config.flush_max_age_secs);
         let tables = self.tables.read();
         let to_flush: Vec<TableId> = tables
             .iter()
             .filter(|(_, state)| {
-                state.store.memtable_size() as u64 >= self.config.flush_threshold_bytes
+                let size_exceeded =
+                    state.store.memtable_size() as u64 >= self.config.flush_threshold_bytes;
+                let age_exceeded = state
+                    .first_unflushed_write_at
+                    .lock()
+                    .is_some_and(|t| now.duration_since(t) >= max_age);
+                size_exceeded || (age_exceeded && state.store.memtable_size() > 0)
             })
             .map(|(id, _)| id.clone())
             .collect();

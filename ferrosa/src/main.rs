@@ -279,10 +279,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&data_dir)?;
     let host_id = load_or_generate_host_id(Path::new(&data_dir));
 
-    // 3. Create StorageEngine
+    // 3. Create StorageEngine — use open() on restart to replay commit log
     let storage_config = ferrosa_storage::StorageEngineConfig::from_env()?;
     let rt = tokio::runtime::Handle::current();
-    let storage = ferrosa_storage::StorageEngine::new(storage_config, Some(&rt))?;
+    let has_commitlog_segments = storage_config
+        .commit_log
+        .log_dir
+        .exists()
+        && std::fs::read_dir(&storage_config.commit_log.log_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| {
+                        e.path()
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map_or(false, |n| {
+                                n.starts_with("commitlog-") && n.ends_with(".log")
+                            })
+                    })
+            })
+            .unwrap_or(false);
+
+    let (storage, pending_mutations) = if has_commitlog_segments {
+        tracing::info!("existing commit log segments found — replaying for crash recovery");
+        let (engine, mutations) =
+            ferrosa_storage::StorageEngine::open(storage_config, Some(&rt))?;
+        tracing::info!(
+            mutation_count = mutations.len(),
+            "commit log replay collected pending mutations"
+        );
+        (engine, mutations)
+    } else {
+        let engine = ferrosa_storage::StorageEngine::new(storage_config, Some(&rt))?;
+        (engine, Vec::new())
+    };
     // Probe object store for conditional put support (CAS).
     // RustFS/MinIO may not support etag-based conditional writes — log a
     // warning but continue. The manifest CAS retry loop will still attempt
@@ -354,6 +385,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             // Persist the S3 schema locally so future restarts don't need S3
             persist_schema_locally(data_path, &schema);
+        }
+    }
+
+    // 4c. Replay pending commit log mutations now that tables are registered.
+    if !pending_mutations.is_empty() {
+        tracing::info!(
+            count = pending_mutations.len(),
+            "replaying commit log mutations into memtables"
+        );
+        if let Err(e) = storage.replay_mutations(pending_mutations) {
+            tracing::error!(%e, "commit log replay failed — some data may be lost");
+        } else {
+            tracing::info!("commit log replay complete — all pending mutations restored");
         }
     }
 
