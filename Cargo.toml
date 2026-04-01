@@ -15,6 +15,7 @@ members = [
     "ferrosa-udf",
     "ferrosa-worker",
     "ferrosa-jepsen",
+    "ferrosa-loadgen",
 ]
 
 [workspace.package]
