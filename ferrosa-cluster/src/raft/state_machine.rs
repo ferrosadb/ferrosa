@@ -596,13 +596,13 @@ impl FerrosStateMachine {
                     // The command is still committed to the Raft log (it's
                     // already been replicated), but the state machine ignores it.
                 } else {
-                let node_id = super::uuid_to_node_id(node_info.host_id);
-                self.state.members.insert(node_id, node_info);
-                self.sync_ring();
-                // Mark the new node as Building for all existing indexes.
-                for statuses in self.state.index_state_map.values_mut() {
-                    statuses.entry(node_id).or_insert(IndexNodeStatus::Building);
-                }
+                    let node_id = super::uuid_to_node_id(node_info.host_id);
+                    self.state.members.insert(node_id, node_info);
+                    self.sync_ring();
+                    // Mark the new node as Building for all existing indexes.
+                    for statuses in self.state.index_state_map.values_mut() {
+                        statuses.entry(node_id).or_insert(IndexNodeStatus::Building);
+                    }
                 }
             }
             RaftOp::LeaveNode { node_id } => {
@@ -1551,7 +1551,8 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
-            flush_threshold_bytes: 4096, flush_max_age_secs: 5,
+            flush_threshold_bytes: 4096,
+            flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
         };
         Arc::new(StorageEngine::new(config, None).unwrap())

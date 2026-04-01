@@ -676,8 +676,8 @@ mod tests {
         // panic on subtraction. This happens during load tests where synthetic
         // timestamps are small integers (e.g., 1000).
         let header = SerializationHeader {
-            min_timestamp: 1000,                  // << TIMESTAMP_EPOCH
-            min_local_deletion_time: 0,           // << DELETION_TIME_EPOCH
+            min_timestamp: 1000,        // << TIMESTAMP_EPOCH
+            min_local_deletion_time: 0, // << DELETION_TIME_EPOCH
             min_ttl: 0,
             max_timestamp: 5000,
             key_type: "T".into(),

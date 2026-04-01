@@ -1073,7 +1073,10 @@ impl StorageEngine {
         })?;
         state.store.write(key, row)?;
         *state.last_commit_log_position.lock() = Some(cl_pos);
-        state.first_unflushed_write_at.lock().get_or_insert_with(std::time::Instant::now);
+        state
+            .first_unflushed_write_at
+            .lock()
+            .get_or_insert_with(std::time::Instant::now);
         drop(tables);
 
         // 3. Notify observers after successful commit log + memtable write.
@@ -1120,7 +1123,10 @@ impl StorageEngine {
                 })?;
                 state.store.write(&key, row)?;
                 *state.last_commit_log_position.lock() = Some(cl_pos);
-                state.first_unflushed_write_at.lock().get_or_insert_with(std::time::Instant::now);
+                state
+                    .first_unflushed_write_at
+                    .lock()
+                    .get_or_insert_with(std::time::Instant::now);
             }
 
             // Notify observers after successful commit log + memtable write.
@@ -1170,7 +1176,10 @@ impl StorageEngine {
             }
             if let Some(&cl_pos) = positions.get(&table_id) {
                 *state.last_commit_log_position.lock() = Some(cl_pos);
-                state.first_unflushed_write_at.lock().get_or_insert_with(std::time::Instant::now);
+                state
+                    .first_unflushed_write_at
+                    .lock()
+                    .get_or_insert_with(std::time::Instant::now);
             }
         }
         drop(tables);

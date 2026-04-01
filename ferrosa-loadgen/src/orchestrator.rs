@@ -11,9 +11,7 @@ use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::commitlog::TableId;
 use ferrosa_storage::engine::StorageEngine;
 
-use crate::generator::{
-    choose_op, choose_value_len, make_key_string, make_random_value, OpType,
-};
+use crate::generator::{choose_op, choose_value_len, make_key_string, make_random_value, OpType};
 use crate::ground_truth::GroundTruth;
 use crate::integrity::IntegrityVerifier;
 use crate::profile::LoadProfile;

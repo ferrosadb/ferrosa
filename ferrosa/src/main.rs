@@ -282,29 +282,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Create StorageEngine — use open() on restart to replay commit log
     let storage_config = ferrosa_storage::StorageEngineConfig::from_env()?;
     let rt = tokio::runtime::Handle::current();
-    let has_commitlog_segments = storage_config
-        .commit_log
-        .log_dir
-        .exists()
+    let has_commitlog_segments = storage_config.commit_log.log_dir.exists()
         && std::fs::read_dir(&storage_config.commit_log.log_dir)
             .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .any(|e| {
-                        e.path()
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .map_or(false, |n| {
-                                n.starts_with("commitlog-") && n.ends_with(".log")
-                            })
-                    })
+                entries.filter_map(|e| e.ok()).any(|e| {
+                    e.path()
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map_or(false, |n| {
+                            n.starts_with("commitlog-") && n.ends_with(".log")
+                        })
+                })
             })
             .unwrap_or(false);
 
     let (storage, pending_mutations) = if has_commitlog_segments {
         tracing::info!("existing commit log segments found — replaying for crash recovery");
-        let (engine, mutations) =
-            ferrosa_storage::StorageEngine::open(storage_config, Some(&rt))?;
+        let (engine, mutations) = ferrosa_storage::StorageEngine::open(storage_config, Some(&rt))?;
         tracing::info!(
             mutation_count = mutations.len(),
             "commit log replay collected pending mutations"

@@ -42,7 +42,10 @@ fn binary_help() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--tui"), "should document --tui flag");
-    assert!(stdout.contains("--profile"), "should document --profile flag");
+    assert!(
+        stdout.contains("--profile"),
+        "should document --profile flag"
+    );
     assert!(
         stdout.contains("--duration"),
         "should document --duration flag"
@@ -79,11 +82,26 @@ fn binary_short_load_test() {
 
     // Verify report sections are present regardless of exit code.
     // The binary always prints a report, even if integrity fails.
-    assert!(stdout.contains("Throughput"), "report should have Throughput section");
-    assert!(stdout.contains("Latency"), "report should have Latency section");
-    assert!(stdout.contains("Storage"), "report should have Storage section");
-    assert!(stdout.contains("Memory (RSS)"), "report should have Memory section");
-    assert!(stdout.contains("Integrity"), "report should have Integrity section");
+    assert!(
+        stdout.contains("Throughput"),
+        "report should have Throughput section"
+    );
+    assert!(
+        stdout.contains("Latency"),
+        "report should have Latency section"
+    );
+    assert!(
+        stdout.contains("Storage"),
+        "report should have Storage section"
+    );
+    assert!(
+        stdout.contains("Memory (RSS)"),
+        "report should have Memory section"
+    );
+    assert!(
+        stdout.contains("Integrity"),
+        "report should have Integrity section"
+    );
     assert!(
         stdout.contains("Resource Leak Detection"),
         "report should have Resource Leak Detection section"

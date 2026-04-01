@@ -19,7 +19,8 @@ fn setup_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
         compaction: CompactionConfig::from_env(dir.path().join("compaction")),
         object_store: None,
         local_cache_max_bytes: 1024 * 1024,
-        flush_threshold_bytes: 4096, flush_max_age_secs: 5,
+        flush_threshold_bytes: 4096,
+        flush_max_age_secs: 5,
         data_dir: dir.path().to_path_buf(),
     };
     let engine = Arc::new(StorageEngine::new(config, None).unwrap());
@@ -237,7 +238,8 @@ fn bootstrap_empty_sstables_uses_raft() {
         compaction: CompactionConfig::from_env(dir.path().join("compaction")),
         object_store: None,
         local_cache_max_bytes: 1024 * 1024,
-        flush_threshold_bytes: 4096, flush_max_age_secs: 5,
+        flush_threshold_bytes: 4096,
+        flush_max_age_secs: 5,
         data_dir: dir.path().to_path_buf(),
     };
     let engine = Arc::new(StorageEngine::new(config, None).unwrap());

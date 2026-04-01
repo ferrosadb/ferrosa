@@ -170,7 +170,8 @@ fn main() {
         compaction: CompactionConfig::from_env(args.data_dir.join("compaction")),
         object_store,
         local_cache_max_bytes: profile.local_cache_max_bytes,
-        flush_threshold_bytes: profile.flush_threshold_bytes, flush_max_age_secs: 30,
+        flush_threshold_bytes: profile.flush_threshold_bytes,
+        flush_max_age_secs: 30,
         data_dir: args.data_dir.clone(),
     };
 

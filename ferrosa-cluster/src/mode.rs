@@ -186,7 +186,10 @@ mod tests {
         assert_eq!(format!("{}", DeploymentMode::Forming), "forming");
         assert_eq!(format!("{}", DeploymentMode::Cluster), "cluster");
         assert_eq!(format!("{}", DeploymentMode::DegradedPair), "degraded-pair");
-        assert_eq!(format!("{}", DeploymentMode::DegradedCluster), "degraded-cluster");
+        assert_eq!(
+            format!("{}", DeploymentMode::DegradedCluster),
+            "degraded-cluster"
+        );
     }
 
     #[test]

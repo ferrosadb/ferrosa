@@ -371,7 +371,11 @@ impl ModeController {
         // Drain all tracked tasks (with a timeout so we don't hang forever).
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut tasks = self.background_tasks.lock();
-        while let Some(result) = tokio::time::timeout_at(deadline, tasks.join_next()).await.ok().flatten() {
+        while let Some(result) = tokio::time::timeout_at(deadline, tasks.join_next())
+            .await
+            .ok()
+            .flatten()
+        {
             match result {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
@@ -833,7 +837,9 @@ impl ModeController {
         self.seen_invite_initiators.lock().clear();
         tracing::info!(
             peer_count = peers.len(),
-            epoch = self.formation_epoch.load(std::sync::atomic::Ordering::Relaxed),
+            epoch = self
+                .formation_epoch
+                .load(std::sync::atomic::Ordering::Relaxed),
             "mode transition: pair -> forming (broadcasting ClusterInvite)"
         );
 
@@ -1627,7 +1633,8 @@ mod tests {
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
-            flush_threshold_bytes: 4096, flush_max_age_secs: 5,
+            flush_threshold_bytes: 4096,
+            flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
@@ -1729,7 +1736,10 @@ mod tests {
         // Degraded preserves pair context — mode is DegradedPair, not Standalone
         assert_eq!(controller.mode(), DeploymentMode::DegradedPair);
         // Pair context is preserved for automatic recovery
-        assert!(controller.role().is_some(), "pair context must be preserved in degraded mode");
+        assert!(
+            controller.role().is_some(),
+            "pair context must be preserved in degraded mode"
+        );
     }
 
     #[test]

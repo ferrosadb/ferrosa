@@ -138,7 +138,11 @@ impl ResourceMonitor {
         self.check_monotonic("tcp_sockets", |s| s.tcp_sockets, &mut warnings);
         self.check_monotonic("unix_sockets", |s| s.unix_sockets, &mut warnings);
         self.check_monotonic("thread_count", |s| s.thread_count, &mut warnings);
-        self.check_monotonic("commit_log_segments", |s| s.commit_log_closed_segments, &mut warnings);
+        self.check_monotonic(
+            "commit_log_segments",
+            |s| s.commit_log_closed_segments,
+            &mut warnings,
+        );
         self.check_monotonic("tmp_files", |s| s.tmp_files, &mut warnings);
 
         // For FDs: check growth relative to SSTable count. If FDs grow but
@@ -284,7 +288,12 @@ impl fmt::Display for ResourceSummary {
         write_delta_mb(f, "RSS", self.rss_baseline, self.rss_final)?;
         write_delta_mb(f, "VSZ", self.vsz_baseline, self.vsz_final)?;
         write_delta(f, "TCP sockets", self.tcp_baseline, self.tcp_final)?;
-        write_delta(f, "CL segments", self.segments_baseline, self.segments_final)?;
+        write_delta(
+            f,
+            "CL segments",
+            self.segments_baseline,
+            self.segments_final,
+        )?;
         write_delta(f, "SSTables", self.sstables_baseline, self.sstables_final)?;
         write_delta(f, "Threads", self.threads_baseline, self.threads_final)?;
 
@@ -296,7 +305,12 @@ impl fmt::Display for ResourceSummary {
     }
 }
 
-fn write_delta(f: &mut fmt::Formatter<'_>, label: &str, baseline: u64, final_val: u64) -> fmt::Result {
+fn write_delta(
+    f: &mut fmt::Formatter<'_>,
+    label: &str,
+    baseline: u64,
+    final_val: u64,
+) -> fmt::Result {
     let delta = final_val as i64 - baseline as i64;
     let sign = if delta >= 0 { "+" } else { "" };
     writeln!(
@@ -306,7 +320,12 @@ fn write_delta(f: &mut fmt::Formatter<'_>, label: &str, baseline: u64, final_val
     )
 }
 
-fn write_delta_mb(f: &mut fmt::Formatter<'_>, label: &str, baseline: u64, final_val: u64) -> fmt::Result {
+fn write_delta_mb(
+    f: &mut fmt::Formatter<'_>,
+    label: &str,
+    baseline: u64,
+    final_val: u64,
+) -> fmt::Result {
     let delta = final_val as i64 - baseline as i64;
     let sign = if delta >= 0 { "+" } else { "" };
     writeln!(
@@ -324,10 +343,7 @@ fn write_delta_mb(f: &mut fmt::Formatter<'_>, label: &str, baseline: u64, final_
 // ---------------------------------------------------------------------------
 
 /// Sample all resource counters for the current process.
-pub fn sample_resources(
-    commit_log_closed_segments: u64,
-    sstable_count: u64,
-) -> ResourceSnapshot {
+pub fn sample_resources(commit_log_closed_segments: u64, sstable_count: u64) -> ResourceSnapshot {
     ResourceSnapshot {
         open_fds: count_open_fds(),
         fd_limit: get_fd_limit(),
@@ -562,9 +578,7 @@ mod tests {
                 match verdict {
                     LeakVerdict::Warning(ref warnings) => {
                         assert!(
-                            warnings
-                                .iter()
-                                .any(|w| w.resource == "commit_log_segments"),
+                            warnings.iter().any(|w| w.resource == "commit_log_segments"),
                             "expected commit_log_segments warning, got: {warnings:?}"
                         );
                     }
@@ -648,7 +662,11 @@ mod tests {
     fn sample_resources_returns_valid_snapshot() {
         let snap = sample_resources(3, 10);
         // FD count should be at least 3 (stdin/stdout/stderr).
-        assert!(snap.open_fds >= 3, "expected >= 3 FDs, got {}", snap.open_fds);
+        assert!(
+            snap.open_fds >= 3,
+            "expected >= 3 FDs, got {}",
+            snap.open_fds
+        );
         // FD limit should be > 0.
         assert!(snap.fd_limit > 0);
         // Engine-provided values should pass through.

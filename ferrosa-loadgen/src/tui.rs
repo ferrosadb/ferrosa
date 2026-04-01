@@ -129,7 +129,7 @@ fn draw_dashboard(f: &mut Frame, data: &TuiFrame) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
+            Constraint::Length(3), // header
             Constraint::Min(10),   // body
             Constraint::Length(3), // footer
         ])
@@ -158,7 +158,11 @@ fn draw_header(f: &mut Frame, area: Rect, data: &TuiFrame) {
         .block(
             Block::default()
                 .title(" ferrosa-loadgen ")
-                .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                .title_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
@@ -178,8 +182,8 @@ fn draw_body(f: &mut Frame, area: Rect, data: &TuiFrame) {
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),  // throughput
-            Constraint::Length(8),  // latency
+            Constraint::Length(8), // throughput
+            Constraint::Length(8), // latency
             Constraint::Min(4),    // sparkline
         ])
         .split(columns[0]);
@@ -187,7 +191,7 @@ fn draw_body(f: &mut Frame, area: Rect, data: &TuiFrame) {
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),  // storage
+            Constraint::Length(9), // storage
             Constraint::Min(4),    // resources
         ])
         .split(columns[1]);
@@ -201,8 +205,16 @@ fn draw_body(f: &mut Frame, area: Rect, data: &TuiFrame) {
 
 fn draw_throughput(f: &mut Frame, area: Rect, data: &TuiFrame) {
     let lines = vec![
-        kv_line("Writes/sec", &format!("{:.0}", data.writes_per_sec), Color::Green),
-        kv_line("Reads/sec", &format!("{:.0}", data.reads_per_sec), Color::Blue),
+        kv_line(
+            "Writes/sec",
+            &format!("{:.0}", data.writes_per_sec),
+            Color::Green,
+        ),
+        kv_line(
+            "Reads/sec",
+            &format!("{:.0}", data.reads_per_sec),
+            Color::Blue,
+        ),
         kv_line(
             "Total ops",
             &format!(
@@ -225,7 +237,10 @@ fn draw_throughput(f: &mut Frame, area: Rect, data: &TuiFrame) {
         ),
         kv_line(
             "Throughput",
-            &format!("{:.1} MB/s", data.bytes_written as f64 / data.elapsed_secs.max(0.001) / (1024.0 * 1024.0)),
+            &format!(
+                "{:.1} MB/s",
+                data.bytes_written as f64 / data.elapsed_secs.max(0.001) / (1024.0 * 1024.0)
+            ),
             Color::Yellow,
         ),
     ];
@@ -249,21 +264,49 @@ fn draw_latency(f: &mut Frame, area: Rect, data: &TuiFrame) {
         ]),
         Line::from(vec![
             Span::styled("Write    ", Style::default().fg(Color::Green)),
-            Span::styled(format!("{:>6.1}ms  ", w.p50_us as f64 / 1000.0), Style::default()),
-            Span::styled(format!("{:>6.1}ms  ", w.p95_us as f64 / 1000.0), latency_color(w.p95_us)),
-            Span::styled(format!("{:>6.1}ms  ", w.p99_us as f64 / 1000.0), latency_color(w.p99_us)),
-            Span::styled(format!("{:>6.1}ms", w.p100_us as f64 / 1000.0), latency_color(w.p100_us)),
+            Span::styled(
+                format!("{:>6.1}ms  ", w.p50_us as f64 / 1000.0),
+                Style::default(),
+            ),
+            Span::styled(
+                format!("{:>6.1}ms  ", w.p95_us as f64 / 1000.0),
+                latency_color(w.p95_us),
+            ),
+            Span::styled(
+                format!("{:>6.1}ms  ", w.p99_us as f64 / 1000.0),
+                latency_color(w.p99_us),
+            ),
+            Span::styled(
+                format!("{:>6.1}ms", w.p100_us as f64 / 1000.0),
+                latency_color(w.p100_us),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Read     ", Style::default().fg(Color::Blue)),
-            Span::styled(format!("{:>6.1}ms  ", r.p50_us as f64 / 1000.0), Style::default()),
-            Span::styled(format!("{:>6.1}ms  ", r.p95_us as f64 / 1000.0), latency_color(r.p95_us)),
-            Span::styled(format!("{:>6.1}ms  ", r.p99_us as f64 / 1000.0), latency_color(r.p99_us)),
-            Span::styled(format!("{:>6.1}ms", r.p100_us as f64 / 1000.0), latency_color(r.p100_us)),
+            Span::styled(
+                format!("{:>6.1}ms  ", r.p50_us as f64 / 1000.0),
+                Style::default(),
+            ),
+            Span::styled(
+                format!("{:>6.1}ms  ", r.p95_us as f64 / 1000.0),
+                latency_color(r.p95_us),
+            ),
+            Span::styled(
+                format!("{:>6.1}ms  ", r.p99_us as f64 / 1000.0),
+                latency_color(r.p99_us),
+            ),
+            Span::styled(
+                format!("{:>6.1}ms", r.p100_us as f64 / 1000.0),
+                latency_color(r.p100_us),
+            ),
         ]),
         kv_line(
             "Mean",
-            &format!("W: {:.2}ms / R: {:.2}ms", w.mean_us / 1000.0, r.mean_us / 1000.0),
+            &format!(
+                "W: {:.2}ms / R: {:.2}ms",
+                w.mean_us / 1000.0,
+                r.mean_us / 1000.0
+            ),
             Color::DarkGray,
         ),
         kv_line(
@@ -337,15 +380,19 @@ fn draw_resources(f: &mut Frame, area: Rect, data: &TuiFrame) {
             kv_line("VSZ", &fmt_bytes(res.vsz_bytes), Color::DarkGray),
             kv_line("TCP sockets", &res.tcp_sockets.to_string(), Color::White),
             kv_line("Threads", &res.thread_count.to_string(), Color::White),
-            kv_line("CL segments", &res.commit_log_closed_segments.to_string(), Color::White),
             kv_line(
-                "Leak warnings",
-                &data.leak_warnings.to_string(),
-                warn_color,
+                "CL segments",
+                &res.commit_log_closed_segments.to_string(),
+                Color::White,
             ),
+            kv_line("Leak warnings", &data.leak_warnings.to_string(), warn_color),
         ]
     } else {
-        vec![kv_line("Status", "waiting for first sample...", Color::DarkGray)]
+        vec![kv_line(
+            "Status",
+            "waiting for first sample...",
+            Color::DarkGray,
+        )]
     };
 
     let title = if data.leak_warnings > 0 {
@@ -361,7 +408,11 @@ fn draw_resources(f: &mut Frame, area: Rect, data: &TuiFrame) {
 
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
     let paragraph = Paragraph::new(lines).block(block);
@@ -399,7 +450,11 @@ fn draw_footer(f: &mut Frame, area: Rect, data: &TuiFrame) {
 fn section_block(title: &str) -> Block<'_> {
     Block::default()
         .title(title)
-        .title_style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
 }

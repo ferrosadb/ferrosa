@@ -230,20 +230,15 @@ async fn run_cluster_load_test_async(
                 let key_str = crate::generator::make_key_string(key_idx);
 
                 if is_reader {
-                    let cql = format!(
-                        "SELECT val FROM data WHERE pk = '{key_str}' AND ck = 1"
-                    );
+                    let cql = format!("SELECT val FROM data WHERE pk = '{key_str}' AND ck = 1");
                     let t0 = Instant::now();
                     match client.query(&cql).await {
                         Ok(_) => sc.record_read(t0.elapsed()),
                         Err(_) => sc.record_read_error(),
                     }
                 } else {
-                    let val_len = crate::generator::choose_value_len(
-                        &mut rng,
-                        value_range.0,
-                        value_range.1,
-                    );
+                    let val_len =
+                        crate::generator::choose_value_len(&mut rng, value_range.0, value_range.1);
                     let value = crate::generator::make_random_value(&mut rng, val_len);
                     local_ts += 1;
                     let val_hex = hex::encode(&value);
@@ -259,9 +254,9 @@ async fn run_cluster_load_test_async(
                         }
                         Err(e) => {
                             sc.record_write_error();
-                            sc.record_error_sample(
-                                ferrosa_common::Error::InvalidData(e.to_string()),
-                            );
+                            sc.record_error_sample(ferrosa_common::Error::InvalidData(
+                                e.to_string(),
+                            ));
                         }
                     }
                 }

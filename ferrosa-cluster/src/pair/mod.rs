@@ -99,10 +99,7 @@ mod tests {
 
     #[test]
     fn inbound_connection_becomes_primary() {
-        assert_eq!(
-            PairRole::from_connection_direction(true),
-            PairRole::Primary
-        );
+        assert_eq!(PairRole::from_connection_direction(true), PairRole::Primary);
     }
 
     #[test]
