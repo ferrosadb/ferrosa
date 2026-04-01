@@ -138,6 +138,9 @@ pub struct ModeController {
     /// Tracks all spawned background tasks. Replaces fire-and-forget spawns
     /// so panics are detected and tasks can be cancelled on shutdown.
     background_tasks: Mutex<tokio::task::JoinSet<()>>,
+    /// Cancellation token — cancelled during shutdown to signal all background
+    /// tasks to stop. Passed to spawned tasks that should respect graceful shutdown.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -215,6 +218,7 @@ impl ModeController {
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
+            cancel: tokio_util::sync::CancellationToken::new(),
         });
 
         let handles = ModeControllerHandles {
@@ -265,6 +269,7 @@ impl ModeController {
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
+            cancel: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -315,6 +320,7 @@ impl ModeController {
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
+            cancel: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -352,6 +358,38 @@ impl ModeController {
     /// Get local host_id.
     pub fn host_id(&self) -> Uuid {
         self.local_host_id
+    }
+
+    /// Graceful shutdown: cancel all background tasks and wait for them to finish.
+    ///
+    /// Call before dropping the node to ensure in-flight Raft proposals,
+    /// schema syncs, and cluster joins complete or abort cleanly.
+    pub async fn shutdown(&self) {
+        tracing::info!("ModeController shutting down — cancelling background tasks");
+        self.cancel.cancel();
+
+        // Drain all tracked tasks (with a timeout so we don't hang forever).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut tasks = self.background_tasks.lock();
+        while let Some(result) = tokio::time::timeout_at(deadline, tasks.join_next()).await.ok().flatten() {
+            match result {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => tracing::warn!("background task panicked during shutdown: {e}"),
+            }
+        }
+        let remaining = tasks.len();
+        if remaining > 0 {
+            tracing::warn!(remaining, "shutdown timed out — aborting remaining tasks");
+            tasks.abort_all();
+        }
+        tracing::info!("ModeController shutdown complete");
+    }
+
+    /// Return a child cancellation token for background tasks that should
+    /// stop on shutdown.
+    pub fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel.clone()
     }
 
     /// Spawn a tracked background task. Unlike bare `tokio::spawn`, panics

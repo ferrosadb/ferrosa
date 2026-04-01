@@ -840,6 +840,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let shutdown_timeout = std::time::Duration::from_secs(30);
     match tokio::time::timeout(shutdown_timeout, async {
+        // Cancel cluster background tasks (Raft init, schema sync, joins).
+        mode_controller.shutdown().await;
+
         // Drain internode connections before flushing memtables so peers stop
         // sending mutations while we're in the middle of a flush.
         tracing::info!("draining internode connections...");
