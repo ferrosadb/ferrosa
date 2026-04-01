@@ -14,7 +14,9 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use arc_swap::ArcSwap;
 use uuid::Uuid;
@@ -304,7 +306,7 @@ impl ModeController {
 
     /// Get current pair role, if in pair mode.
     pub fn role(&self) -> Option<PairRole> {
-        let ctx = self.pair_context.lock().unwrap();
+        let ctx = self.pair_context.lock();
         ctx.as_ref().map(|c| **c.role.load())
     }
 
@@ -364,7 +366,7 @@ impl ModeController {
     /// `RaftState.approved_nodes` so that the controller can perform
     /// synchronous approval checks in `handle_join_request`.
     pub fn approve_node(&self, host_id: Uuid) {
-        self.approved_nodes.lock().unwrap().insert(host_id);
+        self.approved_nodes.lock().insert(host_id);
     }
 
     /// Handle a join request from a new node.
@@ -383,7 +385,7 @@ impl ModeController {
         // 1. Approval check — unless auto_join is enabled.
         //    Checked before Raft access so unapproved nodes are rejected fast.
         if !self.config.auto_join {
-            let approved = self.approved_nodes.lock().unwrap();
+            let approved = self.approved_nodes.lock();
             if !approved.contains(&peer_host_id) {
                 return Err(ClusterError::NotApproved(peer_host_id));
             }
@@ -500,8 +502,8 @@ impl ModeController {
             .store(Arc::new(ClusterStateHolder::Standalone));
         self.mode.store(Arc::new(DeploymentMode::Standalone));
         self.force_promoted.store(true, Ordering::Release);
-        *self.pair_context.lock().unwrap() = None;
-        self.connected_peers.lock().unwrap().clear();
+        *self.pair_context.lock() = None;
+        self.connected_peers.lock().clear();
         tracing::info!("force promoted to standalone primary");
         Ok(())
     }
@@ -511,7 +513,7 @@ impl ModeController {
     /// Must be called on the current primary. Both nodes must be connected.
     pub async fn switchover(&self) -> Result<()> {
         let (role_arc, peer_host_id) = {
-            let ctx = self.pair_context.lock().unwrap();
+            let ctx = self.pair_context.lock();
             let ctx = ctx.as_ref().ok_or(ClusterError::ModeTransitionRejected(
                 "switchover requires pair mode; current node is standalone".into(),
             ))?;
@@ -619,7 +621,7 @@ impl ModeController {
             ))));
 
         // Store pair context for switchover/promote
-        *self.pair_context.lock().unwrap() = Some(PairContext {
+        *self.pair_context.lock() = Some(PairContext {
             role: role_arc,
             peer_host_id,
             peer_addr,
@@ -931,7 +933,7 @@ impl ModeController {
             )));
 
         // Clear pair context — no longer in pair mode
-        *self.pair_context.lock().unwrap() = None;
+        *self.pair_context.lock() = None;
 
         self.mode.store(Arc::new(DeploymentMode::Cluster));
 
@@ -1115,7 +1117,7 @@ impl ModeController {
     fn trigger_cluster_join(&self, host_id: Uuid, addr: std::net::SocketAddr) {
         // De-duplicate: skip if already pending.
         {
-            let mut pending = self.pending_joins.lock().unwrap();
+            let mut pending = self.pending_joins.lock();
             if pending.contains(&host_id) {
                 tracing::info!(peer = %host_id, "peer already pending join, skipping");
                 return;
@@ -1124,7 +1126,7 @@ impl ModeController {
         }
 
         // Capture state needed by the spawned task.
-        let approved_nodes = self.approved_nodes.lock().unwrap().clone();
+        let approved_nodes = self.approved_nodes.lock().clone();
         let peer_node_id = uuid_to_node_id(host_id);
         let raft_instance = self.raft_instance.clone();
         let config_clone = self.config.clone();
@@ -1201,8 +1203,8 @@ impl ModeController {
         self.cluster_state
             .store(Arc::new(ClusterStateHolder::Standalone));
         self.mode.store(Arc::new(DeploymentMode::Standalone));
-        *self.pair_context.lock().unwrap() = None;
-        self.connected_peers.lock().unwrap().clear();
+        *self.pair_context.lock() = None;
+        self.connected_peers.lock().clear();
         tracing::warn!("mode transition: pair -> degraded (peer lost, writes unavailable)");
     }
 }
@@ -1214,7 +1216,7 @@ impl PeerEventListener for ModeController {
 
         // Track this peer
         {
-            let mut peers = self.connected_peers.lock().unwrap();
+            let mut peers = self.connected_peers.lock();
             if !peers.iter().any(|(id, _)| *id == host_id) {
                 peers.push((host_id, addr));
             }
@@ -1238,7 +1240,7 @@ impl PeerEventListener for ModeController {
             }
             DeploymentMode::Pair => {
                 // 2nd peer connecting while in pair mode → transition to cluster
-                let all_peers = self.connected_peers.lock().unwrap().clone();
+                let all_peers = self.connected_peers.lock().clone();
                 if all_peers.len() >= 2 {
                     self.transition_to_cluster(all_peers);
                 }
@@ -1267,7 +1269,7 @@ impl PeerEventListener for ModeController {
 
         // Remove from tracked peers
         {
-            let mut peers = self.connected_peers.lock().unwrap();
+            let mut peers = self.connected_peers.lock();
             peers.retain(|(id, _)| *id != host_id);
         }
 
@@ -1319,7 +1321,7 @@ impl InboundPeerCallback for ModeController {
 
         // Track this peer
         {
-            let mut peers = self.connected_peers.lock().unwrap();
+            let mut peers = self.connected_peers.lock();
             if !peers.iter().any(|(id, _)| *id == host_id) {
                 peers.push((host_id, addr));
             }
@@ -1342,7 +1344,7 @@ impl InboundPeerCallback for ModeController {
             }
             DeploymentMode::Pair => {
                 // 2nd peer connecting while in pair mode → transition to cluster
-                let all_peers = self.connected_peers.lock().unwrap().clone();
+                let all_peers = self.connected_peers.lock().clone();
                 if all_peers.len() >= 2 {
                     self.transition_to_cluster(all_peers);
                 }
@@ -1603,10 +1605,10 @@ mod tests {
         let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
         controller.on_peer_connected((peer_id, peer_addr));
 
-        assert_eq!(controller.connected_peers.lock().unwrap().len(), 1);
+        assert_eq!(controller.connected_peers.lock().len(), 1);
 
         controller.on_peer_disconnected((peer_id, peer_addr));
-        assert_eq!(controller.connected_peers.lock().unwrap().len(), 0);
+        assert_eq!(controller.connected_peers.lock().len(), 0);
     }
 
     /// Helper: create a ModeController in cluster mode with raft init spawned.
@@ -1901,7 +1903,7 @@ mod tests {
         controller.on_peer_connected((new_peer_id, new_peer_addr));
 
         // Verify the join was queued via pending_joins.
-        let pending = controller.pending_joins.lock().unwrap();
+        let pending = controller.pending_joins.lock();
         assert!(
             pending.contains(&new_peer_id),
             "new peer should be in pending_joins after on_peer_connected in cluster mode"
