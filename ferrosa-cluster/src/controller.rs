@@ -35,13 +35,15 @@ use ferrosa_storage::CommitLogPosition;
 use crate::config::ClusterConfig;
 use crate::consistency::ConsistencyLevel;
 use crate::coordinator::{ClusterCoordinator, RepairWriteHandler};
-use crate::ddl_path::{ClusterDdlForwardHandler, DdlPath};
+use crate::ddl_path::{execute_via_raft, ClusterDdlForwardHandler, DdlPath};
 use crate::error::{ClusterError, Result};
 use crate::hints::delivery::HintDeliveryTask;
 use crate::hints::{HintConfig, HintStore};
 use crate::mode::DeploymentMode;
 use crate::pair::coordinator::{encode_mutation, PairCoordinator};
-use crate::pair::ddl::{DdlCoordinator, PairDdlForwardHandler, PairSchemaSyncHandler};
+use crate::pair::ddl::{
+    DdlCoordinator, DdlOperation, PairDdlForwardHandler, PairSchemaSyncHandler,
+};
 use crate::pair::{PairRole, PairState};
 use crate::raft::handlers::{
     RaftAppendHandler, RaftSnapshotHandler, RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
@@ -745,6 +747,36 @@ impl ModeController {
             }
         };
 
+        // 0. Ensure PeerManager has outbound connections to ALL peers.
+        //
+        // BUG FIX: When transitioning from pair → cluster, only the first peer
+        // (from transition_to_pair) has a reverse outbound pool. The second peer
+        // (which triggered this transition) may only have an inbound connection.
+        // Raft needs to SEND to all peers, so we must create outbound pools for
+        // any peer the PeerManager doesn't already know about.
+        let net_cfg = self.net_config.clone();
+        let local_id = self.local_host_id;
+        let internode_port = self.net_config.bind_addr.port();
+        for (peer_uuid, peer_addr) in &peers {
+            if !peer_manager.has_peer(*peer_uuid) {
+                let pm = peer_manager.clone();
+                let cfg = net_cfg.clone();
+                let uuid = *peer_uuid;
+                let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
+                tokio::spawn(async move {
+                    match PriorityPool::connect(cfg, local_id, &reverse_addr.to_string()).await {
+                        Ok(pool) => {
+                            pm.add_peer((uuid, reverse_addr), pool).await;
+                            tracing::info!(%uuid, %reverse_addr, "cluster: reverse connection established");
+                        }
+                        Err(e) => {
+                            tracing::warn!(%uuid, %e, "cluster: reverse connection failed");
+                        }
+                    }
+                });
+            }
+        }
+
         // 1. Create sled log store
         let raft_dir = if let Some(ref dir) = self.config.raft_data_dir {
             dir.clone()
@@ -878,13 +910,12 @@ impl ModeController {
             .store(Arc::new(WritePath::cluster(coordinator)));
 
         // DdlPath::Cluster needs the Raft instance — Raft initialization is async
-        // and happens in a background task. For now, keep DDL on the pair path or
-        // set to direct until Raft is fully initialized. We store the log_store
-        // and network_factory references for later Raft bootstrap.
-        //
-        // In the initial cluster transition we use direct DDL — the Raft leader
-        // election and DDL-via-Raft wiring will be completed by the background
-        // Raft initialization task.
+        // and happens in a background task. Keep DDL on Direct path during the
+        // transition window so standalone/pair DDL continues to work. Once Raft
+        // is initialized and a leader is elected, the background task will:
+        //   1. Swap DDL path to DdlPath::Cluster
+        //   2. Replay the current local schema state through Raft so all
+        //      followers converge on the same schema
         self.ddl_path.store(Arc::new(DdlPath::Direct {
             schema: self.schema.clone(),
             engine: self.storage.clone(),
@@ -915,6 +946,7 @@ impl ModeController {
         let storage_for_handler = self.storage.clone();
         let repair_metrics = repair_metrics_for_handler;
         let cluster_name = self.config.cluster_name.clone();
+        let schema_for_replay = self.schema.clone();
         tokio::spawn(async move {
             // Build openraft Config
             let raft_config = match (openraft::Config {
@@ -1032,6 +1064,33 @@ impl ModeController {
                         peer_manager: peer_manager_for_ddl,
                         node_map: node_map_for_ddl,
                     }));
+
+                    // Replay local schema state through Raft so all followers
+                    // converge. Any DDL applied via the Direct path during the
+                    // transition window is now proposed through consensus.
+                    if lid == local_node_id {
+                        tracing::info!("replaying local schema state through Raft for follower convergence");
+                        let schema_snap = schema_for_replay.snapshot();
+                        for (name, ks) in &schema_snap.keyspaces {
+                            // Skip system keyspaces — they exist on all nodes.
+                            if name.starts_with("system") {
+                                continue;
+                            }
+                            let op = DdlOperation::CreateKeyspace(ks.clone());
+                            if let Err(e) = execute_via_raft(&raft_arc, op).await {
+                                tracing::warn!(%e, ks = %name, "schema replay: CreateKeyspace failed (may already exist)");
+                            }
+                        }
+                        for ((ks, _tbl), table) in &schema_snap.tables {
+                            if ks.starts_with("system") {
+                                continue;
+                            }
+                            let op = DdlOperation::CreateTable(Box::new(table.clone()));
+                            if let Err(e) = execute_via_raft(&raft_arc, op).await {
+                                tracing::warn!(%e, "schema replay: CreateTable failed (may already exist)");
+                            }
+                        }
+                    }
                 }
                 None => {
                     tracing::warn!(

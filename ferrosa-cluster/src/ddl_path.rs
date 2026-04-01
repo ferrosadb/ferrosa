@@ -385,7 +385,7 @@ fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
 /// the leader hint. The [`DdlPath::Cluster`] arm in `execute()` catches this
 /// and transparently forwards the request to the leader instead of propagating
 /// the error to the CQL client.
-async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<()> {
+pub(crate) async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<()> {
     let cmd = ddl_op_to_raft_command(op);
 
     match raft.client_write(cmd).await {
