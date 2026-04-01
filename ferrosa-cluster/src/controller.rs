@@ -126,6 +126,10 @@ pub struct ModeController {
     /// for testability (unit tests can inspect pending joins without
     /// requiring a full Raft cluster).
     pending_joins: Mutex<Vec<Uuid>>,
+    /// Serializes mode transitions. Held across the check-and-transition
+    /// window to prevent concurrent `on_peer_connected` calls from both
+    /// triggering `transition_to_pair` when two peers arrive simultaneously.
+    transition_guard: Mutex<()>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -199,6 +203,7 @@ impl ModeController {
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Mutex::new(Vec::new()),
+            transition_guard: Mutex::new(()),
         });
 
         let handles = ModeControllerHandles {
@@ -245,6 +250,7 @@ impl ModeController {
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Mutex::new(Vec::new()),
+            transition_guard: Mutex::new(()),
         })
     }
 
@@ -291,6 +297,7 @@ impl ModeController {
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Mutex::new(Vec::new()),
+            transition_guard: Mutex::new(()),
         })
     }
 
@@ -1196,16 +1203,20 @@ impl ModeController {
         });
     }
 
-    /// Transition to degraded state: writes unavailable, reads still work.
+    /// Transition to degraded pair state: writes unavailable, stale reads work.
+    ///
+    /// Preserves pair context (role, peer info) so recovery is automatic when
+    /// the peer reconnects. Does NOT clear pair_context or connected_peers —
+    /// unlike the old behavior which reset to Standalone and lost everything.
     fn transition_to_degraded(&self) {
         self.write_path.store(Arc::new(WritePath::unavailable()));
         self.ddl_path.store(Arc::new(DdlPath::Unavailable));
-        self.cluster_state
-            .store(Arc::new(ClusterStateHolder::Standalone));
-        self.mode.store(Arc::new(DeploymentMode::Standalone));
-        *self.pair_context.lock() = None;
-        self.connected_peers.lock().clear();
-        tracing::warn!("mode transition: pair -> degraded (peer lost, writes unavailable)");
+        // Keep pair cluster state — the peer info is still valid for recovery.
+        self.mode.store(Arc::new(DeploymentMode::DegradedPair));
+        // Do NOT clear pair_context — we need it for recovery on reconnect.
+        // Do NOT clear connected_peers — the disconnected peer will be
+        // removed by on_peer_disconnected, remaining peers stay tracked.
+        tracing::warn!("mode transition: pair -> degraded-pair (peer lost, writes unavailable, pair context preserved)");
     }
 }
 
@@ -1222,6 +1233,9 @@ impl PeerEventListener for ModeController {
             }
         }
 
+        // Hold the transition guard across mode-check-and-transition to prevent
+        // two simultaneous peer connections from both triggering transition_to_pair.
+        let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
         let configured_mode = self.config.mode;
         match current_mode {
@@ -1239,6 +1253,14 @@ impl PeerEventListener for ModeController {
                 }
             }
             DeploymentMode::Pair => {
+                // If explicitly configured as pair-only, reject the 3rd peer.
+                if configured_mode == Some(DeploymentMode::Pair) {
+                    tracing::info!(
+                        peer = %host_id,
+                        "rejecting peer — FERROSA_CLUSTER_MODE=pair limits to 1 peer"
+                    );
+                    return;
+                }
                 // 2nd peer connecting while in pair mode → transition to cluster
                 let all_peers = self.connected_peers.lock().clone();
                 if all_peers.len() >= 2 {
@@ -1246,18 +1268,13 @@ impl PeerEventListener for ModeController {
                 }
             }
             DeploymentMode::Cluster => {
-                // Already in cluster mode — trigger join admission for the new peer.
                 tracing::info!(peer = %host_id, "new peer connected in cluster mode, triggering join");
                 self.trigger_cluster_join(host_id, addr);
             }
             DeploymentMode::Forming => {
-                // Already forming — additional peer connects are tracked but
-                // the formation logic handles mesh completion.
                 tracing::info!(peer = %host_id, "peer connected during formation");
             }
             DeploymentMode::DegradedPair | DeploymentMode::DegradedCluster => {
-                // Peer reconnecting during degraded mode — recovery handled
-                // by the degraded-mode transition logic (future sprint).
                 tracing::info!(peer = %host_id, "peer connected in degraded mode");
             }
         }
@@ -1327,6 +1344,7 @@ impl InboundPeerCallback for ModeController {
             }
         }
 
+        let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
         let configured_mode = self.config.mode;
         match current_mode {
@@ -1343,7 +1361,13 @@ impl InboundPeerCallback for ModeController {
                 }
             }
             DeploymentMode::Pair => {
-                // 2nd peer connecting while in pair mode → transition to cluster
+                if configured_mode == Some(DeploymentMode::Pair) {
+                    tracing::info!(
+                        peer = %host_id,
+                        "rejecting inbound peer — FERROSA_CLUSTER_MODE=pair limits to 1 peer"
+                    );
+                    return;
+                }
                 let all_peers = self.connected_peers.lock().clone();
                 if all_peers.len() >= 2 {
                     self.transition_to_cluster(all_peers);
@@ -1518,8 +1542,10 @@ mod tests {
         assert_eq!(controller.mode(), DeploymentMode::Pair);
 
         controller.on_peer_disconnected((peer_id, peer_addr));
-        // Degraded transitions to standalone mode with unavailable writes
-        assert_eq!(controller.mode(), DeploymentMode::Standalone);
+        // Degraded preserves pair context — mode is DegradedPair, not Standalone
+        assert_eq!(controller.mode(), DeploymentMode::DegradedPair);
+        // Pair context is preserved for automatic recovery
+        assert!(controller.role().is_some(), "pair context must be preserved in degraded mode");
     }
 
     #[test]
