@@ -316,7 +316,10 @@ impl ModeController {
         match self.mode() {
             DeploymentMode::Standalone => true,
             DeploymentMode::Pair => self.role() == Some(PairRole::Primary),
+            DeploymentMode::Forming => false, // Not ready until Raft leader elected
             DeploymentMode::Cluster => true,
+            DeploymentMode::DegradedPair => true, // Stale reads available
+            DeploymentMode::DegradedCluster => true, // Stale reads at CL=ONE
         }
     }
 
@@ -1245,6 +1248,16 @@ impl PeerEventListener for ModeController {
                 tracing::info!(peer = %host_id, "new peer connected in cluster mode, triggering join");
                 self.trigger_cluster_join(host_id, addr);
             }
+            DeploymentMode::Forming => {
+                // Already forming — additional peer connects are tracked but
+                // the formation logic handles mesh completion.
+                tracing::info!(peer = %host_id, "peer connected during formation");
+            }
+            DeploymentMode::DegradedPair | DeploymentMode::DegradedCluster => {
+                // Peer reconnecting during degraded mode — recovery handled
+                // by the degraded-mode transition logic (future sprint).
+                tracing::info!(peer = %host_id, "peer connected in degraded mode");
+            }
         }
     }
 
@@ -1337,6 +1350,12 @@ impl InboundPeerCallback for ModeController {
             DeploymentMode::Cluster => {
                 tracing::info!(peer = %host_id, "new inbound peer in cluster mode, triggering join");
                 self.trigger_cluster_join(host_id, addr);
+            }
+            DeploymentMode::Forming => {
+                tracing::info!(peer = %host_id, "inbound peer during formation");
+            }
+            DeploymentMode::DegradedPair | DeploymentMode::DegradedCluster => {
+                tracing::info!(peer = %host_id, "inbound peer in degraded mode");
             }
         }
     }
