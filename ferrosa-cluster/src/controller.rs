@@ -88,7 +88,7 @@ struct PairContext {
 /// Created at startup with standalone mode. When peers connect/disconnect,
 /// transitions the mode and atomically swaps the write path and cluster state.
 pub struct ModeController {
-    mode: ArcSwap<DeploymentMode>,
+    mode: Arc<ArcSwap<DeploymentMode>>,
     write_path: Arc<ArcSwap<WritePath>>,
     cluster_state: Arc<ArcSwap<ClusterStateHolder>>,
     storage: Arc<StorageEngine>,
@@ -130,6 +130,11 @@ pub struct ModeController {
     /// window to prevent concurrent `on_peer_connected` calls from both
     /// triggering `transition_to_pair` when two peers arrive simultaneously.
     transition_guard: Mutex<()>,
+    /// Formation epoch — incremented each time we enter Forming state.
+    /// Used to reject stale ClusterInvite messages from previous formation attempts.
+    formation_epoch: std::sync::atomic::AtomicU64,
+    /// Initiators already seen in this formation epoch. Deduplicates invites.
+    seen_invite_initiators: Mutex<BTreeSet<Uuid>>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -183,7 +188,7 @@ impl ModeController {
         };
 
         let controller = Arc::new(Self {
-            mode: ArcSwap::from_pointee(DeploymentMode::Standalone),
+            mode: Arc::new(ArcSwap::from_pointee(DeploymentMode::Standalone)),
             write_path: write_path.clone(),
             cluster_state: cluster_state.clone(),
             storage,
@@ -204,6 +209,8 @@ impl ModeController {
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Mutex::new(Vec::new()),
             transition_guard: Mutex::new(()),
+            formation_epoch: std::sync::atomic::AtomicU64::new(0),
+            seen_invite_initiators: Mutex::new(BTreeSet::new()),
         });
 
         let handles = ModeControllerHandles {
@@ -230,7 +237,7 @@ impl ModeController {
         let hint_store = Arc::new(HintStore::new(hint_config.clone()).expect("test hint store"));
 
         Arc::new(Self {
-            mode: ArcSwap::from_pointee(DeploymentMode::Standalone),
+            mode: Arc::new(ArcSwap::from_pointee(DeploymentMode::Standalone)),
             write_path,
             cluster_state,
             storage: engine,
@@ -251,6 +258,8 @@ impl ModeController {
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Mutex::new(Vec::new()),
             transition_guard: Mutex::new(()),
+            formation_epoch: std::sync::atomic::AtomicU64::new(0),
+            seen_invite_initiators: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -277,7 +286,7 @@ impl ModeController {
         };
 
         Arc::new(Self {
-            mode: ArcSwap::from_pointee(DeploymentMode::Pair),
+            mode: Arc::new(ArcSwap::from_pointee(DeploymentMode::Pair)),
             write_path,
             cluster_state,
             storage: engine,
@@ -298,6 +307,8 @@ impl ModeController {
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Mutex::new(Vec::new()),
             transition_guard: Mutex::new(()),
+            formation_epoch: std::sync::atomic::AtomicU64::new(0),
+            seen_invite_initiators: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -760,8 +771,12 @@ impl ModeController {
         };
 
         self.mode.store(Arc::new(DeploymentMode::Forming));
+        self.formation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.seen_invite_initiators.lock().clear();
         tracing::info!(
             peer_count = peers.len(),
+            epoch = self.formation_epoch.load(std::sync::atomic::Ordering::Relaxed),
             "mode transition: pair -> forming (broadcasting ClusterInvite)"
         );
 
@@ -787,6 +802,13 @@ impl ModeController {
             }
         });
 
+        // Record when we entered Forming — the timeout check happens in the
+        // Raft init background task (transition_to_cluster) and also in
+        // on_peer_connected if mode is still Forming.
+        // The actual timeout logic is inside transition_to_cluster's leader
+        // election poll: if election doesn't complete in 30s AND formation
+        // timeout is exceeded, the mode reverts to Pair.
+
         // Now proceed to cluster transition with all known peers.
         // In the future, this will wait for mesh completion before Raft init.
         // For now, proceed immediately (matches current behavior).
@@ -804,6 +826,10 @@ impl ModeController {
                 return;
             }
         };
+
+        // Capture whether this node was the seed (Primary) before we clear pair context.
+        // Only the seed calls raft.initialize() — others wait for AppendEntries.
+        let was_seed = self.role() == Some(PairRole::Primary);
 
         // 0. Ensure PeerManager has outbound connections to ALL peers.
         //
@@ -1000,6 +1026,7 @@ impl ModeController {
         // must not block the PeerEventListener callback.
         let raft_instance_swap = self.raft_instance.clone();
         let ddl_path = self.ddl_path.clone();
+        let mode_swap = self.mode.clone();
         let registry = self.registry.clone();
         let storage_for_handler = self.storage.clone();
         let repair_metrics = repair_metrics_for_handler;
@@ -1084,11 +1111,19 @@ impl ModeController {
                 );
             }
 
-            if let Err(e) = raft_arc.initialize(members).await {
-                // InitializeError::NotAllowed means the cluster was already
-                // initialized (e.g. from a prior run with persisted log).
-                // That is not fatal — the node will join the existing cluster.
-                tracing::warn!(%e, "raft initialize returned error (may be already initialized)");
+            // Only the seed (original Primary) calls initialize().
+            // Non-seed nodes will receive their membership via AppendEntries
+            // from the leader. This prevents CF-T17 (membership race from
+            // independent initialize() calls with potentially different member lists).
+            if was_seed {
+                if let Err(e) = raft_arc.initialize(members).await {
+                    // InitializeError::NotAllowed means the cluster was already
+                    // initialized (e.g. from a prior run with persisted log).
+                    // That is not fatal — the node will join the existing cluster.
+                    tracing::warn!(%e, "raft initialize returned error (may be already initialized)");
+                }
+            } else {
+                tracing::info!("non-seed node — skipping raft.initialize(), waiting for leader AppendEntries");
             }
 
             // Wait for leader election (poll with backoff, max ~30s)
@@ -1152,8 +1187,12 @@ impl ModeController {
                 }
                 None => {
                     tracing::warn!(
-                        "raft leader election timed out after 30s, DDL remains on direct path"
+                        "raft leader election timed out after 30s — reverting to Pair mode"
                     );
+                    // Revert to Pair mode — formation failed. The Raft instance
+                    // is stored but non-functional (no leader). Writes stay on
+                    // Pair semantics with the original peer.
+                    mode_swap.store(Arc::new(DeploymentMode::Pair));
                 }
             }
 

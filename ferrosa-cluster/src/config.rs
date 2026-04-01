@@ -45,6 +45,9 @@ pub struct ClusterConfig {
     pub raft_data_dir: Option<PathBuf>,
     /// Role of this node: data, indexer, or both.
     pub node_role: NodeRole,
+    /// Maximum seconds to wait in Forming state before falling back to Pair.
+    /// `None` uses the default of 60 seconds.
+    pub formation_timeout_secs: Option<u64>,
 }
 
 impl Default for ClusterConfig {
@@ -61,6 +64,7 @@ impl Default for ClusterConfig {
             auto_join: false,
             raft_data_dir: None,
             node_role: NodeRole::Both,
+            formation_timeout_secs: None,
         }
     }
 }
@@ -107,6 +111,11 @@ impl ClusterConfig {
         }
         if let Ok(auto) = std::env::var("FERROSA_AUTO_JOIN") {
             config.auto_join = auto == "true" || auto == "1";
+        }
+        if let Ok(timeout) = std::env::var("FERROSA_FORMATION_TIMEOUT_SECS") {
+            if let Ok(n) = timeout.parse() {
+                config.formation_timeout_secs = Some(n);
+            }
         }
         if let Ok(role) = std::env::var("FERROSA_NODE_ROLE") {
             config.node_role = match role.to_lowercase().as_str() {
