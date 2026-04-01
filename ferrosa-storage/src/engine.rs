@@ -158,6 +158,14 @@ struct TableState {
     /// SSTable IDs that are currently pinned on NVMe, in oldest-first order.
     /// Each entry is `(sstable_id, size_bytes)`.
     pinned_sstables: Vec<(String, u64)>,
+    /// Latest commit log position written for this table. Updated on every
+    /// write; passed to `commit_log.discard_completed()` after flush so that
+    /// fully-flushed segments can be GC'd. Without this, closed segments
+    /// accumulate indefinitely and leak file descriptors.
+    ///
+    /// Wrapped in `Mutex` so writers can update it under a read lock on the
+    /// `tables` map (the hot path). The lock protects only two `u64`s.
+    last_commit_log_position: parking_lot::Mutex<Option<CommitLogPosition>>,
 }
 
 /// SSTable reader type alias for file-backed SSTables.
@@ -692,6 +700,7 @@ impl StorageEngine {
             store,
             pin_config: None,
             pinned_sstables: Vec::new(),
+            last_commit_log_position: parking_lot::Mutex::new(None),
         };
         self.tables.write().insert(table_id, state);
         Ok(())
@@ -1038,14 +1047,15 @@ impl StorageEngine {
             vec![row.clone()],
             timestamp,
         );
-        self.commit_log.append(&mutation)?;
+        let cl_pos = self.commit_log.append(&mutation)?;
 
-        // 2. Write to the table's memtable.
+        // 2. Write to the table's memtable and track commit log position.
         let tables = self.tables.read();
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
         state.store.write(key, row)?;
+        *state.last_commit_log_position.lock() = Some(cl_pos);
         drop(tables);
 
         // 3. Notify observers after successful commit log + memtable write.
@@ -1080,9 +1090,9 @@ impl StorageEngine {
             );
 
             // Append to commit log.
-            self.commit_log.append(&mutation)?;
+            let cl_pos = self.commit_log.append(&mutation)?;
 
-            // Write to memtable (scoped read lock).
+            // Write to memtable and track commit log position (scoped read lock).
             {
                 let tables = self.tables.read();
                 let state = tables.get(table_id).ok_or_else(|| {
@@ -1091,6 +1101,7 @@ impl StorageEngine {
                     ))
                 })?;
                 state.store.write(&key, row)?;
+                *state.last_commit_log_position.lock() = Some(cl_pos);
             }
 
             // Notify observers after successful commit log + memtable write.
@@ -1120,12 +1131,15 @@ impl StorageEngine {
             return Ok(());
         }
 
-        // Phase 1: Append all mutations to the commit log.
+        // Phase 1: Append all mutations to the commit log, tracking positions.
+        let mut positions: HashMap<TableId, CommitLogPosition> = HashMap::new();
         for m in &mutations {
-            self.commit_log.append(m)?;
+            let cl_pos = self.commit_log.append(m)?;
+            let table_id = TableId::new(&m.keyspace, &m.table);
+            positions.insert(table_id, cl_pos);
         }
 
-        // Phase 2: Apply to memtables.
+        // Phase 2: Apply to memtables and update commit log positions.
         let tables = self.tables.read();
         for m in &mutations {
             let table_id = TableId::new(&m.keyspace, &m.table);
@@ -1134,6 +1148,9 @@ impl StorageEngine {
             })?;
             for row in &m.rows {
                 state.store.write(&m.key, row.clone())?;
+            }
+            if let Some(&cl_pos) = positions.get(&table_id) {
+                *state.last_commit_log_position.lock() = Some(cl_pos);
             }
         }
         drop(tables);
@@ -1466,11 +1483,15 @@ impl StorageEngine {
     /// and max_bytes eviction is enforced if configured.
     pub fn flush(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         // Flush + index submit under read lock, then release before write lock.
-        let (gen, is_pinned) = {
+        let (gen, is_pinned, cl_position) = {
             let tables = self.tables.read();
             let state = tables.get(table_id).ok_or_else(|| {
                 ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
             })?;
+
+            // Snapshot the commit log position before flushing. All mutations
+            // up to this position are in the memtable we're about to flush.
+            let cl_position = *state.last_commit_log_position.lock();
 
             state.store.flush()?;
 
@@ -1511,8 +1532,18 @@ impl StorageEngine {
 
             let flushed_gen = state.store.last_flush_generation();
             let pinned = state.pin_config.is_some();
-            (flushed_gen, pinned)
+            (flushed_gen, pinned, cl_position)
         };
+
+        // Advance commit log checkpoint: tell the commit log that this table's
+        // mutations are now durable in SSTables up to cl_position. This allows
+        // closed segments with no remaining dirty tables to be GC'd, preventing
+        // file descriptor leaks from accumulating segment file handles.
+        if let Some(pos) = cl_position {
+            if let Err(e) = self.commit_log.discard_completed(table_id, pos) {
+                tracing::warn!(%e, "commit log discard_completed failed for {}", table_id);
+            }
+        }
 
         // For pinned tables: record the new SSTable and enforce max_bytes.
         // We do this outside the read lock so we can take a write lock.
@@ -2216,6 +2247,13 @@ impl StorageEngine {
         self.object_store_and_config()
             .ok()
             .map(|(cfg, store)| (store, cfg.prefix.clone()))
+    }
+
+    /// Returns the number of closed commit log segments waiting for GC.
+    ///
+    /// Used by the load test resource monitor to detect segment accumulation.
+    pub fn commit_log_closed_segment_count(&self) -> usize {
+        self.commit_log.closed_segment_count()
     }
 
     /// Discards commit log segments that have no remaining dirty tables.
@@ -3690,6 +3728,64 @@ mod tests {
             after > before,
             "commit_log_position should advance after write"
         );
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn flush_discards_commit_log_segments() {
+        // Regression test for FD leak: flush() must call discard_completed()
+        // so that closed commit log segments are GC'd and their file handles
+        // released. Without this, segments accumulate indefinitely under load.
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 512, // tiny: forces rotation after ~3 mutations
+                ..CommitLogConfig::test_config(dir.path())
+            },
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+
+        // Write enough mutations to force multiple segment rotations.
+        for i in 0..20 {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"value", 1000 + i),
+                    1000 + i,
+                )
+                .unwrap();
+        }
+
+        let closed_before = engine.commit_log.closed_segment_count();
+        assert!(
+            closed_before >= 2,
+            "need multiple closed segments for this test, got {closed_before}"
+        );
+
+        // Flush the table — this calls discard_completed() internally,
+        // which removes segments where all tables have been flushed.
+        engine.flush(&tid).unwrap();
+
+        // discard_completed() in flush() should have already cleaned up
+        // all closed segments (single table = all segments become empty).
+        let closed_after = engine.commit_log.closed_segment_count();
+        assert!(
+            closed_after < closed_before,
+            "closed segment count should decrease after flush: \
+             before={closed_before}, after={closed_after}"
+        );
+
+        // Data should still be readable from SSTable after commit log GC.
+        for i in 0..20 {
+            let result = engine.read(&tid, &make_key(&format!("k{i}"))).unwrap();
+            assert!(result.is_some(), "key k{i} should be readable after flush");
+        }
 
         engine.shutdown().unwrap();
     }

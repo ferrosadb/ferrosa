@@ -362,6 +362,14 @@ impl CommitLog {
         self.archived.lock().insert(segment_id);
     }
 
+    /// Returns the number of closed segments waiting for GC.
+    ///
+    /// Used by tests and monitoring to verify that flush → discard_completed
+    /// is keeping the closed segment count bounded.
+    pub fn closed_segment_count(&self) -> usize {
+        self.closed_segments.lock().len()
+    }
+
     /// Returns the set of segment IDs currently marked as archived.
     pub fn archived_segments(&self) -> HashSet<u64> {
         self.archived.lock().clone()
@@ -406,8 +414,11 @@ impl CommitLog {
         // Swap the new segment in and get the old one.
         let old_segment = self.active.swap(new_segment);
 
-        // Flush the old segment to disk before archiving.
+        // Flush the old segment to disk before archiving, then release the
+        // file descriptor. The data is fully on disk; keeping the handle open
+        // while waiting for discard_completed() leaks FDs under heavy write load.
         old_segment.flush_to_disk()?;
+        old_segment.close_file_handle();
 
         // Move old segment to closed list.
         let old_id = old_segment.id;
