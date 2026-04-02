@@ -117,6 +117,7 @@ impl PairNode {
         peer_addr: SocketAddr,
         storage: Arc<StorageEngine>,
     ) -> Self {
+        #[allow(deprecated)]
         let role = PairRole::elect(local_host_id, peer_host_id);
         let role_arc = Arc::new(ArcSwap::from_pointee(role));
         let state = Arc::new(RwLock::new(PairState::new(role, peer_host_id, peer_addr)));

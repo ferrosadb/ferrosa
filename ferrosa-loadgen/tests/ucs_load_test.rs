@@ -179,7 +179,7 @@ proptest! {
             num_writers: 2,
             num_readers: 2,
             duration: Duration::from_secs(5),
-            flush_threshold_bytes: 64 * 1024, flush_max_age_secs: 300,
+            flush_threshold_bytes: 64 * 1024,
             local_cache_max_bytes: 5 * 1024 * 1024,
             target_data_size_bytes: 2 * 1024 * 1024,
             fan_factor,

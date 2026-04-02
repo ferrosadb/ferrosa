@@ -289,9 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     e.path()
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .map_or(false, |n| {
-                            n.starts_with("commitlog-") && n.ends_with(".log")
-                        })
+                        .is_some_and(|n| n.starts_with("commitlog-") && n.ends_with(".log"))
                 })
             })
             .unwrap_or(false);

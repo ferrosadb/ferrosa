@@ -368,9 +368,12 @@ impl ModeController {
         tracing::info!("ModeController shutting down — cancelling background tasks");
         self.cancel.cancel();
 
-        // Drain all tracked tasks (with a timeout so we don't hang forever).
+        // Take the JoinSet out of the Mutex to avoid holding the lock across await.
+        let mut tasks = {
+            let mut guard = self.background_tasks.lock();
+            std::mem::take(&mut *guard)
+        };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut tasks = self.background_tasks.lock();
         while let Some(result) = tokio::time::timeout_at(deadline, tasks.join_next())
             .await
             .ok()
@@ -810,12 +813,6 @@ impl ModeController {
         }
     }
 
-    /// Transition from pair mode to cluster mode when a 2nd peer connects.
-    ///
-    /// Sets up:
-    /// 1. Sled-backed Raft log store
-    /// 2. Raft state machine with schema/storage side effects
-    /// 3. Raft network factory bridging openraft to ferrosa-net
     /// Transition from Pair to Forming: broadcast ClusterInvite and prepare
     /// for mesh formation. Does NOT initialize Raft — that happens in
     /// `transition_to_cluster` after all peers are connected.

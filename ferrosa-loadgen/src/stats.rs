@@ -276,6 +276,22 @@ impl Default for LatencyHistogram {
 /// Maximum number of distinct error messages to sample.
 const MAX_ERROR_SAMPLES: usize = 10;
 
+/// Context for finalizing a load test run into a [`LoadStats`] report.
+pub struct FinalizeContext<'a> {
+    pub profile_name: &'a str,
+    pub bytes_written: u64,
+    pub compaction_tasks: u64,
+    pub s3_uploads: u64,
+    pub s3_deletes: u64,
+    pub bytes_reclaimed: u64,
+    pub sstable_count_final: u64,
+    pub missing_keys: u64,
+    pub data_mismatches: u64,
+    pub keys_verified: u64,
+    pub resource_summary: Option<ResourceSummary>,
+    pub abort_reason: Option<String>,
+}
+
 /// Collects statistics during a load test run.
 pub struct StatsCollector {
     pub(crate) start: Instant,
@@ -397,21 +413,21 @@ impl StatsCollector {
     }
 
     /// Finalize and produce the complete stats report.
-    pub fn finalize(
-        self,
-        profile_name: &str,
-        bytes_written: u64,
-        compaction_tasks: u64,
-        s3_uploads: u64,
-        s3_deletes: u64,
-        bytes_reclaimed: u64,
-        sstable_count_final: u64,
-        missing_keys: u64,
-        data_mismatches: u64,
-        keys_verified: u64,
-        resource_summary: Option<ResourceSummary>,
-        abort_reason: Option<String>,
-    ) -> LoadStats {
+    pub fn finalize(self, ctx: FinalizeContext<'_>) -> LoadStats {
+        let FinalizeContext {
+            profile_name,
+            bytes_written,
+            compaction_tasks,
+            s3_uploads,
+            s3_deletes,
+            bytes_reclaimed,
+            sstable_count_final,
+            missing_keys,
+            data_mismatches,
+            keys_verified,
+            resource_summary,
+            abort_reason,
+        } = ctx;
         let elapsed = self.start.elapsed();
         let secs = elapsed.as_secs_f64().max(0.001);
         let total_writes = self.writes.load(Ordering::Relaxed);
@@ -463,6 +479,23 @@ impl Default for StatsCollector {
 mod tests {
     use super::*;
 
+    fn test_ctx(name: &str) -> FinalizeContext<'_> {
+        FinalizeContext {
+            profile_name: name,
+            bytes_written: 0,
+            compaction_tasks: 0,
+            s3_uploads: 0,
+            s3_deletes: 0,
+            bytes_reclaimed: 0,
+            sstable_count_final: 0,
+            missing_keys: 0,
+            data_mismatches: 0,
+            keys_verified: 0,
+            resource_summary: None,
+            abort_reason: None,
+        }
+    }
+
     #[test]
     fn stats_collector_tracks_writes_and_reads() {
         let sc = StatsCollector::new();
@@ -472,7 +505,7 @@ mod tests {
         for _ in 0..50 {
             sc.record_read(Duration::from_micros(100));
         }
-        let stats = sc.finalize("test", 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None);
+        let stats = sc.finalize(test_ctx("test"));
         assert_eq!(stats.total_writes, 100);
         assert_eq!(stats.total_reads, 50);
     }
@@ -483,7 +516,7 @@ mod tests {
         sc.record_write_error();
         sc.record_write_error();
         sc.record_read_error();
-        let stats = sc.finalize("test", 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None);
+        let stats = sc.finalize(test_ctx("test"));
         assert_eq!(stats.write_errors, 2);
         assert_eq!(stats.read_errors, 1);
     }
@@ -518,7 +551,7 @@ mod tests {
         sc.record_write(Duration::from_micros(100));
         sc.record_write(Duration::from_micros(200));
         sc.record_write(Duration::from_micros(5000));
-        let stats = sc.finalize("test", 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None);
+        let stats = sc.finalize(test_ctx("test"));
         assert_eq!(stats.write_latency.count, 3);
         // HDR histogram quantizes values — allow 1% tolerance.
         assert!(
@@ -534,7 +567,12 @@ mod tests {
         let sc = StatsCollector::new();
         sc.record_write(Duration::from_millis(1));
         sc.record_read(Duration::from_millis(2));
-        let stats = sc.finalize("test", 1000, 0, 0, 0, 0, 1, 0, 0, 100, None, None);
+        let stats = sc.finalize(FinalizeContext {
+            bytes_written: 1000,
+            sstable_count_final: 1,
+            keys_verified: 100,
+            ..test_ctx("test")
+        });
         let output = format!("{stats}");
         assert!(output.contains("Latency"));
         assert!(output.contains("p50="));
@@ -546,7 +584,7 @@ mod tests {
     fn stats_snapshot_includes_s3_metrics() {
         let sc = StatsCollector::new();
         sc.take_snapshot(1024, 3, 5000, 2, 1000);
-        let stats = sc.finalize("test", 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None);
+        let stats = sc.finalize(test_ctx("test"));
         assert_eq!(stats.snapshots.len(), 1);
         assert_eq!(stats.snapshots[0].s3_uploads, 2);
         assert_eq!(stats.snapshots[0].bytes_reclaimed, 1000);

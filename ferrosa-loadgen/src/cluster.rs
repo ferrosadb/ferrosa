@@ -18,7 +18,7 @@ use rand::SeedableRng;
 
 use crate::profile::LoadProfile;
 use crate::resource_monitor::{self, LeakVerdict, ResourceMonitor, ResourceSnapshot};
-use crate::stats::{LoadStats, StatsCollector};
+use crate::stats::{FinalizeContext, LoadStats, StatsCollector};
 use crate::tui::{TuiDashboard, TuiFrame};
 
 /// Parse a comma-separated list of node addresses.
@@ -186,7 +186,9 @@ async fn run_cluster_load_test_async(
     let mut resource_mon = ResourceMonitor::new(4);
     let mut abort_reason: Option<String> = None;
     let mut throughput_history: Vec<u64> = Vec::new();
+    #[allow(unused_assignments)]
     let mut leak_warnings: usize = 0;
+    #[allow(unused_assignments)]
     let mut last_resource_snap: Option<ResourceSnapshot> = None;
 
     let mut dashboard = if enable_tui {
@@ -381,20 +383,20 @@ async fn run_cluster_load_test_async(
 
     let stats = Arc::try_unwrap(stats)
         .unwrap_or_else(|_| panic!("worker tasks still hold Arc<StatsCollector>"));
-    stats.finalize(
-        &format!("{} (cluster: {} nodes)", profile.name, nodes.len()),
-        bw_final,
-        0,
-        final_server.s3_object_count,
-        0,
-        final_server.s3_bytes,
-        final_server.sstable_count,
-        0,
-        0,
-        0,
+    stats.finalize(FinalizeContext {
+        profile_name: &format!("{} (cluster: {} nodes)", profile.name, nodes.len()),
+        bytes_written: bw_final,
+        compaction_tasks: 0,
+        s3_uploads: final_server.s3_object_count,
+        s3_deletes: 0,
+        bytes_reclaimed: final_server.s3_bytes,
+        sstable_count_final: final_server.sstable_count,
+        missing_keys: 0,
+        data_mismatches: 0,
+        keys_verified: 0,
         resource_summary,
         abort_reason,
-    )
+    })
 }
 
 /// Poll server metrics (used at end of test for final report).

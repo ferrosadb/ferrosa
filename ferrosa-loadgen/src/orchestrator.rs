@@ -16,7 +16,7 @@ use crate::ground_truth::GroundTruth;
 use crate::integrity::IntegrityVerifier;
 use crate::profile::LoadProfile;
 use crate::resource_monitor::{self, LeakVerdict, ResourceMonitor};
-use crate::stats::{LoadStats, StatsCollector};
+use crate::stats::{FinalizeContext, LoadStats, StatsCollector};
 use crate::tui::{TuiDashboard, TuiFrame};
 
 /// Create the table schema used by load tests.
@@ -338,18 +338,18 @@ fn run_load_test_inner(
 
     let resource_summary = resource_mon.summary();
 
-    stats.finalize(
-        &profile.name,
-        total_bytes,
-        0,
+    stats.finalize(FinalizeContext {
+        profile_name: &profile.name,
+        bytes_written: total_bytes,
+        compaction_tasks: 0,
         s3_uploads,
         s3_deletes,
         bytes_reclaimed,
-        sstable_count,
-        report.missing_keys.len() as u64,
-        report.mismatched_keys.len() as u64,
-        report.keys_checked,
+        sstable_count_final: sstable_count,
+        missing_keys: report.missing_keys.len() as u64,
+        data_mismatches: report.mismatched_keys.len() as u64,
+        keys_verified: report.keys_checked,
         resource_summary,
         abort_reason,
-    )
+    })
 }

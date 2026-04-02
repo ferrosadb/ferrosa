@@ -26,9 +26,12 @@ pub enum ReadResult {
 /// Thread-safe ground truth: records the latest value for each key and
 /// tracks read/write statistics. Deleted keys are recorded with an empty
 /// value vec and are expected to return None on read.
+/// Per-key ground truth entry: (value, timestamp, is_deleted).
+type Entry = (Vec<u8>, i64, bool);
+
 pub struct GroundTruth {
-    /// Key → (value, timestamp, is_deleted). Empty value + is_deleted means tombstone.
-    shards: Vec<Mutex<HashMap<String, (Vec<u8>, i64, bool)>>>,
+    /// Key → entry. Empty value + is_deleted means tombstone.
+    shards: Vec<Mutex<HashMap<String, Entry>>>,
     writes: AtomicU64,
     reads: AtomicU64,
     matches: AtomicU64,
