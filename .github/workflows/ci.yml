@@ -43,7 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: |
-          cargo test --all-features --workspace \
+          cargo test --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
             -- --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
@@ -51,9 +51,8 @@ jobs:
                --skip packet_reorder_linearizability --skip lwt_batch_atomicity_all \
                --skip clock_skew_large_preaccept \
                --skip binary_ \
-               --skip concurrent_write_flush_compact \
-               --skip many_flushes_no_data --skip flush_2000 --skip single_writer_concurrent \
-               --skip write_flush_compact_no_data
+               --skip concurrent_write --skip many_flushes \
+               --skip flush_2000 --skip single_writer --skip write_flush_compact
 
   # ── Stage 2b: Coverage (separate to avoid OOM from instrumentation) ──
   coverage:
