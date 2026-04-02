@@ -98,7 +98,15 @@ impl CompactionExecutor {
             let _ = handle.join();
         }
     }
+}
 
+impl Drop for CompactionExecutor {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl CompactionExecutor {
     /// Execute a single compaction task by merging input SSTables into one output.
     fn execute_task(task: &CompactionTask) -> std::result::Result<SSTableMetadata, String> {
         use crate::flush::{self, FileFlushTarget, FlushTarget};
