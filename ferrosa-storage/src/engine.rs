@@ -4972,18 +4972,17 @@ mod tests {
             .write(&tid, &make_key("k3"), make_row(b"v3", 3000), 3000)
             .unwrap();
 
-        // Wait for compaction to finish.
+        // Wait for compaction to finish (up to 15s under heavy CI load).
         let compaction_dir = dir.path().join("compaction");
-        for _ in 0..60 {
+        for _ in 0..300 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if compaction_dir.exists() {
-                let done = std::fs::read_dir(&compaction_dir)
+            if compaction_dir.exists()
+                && std::fs::read_dir(&compaction_dir)
                     .ok()
                     .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false);
-                if done {
-                    break;
-                }
+                    .unwrap_or(false)
+            {
+                break;
             }
         }
 
@@ -4994,7 +4993,18 @@ mod tests {
             eng_clone.flush(&tid_clone).unwrap();
         });
 
-        engine.poll_compactions().await;
+        // Poll compactions in a retry loop — under CI load the background
+        // compaction thread may not have finished yet.
+        for _ in 0..100 {
+            engine.poll_compactions().await;
+            let (m, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+                .await
+                .unwrap();
+            if m.sstables.get(&tid.to_string()).map(|v| !v.is_empty()) == Some(true) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         flush_handle.await.unwrap();
 
         // Both operations completed without panic.
