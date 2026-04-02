@@ -134,15 +134,21 @@ impl ModeController {
             let internode_port = self.net_config.bind_addr.port();
             let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
             self.spawn_tracked(async move {
-                // Small delay to let peer's RPC server be ready.
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                match PriorityPool::connect(net_cfg, local_id, &reverse_addr.to_string()).await {
-                    Ok(pool) => {
-                        pm.add_peer((peer_host_id, reverse_addr), pool).await;
-                        tracing::info!(%peer_host_id, %reverse_addr, "reverse connection established");
-                    }
-                    Err(e) => {
-                        tracing::warn!(%e, "reverse connection to peer failed");
+                // Retry connecting to peer's RPC server with backoff.
+                for attempt in 0..10 {
+                    match PriorityPool::connect(net_cfg.clone(), local_id, &reverse_addr.to_string()).await {
+                        Ok(pool) => {
+                            pm.add_peer((peer_host_id, reverse_addr), pool).await;
+                            tracing::info!(%peer_host_id, %reverse_addr, attempt, "reverse connection established");
+                            return;
+                        }
+                        Err(e) => {
+                            if attempt < 9 {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            } else {
+                                tracing::warn!(%e, attempt, "reverse connection to peer failed after retries");
+                            }
+                        }
                     }
                 }
             });
@@ -155,8 +161,13 @@ impl ModeController {
             let storage = self.storage.clone();
             let schema = self.schema.clone();
             self.spawn_tracked(async move {
-                // Wait for reverse connection + peer pair transition + handler registration.
-                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                // Retry sending RoleSwap until peer is ready (replaces 4s fixed sleep).
+                for _attempt in 0..8 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if pm.has_peer(peer_host_id) {
+                        break;
+                    }
+                }
 
                 // Tell peer to become secondary.
                 match pm
@@ -216,8 +227,15 @@ impl ModeController {
                 let pm = peer_manager;
                 let schema = self.schema.clone();
                 handle.spawn(async move {
-                    // Wait for peer to complete its pair transition and register handlers.
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Retry schema sync until peer's handler is ready.
+                    for _attempt in 0..10 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        if pm.has_peer(peer_host_id) {
+                            send_schema_sync_to_peer(&pm, peer_host_id, &schema).await;
+                            return;
+                        }
+                    }
+                    // Final attempt even if peer not confirmed
                     send_schema_sync_to_peer(&pm, peer_host_id, &schema).await;
                 });
             }

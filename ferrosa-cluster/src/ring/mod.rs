@@ -56,7 +56,7 @@ impl TokenRing {
         let is_normal = |nid: u64| -> bool {
             self.nodes
                 .get(&nid)
-                .map_or(false, |n| n.state == crate::raft::NodeState::Normal)
+                .is_some_and(|n| n.state == crate::raft::NodeState::Normal)
         };
 
         // Walk clockwise from token (entries >= token)

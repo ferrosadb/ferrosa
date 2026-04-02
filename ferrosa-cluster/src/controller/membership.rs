@@ -117,9 +117,7 @@ impl ModeController {
         // leader via normal Raft election timeout (~1-2s).
         if let Some(lid) = raft.current_leader().await {
             if lid == node_id {
-                tracing::info!(
-                    "decommissioning the leader — Raft will auto-elect after LeaveNode"
-                );
+                tracing::info!("decommissioning the leader — Raft will auto-elect after LeaveNode");
             }
         }
 
@@ -150,7 +148,7 @@ impl ModeController {
             let config = crate::streaming::StreamConfig::default();
             let mut session_counter = 0_u64;
 
-            for ((ks, tbl), _) in &schema_snap.tables {
+            for (ks, tbl) in schema_snap.tables.keys() {
                 if ks.starts_with("system") {
                     continue;
                 }
@@ -170,14 +168,19 @@ impl ModeController {
                         let replicas = ring.replicas(token, 2);
                         let target = replicas.iter().find(|&&nid| nid != node_id);
                         if let Some(&target_nid) = target {
-                            let target_uuid = ring.get_node(target_nid)
+                            let target_uuid = ring
+                                .get_node(target_nid)
                                 .map(|n| n.host_id)
                                 .unwrap_or_default();
-                            let row_bytes = partition.rows.first()
+                            let row_bytes = partition
+                                .rows
+                                .first()
                                 .and_then(|r| r.cells.first())
                                 .and_then(|(_, cv)| cv.value.clone())
                                 .unwrap_or_default();
-                            let ts = partition.rows.first()
+                            let ts = partition
+                                .rows
+                                .first()
                                 .and_then(|r| r.cells.first())
                                 .map(|(_, cv)| cv.timestamp)
                                 .unwrap_or(0);

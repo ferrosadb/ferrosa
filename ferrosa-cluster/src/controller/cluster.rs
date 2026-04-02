@@ -495,7 +495,7 @@ impl ModeController {
                             let node_map = node_map_for_bootstrap.read().unwrap().clone();
                             let mut session_counter = 0_u64;
 
-                            for ((ks, tbl), _table_meta) in &schema_snap.tables {
+                            for (ks, tbl) in schema_snap.tables.keys() {
                                 if ks.starts_with("system") {
                                     continue;
                                 }
