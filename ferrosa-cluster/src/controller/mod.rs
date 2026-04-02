@@ -1,6 +1,6 @@
 //! Mode controller — manages runtime transitions between deployment modes.
 //!
-//! The controller implements [`PeerEventListener`] and swaps the active
+//! The controller implements [`ferrosa_net::peer::PeerEventListener`] and swaps the active
 //! [`WritePath`] and [`ClusterStateHolder`] atomically when the deployment mode
 //! changes (standalone → pair → cluster).
 //!
@@ -51,15 +51,15 @@ use crate::write_path::WritePath;
 
 // Re-exports used by tests via `use super::*`.
 #[cfg(test)]
+pub(crate) use crate::error::ClusterError;
+#[cfg(test)]
+pub(crate) use crate::raft::uuid_to_node_id;
+#[cfg(test)]
 pub(crate) use ferrosa_net::codec::MsgType;
 #[cfg(test)]
 pub(crate) use ferrosa_net::peer::{PeerEventListener, PeerManager};
 #[cfg(test)]
 pub(crate) use ferrosa_net::rpc::InboundPeerCallback;
-#[cfg(test)]
-pub(crate) use crate::error::ClusterError;
-#[cfg(test)]
-pub(crate) use crate::raft::uuid_to_node_id;
 
 /// Swappable cluster state — enum dispatch to avoid trait object Sized issues.
 pub enum ClusterStateHolder {
@@ -435,9 +435,9 @@ impl ModeController {
 
     /// Return a reference to the shared hint store.
     ///
-    /// Used by callers that build a [`ClusterCoordinator`] and want to
+    /// Used by callers that build a [`crate::coordinator::ClusterCoordinator`] and want to
     /// attach the same `HintStore` instance via
-    /// [`ClusterCoordinator::with_hint_store`].
+    /// [`crate::coordinator::ClusterCoordinator::with_hint_store`].
     pub fn hint_store(&self) -> Arc<HintStore> {
         self.hint_store.clone()
     }

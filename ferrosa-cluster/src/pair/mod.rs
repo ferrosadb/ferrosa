@@ -38,7 +38,7 @@ impl PairRole {
     }
 
     /// Legacy: Determine this node's role by comparing host_ids.
-    /// Deprecated in favor of [`from_connection_direction`].
+    /// Deprecated in favor of [`Self::from_connection_direction`].
     #[deprecated(note = "use from_connection_direction — UUID election has race conditions")]
     pub fn elect(local_id: Uuid, peer_id: Uuid) -> Self {
         if local_id > peer_id {

@@ -23,7 +23,12 @@ use super::token::send_schema_sync_to_peer;
 use super::{ClusterStateHolder, ModeController, PairContext};
 
 impl ModeController {
-    pub(super) fn transition_to_pair(&self, peer_host_id: Uuid, peer_addr: SocketAddr, need_reverse: bool) {
+    pub(super) fn transition_to_pair(
+        &self,
+        peer_host_id: Uuid,
+        peer_addr: SocketAddr,
+        need_reverse: bool,
+    ) {
         let peer_manager = match &**self.peer_manager.load() {
             Some(pm) => pm.clone(),
             None => {

@@ -12,7 +12,11 @@ use uuid::Uuid;
 /// Used both after a force-promote rejoin (to sync schema + data replay) and
 /// after a normal pair reconnection (to catch up schema changes the secondary
 /// missed while it was offline).
-pub(super) async fn send_schema_sync_to_peer(pm: &PeerManager, peer_host_id: Uuid, schema: &Schema) {
+pub(super) async fn send_schema_sync_to_peer(
+    pm: &PeerManager,
+    peer_host_id: Uuid,
+    schema: &Schema,
+) {
     let snap = schema.snapshot();
     let wire_snap = crate::pair::ddl::WireSchemaSnapshot::from_snapshot(&snap);
     match serde_json::to_vec(&wire_snap) {

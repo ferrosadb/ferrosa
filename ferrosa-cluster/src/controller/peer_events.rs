@@ -120,9 +120,11 @@ impl PeerEventListener for ModeController {
                         "quorum lost — transitioning to DegradedCluster"
                     );
                     self.mode.store(Arc::new(DeploymentMode::DegradedCluster));
-                    self.write_path.store(Arc::new(crate::write_path::WritePath::unavailable()));
+                    self.write_path
+                        .store(Arc::new(crate::write_path::WritePath::unavailable()));
                     // DDL unavailable without quorum
-                    self.ddl_path.store(Arc::new(crate::ddl_path::DdlPath::Unavailable));
+                    self.ddl_path
+                        .store(Arc::new(crate::ddl_path::DdlPath::Unavailable));
                 }
                 // If quorum intact, Raft handles it — no mode change needed.
             }
