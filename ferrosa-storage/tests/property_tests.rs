@@ -106,7 +106,7 @@ proptest! {
     fn flush_preserves_all_data(n in 1usize..20) {
         let store = TableStore::new(
             test_schema(),
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions { compression: None, ..WriteOptions::default() },
         );
 

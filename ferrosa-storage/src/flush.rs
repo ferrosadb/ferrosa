@@ -191,6 +191,10 @@ pub trait FlushTarget {
         0
     }
 
+    /// Advance the generation counter to at least `min_gen + 1`.
+    /// Prevents future flush file names from colliding with compaction output.
+    fn advance_generation(&self, _min_gen: u64) {}
+
     /// Write per-index sidecar files alongside the flushed SSTable.
     ///
     /// Called after [`FlushTarget::flush`] with the same generation number. For each
@@ -225,12 +229,33 @@ pub trait FlushTarget {
 /// In-memory flush target for testing — wraps output as `SSTableComponents<Vec<u8>>`.
 ///
 /// No filesystem interaction. The flushed data lives entirely in memory.
-pub struct InMemoryFlushTarget;
+/// Tracks a monotonic generation counter so that each flush produces a
+/// unique ID, matching the behavior of [`FileFlushTarget`].
+pub struct InMemoryFlushTarget {
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl InMemoryFlushTarget {
+    /// Create a new in-memory flush target with the generation counter at 0.
+    pub fn new() -> Self {
+        Self {
+            generation: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for InMemoryFlushTarget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FlushTarget for InMemoryFlushTarget {
     type Reader = Vec<u8>;
 
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<Vec<u8>>> {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         SSTableReader::open(SSTableComponents {
             data: output.data,
             partitions: output.partitions,
@@ -239,6 +264,15 @@ impl FlushTarget for InMemoryFlushTarget {
             compression_info: output.compression_info,
             statistics: output.statistics,
         })
+    }
+
+    fn last_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn advance_generation(&self, min_gen: u64) {
+        self.generation
+            .fetch_max(min_gen + 1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -402,6 +436,10 @@ impl FlushTarget for FileFlushTarget {
 
     fn last_generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    fn advance_generation(&self, min_gen: u64) {
+        self.generation.fetch_max(min_gen + 1, Ordering::SeqCst);
     }
 
     /// Write per-index sidecar files as `{gen}-{index_name}.sidecar`.
@@ -571,7 +609,7 @@ mod tests {
         }
         let output = writer.finish().unwrap();
 
-        let target = InMemoryFlushTarget;
+        let target = InMemoryFlushTarget::new();
         let reader = target.flush(output).unwrap();
 
         // Verify we can read back both partitions

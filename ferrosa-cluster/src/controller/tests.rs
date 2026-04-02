@@ -666,3 +666,105 @@ fn is_cql_ready_pair_secondary_returns_false() {
         "pair secondary must NOT accept CQL connections"
     );
 }
+
+// -----------------------------------------------------------------------
+// ClusterInviteHandler
+// -----------------------------------------------------------------------
+
+// -----------------------------------------------------------------------
+// Promotion epoch
+// -----------------------------------------------------------------------
+
+/// force_promote increments the promote_epoch counter each time.
+/// On reconnect, higher epoch wins primary role.
+#[test]
+fn force_promote_increments_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig::default());
+    let net_config = Arc::new(NetConfig::default());
+    let host_id = Uuid::new_v4();
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) =
+        ModeController::new(config, net_config, host_id, storage, schema, registry);
+
+    assert_eq!(controller.promote_epoch(), 0, "starts at 0");
+
+    controller.force_promote().unwrap();
+    assert_eq!(controller.promote_epoch(), 1, "first promote → epoch 1");
+
+    controller.force_promote().unwrap();
+    assert_eq!(controller.promote_epoch(), 2, "second promote → epoch 2");
+}
+
+/// set_promote_epoch allows updating to a peer's higher epoch on reconnect.
+#[test]
+fn set_promote_epoch_accepts_higher_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig::default());
+    let net_config = Arc::new(NetConfig::default());
+    let host_id = Uuid::new_v4();
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) =
+        ModeController::new(config, net_config, host_id, storage, schema, registry);
+
+    controller.force_promote().unwrap();
+    assert_eq!(controller.promote_epoch(), 1);
+
+    // Simulate receiving a higher epoch from peer during reconnect.
+    controller.set_promote_epoch(5);
+    assert_eq!(controller.promote_epoch(), 5);
+}
+
+/// ClusterInviteHandler replies with ClusterInviteAck and identifies
+/// unknown peers from the invite's peer list.
+#[tokio::test]
+async fn cluster_invite_handler_replies_with_ack() {
+    use ferrosa_net::rpc::RpcHandler;
+
+    let local_id = Uuid::new_v4();
+    let net_config = Arc::new(NetConfig::default());
+
+    struct NoopListener;
+    impl ferrosa_net::peer::PeerEventListener for NoopListener {
+        fn on_peer_connected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+        fn on_peer_disconnected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+        fn on_peer_suspected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+        fn on_peer_recovered(&self, _: uuid::Uuid) {}
+        fn on_peer_failed(&self, _: uuid::Uuid) {}
+    }
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        Arc::new(NoopListener),
+    ));
+
+    let handler = cluster::ClusterInviteHandler::new(local_id, pm, net_config);
+
+    let initiator = Uuid::new_v4();
+    let peer1 = Uuid::new_v4();
+    let peer2 = Uuid::new_v4();
+
+    let msg = ferrosa_net::message::Message::ClusterInvite {
+        initiator,
+        peers: vec![
+            (local_id, "10.0.0.1:7000".parse().unwrap()),
+            (peer1, "10.0.0.2:7000".parse().unwrap()),
+            (peer2, "10.0.0.3:7000".parse().unwrap()),
+        ],
+    };
+
+    let from = (initiator, "10.0.0.4:7000".parse().unwrap());
+    let response = handler.handle(from, msg).await;
+
+    assert!(response.is_some(), "handler should reply");
+    match response.unwrap() {
+        ferrosa_net::message::Message::ClusterInviteAck { host_id } => {
+            assert_eq!(host_id, local_id, "ACK should contain local host_id");
+        }
+        other => panic!("expected ClusterInviteAck, got: {other:?}"),
+    }
+}

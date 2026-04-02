@@ -106,6 +106,10 @@ pub struct ModeController {
     pub(super) pair_context: Mutex<Option<PairContext>>,
     /// Set by force_promote — overrides UUID election on next pair transition.
     pub(super) force_promoted: AtomicBool,
+    /// Lamport counter incremented on each force_promote. On reconnect after
+    /// a partition, the node with the higher promote_epoch wins primary role.
+    /// Prevents split-brain when both nodes force_promote independently.
+    pub(super) promote_epoch: std::sync::atomic::AtomicU64,
     /// All connected peers, tracked across mode transitions.
     pub(super) connected_peers: Mutex<Vec<(Uuid, SocketAddr)>>,
     /// Raft instance, set asynchronously after cluster transition completes.
@@ -210,6 +214,7 @@ impl ModeController {
             registry,
             pair_context: Mutex::new(None),
             force_promoted: AtomicBool::new(false),
+            promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
             raft_instance: Arc::new(ArcSwap::from_pointee(None)),
             hint_store,
@@ -261,6 +266,7 @@ impl ModeController {
             registry: Arc::new(HandlerRegistry::new()),
             pair_context: Mutex::new(None),
             force_promoted: AtomicBool::new(false),
+            promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
             raft_instance: Arc::new(ArcSwap::from_pointee(None)),
             hint_store,
@@ -312,6 +318,7 @@ impl ModeController {
             registry: Arc::new(HandlerRegistry::new()),
             pair_context: Mutex::new(Some(pair_ctx)),
             force_promoted: AtomicBool::new(false),
+            promote_epoch: std::sync::atomic::AtomicU64::new(0),
             connected_peers: Mutex::new(Vec::new()),
             raft_instance: Arc::new(ArcSwap::from_pointee(None)),
             hint_store,
@@ -328,7 +335,21 @@ impl ModeController {
     }
 
     /// Set the peer manager reference. Must be called after PeerManager is created.
+    ///
+    /// Also registers the `ClusterInviteHandler` so this node can process
+    /// incoming `ClusterInvite` messages and connect to discovered peers.
     pub fn set_peer_manager(&self, pm: Arc<ferrosa_net::peer::PeerManager>) {
+        // Register ClusterInvite handler so this node can process
+        // incoming invites and connect to discovered peers.
+        use ferrosa_net::codec::MsgType;
+        let invite_handler = Arc::new(cluster::ClusterInviteHandler::new(
+            self.local_host_id,
+            pm.clone(),
+            self.net_config.clone(),
+        ));
+        self.registry
+            .register(MsgType::ClusterInvite, invite_handler);
+
         self.peer_manager.store(Arc::new(Some(pm)));
     }
 

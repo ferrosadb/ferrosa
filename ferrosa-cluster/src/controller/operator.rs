@@ -16,6 +16,7 @@ impl ModeController {
     /// Use when the peer is unreachable and the operator wants to resume writes.
     /// Subsequent peer reconnection will auto re-pair with this node as primary.
     pub fn force_promote(&self) -> Result<()> {
+        let epoch = self.promote_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.write_path
             .store(Arc::new(WritePath::direct(self.storage.clone())));
         self.ddl_path.store(Arc::new(DdlPath::Direct {
@@ -28,8 +29,21 @@ impl ModeController {
         self.force_promoted.store(true, Ordering::Release);
         *self.pair_context.lock() = None;
         self.connected_peers.lock().clear();
-        tracing::info!("force promoted to standalone primary");
+        tracing::info!(epoch, "force promoted to standalone primary");
         Ok(())
+    }
+
+    /// Returns the current promote epoch (Lamport counter).
+    ///
+    /// Used during reconnect handshake: the node with the higher epoch
+    /// becomes primary. If equal, UUID comparison breaks the tie.
+    pub fn promote_epoch(&self) -> u64 {
+        self.promote_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Set the promote epoch (used when receiving a higher epoch from a peer).
+    pub fn set_promote_epoch(&self, epoch: u64) {
+        self.promote_epoch.store(epoch, Ordering::SeqCst);
     }
 
     /// Initiate switchover: swap primary/secondary roles.

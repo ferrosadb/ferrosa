@@ -54,7 +54,7 @@ fn test_options() -> WriteOptions {
 }
 
 fn test_store() -> TableStore<InMemoryFlushTarget> {
-    TableStore::new(test_schema(), InMemoryFlushTarget, test_options())
+    TableStore::new(test_schema(), InMemoryFlushTarget::new(), test_options())
 }
 
 #[test]

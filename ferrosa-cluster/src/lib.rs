@@ -11,6 +11,7 @@ pub mod mode;
 pub mod pair;
 pub mod raft;
 pub mod rebalance;
+pub mod repair;
 pub mod ring;
 pub mod state;
 pub mod streaming;

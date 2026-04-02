@@ -1671,7 +1671,7 @@ impl StorageEngine {
     pub async fn poll_compactions(&self) {
         let results = self.compaction_executor.poll_results();
         for result in results {
-            let input_count = result.task.inputs.len();
+            let input_ids: Vec<String> = result.task.inputs.iter().map(|m| m.id.clone()).collect();
             let table_id = &result.task.table_id;
 
             // Open the compacted output SSTable.
@@ -1685,12 +1685,19 @@ impl StorageEngine {
                 }
             };
 
-            // Swap: remove input SSTables, insert output.
+            // Swap: remove input SSTables by ID, insert output.
+            // Compaction output gen may collide with flush gen (different dirs).
+            // Advance the flush target past this gen to prevent future collisions,
+            // and use the store's unique ID allocator for the tracking ID.
             {
                 let tables = self.tables.read();
                 if let Some(state) = tables.get(table_id) {
+                    // Prefix with "c" so compaction output IDs never collide
+                    // with flush IDs (prefixed with "f") in sstable_ids.
+                    let output_id = format!("c{gen}");
                     if let Err(e) = state.store.swap_compacted_sstables(
-                        input_count,
+                        &input_ids,
+                        output_id,
                         reader,
                         std::collections::HashMap::new(),
                     ) {
@@ -1888,7 +1895,12 @@ impl StorageEngine {
                         .iter()
                         .flat_map(|input| {
                             component_suffixes.iter().map(move |suffix| {
-                                let path = input.path.join(format!("{}-{suffix}", input.id));
+                                let file_gen = input
+                                    .id
+                                    .strip_prefix('f')
+                                    .or_else(|| input.id.strip_prefix('c'))
+                                    .unwrap_or(&input.id);
+                                let path = input.path.join(format!("{file_gen}-{suffix}"));
                                 std::fs::metadata(&path)
                                     .map(|m| m.len() as i64)
                                     .unwrap_or(0)
@@ -1900,7 +1912,17 @@ impl StorageEngine {
 
             match crate::manifest::Manifest::load(store.as_ref(), &prefix).await {
                 Ok((mut manifest, _version)) => {
-                    manifest.remove_sstables(&table_id_str, &input_ids);
+                    // Strip tracking prefix for manifest ops (manifest uses raw gens).
+                    let manifest_input_ids: Vec<String> = input_ids
+                        .iter()
+                        .map(|id| {
+                            id.strip_prefix('f')
+                                .or_else(|| id.strip_prefix('c'))
+                                .unwrap_or(id)
+                                .to_string()
+                        })
+                        .collect();
+                    manifest.remove_sstables(&table_id_str, &manifest_input_ids);
                     manifest.add_sstable(
                         &table_id_str,
                         crate::manifest::ManifestEntry {
@@ -1959,8 +1981,13 @@ impl StorageEngine {
                     "TOC.txt",
                     "CompressionInfo.db",
                 ];
+                // Strip tracking prefix ("f" or "c") to get the file gen.
+                let file_gen = input_id
+                    .strip_prefix('f')
+                    .or_else(|| input_id.strip_prefix('c'))
+                    .unwrap_or(input_id);
                 for component in &standard_components {
-                    let file_path = table_dir.join(format!("{input_id}-{component}"));
+                    let file_path = table_dir.join(format!("{file_gen}-{component}"));
                     let _ = std::fs::remove_file(&file_path);
                 }
             }
@@ -2000,6 +2027,19 @@ impl StorageEngine {
             .read()
             .get(table_id)
             .map(|s| s.store.sstable_count())
+            .unwrap_or(0)
+    }
+
+    /// Returns the count of SSTable read errors for a table.
+    pub fn sstable_read_errors(&self, table_id: &TableId) -> u64 {
+        self.tables
+            .read()
+            .get(table_id)
+            .map(|s| {
+                s.store
+                    .sstable_read_errors
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
             .unwrap_or(0)
     }
 
@@ -6659,6 +6699,135 @@ mod tests {
         assert!(
             !result_keys.contains(&"r3".to_string()),
             "r3 has neither term"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Data loss regression: write → flush → compact → read must return all keys
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_flush_compact_no_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // Write 100 keys, flush every 25 to create 4+ SSTables and trigger compaction.
+        for i in 0..100u64 {
+            let key = make_key(&format!("key_{i:04}"));
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(
+                    0,
+                    CellValue::live(format!("val_{i}").into_bytes(), i as i64),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(i as i64),
+            };
+            engine.write(&tid, &key, row, i as i64).unwrap();
+
+            if (i + 1) % 25 == 0 {
+                engine.flush(&tid).unwrap();
+            }
+        }
+
+        // Final flush.
+        engine.flush(&tid).unwrap();
+
+        // Poll compaction (STCS triggers at 4 SSTables).
+        engine.poll_compactions().await;
+
+        // Read all 100 keys — none should be missing.
+        let mut missing = Vec::new();
+        for i in 0..100u64 {
+            let key = make_key(&format!("key_{i:04}"));
+            match engine.read(&tid, &key) {
+                Ok(Some(_)) => {}
+                Ok(None) => missing.push(format!("key_{i:04}")),
+                Err(e) => missing.push(format!("key_{i:04} (error: {e})")),
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "data loss: {}/{} keys missing after flush+compact: {:?}",
+            missing.len(),
+            100,
+            &missing[..missing.len().min(10)]
+        );
+    }
+
+    /// Concurrent writes + flushes + compaction — reproduces the loadgen data loss.
+    #[tokio::test]
+    async fn concurrent_write_flush_compact_no_data_loss() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(AtomicU64::new(0));
+
+        // Writer threads
+        let mut handles = vec![];
+        for worker in 0..4u64 {
+            let eng = engine.clone();
+            let tid = tid.clone();
+            let stop = stop.clone();
+            let written = written.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut ts = worker * 1_000_000;
+                while !stop.load(Ordering::Relaxed) {
+                    let idx = written.fetch_add(1, Ordering::SeqCst);
+                    let key = make_key(&format!("k_{idx:06}"));
+                    ts += 1;
+                    let row = Row {
+                        clustering: vec![0, 0, 0, 1],
+                        cells: vec![(
+                            0,
+                            CellValue::live(format!("v{idx}").into_bytes(), ts as i64),
+                        )],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(ts as i64),
+                    };
+                    let _ = eng.write(&tid, &key, row, ts as i64);
+                }
+            }));
+        }
+
+        // Main thread: flush + compact for 2 seconds.
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = engine.flush(&tid);
+            engine.poll_compactions().await;
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Final flush.
+        engine.flush(&tid).unwrap();
+
+        // Read back all written keys.
+        let total = written.load(Ordering::SeqCst);
+        let mut missing = 0u64;
+        for i in 0..total {
+            let key = make_key(&format!("k_{i:06}"));
+            if engine.read(&tid, &key).unwrap().is_none() {
+                missing += 1;
+            }
+        }
+
+        assert_eq!(
+            missing, 0,
+            "data loss: {missing}/{total} keys missing after concurrent write+flush+compact"
         );
     }
 }

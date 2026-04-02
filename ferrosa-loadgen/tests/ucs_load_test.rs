@@ -21,7 +21,7 @@ use ferrosa_storage::{
 fn test_engine_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
     StorageEngineConfig {
         commit_log: CommitLogConfig {
-            segment_size: 4096,
+            segment_size: 32 * 1024 * 1024, // 32 MB — must exceed largest mutation
             max_segment_age: Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
             log_dir: dir.join("commitlog"),

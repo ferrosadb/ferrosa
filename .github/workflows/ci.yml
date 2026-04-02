@@ -54,7 +54,8 @@ jobs:
                --skip dep_wait_ordering --skip disk_fail_no_phantom \
                --skip packet_reorder_linearizability --skip lwt_batch_atomicity_all \
                --skip clock_skew_large_preaccept \
-               --skip binary_
+               --skip binary_ \
+               --skip ucs_load_s3
           cargo llvm-cov report --html --output-dir coverage-html
           cargo llvm-cov report --summary-only 2>&1 | tee coverage-summary.txt
       - name: Upload coverage report

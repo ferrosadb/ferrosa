@@ -40,8 +40,12 @@ impl ModeController {
         // Role is determined by connection direction:
         //   need_reverse = true  → inbound connection → this node is Primary (seed)
         //   need_reverse = false → outbound connection → this node is Secondary (joiner)
-        // Force-promoted nodes always stay primary regardless of direction.
+        //
+        // Force-promoted nodes stay primary. If both nodes were force-promoted
+        // (partition healed), the higher promote_epoch wins. If epochs are equal,
+        // UUID comparison breaks the tie.
         let was_promoted = self.force_promoted.swap(false, Ordering::AcqRel);
+        let local_epoch = self.promote_epoch.load(Ordering::SeqCst);
         let role = if was_promoted {
             PairRole::Primary
         } else {
@@ -122,6 +126,7 @@ impl ModeController {
             %role,
             peer = %peer_host_id,
             promoted = was_promoted,
+            promote_epoch = local_epoch,
             "mode transition: standalone → pair"
         );
 

@@ -5,8 +5,12 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use ferrosa_net::codec::{Lane, MsgType};
+use ferrosa_net::config::NetConfig;
 use ferrosa_net::message::Message;
+use ferrosa_net::peer::PeerManager;
 use ferrosa_net::pool::PriorityPool;
+use ferrosa_net::rpc::handler::PeerId;
+use ferrosa_net::rpc::RpcHandler;
 use uuid::Uuid;
 
 use crate::consistency::ConsistencyLevel;
@@ -526,14 +530,20 @@ impl ModeController {
                                         .unwrap_or(local_node_id);
 
                                     if owner != local_node_id {
-                                        // Extract the first cell's value bytes as the row payload.
-                                        let (row_bytes, ts) = partition.rows.first()
-                                            .and_then(|r| r.cells.first())
-                                            .map(|(_, cv)| {
-                                                let bytes = cv.value.clone().unwrap_or_default();
-                                                (bytes, cv.timestamp)
-                                            })
+                                        // Serialize all rows via RowWire for full fidelity
+                                        // (clustering keys, all cells, deletion, liveness).
+                                        use crate::raft::handlers::RowWire;
+                                        let wire_rows: Vec<RowWire> = partition.rows
+                                            .iter()
+                                            .cloned()
+                                            .map(RowWire::from)
+                                            .collect();
+                                        let row_bytes = bincode::serialize(&wire_rows)
                                             .unwrap_or_default();
+                                        let ts = partition.rows.first()
+                                            .and_then(|r| r.cells.first())
+                                            .map(|(_, cv)| cv.timestamp)
+                                            .unwrap_or(0);
 
                                         by_node.entry(owner).or_default().push(StreamedMutation {
                                             keyspace: ks.clone(),
@@ -616,5 +626,121 @@ impl ModeController {
             // Store the raft instance so it is accessible via controller.raft()
             raft_instance_swap.store(Arc::new(Some(raft_arc)));
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClusterInviteHandler — connects to discovered peers on invite receipt
+// ---------------------------------------------------------------------------
+
+/// RPC handler for `ClusterInvite` messages.
+///
+/// When a node receives a `ClusterInvite`, it:
+/// 1. Connects to any peers listed in the invite that it doesn't already know.
+/// 2. Re-broadcasts the invite to those newly connected peers.
+/// 3. Replies with `ClusterInviteAck`.
+pub struct ClusterInviteHandler {
+    local_host_id: Uuid,
+    peer_manager: Arc<PeerManager>,
+    net_config: Arc<NetConfig>,
+}
+
+impl ClusterInviteHandler {
+    pub fn new(
+        local_host_id: Uuid,
+        peer_manager: Arc<PeerManager>,
+        net_config: Arc<NetConfig>,
+    ) -> Self {
+        Self {
+            local_host_id,
+            peer_manager,
+            net_config,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for ClusterInviteHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let (initiator, peers) = match msg {
+            Message::ClusterInvite { initiator, peers } => (initiator, peers),
+            _ => return None,
+        };
+
+        tracing::info!(
+            %initiator,
+            peer_count = peers.len(),
+            "received ClusterInvite"
+        );
+
+        // Find peers we don't already know about.
+        let mut new_peers = Vec::new();
+        for (peer_id, peer_addr) in &peers {
+            if *peer_id == self.local_host_id {
+                continue; // skip self
+            }
+            if self.peer_manager.has_peer(*peer_id) {
+                continue; // peer_manager already knows this peer
+            }
+            new_peers.push((*peer_id, *peer_addr));
+        }
+
+        // Connect to unknown peers.
+        let internode_port = self.net_config.bind_addr.port();
+        for (peer_id, peer_addr) in &new_peers {
+            let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
+            let pm = self.peer_manager.clone();
+            let cfg = self.net_config.clone();
+            let local_id = self.local_host_id;
+            let uuid = *peer_id;
+            let addr = reverse_addr;
+
+            // Connect in background to avoid blocking the handler.
+            tokio::spawn(async move {
+                match PriorityPool::connect(cfg, local_id, &addr.to_string()).await {
+                    Ok(pool) => {
+                        pm.add_peer((uuid, addr), pool).await;
+                        tracing::info!(
+                            %uuid,
+                            %addr,
+                            "cluster invite: connected to discovered peer"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %uuid,
+                            %e,
+                            "cluster invite: failed to connect to discovered peer"
+                        );
+                    }
+                }
+            });
+        }
+
+        // Re-broadcast the invite to newly connected peers (after a short delay
+        // to allow connections to establish).
+        if !new_peers.is_empty() {
+            let pm = self.peer_manager.clone();
+            let invite = Message::ClusterInvite {
+                initiator,
+                peers: peers.clone(),
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                for (peer_id, _) in &new_peers {
+                    if let Err(e) = pm.fire(*peer_id, invite.clone(), Lane::Raft).await {
+                        tracing::debug!(
+                            peer = %peer_id,
+                            %e,
+                            "cluster invite: re-broadcast failed (peer may not be connected yet)"
+                        );
+                    }
+                }
+            });
+        }
+
+        Some(Message::ClusterInviteAck {
+            host_id: self.local_host_id,
+        })
     }
 }
