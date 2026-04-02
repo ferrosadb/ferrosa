@@ -39,13 +39,10 @@ impl ModeController {
     /// for mesh formation. Does NOT initialize Raft — that happens in
     /// `transition_to_cluster` after all peers are connected.
     pub(super) fn transition_to_forming(&self, peers: Vec<(Uuid, SocketAddr)>) {
-        let peer_manager = match &**self.peer_manager.load() {
-            Some(pm) => pm.clone(),
-            None => {
-                tracing::error!("cannot transition to forming: peer_manager not set");
-                return;
-            }
-        };
+        if self.peer_manager.load().is_none() {
+            tracing::error!("cannot transition to forming: peer_manager not set");
+            return;
+        }
 
         self.mode.store(Arc::new(DeploymentMode::Forming));
         // Block DDL during formation — prevents schema divergence (FMEA F3, RPN 378).
@@ -62,27 +59,8 @@ impl ModeController {
             "mode transition: pair -> forming (broadcasting ClusterInvite)"
         );
 
-        // Broadcast ClusterInvite to all connected peers so they discover each other.
-        let local_id = self.local_host_id;
-        let listen_addr = self.net_config.broadcast_addr;
-        let peers_for_invite = peers.clone();
-        let pm_clone = peer_manager.clone();
-        self.spawn_tracked(async move {
-            let invite = Message::ClusterInvite {
-                initiator: local_id,
-                peers: peers_for_invite
-                    .iter()
-                    .map(|(id, addr)| (*id, *addr))
-                    .chain(std::iter::once((local_id, listen_addr)))
-                    .collect(),
-            };
-
-            for (peer_id, _) in &peers_for_invite {
-                if let Err(e) = pm_clone.fire(*peer_id, invite.clone(), Lane::Data).await {
-                    tracing::warn!(peer = %peer_id, %e, "failed to send ClusterInvite");
-                }
-            }
-        });
+        // ClusterInvite delivery moved into the Raft init task (transition_to_cluster)
+        // to ensure invites arrive before elections start.
 
         // Record when we entered Forming — the timeout check happens in the
         // Raft init background task (transition_to_cluster) and also in
@@ -370,6 +348,51 @@ impl ModeController {
         self.registry.register(MsgType::ReadRequest, read_handler);
 
         self.spawn_tracked(async move {
+            // Deliver ClusterInvite to all peers BEFORE starting Raft.
+            // This ensures peers transition to cluster mode and register
+            // Raft handlers before elections begin.
+            // Build invite inside the async block using captured peer list.
+            // local_host_id is captured via the `peers` vec (all peers except self).
+            let invite_initiator = {
+                // Recover the local UUID from the node_map.
+                let map = node_map_for_bootstrap.read().unwrap();
+                map.get(&local_node_id).copied().unwrap_or_default()
+            };
+            let invite = Message::ClusterInvite {
+                initiator: invite_initiator,
+                peers: peers
+                    .iter()
+                    .map(|(id, addr)| (*id, *addr))
+                    .collect(),
+            };
+            for (peer_id, _) in &peers {
+                for attempt in 0..10 {
+                    match peer_manager_for_bootstrap
+                        .send(*peer_id, invite.clone(), Lane::Data)
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::info!(peer = %peer_id, "ClusterInvite delivered");
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt < 9 {
+                                tracing::debug!(
+                                    peer = %peer_id, attempt, %e,
+                                    "ClusterInvite delivery retry"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            } else {
+                                tracing::warn!(
+                                    peer = %peer_id,
+                                    "ClusterInvite delivery failed after 10 attempts"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // Build openraft Config
             let raft_config = match (openraft::Config {
                 cluster_name,
