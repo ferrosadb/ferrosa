@@ -8,6 +8,15 @@
 
 use std::process::Command;
 
+fn require_loadgen_binary() {
+    if std::env::var("FERROSA_TEST_LOADGEN").is_err() {
+        panic!(
+            "FERROSA_TEST_LOADGEN not set — these tests spawn cargo run as a subprocess \
+             and take several minutes to compile. Run with FERROSA_TEST_LOADGEN=1 for local testing."
+        );
+    }
+}
+
 fn cargo_bin() -> Command {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args(["run", "-p", "ferrosa-loadgen", "--"]);
@@ -16,6 +25,7 @@ fn cargo_bin() -> Command {
 
 #[test]
 fn binary_list_profiles() {
+    require_loadgen_binary();
     let output = cargo_bin()
         .arg("--list-profiles")
         .output()
@@ -34,6 +44,7 @@ fn binary_list_profiles() {
 
 #[test]
 fn binary_help() {
+    require_loadgen_binary();
     let output = cargo_bin()
         .arg("--help")
         .output()
@@ -54,6 +65,7 @@ fn binary_help() {
 
 #[test]
 fn binary_short_load_test() {
+    require_loadgen_binary();
     let dir = tempfile::tempdir().expect("create temp dir");
 
     // Use read_heavy profile — lightest workload. Duration must be long enough
@@ -126,6 +138,7 @@ fn binary_short_load_test() {
 
 #[test]
 fn binary_write_heavy_no_resource_abort() {
+    require_loadgen_binary();
     let dir = tempfile::tempdir().expect("create temp dir");
 
     let output = cargo_bin()

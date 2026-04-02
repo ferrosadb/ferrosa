@@ -53,7 +53,8 @@ jobs:
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
                --skip dep_wait_ordering --skip disk_fail_no_phantom \
                --skip packet_reorder_linearizability --skip lwt_batch_atomicity_all \
-               --skip clock_skew_large_preaccept
+               --skip clock_skew_large_preaccept \
+               --skip binary_
           cargo llvm-cov report --html --output-dir coverage-html
           cargo llvm-cov report --summary-only 2>&1 | tee coverage-summary.txt
       - name: Upload coverage report
