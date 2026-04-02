@@ -52,6 +52,12 @@ fn load_config(path: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
 
 /// Load host_id from disk, env var, or generate a new one.
 fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
+    load_or_generate_host_id_with(data_dir, std::env::var("FERROSA_HOST_ID").ok())
+}
+
+/// Core implementation that accepts an explicit host_id override.
+/// Avoids process-global env var mutation in tests.
+fn load_or_generate_host_id_with(data_dir: &Path, env_override: Option<String>) -> Uuid {
     let path = data_dir.join("host_id");
 
     // Try reading existing host_id from disk.
@@ -62,11 +68,11 @@ fn load_or_generate_host_id(data_dir: &Path) -> Uuid {
         }
     }
 
-    // Check env var override.
-    if let Ok(id_str) = std::env::var("FERROSA_HOST_ID") {
+    // Check explicit override (from FERROSA_HOST_ID env var or test parameter).
+    if let Some(id_str) = env_override {
         if let Ok(id) = Uuid::parse_str(&id_str) {
             let _ = std::fs::write(&path, id.to_string());
-            tracing::info!(%id, "using host_id from FERROSA_HOST_ID");
+            tracing::info!(%id, "using host_id from override");
             return id;
         }
     }
@@ -1266,13 +1272,11 @@ mod tests {
     fn bt005_host_id_from_env_var() {
         let dir = tempfile::tempdir().unwrap();
         let expected = Uuid::new_v4();
-        std::env::set_var("FERROSA_HOST_ID", expected.to_string());
 
-        let id = load_or_generate_host_id(dir.path());
-        assert_eq!(id, expected, "host_id must match FERROSA_HOST_ID env var");
-
-        // Clean up.
-        std::env::remove_var("FERROSA_HOST_ID");
+        // Use the _with variant directly — no process-global env var mutation,
+        // so this test is safe to run in parallel with other tests.
+        let id = load_or_generate_host_id_with(dir.path(), Some(expected.to_string()));
+        assert_eq!(id, expected, "host_id must match override");
     }
 
     /// BT-005k: load_local_schema returns None for corrupt schema.json.
