@@ -78,7 +78,7 @@ impl ModeController {
             };
 
             for (peer_id, _) in &peers_for_invite {
-                if let Err(e) = pm_clone.fire(*peer_id, invite.clone(), Lane::Raft).await {
+                if let Err(e) = pm_clone.fire(*peer_id, invite.clone(), Lane::Data).await {
                     tracing::warn!(peer = %peer_id, %e, "failed to send ClusterInvite");
                 }
             }
@@ -733,7 +733,7 @@ impl RpcHandler for ClusterInviteHandler {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 for (peer_id, _) in &new_peers {
-                    if let Err(e) = pm.fire(*peer_id, invite.clone(), Lane::Raft).await {
+                    if let Err(e) = pm.fire(*peer_id, invite.clone(), Lane::Data).await {
                         tracing::debug!(
                             peer = %peer_id,
                             %e,
