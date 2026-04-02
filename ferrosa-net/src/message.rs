@@ -414,6 +414,11 @@ impl Message {
                     ));
                 }
                 let count = body.get_u32() as usize;
+                if count > 10_000 {
+                    return Err(NetError::Protocol(format!(
+                        "cluster invite peer count too large: {count}"
+                    )));
+                }
                 let mut peers = Vec::with_capacity(count);
                 for _ in 0..count {
                     let id = get_uuid(body)?;
