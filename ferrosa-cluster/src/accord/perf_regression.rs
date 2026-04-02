@@ -263,10 +263,10 @@ mod tests {
         durations.sort();
         let p99 = percentile(&durations, 99.0);
         // With 100 entries per key, deps_before_t0 scans the list.
-        // p99 should be well under 1ms even on CI.
+        // 5ms threshold accommodates CI runners with llvm-cov instrumentation overhead.
         assert!(
-            p99 < 1_000_000,
-            "conflict index lookup p99 = {}ns exceeds 1ms threshold",
+            p99 < 5_000_000,
+            "conflict index lookup p99 = {}ns exceeds 5ms threshold",
             p99
         );
 

@@ -9,7 +9,7 @@
 //! builds a [`SerializationHeader`] compatible with the SSTable writer.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrosa_index::{IndexKey, RowPosition};
@@ -191,6 +191,10 @@ pub trait FlushTarget {
         0
     }
 
+    /// Advance the generation counter to at least `min_gen + 1`.
+    /// Prevents future flush file names from colliding with compaction output.
+    fn advance_generation(&self, _min_gen: u64) {}
+
     /// Write per-index sidecar files alongside the flushed SSTable.
     ///
     /// Called after [`FlushTarget::flush`] with the same generation number. For each
@@ -225,12 +229,33 @@ pub trait FlushTarget {
 /// In-memory flush target for testing — wraps output as `SSTableComponents<Vec<u8>>`.
 ///
 /// No filesystem interaction. The flushed data lives entirely in memory.
-pub struct InMemoryFlushTarget;
+/// Tracks a monotonic generation counter so that each flush produces a
+/// unique ID, matching the behavior of [`FileFlushTarget`].
+pub struct InMemoryFlushTarget {
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl InMemoryFlushTarget {
+    /// Create a new in-memory flush target with the generation counter at 0.
+    pub fn new() -> Self {
+        Self {
+            generation: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for InMemoryFlushTarget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FlushTarget for InMemoryFlushTarget {
     type Reader = Vec<u8>;
 
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<Vec<u8>>> {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         SSTableReader::open(SSTableComponents {
             data: output.data,
             partitions: output.partitions,
@@ -239,6 +264,15 @@ impl FlushTarget for InMemoryFlushTarget {
             compression_info: output.compression_info,
             statistics: output.statistics,
         })
+    }
+
+    fn last_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn advance_generation(&self, min_gen: u64) {
+        self.generation
+            .fetch_max(min_gen + 1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -262,10 +296,23 @@ impl FileFlushTarget {
     /// counter starts at 0; the first flush produces generation 1.
     pub fn new(base_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&base_dir)?;
+        Self::cleanup_stale_tmp_files(&base_dir);
         Ok(Self {
             base_dir,
             generation: AtomicU64::new(0),
         })
+    }
+
+    /// Remove any stale `.tmp` files left behind by a crash during flush.
+    fn cleanup_stale_tmp_files(dir: &Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "tmp") {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
     }
 
     /// Returns the current generation counter value (the last generation written).
@@ -280,6 +327,7 @@ impl FileFlushTarget {
     /// executor to avoid overwriting SSTables from prior flushes.
     pub fn new_starting_at(base_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&base_dir)?;
+        Self::cleanup_stale_tmp_files(&base_dir);
         let max_gen = Self::scan_max_generation(&base_dir);
         Ok(Self {
             base_dir,
@@ -323,19 +371,24 @@ impl FlushTarget for FileFlushTarget {
 
         let has_compression_info = output.compression_info.is_some();
 
-        // Write compression info outside the thread scope to avoid borrow issues
+        // Write to .tmp files first, then atomically rename.
+        // If the process crashes mid-flush, only .tmp files exist — no corrupt
+        // final SSTables. Stale .tmp files are cleaned up on next startup.
+        let tmp = |p: &Path| p.with_extension("db.tmp");
+        let toc_tmp = toc_path.with_extension("txt.tmp");
+
         if let Some(ref ci) = output.compression_info {
-            std::fs::write(&compression_info_path, ci)?;
+            std::fs::write(tmp(&compression_info_path), ci)?;
         }
 
         std::thread::scope(|s| {
             let handles: Vec<_> = [
-                s.spawn(|| std::fs::write(&data_path, &output.data)),
-                s.spawn(|| std::fs::write(&partitions_path, &output.partitions)),
-                s.spawn(|| std::fs::write(&rows_path, &output.rows)),
-                s.spawn(|| std::fs::write(&filter_path, &output.filter)),
-                s.spawn(|| std::fs::write(&statistics_path, &output.statistics)),
-                s.spawn(|| std::fs::write(&toc_path, &output.toc)),
+                s.spawn(|| std::fs::write(tmp(&data_path), &output.data)),
+                s.spawn(|| std::fs::write(tmp(&partitions_path), &output.partitions)),
+                s.spawn(|| std::fs::write(tmp(&rows_path), &output.rows)),
+                s.spawn(|| std::fs::write(tmp(&filter_path), &output.filter)),
+                s.spawn(|| std::fs::write(tmp(&statistics_path), &output.statistics)),
+                s.spawn(|| std::fs::write(&toc_tmp, &output.toc)),
             ]
             .into_iter()
             .collect();
@@ -346,6 +399,18 @@ impl FlushTarget for FileFlushTarget {
 
             Ok::<(), ferrosa_common::Error>(())
         })?;
+
+        // All tmp files written successfully — atomically rename to final names.
+        // rename() is atomic on POSIX (same filesystem).
+        std::fs::rename(tmp(&data_path), &data_path)?;
+        std::fs::rename(tmp(&partitions_path), &partitions_path)?;
+        std::fs::rename(tmp(&rows_path), &rows_path)?;
+        std::fs::rename(tmp(&filter_path), &filter_path)?;
+        std::fs::rename(tmp(&statistics_path), &statistics_path)?;
+        std::fs::rename(&toc_tmp, &toc_path)?;
+        if has_compression_info {
+            std::fs::rename(tmp(&compression_info_path), &compression_info_path)?;
+        }
 
         // FileReadAt::open returns ferrosa_common::Result — use ? directly
         let data = FileReadAt::open(&data_path)?;
@@ -371,6 +436,10 @@ impl FlushTarget for FileFlushTarget {
 
     fn last_generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    fn advance_generation(&self, min_gen: u64) {
+        self.generation.fetch_max(min_gen + 1, Ordering::SeqCst);
     }
 
     /// Write per-index sidecar files as `{gen}-{index_name}.sidecar`.
@@ -540,7 +609,7 @@ mod tests {
         }
         let output = writer.finish().unwrap();
 
-        let target = InMemoryFlushTarget;
+        let target = InMemoryFlushTarget::new();
         let reader = target.flush(output).unwrap();
 
         // Verify we can read back both partitions
@@ -656,5 +725,71 @@ mod tests {
         // Verify both generations have files
         assert!(dir.path().join("1-Data.db").exists());
         assert!(dir.path().join("2-Data.db").exists());
+    }
+
+    #[test]
+    fn flush_does_not_leave_final_files_if_interrupted() {
+        // Simulate a crash: write a .tmp file for Data.db but no final files.
+        // On next load, the .tmp should be ignored and cleaned up.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a stale .tmp file as if flush crashed mid-write
+        std::fs::write(dir.path().join("1-Data.db.tmp"), b"partial data").unwrap();
+        std::fs::write(dir.path().join("1-Partitions.db.tmp"), b"partial").unwrap();
+
+        // These .tmp files must NOT be treated as valid SSTables
+        assert!(
+            !dir.path().join("1-Data.db").exists(),
+            "final Data.db must not exist — flush was interrupted"
+        );
+
+        // Creating a new FileFlushTarget should clean up stale .tmp files
+        let _target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        assert!(
+            !dir.path().join("1-Data.db.tmp").exists(),
+            "stale .tmp files must be cleaned up on startup"
+        );
+        assert!(
+            !dir.path().join("1-Partitions.db.tmp").exists(),
+            "stale .tmp files must be cleaned up on startup"
+        );
+    }
+
+    #[test]
+    fn flush_uses_atomic_rename() {
+        // After a successful flush, no .tmp files should remain
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![make_partition("k1", b"v1", 5000)];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let header = build_serialization_header(&schema, &partitions);
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let mut writer = SSTableWriter::new(options, header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let _reader = target.flush(output).unwrap();
+
+        // Final files exist
+        assert!(dir.path().join("1-Data.db").exists());
+        assert!(dir.path().join("1-Partitions.db").exists());
+
+        // No .tmp files remain
+        let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
+            .collect();
+        assert!(
+            tmp_files.is_empty(),
+            "no .tmp files should remain after successful flush, found: {tmp_files:?}"
+        );
     }
 }

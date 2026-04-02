@@ -2770,7 +2770,7 @@ async fn route_create_keyspace(
             let op = DdlOperation::CreateKeyspace(ks_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -2834,7 +2834,7 @@ async fn route_alter_keyspace(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -2895,7 +2895,7 @@ async fn route_drop_keyspace(
             let op = DdlOperation::DropKeyspace(s.name.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3035,7 +3035,7 @@ async fn route_create_table(
             // Auto-create cascade tables after primary table is created.
             create_cascade_tables_if_needed(state, &table_meta)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3275,7 +3275,7 @@ async fn route_alter_table(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3340,7 +3340,7 @@ async fn route_drop_table(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3422,7 +3422,7 @@ async fn route_create_index(
             let op = DdlOperation::CreateIndex(index_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3536,7 +3536,7 @@ async fn route_drop_index(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3587,7 +3587,7 @@ async fn route_create_role(
             let op = DdlOperation::CreateRole(role);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3634,7 +3634,7 @@ async fn route_alter_role(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3668,7 +3668,7 @@ async fn route_drop_role(
             let op = DdlOperation::DropRole(s.name.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3717,7 +3717,7 @@ async fn route_grant(
             });
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3771,7 +3771,7 @@ async fn route_revoke(
                 ddl.execute(op).await.map_err(CqlError::from)?;
             }
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -4992,7 +4992,7 @@ async fn route_create_type(
             let op = DdlOperation::CreateType(udt);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -5103,7 +5103,7 @@ async fn route_drop_type(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -5245,7 +5245,7 @@ async fn route_create_function(
             let op = DdlOperation::CreateFunction(func_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -5375,7 +5375,7 @@ async fn route_drop_function(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -5519,7 +5519,7 @@ async fn route_create_aggregate(
             let op = DdlOperation::CreateAggregate(agg_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -5647,7 +5647,7 @@ async fn route_drop_aggregate(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -6082,6 +6082,7 @@ mod tests {
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
             flush_threshold_bytes: 4096,
+            flush_max_age_secs: 5,
             data_dir: dir.path().to_path_buf(),
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
@@ -9916,6 +9917,7 @@ mod tests {
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
             flush_threshold_bytes: 4096,
+            flush_max_age_secs: 5,
             data_dir: dir.path().to_path_buf(),
         };
         let engine = StorageEngine::new(engine_config, None).unwrap();

@@ -60,6 +60,10 @@ pub struct StorageEngineConfig {
     pub object_store: Option<ObjectStoreConfig>,
     pub local_cache_max_bytes: u64,
     pub flush_threshold_bytes: u64,
+    /// Maximum age (seconds) of unflushed memtable data before a time-based
+    /// flush is triggered, regardless of size. Protects small/infrequent
+    /// tables from data loss on restart. Default: 30 seconds.
+    pub flush_max_age_secs: u64,
     pub data_dir: PathBuf,
 }
 
@@ -90,12 +94,18 @@ impl StorageEngineConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(64 * 1024 * 1024); // 64 MB default
 
+        let flush_max_age_secs = std::env::var("FERROSA_FLUSH_MAX_AGE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30); // 30 seconds default
+
         Ok(Self {
             commit_log,
             compaction,
             object_store,
             local_cache_max_bytes,
             flush_threshold_bytes,
+            flush_max_age_secs,
             data_dir,
         })
     }
@@ -109,6 +119,7 @@ impl StorageEngineConfig {
             object_store: None,
             local_cache_max_bytes: 1024 * 1024, // 1 MB
             flush_threshold_bytes: 4096,        // 4 KB — triggers flush quickly in tests
+            flush_max_age_secs: 5,              // 5s — fast age-based flush in tests
             data_dir: dir.to_path_buf(),
         }
     }
@@ -158,6 +169,19 @@ struct TableState {
     /// SSTable IDs that are currently pinned on NVMe, in oldest-first order.
     /// Each entry is `(sstable_id, size_bytes)`.
     pinned_sstables: Vec<(String, u64)>,
+    /// Timestamp of the first write to the current (unflushed) memtable.
+    /// Reset to `None` after each flush. Used by `flush_if_needed` to trigger
+    /// time-based flushes for small, infrequently-updated tables.
+    /// Behind `Mutex` so writers can update it under a read lock on `tables`.
+    first_unflushed_write_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Latest commit log position written for this table. Updated on every
+    /// write; passed to `commit_log.discard_completed()` after flush so that
+    /// fully-flushed segments can be GC'd. Without this, closed segments
+    /// accumulate indefinitely and leak file descriptors.
+    ///
+    /// Wrapped in `Mutex` so writers can update it under a read lock on the
+    /// `tables` map (the hot path). The lock protects only two `u64`s.
+    last_commit_log_position: parking_lot::Mutex<Option<CommitLogPosition>>,
 }
 
 /// SSTable reader type alias for file-backed SSTables.
@@ -692,6 +716,8 @@ impl StorageEngine {
             store,
             pin_config: None,
             pinned_sstables: Vec::new(),
+            first_unflushed_write_at: parking_lot::Mutex::new(None),
+            last_commit_log_position: parking_lot::Mutex::new(None),
         };
         self.tables.write().insert(table_id, state);
         Ok(())
@@ -1038,14 +1064,19 @@ impl StorageEngine {
             vec![row.clone()],
             timestamp,
         );
-        self.commit_log.append(&mutation)?;
+        let cl_pos = self.commit_log.append(&mutation)?;
 
-        // 2. Write to the table's memtable.
+        // 2. Write to the table's memtable and track commit log position.
         let tables = self.tables.read();
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
         state.store.write(key, row)?;
+        *state.last_commit_log_position.lock() = Some(cl_pos);
+        state
+            .first_unflushed_write_at
+            .lock()
+            .get_or_insert_with(std::time::Instant::now);
         drop(tables);
 
         // 3. Notify observers after successful commit log + memtable write.
@@ -1080,9 +1111,9 @@ impl StorageEngine {
             );
 
             // Append to commit log.
-            self.commit_log.append(&mutation)?;
+            let cl_pos = self.commit_log.append(&mutation)?;
 
-            // Write to memtable (scoped read lock).
+            // Write to memtable and track commit log position (scoped read lock).
             {
                 let tables = self.tables.read();
                 let state = tables.get(table_id).ok_or_else(|| {
@@ -1091,6 +1122,11 @@ impl StorageEngine {
                     ))
                 })?;
                 state.store.write(&key, row)?;
+                *state.last_commit_log_position.lock() = Some(cl_pos);
+                state
+                    .first_unflushed_write_at
+                    .lock()
+                    .get_or_insert_with(std::time::Instant::now);
             }
 
             // Notify observers after successful commit log + memtable write.
@@ -1120,12 +1156,15 @@ impl StorageEngine {
             return Ok(());
         }
 
-        // Phase 1: Append all mutations to the commit log.
+        // Phase 1: Append all mutations to the commit log, tracking positions.
+        let mut positions: HashMap<TableId, CommitLogPosition> = HashMap::new();
         for m in &mutations {
-            self.commit_log.append(m)?;
+            let cl_pos = self.commit_log.append(m)?;
+            let table_id = TableId::new(&m.keyspace, &m.table);
+            positions.insert(table_id, cl_pos);
         }
 
-        // Phase 2: Apply to memtables.
+        // Phase 2: Apply to memtables and update commit log positions.
         let tables = self.tables.read();
         for m in &mutations {
             let table_id = TableId::new(&m.keyspace, &m.table);
@@ -1134,6 +1173,13 @@ impl StorageEngine {
             })?;
             for row in &m.rows {
                 state.store.write(&m.key, row.clone())?;
+            }
+            if let Some(&cl_pos) = positions.get(&table_id) {
+                *state.last_commit_log_position.lock() = Some(cl_pos);
+                state
+                    .first_unflushed_write_at
+                    .lock()
+                    .get_or_insert_with(std::time::Instant::now);
             }
         }
         drop(tables);
@@ -1466,13 +1512,21 @@ impl StorageEngine {
     /// and max_bytes eviction is enforced if configured.
     pub fn flush(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         // Flush + index submit under read lock, then release before write lock.
-        let (gen, is_pinned) = {
+        let (gen, is_pinned, cl_position) = {
             let tables = self.tables.read();
             let state = tables.get(table_id).ok_or_else(|| {
                 ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
             })?;
 
+            // Snapshot the commit log position before flushing. All mutations
+            // up to this position are in the memtable we're about to flush.
+            let cl_position = *state.last_commit_log_position.lock();
+
             state.store.flush()?;
+
+            // Reset the unflushed-write timestamp so the next write starts a
+            // fresh age window. This must happen after flush() succeeds.
+            *state.first_unflushed_write_at.lock() = None;
 
             // Eager index build: submit high-priority index rebuild for the newly
             // flushed SSTable. This keeps the MemtableIndex (Layer 4) bounded to
@@ -1511,8 +1565,18 @@ impl StorageEngine {
 
             let flushed_gen = state.store.last_flush_generation();
             let pinned = state.pin_config.is_some();
-            (flushed_gen, pinned)
+            (flushed_gen, pinned, cl_position)
         };
+
+        // Advance commit log checkpoint: tell the commit log that this table's
+        // mutations are now durable in SSTables up to cl_position. This allows
+        // closed segments with no remaining dirty tables to be GC'd, preventing
+        // file descriptor leaks from accumulating segment file handles.
+        if let Some(pos) = cl_position {
+            if let Err(e) = self.commit_log.discard_completed(table_id, pos) {
+                tracing::warn!(%e, "commit log discard_completed failed for {}", table_id);
+            }
+        }
 
         // For pinned tables: record the new SSTable and enforce max_bytes.
         // We do this outside the read lock so we can take a write lock.
@@ -1552,13 +1616,23 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Flushes all tables that exceed the configured memtable size threshold.
+    /// Flushes tables that exceed the size threshold OR have unflushed data
+    /// older than `flush_max_age_secs`. The time-based trigger ensures small,
+    /// infrequently-updated tables are durable within a bounded window.
     pub fn flush_if_needed(&self) -> ferrosa_common::Result<()> {
+        let now = std::time::Instant::now();
+        let max_age = std::time::Duration::from_secs(self.config.flush_max_age_secs);
         let tables = self.tables.read();
         let to_flush: Vec<TableId> = tables
             .iter()
             .filter(|(_, state)| {
-                state.store.memtable_size() as u64 >= self.config.flush_threshold_bytes
+                let size_exceeded =
+                    state.store.memtable_size() as u64 >= self.config.flush_threshold_bytes;
+                let age_exceeded = state
+                    .first_unflushed_write_at
+                    .lock()
+                    .is_some_and(|t| now.duration_since(t) >= max_age);
+                size_exceeded || (age_exceeded && state.store.memtable_size() > 0)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1597,7 +1671,12 @@ impl StorageEngine {
     pub async fn poll_compactions(&self) {
         let results = self.compaction_executor.poll_results();
         for result in results {
-            let input_count = result.task.inputs.len();
+            let input_id_paths: Vec<(String, std::path::PathBuf)> = result
+                .task
+                .inputs
+                .iter()
+                .map(|m| (m.id.clone(), m.path.clone()))
+                .collect();
             let table_id = &result.task.table_id;
 
             // Open the compacted output SSTable.
@@ -1611,12 +1690,23 @@ impl StorageEngine {
                 }
             };
 
-            // Swap: remove input SSTables, insert output.
+            // Swap: remove input SSTables by ID, insert output.
+            // Compaction output gen may collide with flush gen (different dirs).
+            // Advance the flush target past this gen to prevent future collisions,
+            // and use the store's unique ID allocator for the tracking ID.
             {
                 let tables = self.tables.read();
                 if let Some(state) = tables.get(table_id) {
+                    let output_id = gen.clone();
+                    // Advance the store's flush target past the compaction gen
+                    // to prevent future flush IDs from colliding with this output.
+                    if let Ok(gen_num) = gen.parse::<u64>() {
+                        state.store.advance_gen_past(gen_num);
+                    }
                     if let Err(e) = state.store.swap_compacted_sstables(
-                        input_count,
+                        &input_id_paths,
+                        output_id,
+                        result.output.path.clone(),
                         reader,
                         std::collections::HashMap::new(),
                     ) {
@@ -1786,8 +1876,6 @@ impl StorageEngine {
             // Step 5: update manifest — load fresh copy, remove inputs, add output, save.
             // Keep full input metadata for local eviction after manifest update.
             let input_ids: Vec<String> = result.task.inputs.iter().map(|i| i.id.clone()).collect();
-            let input_paths: Vec<std::path::PathBuf> =
-                result.task.inputs.iter().map(|i| i.path.clone()).collect();
 
             // Compute total input bytes for metrics (used after manifest update).
             // If the metadata carries a non-zero size we use it directly;
@@ -1873,9 +1961,8 @@ impl StorageEngine {
             }
 
             // Evict local input SSTable component files (best-effort).
-            // Files are stored flat in the table directory as {gen}-Data.db etc.
-            for (input_id, table_dir) in input_ids.iter().zip(input_paths.iter()) {
-                // Remove all component files for this generation.
+            // Each input carries its own path (flush dir or compaction dir).
+            for input in &result.task.inputs {
                 let standard_components = [
                     "Data.db",
                     "Partitions.db",
@@ -1886,7 +1973,7 @@ impl StorageEngine {
                     "CompressionInfo.db",
                 ];
                 for component in &standard_components {
-                    let file_path = table_dir.join(format!("{input_id}-{component}"));
+                    let file_path = input.path.join(format!("{}-{component}", input.id));
                     let _ = std::fs::remove_file(&file_path);
                 }
             }
@@ -1926,6 +2013,19 @@ impl StorageEngine {
             .read()
             .get(table_id)
             .map(|s| s.store.sstable_count())
+            .unwrap_or(0)
+    }
+
+    /// Returns the count of SSTable read errors for a table.
+    pub fn sstable_read_errors(&self, table_id: &TableId) -> u64 {
+        self.tables
+            .read()
+            .get(table_id)
+            .map(|s| {
+                s.store
+                    .sstable_read_errors
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
             .unwrap_or(0)
     }
 
@@ -2216,6 +2316,13 @@ impl StorageEngine {
         self.object_store_and_config()
             .ok()
             .map(|(cfg, store)| (store, cfg.prefix.clone()))
+    }
+
+    /// Returns the number of closed commit log segments waiting for GC.
+    ///
+    /// Used by the load test resource monitor to detect segment accumulation.
+    pub fn commit_log_closed_segment_count(&self) -> usize {
+        self.commit_log.closed_segment_count()
     }
 
     /// Discards commit log segments that have no remaining dirty tables.
@@ -3695,6 +3802,64 @@ mod tests {
     }
 
     #[test]
+    fn flush_discards_commit_log_segments() {
+        // Regression test for FD leak: flush() must call discard_completed()
+        // so that closed commit log segments are GC'd and their file handles
+        // released. Without this, segments accumulate indefinitely under load.
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 512, // tiny: forces rotation after ~3 mutations
+                ..CommitLogConfig::test_config(dir.path())
+            },
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let tid = table_id();
+
+        // Write enough mutations to force multiple segment rotations.
+        for i in 0..20 {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"value", 1000 + i),
+                    1000 + i,
+                )
+                .unwrap();
+        }
+
+        let closed_before = engine.commit_log.closed_segment_count();
+        assert!(
+            closed_before >= 2,
+            "need multiple closed segments for this test, got {closed_before}"
+        );
+
+        // Flush the table — this calls discard_completed() internally,
+        // which removes segments where all tables have been flushed.
+        engine.flush(&tid).unwrap();
+
+        // discard_completed() in flush() should have already cleaned up
+        // all closed segments (single table = all segments become empty).
+        let closed_after = engine.commit_log.closed_segment_count();
+        assert!(
+            closed_after < closed_before,
+            "closed segment count should decrease after flush: \
+             before={closed_before}, after={closed_after}"
+        );
+
+        // Data should still be readable from SSTable after commit log GC.
+        for i in 0..20 {
+            let result = engine.read(&tid, &make_key(&format!("k{i}"))).unwrap();
+            assert!(result.is_some(), "key k{i} should be readable after flush");
+        }
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
     fn archiver_uploads_closed_segment_on_rotate() {
         use object_store::memory::InMemory;
         use object_store::path::Path as ObjectPath;
@@ -4793,18 +4958,17 @@ mod tests {
             .write(&tid, &make_key("k3"), make_row(b"v3", 3000), 3000)
             .unwrap();
 
-        // Wait for compaction to finish.
+        // Wait for compaction to finish (up to 15s under heavy CI load).
         let compaction_dir = dir.path().join("compaction");
-        for _ in 0..60 {
+        for _ in 0..300 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if compaction_dir.exists() {
-                let done = std::fs::read_dir(&compaction_dir)
+            if compaction_dir.exists()
+                && std::fs::read_dir(&compaction_dir)
                     .ok()
                     .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false);
-                if done {
-                    break;
-                }
+                    .unwrap_or(false)
+            {
+                break;
             }
         }
 
@@ -4815,7 +4979,18 @@ mod tests {
             eng_clone.flush(&tid_clone).unwrap();
         });
 
-        engine.poll_compactions().await;
+        // Poll compactions in a retry loop — under CI load the background
+        // compaction thread may not have finished yet.
+        for _ in 0..100 {
+            engine.poll_compactions().await;
+            let (m, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+                .await
+                .unwrap();
+            if m.sstables.get(&tid.to_string()).map(|v| !v.is_empty()) == Some(true) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         flush_handle.await.unwrap();
 
         // Both operations completed without panic.
@@ -6520,6 +6695,135 @@ mod tests {
         assert!(
             !result_keys.contains(&"r3".to_string()),
             "r3 has neither term"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Data loss regression: write → flush → compact → read must return all keys
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_flush_compact_no_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // Write 100 keys, flush every 25 to create 4+ SSTables and trigger compaction.
+        for i in 0..100u64 {
+            let key = make_key(&format!("key_{i:04}"));
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(
+                    0,
+                    CellValue::live(format!("val_{i}").into_bytes(), i as i64),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(i as i64),
+            };
+            engine.write(&tid, &key, row, i as i64).unwrap();
+
+            if (i + 1) % 25 == 0 {
+                engine.flush(&tid).unwrap();
+            }
+        }
+
+        // Final flush.
+        engine.flush(&tid).unwrap();
+
+        // Poll compaction (STCS triggers at 4 SSTables).
+        engine.poll_compactions().await;
+
+        // Read all 100 keys — none should be missing.
+        let mut missing = Vec::new();
+        for i in 0..100u64 {
+            let key = make_key(&format!("key_{i:04}"));
+            match engine.read(&tid, &key) {
+                Ok(Some(_)) => {}
+                Ok(None) => missing.push(format!("key_{i:04}")),
+                Err(e) => missing.push(format!("key_{i:04} (error: {e})")),
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "data loss: {}/{} keys missing after flush+compact: {:?}",
+            missing.len(),
+            100,
+            &missing[..missing.len().min(10)]
+        );
+    }
+
+    /// Concurrent writes + flushes + compaction — reproduces the loadgen data loss.
+    #[tokio::test]
+    async fn concurrent_write_flush_compact_no_data_loss() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(AtomicU64::new(0));
+
+        // Writer threads
+        let mut handles = vec![];
+        for worker in 0..4u64 {
+            let eng = engine.clone();
+            let tid = tid.clone();
+            let stop = stop.clone();
+            let written = written.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut ts = worker * 1_000_000;
+                while !stop.load(Ordering::Relaxed) {
+                    let idx = written.fetch_add(1, Ordering::SeqCst);
+                    let key = make_key(&format!("k_{idx:06}"));
+                    ts += 1;
+                    let row = Row {
+                        clustering: vec![0, 0, 0, 1],
+                        cells: vec![(
+                            0,
+                            CellValue::live(format!("v{idx}").into_bytes(), ts as i64),
+                        )],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(ts as i64),
+                    };
+                    let _ = eng.write(&tid, &key, row, ts as i64);
+                }
+            }));
+        }
+
+        // Main thread: flush + compact for 2 seconds.
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = engine.flush(&tid);
+            engine.poll_compactions().await;
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Final flush.
+        engine.flush(&tid).unwrap();
+
+        // Read back all written keys.
+        let total = written.load(Ordering::SeqCst);
+        let mut missing = 0u64;
+        for i in 0..total {
+            let key = make_key(&format!("k_{i:06}"));
+            if engine.read(&tid, &key).unwrap().is_none() {
+                missing += 1;
+            }
+        }
+
+        assert_eq!(
+            missing, 0,
+            "data loss: {missing}/{total} keys missing after concurrent write+flush+compact"
         );
     }
 }

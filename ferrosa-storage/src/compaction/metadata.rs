@@ -10,7 +10,7 @@ use crate::TableId;
 /// without reading the SSTable itself.
 #[derive(Debug, Clone)]
 pub struct SSTableMetadata {
-    /// Unique identifier for this SSTable.
+    /// Unique identifier for this SSTable (file generation number).
     pub id: String,
     /// Path to the SSTable directory on disk.
     pub path: PathBuf,

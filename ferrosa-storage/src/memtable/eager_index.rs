@@ -169,7 +169,7 @@ mod tests {
 
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions::default(),
             vec![("idx_val".to_string(), 0)],
         );

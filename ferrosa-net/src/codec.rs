@@ -53,6 +53,8 @@ pub enum MsgType {
     HandshakeAck = 0x02,
     Ping = 0x03,
     Pong = 0x04,
+    ClusterInvite = 0x05,
+    ClusterInviteAck = 0x06,
     // Raft
     RaftAppendEntries = 0x10,
     RaftAppendResponse = 0x11,
@@ -113,6 +115,8 @@ impl TryFrom<u8> for MsgType {
             0x02 => Ok(Self::HandshakeAck),
             0x03 => Ok(Self::Ping),
             0x04 => Ok(Self::Pong),
+            0x05 => Ok(Self::ClusterInvite),
+            0x06 => Ok(Self::ClusterInviteAck),
             0x10 => Ok(Self::RaftAppendEntries),
             0x11 => Ok(Self::RaftAppendResponse),
             0x12 => Ok(Self::RaftVote),

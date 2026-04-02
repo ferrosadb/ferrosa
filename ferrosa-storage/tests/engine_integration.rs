@@ -34,7 +34,7 @@ fn test_schema(keyspace: &str, table: &str) -> TableSchema {
 fn test_engine_config(dir: &Path) -> StorageEngineConfig {
     StorageEngineConfig {
         commit_log: CommitLogConfig {
-            segment_size: 4096,
+            segment_size: 256 * 1024, // 256 KB — must fit largest mutation
             max_segment_age: Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
             log_dir: dir.join("commitlog"),
@@ -45,6 +45,7 @@ fn test_engine_config(dir: &Path) -> StorageEngineConfig {
         object_store: None,
         local_cache_max_bytes: 1024 * 1024,
         flush_threshold_bytes: 4096,
+        flush_max_age_secs: 5,
         data_dir: dir.to_path_buf(),
     }
 }
@@ -287,6 +288,242 @@ fn concurrent_writers() {
         }
     }
     assert_eq!(found, 100, "all 100 writes should be readable");
+
+    engine.shutdown().unwrap();
+}
+
+/// Write 2000 unique keys, flush once, read all back.
+/// Tests the SSTable writer/reader pipeline for large partition counts.
+#[test]
+fn flush_2000_keys_all_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_engine_config(dir.path());
+    let engine = StorageEngine::new(config, None).unwrap();
+    engine.register_table(test_schema("load", "data")).unwrap();
+    let tid = TableId::new("load", "data");
+
+    for i in 0..2000u64 {
+        let key = make_key(&format!("k{i:06}"));
+        let ts = i as i64;
+        engine
+            .write(&tid, &key, make_row(format!("v{i}").as_bytes(), ts), ts)
+            .unwrap();
+    }
+
+    engine.flush(&tid).unwrap();
+
+    let mut missing = 0u64;
+    for i in 0..2000u64 {
+        let key = make_key(&format!("k{i:06}"));
+        if engine.read(&tid, &key).unwrap().is_none() {
+            missing += 1;
+            if missing <= 3 {
+                eprintln!("MISSING after single flush: k{i:06}");
+            }
+        }
+    }
+
+    assert_eq!(
+        missing, 0,
+        "data loss: {missing}/2000 keys missing after single flush"
+    );
+    engine.shutdown().unwrap();
+}
+
+/// 1000 unique keys across 20 flush cycles — no data loss.
+/// Mimics the loadgen pattern without concurrency to isolate
+/// whether data loss is a flush/SSTable bug or a concurrency bug.
+#[test]
+fn many_flushes_no_data_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_engine_config(dir.path());
+    let engine = StorageEngine::new(config, None).unwrap();
+    engine.register_table(test_schema("load", "data")).unwrap();
+    let tid = TableId::new("load", "data");
+
+    // Write 1000 unique keys across 20 flush cycles.
+    for batch in 0..20u64 {
+        for i in 0..50u64 {
+            let key_idx = batch * 50 + i;
+            let key = make_key(&format!("k{key_idx:06}"));
+            let ts = key_idx as i64 * 1000;
+            engine
+                .write(
+                    &tid,
+                    &key,
+                    make_row(format!("v{key_idx}").as_bytes(), ts),
+                    ts,
+                )
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+    }
+
+    // Read back all 1000 keys.
+    let mut missing = Vec::new();
+    for i in 0..1000u64 {
+        let key = make_key(&format!("k{i:06}"));
+        if engine.read(&tid, &key).unwrap().is_none() {
+            missing.push(format!("k{i:06}"));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "data loss: {}/1000 keys missing after 20 flushes: {:?}",
+        missing.len(),
+        &missing[..missing.len().min(10)]
+    );
+
+    engine.shutdown().unwrap();
+}
+
+/// Single writer + concurrent flusher — isolates flush race from write contention.
+#[test]
+fn single_writer_concurrent_flush_no_data_loss() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_engine_config(dir.path());
+    let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+    engine.register_table(test_schema("load", "data")).unwrap();
+    let tid = TableId::new("load", "data");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let counter = Arc::new(AtomicU64::new(0));
+
+    // Single writer thread
+    let eng = engine.clone();
+    let tid_w = tid.clone();
+    let stop_w = stop.clone();
+    let counter_w = counter.clone();
+    let writer = std::thread::spawn(move || {
+        let mut ts = 0i64;
+        while !stop_w.load(Ordering::Relaxed) {
+            let idx = counter_w.fetch_add(1, Ordering::SeqCst);
+            let key = make_key(&format!("k{idx:08}"));
+            ts += 1;
+            let _ = eng.write(&tid_w, &key, make_row(format!("v{idx}").as_bytes(), ts), ts);
+        }
+    });
+
+    // Main thread flushes rapidly for 3 seconds.
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = engine.flush(&tid);
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    engine.flush(&tid).unwrap();
+
+    let total = counter.load(Ordering::SeqCst);
+    let mut missing = 0u64;
+    for i in 0..total {
+        let key = make_key(&format!("k{i:08}"));
+        if engine.read(&tid, &key).unwrap().is_none() {
+            missing += 1;
+        }
+    }
+
+    assert_eq!(
+        missing, 0,
+        "data loss: {missing}/{total} keys missing with single writer + concurrent flush"
+    );
+    engine.shutdown().unwrap();
+}
+
+/// Concurrent writes + periodic flushes — reproduces the loadgen data loss.
+/// 8 writers, main thread flushes every 50ms for 10 seconds, 5000 key space.
+#[test]
+fn concurrent_writes_with_flushes_no_data_loss() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_engine_config(dir.path());
+    let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+    engine.register_table(test_schema("load", "data")).unwrap();
+    let tid = TableId::new("load", "data");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let counter = Arc::new(AtomicU64::new(0));
+    let written_keys = Arc::new(parking_lot::Mutex::new(
+        std::collections::HashSet::<u64>::new(),
+    ));
+
+    let mut handles = vec![];
+    for worker in 0..8u64 {
+        let eng = engine.clone();
+        let tid = tid.clone();
+        let stop = stop.clone();
+        let counter = counter.clone();
+        let wk = written_keys.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut ts = worker * 10_000_000;
+            let mut local_counter = worker;
+            while !stop.load(Ordering::Relaxed) {
+                // Use a 5000 key space to create overwrites (like the loadgen).
+                let key_idx = local_counter % 5000;
+                local_counter += 8; // stride by worker count
+                let key = make_key(&format!("k{key_idx:08}"));
+                ts += 1;
+                match eng.write(
+                    &tid,
+                    &key,
+                    make_row(format!("v{ts}").as_bytes(), ts as i64),
+                    ts as i64,
+                ) {
+                    Ok(()) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        wk.lock().insert(key_idx);
+                    }
+                    Err(_) => {
+                        // Write failed — don't count it.
+                    }
+                }
+            }
+        }));
+    }
+
+    // Flush for 10 seconds.
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = engine.flush(&tid);
+    }
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Final flush.
+    engine.flush(&tid).unwrap();
+
+    // Read back only keys that were successfully written.
+    let total_ops = counter.load(Ordering::SeqCst);
+    let keys = written_keys.lock().clone();
+    let mut missing = 0u64;
+    for &key_idx in &keys {
+        let key = make_key(&format!("k{key_idx:08}"));
+        if engine.read(&tid, &key).unwrap().is_none() {
+            missing += 1;
+        }
+    }
+    let read_errors = engine.sstable_read_errors(&tid);
+    eprintln!(
+        "[TEST] total_ops={total_ops}, unique_keys={}, missing={missing}, read_errors={read_errors}, sstables={}",
+        keys.len(),
+        engine.sstable_count(&tid)
+    );
+
+    assert_eq!(
+        missing,
+        0,
+        "data loss: {missing}/{} written keys missing after concurrent write+flush",
+        keys.len()
+    );
 
     engine.shutdown().unwrap();
 }

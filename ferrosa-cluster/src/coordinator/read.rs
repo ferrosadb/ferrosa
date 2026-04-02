@@ -549,6 +549,9 @@ impl ClusterCoordinator {
     // -----------------------------------------------------------------------
 
     /// Read from a single replica, preferring local.
+    ///
+    /// Tries the local node first (if it's a replica), then iterates through
+    /// remaining replicas in order until one returns data or all are exhausted.
     async fn read_one_replica(
         &self,
         table_id: &TableId,
@@ -556,50 +559,72 @@ impl ClusterCoordinator {
         replicas: &[u64],
         ring: &crate::ring::TokenRing,
     ) -> crate::error::Result<Option<Vec<Row>>> {
-        // Prefer local node.
-        let target = if replicas.contains(&self.local_node_id) {
-            self.local_node_id
-        } else {
-            replicas[0]
-        };
-
-        if target == self.local_node_id {
-            return self
-                .storage
-                .read(table_id, key)
-                .map(|opt| opt.map(|p| p.rows))
-                .map_err(ClusterError::Storage);
+        // Build an ordered candidate list: local node first, then remaining replicas.
+        let mut candidates: Vec<u64> = Vec::with_capacity(replicas.len());
+        if replicas.contains(&self.local_node_id) {
+            candidates.push(self.local_node_id);
+        }
+        for &r in replicas {
+            if r != self.local_node_id {
+                candidates.push(r);
+            }
         }
 
-        // Remote replica.
-        let host_id = ring.get_node(target).map(|n| n.host_id);
-        match host_id {
-            None => Ok(None),
-            Some(hid) => {
-                let payload = ReadRequestPayload {
-                    keyspace: table_id.keyspace.clone(),
-                    table: table_id.table.clone(),
-                    key: key.key.as_bytes().to_vec(),
-                    digest_only: false,
-                };
-                let body = encode_read_request(&payload);
+        for &target in &candidates {
+            if target == self.local_node_id {
                 match self
-                    .peer_manager
-                    .send(hid, Message::ReadRequest(body), Lane::Data)
-                    .await
+                    .storage
+                    .read(table_id, key)
+                    .map(|opt| opt.map(|p| p.rows))
+                    .map_err(ClusterError::Storage)
                 {
-                    Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
-                        Some(resp) if resp.found => {
-                            let partition = resp.partition.map(partition_from_wire);
-                            Ok(partition.map(|p| p.rows))
+                    Ok(Some(rows)) if !rows.is_empty() => return Ok(Some(rows)),
+                    Ok(_) => continue, // no data on this replica, try next
+                    Err(e) => {
+                        tracing::debug!(%e, "read_one_replica: local read failed, trying next");
+                        continue;
+                    }
+                }
+            }
+
+            // Remote replica.
+            let host_id = match ring.get_node(target).map(|n| n.host_id) {
+                Some(hid) => hid,
+                None => continue,
+            };
+
+            let payload = ReadRequestPayload {
+                keyspace: table_id.keyspace.clone(),
+                table: table_id.table.clone(),
+                key: key.key.as_bytes().to_vec(),
+                digest_only: false,
+            };
+            let body = encode_read_request(&payload);
+            match self
+                .peer_manager
+                .send(host_id, Message::ReadRequest(body), Lane::Data)
+                .await
+            {
+                Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
+                    Some(resp) if resp.found => {
+                        let partition = resp.partition.map(partition_from_wire);
+                        if let Some(p) = partition {
+                            if !p.rows.is_empty() {
+                                return Ok(Some(p.rows));
+                            }
                         }
-                        Some(_) => Ok(None),
-                        None => Ok(None),
-                    },
-                    _ => Ok(None),
+                        // found=true but no rows — try next replica
+                    }
+                    _ => {} // not found or decode failure — try next
+                },
+                _ => {
+                    tracing::debug!(target, "read_one_replica: remote send failed, trying next");
                 }
             }
         }
+
+        // All replicas exhausted — data genuinely not found.
+        Ok(None)
     }
 
     /// Coordinate a read using NetworkTopologyStrategy with DC-aware consistency.
@@ -878,6 +903,7 @@ mod tests {
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
             flush_threshold_bytes: 4096,
+            flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
@@ -1707,5 +1733,104 @@ mod tests {
 
         // Ready nodes first (3, 1 -- in original relative order), then rest (4, 2).
         assert_eq!(result, vec![3, 1, 4, 2]);
+    }
+
+    // -----------------------------------------------------------------------
+    // CL=ONE read fallback: data on non-preferred replica
+    // -----------------------------------------------------------------------
+
+    /// CL=ONE with RF=1: local replica has no data for the key.
+    /// The coordinator should try the next replica and return data.
+    /// This tests the fallback behavior when the preferred (local) replica
+    /// returns None — the coordinator must not give up immediately.
+    #[tokio::test]
+    async fn read_one_fallback_returns_data_from_second_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = make_coordinator(
+            ring.clone(),
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+
+        // Do NOT write any data — local storage is empty.
+        // With a single-node ring, the coordinator should try local and get None.
+        let result = coordinator
+            .read_one_replica(&table_id, &key, &[local_node_id], &ring)
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "should return None when only replica has no data"
+        );
+
+        // Now write data and verify it returns.
+        storage
+            .write(&table_id, &key, test_row(1000), 1000)
+            .unwrap();
+        let result = coordinator
+            .read_one_replica(&table_id, &key, &[local_node_id], &ring)
+            .await
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "should find data after write to local replica"
+        );
+    }
+
+    /// CL=ONE with multiple local replicas: first replica has no data,
+    /// second replica (also local) has data. Verifies the fallback loop.
+    #[tokio::test]
+    async fn read_one_fallback_iterates_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = make_coordinator(
+            ring.clone(),
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+
+        // Write data to storage for this key.
+        storage
+            .write(&table_id, &key, test_row(2000), 2000)
+            .unwrap();
+
+        // Pass replicas list where local is second — the function should
+        // still find it because it reorders to prefer local.
+        let remote_id = 99u64;
+        let result = coordinator
+            .read_one_replica(&table_id, &key, &[remote_id, local_node_id], &ring)
+            .await
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "should find data on local replica even when listed second"
+        );
     }
 }

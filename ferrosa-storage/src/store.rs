@@ -55,6 +55,10 @@ struct StoreView<R: ReadAt + Send + Sync + 'static> {
     flushing: Option<Arc<dyn Memtable>>,
     /// Completed SSTables, newest first.
     sstables: Arc<Vec<Arc<SSTableReader<R>>>>,
+    /// Stable generation IDs and file directories for each SSTable, parallel to `sstables`.
+    /// The String is the gen (used for file names and swap matching).
+    /// The PathBuf is the directory containing the SSTable files.
+    sstable_ids: Arc<Vec<(String, std::path::PathBuf)>>,
     /// Per-index MemtableIndex companions for the active memtable, keyed by
     /// index name. Swapped atomically alongside the active memtable during flush.
     indexes: Arc<HashMap<String, Arc<MemtableIndex>>>,
@@ -73,6 +77,12 @@ pub struct TableStore<F: FlushTarget> {
     view: ArcSwap<StoreView<F::Reader>>,
     /// Serializes concurrent flushes. The read/write paths never touch this.
     flush_guard: Mutex<()>,
+    /// Write barrier: writes hold shared (read), flush holds exclusive (write)
+    /// during the memtable swap. This ensures no writer is mid-put when the
+    /// active memtable is swapped, preventing writes to a stale memtable.
+    write_barrier: parking_lot::RwLock<()>,
+    /// Counter of SSTable read errors during get_partition.
+    pub sstable_read_errors: std::sync::atomic::AtomicU64,
     flush_target: F,
     options: WriteOptions,
     /// Secondary index declarations: `(index_name, column_position)` pairs.
@@ -82,6 +92,10 @@ pub struct TableStore<F: FlushTarget> {
     /// Full-text index declarations: `(index_name, column_position)` pairs.
     /// Built as FTI sidecar files during flush.
     fulltext_indexes: Vec<(String, usize)>,
+    /// Monotonic generation counter for stable SSTable IDs.
+    /// Incremented on each flush. Used by compaction swap to identify
+    /// exactly which SSTables to remove.
+    next_gen: std::sync::atomic::AtomicU64,
 }
 
 fn new_memtable() -> Arc<dyn Memtable> {
@@ -144,6 +158,7 @@ impl<F: FlushTarget> TableStore<F> {
             active,
             flushing: None,
             sstables: Arc::new(vec![]),
+            sstable_ids: Arc::new(vec![]),
             indexes,
             sidecar_indexes: Arc::new(vec![]),
         };
@@ -155,6 +170,9 @@ impl<F: FlushTarget> TableStore<F> {
             options,
             indexed_columns,
             fulltext_indexes: vec![],
+            next_gen: std::sync::atomic::AtomicU64::new(1),
+            write_barrier: parking_lot::RwLock::new(()),
+            sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -204,10 +222,14 @@ impl<F: FlushTarget> TableStore<F> {
             sidecars.push(Arc::new(HashMap::new()));
         }
 
+        let initial_ids: Vec<(String, std::path::PathBuf)> = (1..=sidecar_count)
+            .map(|i| (format!("{i}"), std::path::PathBuf::new()))
+            .collect();
         let initial_view = StoreView {
             active,
             flushing: None,
             sstables: Arc::new(initial_sstables),
+            sstable_ids: Arc::new(initial_ids),
             indexes,
             sidecar_indexes: Arc::new(sidecars),
         };
@@ -219,6 +241,9 @@ impl<F: FlushTarget> TableStore<F> {
             options,
             indexed_columns,
             fulltext_indexes: vec![],
+            next_gen: std::sync::atomic::AtomicU64::new(1),
+            write_barrier: parking_lot::RwLock::new(()),
+            sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -252,7 +277,13 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        guard.active.put(key, row, &self.schema)
+        // Hold the write barrier (shared) during the memtable put.
+        // This prevents the flush from swapping the active memtable while
+        // we're writing. Re-load the view INSIDE the barrier to ensure we
+        // write to the current active, not a stale one.
+        let _wb = self.write_barrier.read();
+        let current = self.view.load();
+        current.active.put(key, row, &self.schema)
     }
 
     /// Read a partition by merging all sources: active memtable, flushing
@@ -291,6 +322,8 @@ impl<F: FlushTarget> TableStore<F> {
                         error = %e,
                         "skipping corrupt SSTable partition during read — data may be incomplete"
                     );
+                    self.sstable_read_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -315,28 +348,53 @@ impl<F: FlushTarget> TableStore<F> {
         let _guard = self.flush_guard.lock();
 
         // Step 1: Swap in a fresh active memtable, move old to flushing.
-        // Also swap in fresh indexes for the new active memtable.
+        // Take the write barrier (exclusive) to ensure no writer is mid-put
+        // during the swap. This is the critical section: after the swap, all
+        // new writes go to the new active memtable, and the old memtable
+        // contains a complete snapshot.
         let new_active: Arc<dyn Memtable> = new_memtable();
         let fresh_indexes = new_indexes(&self.indexed_columns);
-        let old_view = self.view.load();
-        let old_active = Arc::clone(&old_view.active);
-        let old_indexes = Arc::clone(&old_view.indexes);
-        let current_sstables = Arc::clone(&old_view.sstables);
-        let current_sidecars = Arc::clone(&old_view.sidecar_indexes);
-        // Drop the guard before storing (ArcSwap does not require it, but
-        // dropping early avoids holding a pinned epoch longer than needed).
-        drop(old_view);
+        let (old_active, old_view_flushing, old_indexes) = {
+            let _wb = self.write_barrier.write(); // block all writers
+            let old_view = self.view.load();
+            let old_active = Arc::clone(&old_view.active);
+            let old_view_flushing = old_view.flushing.clone();
+            let old_indexes = Arc::clone(&old_view.indexes);
+            let current_sstables = Arc::clone(&old_view.sstables);
+            let current_ids = Arc::clone(&old_view.sstable_ids);
+            let current_sidecars = Arc::clone(&old_view.sidecar_indexes);
+            drop(old_view);
 
-        self.view.store(Arc::new(StoreView {
-            active: new_active,
-            flushing: Some(Arc::clone(&old_active)),
-            sstables: Arc::clone(&current_sstables),
-            indexes: fresh_indexes,
-            sidecar_indexes: Arc::clone(&current_sidecars),
-        }));
+            self.view.store(Arc::new(StoreView {
+                active: new_active,
+                flushing: Some(Arc::clone(&old_active)),
+                sstables: Arc::clone(&current_sstables),
+                sstable_ids: Arc::clone(&current_ids),
+                indexes: fresh_indexes,
+                sidecar_indexes: Arc::clone(&current_sidecars),
+            }));
+            // Write barrier released here — writers resume with the new active.
+            (old_active, old_view_flushing, old_indexes)
+        };
 
         // Step 2: Snapshot the flushing memtable.
+        // Also capture any late writes from the PREVIOUS flushing memtable
+        // (kept alive since the last flush). These are writes that landed
+        // between the previous snapshot and the view swap.
         let mut partitions = old_active.snapshot();
+        if let Some(ref prev_flushing) = old_view_flushing {
+            let prev_parts = prev_flushing.snapshot();
+            // Merge previous flushing data: only include keys NOT already
+            // in the current snapshot (the SSTable should have them, but
+            // late writes wouldn't be there).
+            let existing_keys: std::collections::BTreeSet<ferrosa_common::key::DecoratedKey> =
+                partitions.iter().map(|p| p.key.clone()).collect();
+            for p in prev_parts {
+                if !existing_keys.contains(&p.key) {
+                    partitions.push(p);
+                }
+            }
+        }
 
         // Step 3: No-op if the memtable was empty.
         if partitions.is_empty() {
@@ -348,6 +406,7 @@ impl<F: FlushTarget> TableStore<F> {
                 active: Arc::clone(&live.active),
                 flushing: None,
                 sstables: Arc::clone(&live.sstables),
+                sstable_ids: Arc::clone(&live.sstable_ids),
                 indexes: Arc::clone(&live.indexes),
                 sidecar_indexes: Arc::clone(&live.sidecar_indexes),
             }));
@@ -374,7 +433,13 @@ impl<F: FlushTarget> TableStore<F> {
 
         // Step 5b: Build sidecar readers from the old memtable indexes and
         // persist them to disk so they survive process restarts.
+        // Use the flush target's generation as the SSTable ID so it matches
+        // the file names on disk (critical for compaction to find files).
+        // Also advance next_gen to stay in sync.
         let gen = self.flush_target.last_generation();
+        // Keep next_gen at least as high as the flush target gen + 1.
+        self.next_gen
+            .fetch_max(gen + 1, std::sync::atomic::Ordering::SeqCst);
         let mut raw_sidecar_entries: HashMap<String, Vec<(IndexKey, RowPosition)>> = HashMap::new();
         let mut sidecar_map: HashMap<String, SidecarReader> = HashMap::new();
         for (index_name, memtable_idx) in old_indexes.iter() {
@@ -440,18 +505,50 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
+        // Step 5d: Drain late writers. Any writer that loaded the view before
+        // step 1 may have written to old_active AFTER our snapshot. Those writes
+        // would be lost when we clear `flushing`. Re-snapshot the old memtable
+        // and replay any entries not in the original flush to the new active.
+        let late_partitions = old_active.snapshot();
+        if late_partitions.len() > partitions.len() {
+            let current_view = self.view.load();
+            // The original partitions were sorted by key. Build a set of flushed keys.
+            let flushed_keys: std::collections::BTreeSet<_> =
+                partitions.iter().map(|p| &p.key).collect();
+            for p in &late_partitions {
+                if !flushed_keys.contains(&p.key) {
+                    // Late write — replay to the current active memtable.
+                    for row in &p.rows {
+                        let _ = current_view.active.put(&p.key, row.clone(), &self.schema);
+                    }
+                }
+            }
+            drop(current_view);
+        }
+
         // Step 6: Prepend new SSTable and sidecar, clear flushing.
         let current_view = self.view.load();
         let mut new_sstables = vec![new_reader];
         new_sstables.extend(current_view.sstables.iter().cloned());
 
+        let mut new_ids = vec![(format!("{gen}"), std::path::PathBuf::new())];
+        new_ids.extend(current_view.sstable_ids.iter().cloned());
+
         let mut new_sidecars = vec![Arc::new(sidecar_map)];
         new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
 
+        // Keep the old flushing memtable alive until the NEXT flush
+        // replaces it. This ensures any late writers (threads that loaded
+        // the view before step 1 and haven't written yet) can still write
+        // to the old memtable and their data remains readable via the
+        // flushing slot. The next flush's step 1 will atomically replace
+        // flushing, at which point ArcSwap guarantees all prior readers
+        // have released their guards.
         self.view.store(Arc::new(StoreView {
             active: Arc::clone(&current_view.active),
-            flushing: None,
+            flushing: Some(old_active),
             sstables: Arc::new(new_sstables),
+            sstable_ids: Arc::new(new_ids),
             indexes: Arc::clone(&current_view.indexes),
             sidecar_indexes: Arc::new(new_sidecars),
         }));
@@ -613,6 +710,7 @@ impl<F: FlushTarget> TableStore<F> {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
             sstables: Arc::clone(&current.sstables),
+            sstable_ids: Arc::clone(&current.sstable_ids),
             indexes: Arc::new(new_indexes),
             sidecar_indexes: Arc::clone(&current.sidecar_indexes),
         }));
@@ -673,6 +771,23 @@ impl<F: FlushTarget> TableStore<F> {
         self.view.load().sstables.len()
     }
 
+    /// Allocate a new unique SSTable generation ID.
+    pub fn next_sstable_id(&self) -> String {
+        format!(
+            "{}",
+            self.next_gen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        )
+    }
+
+    /// Advance the internal generation counter to at least `min_gen + 1`.
+    /// Also advances the flush target's generation so file names don't collide.
+    pub fn advance_gen_past(&self, min_gen: u64) {
+        self.next_gen
+            .fetch_max(min_gen + 1, std::sync::atomic::Ordering::SeqCst);
+        self.flush_target.advance_generation(min_gen);
+    }
+
     /// Approximate memory usage of the active memtable in bytes.
     pub fn memtable_size(&self) -> usize {
         self.view.load().active.size_bytes()
@@ -708,6 +823,7 @@ impl<F: FlushTarget> TableStore<F> {
             active: new_memtable(),
             flushing: None,
             sstables: Arc::new(vec![]),
+            sstable_ids: Arc::new(vec![]),
             indexes: new_indexes(&self.indexed_columns),
             sidecar_indexes: Arc::new(vec![]),
         }));
@@ -715,60 +831,69 @@ impl<F: FlushTarget> TableStore<F> {
 
     /// Atomically replace input SSTables with a compacted output SSTable.
     ///
-    /// Removes the `input_count` oldest SSTables (from the end of the
-    /// "newest first" list) and inserts the compacted output at position 0.
+    /// Identifies input SSTables by their `(id, path)` pair — not just by ID —
+    /// because different directories (flush vs compaction) can produce the same
+    /// generation number. Matching on both fields prevents accidental removal
+    /// of an SSTable that happens to share a gen with an input in a different dir.
     pub fn swap_compacted_sstables(
         &self,
-        input_count: usize,
+        input_ids: &[(String, std::path::PathBuf)],
+        output_id: String,
+        output_path: std::path::PathBuf,
         add: Arc<SSTableReader<F::Reader>>,
         output_sidecars: HashMap<String, SidecarReader>,
     ) -> Result<()> {
         let _guard = self.flush_guard.lock();
         let current = self.view.load();
-        let len = current.sstables.len();
-        let mut new_sstables: Vec<Arc<SSTableReader<F::Reader>>> = current
-            .sstables
-            .iter()
-            .take(len.saturating_sub(input_count))
-            .cloned()
-            .collect();
-        new_sstables.insert(0, add);
 
-        // Mirror the sidecar list: drop the oldest `input_count`, prepend merged output sidecar.
-        let slen = current.sidecar_indexes.len();
-        let mut new_sidecars: Vec<Arc<HashMap<String, SidecarReader>>> = current
-            .sidecar_indexes
-            .iter()
-            .take(slen.saturating_sub(input_count))
-            .cloned()
-            .collect();
+        // Keep SSTables whose (id, path) is NOT in the compaction input set.
+        let mut new_sstables = Vec::with_capacity(current.sstables.len());
+        let mut new_ids = Vec::with_capacity(current.sstable_ids.len());
+        let mut new_sidecars = Vec::with_capacity(current.sidecar_indexes.len());
+
+        for (i, id_entry) in current.sstable_ids.iter().enumerate() {
+            if !input_ids.contains(id_entry) {
+                new_sstables.push(Arc::clone(&current.sstables[i]));
+                new_ids.push(id_entry.clone());
+                if i < current.sidecar_indexes.len() {
+                    new_sidecars.push(Arc::clone(&current.sidecar_indexes[i]));
+                }
+            }
+        }
+
+        // Prepend the compacted output.
+        new_sstables.insert(0, add);
+        new_ids.insert(0, (output_id, output_path));
         new_sidecars.insert(0, Arc::new(output_sidecars));
 
         self.view.store(Arc::new(StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
             sstables: Arc::new(new_sstables),
+            sstable_ids: Arc::new(new_ids),
             indexes: Arc::clone(&current.indexes),
             sidecar_indexes: Arc::new(new_sidecars),
         }));
         Ok(())
     }
 
-    /// Collects sidecar entries from the oldest `input_count` SSTables for merging.
+    /// Collects sidecar entries from SSTables matching the given `(id, path)` pairs for merging.
     pub fn collect_compaction_sidecar_entries(
         &self,
-        input_count: usize,
+        input_ids: &[(String, std::path::PathBuf)],
     ) -> HashMap<String, Vec<(IndexKey, RowPosition)>> {
         let guard = self.view.load();
-        let slen = guard.sidecar_indexes.len();
-        let start = slen.saturating_sub(input_count);
         let mut merged: HashMap<String, Vec<(IndexKey, RowPosition)>> = HashMap::new();
-        for sidecar_map in &guard.sidecar_indexes[start..] {
-            for (index_name, reader) in sidecar_map.as_ref() {
-                merged
-                    .entry(index_name.clone())
-                    .or_default()
-                    .extend(reader.all_entries());
+        for (i, id_entry) in guard.sstable_ids.iter().enumerate() {
+            if input_ids.contains(id_entry) {
+                if let Some(sidecar_map) = guard.sidecar_indexes.get(i) {
+                    for (index_name, reader) in sidecar_map.as_ref() {
+                        merged
+                            .entry(index_name.clone())
+                            .or_default()
+                            .extend(reader.all_entries());
+                    }
+                }
             }
         }
         merged
@@ -801,9 +926,23 @@ impl<F: FlushTarget> TableStore<F> {
                 let min_token = Token::from_key(sst.smallest_key_bytes()).0;
                 let max_token = Token::from_key(sst.largest_key_bytes()).0;
 
+                let id_path = guard.sstable_ids.get(i);
+                let sstable_id = id_path
+                    .map(|(id, _)| id.clone())
+                    .unwrap_or_else(|| format!("{}", i + 1));
+                let sstable_path = id_path
+                    .map(|(_, p)| {
+                        if p.as_os_str().is_empty() {
+                            table_dir.to_path_buf()
+                        } else {
+                            p.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| table_dir.to_path_buf());
+
                 crate::compaction::metadata::SSTableMetadata {
-                    id: format!("{}", i + 1),
-                    path: table_dir.to_path_buf(),
+                    id: sstable_id,
+                    path: sstable_path,
                     size_bytes,
                     min_token,
                     max_token,
@@ -860,7 +999,7 @@ mod tests {
     fn test_store() -> TableStore<InMemoryFlushTarget> {
         TableStore::new(
             test_schema(),
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1088,7 +1227,7 @@ mod tests {
         let indexed_columns = vec![("email_idx".to_string(), 0_usize)];
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1140,7 +1279,7 @@ mod tests {
 
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1201,7 +1340,7 @@ mod tests {
 
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1252,7 +1391,7 @@ mod tests {
 
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1338,11 +1477,41 @@ mod tests {
         let new_sst = Arc::clone(&view.sstables[0]);
         drop(view);
 
-        // Perform swap: remove 2 oldest, add 1 → should go from 4 to 3.
+        // Get the actual stored IDs.
+        let view = store.view.load();
+        let current_id_paths: Vec<(String, std::path::PathBuf)> =
+            view.sstable_ids.iter().cloned().collect();
+        drop(view);
+        // Remove the 2 oldest (last 2 in the list).
+        let input_id_paths: Vec<(String, std::path::PathBuf)> =
+            current_id_paths.iter().rev().take(2).cloned().collect();
+
         store
-            .swap_compacted_sstables(2, new_sst, HashMap::new())
+            .swap_compacted_sstables(
+                &input_id_paths,
+                "compacted".to_string(),
+                std::path::PathBuf::new(),
+                new_sst,
+                HashMap::new(),
+            )
             .unwrap();
         assert_eq!(store.sstable_count(), 3); // 4 - 2 + 1 = 3
+
+        // Verify output is present and inputs are gone.
+        let view = store.view.load();
+        assert!(
+            view.sstable_ids.iter().any(|(id, _)| id == "compacted"),
+            "compacted output should be present"
+        );
+        for (id, path) in &input_id_paths {
+            assert!(
+                !view
+                    .sstable_ids
+                    .iter()
+                    .any(|entry| entry == &(id.clone(), path.clone())),
+                "input {id} should be removed"
+            );
+        }
     }
 
     // =========================================================================
@@ -1371,7 +1540,7 @@ mod tests {
 
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1432,7 +1601,7 @@ mod tests {
 
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1510,7 +1679,7 @@ mod tests {
 
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1558,7 +1727,7 @@ mod tests {
 
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1611,7 +1780,7 @@ mod tests {
 
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1669,7 +1838,7 @@ mod tests {
         // Index on "email" (column position 0), but row only has "name" (position 1)
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1721,7 +1890,7 @@ mod tests {
 
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()
@@ -1784,7 +1953,7 @@ mod tests {
 
         let store = TableStore::new_with_indexes(
             schema,
-            InMemoryFlushTarget,
+            InMemoryFlushTarget::new(),
             WriteOptions {
                 compression: None,
                 ..WriteOptions::default()

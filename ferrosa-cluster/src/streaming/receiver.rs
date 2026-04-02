@@ -94,32 +94,36 @@ impl StreamSession {
                 key: PartitionKey::new(mutation.key.clone()),
             };
 
-            // Decode the row bytes.  During streaming, `row` contains the
-            // bincode-encoded Row from the sender node.  For now we apply a
-            // raw bytes-as-row placeholder — full Row decoding will be wired
-            // when the compaction/SSTable layer is integrated.
-            //
-            // We store the raw bytes via the commit log path so that mutations
-            // are durable.  The Row decoding is done by ferrosa-sstable, which
-            // is not imported here to avoid a circular dependency.
-            //
-            // TODO: decode mutation.row as a `ferrosa_sstable::types::Row`
-            //       once a shared serialisation format is established.
+            // Decode the row bytes. The sender serializes rows as
+            // Vec<RowWire> via bincode. Fall back to a single-cell
+            // placeholder if decoding fails (backwards compat with
+            // pre-RowWire streams).
+            use crate::raft::handlers::RowWire;
             use ferrosa_common::CellValue;
             use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
-            let row = Row {
-                clustering: vec![],
-                cells: vec![(0, CellValue::live(mutation.row.clone(), mutation.timestamp))],
-                deletion: DeletionTime::LIVE,
-                primary_key_liveness: LivenessInfo::with_timestamp(mutation.timestamp),
+            let rows: Vec<Row> = match bincode::deserialize::<Vec<RowWire>>(&mutation.row) {
+                Ok(wire_rows) if !wire_rows.is_empty() => {
+                    wire_rows.into_iter().map(Row::from).collect()
+                }
+                _ => {
+                    // Fallback: treat raw bytes as a single cell value.
+                    vec![Row {
+                        clustering: vec![],
+                        cells: vec![(0, CellValue::live(mutation.row.clone(), mutation.timestamp))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(mutation.timestamp),
+                    }]
+                }
             };
 
-            storage
-                .write(&table_id, &key, row, mutation.timestamp)
-                .map_err(|e| {
-                    ClusterError::Internal(format!("stream: storage write failed: {e}"))
-                })?;
+            for row in rows {
+                storage
+                    .write(&table_id, &key, row, mutation.timestamp)
+                    .map_err(|e| {
+                        ClusterError::Internal(format!("stream: storage write failed: {e}"))
+                    })?;
+            }
             applied += 1;
         }
 
@@ -243,6 +247,7 @@ mod tests {
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
             flush_threshold_bytes: 4096,
+            flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
@@ -473,5 +478,86 @@ mod tests {
             "expected ≥5 chunks; got {}",
             chunks.len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. Full Row round-trip via RowWire encoding
+    // -----------------------------------------------------------------------
+
+    /// Verifies that a mutation carrying bincode-encoded Vec<RowWire> is
+    /// correctly decoded back into full Rows with clustering keys and
+    /// multiple cells — not the single-cell placeholder.
+    #[tokio::test]
+    async fn receive_decodes_full_row_wire() {
+        use crate::raft::handlers::RowWire;
+        use ferrosa_common::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_table(&storage, "ks", "tbl");
+
+        // Build a Row with clustering keys and multiple cells.
+        let row = Row {
+            clustering: vec![0, 1, 2, 3],
+            cells: vec![
+                (0, CellValue::live(b"cell_0".to_vec(), 100)),
+                (1, CellValue::live(b"cell_1".to_vec(), 100)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(100),
+        };
+        let wire: Vec<RowWire> = vec![RowWire::from(row.clone())];
+        let row_bytes = bincode::serialize(&wire).unwrap();
+
+        let mutation = StreamedMutation {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key: 42u64.to_be_bytes().to_vec(),
+            row: row_bytes,
+            timestamp: 100,
+        };
+
+        let checksum = compute_checksum(std::slice::from_ref(&mutation));
+        let start = StreamStartPayload {
+            session_id: 10,
+            source_node: 1,
+            token_range_start: 0,
+            token_range_end: 100,
+            estimated_bytes: 0,
+        };
+        let chunks = vec![StreamChunkPayload {
+            session_id: 10,
+            mutations: vec![mutation],
+        }];
+        let end = StreamEndPayload {
+            session_id: 10,
+            total_mutations: 1,
+            checksum,
+        };
+
+        let result = StreamReceiver::receive_and_apply(&storage, start, chunks, end)
+            .await
+            .unwrap();
+
+        assert_eq!(result.applied, 1);
+
+        // Read back from storage and verify the full row was applied.
+        let table_id = ferrosa_storage::TableId::new("ks", "tbl");
+        let key = ferrosa_common::key::DecoratedKey {
+            token: ferrosa_common::Token(0),
+            key: ferrosa_common::PartitionKey::new(42u64.to_be_bytes().to_vec()),
+        };
+        let partition = storage.read(&table_id, &key).unwrap();
+        assert!(partition.is_some(), "should find stored partition");
+        let partition = partition.unwrap();
+        assert!(!partition.rows.is_empty(), "should have rows");
+        let stored_row = &partition.rows[0];
+        assert_eq!(
+            stored_row.clustering,
+            vec![0, 1, 2, 3],
+            "clustering keys must be preserved"
+        );
+        assert_eq!(stored_row.cells.len(), 2, "both cells must be preserved");
     }
 }

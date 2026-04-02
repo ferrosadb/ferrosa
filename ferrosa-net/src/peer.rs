@@ -63,6 +63,16 @@ impl PeerManager {
         self.listener.on_peer_connected(peer_id);
     }
 
+    /// Returns `true` if the PeerManager has an outbound connection to this peer.
+    pub fn has_peer(&self, host_id: uuid::Uuid) -> bool {
+        // Use try_read to avoid blocking the caller — if the lock is held,
+        // conservatively return false (the peer will be connected shortly).
+        self.peers
+            .try_read()
+            .map(|peers| peers.contains_key(&host_id))
+            .unwrap_or(false)
+    }
+
     /// Add a peer entry without a connection pool (for unit testing).
     pub async fn add_peer_entry(&self, peer_id: PeerId) {
         let (host_id, _addr) = peer_id;

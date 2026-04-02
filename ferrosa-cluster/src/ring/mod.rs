@@ -48,12 +48,20 @@ impl TokenRing {
     /// Find RF replicas for a token using SimpleStrategy.
     /// Walks clockwise from token, collecting distinct node IDs.
     pub fn replicas(&self, token: Token, rf: usize) -> Vec<u64> {
+        // Only return nodes in Normal state — Joining nodes are still
+        // receiving bootstrap data and should not serve reads.
         let mut result = Vec::with_capacity(rf);
         let mut seen = HashSet::new();
 
+        let is_normal = |nid: u64| -> bool {
+            self.nodes
+                .get(&nid)
+                .is_some_and(|n| n.state == crate::raft::NodeState::Normal)
+        };
+
         // Walk clockwise from token (entries >= token)
         for (_, &node_id) in self.ring.range(token..) {
-            if seen.insert(node_id) {
+            if seen.insert(node_id) && is_normal(node_id) {
                 result.push(node_id);
                 if result.len() >= rf {
                     return result;
@@ -63,7 +71,7 @@ impl TokenRing {
 
         // Wrap around to the beginning of the ring
         for (_, &node_id) in self.ring.iter() {
-            if seen.insert(node_id) {
+            if seen.insert(node_id) && is_normal(node_id) {
                 result.push(node_id);
                 if result.len() >= rf {
                     return result;
@@ -72,6 +80,16 @@ impl TokenRing {
         }
 
         result
+    }
+
+    /// Returns the primary owner of a token regardless of node state.
+    /// Used by bootstrap streaming to find which node WILL own a partition.
+    pub fn primary_owner(&self, token: Token) -> Option<u64> {
+        self.ring
+            .range(token..)
+            .next()
+            .or_else(|| self.ring.iter().next())
+            .map(|(_, &nid)| nid)
     }
 
     /// Number of distinct nodes in the ring.

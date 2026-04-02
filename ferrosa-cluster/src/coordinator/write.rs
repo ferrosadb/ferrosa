@@ -149,10 +149,13 @@ impl ClusterCoordinator {
             }
         }
 
-        if acks >= required {
-            // Store hints for replicas that failed to ack.
+        // Store hints for replicas that failed to ack, as long as at least
+        // one replica succeeded. Even if quorum wasn't met, the successful
+        // replicas have the data and the failed ones need it for convergence.
+        // Without hints, the only path to consistency is anti-entropy repair.
+        if acks > 0 && !failed_replicas.is_empty() {
             if let Some(ref hint_store) = self.hint_store {
-                let hint_row = body.to_vec(); // full encoded mutation bytes
+                let hint_row = body.to_vec();
                 let hint_key = key.key.as_bytes().to_vec();
                 for peer_id in &failed_replicas {
                     if let Err(e) = hint_store.store(
@@ -170,11 +173,11 @@ impl ClusterCoordinator {
                     }
                 }
             }
+        }
+
+        if acks >= required {
             Ok(())
         } else {
-            // Write failed — do NOT store hints.  Hints are only stored when
-            // the write succeeds at quorum; a failed write is not a replicated
-            // mutation and should not be delivered to any replica later.
             Err(ClusterError::WriteTimeout {
                 consistency: cl.to_string(),
                 received: acks,
@@ -327,8 +330,8 @@ impl ClusterCoordinator {
             _ => total_acks >= required,
         };
 
-        if satisfied {
-            // Store hints for failed replicas.
+        // Store hints for failed replicas whenever at least one replica ACK'd.
+        if total_acks > 0 && !failed_replicas.is_empty() {
             if let Some(ref hint_store) = self.hint_store {
                 let hint_row = body.to_vec();
                 let hint_key = key.key.as_bytes().to_vec();
@@ -343,6 +346,9 @@ impl ClusterCoordinator {
                     );
                 }
             }
+        }
+
+        if satisfied {
             Ok(())
         } else {
             Err(ClusterError::WriteTimeout {
@@ -387,6 +393,7 @@ mod tests {
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
             flush_threshold_bytes: 4096,
+            flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
@@ -835,15 +842,11 @@ mod tests {
     }
 
     /// 3-node ring, RF=3, CL=QUORUM (required=2).
-    /// All 3 nodes fail (local storage write fails because table doesn't exist,
-    /// remote sends also fail).  Write returns WriteTimeout.
-    /// No hints should be stored for any peer.
-    ///
-    /// We simulate a total failure by using an empty ring (required > alive),
-    /// which returns Unavailable — so instead we use a 3-node ring where the
-    /// local write succeeds but both remotes fail, giving acks=1 < required=2.
+    /// Local write succeeds (acks=1), both remotes fail → WriteTimeout.
+    /// Hints SHOULD be stored for the failed remotes because the local replica
+    /// has the data and the failed replicas need it for eventual convergence.
     #[tokio::test]
-    async fn write_below_quorum_does_not_store_hints() {
+    async fn write_below_quorum_stores_hints_for_failed_replicas() {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
         register_test_table(&storage);
@@ -901,16 +904,17 @@ mod tests {
             "expected WriteTimeout, got: {result:?}"
         );
 
-        // No hints stored — write did not succeed.
+        // Hints stored for both failed remotes — local replica has the data
+        // and the failed replicas need it for eventual convergence.
         assert_eq!(
             hint_store.pending_count(remote_uuid_2),
-            0,
-            "no hints for remote_2 on failed write"
+            1,
+            "remote_2 should have 1 hint even on below-quorum write"
         );
         assert_eq!(
             hint_store.pending_count(remote_uuid_3),
-            0,
-            "no hints for remote_3 on failed write"
+            1,
+            "remote_3 should have 1 hint even on below-quorum write"
         );
     }
 

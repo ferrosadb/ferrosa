@@ -1,0 +1,30 @@
+[package]
+name = "ferrosa-loadgen"
+description = "UCS compaction load test generator for Ferrosa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-schema = { path = "../ferrosa-schema" }
+ferrosa-sstable = { path = "../ferrosa-sstable" }
+ferrosa-cql = { path = "../ferrosa-cql" }
+ferrosa-storage = { path = "../ferrosa-storage" }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+crossterm = "0.28"
+hdrhistogram = "7"
+libc = "0.2"
+parking_lot = "0.12"
+rand = "0.8"
+ratatui = "0.29"
+tokio = { version = "1", features = ["rt", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

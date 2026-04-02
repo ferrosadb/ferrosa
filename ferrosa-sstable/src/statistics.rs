@@ -317,9 +317,10 @@ const TTL_EPOCH: i32 = 0;
 pub fn read_serialization_header(data: &[u8]) -> Result<SerializationHeader> {
     let mut pos = 0;
 
-    let min_timestamp = read_uvint_u64(data, &mut pos)? as i64 + TIMESTAMP_EPOCH;
-    let min_local_deletion_time = read_uvint_u32(data, &mut pos)? as i32 + DELETION_TIME_EPOCH;
-    let min_ttl = read_uvint_u32(data, &mut pos)? as i32 + TTL_EPOCH;
+    let min_timestamp = (read_uvint_u64(data, &mut pos)? as i64).wrapping_add(TIMESTAMP_EPOCH);
+    let min_local_deletion_time =
+        (read_uvint_u32(data, &mut pos)? as i32).wrapping_add(DELETION_TIME_EPOCH);
+    let min_ttl = (read_uvint_u32(data, &mut pos)? as i32).wrapping_add(TTL_EPOCH);
 
     let key_type = read_vint_prefixed_string(data, &mut pos)?;
 
@@ -351,7 +352,7 @@ pub fn read_serialization_header(data: &[u8]) -> Result<SerializationHeader> {
     let max_timestamp = if pos < data.len() {
         read_uvint_u64(data, &mut pos)
             .ok()
-            .map_or(i64::MAX, |v| v as i64 + TIMESTAMP_EPOCH)
+            .map_or(i64::MAX, |v| (v as i64).wrapping_add(TIMESTAMP_EPOCH))
     } else {
         i64::MAX
     };
@@ -376,18 +377,21 @@ pub fn write_serialization_header(h: &SerializationHeader) -> Vec<u8> {
     let mut out = Vec::new();
     let mut vbuf = [0u8; 9];
 
-    // min_timestamp delta (unsigned vint)
-    let ts_delta = (h.min_timestamp - TIMESTAMP_EPOCH) as u64;
+    // min_timestamp delta (unsigned vint).
+    // wrapping_sub: values before the epoch (e.g., synthetic test timestamps)
+    // produce large unsigned deltas that round-trip correctly through the
+    // unsigned vint encoding + read_serialization_header's wrapping add.
+    let ts_delta = h.min_timestamp.wrapping_sub(TIMESTAMP_EPOCH) as u64;
     let n = varint::write_unsigned_vint(&mut vbuf, ts_delta);
     out.extend_from_slice(&vbuf[..n]);
 
     // min_local_deletion_time delta (unsigned vint32)
-    let ldt_delta = (h.min_local_deletion_time - DELETION_TIME_EPOCH) as u64;
+    let ldt_delta = h.min_local_deletion_time.wrapping_sub(DELETION_TIME_EPOCH) as u32 as u64;
     let n = varint::write_unsigned_vint(&mut vbuf, ldt_delta);
     out.extend_from_slice(&vbuf[..n]);
 
     // min_ttl delta (unsigned vint32)
-    let ttl_delta = (h.min_ttl - TTL_EPOCH) as u64;
+    let ttl_delta = h.min_ttl.wrapping_sub(TTL_EPOCH) as u32 as u64;
     let n = varint::write_unsigned_vint(&mut vbuf, ttl_delta);
     out.extend_from_slice(&vbuf[..n]);
 
@@ -421,7 +425,7 @@ pub fn write_serialization_header(h: &SerializationHeader) -> Vec<u8> {
     // fields so that Cassandra-produced SSTables (which lack this field)
     // can still be read.
     if h.max_timestamp != i64::MAX {
-        let max_ts_delta = (h.max_timestamp - TIMESTAMP_EPOCH) as u64;
+        let max_ts_delta = h.max_timestamp.wrapping_sub(TIMESTAMP_EPOCH) as u64;
         let n = varint::write_unsigned_vint(&mut vbuf, max_ts_delta);
         out.extend_from_slice(&vbuf[..n]);
     }
@@ -664,6 +668,29 @@ mod tests {
         assert_eq!(decoded.min_timestamp, TIMESTAMP_EPOCH + 1_000_000);
         assert_eq!(decoded.min_local_deletion_time, i32::MAX);
         assert_eq!(decoded.min_ttl, 0);
+    }
+
+    #[test]
+    fn serialization_header_pre_epoch_values_no_panic() {
+        // Regression test: values before the delta-encoding epoch must not
+        // panic on subtraction. This happens during load tests where synthetic
+        // timestamps are small integers (e.g., 1000).
+        let header = SerializationHeader {
+            min_timestamp: 1000,        // << TIMESTAMP_EPOCH
+            min_local_deletion_time: 0, // << DELETION_TIME_EPOCH
+            min_ttl: 0,
+            max_timestamp: 5000,
+            key_type: "T".into(),
+            clustering_types: vec![],
+            static_columns: vec![],
+            regular_columns: vec![],
+        };
+        let encoded = write_serialization_header(&header);
+        let decoded = read_serialization_header(&encoded).unwrap();
+
+        assert_eq!(decoded.min_timestamp, 1000);
+        assert_eq!(decoded.min_local_deletion_time, 0);
+        assert_eq!(decoded.max_timestamp, 5000);
     }
 
     // -- Full Statistics round-trip --

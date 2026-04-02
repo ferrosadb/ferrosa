@@ -441,6 +441,17 @@ impl Segment {
         Ok(())
     }
 
+    /// Closes the persistent file handle, releasing the file descriptor.
+    ///
+    /// Called after the segment's final flush when it moves to `closed_segments`.
+    /// The segment data is fully on disk, so the handle is no longer needed.
+    /// This prevents file descriptor leaks when many segments accumulate
+    /// waiting for `discard_completed()` to clean them up.
+    pub fn close_file_handle(&self) {
+        let mut handle = self.file_handle.lock();
+        *handle = None;
+    }
+
     /// Marks a table as having dirty (unflushed) data in this segment.
     pub fn mark_table_dirty(&self, table_id: &TableId, position: CommitLogPosition) {
         let mut dirty = self.dirty_tables.lock();

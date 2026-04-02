@@ -12,6 +12,7 @@
 
 pub mod receiver;
 pub mod sender;
+pub mod sstable_transfer;
 
 pub use receiver::{StreamReceiver, StreamResult};
 pub use sender::StreamSender;

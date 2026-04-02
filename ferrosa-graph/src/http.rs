@@ -810,6 +810,7 @@ mod tests {
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
             flush_threshold_bytes: 4096,
+            flush_max_age_secs: 5,
             data_dir: tmp.path().to_path_buf(),
         };
         let storage = Arc::new(ferrosa_storage::StorageEngine::new(storage_config, None).unwrap());

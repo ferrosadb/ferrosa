@@ -45,6 +45,12 @@ pub enum DdlPath {
         /// the same up-to-date mapping without a separate sync mechanism.
         node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
     },
+    /// Blocked: cluster formation in progress (Forming state).
+    ///
+    /// DDL is rejected because the node has left Pair mode but Raft has not
+    /// yet elected a leader.  Any DDL applied now would use `Direct` path
+    /// and never replicate, causing silent schema divergence (FMEA F3).
+    Blocked,
     /// Degraded: peer lost, DDL rejected until operator promotes.
     Unavailable,
 }
@@ -109,6 +115,10 @@ impl DdlPath {
                     Err(other) => Err(other),
                 }
             }
+            Self::Blocked => Err(ClusterError::Internal(
+                "DDL unavailable: cluster formation in progress, retry after Raft leader election"
+                    .into(),
+            )),
             Self::Unavailable => Err(ClusterError::Internal(
                 "DDL unavailable: peer lost, wait for operator action".into(),
             )),
@@ -385,7 +395,7 @@ fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
 /// the leader hint. The [`DdlPath::Cluster`] arm in `execute()` catches this
 /// and transparently forwards the request to the leader instead of propagating
 /// the error to the CQL client.
-async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<()> {
+pub(crate) async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<()> {
     let cmd = ddl_op_to_raft_command(op);
 
     match raft.client_write(cmd).await {
@@ -510,6 +520,7 @@ mod tests {
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
             flush_threshold_bytes: 4096,
+            flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
@@ -848,6 +859,18 @@ mod tests {
     /// This is a pure unit test that does NOT require a live Raft instance
     /// because openraft's `Raft::new` is async and needs a running cluster.
     /// We verify the message-type guard in the handler at the codec level.
+    #[tokio::test]
+    async fn test_blocked_ddl_path_returns_error() {
+        let ddl = DdlPath::Blocked;
+        let op = DdlOperation::CreateKeyspace(simple_keyspace("should_fail"));
+        let err = ddl.execute(op).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("formation in progress"),
+            "Blocked error must mention 'formation in progress', got: {msg}"
+        );
+    }
+
     #[test]
     fn ddl_operation_from_bytes_handles_malformed_payload() {
         // Confirm that a garbage payload produces an error, not a panic.
