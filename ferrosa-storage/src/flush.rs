@@ -274,7 +274,7 @@ impl FileFlushTarget {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "tmp") {
+                if path.extension().is_some_and(|ext| ext == "tmp") {
                     let _ = std::fs::remove_file(&path);
                 }
             }
@@ -344,7 +344,7 @@ impl FlushTarget for FileFlushTarget {
         let toc_tmp = toc_path.with_extension("txt.tmp");
 
         if let Some(ref ci) = output.compression_info {
-            std::fs::write(&tmp(&compression_info_path), ci)?;
+            std::fs::write(tmp(&compression_info_path), ci)?;
         }
 
         std::thread::scope(|s| {
@@ -747,7 +747,7 @@ mod tests {
         let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "tmp"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
             .collect();
         assert!(
             tmp_files.is_empty(),
