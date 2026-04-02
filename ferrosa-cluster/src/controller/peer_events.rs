@@ -31,17 +31,10 @@ impl PeerEventListener for ModeController {
         let configured_mode = self.config.mode;
         match current_mode {
             DeploymentMode::Standalone => {
-                if configured_mode == Some(DeploymentMode::Standalone) {
-                    // Standalone nodes do not auto-promote on outbound connections.
-                    // The operator must explicitly set cluster_mode to pair or cluster.
-                    tracing::info!(
-                        peer = %host_id,
-                        "ignoring outbound peer in standalone mode (set FERROSA_CLUSTER_MODE to enable clustering)"
-                    );
-                } else {
-                    // Outbound connection — we already have a pool, no reverse needed.
-                    self.transition_to_pair(host_id, addr, false);
-                }
+                // Any peer connection triggers progressive join: standalone → pair.
+                // FERROSA_CLUSTER_MODE=standalone means "start as standalone" not
+                // "permanently refuse clustering."
+                self.transition_to_pair(host_id, addr, false);
             }
             DeploymentMode::Pair => {
                 // If explicitly configured as pair-only, reject the 3rd peer.
@@ -184,16 +177,8 @@ impl InboundPeerCallback for ModeController {
         let configured_mode = self.config.mode;
         match current_mode {
             DeploymentMode::Standalone => {
-                if configured_mode == Some(DeploymentMode::Standalone) {
-                    // Standalone nodes do not auto-promote on inbound connections.
-                    tracing::info!(
-                        peer = %host_id, %addr,
-                        "ignoring inbound peer in standalone mode (set FERROSA_CLUSTER_MODE to enable clustering)"
-                    );
-                } else {
-                    // Inbound connection — we need a reverse outbound pool for sends.
-                    self.transition_to_pair(host_id, addr, true);
-                }
+                // Inbound connection — we need a reverse outbound pool for sends.
+                self.transition_to_pair(host_id, addr, true);
             }
             DeploymentMode::Pair => {
                 if configured_mode == Some(DeploymentMode::Pair) {
