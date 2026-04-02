@@ -34,7 +34,7 @@ fn test_schema(keyspace: &str, table: &str) -> TableSchema {
 fn test_engine_config(dir: &Path) -> StorageEngineConfig {
     StorageEngineConfig {
         commit_log: CommitLogConfig {
-            segment_size: 32 * 1024 * 1024, // 32 MB — must fit largest mutation
+            segment_size: 256 * 1024, // 256 KB — must fit largest mutation
             max_segment_age: Duration::from_secs(60),
             sync_strategy: SyncStrategyConfig::Batch,
             log_dir: dir.join("commitlog"),
