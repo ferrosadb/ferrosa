@@ -643,6 +643,9 @@ pub struct ClusterInviteHandler {
     local_host_id: Uuid,
     peer_manager: Arc<PeerManager>,
     net_config: Arc<NetConfig>,
+    /// Weak reference to the ModeController for triggering cluster transition
+    /// when this node receives a ClusterInvite while in Pair mode.
+    controller: std::sync::Weak<ModeController>,
 }
 
 impl ClusterInviteHandler {
@@ -650,11 +653,13 @@ impl ClusterInviteHandler {
         local_host_id: Uuid,
         peer_manager: Arc<PeerManager>,
         net_config: Arc<NetConfig>,
+        controller: std::sync::Weak<ModeController>,
     ) -> Self {
         Self {
             local_host_id,
             peer_manager,
             net_config,
+            controller,
         }
     }
 }
@@ -737,6 +742,28 @@ impl RpcHandler for ClusterInviteHandler {
                     }
                 }
             });
+        }
+
+        // If this node is in Pair mode, the invite signals that a 3rd node
+        // has joined and we should transition to cluster mode. Without this,
+        // only the node that saw the 3rd peer connection transitions — the
+        // other nodes stay in Pair forever and never register Raft handlers.
+        if let Some(ctrl) = self.controller.upgrade() {
+            let mode = ctrl.mode();
+            if mode == DeploymentMode::Pair || mode == DeploymentMode::Standalone {
+                let all_peers: Vec<(Uuid, std::net::SocketAddr)> = peers
+                    .iter()
+                    .filter(|(id, _)| *id != self.local_host_id)
+                    .cloned()
+                    .collect();
+                if all_peers.len() >= 2 {
+                    tracing::info!(
+                        peer_count = all_peers.len(),
+                        "cluster invite: triggering cluster transition from {mode:?}"
+                    );
+                    ctrl.transition_to_cluster(all_peers);
+                }
+            }
         }
 
         Some(Message::ClusterInviteAck {

@@ -742,7 +742,8 @@ async fn cluster_invite_handler_replies_with_ack() {
         Arc::new(NoopListener),
     ));
 
-    let handler = cluster::ClusterInviteHandler::new(local_id, pm, net_config);
+    let handler =
+        cluster::ClusterInviteHandler::new(local_id, pm, net_config, std::sync::Weak::new());
 
     let initiator = Uuid::new_v4();
     let peer1 = Uuid::new_v4();
