@@ -108,6 +108,14 @@ impl ModeController {
         // Only the seed calls raft.initialize() — others wait for AppendEntries.
         let was_seed = self.role() == Some(PairRole::Primary);
 
+        // Flush all memtables to SSTables before the write path switches to the
+        // ClusterCoordinator. Data written in standalone/pair mode lives only in
+        // node1's memtable — without flushing, token redistribution makes it
+        // unreachable via the coordinator (P0 data loss bug).
+        if let Err(e) = self.storage.flush_all() {
+            tracing::error!(%e, "failed to flush memtables before cluster transition");
+        }
+
         // 0. Ensure PeerManager has outbound connections to ALL peers.
         //
         // BUG FIX: When transitioning from pair → cluster, only the first peer
@@ -255,13 +263,21 @@ impl ModeController {
         }
 
         // 5. Create coordinator
+        //
+        // Start with RF=1 CL=ONE during initial formation so that data written
+        // in standalone mode (only on node1) remains readable. The coordinator
+        // routes reads to the single replica that has the data. After bootstrap
+        // streaming redistributes data to new token owners, operators can
+        // ALTER KEYSPACE to increase RF.
+        let initial_rf = 1;
+        let initial_cl = ConsistencyLevel::One;
         let coordinator = Arc::new(ClusterCoordinator::new(
             ring_arc.clone(),
             peer_manager,
             local_node_id,
             self.storage.clone(),
-            3, // default RF
-            ConsistencyLevel::Quorum,
+            initial_rf,
+            initial_cl,
         ));
 
         let repair_metrics_for_handler = coordinator.repair_metrics.clone();
