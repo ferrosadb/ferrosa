@@ -331,14 +331,44 @@ impl ModeController {
         let ddl_path = self.ddl_path.clone();
         let mode_swap = self.mode.clone();
         let registry = self.registry.clone();
-        let storage_for_handler = self.storage.clone();
         let storage_for_bootstrap = self.storage.clone();
         let schema_for_bootstrap = self.schema.clone();
         let ring_for_bootstrap = self.ring.clone();
         let all_node_ids_for_bootstrap = all_node_ids.clone();
-        let repair_metrics = repair_metrics_for_handler;
         let cluster_name = self.config.cluster_name.clone();
         let schema_for_replay = self.schema.clone();
+
+        // Register Raft RPC handlers BEFORE spawning the init task.
+        // Handlers use LazyRaft to wait for the instance to be ready.
+        // This eliminates the race where vote requests arrive before
+        // handlers are registered.
+        use crate::raft::handlers::LazyRaft;
+        let (raft_tx, lazy_raft) = LazyRaft::channel();
+
+        let append_handler = Arc::new(RaftAppendHandler::new(lazy_raft.clone()));
+        self.registry
+            .register(MsgType::RaftAppendEntries, append_handler);
+
+        let vote_handler = Arc::new(RaftVoteHandler::new(lazy_raft.clone()));
+        self.registry.register(MsgType::RaftVote, vote_handler);
+
+        let snapshot_handler = Arc::new(RaftSnapshotHandler::new(lazy_raft));
+        self.registry
+            .register(MsgType::RaftInstallSnapshot, snapshot_handler);
+
+        let repair_handler = Arc::new(RepairWriteHandler::new(
+            self.storage.clone(),
+            repair_metrics_for_handler,
+        ));
+        self.registry.register(MsgType::RepairWrite, repair_handler);
+
+        let range_read_handler = Arc::new(RangeReadHandler::new(self.storage.clone()));
+        self.registry
+            .register(MsgType::RangeReadRequest, range_read_handler);
+
+        let read_handler = Arc::new(ReadRequestHandler::new(self.storage.clone()));
+        self.registry.register(MsgType::ReadRequest, read_handler);
+
         self.spawn_tracked(async move {
             // Build openraft Config
             let raft_config = match (openraft::Config {
@@ -378,27 +408,8 @@ impl ModeController {
 
             let raft_arc = Arc::new(raft);
 
-            // Register Raft RPC handlers so peers can reach this node's Raft
-            let append_handler = Arc::new(RaftAppendHandler::new((*raft_arc).clone()));
-            registry.register(MsgType::RaftAppendEntries, append_handler);
-
-            let vote_handler = Arc::new(RaftVoteHandler::new((*raft_arc).clone()));
-            registry.register(MsgType::RaftVote, vote_handler);
-
-            let snapshot_handler = Arc::new(RaftSnapshotHandler::new((*raft_arc).clone()));
-            registry.register(MsgType::RaftInstallSnapshot, snapshot_handler);
-
-            let repair_handler = Arc::new(RepairWriteHandler::new(
-                storage_for_handler.clone(),
-                repair_metrics,
-            ));
-            registry.register(MsgType::RepairWrite, repair_handler);
-
-            let range_read_handler = Arc::new(RangeReadHandler::new(storage_for_handler.clone()));
-            registry.register(MsgType::RangeReadRequest, range_read_handler);
-
-            let read_handler = Arc::new(ReadRequestHandler::new(storage_for_handler));
-            registry.register(MsgType::ReadRequest, read_handler);
+            // Publish the Raft instance — handlers waiting in LazyRaft::get() will unblock.
+            let _ = raft_tx.send(Some(raft_arc.clone()));
 
             // Build initial membership: all known nodes including self
             let mut members = std::collections::BTreeMap::new();

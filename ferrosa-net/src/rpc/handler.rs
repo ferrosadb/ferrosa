@@ -128,4 +128,47 @@ mod tests {
         let response = registry.dispatch(peer_id, MsgType::Ping, msg).await;
         assert!(response.is_none());
     }
+
+    /// Regression test for BUG-RAFT-HANDLER-RACE.
+    ///
+    /// Simulates the cluster formation race: RaftVote messages arrive at a peer
+    /// before its Raft handlers are registered (because handler registration
+    /// happens asynchronously in spawn_tracked, after the mode transition).
+    ///
+    /// The test proves the bug exists: dispatch returns None for RaftVote when
+    /// handlers haven't been registered yet, causing the sender to time out.
+    /// Once fixed, this test should be updated to assert the message is handled.
+    #[tokio::test]
+    async fn raft_vote_dropped_when_handler_not_yet_registered() {
+        // Simulate: node just transitioned to Cluster mode, but spawn_tracked
+        // hasn't registered RaftVoteHandler yet.
+        let registry = Arc::new(HandlerRegistry::new());
+        let peer_id = (uuid::Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+
+        // RaftVote arrives immediately after mode transition — before handler registration
+        let vote_msg = Message::RaftVote(bytes::Bytes::from_static(b"vote-request-payload"));
+        let response = registry
+            .dispatch(peer_id, MsgType::RaftVote, vote_msg)
+            .await;
+
+        // BUG: response is None because no handler is registered yet.
+        // The sender will time out waiting for a VoteResponse.
+        assert!(
+            response.is_none(),
+            "BUG-RAFT-HANDLER-RACE: RaftVote dispatched to missing handler returns None, \
+             causing election timeout. Once fixed, this assertion should flip to Some."
+        );
+
+        // Simulate: spawn_tracked eventually completes and registers the handler
+        let registry_clone = registry.clone();
+        let handler_registered = tokio::spawn(async move {
+            // Artificial delay simulating FerrosRaft::new()
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            registry_clone.register(MsgType::RaftVote, Arc::new(EchoPingHandler));
+        });
+        handler_registered.await.unwrap();
+
+        // After registration, votes work — but any votes sent during the window were lost
+        assert!(registry.has_handler(MsgType::RaftVote));
+    }
 }
