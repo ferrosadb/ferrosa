@@ -24,6 +24,7 @@ use crate::raft::state_machine::FerrosStateMachine;
 use crate::raft::{uuid_to_node_id, FerrosRaft, NodeInfo, NodeState};
 use crate::ring::TokenRing;
 use crate::state::RaftClusterState;
+use crate::streaming::{sender::StreamSender, StreamConfig, StreamedMutation};
 use crate::write_path::WritePath;
 
 use super::token::generate_deterministic_token;
@@ -181,9 +182,11 @@ impl ModeController {
         // Capture the node_map Arc before the factory is consumed by FerrosRaft::new.
         // This shared map is used by DdlPath::Cluster to resolve leader NodeId → Uuid.
         let node_map_for_ddl = network_factory.node_map();
+        let node_map_for_bootstrap = node_map_for_ddl.clone();
         // Clone peer_manager for DdlPath::Cluster forwarding (ClusterCoordinator
         // will consume `peer_manager` below).
         let peer_manager_for_ddl = peer_manager.clone();
+        let peer_manager_for_bootstrap = peer_manager.clone();
 
         // 4. Build TokenRing with deterministic initial tokens
         let mut ring = TokenRing::new();
@@ -211,7 +214,10 @@ impl ModeController {
                     addr: addr.to_string(),
                     data_center: self.config.data_center.clone(),
                     rack: self.config.rack.clone(),
-                    state: NodeState::Normal,
+                    // Start as Joining — only promoted to Normal after bootstrap
+                    // streaming completes. Joining nodes don't serve reads for
+                    // their token ranges until they have the data.
+                    state: NodeState::Joining,
                 },
             );
         }
@@ -322,6 +328,10 @@ impl ModeController {
         let mode_swap = self.mode.clone();
         let registry = self.registry.clone();
         let storage_for_handler = self.storage.clone();
+        let storage_for_bootstrap = self.storage.clone();
+        let schema_for_bootstrap = self.schema.clone();
+        let ring_for_bootstrap = self.ring.clone();
+        let all_node_ids_for_bootstrap = all_node_ids.clone();
         let repair_metrics = repair_metrics_for_handler;
         let cluster_name = self.config.cluster_name.clone();
         let schema_for_replay = self.schema.clone();
@@ -475,6 +485,120 @@ impl ModeController {
                             if let Err(e) = execute_via_raft(&raft_arc, op).await {
                                 tracing::warn!(%e, "schema replay: CreateTable failed (may already exist)");
                             }
+                        }
+                        // Bootstrap streaming: the leader (node1, which has all
+                        // pre-cluster data) streams partitions to new token owners.
+                        tracing::info!("starting bootstrap streaming to new token owners");
+                        if let Some(ring) = &**ring_for_bootstrap.load() {
+                            let schema_snap = schema_for_bootstrap.snapshot();
+                            let config = StreamConfig::default();
+                            let node_map = node_map_for_bootstrap.read().unwrap().clone();
+                            let mut session_counter = 0_u64;
+
+                            for ((ks, tbl), _table_meta) in &schema_snap.tables {
+                                if ks.starts_with("system") {
+                                    continue;
+                                }
+                                let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
+                                let partitions = match storage_for_bootstrap.read_range(
+                                    &table_id,
+                                    None,
+                                    None,
+                                    usize::MAX,
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        tracing::warn!(%e, ks, tbl, "bootstrap: failed to read table");
+                                        continue;
+                                    }
+                                };
+
+                                // Group partitions by target node (using all nodes, including
+                                // Joining — they need the data even though they're not serving yet)
+                                let mut by_node: std::collections::HashMap<u64, Vec<StreamedMutation>> =
+                                    std::collections::HashMap::new();
+                                for partition in &partitions {
+                                    let token = partition.key.token.0; // Token(i64) → i64
+                                    // Find the node that WILL own this token once promoted
+                                    // to Normal (includes Joining nodes).
+                                    let owner = ring
+                                        .primary_owner(token)
+                                        .unwrap_or(local_node_id);
+
+                                    if owner != local_node_id {
+                                        // Extract the first cell's value bytes as the row payload.
+                                        let (row_bytes, ts) = partition.rows.first()
+                                            .and_then(|r| r.cells.first())
+                                            .map(|(_, cv)| {
+                                                let bytes = cv.value.clone().unwrap_or_default();
+                                                (bytes, cv.timestamp)
+                                            })
+                                            .unwrap_or_default();
+
+                                        by_node.entry(owner).or_default().push(StreamedMutation {
+                                            keyspace: ks.clone(),
+                                            table: tbl.clone(),
+                                            key: partition.key.key.as_bytes().to_vec(),
+                                            row: row_bytes,
+                                            timestamp: ts,
+                                        });
+                                    }
+                                }
+
+                                for (target_node_id, mutations) in by_node {
+                                    let target_uuid = node_map.get(&target_node_id).copied();
+
+                                    if let Some(uuid) = target_uuid {
+                                        session_counter += 1;
+                                        let count = mutations.len();
+                                        if let Err(e) = StreamSender::send_stream(
+                                            mutations,
+                                            &peer_manager_for_bootstrap,
+                                            uuid,
+                                            session_counter,
+                                            (i64::MIN, i64::MAX),
+                                            local_node_id,
+                                            &config,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                %e,
+                                                target = target_node_id,
+                                                "bootstrap streaming failed for {ks}.{tbl}"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                target = target_node_id,
+                                                count,
+                                                "bootstrapped {ks}.{tbl} to node {target_node_id}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            // Promote all Joining nodes to Normal now that bootstrap
+                            // streaming is complete. Proposed through Raft so all nodes
+                            // update their ring consistently.
+                            for &nid in &all_node_ids_for_bootstrap {
+                                if nid != local_node_id {
+                                    let cmd = crate::raft::RaftCommand {
+                                        op: crate::raft::RaftOp::SetNodeState {
+                                            node_id: nid,
+                                            state: NodeState::Normal,
+                                        },
+                                        schema_version: Uuid::new_v4(),
+                                    };
+                                    if let Err(e) = raft_arc.client_write(cmd).await {
+                                        tracing::warn!(
+                                            node_id = nid,
+                                            %e,
+                                            "failed to promote node to Normal"
+                                        );
+                                    }
+                                }
+                            }
+                            tracing::info!("bootstrap streaming complete — all nodes Normal");
                         }
                     }
                 }

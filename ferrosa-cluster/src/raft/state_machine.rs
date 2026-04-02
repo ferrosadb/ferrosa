@@ -630,6 +630,20 @@ impl FerrosStateMachine {
             RaftOp::ApproveNode { host_id } => {
                 self.state.approved_nodes.insert(host_id);
             }
+
+            // ---- Node lifecycle ----------------------------------------
+            RaftOp::SetNodeState { node_id, state } => {
+                if let Some(node) = self.state.members.get_mut(&node_id) {
+                    tracing::info!(
+                        node_id,
+                        old = ?node.state,
+                        new = ?state,
+                        "node state transition"
+                    );
+                    node.state = state;
+                }
+                self.sync_ring();
+            }
         }
 
         // Use the leader-generated schema version so all nodes agree.

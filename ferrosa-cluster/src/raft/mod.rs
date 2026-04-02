@@ -206,10 +206,15 @@ pub enum RaftOp {
     /// Replace the cluster-wide configuration.
     UpdateConfig(ClusterConfig),
 
-    // ---- Node admission ------------------------------------------------
+    // ---- Node lifecycle -------------------------------------------------
     /// Approve a node that has requested admission to the cluster.
     ApproveNode {
         host_id: Uuid,
+    },
+    /// Promote a node from Joining to Normal after bootstrap completes.
+    SetNodeState {
+        node_id: u64,
+        state: NodeState,
     },
 }
 
