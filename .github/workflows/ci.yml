@@ -35,7 +35,7 @@ jobs:
 
   # ── Stage 2: Tests ──────────────────────────────────────────────────
   test:
-    name: Test
+    name: Test + Coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +56,7 @@ jobs:
 
   # ── Stage 2b: Coverage (separate to avoid OOM from instrumentation) ──
   coverage:
-    name: Coverage
+    name: Coverage Report
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
