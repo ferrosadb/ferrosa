@@ -58,7 +58,8 @@ jobs:
                --skip ucs_load_s3 --skip ucs_load_ --skip ucs_compaction \
                --skip concurrent_write_flush_compact \
                --skip many_flushes_no_data --skip flush_2000 --skip single_writer_concurrent \
-               --skip write_flush_compact_no_data
+               --skip write_flush_compact_no_data \
+               --test-threads=4
           cargo llvm-cov report --html --output-dir coverage-html
           cargo llvm-cov report --summary-only 2>&1 | tee coverage-summary.txt
       - name: Upload coverage report
