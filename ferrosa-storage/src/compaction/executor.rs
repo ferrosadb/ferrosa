@@ -114,8 +114,7 @@ impl CompactionExecutor {
             BTreeMap::new();
 
         for input in &task.inputs {
-            // Strip tracking prefix (e.g., "f3" → "3") to get the file gen.
-            let gen = input.id.strip_prefix('f').unwrap_or(&input.id);
+            let gen = &input.id;
             let dir = &input.path;
 
             let data = FileReadAt::open(dir.join(format!("{gen}-Data.db")))

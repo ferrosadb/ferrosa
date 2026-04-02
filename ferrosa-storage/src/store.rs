@@ -55,9 +55,10 @@ struct StoreView<R: ReadAt + Send + Sync + 'static> {
     flushing: Option<Arc<dyn Memtable>>,
     /// Completed SSTables, newest first.
     sstables: Arc<Vec<Arc<SSTableReader<R>>>>,
-    /// Stable generation IDs for each SSTable, parallel to `sstables`.
-    /// Used by compaction swap to identify which SSTables to remove.
-    sstable_ids: Arc<Vec<String>>,
+    /// Stable generation IDs and file directories for each SSTable, parallel to `sstables`.
+    /// The String is the gen (used for file names and swap matching).
+    /// The PathBuf is the directory containing the SSTable files.
+    sstable_ids: Arc<Vec<(String, std::path::PathBuf)>>,
     /// Per-index MemtableIndex companions for the active memtable, keyed by
     /// index name. Swapped atomically alongside the active memtable during flush.
     indexes: Arc<HashMap<String, Arc<MemtableIndex>>>,
@@ -221,7 +222,9 @@ impl<F: FlushTarget> TableStore<F> {
             sidecars.push(Arc::new(HashMap::new()));
         }
 
-        let initial_ids: Vec<String> = (1..=sidecar_count).map(|i| format!("f{i}")).collect();
+        let initial_ids: Vec<(String, std::path::PathBuf)> = (1..=sidecar_count)
+            .map(|i| (format!("{i}"), std::path::PathBuf::new()))
+            .collect();
         let initial_view = StoreView {
             active,
             flushing: None,
@@ -528,7 +531,7 @@ impl<F: FlushTarget> TableStore<F> {
         let mut new_sstables = vec![new_reader];
         new_sstables.extend(current_view.sstables.iter().cloned());
 
-        let mut new_ids = vec![format!("f{gen}")];
+        let mut new_ids = vec![(format!("{gen}"), std::path::PathBuf::new())];
         new_ids.extend(current_view.sstable_ids.iter().cloned());
 
         let mut new_sidecars = vec![Arc::new(sidecar_map)];
@@ -828,28 +831,30 @@ impl<F: FlushTarget> TableStore<F> {
 
     /// Atomically replace input SSTables with a compacted output SSTable.
     ///
-    /// Identifies input SSTables by their stable generation IDs (not position)
-    /// and removes exactly those, regardless of flushes that occurred since
-    /// the compaction was submitted.
+    /// Identifies input SSTables by their `(id, path)` pair — not just by ID —
+    /// because different directories (flush vs compaction) can produce the same
+    /// generation number. Matching on both fields prevents accidental removal
+    /// of an SSTable that happens to share a gen with an input in a different dir.
     pub fn swap_compacted_sstables(
         &self,
-        input_ids: &[String],
+        input_ids: &[(String, std::path::PathBuf)],
         output_id: String,
+        output_path: std::path::PathBuf,
         add: Arc<SSTableReader<F::Reader>>,
         output_sidecars: HashMap<String, SidecarReader>,
     ) -> Result<()> {
         let _guard = self.flush_guard.lock();
         let current = self.view.load();
 
-        // Keep SSTables whose ID is NOT in the compaction input set.
+        // Keep SSTables whose (id, path) is NOT in the compaction input set.
         let mut new_sstables = Vec::with_capacity(current.sstables.len());
         let mut new_ids = Vec::with_capacity(current.sstable_ids.len());
         let mut new_sidecars = Vec::with_capacity(current.sidecar_indexes.len());
 
-        for (i, id) in current.sstable_ids.iter().enumerate() {
-            if !input_ids.contains(id) {
+        for (i, id_entry) in current.sstable_ids.iter().enumerate() {
+            if !input_ids.contains(id_entry) {
                 new_sstables.push(Arc::clone(&current.sstables[i]));
-                new_ids.push(id.clone());
+                new_ids.push(id_entry.clone());
                 if i < current.sidecar_indexes.len() {
                     new_sidecars.push(Arc::clone(&current.sidecar_indexes[i]));
                 }
@@ -858,7 +863,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         // Prepend the compacted output.
         new_sstables.insert(0, add);
-        new_ids.insert(0, output_id);
+        new_ids.insert(0, (output_id, output_path));
         new_sidecars.insert(0, Arc::new(output_sidecars));
 
         self.view.store(Arc::new(StoreView {
@@ -872,15 +877,15 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(())
     }
 
-    /// Collects sidecar entries from SSTables matching the given IDs for merging.
+    /// Collects sidecar entries from SSTables matching the given `(id, path)` pairs for merging.
     pub fn collect_compaction_sidecar_entries(
         &self,
-        input_ids: &[String],
+        input_ids: &[(String, std::path::PathBuf)],
     ) -> HashMap<String, Vec<(IndexKey, RowPosition)>> {
         let guard = self.view.load();
         let mut merged: HashMap<String, Vec<(IndexKey, RowPosition)>> = HashMap::new();
-        for (i, id) in guard.sstable_ids.iter().enumerate() {
-            if input_ids.contains(id) {
+        for (i, id_entry) in guard.sstable_ids.iter().enumerate() {
+            if input_ids.contains(id_entry) {
                 if let Some(sidecar_map) = guard.sidecar_indexes.get(i) {
                     for (index_name, reader) in sidecar_map.as_ref() {
                         merged
@@ -921,13 +926,23 @@ impl<F: FlushTarget> TableStore<F> {
                 let min_token = Token::from_key(sst.smallest_key_bytes()).0;
                 let max_token = Token::from_key(sst.largest_key_bytes()).0;
 
+                let id_path = guard.sstable_ids.get(i);
+                let sstable_id = id_path
+                    .map(|(id, _)| id.clone())
+                    .unwrap_or_else(|| format!("{}", i + 1));
+                let sstable_path = id_path
+                    .map(|(_, p)| {
+                        if p.as_os_str().is_empty() {
+                            table_dir.to_path_buf()
+                        } else {
+                            p.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| table_dir.to_path_buf());
+
                 crate::compaction::metadata::SSTableMetadata {
-                    id: guard
-                        .sstable_ids
-                        .get(i)
-                        .cloned()
-                        .unwrap_or_else(|| format!("{}", i + 1)),
-                    path: table_dir.to_path_buf(),
+                    id: sstable_id,
+                    path: sstable_path,
                     size_bytes,
                     min_token,
                     max_token,
@@ -1464,22 +1479,36 @@ mod tests {
 
         // Get the actual stored IDs.
         let view = store.view.load();
-        let current_ids: Vec<String> = view.sstable_ids.iter().cloned().collect();
+        let current_id_paths: Vec<(String, std::path::PathBuf)> =
+            view.sstable_ids.iter().cloned().collect();
         drop(view);
         // Remove the 2 oldest (last 2 in the list).
-        let input_ids: Vec<String> = current_ids.iter().rev().take(2).cloned().collect();
+        let input_id_paths: Vec<(String, std::path::PathBuf)> =
+            current_id_paths.iter().rev().take(2).cloned().collect();
 
         store
-            .swap_compacted_sstables(&input_ids, "compacted".to_string(), new_sst, HashMap::new())
+            .swap_compacted_sstables(
+                &input_id_paths,
+                "compacted".to_string(),
+                std::path::PathBuf::new(),
+                new_sst,
+                HashMap::new(),
+            )
             .unwrap();
         assert_eq!(store.sstable_count(), 3); // 4 - 2 + 1 = 3
 
         // Verify output is present and inputs are gone.
         let view = store.view.load();
-        assert!(view.sstable_ids.contains(&"compacted".to_string()));
-        for id in &input_ids {
+        assert!(
+            view.sstable_ids.iter().any(|(id, _)| id == "compacted"),
+            "compacted output should be present"
+        );
+        for (id, path) in &input_id_paths {
             assert!(
-                !view.sstable_ids.contains(id),
+                !view
+                    .sstable_ids
+                    .iter()
+                    .any(|entry| entry == &(id.clone(), path.clone())),
                 "input {id} should be removed"
             );
         }

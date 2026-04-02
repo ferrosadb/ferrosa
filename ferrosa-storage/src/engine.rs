@@ -1671,7 +1671,12 @@ impl StorageEngine {
     pub async fn poll_compactions(&self) {
         let results = self.compaction_executor.poll_results();
         for result in results {
-            let input_ids: Vec<String> = result.task.inputs.iter().map(|m| m.id.clone()).collect();
+            let input_id_paths: Vec<(String, std::path::PathBuf)> = result
+                .task
+                .inputs
+                .iter()
+                .map(|m| (m.id.clone(), m.path.clone()))
+                .collect();
             let table_id = &result.task.table_id;
 
             // Open the compacted output SSTable.
@@ -1692,12 +1697,16 @@ impl StorageEngine {
             {
                 let tables = self.tables.read();
                 if let Some(state) = tables.get(table_id) {
-                    // Prefix with "c" so compaction output IDs never collide
-                    // with flush IDs (prefixed with "f") in sstable_ids.
-                    let output_id = format!("c{gen}");
+                    let output_id = gen.clone();
+                    // Advance the store's flush target past the compaction gen
+                    // to prevent future flush IDs from colliding with this output.
+                    if let Ok(gen_num) = gen.parse::<u64>() {
+                        state.store.advance_gen_past(gen_num);
+                    }
                     if let Err(e) = state.store.swap_compacted_sstables(
-                        &input_ids,
+                        &input_id_paths,
                         output_id,
+                        result.output.path.clone(),
                         reader,
                         std::collections::HashMap::new(),
                     ) {
@@ -1867,8 +1876,6 @@ impl StorageEngine {
             // Step 5: update manifest — load fresh copy, remove inputs, add output, save.
             // Keep full input metadata for local eviction after manifest update.
             let input_ids: Vec<String> = result.task.inputs.iter().map(|i| i.id.clone()).collect();
-            let input_paths: Vec<std::path::PathBuf> =
-                result.task.inputs.iter().map(|i| i.path.clone()).collect();
 
             // Compute total input bytes for metrics (used after manifest update).
             // If the metadata carries a non-zero size we use it directly;
@@ -1895,12 +1902,7 @@ impl StorageEngine {
                         .iter()
                         .flat_map(|input| {
                             component_suffixes.iter().map(move |suffix| {
-                                let file_gen = input
-                                    .id
-                                    .strip_prefix('f')
-                                    .or_else(|| input.id.strip_prefix('c'))
-                                    .unwrap_or(&input.id);
-                                let path = input.path.join(format!("{file_gen}-{suffix}"));
+                                let path = input.path.join(format!("{}-{suffix}", input.id));
                                 std::fs::metadata(&path)
                                     .map(|m| m.len() as i64)
                                     .unwrap_or(0)
@@ -1912,17 +1914,7 @@ impl StorageEngine {
 
             match crate::manifest::Manifest::load(store.as_ref(), &prefix).await {
                 Ok((mut manifest, _version)) => {
-                    // Strip tracking prefix for manifest ops (manifest uses raw gens).
-                    let manifest_input_ids: Vec<String> = input_ids
-                        .iter()
-                        .map(|id| {
-                            id.strip_prefix('f')
-                                .or_else(|| id.strip_prefix('c'))
-                                .unwrap_or(id)
-                                .to_string()
-                        })
-                        .collect();
-                    manifest.remove_sstables(&table_id_str, &manifest_input_ids);
+                    manifest.remove_sstables(&table_id_str, &input_ids);
                     manifest.add_sstable(
                         &table_id_str,
                         crate::manifest::ManifestEntry {
@@ -1969,9 +1961,8 @@ impl StorageEngine {
             }
 
             // Evict local input SSTable component files (best-effort).
-            // Files are stored flat in the table directory as {gen}-Data.db etc.
-            for (input_id, table_dir) in input_ids.iter().zip(input_paths.iter()) {
-                // Remove all component files for this generation.
+            // Each input carries its own path (flush dir or compaction dir).
+            for input in &result.task.inputs {
                 let standard_components = [
                     "Data.db",
                     "Partitions.db",
@@ -1981,13 +1972,8 @@ impl StorageEngine {
                     "TOC.txt",
                     "CompressionInfo.db",
                 ];
-                // Strip tracking prefix ("f" or "c") to get the file gen.
-                let file_gen = input_id
-                    .strip_prefix('f')
-                    .or_else(|| input_id.strip_prefix('c'))
-                    .unwrap_or(input_id);
                 for component in &standard_components {
-                    let file_path = table_dir.join(format!("{file_gen}-{component}"));
+                    let file_path = input.path.join(format!("{}-{component}", input.id));
                     let _ = std::fs::remove_file(&file_path);
                 }
             }
