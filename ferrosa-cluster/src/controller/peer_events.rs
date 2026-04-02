@@ -28,23 +28,11 @@ impl PeerEventListener for ModeController {
         // two simultaneous peer connections from both triggering transition_to_pair.
         let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
-        let configured_mode = self.config.mode;
         match current_mode {
             DeploymentMode::Standalone => {
-                // Any peer connection triggers progressive join: standalone → pair.
-                // FERROSA_CLUSTER_MODE=standalone means "start as standalone" not
-                // "permanently refuse clustering."
                 self.transition_to_pair(host_id, addr, false);
             }
             DeploymentMode::Pair => {
-                // If explicitly configured as pair-only, reject the 3rd peer.
-                if configured_mode == Some(DeploymentMode::Pair) {
-                    tracing::info!(
-                        peer = %host_id,
-                        "rejecting peer — FERROSA_CLUSTER_MODE=pair limits to 1 peer"
-                    );
-                    return;
-                }
                 // 2nd peer connecting while in pair mode → enter forming state
                 let all_peers = self.connected_peers.lock().clone();
                 if all_peers.len() >= 2 {
@@ -174,20 +162,12 @@ impl InboundPeerCallback for ModeController {
 
         let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
-        let configured_mode = self.config.mode;
         match current_mode {
             DeploymentMode::Standalone => {
                 // Inbound connection — we need a reverse outbound pool for sends.
                 self.transition_to_pair(host_id, addr, true);
             }
             DeploymentMode::Pair => {
-                if configured_mode == Some(DeploymentMode::Pair) {
-                    tracing::info!(
-                        peer = %host_id,
-                        "rejecting inbound peer — FERROSA_CLUSTER_MODE=pair limits to 1 peer"
-                    );
-                    return;
-                }
                 let all_peers = self.connected_peers.lock().clone();
                 if all_peers.len() >= 2 {
                     self.transition_to_cluster(all_peers);

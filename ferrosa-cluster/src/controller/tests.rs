@@ -773,18 +773,14 @@ async fn cluster_invite_handler_replies_with_ack() {
 // Progressive join: standalone → pair → cluster
 // -----------------------------------------------------------------------
 
-/// FERROSA_CLUSTER_MODE=standalone must NOT block peer connections.
-/// A standalone node should auto-promote to pair when a peer connects.
+/// A standalone node auto-promotes to pair when a peer connects.
 #[tokio::test]
 async fn standalone_mode_accepts_peer_and_transitions_to_pair() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());
     let schema = test_schema();
     // Explicitly configure as standalone — this is what the compose does.
-    let config = Arc::new(ClusterConfig {
-        mode: Some(DeploymentMode::Standalone),
-        ..ClusterConfig::default()
-    });
+    let config = Arc::new(ClusterConfig::default());
     let net_config = Arc::new(NetConfig::default());
     let local_id = Uuid::new_v4();
     let peer_id = Uuid::new_v4();
@@ -821,10 +817,7 @@ async fn progressive_join_standalone_to_pair_to_cluster() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());
     let schema = test_schema();
-    let config = Arc::new(ClusterConfig {
-        mode: Some(DeploymentMode::Standalone),
-        ..ClusterConfig::default()
-    });
+    let config = Arc::new(ClusterConfig::default());
     let net_config = Arc::new(NetConfig::default());
     let local_id = Uuid::new_v4();
     let peer1 = Uuid::new_v4();
@@ -865,10 +858,7 @@ async fn standalone_inbound_peer_transitions_to_pair() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());
     let schema = test_schema();
-    let config = Arc::new(ClusterConfig {
-        mode: Some(DeploymentMode::Standalone),
-        ..ClusterConfig::default()
-    });
+    let config = Arc::new(ClusterConfig::default());
     let net_config = Arc::new(NetConfig::default());
     let local_id = Uuid::new_v4();
     let peer_id = Uuid::new_v4();

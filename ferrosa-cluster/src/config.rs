@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::consistency::ConsistencyLevel;
-use crate::mode::DeploymentMode;
 
 /// Role of this node in the cluster.
 ///
@@ -23,8 +22,6 @@ pub enum NodeRole {
 /// Cluster configuration. Parsed from `FERROSA_*` environment variables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
-    /// Forced deployment mode. `None` means auto-detect from peer count.
-    pub mode: Option<DeploymentMode>,
     /// Cluster name — must match across all nodes.
     pub cluster_name: String,
     /// This node's data center.
@@ -53,7 +50,6 @@ pub struct ClusterConfig {
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
-            mode: None,
             cluster_name: "ferrosa".to_string(),
             data_center: "dc1".to_string(),
             rack: "rack1".to_string(),
@@ -74,14 +70,6 @@ impl ClusterConfig {
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
-        if let Ok(mode) = std::env::var("FERROSA_CLUSTER_MODE") {
-            config.mode = match mode.to_lowercase().as_str() {
-                "standalone" => Some(DeploymentMode::Standalone),
-                "pair" => Some(DeploymentMode::Pair),
-                "cluster" => Some(DeploymentMode::Cluster),
-                _ => None,
-            };
-        }
         if let Ok(name) = std::env::var("FERROSA_CLUSTER_NAME") {
             config.cluster_name = name;
         }
