@@ -62,7 +62,7 @@ impl FerrosRaftNetworkFactory {
     pub fn register_node(&self, node_id: u64, host_id: Uuid) {
         self.node_map
             .write()
-            .expect("node_map lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(node_id, host_id);
     }
 
@@ -84,7 +84,7 @@ impl FerrosRaftNetworkFactory {
     fn resolve_host_id(&self, node_id: u64) -> Option<Uuid> {
         self.node_map
             .read()
-            .expect("node_map lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(&node_id)
             .copied()
     }
