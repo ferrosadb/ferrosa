@@ -245,6 +245,13 @@ impl ModeController {
                 tracing::info!(peer = %host_id, "peer already pending join, skipping");
                 return;
             }
+            if pending.len() >= super::MAX_PENDING_JOINS {
+                tracing::warn!(
+                    cap = super::MAX_PENDING_JOINS,
+                    "pending_joins at capacity — evicting oldest entry"
+                );
+                pending.remove(0);
+            }
             pending.push(host_id);
         }
 
