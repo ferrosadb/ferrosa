@@ -27,6 +27,8 @@ pub struct PeerManager {
     local_host_id: uuid::Uuid,
     peers: RwLock<HashMap<uuid::Uuid, PeerState>>,
     listener: Arc<dyn PeerEventListener>,
+    /// CQL broadcast addresses learned from peer handshakes.
+    peer_cql_broadcasts: RwLock<HashMap<uuid::Uuid, String>>,
 }
 
 struct PeerState {
@@ -47,12 +49,23 @@ impl PeerManager {
             local_host_id,
             peers: RwLock::new(HashMap::new()),
             listener,
+            peer_cql_broadcasts: RwLock::new(HashMap::new()),
         }
     }
 
     /// Add a connected peer with a real connection pool.
+    ///
+    /// If the pool's handshake received a CQL broadcast address from the peer,
+    /// it is stored for system.peers.native_address lookups.
     pub async fn add_peer(&self, peer_id: PeerId, pool: PriorityPool) {
         let (host_id, _addr) = peer_id;
+        // Extract the peer's CQL broadcast from the handshake before wrapping in Arc.
+        if let Some(broadcast) = pool.peer_cql_broadcast() {
+            self.peer_cql_broadcasts
+                .write()
+                .await
+                .insert(host_id, broadcast.to_string());
+        }
         let state = PeerState {
             pool: Some(Arc::new(pool)),
             peer_id,
@@ -269,6 +282,25 @@ impl PeerManager {
             state.last_heartbeat = tokio::time::Instant::now();
             state.missed_heartbeats = 0;
         }
+    }
+
+    /// Store a peer's CQL broadcast address learned during handshake.
+    pub async fn set_peer_cql_broadcast(&self, host_id: uuid::Uuid, addr: String) {
+        self.peer_cql_broadcasts.write().await.insert(host_id, addr);
+    }
+
+    /// Retrieve a peer's CQL broadcast address (if known from handshake).
+    pub async fn get_peer_cql_broadcast(&self, host_id: uuid::Uuid) -> Option<String> {
+        self.peer_cql_broadcasts.read().await.get(&host_id).cloned()
+    }
+
+    /// Non-blocking version for synchronous contexts (e.g., system.peers query).
+    /// Returns None if the lock is contended.
+    pub fn get_peer_cql_broadcast_sync(&self, host_id: uuid::Uuid) -> Option<String> {
+        self.peer_cql_broadcasts
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.get(&host_id).cloned())
     }
 }
 

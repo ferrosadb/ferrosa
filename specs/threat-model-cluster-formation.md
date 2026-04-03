@@ -79,8 +79,8 @@ This document covers:
 | **Likelihood** | 2 |
 | **Impact** | 4 |
 | **Risk** | **8** |
-| **Mitigation** | (1) `FERROSA_CLUSTER_MODE=pair` caps at 1 peer (not enforced in code). (2) Initial formation should respect `auto_join=false`. (3) Log all mode transitions. |
-| **Status** | **Partial** — standalone guard exists; pair cap and formation approval are gaps |
+| **Mitigation** | (1) Progressive formation state machine gates transitions (Standalone->Pair->Forming->Cluster). `FERROSA_CLUSTER_MODE` was removed (commit 83943a5) — the state machine itself enforces correct progression. (2) Initial formation should respect `auto_join=false`. (3) Log all mode transitions. |
+| **Status** | **Partial** — progressive state machine gates transitions; formation approval is a gap |
 
 #### CF-T5: Formation Stall — No Forming State (Risk 6 — High)
 

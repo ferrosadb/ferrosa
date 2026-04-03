@@ -1,6 +1,6 @@
 # Ferrosa Development Status
 
-> Last updated: 2026-03-30
+> Last updated: 2026-04-02
 > Status: Living document
 
 ## Overview
@@ -8,8 +8,10 @@
 Ferrosa is a **distributed CQL-compatible database** with graph query support,
 built-in observability, Accord consensus transactions, and S3-backed storage.
 
-**Completed milestones (2026-03-30):**
+**Completed milestones (2026-04-02):**
 
+- **P0 NTS fix** — `keyspace_rf()` returned RF=1 for NetworkTopologyStrategy keyspaces; writes went to coordinator only. Fixed: RF extraction via `ReplicationStrategy` parser, `WritePath` dispatches to `coordinate_write_nts()` for NTS, default datacenter changed to `datacenter1`.
+- **Cluster formation** — Progressive join (Standalone→Pair→Forming→Cluster), ClusterInvite protocol, LazyRaft handler registration, all-node bootstrap streaming, CQL broadcast propagation via PeerManager, system.peers tokens/native_address, connection slot leak fix with RAII guard.
 - **Accord transactions** — 7 sprints (A1-A7) complete: PreAccept/Accept/Commit/Execute, LWT, BEGIN TRANSACTION, cross-shard conflict detection, crash recovery, electorate reconfiguration, 2,808+ tests
 - **Correctness sprints** — C1-C7 complete: BUG-021-026 fixed, P0 storage hazards closed, Jepsen infrastructure wired, SSTable Cassandra compat validated, Accord failure mode coverage, compaction S3 lifecycle complete. C4 (live Jepsen runs) and C8 (all-drivers compat) remain.
 - **NVMe table pinning** — Per-table `storage.pin = nvme` attribute: skip S3 upload, pin in local cache, max_bytes enforcement, ALTER TABLE pin/unpin transitions, Prometheus metrics
@@ -331,8 +333,9 @@ jepsen         ██████   █████░  ████░░   █
   Background maintenance loop (auto-flush, compaction polling, commit log GC).
   Graceful shutdown with configurable timeout (drains in-flight requests).
   Internode drain on shutdown. Per-connection request limiting for backpressure
-  under load. Exponential backoff reconnection for internode links. Ships as
-  .deb via `scripts/build-deb.sh` with systemd service unit.
+  under load. Exponential backoff reconnection for internode links.
+  IpSlotGuard for CQL server connection management + TCP keepalive.
+  Ships as .deb via `scripts/build-deb.sh` with systemd service unit.
 - **Remaining:**
   - [x] ~~Graceful shutdown sequencing~~ (done)
   - [x] ~~Configuration file support~~ (TOML with env var override)
@@ -441,6 +444,14 @@ jepsen         ██████   █████░  ████░░   █
   - [x] UDF/UDA integration with Accord (18 tests)
   - [x] Transactional secondary index reads (READ_2I, 5-layer merge)
   - [x] SUBSCRIBE dual timestamps for Accord ordering
+- **Recent fixes (2026-04-02, cluster formation hardening):**
+  - [x] system.peers tokens column fix
+  - [x] Bootstrap streaming all-nodes fix (Phase A: schema convergence, Phase B: streaming, Phase C: leader promotes)
+  - [x] LazyRaft handler registration — Raft handlers registered before async init (7b057b0)
+  - [x] ClusterInvite sent on Data lane with 10-attempt retry (808b72b)
+  - [x] ClusterInvite delivered synchronously before Raft init (30768c0)
+  - [x] ClusterInvite triggers cluster transition on receiving nodes (ba7599a)
+  - [x] FERROSA_CLUSTER_MODE config removed — progressive join is the only mode (83943a5)
 - **Remaining:**
   - [ ] NetworkTopologyStrategy (multi-DC)
   - [ ] Read repair (full inline repair)
@@ -471,6 +482,7 @@ jepsen         ██████   █████░  ████░░   █
 | ~~SSTable expiring cell (TTL) serialization~~ | — | Done (P0 data corruption fix) |
 | ~~SSTable reader fuzz testing~~ | — | Done (proptest, 9 fuzz tests) |
 | ~~Cassandra Murmur3Partitioner compat~~ | — | Done |
+| Cluster formation hardening | fix/standalone-progressive-join | Active — LazyRaft (7b057b0), ClusterInvite Data lane + retry (808b72b, 30768c0), ClusterInvite triggers transition (ba7599a), FERROSA_CLUSTER_MODE removed (83943a5), all-nodes bootstrap (ae5ba57), IpSlotGuard + keepalive (5063ca6), system.peers tokens (d7a951e), FERROSA_CQL_BROADCAST handshake exchange (ce72f32, efea71c) |
 | Temporal v1.31.0 on ferrosa | ferrosa-temporal | Running (shard acquisition WIP) |
 | Beta release v1.0.0-beta.4 | — | Sprints complete |
 | NetworkTopologyStrategy (multi-DC) | — | Planned |

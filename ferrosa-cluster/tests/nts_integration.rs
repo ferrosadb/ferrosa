@@ -22,6 +22,7 @@ fn make_node(addr: &str, dc: &str, rack: &str) -> NodeInfo {
         data_center: dc.to_string(),
         rack: rack.to_string(),
         state: NodeState::Normal,
+        cql_broadcast: None,
     }
 }
 

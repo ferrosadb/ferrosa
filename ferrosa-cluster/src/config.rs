@@ -45,13 +45,17 @@ pub struct ClusterConfig {
     /// Maximum seconds to wait in Forming state before falling back to Pair.
     /// `None` uses the default of 60 seconds.
     pub formation_timeout_secs: Option<u64>,
+    /// CQL broadcast address (host:port) for system.peers.
+    /// When set, overrides the internode address for native_address.
+    /// Parsed from FERROSA_CQL_BROADCAST env var.
+    pub cql_broadcast: Option<String>,
 }
 
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             cluster_name: "ferrosa".to_string(),
-            data_center: "dc1".to_string(),
+            data_center: "datacenter1".to_string(),
             rack: "rack1".to_string(),
             num_tokens: 256,
             default_cl: ConsistencyLevel::Quorum,
@@ -61,6 +65,7 @@ impl Default for ClusterConfig {
             raft_data_dir: None,
             node_role: NodeRole::Both,
             formation_timeout_secs: None,
+            cql_broadcast: None,
         }
     }
 }
@@ -113,6 +118,9 @@ impl ClusterConfig {
                 _ => NodeRole::Both,
             };
         }
+        if let Ok(addr) = std::env::var("FERROSA_CQL_BROADCAST") {
+            config.cql_broadcast = Some(addr);
+        }
 
         config
     }
@@ -126,7 +134,7 @@ mod tests {
     fn default_config_values() {
         let config = ClusterConfig::default();
         assert_eq!(config.cluster_name, "ferrosa");
-        assert_eq!(config.data_center, "dc1");
+        assert_eq!(config.data_center, "datacenter1");
         assert_eq!(config.rack, "rack1");
         assert_eq!(config.num_tokens, 256);
         assert_eq!(config.default_cl, ConsistencyLevel::Quorum);

@@ -148,9 +148,21 @@ impl PeerEventListener for ModeController {
 }
 
 impl InboundPeerCallback for ModeController {
-    fn on_inbound_peer(&self, peer_id: PeerId) {
+    fn on_inbound_peer(&self, peer_id: PeerId, cql_broadcast: Option<String>) {
         let (host_id, addr) = peer_id;
-        tracing::info!(peer = %host_id, %addr, "inbound peer connected");
+        tracing::info!(peer = %host_id, %addr, ?cql_broadcast, "inbound peer connected");
+
+        // Store the peer's CQL broadcast address (from handshake) in PeerManager
+        // so system.peers can return it instead of the container-internal IP.
+        if let Some(broadcast) = cql_broadcast {
+            if let Some(pm) = &**self.peer_manager.load() {
+                let pm = pm.clone();
+                let hid = host_id;
+                tokio::spawn(async move {
+                    pm.set_peer_cql_broadcast(hid, broadcast).await;
+                });
+            }
+        }
 
         // Track this peer
         {

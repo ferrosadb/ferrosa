@@ -1,6 +1,6 @@
 # Component Architecture
 
-> Last updated: 2026-03-22
+> Last updated: 2026-04-02
 > Status: Approved
 
 ## Overview
@@ -188,7 +188,7 @@ graph BT
 - **Modules**:
   - `frame.rs` — CQL v5 binary framing, `CqlCodec` (Tokio `Encoder`/`Decoder`)
   - `types.rs` — `CqlValue` enum with encode/decode for all CQL types, including `CqlType::Vector` (`vector<float, N>`) encoded as Custom wire type 0x0000
-  - `server.rs` — TCP listener, per-connection Tokio tasks, max connection limit
+  - `server.rs` — TCP listener, per-connection Tokio tasks, max connection limit, RAII `IpSlotGuard` for connection slot cleanup (prevents leak on client death/panic), TCP keepalive (30s probe, 10s interval via `socket2`)
   - `connection.rs` — Connection state machine (AwaitingStartup → Authenticating → Ready), idle timeout (300s)
   - `auth.rs` — SASL PLAIN authentication, max 3 attempts per connection
   - `error.rs` — CQL error codes
@@ -255,27 +255,29 @@ graph BT
 - **Purpose**: Custom internode protocol — transport, RPC, failure detection
 - **Location**: `ferrosa-net/`
 - **Dependencies**: `bytes`, `tokio`, `tokio-util`, `futures`, `hmac`, `sha2`, `rand`, `uuid`
-- **Status**: Phase 1 complete — 24 message types, PSK auth, priority-lane RPC
+- **Status**: Phase 1 complete — 26 message types, PSK auth, priority-lane RPC, CQL broadcast propagation
 - **No dependency on ferrosa-common** (standalone crate)
 - **Modules**:
   - `codec.rs` — 12-byte frame header, `MsgType` enum (0x01-0x47), `InternodeCodec`
-  - `message.rs` — `Message` enum, encode/decode for all types
-  - `handshake.rs` — PSK-authenticated handshake (HMAC-SHA256), cluster name + protocol version
-  - `config.rs` — `NetConfig` with 12-factor env var support
-  - `pool.rs` — `PriorityPool` (3 TCP connections per peer: Raft/Data/Bulk lanes)
-  - `peer.rs` — `PeerManager` with heartbeat-based failure detection
-  - `rpc/` — `RpcServer`, `RpcClient`, `HandlerRegistry`, request-response + fire-and-forget
+  - `message.rs` — `Message` enum, encode/decode for all types including `ClusterInvite` (peer list with 10k cap) and `ClusterInviteAck`
+  - `handshake.rs` — PSK-authenticated handshake (HMAC-SHA256), cluster name + protocol version + bidirectional CQL broadcast address exchange
+  - `config.rs` — `NetConfig` with 12-factor env var support, `cql_broadcast: Option<String>` (`FERROSA_CQL_BROADCAST`)
+  - `pool.rs` — `PriorityPool` (3 TCP connections per peer: Raft/Data/Bulk lanes), `peer_cql_broadcast()` accessor
+  - `peer.rs` — `PeerManager` with heartbeat-based failure detection, `peer_cql_broadcasts: RwLock<HashMap<Uuid, String>>` for storing handshake-learned CQL broadcast addresses, `get_peer_cql_broadcast_sync()` (non-blocking `try_read` for CQL query path)
+  - `rpc/` — `RpcServer`, `RpcClient`, `HandlerRegistry` with runtime-dynamic registration (supports `LazyRaft` pattern), request-response + fire-and-forget
   - `discovery/` — static seed resolution
 - **Transport**: TCP + length-prefixed binary framing. TLS (rustls) and QUIC are Phase 2.
 
 ### ferrosa-cluster
 
-- **Purpose**: Distributed coordination — Raft consensus, token ring, tunable CL, pair mode, DDL replication, failover
+- **Purpose**: Distributed coordination — Raft consensus, token ring, tunable CL, progressive join, DDL replication, failover
 - **Location**: `ferrosa-cluster/`
 - **Dependencies**: `ferrosa-common`, `ferrosa-net`, `ferrosa-storage`, `ferrosa-schema`, `openraft`, `sled`, `arc-swap`, `async-trait`, `bytes`, `serde`, `serde_json`, `tokio`, `uuid`
-- **Status**: Phase 3 complete + Accord transactions (Sprints A1-A7) — Raft consensus, token ring, coordinator, hinted handoff, node lifecycle (join/decommission/streaming/rebalance), plus Phase 1 pair mode, plus full Accord consensus protocol
+- **Status**: Phase 3 complete + Accord transactions (Sprints A1-A7) + progressive join (Standalone→Pair→Forming→Cluster) — Raft consensus, token ring, coordinator, hinted handoff, node lifecycle, ClusterInvite protocol, LazyRaft handler registration, bootstrap streaming (all nodes participate), CQL broadcast propagation via PeerManager
 - **Modules**:
-  - `controller.rs` — `ModeController` (standalone → pair → degraded → cluster transitions), `ClusterStateHolder`, reverse connections, catch-up orchestration, `transition_to_cluster()` (3rd peer triggers Raft group + token ring + coordinator)
+  - `controller/cluster.rs` — `transition_to_forming()`, `transition_to_cluster()` with 3-phase bootstrap (A: schema convergence, B: all-node streaming, C: promote Joining→Normal), `ClusterInviteHandler` (RPC handler for peer discovery + re-broadcast), reverse connection pool setup, `LazyRaft` channel for pre-init handler registration
+  - `controller/mod.rs` — `ModeController` (Standalone→Pair→Forming→Cluster→DegradedPair→DegradedCluster), `formation_epoch` + `seen_invite_initiators` for idempotent invite dedup, tracked `JoinSet` for background tasks
+  - `controller/peer_events.rs` — `on_inbound_peer()` with CQL broadcast extraction from handshake, progressive join transitions
   - `write_path.rs` — `WritePath` enum (Direct/Pair/Cluster/Unavailable) for atomic write routing
   - `ddl_path.rs` — `DdlPath` enum (Direct/Pair/Cluster/Unavailable) for atomic DDL routing
   - `pair/coordinator.rs` — `PairCoordinator` (write forwarding + replication)
@@ -284,17 +286,20 @@ graph BT
   - `pair/switchover.rs` — `initiate_switchover`, `RoleSwapHandler` (bidirectional)
   - `pair/catchup.rs` — `request_catchup`, `PairCatchUpHandler`
   - `pair/node.rs` — `PairNode` integration struct
-  - `raft/mod.rs` — `FerrosRaftConfig` (openraft type config), `RaftCommand` enum (15 schema + 3 topology + 1 config variant)
+  - `raft/mod.rs` — `FerrosRaftConfig` (openraft type config), `RaftCommand` enum (15 schema + 3 topology + 1 config variant), `cql_broadcast` field in `NodeInfo`
   - `raft/log_store.rs` — `SledLogStore` (sled-backed persistent Raft log with vote/commit persistence)
   - `raft/state_machine.rs` — `FerrosStateMachine` (deterministic apply with `BTreeMap`-based `RaftState`, schema + topology + token map, snapshot build/install)
   - `raft/network.rs` — `FerrosRaftNetwork` + factory (wraps PeerManager for Raft RPC)
+  - `raft/handlers.rs` — `LazyRaft` (watch channel for async init), `RaftAppendHandler`, `RaftVoteHandler`, `RaftSnapshotHandler`, `ReadRequestHandler`, `RangeReadHandler`, `RepairWriteHandler` — all registered BEFORE Raft init via LazyRaft to prevent handler-registration race
   - `ring/mod.rs` — `TokenRing` with `BTreeMap<Token, u64>` for O(log n) replica lookup, clockwise walk
   - `ring/strategy.rs` — `SimpleStrategy` with vnode-aware dedup
   - `coordinator/mod.rs` — `ClusterCoordinator` composition
   - `coordinator/write.rs` — Write fan-out with tunable CL enforcement (`blockFor(CL)` ACK collection)
   - `coordinator/read.rs` — Read fan-out with local-replica optimization
   - `consistency.rs` — `ConsistencyLevel` with `blockFor()` + property tests
-  - `config.rs`, `error.rs`, `mode.rs`, `state.rs`
+  - `state.rs` — `RaftClusterState` with `PeerManager` binding for 3-tier CQL broadcast resolution (ring → PeerManager → internode fallback), `system.peers` native_address/tokens population
+  - `config.rs` — `ClusterConfig` with `cql_broadcast: Option<String>` (`FERROSA_CQL_BROADCAST`), `formation_timeout_secs`, `auto_join`, `node_role`
+  - `error.rs`, `mode.rs`
   - `accord/state_machine.rs` — `AccordStateMachine` (core consensus state machine, 39 tests)
   - `accord/coordinator.rs` — `AccordCoordinator` (fast path 3/4 quorum, slow path majority, quorum formulas)
   - `accord/conflict_index.rs` — `ConflictIndex` (key-range conflict detection for concurrent transactions)
@@ -324,7 +329,7 @@ graph BT
   - `web/static_files.rs` — `rust-embed` static file serving for the dashboard UI
   - `web/index.html` — Single-file HTML/CSS/JS dashboard with auto-refresh, connection/query/storage panels
 - **Startup sequence**: tracing init → host_id load/generate → `StorageEngine::new()` → `Schema::new()` → `ModeController::new()` → `PeerManager::new()` → RPC server on :7000 → `CqlServer::start_background()` → optional `GraphEngine` + HTTP → web admin + cluster API on :9090 → background seed connection → ctrl-c → graceful shutdown
-- **Environment variables**: `FERROSA_CQL_BIND`, `FERROSA_AUTH_DISABLED`, `FERROSA_GRAPH_ENABLED`, `FERROSA_WEB_BIND`, `FERROSA_DATA_DIR`, `FERROSA_HOST_ID`, `FERROSA_INTERNODE_BIND`, `FERROSA_INTERNODE_BROADCAST`, `FERROSA_SEED`, `FERROSA_CLUSTER_NAME`, plus storage/schema/S3 env vars
+- **Environment variables**: `FERROSA_CQL_BIND`, `FERROSA_CQL_BROADCAST` (advertised CQL address for system.peers, hostname resolution supported), `FERROSA_AUTH_DISABLED`, `FERROSA_GRAPH_ENABLED`, `FERROSA_WEB_BIND`, `FERROSA_DATA_DIR`, `FERROSA_HOST_ID`, `FERROSA_INTERNODE_BIND`, `FERROSA_INTERNODE_BROADCAST`, `FERROSA_SEED`, `FERROSA_CLUSTER_NAME`, plus storage/schema/S3 env vars
 
 ## Build Order
 

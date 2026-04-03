@@ -183,6 +183,7 @@ impl ModeController {
                 data_center: self.config.data_center.clone(),
                 rack: self.config.rack.clone(),
                 state: NodeState::Normal,
+                cql_broadcast: self.config.cql_broadcast.clone(),
             },
         );
 
@@ -200,6 +201,9 @@ impl ModeController {
                     // streaming completes. Joining nodes don't serve reads for
                     // their token ranges until they have the data.
                     state: NodeState::Joining,
+                    // Peer's cql_broadcast is unknown at this point; it will be
+                    // propagated through Raft NodeInfo once the peer joins.
+                    cql_broadcast: None,
                 },
             );
         }
@@ -289,7 +293,11 @@ impl ModeController {
         // Swap cluster state to Raft-based
         self.cluster_state
             .store(Arc::new(ClusterStateHolder::Cluster(
-                RaftClusterState::new(ring_arc, local_node_id),
+                RaftClusterState::with_peer_manager(
+                    ring_arc,
+                    local_node_id,
+                    peer_manager_for_bootstrap.clone(),
+                ),
             )));
 
         // Clear pair context — no longer in pair mode
@@ -355,7 +363,8 @@ impl ModeController {
             // local_host_id is captured via the `peers` vec (all peers except self).
             let invite_initiator = {
                 // Recover the local UUID from the node_map.
-                let map = node_map_for_bootstrap.read().unwrap();
+                // Read through poison — a poisoned lock still has valid data.
+                let map = node_map_for_bootstrap.read().unwrap_or_else(|e| e.into_inner());
                 map.get(&local_node_id).copied().unwrap_or_default()
             };
             let invite = Message::ClusterInvite {
@@ -499,151 +508,225 @@ impl ModeController {
                         node_map: node_map_for_ddl,
                     }));
 
-                    // Replay local schema state through Raft so all followers
-                    // converge. Any DDL applied via the Direct path during the
-                    // transition window is now proposed through consensus.
-                    if lid == local_node_id {
-                        tracing::info!("replaying local schema state through Raft for follower convergence");
+                    // --- Phase A: Schema convergence (all nodes) ---
+                    //
+                    // Every node replays its local schema so that all peers
+                    // learn about user-created keyspaces/tables. The leader
+                    // proposes directly via Raft; non-leaders forward to the
+                    // leader via the existing PairDdlForward RPC.
+                    {
                         let schema_snap = schema_for_replay.snapshot();
-                        for (name, ks) in &schema_snap.keyspaces {
-                            // Skip system keyspaces — they exist on all nodes.
-                            if name.starts_with("system") {
-                                continue;
-                            }
-                            let op = DdlOperation::CreateKeyspace(ks.clone());
-                            if let Err(e) = execute_via_raft(&raft_arc, op).await {
-                                tracing::warn!(%e, ks = %name, "schema replay: CreateKeyspace failed (may already exist)");
-                            }
-                        }
-                        for ((ks, _tbl), table) in &schema_snap.tables {
-                            if ks.starts_with("system") {
-                                continue;
-                            }
-                            let op = DdlOperation::CreateTable(Box::new(table.clone()));
-                            if let Err(e) = execute_via_raft(&raft_arc, op).await {
-                                tracing::warn!(%e, "schema replay: CreateTable failed (may already exist)");
-                            }
-                        }
-                        // Bootstrap streaming: the leader (node1, which has all
-                        // pre-cluster data) streams partitions to new token owners.
-                        tracing::info!("starting bootstrap streaming to new token owners");
-                        if let Some(ring) = &**ring_for_bootstrap.load() {
-                            let schema_snap = schema_for_bootstrap.snapshot();
-                            let config = StreamConfig::default();
-                            let node_map = node_map_for_bootstrap.read().unwrap().clone();
-                            let mut session_counter = 0_u64;
+                        let user_ks: Vec<_> = schema_snap
+                            .keyspaces
+                            .iter()
+                            .filter(|(name, _)| !name.starts_with("system"))
+                            .collect();
+                        let user_tables: Vec<_> = schema_snap
+                            .tables
+                            .iter()
+                            .filter(|((ks, _), _)| !ks.starts_with("system"))
+                            .collect();
 
-                            for (ks, tbl) in schema_snap.tables.keys() {
-                                if ks.starts_with("system") {
-                                    continue;
-                                }
-                                let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
-                                let partitions = match storage_for_bootstrap.read_range(
-                                    &table_id,
-                                    None,
-                                    None,
-                                    usize::MAX,
-                                ) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        tracing::warn!(%e, ks, tbl, "bootstrap: failed to read table");
-                                        continue;
+                        if !user_ks.is_empty() || !user_tables.is_empty() {
+                            if lid == local_node_id {
+                                tracing::info!(
+                                    ks_count = user_ks.len(),
+                                    table_count = user_tables.len(),
+                                    "leader: replaying local schema through Raft"
+                                );
+                                for (name, ks) in &user_ks {
+                                    let op = DdlOperation::CreateKeyspace((*ks).clone());
+                                    if let Err(e) = execute_via_raft(&raft_arc, op).await {
+                                        tracing::warn!(%e, ks = %name, "schema replay: CreateKeyspace failed (may already exist)");
                                     }
+                                }
+                                for ((ks, _tbl), table) in &user_tables {
+                                    let op = DdlOperation::CreateTable(Box::new((*table).clone()));
+                                    if let Err(e) = execute_via_raft(&raft_arc, op).await {
+                                        tracing::warn!(%e, ks, "schema replay: CreateTable failed (may already exist)");
+                                    }
+                                }
+                            } else {
+                                // Resolve leader NodeId → Uuid for RPC.
+                                let leader_uuid = {
+                                    let map = node_map_for_bootstrap.read().unwrap_or_else(|e| e.into_inner());
+                                    map.get(&lid).copied()
                                 };
-
-                                // Group partitions by target node (using all nodes, including
-                                // Joining — they need the data even though they're not serving yet)
-                                let mut by_node: std::collections::HashMap<u64, Vec<StreamedMutation>> =
-                                    std::collections::HashMap::new();
-                                for partition in &partitions {
-                                    let token = partition.key.token.0; // Token(i64) → i64
-                                    // Find the node that WILL own this token once promoted
-                                    // to Normal (includes Joining nodes).
-                                    let owner = ring
-                                        .primary_owner(token)
-                                        .unwrap_or(local_node_id);
-
-                                    if owner != local_node_id {
-                                        // Serialize all rows via RowWire for full fidelity
-                                        // (clustering keys, all cells, deletion, liveness).
-                                        use crate::raft::handlers::RowWire;
-                                        let wire_rows: Vec<RowWire> = partition.rows
-                                            .iter()
-                                            .cloned()
-                                            .map(RowWire::from)
-                                            .collect();
-                                        let row_bytes = bincode::serialize(&wire_rows)
-                                            .unwrap_or_default();
-                                        let ts = partition.rows.first()
-                                            .and_then(|r| r.cells.first())
-                                            .map(|(_, cv)| cv.timestamp)
-                                            .unwrap_or(0);
-
-                                        by_node.entry(owner).or_default().push(StreamedMutation {
-                                            keyspace: ks.clone(),
-                                            table: tbl.clone(),
-                                            key: partition.key.key.as_bytes().to_vec(),
-                                            row: row_bytes,
-                                            timestamp: ts,
-                                        });
-                                    }
-                                }
-
-                                for (target_node_id, mutations) in by_node {
-                                    let target_uuid = node_map.get(&target_node_id).copied();
-
-                                    if let Some(uuid) = target_uuid {
-                                        session_counter += 1;
-                                        let count = mutations.len();
-                                        if let Err(e) = StreamSender::send_stream(
-                                            mutations,
+                                if let Some(leader_uuid) = leader_uuid {
+                                    tracing::info!(
+                                        ks_count = user_ks.len(),
+                                        table_count = user_tables.len(),
+                                        "non-leader: forwarding local schema to leader"
+                                    );
+                                    for (name, ks) in &user_ks {
+                                        let op = DdlOperation::CreateKeyspace((*ks).clone());
+                                        if let Err(e) = crate::ddl_path::forward_ddl_to_leader(
                                             &peer_manager_for_bootstrap,
-                                            uuid,
-                                            session_counter,
-                                            (i64::MIN, i64::MAX),
-                                            local_node_id,
-                                            &config,
+                                            leader_uuid,
+                                            op,
                                         )
                                         .await
                                         {
-                                            tracing::warn!(
-                                                %e,
-                                                target = target_node_id,
-                                                "bootstrap streaming failed for {ks}.{tbl}"
-                                            );
-                                        } else {
-                                            tracing::info!(
-                                                target = target_node_id,
-                                                count,
-                                                "bootstrapped {ks}.{tbl} to node {target_node_id}"
-                                            );
+                                            tracing::warn!(%e, ks = %name, "schema forward: CreateKeyspace failed");
                                         }
                                     }
+                                    for ((ks, _tbl), table) in &user_tables {
+                                        let op = DdlOperation::CreateTable(Box::new((*table).clone()));
+                                        if let Err(e) = crate::ddl_path::forward_ddl_to_leader(
+                                            &peer_manager_for_bootstrap,
+                                            leader_uuid,
+                                            op,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(%e, ks, "schema forward: CreateTable failed");
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!("cannot forward schema: leader UUID not in node_map");
                                 }
                             }
-                            // Promote all Joining nodes to Normal now that bootstrap
-                            // streaming is complete. Proposed through Raft so all nodes
-                            // update their ring consistently.
-                            for &nid in &all_node_ids_for_bootstrap {
-                                if nid != local_node_id {
-                                    let cmd = crate::raft::RaftCommand {
-                                        op: crate::raft::RaftOp::SetNodeState {
-                                            node_id: nid,
-                                            state: NodeState::Normal,
-                                        },
-                                        schema_version: Uuid::new_v4(),
+                        }
+                    }
+
+                    // --- Phase B: Bootstrap streaming (all nodes) ---
+                    //
+                    // Every node reads from its local storage and streams
+                    // partitions that belong to other nodes per the new ring.
+                    // Nodes with no data complete instantly (zero iterations).
+                    tracing::info!("starting bootstrap streaming to new token owners");
+                    if let Some(ring) = &**ring_for_bootstrap.load() {
+                        let schema_snap = schema_for_bootstrap.snapshot();
+                        let config = StreamConfig::default();
+                        let node_map = node_map_for_bootstrap.read().unwrap_or_else(|e| e.into_inner()).clone();
+                        let mut session_counter = 0_u64;
+
+                        for (ks, tbl) in schema_snap.tables.keys() {
+                            if ks.starts_with("system") {
+                                continue;
+                            }
+                            let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
+                            let partitions = match storage_for_bootstrap.read_range(
+                                &table_id,
+                                None,
+                                None,
+                                usize::MAX,
+                            ) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::warn!(%e, ks, tbl, "bootstrap: failed to read table");
+                                    continue;
+                                }
+                            };
+
+                            // Group partitions by target node (using all nodes, including
+                            // Joining — they need the data even though they're not serving yet)
+                            let mut by_node: std::collections::HashMap<u64, Vec<StreamedMutation>> =
+                                std::collections::HashMap::new();
+                            for partition in &partitions {
+                                let token = partition.key.token.0; // Token(i64) → i64
+                                // Find the node that WILL own this token once promoted
+                                // to Normal (includes Joining nodes).
+                                let owner = ring
+                                    .primary_owner(token)
+                                    .unwrap_or(local_node_id);
+
+                                if owner != local_node_id {
+                                    // Serialize all rows via RowWire for full fidelity
+                                    // (clustering keys, all cells, deletion, liveness).
+                                    use crate::raft::handlers::RowWire;
+                                    let wire_rows: Vec<RowWire> = partition.rows
+                                        .iter()
+                                        .cloned()
+                                        .map(RowWire::from)
+                                        .collect();
+                                    let row_bytes = match bincode::serialize(&wire_rows) {
+                                        Ok(bytes) => bytes,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                %e,
+                                                partition_key = ?partition.key,
+                                                "bootstrap: failed to serialize rows, skipping partition (data loss avoided)"
+                                            );
+                                            continue;
+                                        }
                                     };
-                                    if let Err(e) = raft_arc.client_write(cmd).await {
+                                    let ts = partition.rows.first()
+                                        .and_then(|r| r.cells.first())
+                                        .map(|(_, cv)| cv.timestamp)
+                                        .unwrap_or(0);
+
+                                    by_node.entry(owner).or_default().push(StreamedMutation {
+                                        keyspace: ks.clone(),
+                                        table: tbl.clone(),
+                                        key: partition.key.key.as_bytes().to_vec(),
+                                        row: row_bytes,
+                                        timestamp: ts,
+                                    });
+                                }
+                            }
+
+                            for (target_node_id, mutations) in by_node {
+                                let target_uuid = node_map.get(&target_node_id).copied();
+
+                                if let Some(uuid) = target_uuid {
+                                    session_counter += 1;
+                                    let count = mutations.len();
+                                    if let Err(e) = StreamSender::send_stream(
+                                        mutations,
+                                        &peer_manager_for_bootstrap,
+                                        uuid,
+                                        session_counter,
+                                        (i64::MIN, i64::MAX),
+                                        local_node_id,
+                                        &config,
+                                    )
+                                    .await
+                                    {
                                         tracing::warn!(
-                                            node_id = nid,
                                             %e,
-                                            "failed to promote node to Normal"
+                                            target = target_node_id,
+                                            "bootstrap streaming failed for {ks}.{tbl}"
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            target = target_node_id,
+                                            count,
+                                            "bootstrapped {ks}.{tbl} to node {target_node_id}"
                                         );
                                     }
                                 }
                             }
-                            tracing::info!("bootstrap streaming complete — all nodes Normal");
                         }
+                        tracing::info!("bootstrap streaming complete on this node");
+                    }
+
+                    // --- Phase C: Promote to Normal (leader only) ---
+                    //
+                    // Wait for non-leader streaming to settle, then promote all
+                    // Joining nodes to Normal via Raft.
+                    // TODO: Replace fixed delay with proper BootstrapComplete RPC barrier.
+                    if lid == local_node_id {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        for &nid in &all_node_ids_for_bootstrap {
+                            if nid != local_node_id {
+                                let cmd = crate::raft::RaftCommand {
+                                    op: crate::raft::RaftOp::SetNodeState {
+                                        node_id: nid,
+                                        state: NodeState::Normal,
+                                    },
+                                    schema_version: Uuid::new_v4(),
+                                };
+                                if let Err(e) = raft_arc.client_write(cmd).await {
+                                    tracing::warn!(
+                                        node_id = nid,
+                                        %e,
+                                        "failed to promote node to Normal"
+                                    );
+                                }
+                            }
+                        }
+                        tracing::info!("bootstrap complete — all nodes promoted to Normal");
                     }
                 }
                 None => {

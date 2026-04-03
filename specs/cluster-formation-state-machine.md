@@ -130,22 +130,33 @@ relationship they had as secondaries. No data movement, no re-election
 surprise.
 
 **Actions:**
-1. Create Raft log store, state machine (seeded with current schema), network factory
-2. Register all peer node IDs in Raft network factory
-3. Build initial token ring with deterministic token assignment
-4. Initialize Raft membership with all nodes
-5. Wait for leader election (30s timeout with backoff)
-6. Register Raft RPC handlers (AppendEntries, Vote, InstallSnapshot)
-7. Swap DDL path to `DdlPath::Cluster`
-8. **Leader (original primary):** Replay local schema state through Raft so
-   all followers converge (keyspaces + tables created during Direct/Pair window)
-9. Swap write path to `WritePath::Cluster`
-10. Set state to `Cluster`
+1. Register Raft RPC handlers (AppendEntries, Vote, InstallSnapshot) BEFORE async
+   Raft init using the LazyRaft pattern (commit 7b057b0) — ensures handlers are
+   ready to receive messages the moment Raft starts on any node
+2. Deliver `ClusterInvite` synchronously on the **Data lane** (not the Raft lane)
+   with a 10-attempt retry loop BEFORE Raft init starts (commits 808b72b, 30768c0)
+3. Create Raft log store, state machine (seeded with current schema), network factory
+4. Register all peer node IDs in Raft network factory
+5. Build initial token ring with deterministic token assignment
+6. Initialize Raft membership with all nodes
+7. Wait for leader election (30s timeout with backoff)
+8. Swap DDL path to `DdlPath::Cluster`
+9. **Bootstrap streaming on ALL nodes** (3 phases):
+   - **Phase A — Schema convergence:** Leader replays local schema state through
+     Raft so all followers converge. Non-leaders replay schema via
+     `PairDdlForward` to ensure DDL applied during Pair/Direct windows is captured.
+   - **Phase B — Data streaming:** ALL nodes stream their local data to the new
+     token owners based on the initial token ring assignment.
+   - **Phase C — Leader promotes:** Leader proposes state changes from `Joining`
+     to `Normal` for all nodes via Raft.
+10. Swap write path to `WritePath::Cluster`
+11. Set state to `Cluster`
 
 **Invariants:**
 - All peers connected with bidirectional pools (outbound for sends)
+- Raft handlers registered before async Raft init (no message-before-handler race)
 - Raft leader elected (original seed/primary)
-- All nodes have identical schema (via Raft replay)
+- All nodes have identical schema (via Raft replay + PairDdlForward)
 
 #### T4: Cluster -> Cluster (Adding Members)
 
@@ -645,13 +656,15 @@ flowchart LR
 keyspaces and tables through Raft. The state machine's `apply_command` is
 idempotent (`or_insert_with`), so replaying existing entries is safe.
 
-### Configuration Guards
+### Configuration
+
+Progressive join (Standalone -> Pair -> Cluster) is the only supported formation
+mode. The `FERROSA_CLUSTER_MODE` environment variable was removed (commit 83943a5)
+as it added configuration complexity without meaningful safety benefit — the
+progressive state machine already gates transitions correctly.
 
 | Config | Effect |
 |--------|--------|
-| `FERROSA_CLUSTER_MODE=standalone` | Rejects all peer connections, stays Standalone |
-| `FERROSA_CLUSTER_MODE=pair` | Accepts 1 peer, rejects 3rd, stays Pair |
-| `FERROSA_CLUSTER_MODE=cluster` | Allows full formation (default behavior) |
 | `FERROSA_AUTO_JOIN=false` | New nodes after initial formation must be pre-approved |
 | `FERROSA_AUTO_JOIN=true` | Any authenticated node can join (dev/test only) |
 

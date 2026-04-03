@@ -1,6 +1,6 @@
 # FMEA — Cluster Formation State Machine
 
-> Date: 2026-04-01
+> Date: 2026-04-02
 > Scope: All state transitions T1–T9, T6a–T6c from specs/cluster-formation-state-machine.md
 > Reference: ferrosa-cluster/src/controller.rs, mode.rs, ddl_path.rs, write_path.rs
 
@@ -9,62 +9,90 @@
 | ID | Transition | Failure Mode | Effect | Sev | Occ | Det | RPN |
 |----|-----------|-------------|--------|-----|-----|-----|-----|
 | F3 | T3 Forming→Cluster | DDL race during Forming window — DDL via Direct path never reaches followers | Schema divergence: leader has tables followers lack. Writes to those tables fail silently on followers. | 9 | 6 | 7 | **378** |
-| F5 | T2/T3 | Missing reverse outbound pools for late peers — Raft init proceeds without waiting | Raft AppendEntries fails to unconnected peers. Quorum may not form. Schema replay silently drops. | 8 | 7 | 5 | **280** |
-| F1 | T2 Pair→Forming | No ClusterInvite — non-seed nodes never discover each other | Nodes stuck in Pair. Raft can't form quorum. Cluster is non-functional. | 9 | 10 | 3 | **270** |
-| F2 | T2 Pair→Forming | No Forming state — jumps Pair→Cluster. If pool not ready, Raft fails. | Raft init hangs. DDL on Direct forever. Cluster appears formed but inoperable. | 8 | 8 | 4 | **256** |
-| F6 | T2/T3 | No Forming→Pair fallback — 3rd node disconnects, seed stuck in Cluster with no quorum | Permanent Raft quorum loss. Writes fail indefinitely. Requires operator restart. | 8 | 4 | 8 | **256** |
-| F4 | T5a Decommission | No data streaming before removal — LeaveNode via Raft but data not transferred | Token ranges unavailable. Unflushed data permanently lost. | 10 | 5 | 5 | **250** |
-| F13 | T6c Quorum Lost | Surviving node serves stale reads with no client-visible warning | Clients read stale data believing current. Application consistency violations. | 7 | 4 | 7 | **196** |
-| F20 | T1/T2/T3 | PairSchemaSync arrives before handler registered (race with sleep-based timing) | Schema sync dropped. Secondary starts with empty schema. Writes fail. | 7 | 4 | 7 | **196** |
+| F5 | T2/T3 | Missing reverse outbound pools for late peers — Raft init proceeds without waiting | Raft AppendEntries fails to unconnected peers. Quorum may not form. Schema replay silently drops. **Partially mitigated:** CQL broadcast propagation through handshake (ce72f32, 1456778) improves peer address discovery. Hostname resolution (8bd3149) reduces address mismatch. Core fire-and-forget pool creation still unresolved. | 8 | 6 | 4 | **192** |
 | F7 | T4 Add Member | Approval check outside Raft proposal — TOCTOU race | Unapproved node's JoinNode committed to Raft. Security boundary violated. | 7 | 3 | 9 | **189** |
 | F10 | T3 Forming→Cluster | Node crash during Raft init — between mode swap and Raft::new | Ghost member in Raft membership. Other nodes can't reach it. Prevents quorum. | 9 | 3 | 7 | **189** |
-| F9 | T1 Standalone→Pair | Reverse outbound pool fails (500ms delay, single attempt, no retry) | Primary can't send PairSchemaSync. Silent schema divergence. | 7 | 4 | 6 | **168** |
 | F19 | T7 Degraded→Cluster | Hint overflow during extended outage — no auto repair triggered | Recovered node missing mutations beyond hint capacity. Data silently incomplete. | 7 | 3 | 8 | **168** |
 | F12 | T8b/T9 Primary Fails + Promote | Old primary returns with unreplicated writes — silently discarded | Data loss for partition-era mutations. No conflict detection or warning. | 9 | 2 | 9 | **162** |
-| F15 | T4 Add Member | No ClusterInvite to new node — can't reach all cluster members | Node in Raft membership but unreachable by some peers. Raft messages fail. | 8 | 5 | 4 | **160** |
+| F4 | T5a Decommission | No data streaming before removal — LeaveNode via Raft but data not transferred | Token ranges unavailable. Unflushed data permanently lost. **Partially mitigated:** Bootstrap streaming now implemented for all nodes (ae5ba57) — formation-time streaming works. Decommission-time streaming still missing. | 10 | 4 | 4 | **160** |
 | F11 | T1 Standalone→Pair | Concurrent inbound connections both trigger transition_to_pair | Race: duplicate PairCoordinator, corrupted pair state, duplicate handlers. | 8 | 3 | 6 | **144** |
 | F14 | T3 Forming→Cluster | Schema replay errors treated as warnings — followers permanently miss DDL | Tables on leader but not followers. Writes to those tables produce silent errors. | 9 | 2 | 8 | **144** |
+| F26 | T2/T3 | Formation timeout path not tested — `formation_timeout_secs` exists but no test validates Forming→Pair fallback | If fallback is silently broken, F6 risk reverts to pre-mitigation level: permanent quorum loss on 3rd node disconnect. Operators won't discover this until production failure. | 5 | 4 | 7 | **140** |
+| F13 | T6c Quorum Lost | Surviving node serves stale reads with no client-visible warning | Clients read stale data believing current. Application consistency violations. **Partially mitigated:** Correct system.peers addresses (ce72f32, 1456778) and hostname resolution (8bd3149) improve client-side topology awareness. Clients can now detect unreachable peers. No explicit quorum-loss warning to clients yet. | 7 | 4 | 5 | **140** |
+| F6 | T2/T3 | No Forming→Pair fallback — 3rd node disconnects, seed stuck in Cluster with no quorum | Permanent Raft quorum loss. Writes fail indefinitely. Requires operator restart. **Partially mitigated:** Forming state (0bf686d) defines Forming→Pair as valid transition. `formation_timeout_secs` config exists but fallback path is untested (see F26). | 8 | 2 | 8 | **128** |
 | F21 | T3 Forming→Cluster | connected_peers mutex contention — peer added during transition | Raft initialized with wrong membership. | 7 | 3 | 6 | **126** |
 | F8 | T3 Forming→Cluster | Raft leader election timeout (30s) — DDL on Direct | 30s of unreplicated DDL. If leader never elected, Direct path persists. | 8 | 3 | 5 | **120** |
+| F1 | T2 Pair→Forming | ClusterInvite not received — non-seed nodes fail to discover each other | Nodes stuck in Pair. Raft can't form quorum. Cluster is non-functional. **Partially mitigated:** ClusterInvite now sent on Data lane with 10-attempt retry (808b72b), and ClusterInvite handler triggers cluster transition on receiving nodes (ba7599a). Remaining risk: all 10 retries fail under sustained network partition. | 9 | 4 | 3 | **108** |
+| F2 | T2 Pair→Forming | No Forming state — jumps Pair→Cluster. If pool not ready, Raft fails. | Raft init hangs. DDL on Direct forever. Cluster appears formed but inoperable. **Substantially mitigated:** Forming state added (0bf686d) with progressive join path Standalone→Pair→Forming→Cluster. Forming→Pair fallback transition defined. Remaining risk: fallback timeout path untested (see F26). | 8 | 3 | 4 | **96** |
+| F27 | T3 Forming→Cluster | Bootstrap Phase C uses fixed 5s delay instead of BootstrapComplete RPC barrier | If streaming takes >5s, nodes promoted to Cluster before data transfer completes. Missing data on newly joined node. Reads return NotFound for recently-streamed token ranges. | 8 | 4 | 3 | **96** |
 | F18 | T5b Decommission Leader | transfer_leader not implemented — leader removes itself from Raft | Remaining nodes lose coordinator. Possible membership corruption. | 9 | 2 | 5 | **90** |
+| F28 | T4/T6a/T6b | PeerManager broadcast map never cleaned on disconnect — stale entries accumulate | On peer churn, broadcast map grows with stale addresses. system.peers returns unreachable addresses. Clients route requests to dead nodes. Slow leak, not immediately visible. | 3 | 5 | 6 | **90** |
+| F29 | T3 Forming→Cluster | LazyRaft 10s timeout silently drops Raft messages during slow init | If Raft initialization takes >10s (slow disk, large log replay), LazyRaft handler returns None for all messages. Raft election fails silently. Leader never elected. DDL stays on Direct path indefinitely. | 6 | 3 | 5 | **90** |
+| F9 | T1 Standalone→Pair | Reverse outbound pool fails (500ms delay, single attempt, no retry) | Primary can't send PairSchemaSync. Silent schema divergence. **Partially mitigated:** CQL broadcast and hostname resolution (ce72f32, 8bd3149) ensure correct peer addresses in system.peers. Pool creation itself still single-attempt, but address correctness reduces misrouting. | 7 | 4 | 3 | **84** |
 | F16 | T1 Standalone→Pair | Partition immediately after pair formation — writes hang on replication | Write timeout or hang. User-visible latency spike. | 7 | 3 | 4 | **84** |
 | F24 | T6b Leader Fails | Clock skew → premature Raft elections | Unnecessary elections. Brief write unavailability. Under heavy skew, livelock. | 5 | 3 | 5 | **75** |
-| F22 | T4 Add Member | FD exhaustion — each peer needs multiple TCP connections | PriorityPool::connect fails. New node can't join. Existing connections disrupted. | 7 | 3 | 3 | **63** |
+| F15 | T4 Add Member | No ClusterInvite to new node — can't reach all cluster members | Node in Raft membership but unreachable by some peers. Raft messages fail. **Mitigated:** CQL broadcast exchanged in handshake (ce72f32, 1456778), hostname resolution in FERROSA_CQL_BROADCAST (8bd3149), system.peers now populated with correct addresses. | 8 | 3 | 3 | **72** |
+| F20 | T1/T2/T3 | PairSchemaSync arrives before handler registered (race with sleep-based timing) | Schema sync dropped. Secondary starts with empty schema. Writes fail. **Mitigated:** LazyRaft pattern (7b057b0) registers Raft handlers before async init, eliminating the handler registration race for Raft messages. PairSchemaSync handler registration timing is also improved. | 7 | 2 | 4 | **56** |
 | F17 | T3 Forming→Cluster | Sled log store creation fails (disk full, permissions) | Mode is Cluster but Raft never initializes. Zombie state. | 9 | 2 | 3 | **54** |
 | F25 | T2/T3 | Duplicate ClusterInvite propagation — no dedup | Exponential message amplification. Network saturation. | 5 | 3 | 3 | **45** |
+| F22 | T4 Add Member | FD exhaustion — each peer needs multiple TCP connections | PriorityPool::connect fails. New node can't join. Existing connections disrupted. **Mitigated:** RAII IpSlotGuard (5063ca6) prevents CQL connection slot leaks. TCP keepalive detects dead peers in ~60s. | 7 | 2 | 2 | **28** |
 | F23 | T8a Secondary Fails | Hint store init failure — expect() panics | Total node crash instead of graceful degradation. | 10 | 1 | 2 | **20** |
 
-## Critical Findings (RPN ≥ 200)
+## Critical Findings (RPN ≥ 150)
 
 ### CRITICAL-1: DDL Race During Formation Window (F3, RPN=378)
 
-`controller.rs:919` sets DDL to `DdlPath::Direct` during Raft init. DDL in this 30s+ window is local-only. Schema replay (L1071-1093) errors are logged as warnings and swallowed.
+`controller.rs:919` sets DDL to `DdlPath::Direct` during Raft init. DDL in this 30s+ window is local-only. Schema replay (L1071-1093) errors are logged as warnings and swallowed. **Highest-RPN item in this FMEA, unchanged since initial assessment.**
 
 **Fix:** Block DDL during Forming state OR queue and replay after leader election.
 
-### CRITICAL-2: Missing Reverse Outbound Pools (F5, RPN=280)
+### CRITICAL-2: Missing Reverse Outbound Pools (F5, RPN=280 -> 192)
 
-Reverse pool creation at L760-778 is fire-and-forget. Raft init at L950 proceeds without waiting. AppendEntries to unconnected peers fails silently.
+**Partially mitigated.** CQL broadcast propagation (ce72f32, 1456778) and hostname
+resolution (8bd3149) improve peer address discovery, reducing occurrence from 7 to 6.
+Core fire-and-forget pool creation at L760-778 still unresolved. Raft init at L950
+proceeds without waiting.
 
-**Fix:** `PeerManager::wait_for_peer(host_id, timeout)` before Raft init.
+**Remaining fix:** `PeerManager::wait_for_peer(host_id, timeout)` before Raft init.
 
-### CRITICAL-3: No ClusterInvite Message (F1, RPN=270)
+### CRITICAL-3: ClusterInvite Delivery (F1, RPN=270 -> 108)
 
-No `Message::ClusterInvite` variant exists. Hub-and-spoke topology → non-seed nodes never discover each other → cluster formation broken.
+**Partially mitigated.** ClusterInvite is now implemented and sent on the Data lane
+with a 10-attempt retry loop (808b72b). The ClusterInvite handler triggers cluster
+transition on receiving nodes (ba7599a). Remaining risk: all 10 retries fail under
+sustained network partition. Below critical threshold but still high.
 
-**Fix:** Implement ClusterInvite / ClusterInviteAck as specified.
+**Remaining fix:** Persistent retry or operator-triggered re-invite for partition scenarios.
 
-### CRITICAL-4: No Forming State + No Fallback (F2+F6, RPN=256)
+### CRITICAL-4: No Forming State + No Fallback (F2+F6, RPN=256 -> 96/128)
 
-Only Standalone|Pair|Cluster. No Forming state. Once in Cluster, can't go back. 3rd node disconnect = permanent stuck state.
+**Substantially mitigated.** Forming state added (0bf686d) with progressive join
+path Standalone→Pair→Forming→Cluster. Forming→Pair defined as valid transition.
+`formation_timeout_secs` config exists. **However**, the timeout fallback path has
+no test coverage (see F26, RPN=140). If the fallback is silently broken, F6 risk
+reverts to pre-mitigation severity.
 
-**Fix:** Add Forming variant. 60s timeout → fall back to Pair.
+**Remaining fix:** Integration test for Forming→Pair fallback under timeout.
 
-### CRITICAL-5: No Decommission Data Streaming (F4, RPN=250)
+### CRITICAL-5: No Decommission Data Streaming (F4, RPN=250 -> 160)
 
-`initiate_decommission` (L451-483) proposes LeaveNode but skips data transfer. Relies on S3 write-behind which may be stale.
+**Partially mitigated.** Bootstrap streaming now implemented for all nodes (ae5ba57),
+covering formation-time data transfer. `initiate_decommission` (L451-483) still
+proposes LeaveNode without data transfer. Relies on S3 write-behind which may be stale.
 
-**Fix:** Full sequence: LeaveNode → ReassignTokens → stream data → RemoveNode.
+**Remaining fix:** Full sequence: LeaveNode → ReassignTokens → stream data → RemoveNode.
+
+### CRITICAL-6: Hint Overflow Without Auto Repair (F19, RPN=168)
+
+Recovered node missing mutations beyond hint capacity. No automatic repair triggered after extended outage. Data silently incomplete.
+
+**Fix:** Trigger anti-entropy repair when hint replay exceeds configurable threshold.
+
+### CRITICAL-7: Unreplicated Primary Returns (F12, RPN=162)
+
+Old primary returns with unreplicated writes after partition. Writes silently discarded with no conflict detection or warning.
+
+**Fix:** Conflict detection on primary rejoin. Log/alert for discarded mutations.
 
 ## Cross-Cutting Observations
 
@@ -72,24 +100,29 @@ Only Standalone|Pair|Cluster. No Forming state. Once in Cluster, can't go back. 
 2. **Fire-and-forget spawns** — 7 critical `tokio::spawn` calls with no JoinHandle tracking.
 3. **Single-attempt operations** — reverse pools, schema sync, Raft proposals attempted once. Transient failures → permanent inconsistency.
 4. **Mode transition not atomic with side effects** — mode stored as Cluster before Raft init completes (L933 vs L950).
-5. **Hardcoded timing** — 500ms, 2s, 4s magic numbers. Should be condition-based waits.
+5. **Hardcoded timing** — 500ms, 2s, 4s, 5s (Phase C bootstrap), 10s (LazyRaft) magic numbers. Should be condition-based waits or RPC barriers.
+6. **No cleanup on disconnect** — PeerManager broadcast map accumulates stale entries on peer churn (F28).
 
 ## Recommended Test Cases
 
 | # | Test | Failure Mode | RPN | Infra |
 |---|------|-------------|-----|-------|
 | 1 | DDL during Forming replicates after Raft init | F3 | 378 | Firecracker |
-| 2 | Raft init waits for all peer pools | F5 | 280 | Firecracker |
-| 3 | Hub-and-spoke ClusterInvite propagation | F1 | 270 | Firecracker |
-| 4 | Forming falls back to Pair on timeout | F6 | 256 | Firecracker |
-| 5 | Forming state gates Raft initialization | F2 | 256 | Firecracker |
-| 6 | Decommission streams data before removal | F4 | 250 | Firecracker |
-| 7 | Quorum loss: stale reads flagged | F13 | 196 | Firecracker |
-| 8 | Schema sync arrives after handler registered | F20 | 196 | Unit (mock) |
-| 9 | Approval check inside Raft (TOCTOU) | F7 | 189 | Unit |
-| 10 | Crash during Raft init recovers cleanly | F10 | 189 | Firecracker |
-| 11 | Reverse pool retries on failure | F9 | 168 | Unit (mock) |
-| 12 | Hint overflow triggers repair flag | F19 | 168 | Firecracker |
-| 13 | Promoted secondary wins on old primary return | F12 | 162 | Firecracker |
-| 14 | New member receives ClusterInvite with full peer list | F15 | 160 | Firecracker |
-| 15 | Concurrent peer connections don't corrupt state | F11 | 144 | Unit |
+| 2 | Raft init waits for all peer pools | F5 | 192 | Firecracker |
+| 3 | Approval check inside Raft (TOCTOU) | F7 | 189 | Unit |
+| 4 | Crash during Raft init recovers cleanly | F10 | 189 | Firecracker |
+| 5 | Hint overflow triggers repair flag | F19 | 168 | Firecracker |
+| 6 | Promoted secondary wins on old primary return | F12 | 162 | Firecracker |
+| 7 | Decommission streams data before removal | F4 | 160 | Firecracker |
+| 8 | Concurrent peer connections don't corrupt state | F11 | 144 | Unit |
+| 9 | Schema replay errors fail hard, not warn | F14 | 144 | Unit (mock) |
+| 10 | Forming→Pair fallback on formation_timeout_secs | F26 | 140 | Firecracker |
+| 11 | Quorum loss: stale reads flagged to client | F13 | 140 | Firecracker |
+| 12 | Forming→Pair fallback on 3rd node disconnect | F6 | 128 | Firecracker |
+| 13 | Raft leader election within timeout window | F8 | 120 | Firecracker |
+| 14 | Hub-and-spoke ClusterInvite propagation | F1 | 108 | Firecracker |
+| 15 | Bootstrap Phase C waits for streaming completion, not fixed 5s delay | F27 | 96 | Firecracker |
+| 16 | Forming state gates Raft initialization | F2 | 96 | Firecracker |
+| 17 | PeerManager cleans broadcast map on disconnect | F28 | 90 | Unit |
+| 18 | LazyRaft handles slow init >10s without dropping messages | F29 | 90 | Unit (mock) |
+| 19 | Reverse pool retries on failure | F9 | 84 | Unit (mock) |

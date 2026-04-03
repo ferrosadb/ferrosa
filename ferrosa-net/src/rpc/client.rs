@@ -19,6 +19,8 @@ pub struct RpcClient {
     config: Arc<NetConfig>,
     peer_addr: std::net::SocketAddr,
     peer_host_id: uuid::Uuid,
+    /// CQL broadcast address the peer advertised during handshake.
+    peer_cql_broadcast: Option<String>,
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Message>>>>,
     tx: mpsc::Sender<Frame>,
     next_stream_id: Arc<AtomicU32>,
@@ -34,6 +36,11 @@ impl RpcClient {
     /// The peer's host_id, obtained during the handshake.
     pub fn peer_host_id(&self) -> uuid::Uuid {
         self.peer_host_id
+    }
+
+    /// The peer's CQL broadcast address, obtained during the handshake.
+    pub fn peer_cql_broadcast(&self) -> Option<&str> {
+        self.peer_cql_broadcast.as_deref()
     }
 
     /// Subscribe to the connection liveness channel.
@@ -88,7 +95,7 @@ impl RpcClient {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let peer_host_id = tokio::time::timeout(
+        let (peer_host_id, peer_cql_broadcast) = tokio::time::timeout(
             config.handshake_timeout,
             initiate_handshake(&mut framed, &config, local_host_id),
         )
@@ -133,6 +140,7 @@ impl RpcClient {
             config,
             peer_addr,
             peer_host_id,
+            peer_cql_broadcast,
             pending,
             tx,
             next_stream_id: Arc::new(AtomicU32::new(1)),

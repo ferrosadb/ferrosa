@@ -6,7 +6,7 @@ description = "WASM-sandboxed User-Defined Function execution for Ferrosa"
 
 [dependencies]
 ferrosa-common = { path = "../ferrosa-common" }
-wasmtime = { version = "29", features = ["component-model"] }
+wasmtime = { version = "36", features = ["component-model"] }
 slotmap = "1"
 num-bigint = "0.4"
 thiserror = "2"

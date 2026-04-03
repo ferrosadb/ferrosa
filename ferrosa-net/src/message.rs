@@ -68,6 +68,7 @@ pub enum Message {
         protocol_version: u8,
         supported_compression: Vec<u8>, // 0=none, 1=lz4, 2=snappy
         auth_token: Vec<u8>,
+        cql_broadcast: Option<String>,
     },
     HandshakeAck {
         host_id: Uuid,
@@ -75,6 +76,7 @@ pub enum Message {
         chosen_compression: u8, // selected from initiator's supported list
         accepted: bool,
         reason: String,
+        cql_broadcast: Option<String>,
     },
     Ping {
         nonce: u64,
@@ -235,6 +237,7 @@ impl Message {
                 protocol_version,
                 supported_compression,
                 auth_token,
+                cql_broadcast,
             } => {
                 put_string(buf, cluster_name)?;
                 put_uuid(buf, host_id);
@@ -244,6 +247,16 @@ impl Message {
                 buf.put_u8(comp_len);
                 buf.put_slice(supported_compression);
                 put_bytes(buf, auth_token)?;
+                // Optional CQL broadcast address (v1 extension — safe to add after auth_token)
+                match cql_broadcast {
+                    Some(addr) => {
+                        buf.put_u8(1);
+                        put_string(buf, addr)?;
+                    }
+                    None => {
+                        buf.put_u8(0);
+                    }
+                }
             }
             Self::HandshakeAck {
                 host_id,
@@ -251,12 +264,23 @@ impl Message {
                 chosen_compression,
                 accepted,
                 reason,
+                cql_broadcast,
             } => {
                 put_uuid(buf, host_id);
                 buf.put_u8(*protocol_version);
                 buf.put_u8(*chosen_compression);
                 buf.put_u8(if *accepted { 1 } else { 0 });
                 put_string(buf, reason)?;
+                // Optional CQL broadcast address (v1 extension)
+                match cql_broadcast {
+                    Some(addr) => {
+                        buf.put_u8(1);
+                        put_string(buf, addr)?;
+                    }
+                    None => {
+                        buf.put_u8(0);
+                    }
+                }
             }
             Self::Ping { nonce, sent_at } => {
                 buf.put_u64(*nonce);
@@ -362,12 +386,24 @@ impl Message {
                 }
                 let supported_compression = body.split_to(comp_len).to_vec();
                 let auth_token = get_bytes(body)?;
+                // Optional CQL broadcast address (v1 extension)
+                let cql_broadcast = if body.remaining() > 0 {
+                    let marker = body.get_u8();
+                    if marker == 1 {
+                        Some(get_string(body)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None // pre-extension peer — no broadcast field
+                };
                 Self::Handshake {
                     cluster_name,
                     host_id,
                     protocol_version,
                     supported_compression,
                     auth_token,
+                    cql_broadcast,
                 }
             }
             MsgType::HandshakeAck => {
@@ -379,12 +415,24 @@ impl Message {
                 let chosen_compression = body.get_u8();
                 let accepted = body.get_u8() != 0;
                 let reason = get_string(body)?;
+                // Optional CQL broadcast address (v1 extension)
+                let cql_broadcast = if body.remaining() > 0 {
+                    let marker = body.get_u8();
+                    if marker == 1 {
+                        Some(get_string(body)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None // pre-extension peer — no broadcast field
+                };
                 Self::HandshakeAck {
                     host_id,
                     protocol_version,
                     chosen_compression,
                     accepted,
                     reason,
+                    cql_broadcast,
                 }
             }
             MsgType::Ping => {
@@ -534,11 +582,74 @@ mod tests {
             protocol_version: 1,
             supported_compression: vec![0, 1], // none + lz4
             auth_token: vec![0xAB; 32],
+            cql_broadcast: Some("host:19042".into()),
         };
         let mut buf = BytesMut::new();
         msg.encode(&mut buf).unwrap();
         let decoded = Message::decode(MsgType::Handshake, &mut buf.freeze()).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn handshake_roundtrip_no_broadcast() {
+        let msg = Message::Handshake {
+            cluster_name: "ferrosa".to_string(),
+            host_id: Uuid::new_v4(),
+            protocol_version: 1,
+            supported_compression: vec![0],
+            auth_token: vec![],
+            cql_broadcast: None,
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::Handshake, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn handshake_ack_roundtrip_with_broadcast() {
+        let msg = Message::HandshakeAck {
+            host_id: Uuid::new_v4(),
+            protocol_version: 1,
+            chosen_compression: 0,
+            accepted: true,
+            reason: String::new(),
+            cql_broadcast: Some("192.168.1.5:19042".into()),
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        let decoded = Message::decode(MsgType::HandshakeAck, &mut buf.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn handshake_backward_compat_no_broadcast_field() {
+        // Simulate a pre-extension peer that sends a Handshake without the
+        // cql_broadcast trailing field. We manually encode the old format.
+        let host_id = Uuid::new_v4();
+        let mut buf = BytesMut::new();
+        put_string(&mut buf, "ferrosa").unwrap();
+        put_uuid(&mut buf, &host_id);
+        buf.put_u8(1); // protocol_version
+        buf.put_u8(1); // compression list length
+        buf.put_u8(0); // supported_compression[0] = none
+        put_bytes(&mut buf, &[]).unwrap(); // auth_token (empty)
+                                           // No trailing cql_broadcast marker
+
+        let decoded = Message::decode(MsgType::Handshake, &mut buf.freeze()).unwrap();
+        match decoded {
+            Message::Handshake {
+                cql_broadcast,
+                cluster_name,
+                host_id: decoded_id,
+                ..
+            } => {
+                assert_eq!(cluster_name, "ferrosa");
+                assert_eq!(decoded_id, host_id);
+                assert_eq!(cql_broadcast, None);
+            }
+            other => panic!("expected Handshake, got {other:?}"),
+        }
     }
 
     #[test]

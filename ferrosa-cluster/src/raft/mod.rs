@@ -86,6 +86,11 @@ pub struct NodeInfo {
     pub rack: String,
     /// Current lifecycle state.
     pub state: NodeState,
+    /// CQL broadcast address (host:port) for system.peers.
+    /// When set, overrides addr for native_address in system.peers.
+    /// Parsed from FERROSA_CQL_BROADCAST on each node.
+    #[serde(default)]
+    pub cql_broadcast: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +350,7 @@ mod tests {
             data_center: "dc1".to_string(),
             rack: "rack1".to_string(),
             state: NodeState::Joining,
+            cql_broadcast: None,
         };
         let cmd = wrap(RaftOp::JoinNode(node.clone()));
         let encoded = bincode::serialize(&cmd).expect("serialize");

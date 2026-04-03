@@ -2,9 +2,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use async_trait::async_trait;
+use std::future::Future;
+
 use russh::client;
-use russh::keys::key;
+use russh::keys::ssh_key;
 use russh::{ChannelMsg, Disconnect};
 use tracing::{debug, info};
 
@@ -22,16 +23,15 @@ pub struct CommandOutput {
 /// so strict host-key checking is unnecessary.
 struct ClientHandler;
 
-#[async_trait]
 impl client::Handler for ClientHandler {
     type Error = anyhow::Error;
 
-    async fn check_server_key(
+    fn check_server_key(
         &mut self,
-        _server_public_key: &key::PublicKey,
-    ) -> std::result::Result<bool, Self::Error> {
+        _server_public_key: &ssh_key::PublicKey,
+    ) -> impl Future<Output = std::result::Result<bool, Self::Error>> + Send {
         // Accept all keys — VMs are ephemeral and we built the rootfs.
-        Ok(true)
+        std::future::ready(Ok(true))
     }
 }
 
@@ -50,7 +50,7 @@ impl SshClient {
     pub async fn connect(host: &str, port: u16, user: &str, key_path: &Path) -> Result<Self> {
         info!(host = %host, port = port, user = %user, "SSH connecting");
 
-        let key_pair = russh_keys::load_secret_key(key_path, None)
+        let key_pair = russh::keys::load_secret_key(key_path, None)
             .with_context(|| format!("loading SSH key from {}", key_path.display()))?;
 
         let config = client::Config::default();
@@ -59,12 +59,15 @@ impl SshClient {
             .await
             .context("SSH TCP connect")?;
 
-        let auth_ok = handle
-            .authenticate_publickey(user, Arc::new(key_pair))
+        let auth_result = handle
+            .authenticate_publickey(
+                user,
+                russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), None),
+            )
             .await
             .context("SSH public-key authentication")?;
 
-        if !auth_ok {
+        if !auth_result.success() {
             bail!("SSH authentication rejected for user {user}");
         }
 

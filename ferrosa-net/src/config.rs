@@ -35,6 +35,9 @@ pub struct NetConfig {
     pub tls_ca_path: Option<String>,
     /// If true, reject startup when no TLS cert/key are configured.
     pub require_tls: bool,
+    /// CQL broadcast address advertised to peers during handshake.
+    /// Peers use this for `system.peers.native_address`.
+    pub cql_broadcast: Option<String>,
 }
 
 impl Default for NetConfig {
@@ -55,6 +58,7 @@ impl Default for NetConfig {
             tls_key_path: None,
             tls_ca_path: None,
             require_tls: false,
+            cql_broadcast: None,
         }
     }
 }
@@ -124,6 +128,9 @@ impl NetConfig {
         }
         if let Ok(v) = std::env::var("FERROSA_INTERNODE_REQUIRE_TLS") {
             cfg.require_tls = v == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("FERROSA_CQL_BROADCAST") {
+            cfg.cql_broadcast = Some(v);
         }
 
         cfg

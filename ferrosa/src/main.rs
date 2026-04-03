@@ -501,19 +501,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CQL drivers use this to create connection pools, so it must be a
     // reachable address (not 0.0.0.0).
     let cql_broadcast_addr = match std::env::var("FERROSA_CQL_BROADCAST") {
-        Ok(addr_str) => addr_str.parse::<std::net::IpAddr>().unwrap_or_else(|_| {
-            // Try parsing as SocketAddr (ip:port) and extract IP.
-            addr_str
-                .parse::<std::net::SocketAddr>()
-                .map(|sa| sa.ip())
-                .unwrap_or_else(|_| {
-                    tracing::warn!(
-                        "FERROSA_CQL_BROADCAST={addr_str} is not a valid address, \
-                             falling back to 127.0.0.1"
-                    );
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                })
-        }),
+        Ok(addr_str) => addr_str
+            .parse::<std::net::IpAddr>()
+            .or_else(|_| {
+                // Try parsing as SocketAddr (ip:port) and extract IP.
+                addr_str.parse::<std::net::SocketAddr>().map(|sa| sa.ip())
+            })
+            .or_else(|_: std::net::AddrParseError| {
+                // Try DNS resolution for hostnames like "host.containers.internal:19043".
+                // Strip the port if present, resolve the hostname, use the first result.
+                let host = addr_str
+                    .rsplit_once(':')
+                    .map_or(addr_str.as_str(), |(h, _)| h);
+                use std::net::ToSocketAddrs;
+                format!("{host}:0")
+                    .to_socket_addrs()
+                    .map_err(|_| "dns failed".parse::<std::net::IpAddr>().unwrap_err())
+                    .and_then(|mut addrs| {
+                        addrs
+                            .next()
+                            .map(|sa| sa.ip())
+                            .ok_or_else(|| "no addrs".parse::<std::net::IpAddr>().unwrap_err())
+                    })
+            })
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    "FERROSA_CQL_BROADCAST={addr_str} could not be resolved, \
+                         falling back to 127.0.0.1"
+                );
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            }),
         Err(_) => {
             if cql_bind.ip().is_unspecified() {
                 // 0.0.0.0 → substitute 127.0.0.1 as safe local default.

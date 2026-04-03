@@ -62,6 +62,7 @@ impl ModeController {
             data_center: self.config.data_center.clone(),
             rack: self.config.rack.clone(),
             state: NodeState::Normal,
+            cql_broadcast: None,
         };
 
         let join_cmd = RaftCommand {
@@ -281,6 +282,7 @@ impl ModeController {
                 data_center: config_clone.data_center.clone(),
                 rack: config_clone.rack.clone(),
                 state: NodeState::Normal,
+                cql_broadcast: None,
             };
 
             let join_cmd = RaftCommand {
