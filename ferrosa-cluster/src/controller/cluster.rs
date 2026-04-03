@@ -325,6 +325,7 @@ impl ModeController {
         let ring_for_bootstrap = self.ring.clone();
         let all_node_ids_for_bootstrap = all_node_ids.clone();
         let cluster_name = self.config.cluster_name.clone();
+        let config_for_promotion = self.config.clone();
         let schema_for_replay = self.schema.clone();
 
         // Register Raft RPC handlers BEFORE spawning the init task.
@@ -712,9 +713,21 @@ impl ModeController {
                     //
                     // Wait for non-leader streaming to settle, then promote all
                     // Joining nodes to Normal via Raft.
-                    // TODO: Replace fixed delay with proper BootstrapComplete RPC barrier.
+                    //
+                    // TODO(S4): Replace delay with BootstrapComplete RPC — each node
+                    // sends a message when streaming finishes; leader waits for all.
+                    // For now, use a configurable delay (default 10s) that's long enough
+                    // for typical bootstrap but not a hard guarantee.
                     if lid == local_node_id {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let promotion_delay = config_for_promotion
+                            .formation_timeout_secs
+                            .map(|s| s / 6)
+                            .unwrap_or(10);
+                        tracing::info!(
+                            delay_secs = promotion_delay,
+                            "waiting for bootstrap streaming to settle before promotion"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(promotion_delay)).await;
                         for &nid in &all_node_ids_for_bootstrap {
                             if nid != local_node_id {
                                 let cmd = crate::raft::RaftCommand {
