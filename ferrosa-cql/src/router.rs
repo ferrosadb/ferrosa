@@ -31,11 +31,11 @@ use ferrosa_schema::{
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
 use ferrosa_udf::UdfExecutor;
-use tracing::Instrument;
 
 use crate::ast::*;
 use crate::bridge;
 use crate::error::CqlError;
+use crate::observability::{CqlMetrics, CqlOpcode};
 use crate::planner::{self, ScanPlan};
 use crate::prepared::PreparedCache;
 use crate::result;
@@ -45,145 +45,6 @@ use crate::virtual_tables::connections::ConnectionTracker;
 
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
 const MAX_BATCH_STATEMENTS: usize = 500;
-
-/// Slow query threshold in milliseconds. Parsed once at module load from
-/// `FERROSA_SLOW_QUERY_THRESHOLD_MS` (default 1000).
-fn slow_query_threshold_ms() -> u64 {
-    use std::sync::OnceLock;
-    static THRESHOLD: OnceLock<u64> = OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        std::env::var("FERROSA_SLOW_QUERY_THRESHOLD_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1000)
-    })
-}
-
-/// A record of a slow query for observability.
-#[derive(Debug, Clone)]
-pub struct SlowQueryRecord {
-    /// Parameterized query text (literals replaced with `?`).
-    pub query: String,
-    /// Keyspace in which the query executed.
-    pub keyspace: String,
-    /// Duration of the query in milliseconds.
-    pub duration_ms: u64,
-    /// Wall-clock timestamp when the query completed (ms since epoch).
-    pub timestamp_ms: i64,
-}
-
-/// Replace string literals, number literals, UUID literals, and blob
-/// literals with `?` for parameterized logging. This is a best-effort
-/// regex-free implementation suitable for v1 observability.
-pub fn parameterize_query(query: &str) -> String {
-    let mut result = String::with_capacity(query.len());
-    let bytes = query.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        match bytes[i] {
-            // String literal: '...' (handle escaped '' inside)
-            b'\'' => {
-                result.push('?');
-                i += 1;
-                while i < len {
-                    if bytes[i] == b'\'' {
-                        i += 1;
-                        // Escaped '' — continue inside the string
-                        if i < len && bytes[i] == b'\'' {
-                            i += 1;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            // Blob literal: 0x...
-            b'0' if i + 1 < len && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') => {
-                // Check if preceded by a word char (then it's part of an identifier)
-                if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
-                    result.push(bytes[i] as char);
-                    i += 1;
-                    continue;
-                }
-                result.push('?');
-                i += 2; // skip "0x"
-                while i < len && bytes[i].is_ascii_hexdigit() {
-                    i += 1;
-                }
-            }
-            // Hex digit or digit — could be UUID, number, or identifier fragment.
-            b if b.is_ascii_hexdigit() => {
-                // Check if preceded by a letter or underscore (part of identifier).
-                if i > 0 && (bytes[i - 1].is_ascii_alphabetic() || bytes[i - 1] == b'_') {
-                    result.push(bytes[i] as char);
-                    i += 1;
-                    continue;
-                }
-
-                // Try to match UUID pattern: 8-4-4-4-12 hex with dashes.
-                if let Some(uuid_end) = try_match_uuid(bytes, i) {
-                    result.push('?');
-                    i = uuid_end;
-                    continue;
-                }
-
-                // Number literal (must start with a digit, not a-f).
-                if b.is_ascii_digit() {
-                    result.push('?');
-                    while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
-                        i += 1;
-                    }
-                } else {
-                    // Bare hex letter (a-f) not part of a UUID — output as-is.
-                    result.push(bytes[i] as char);
-                    i += 1;
-                }
-            }
-            _ => {
-                result.push(bytes[i] as char);
-                i += 1;
-            }
-        }
-    }
-
-    result
-}
-
-/// Try to match a UUID pattern starting at `start` in `bytes`.
-/// Returns `Some(end)` if a 36-character UUID (8-4-4-4-12) is found,
-/// `None` otherwise.
-fn try_match_uuid(bytes: &[u8], start: usize) -> Option<usize> {
-    let len = bytes.len();
-    if start + 36 > len {
-        return None;
-    }
-
-    // UUID structure: 8 hex, '-', 4 hex, '-', 4 hex, '-', 4 hex, '-', 12 hex
-    let expected_dashes = [8, 13, 18, 23];
-    let j = start;
-
-    for pos in 0..36 {
-        let ch = bytes[j + pos];
-        if expected_dashes.contains(&pos) {
-            if ch != b'-' {
-                return None;
-            }
-        } else if !ch.is_ascii_hexdigit() {
-            return None;
-        }
-    }
-
-    // Ensure the UUID is not followed by a word character (would be an identifier).
-    if start + 36 < len && (bytes[start + 36].is_ascii_alphanumeric() || bytes[start + 36] == b'_')
-    {
-        return None;
-    }
-
-    Some(start + 36)
-}
 
 /// UUID epoch offset: 100-nanosecond intervals between 1582-10-15 and 1970-01-01.
 const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
@@ -292,6 +153,8 @@ pub struct SharedState {
     pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
     /// Mode controller for checking CQL readiness (pair mode gating).
     pub mode_controller: Arc<ferrosa_cluster::ModeController>,
+    /// CQL request metrics (per-opcode counters and error counter).
+    pub cql_metrics: Arc<CqlMetrics>,
 }
 
 /// Per-request context: authentication, current keyspace, and consistency level.
@@ -334,22 +197,6 @@ pub async fn route(
     ctx: &RequestContext<'_>,
     stmt: Statement,
 ) -> Result<RouteResult, CqlError> {
-    let route_span = tracing::info_span!(
-        "cql.route",
-        cql.consistency_level = %ctx.consistency,
-    );
-
-    route_inner(state, ctx, stmt).instrument(route_span).await
-}
-
-/// Inner dispatch, instrumented with `cql.route` span by the caller.
-async fn route_inner(
-    state: &SharedState,
-    ctx: &RequestContext<'_>,
-    stmt: Statement,
-) -> Result<RouteResult, CqlError> {
-    let start = std::time::Instant::now();
-
     // Track the query for observability; the guard calls complete() on drop.
     let query_desc: String = format!("{:?}", &stmt).chars().take(200).collect();
     let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
@@ -360,208 +207,213 @@ async fn route_inner(
         &ctx.auth.role,
     );
 
-    let execute_span =
-        tracing::info_span!("cql.execute", cql.rows_returned = tracing::field::Empty,);
+    // Classify the statement opcode for metrics before matching.
+    let opcode = match &stmt {
+        Statement::Select(_) => CqlOpcode::Select,
+        Statement::Insert(_) => CqlOpcode::Insert,
+        Statement::Update(_) => CqlOpcode::Update,
+        Statement::Delete(_) => CqlOpcode::Delete,
+        Statement::Batch(_) => CqlOpcode::Batch,
+        Statement::CreateKeyspace(_)
+        | Statement::AlterKeyspace(_)
+        | Statement::DropKeyspace(_)
+        | Statement::CreateTable(_)
+        | Statement::AlterTable(_)
+        | Statement::DropTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_)
+        | Statement::CreateRole(_)
+        | Statement::AlterRole(_)
+        | Statement::DropRole(_)
+        | Statement::CreateType { .. }
+        | Statement::AlterType { .. }
+        | Statement::DropType { .. }
+        | Statement::CreateFunction { .. }
+        | Statement::DropFunction { .. }
+        | Statement::CreateAggregate { .. }
+        | Statement::DropAggregate { .. }
+        | Statement::Truncate(_) => CqlOpcode::Ddl,
+        _ => CqlOpcode::Other,
+    };
 
-    let result = async {
-        match stmt {
-            Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
-            Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
-            Statement::Update(u) => route_update(state, ctx, u).await.map(RouteResult::Result),
-            Statement::Delete(d) => route_delete(state, ctx, d).await.map(RouteResult::Result),
-            Statement::Batch(b) => route_batch(state, ctx, b).await.map(RouteResult::Result),
-            Statement::CreateKeyspace(ck) => route_create_keyspace(state, ctx, ck)
-                .await
-                .map(RouteResult::Result),
-            Statement::CreateTable(ct) => route_create_table(state, ctx, ct)
-                .await
-                .map(RouteResult::Result),
-            Statement::AlterTable(at) => route_alter_table(state, ctx, at)
-                .await
-                .map(RouteResult::Result),
-            Statement::DropTable(dt) => route_drop_table(state, ctx, dt)
-                .await
-                .map(RouteResult::Result),
-            Statement::AlterKeyspace(ak) => route_alter_keyspace(state, ctx, ak)
-                .await
-                .map(RouteResult::Result),
-            Statement::DropKeyspace(dk) => route_drop_keyspace(state, ctx, dk)
-                .await
-                .map(RouteResult::Result),
-            Statement::CreateRole(cr) => route_create_role(state, ctx, cr)
-                .await
-                .map(RouteResult::Result),
-            Statement::AlterRole(ar) => route_alter_role(state, ctx, ar)
-                .await
-                .map(RouteResult::Result),
-            Statement::DropRole(dr) => route_drop_role(state, ctx, dr)
-                .await
-                .map(RouteResult::Result),
-            Statement::Grant(g) => route_grant(state, ctx, g).await.map(RouteResult::Result),
-            Statement::Revoke(r) => route_revoke(state, ctx, r).await.map(RouteResult::Result),
-            Statement::Use(u) => {
-                let body = result::encode_set_keyspace(&u.keyspace);
-                Ok(RouteResult::SetKeyspace(u.keyspace, body))
+    let result = match stmt {
+        Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
+        Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
+        Statement::Update(u) => route_update(state, ctx, u).await.map(RouteResult::Result),
+        Statement::Delete(d) => route_delete(state, ctx, d).await.map(RouteResult::Result),
+        Statement::Batch(b) => route_batch(state, ctx, b).await.map(RouteResult::Result),
+        Statement::CreateKeyspace(ck) => route_create_keyspace(state, ctx, ck)
+            .await
+            .map(RouteResult::Result),
+        Statement::CreateTable(ct) => route_create_table(state, ctx, ct)
+            .await
+            .map(RouteResult::Result),
+        Statement::AlterTable(at) => route_alter_table(state, ctx, at)
+            .await
+            .map(RouteResult::Result),
+        Statement::DropTable(dt) => route_drop_table(state, ctx, dt)
+            .await
+            .map(RouteResult::Result),
+        Statement::AlterKeyspace(ak) => route_alter_keyspace(state, ctx, ak)
+            .await
+            .map(RouteResult::Result),
+        Statement::DropKeyspace(dk) => route_drop_keyspace(state, ctx, dk)
+            .await
+            .map(RouteResult::Result),
+        Statement::CreateRole(cr) => route_create_role(state, ctx, cr)
+            .await
+            .map(RouteResult::Result),
+        Statement::AlterRole(ar) => route_alter_role(state, ctx, ar)
+            .await
+            .map(RouteResult::Result),
+        Statement::DropRole(dr) => route_drop_role(state, ctx, dr)
+            .await
+            .map(RouteResult::Result),
+        Statement::Grant(g) => route_grant(state, ctx, g).await.map(RouteResult::Result),
+        Statement::Revoke(r) => route_revoke(state, ctx, r).await.map(RouteResult::Result),
+        Statement::Use(u) => {
+            let body = result::encode_set_keyspace(&u.keyspace);
+            Ok(RouteResult::SetKeyspace(u.keyspace, body))
+        }
+        Statement::Truncate(t) => route_truncate(state, ctx, t).map(RouteResult::Result),
+        Statement::CreateIndex(ci) => route_create_index(state, ctx, ci)
+            .await
+            .map(RouteResult::Result),
+        Statement::DropIndex(di) => route_drop_index(state, ctx, di)
+            .await
+            .map(RouteResult::Result),
+        Statement::Subscribe {
+            inner,
+            interval,
+            delta,
+        } => {
+            // Validate: inner must be a Select
+            match inner.as_ref() {
+                Statement::Select(s) => {
+                    let ks = s
+                        .keyspace
+                        .as_deref()
+                        .or(ctx.current_keyspace.as_deref())
+                        .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
+                    state.schema.check_permission(
+                        ctx.auth,
+                        Permission::Select,
+                        &Resource::Table(ks.to_string(), s.table.clone()),
+                    )?;
+                }
+                _ => {
+                    return Err(CqlError::Invalid(
+                        "SUBSCRIBE requires a SELECT statement".into(),
+                    ))
+                }
             }
-            Statement::Truncate(t) => route_truncate(state, ctx, t).map(RouteResult::Result),
-            Statement::CreateIndex(ci) => route_create_index(state, ctx, ci)
-                .await
-                .map(RouteResult::Result),
-            Statement::DropIndex(di) => route_drop_index(state, ctx, di)
-                .await
-                .map(RouteResult::Result),
-            Statement::Subscribe {
+            Ok(RouteResult::Subscribe {
                 inner,
                 interval,
                 delta,
-            } => {
-                // Validate: inner must be a Select
-                match inner.as_ref() {
-                    Statement::Select(s) => {
-                        let ks = s
-                            .keyspace
-                            .as_deref()
-                            .or(ctx.current_keyspace.as_deref())
-                            .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
-                        state.schema.check_permission(
-                            ctx.auth,
-                            Permission::Select,
-                            &Resource::Table(ks.to_string(), s.table.clone()),
-                        )?;
-                    }
-                    _ => {
-                        return Err(CqlError::Invalid(
-                            "SUBSCRIBE requires a SELECT statement".into(),
-                        ))
-                    }
-                }
-                Ok(RouteResult::Subscribe {
-                    inner,
-                    interval,
-                    delta,
-                })
-            }
-            Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
-            Statement::CreateType {
-                keyspace,
-                name,
-                if_not_exists,
-                fields,
-            } => route_create_type(state, ctx, keyspace, name, if_not_exists, fields)
-                .await
-                .map(RouteResult::Result),
-            Statement::AlterType {
-                keyspace,
-                name,
-                alterations,
-            } => route_alter_type(state, ctx, keyspace, name, alterations)
-                .await
-                .map(RouteResult::Result),
-            Statement::DropType {
-                keyspace,
-                name,
-                if_exists,
-            } => route_drop_type(state, ctx, keyspace, name, if_exists)
-                .await
-                .map(RouteResult::Result),
-            Statement::CreateFunction {
-                keyspace,
-                name,
-                or_replace,
-                if_not_exists,
-                params,
-                called_on_null,
-                return_type,
-                language,
-                body,
-            } => route_create_function(
-                state,
-                ctx,
-                keyspace,
-                name,
-                or_replace,
-                if_not_exists,
-                params,
-                called_on_null,
-                return_type,
-                language,
-                body,
-            )
-            .await
-            .map(RouteResult::Result),
-            Statement::DropFunction {
-                keyspace,
-                name,
-                arg_types,
-                if_exists,
-            } => route_drop_function(state, ctx, keyspace, name, arg_types, if_exists)
-                .await
-                .map(RouteResult::Result),
-            Statement::CreateAggregate {
-                keyspace,
-                name,
-                or_replace,
-                if_not_exists,
-                arg_types,
-                state_func,
-                state_type,
-                final_func,
-                init_cond,
-            } => route_create_aggregate(
-                state,
-                ctx,
-                keyspace,
-                name,
-                or_replace,
-                if_not_exists,
-                arg_types,
-                state_func,
-                state_type,
-                final_func,
-                init_cond,
-            )
-            .await
-            .map(RouteResult::Result),
-            Statement::DropAggregate {
-                keyspace,
-                name,
-                arg_types,
-                if_exists,
-            } => route_drop_aggregate(state, ctx, keyspace, name, arg_types, if_exists)
-                .await
-                .map(RouteResult::Result),
-            Statement::Explain(s) => route_explain(state, ctx, *s).map(RouteResult::Result),
-            // Accord transaction control statements are handled at the session/connection
-            // level, not in the router. If they reach here, return a void result.
-            Statement::BeginTransaction | Statement::Commit | Statement::Rollback => {
-                Ok(RouteResult::Result(crate::result::encode_void()))
-            }
+            })
         }
-    }
-    .instrument(execute_span)
-    .await;
+        Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
+        Statement::CreateType {
+            keyspace,
+            name,
+            if_not_exists,
+            fields,
+        } => route_create_type(state, ctx, keyspace, name, if_not_exists, fields)
+            .await
+            .map(RouteResult::Result),
+        Statement::AlterType {
+            keyspace,
+            name,
+            alterations,
+        } => route_alter_type(state, ctx, keyspace, name, alterations)
+            .await
+            .map(RouteResult::Result),
+        Statement::DropType {
+            keyspace,
+            name,
+            if_exists,
+        } => route_drop_type(state, ctx, keyspace, name, if_exists)
+            .await
+            .map(RouteResult::Result),
+        Statement::CreateFunction {
+            keyspace,
+            name,
+            or_replace,
+            if_not_exists,
+            params,
+            called_on_null,
+            return_type,
+            language,
+            body,
+        } => route_create_function(
+            state,
+            ctx,
+            keyspace,
+            name,
+            or_replace,
+            if_not_exists,
+            params,
+            called_on_null,
+            return_type,
+            language,
+            body,
+        )
+        .await
+        .map(RouteResult::Result),
+        Statement::DropFunction {
+            keyspace,
+            name,
+            arg_types,
+            if_exists,
+        } => route_drop_function(state, ctx, keyspace, name, arg_types, if_exists)
+            .await
+            .map(RouteResult::Result),
+        Statement::CreateAggregate {
+            keyspace,
+            name,
+            or_replace,
+            if_not_exists,
+            arg_types,
+            state_func,
+            state_type,
+            final_func,
+            init_cond,
+        } => route_create_aggregate(
+            state,
+            ctx,
+            keyspace,
+            name,
+            or_replace,
+            if_not_exists,
+            arg_types,
+            state_func,
+            state_type,
+            final_func,
+            init_cond,
+        )
+        .await
+        .map(RouteResult::Result),
+        Statement::DropAggregate {
+            keyspace,
+            name,
+            arg_types,
+            if_exists,
+        } => route_drop_aggregate(state, ctx, keyspace, name, arg_types, if_exists)
+            .await
+            .map(RouteResult::Result),
+        Statement::Explain(s) => route_explain(state, ctx, *s).map(RouteResult::Result),
+        // Accord transaction control statements are handled at the session/connection
+        // level, not in the router. If they reach here, return a void result.
+        Statement::BeginTransaction | Statement::Commit | Statement::Rollback => {
+            Ok(RouteResult::Result(crate::result::encode_void()))
+        }
+    };
 
-    // Slow query detection: log and record if execution exceeded the threshold.
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-    let threshold = slow_query_threshold_ms();
-    if elapsed_ms >= threshold {
-        let ks = ctx.current_keyspace.as_deref().unwrap_or("<none>");
-        tracing::warn!(
-            duration_ms = elapsed_ms,
-            keyspace = ks,
-            "slow query detected"
-        );
-        let _record = SlowQueryRecord {
-            query: parameterize_query(&query_desc),
-            keyspace: ks.to_string(),
-            duration_ms: elapsed_ms,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64,
-        };
-        // Future: write _record to system_observability.slow_queries via
-        // StorageEngine::write_observability() when that API is available.
+    // Track CQL metrics: increment per-opcode counter, and error counter on failure.
+    state.cql_metrics.inc_request(opcode);
+    if result.is_err() {
+        state.cql_metrics.inc_error();
     }
 
     result
@@ -2990,7 +2842,7 @@ async fn route_create_keyspace(
             let op = DdlOperation::CreateKeyspace(ks_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3054,7 +2906,7 @@ async fn route_alter_keyspace(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3115,7 +2967,7 @@ async fn route_drop_keyspace(
             let op = DdlOperation::DropKeyspace(s.name.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3255,7 +3107,7 @@ async fn route_create_table(
             // Auto-create cascade tables after primary table is created.
             create_cascade_tables_if_needed(state, &table_meta)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3495,7 +3347,7 @@ async fn route_alter_table(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3560,7 +3412,7 @@ async fn route_drop_table(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3642,7 +3494,7 @@ async fn route_create_index(
             let op = DdlOperation::CreateIndex(index_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3756,7 +3608,7 @@ async fn route_drop_index(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3807,7 +3659,7 @@ async fn route_create_role(
             let op = DdlOperation::CreateRole(role);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3854,7 +3706,7 @@ async fn route_alter_role(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3888,7 +3740,7 @@ async fn route_drop_role(
             let op = DdlOperation::DropRole(s.name.clone());
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3937,7 +3789,7 @@ async fn route_grant(
             });
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -3991,7 +3843,7 @@ async fn route_revoke(
                 ddl.execute(op).await.map_err(CqlError::from)?;
             }
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -5226,7 +5078,7 @@ async fn route_create_type(
             let op = DdlOperation::CreateType(udt);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -5337,7 +5189,7 @@ async fn route_drop_type(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -5479,7 +5331,7 @@ async fn route_create_function(
             let op = DdlOperation::CreateFunction(func_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -5609,7 +5461,7 @@ async fn route_drop_function(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -5753,7 +5605,7 @@ async fn route_create_aggregate(
             let op = DdlOperation::CreateAggregate(agg_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -5881,7 +5733,7 @@ async fn route_drop_aggregate(
             };
             ddl.execute(op).await.map_err(CqlError::from)?;
         }
-        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+        DdlPath::Unavailable | DdlPath::Blocked => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
@@ -6368,6 +6220,7 @@ mod tests {
             udf_executor,
             event_sender: tokio::sync::broadcast::channel(64).0,
             mode_controller,
+            cql_metrics: Arc::new(CqlMetrics::new()),
         };
         (state, dir)
     }
@@ -10774,86 +10627,5 @@ mod tests {
             "REVOKE EXECUTE ON ALL FUNCTIONS should succeed, got: {:?}",
             result.err()
         );
-    }
-
-    // ── Tracing instrumentation tests ───────────────────────────────────
-
-    /// Verify that route() succeeds when tracing spans are active.
-    /// This exercises the cql.route and cql.execute span creation paths
-    /// to ensure they don't panic or interfere with query execution.
-    #[tokio::test]
-    async fn route_creates_tracing_spans() {
-        let (state, _dir) = setup();
-        let ctx = RequestContext {
-            auth: &dev_auth(),
-            current_keyspace: &Some("system".into()),
-            consistency: ConsistencyLevel::One,
-            serial_consistency: None,
-            paging: crate::paging::PagingParams::default(),
-            client_address: "127.0.0.1:9999".into(),
-        };
-        // SELECT from a system table exercises the full span path.
-        let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
-        let result = route(&state, &ctx, stmt).await;
-        assert!(
-            result.is_ok(),
-            "route with tracing spans should succeed, got: {:?}",
-            result.err()
-        );
-    }
-
-    // ── Slow query / parameterize_query tests ───────────────────────────
-
-    #[test]
-    fn parameterize_query_replaces_string_literals() {
-        let q = "SELECT * FROM ks.t WHERE name = 'hello world'";
-        assert_eq!(parameterize_query(q), "SELECT * FROM ks.t WHERE name = ?");
-    }
-
-    #[test]
-    fn parameterize_query_replaces_number_literals() {
-        let q = "SELECT * FROM ks.t WHERE id = 42 AND age > 18.5";
-        assert_eq!(
-            parameterize_query(q),
-            "SELECT * FROM ks.t WHERE id = ? AND age > ?"
-        );
-    }
-
-    #[test]
-    fn parameterize_query_replaces_uuid_literals() {
-        let q = "SELECT * FROM ks.t WHERE id = 550e8400-e29b-41d4-a716-446655440000";
-        assert_eq!(parameterize_query(q), "SELECT * FROM ks.t WHERE id = ?");
-    }
-
-    #[test]
-    fn parameterize_query_replaces_blob_literals() {
-        let q = "INSERT INTO ks.t (data) VALUES (0xDEADBEEF)";
-        assert_eq!(parameterize_query(q), "INSERT INTO ks.t (data) VALUES (?)");
-    }
-
-    #[test]
-    fn parameterize_query_preserves_identifiers() {
-        let q = "SELECT col1 FROM table1 WHERE pk = 'val'";
-        let result = parameterize_query(q);
-        assert!(result.contains("col1"), "identifiers must be preserved");
-        assert!(result.contains("table1"), "identifiers must be preserved");
-    }
-
-    #[test]
-    fn parameterize_query_handles_escaped_quotes() {
-        let q = "INSERT INTO ks.t (v) VALUES ('it''s fine')";
-        assert_eq!(parameterize_query(q), "INSERT INTO ks.t (v) VALUES (?)");
-    }
-
-    #[test]
-    fn slow_query_record_fields() {
-        let record = SlowQueryRecord {
-            query: "SELECT * FROM ks.t WHERE id = ?".into(),
-            keyspace: "ks".into(),
-            duration_ms: 2000,
-            timestamp_ms: 1700000000000,
-        };
-        assert_eq!(record.duration_ms, 2000);
-        assert_eq!(record.keyspace, "ks");
     }
 }
