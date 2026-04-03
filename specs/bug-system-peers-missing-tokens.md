@@ -1,7 +1,9 @@
 # BUG: `FERROSA_CQL_BROADCAST` not propagated to `system.peers` on other nodes
 
+**Status:** RESOLVED — `ce72f32` (handshake exchange) + `efea71c` (wired into system.peers via PeerManager)
+
 **Severity:** P1 — blocks token-aware CQL drivers from connecting to multi-node clusters behind port-mapped containers
-**Branch:** `fix/standalone-progressive-join` (commits up to `c3e269b`)
+**Branch:** `fix/standalone-progressive-join`
 **Found:** 2026-04-02
 **Reporter:** ferrosa-memory-mcp (cdrs-tokio client)
 

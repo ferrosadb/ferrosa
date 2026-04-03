@@ -480,7 +480,7 @@ jepsen         ██████   █████░  ████░░   █
 | ~~SSTable expiring cell (TTL) serialization~~ | — | Done (P0 data corruption fix) |
 | ~~SSTable reader fuzz testing~~ | — | Done (proptest, 9 fuzz tests) |
 | ~~Cassandra Murmur3Partitioner compat~~ | — | Done |
-| Cluster formation hardening | fix/standalone-progressive-join | Active — LazyRaft handler registration (7b057b0), ClusterInvite Data lane + 10-attempt retry (808b72b, 30768c0), ClusterInvite triggers cluster transition on receivers (ba7599a), FERROSA_CLUSTER_MODE removed (83943a5) |
+| Cluster formation hardening | fix/standalone-progressive-join | Active — LazyRaft (7b057b0), ClusterInvite Data lane + retry (808b72b, 30768c0), ClusterInvite triggers transition (ba7599a), FERROSA_CLUSTER_MODE removed (83943a5), all-nodes bootstrap (ae5ba57), IpSlotGuard + keepalive (5063ca6), system.peers tokens (d7a951e), FERROSA_CQL_BROADCAST handshake exchange (ce72f32, efea71c) |
 | Temporal v1.31.0 on ferrosa | ferrosa-temporal | Running (shard acquisition WIP) |
 | Beta release v1.0.0-beta.4 | — | Sprints complete |
 | NetworkTopologyStrategy (multi-DC) | — | Planned |
