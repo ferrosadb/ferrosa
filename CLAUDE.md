@@ -119,4 +119,6 @@ These rules apply to every agent working in this repository. They cannot be over
 
 ## Current Sprint Focus
 
-See [specs/project-plan-correctness-sprints.md](specs/project-plan-correctness-sprints.md) for the active sprint plan: 6 sprints focused on single-DC Jepsen correctness, S3/SSTable Cassandra format validation, and Accord transaction correctness under all failure modes. Start here before taking on new work.
+See [specs/project-plan-next-sprints.md](specs/project-plan-next-sprints.md) for the active sprint plan: 4 sprints covering P0/P1 hazard fixes, NTS read path, correctness gaps (read fallback, hints, streaming), formation robustness, anti-entropy repair, and Jepsen/driver validation. Start here before taking on new work.
+
+Previous: [specs/project-plan-correctness-sprints.md](specs/project-plan-correctness-sprints.md) (C1-C7 complete, C4/C8 remaining — folded into S4).
