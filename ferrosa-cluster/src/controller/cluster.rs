@@ -39,13 +39,10 @@ impl ModeController {
     /// for mesh formation. Does NOT initialize Raft — that happens in
     /// `transition_to_cluster` after all peers are connected.
     pub(super) fn transition_to_forming(&self, peers: Vec<(Uuid, SocketAddr)>) {
-        let peer_manager = match &**self.peer_manager.load() {
-            Some(pm) => pm.clone(),
-            None => {
-                tracing::error!("cannot transition to forming: peer_manager not set");
-                return;
-            }
-        };
+        if self.peer_manager.load().is_none() {
+            tracing::error!("cannot transition to forming: peer_manager not set");
+            return;
+        }
 
         self.mode.store(Arc::new(DeploymentMode::Forming));
         // Block DDL during formation — prevents schema divergence (FMEA F3, RPN 378).
@@ -62,27 +59,8 @@ impl ModeController {
             "mode transition: pair -> forming (broadcasting ClusterInvite)"
         );
 
-        // Broadcast ClusterInvite to all connected peers so they discover each other.
-        let local_id = self.local_host_id;
-        let listen_addr = self.net_config.broadcast_addr;
-        let peers_for_invite = peers.clone();
-        let pm_clone = peer_manager.clone();
-        self.spawn_tracked(async move {
-            let invite = Message::ClusterInvite {
-                initiator: local_id,
-                peers: peers_for_invite
-                    .iter()
-                    .map(|(id, addr)| (*id, *addr))
-                    .chain(std::iter::once((local_id, listen_addr)))
-                    .collect(),
-            };
-
-            for (peer_id, _) in &peers_for_invite {
-                if let Err(e) = pm_clone.fire(*peer_id, invite.clone(), Lane::Raft).await {
-                    tracing::warn!(peer = %peer_id, %e, "failed to send ClusterInvite");
-                }
-            }
-        });
+        // ClusterInvite delivery moved into the Raft init task (transition_to_cluster)
+        // to ensure invites arrive before elections start.
 
         // Record when we entered Forming — the timeout check happens in the
         // Raft init background task (transition_to_cluster) and also in
@@ -331,15 +309,90 @@ impl ModeController {
         let ddl_path = self.ddl_path.clone();
         let mode_swap = self.mode.clone();
         let registry = self.registry.clone();
-        let storage_for_handler = self.storage.clone();
         let storage_for_bootstrap = self.storage.clone();
         let schema_for_bootstrap = self.schema.clone();
         let ring_for_bootstrap = self.ring.clone();
         let all_node_ids_for_bootstrap = all_node_ids.clone();
-        let repair_metrics = repair_metrics_for_handler;
         let cluster_name = self.config.cluster_name.clone();
         let schema_for_replay = self.schema.clone();
+
+        // Register Raft RPC handlers BEFORE spawning the init task.
+        // Handlers use LazyRaft to wait for the instance to be ready.
+        // This eliminates the race where vote requests arrive before
+        // handlers are registered.
+        use crate::raft::handlers::LazyRaft;
+        let (raft_tx, lazy_raft) = LazyRaft::channel();
+
+        let append_handler = Arc::new(RaftAppendHandler::new(lazy_raft.clone()));
+        self.registry
+            .register(MsgType::RaftAppendEntries, append_handler);
+
+        let vote_handler = Arc::new(RaftVoteHandler::new(lazy_raft.clone()));
+        self.registry.register(MsgType::RaftVote, vote_handler);
+
+        let snapshot_handler = Arc::new(RaftSnapshotHandler::new(lazy_raft));
+        self.registry
+            .register(MsgType::RaftInstallSnapshot, snapshot_handler);
+
+        let repair_handler = Arc::new(RepairWriteHandler::new(
+            self.storage.clone(),
+            repair_metrics_for_handler,
+        ));
+        self.registry.register(MsgType::RepairWrite, repair_handler);
+
+        let range_read_handler = Arc::new(RangeReadHandler::new(self.storage.clone()));
+        self.registry
+            .register(MsgType::RangeReadRequest, range_read_handler);
+
+        let read_handler = Arc::new(ReadRequestHandler::new(self.storage.clone()));
+        self.registry.register(MsgType::ReadRequest, read_handler);
+
         self.spawn_tracked(async move {
+            // Deliver ClusterInvite to all peers BEFORE starting Raft.
+            // This ensures peers transition to cluster mode and register
+            // Raft handlers before elections begin.
+            // Build invite inside the async block using captured peer list.
+            // local_host_id is captured via the `peers` vec (all peers except self).
+            let invite_initiator = {
+                // Recover the local UUID from the node_map.
+                let map = node_map_for_bootstrap.read().unwrap();
+                map.get(&local_node_id).copied().unwrap_or_default()
+            };
+            let invite = Message::ClusterInvite {
+                initiator: invite_initiator,
+                peers: peers
+                    .iter()
+                    .map(|(id, addr)| (*id, *addr))
+                    .collect(),
+            };
+            for (peer_id, _) in &peers {
+                for attempt in 0..10 {
+                    match peer_manager_for_bootstrap
+                        .send(*peer_id, invite.clone(), Lane::Data)
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::info!(peer = %peer_id, "ClusterInvite delivered");
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt < 9 {
+                                tracing::debug!(
+                                    peer = %peer_id, attempt, %e,
+                                    "ClusterInvite delivery retry"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            } else {
+                                tracing::warn!(
+                                    peer = %peer_id,
+                                    "ClusterInvite delivery failed after 10 attempts"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // Build openraft Config
             let raft_config = match (openraft::Config {
                 cluster_name,
@@ -378,27 +431,8 @@ impl ModeController {
 
             let raft_arc = Arc::new(raft);
 
-            // Register Raft RPC handlers so peers can reach this node's Raft
-            let append_handler = Arc::new(RaftAppendHandler::new((*raft_arc).clone()));
-            registry.register(MsgType::RaftAppendEntries, append_handler);
-
-            let vote_handler = Arc::new(RaftVoteHandler::new((*raft_arc).clone()));
-            registry.register(MsgType::RaftVote, vote_handler);
-
-            let snapshot_handler = Arc::new(RaftSnapshotHandler::new((*raft_arc).clone()));
-            registry.register(MsgType::RaftInstallSnapshot, snapshot_handler);
-
-            let repair_handler = Arc::new(RepairWriteHandler::new(
-                storage_for_handler.clone(),
-                repair_metrics,
-            ));
-            registry.register(MsgType::RepairWrite, repair_handler);
-
-            let range_read_handler = Arc::new(RangeReadHandler::new(storage_for_handler.clone()));
-            registry.register(MsgType::RangeReadRequest, range_read_handler);
-
-            let read_handler = Arc::new(ReadRequestHandler::new(storage_for_handler));
-            registry.register(MsgType::ReadRequest, read_handler);
+            // Publish the Raft instance — handlers waiting in LazyRaft::get() will unblock.
+            let _ = raft_tx.send(Some(raft_arc.clone()));
 
             // Build initial membership: all known nodes including self
             let mut members = std::collections::BTreeMap::new();
@@ -643,6 +677,9 @@ pub struct ClusterInviteHandler {
     local_host_id: Uuid,
     peer_manager: Arc<PeerManager>,
     net_config: Arc<NetConfig>,
+    /// Weak reference to the ModeController for triggering cluster transition
+    /// when this node receives a ClusterInvite while in Pair mode.
+    controller: std::sync::Weak<ModeController>,
 }
 
 impl ClusterInviteHandler {
@@ -650,11 +687,13 @@ impl ClusterInviteHandler {
         local_host_id: Uuid,
         peer_manager: Arc<PeerManager>,
         net_config: Arc<NetConfig>,
+        controller: std::sync::Weak<ModeController>,
     ) -> Self {
         Self {
             local_host_id,
             peer_manager,
             net_config,
+            controller,
         }
     }
 }
@@ -728,7 +767,7 @@ impl RpcHandler for ClusterInviteHandler {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 for (peer_id, _) in &new_peers {
-                    if let Err(e) = pm.fire(*peer_id, invite.clone(), Lane::Raft).await {
+                    if let Err(e) = pm.fire(*peer_id, invite.clone(), Lane::Data).await {
                         tracing::debug!(
                             peer = %peer_id,
                             %e,
@@ -737,6 +776,28 @@ impl RpcHandler for ClusterInviteHandler {
                     }
                 }
             });
+        }
+
+        // If this node is in Pair mode, the invite signals that a 3rd node
+        // has joined and we should transition to cluster mode. Without this,
+        // only the node that saw the 3rd peer connection transitions — the
+        // other nodes stay in Pair forever and never register Raft handlers.
+        if let Some(ctrl) = self.controller.upgrade() {
+            let mode = ctrl.mode();
+            if mode == DeploymentMode::Pair || mode == DeploymentMode::Standalone {
+                let all_peers: Vec<(Uuid, std::net::SocketAddr)> = peers
+                    .iter()
+                    .filter(|(id, _)| *id != self.local_host_id)
+                    .cloned()
+                    .collect();
+                if all_peers.len() >= 2 {
+                    tracing::info!(
+                        peer_count = all_peers.len(),
+                        "cluster invite: triggering cluster transition from {mode:?}"
+                    );
+                    ctrl.transition_to_cluster(all_peers);
+                }
+            }
         }
 
         Some(Message::ClusterInviteAck {

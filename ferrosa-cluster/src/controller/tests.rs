@@ -742,7 +742,8 @@ async fn cluster_invite_handler_replies_with_ack() {
         Arc::new(NoopListener),
     ));
 
-    let handler = cluster::ClusterInviteHandler::new(local_id, pm, net_config);
+    let handler =
+        cluster::ClusterInviteHandler::new(local_id, pm, net_config, std::sync::Weak::new());
 
     let initiator = Uuid::new_v4();
     let peer1 = Uuid::new_v4();
@@ -767,4 +768,124 @@ async fn cluster_invite_handler_replies_with_ack() {
         }
         other => panic!("expected ClusterInviteAck, got: {other:?}"),
     }
+}
+
+// -----------------------------------------------------------------------
+// Progressive join: standalone → pair → cluster
+// -----------------------------------------------------------------------
+
+/// A standalone node auto-promotes to pair when a peer connects.
+#[tokio::test]
+async fn standalone_mode_accepts_peer_and_transitions_to_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    // Explicitly configure as standalone — this is what the compose does.
+    let config = Arc::new(ClusterConfig::default());
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    assert_eq!(controller.mode(), DeploymentMode::Standalone);
+
+    // Peer connects — should transition to Pair, not be rejected.
+    let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    controller.on_peer_connected((peer_id, peer_addr));
+
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "standalone node must accept peer and transition to pair"
+    );
+}
+
+/// Full progressive join: standalone → pair → cluster (3 nodes).
+#[tokio::test]
+async fn progressive_join_standalone_to_pair_to_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig::default());
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1 = Uuid::new_v4();
+    let peer2 = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    // Start standalone.
+    assert_eq!(controller.mode(), DeploymentMode::Standalone);
+
+    // First peer → pair.
+    controller.on_peer_connected((peer1, "10.0.0.2:7000".parse().unwrap()));
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+
+    // Second peer → forming/cluster.
+    controller.on_peer_connected((peer2, "10.0.0.3:7000".parse().unwrap()));
+    let mode = controller.mode();
+    assert!(
+        mode == DeploymentMode::Forming || mode == DeploymentMode::Cluster,
+        "expected Forming or Cluster after 3rd node, got {mode:?}"
+    );
+}
+
+/// Inbound peer to standalone node also triggers progressive join.
+#[tokio::test]
+async fn standalone_inbound_peer_transitions_to_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig::default());
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    assert_eq!(controller.mode(), DeploymentMode::Standalone);
+
+    // Inbound connection — should also transition, not reject.
+    use ferrosa_net::rpc::InboundPeerCallback;
+    controller.on_inbound_peer((peer_id, "10.0.0.2:7000".parse().unwrap()));
+
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "standalone node must accept inbound peer and transition to pair"
+    );
 }

@@ -338,14 +338,17 @@ impl ModeController {
     ///
     /// Also registers the `ClusterInviteHandler` so this node can process
     /// incoming `ClusterInvite` messages and connect to discovered peers.
-    pub fn set_peer_manager(&self, pm: Arc<ferrosa_net::peer::PeerManager>) {
+    pub fn set_peer_manager(self: &Arc<Self>, pm: Arc<ferrosa_net::peer::PeerManager>) {
         // Register ClusterInvite handler so this node can process
         // incoming invites and connect to discovered peers.
+        // The handler gets a Weak<ModeController> so it can trigger
+        // cluster transition when receiving an invite in Pair mode.
         use ferrosa_net::codec::MsgType;
         let invite_handler = Arc::new(cluster::ClusterInviteHandler::new(
             self.local_host_id,
             pm.clone(),
             self.net_config.clone(),
+            Arc::downgrade(self),
         ));
         self.registry
             .register(MsgType::ClusterInvite, invite_handler);

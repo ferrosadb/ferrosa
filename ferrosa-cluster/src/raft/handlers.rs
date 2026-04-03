@@ -305,6 +305,51 @@ fn row_max_timestamp(row: &Row) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// LazyRaft — waits for the Raft instance to be initialized
+// ---------------------------------------------------------------------------
+
+/// A lazy reference to the Raft instance that becomes available after async
+/// initialization completes. Handlers are registered immediately (before
+/// `FerrosRaft::new()` returns) and use this to wait for the instance.
+#[derive(Clone)]
+pub struct LazyRaft {
+    rx: tokio::sync::watch::Receiver<Option<Arc<super::FerrosRaft>>>,
+}
+
+impl LazyRaft {
+    /// Create a new lazy Raft reference and the sender to publish the instance.
+    pub fn channel() -> (
+        tokio::sync::watch::Sender<Option<Arc<super::FerrosRaft>>>,
+        Self,
+    ) {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        (tx, Self { rx })
+    }
+
+    /// Wait up to 10 seconds for the Raft instance to be initialized.
+    async fn get(&self) -> Option<Arc<super::FerrosRaft>> {
+        let mut rx = self.rx.clone();
+        // If already available, return immediately.
+        if rx.borrow().is_some() {
+            return rx.borrow().clone();
+        }
+        // Wait for the sender to publish the instance.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            rx.wait_for(|v| v.is_some()),
+        )
+        .await;
+        match result {
+            Ok(Ok(guard)) => guard.clone(),
+            _ => {
+                tracing::warn!("LazyRaft: timed out waiting for Raft initialization");
+                None
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RaftAppendHandler
 // ---------------------------------------------------------------------------
 
@@ -313,11 +358,11 @@ fn row_max_timestamp(row: &Row) -> i64 {
 /// Deserializes the request with bincode, forwards it to the local Raft
 /// instance, and returns the serialized response as `RaftAppendResponse`.
 pub struct RaftAppendHandler {
-    raft: super::FerrosRaft,
+    raft: LazyRaft,
 }
 
 impl RaftAppendHandler {
-    pub fn new(raft: super::FerrosRaft) -> Self {
+    pub fn new(raft: LazyRaft) -> Self {
         Self { raft }
     }
 }
@@ -330,6 +375,8 @@ impl RpcHandler for RaftAppendHandler {
             _ => return None,
         };
 
+        let raft = self.raft.get().await?;
+
         let req: AppendEntriesRequest<FerrosRaftConfig> = bincode::deserialize(&bytes)
             .map_err(|e| {
                 tracing::warn!("RaftAppendHandler: failed to deserialize request: {e}");
@@ -337,8 +384,7 @@ impl RpcHandler for RaftAppendHandler {
             })
             .ok()?;
 
-        let resp = self
-            .raft
+        let resp = raft
             .append_entries(req)
             .await
             .map_err(|e| {
@@ -367,11 +413,11 @@ impl RpcHandler for RaftAppendHandler {
 /// Deserializes the vote request, forwards it to the local Raft instance, and
 /// returns the serialized vote response.
 pub struct RaftVoteHandler {
-    raft: super::FerrosRaft,
+    raft: LazyRaft,
 }
 
 impl RaftVoteHandler {
-    pub fn new(raft: super::FerrosRaft) -> Self {
+    pub fn new(raft: LazyRaft) -> Self {
         Self { raft }
     }
 }
@@ -384,6 +430,8 @@ impl RpcHandler for RaftVoteHandler {
             _ => return None,
         };
 
+        let raft = self.raft.get().await?;
+
         let req: VoteRequest<u64> = bincode::deserialize(&bytes)
             .map_err(|e| {
                 tracing::warn!("RaftVoteHandler: failed to deserialize request: {e}");
@@ -391,8 +439,7 @@ impl RpcHandler for RaftVoteHandler {
             })
             .ok()?;
 
-        let resp: VoteResponse<u64> = self
-            .raft
+        let resp: VoteResponse<u64> = raft
             .vote(req)
             .await
             .map_err(|e| {
@@ -422,11 +469,11 @@ impl RpcHandler for RaftVoteHandler {
 /// and returns the serialized response as `RaftAppendResponse` (matching the
 /// convention used in [`super::network`]).
 pub struct RaftSnapshotHandler {
-    raft: super::FerrosRaft,
+    raft: LazyRaft,
 }
 
 impl RaftSnapshotHandler {
-    pub fn new(raft: super::FerrosRaft) -> Self {
+    pub fn new(raft: LazyRaft) -> Self {
         Self { raft }
     }
 }
@@ -439,6 +486,8 @@ impl RpcHandler for RaftSnapshotHandler {
             _ => return None,
         };
 
+        let raft = self.raft.get().await?;
+
         let req: InstallSnapshotRequest<FerrosRaftConfig> = bincode::deserialize(&bytes)
             .map_err(|e| {
                 tracing::warn!("RaftSnapshotHandler: failed to deserialize request: {e}");
@@ -446,8 +495,7 @@ impl RpcHandler for RaftSnapshotHandler {
             })
             .ok()?;
 
-        let resp: InstallSnapshotResponse<u64> = self
-            .raft
+        let resp: InstallSnapshotResponse<u64> = raft
             .install_snapshot(req)
             .await
             .map_err(|e| {
