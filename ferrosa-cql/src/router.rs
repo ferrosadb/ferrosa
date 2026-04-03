@@ -46,6 +46,146 @@ use crate::virtual_tables::connections::ConnectionTracker;
 /// Maximum number of statements allowed in a BATCH (security mitigation M12).
 const MAX_BATCH_STATEMENTS: usize = 500;
 
+/// Slow query threshold in milliseconds. Parsed once at module load from
+/// `FERROSA_SLOW_QUERY_THRESHOLD_MS` (default 1000).
+fn slow_query_threshold_ms() -> u64 {
+    use std::sync::OnceLock;
+    static THRESHOLD: OnceLock<u64> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("FERROSA_SLOW_QUERY_THRESHOLD_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1000)
+    })
+}
+
+/// A record of a slow query for observability.
+#[derive(Debug, Clone)]
+pub struct SlowQueryRecord {
+    /// Parameterized query text (literals replaced with `?`).
+    pub query: String,
+    /// Keyspace in which the query executed.
+    pub keyspace: String,
+    /// Duration of the query in milliseconds.
+    pub duration_ms: u64,
+    /// Wall-clock timestamp when the query completed (ms since epoch).
+    pub timestamp_ms: i64,
+}
+
+/// Replace string literals, number literals, UUID literals, and blob
+/// literals with `?` for parameterized logging. This is a best-effort
+/// regex-free implementation suitable for v1 observability.
+pub fn parameterize_query(query: &str) -> String {
+    let mut result = String::with_capacity(query.len());
+    let bytes = query.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        match bytes[i] {
+            // String literal: '...' (handle escaped '' inside)
+            b'\'' => {
+                result.push('?');
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        // Escaped '' — continue inside the string
+                        if i < len && bytes[i] == b'\'' {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // Blob literal: 0x...
+            b'0' if i + 1 < len && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') => {
+                // Check if preceded by a word char (then it's part of an identifier)
+                if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
+                result.push('?');
+                i += 2; // skip "0x"
+                while i < len && bytes[i].is_ascii_hexdigit() {
+                    i += 1;
+                }
+            }
+            // Hex digit or digit — could be UUID, number, or identifier fragment.
+            b if b.is_ascii_hexdigit() => {
+                // Check if preceded by a letter or underscore (part of identifier).
+                if i > 0 && (bytes[i - 1].is_ascii_alphabetic() || bytes[i - 1] == b'_') {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
+
+                // Try to match UUID pattern: 8-4-4-4-12 hex with dashes.
+                if let Some(uuid_end) = try_match_uuid(bytes, i) {
+                    result.push('?');
+                    i = uuid_end;
+                    continue;
+                }
+
+                // Number literal (must start with a digit, not a-f).
+                if b.is_ascii_digit() {
+                    result.push('?');
+                    while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                        i += 1;
+                    }
+                } else {
+                    // Bare hex letter (a-f) not part of a UUID — output as-is.
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            _ => {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+
+    result
+}
+
+/// Try to match a UUID pattern starting at `start` in `bytes`.
+/// Returns `Some(end)` if a 36-character UUID (8-4-4-4-12) is found,
+/// `None` otherwise.
+fn try_match_uuid(bytes: &[u8], start: usize) -> Option<usize> {
+    let len = bytes.len();
+    if start + 36 > len {
+        return None;
+    }
+
+    // UUID structure: 8 hex, '-', 4 hex, '-', 4 hex, '-', 4 hex, '-', 12 hex
+    let expected_dashes = [8, 13, 18, 23];
+    let j = start;
+
+    for pos in 0..36 {
+        let ch = bytes[j + pos];
+        if expected_dashes.contains(&pos) {
+            if ch != b'-' {
+                return None;
+            }
+        } else if !ch.is_ascii_hexdigit() {
+            return None;
+        }
+    }
+
+    // Ensure the UUID is not followed by a word character (would be an identifier).
+    if start + 36 < len
+        && (bytes[start + 36].is_ascii_alphanumeric() || bytes[start + 36] == b'_')
+    {
+        return None;
+    }
+
+    Some(start + 36)
+}
+
 /// UUID epoch offset: 100-nanosecond intervals between 1582-10-15 and 1970-01-01.
 const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
 
@@ -211,6 +351,8 @@ async fn route_inner(
     ctx: &RequestContext<'_>,
     stmt: Statement,
 ) -> Result<RouteResult, CqlError> {
+    let start = std::time::Instant::now();
+
     // Track the query for observability; the guard calls complete() on drop.
     let query_desc: String = format!("{:?}", &stmt).chars().take(200).collect();
     let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
@@ -403,6 +545,29 @@ async fn route_inner(
     }
     .instrument(execute_span)
     .await;
+
+    // Slow query detection: log and record if execution exceeded the threshold.
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let threshold = slow_query_threshold_ms();
+    if elapsed_ms >= threshold {
+        let ks = ctx.current_keyspace.as_deref().unwrap_or("<none>");
+        tracing::warn!(
+            duration_ms = elapsed_ms,
+            keyspace = ks,
+            "slow query detected"
+        );
+        let _record = SlowQueryRecord {
+            query: parameterize_query(&query_desc),
+            keyspace: ks.to_string(),
+            duration_ms: elapsed_ms,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        };
+        // Future: write _record to system_observability.slow_queries via
+        // StorageEngine::write_observability() when that API is available.
+    }
 
     result
 }
@@ -10640,5 +10805,66 @@ mod tests {
             "route with tracing spans should succeed, got: {:?}",
             result.err()
         );
+    }
+
+    // ── Slow query / parameterize_query tests ───────────────────────────
+
+    #[test]
+    fn parameterize_query_replaces_string_literals() {
+        let q = "SELECT * FROM ks.t WHERE name = 'hello world'";
+        assert_eq!(parameterize_query(q), "SELECT * FROM ks.t WHERE name = ?");
+    }
+
+    #[test]
+    fn parameterize_query_replaces_number_literals() {
+        let q = "SELECT * FROM ks.t WHERE id = 42 AND age > 18.5";
+        assert_eq!(
+            parameterize_query(q),
+            "SELECT * FROM ks.t WHERE id = ? AND age > ?"
+        );
+    }
+
+    #[test]
+    fn parameterize_query_replaces_uuid_literals() {
+        let q = "SELECT * FROM ks.t WHERE id = 550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(parameterize_query(q), "SELECT * FROM ks.t WHERE id = ?");
+    }
+
+    #[test]
+    fn parameterize_query_replaces_blob_literals() {
+        let q = "INSERT INTO ks.t (data) VALUES (0xDEADBEEF)";
+        assert_eq!(
+            parameterize_query(q),
+            "INSERT INTO ks.t (data) VALUES (?)"
+        );
+    }
+
+    #[test]
+    fn parameterize_query_preserves_identifiers() {
+        let q = "SELECT col1 FROM table1 WHERE pk = 'val'";
+        let result = parameterize_query(q);
+        assert!(result.contains("col1"), "identifiers must be preserved");
+        assert!(result.contains("table1"), "identifiers must be preserved");
+    }
+
+    #[test]
+    fn parameterize_query_handles_escaped_quotes() {
+        let q = "INSERT INTO ks.t (v) VALUES ('it''s fine')";
+        assert_eq!(
+            parameterize_query(q),
+            "INSERT INTO ks.t (v) VALUES (?)"
+        );
+    }
+
+    #[test]
+    fn slow_query_record_fields() {
+        let record = SlowQueryRecord {
+            query: "SELECT * FROM ks.t WHERE id = ?".into(),
+            keyspace: "ks".into(),
+            duration_ms: 2000,
+            timestamp_ms: 1700000000000,
+        };
+        assert_eq!(record.duration_ms, 2000);
+        assert_eq!(record.keyspace, "ks");
     }
 }
