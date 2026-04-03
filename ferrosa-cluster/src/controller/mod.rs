@@ -23,9 +23,9 @@ pub(crate) use token::generate_deterministic_token;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
 use parking_lot::Mutex;

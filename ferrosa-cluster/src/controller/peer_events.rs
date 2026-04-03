@@ -57,7 +57,11 @@ impl PeerEventListener for ModeController {
                 let committed = self
                     .committed_cluster_size
                     .load(std::sync::atomic::Ordering::Relaxed);
-                let total = if committed > 0 { committed } else { connected + 1 };
+                let total = if committed > 0 {
+                    committed
+                } else {
+                    connected + 1
+                };
                 let quorum = (total / 2) + 1;
                 if connected + 1 >= quorum {
                     tracing::info!(
@@ -98,7 +102,11 @@ impl PeerEventListener for ModeController {
                 let committed = self
                     .committed_cluster_size
                     .load(std::sync::atomic::Ordering::Relaxed);
-                let total = if committed > 0 { committed } else { connected + 1 };
+                let total = if committed > 0 {
+                    committed
+                } else {
+                    connected + 1
+                };
                 let quorum = (total / 2) + 1;
                 if connected + 1 < quorum {
                     tracing::warn!(

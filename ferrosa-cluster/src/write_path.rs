@@ -106,22 +106,24 @@ impl WritePath {
             Self::Pair(coordinator) => coordinator.local_storage().read(table_id, key),
             Self::Cluster(coordinator) => {
                 let rows_opt = match strategy {
-                    ReplicationStrategy::Simple { replication_factor } => coordinator
-                        .coordinate_read_with(table_id, key, cl, *replication_factor)
-                        .await,
-                    ReplicationStrategy::NetworkTopology { .. } => coordinator
-                        .coordinate_read_nts(table_id, key, cl, strategy)
-                        .await,
+                    ReplicationStrategy::Simple { replication_factor } => {
+                        coordinator
+                            .coordinate_read_with(table_id, key, cl, *replication_factor)
+                            .await
+                    }
+                    ReplicationStrategy::NetworkTopology { .. } => {
+                        coordinator
+                            .coordinate_read_nts(table_id, key, cl, strategy)
+                            .await
+                    }
                 };
                 match rows_opt {
-                    Ok(Some(rows)) if !rows.is_empty() => {
-                        Ok(Some(Partition {
-                            key: key.clone(),
-                            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
-                            static_row: None,
-                            rows,
-                        }))
-                    }
+                    Ok(Some(rows)) if !rows.is_empty() => Ok(Some(Partition {
+                        key: key.clone(),
+                        deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                        static_row: None,
+                        rows,
+                    })),
                     Ok(_) => Ok(None),
                     Err(e) => Err(ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
                 }
