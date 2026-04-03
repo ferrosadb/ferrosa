@@ -11,7 +11,7 @@
 
 | Priority | Count | Category |
 |----------|------:|----------|
-| P0 — silent data loss/corruption | 3 | DDL gap, bincode silent empty, RwLock unwrap in Raft RPC |
+| P0 — silent data loss/corruption | 3 (2 fixed) | DDL gap, ~~bincode silent empty~~ (45eaa91), ~~RwLock unwrap in Raft RPC~~ (45eaa91) |
 | P1 — correctness under concurrency | 8 | std::sync::RwLock poison, fire-and-forget spawns, quorum calc, unbounded reads |
 | P2 — latent bugs needing trigger | 6 | Hardcoded sleeps, missing shutdown, unbounded collections, magic numbers, silent fallbacks |
 
@@ -96,19 +96,19 @@ fire-and-forget.
 New hazards identified by scanning recently-changed files. Cross-referenced
 against existing findings above to avoid duplication.
 
-### P0-2: `bincode::serialize().unwrap_or_default()` Silently Produces Empty Data
+### P0-2: `bincode::serialize().unwrap_or_default()` Silently Produces Empty Data — FIXED (45eaa91)
 
 **Location:** `ferrosa-cluster/src/controller/cluster.rs:642-643`
 **Hazard:** During bootstrap streaming, `bincode::serialize(&wire_rows).unwrap_or_default()` silently replaces serialization failures with an empty `Vec<u8>`. The streamed mutation arrives at the destination with zero-length row data. The receiving node writes a partition with no rows — **silent data loss**. The sending node logs nothing.
 **Impact:** P0 — a serialization bug (e.g., from a bincode version mismatch or a row with an unexpected field) would corrupt data across the cluster during bootstrap.
-**Fix:** Replace `.unwrap_or_default()` with explicit error handling. Log the error and skip the partition (or fail the bootstrap).
+**Fix applied:** Replaced `.unwrap_or_default()` with `match` — serialization failures now log an error with the partition key and `continue` to skip the partition. No silent data loss.
 
-### P0-3: `std::sync::RwLock::read().unwrap()` in Raft Init Async Task
+### P0-3: `std::sync::RwLock::read().unwrap()` in Raft Init Async Task — FIXED (45eaa91)
 
 **Location:** `ferrosa-cluster/src/controller/cluster.rs:366, 551, 600`
 **Hazard:** The `node_map` is a `std::sync::RwLock` (from `raft/network.rs`). Three `.read().unwrap()` calls are inside the `spawn_tracked` async block. If the RwLock is ever poisoned (e.g., a panic in `register_node` which calls `.write().expect()`), the Raft init task panics. Since this task is fire-and-forget (tracked but not awaited for error recovery), the node enters Cluster mode with no functioning Raft instance and no DDL path.
 **Impact:** P0 — node appears healthy but cannot process writes or DDL; silent split-brain risk.
-**Fix:** Replace `.unwrap()` with `.unwrap_or_else(|e| e.into_inner())` (read through poison) or switch to `parking_lot::RwLock` (no poison). The `raft/network.rs` file already has `.expect("node_map lock poisoned")` on 3 call sites — these should all be hardened.
+**Fix applied:** All 3 sites now use `.unwrap_or_else(|e| e.into_inner())` to read through poison. The underlying HashMap data is still valid even when the lock is poisoned.
 
 ### P1-6: `std::sync::RwLock` in `IpConnectionTracker` — Panic on Poison
 
@@ -200,8 +200,8 @@ These tasks cannot be cancelled during shutdown and panics are silently swallowe
 | Priority | Hazard | Effort | Sprint |
 |----------|--------|--------|--------|
 | P0-1 | Block or queue DDL during Forming | S | 1 |
-| **P0-2** | **Fix `unwrap_or_default()` in bootstrap serialization** | **S** | **1** |
-| **P0-3** | **Harden `std::sync::RwLock` in Raft init (node_map)** | **S** | **1** |
+| ~~P0-2~~ | ~~Fix `unwrap_or_default()` in bootstrap serialization~~ | **DONE** (45eaa91) | — |
+| ~~P0-3~~ | ~~Harden `std::sync::RwLock` in Raft init (node_map)~~ | **DONE** (45eaa91) | — |
 | P1-1 | Replace `std::sync::Mutex` with `parking_lot::Mutex` | S | 1 |
 | P1-2 | Track spawned tasks with JoinSet | M | 1 |
 | P1-3 | Add transition lock or CAS for mode changes | M | 1 |
