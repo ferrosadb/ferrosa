@@ -158,6 +158,15 @@ impl RpcClient {
     /// the stream ID will never be reclaimed. Only call this from actor loops that
     /// guarantee the future runs to completion.
     pub async fn send(&self, msg: Message, lane: Lane) -> Result<Message> {
+        let span = tracing::info_span!(
+            "net.rpc",
+            peer = %self.peer_addr,
+            msg_type = ?msg.msg_type(),
+            lane = ?lane,
+        );
+        let _enter = span.enter();
+        drop(_enter);
+        // Span is recorded but not held across await points.
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let (resp_tx, resp_rx) = oneshot::channel();
 
@@ -387,6 +396,72 @@ mod tests {
         assert!(
             !*alive_rx.borrow(),
             "alive_rx should be false after connection drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_send_creates_net_rpc_span() {
+        use std::sync::atomic::AtomicU64;
+
+        struct SpanCollector {
+            names: Arc<std::sync::Mutex<Vec<String>>>,
+            next_id: AtomicU64,
+        }
+
+        impl tracing::Subscriber for SpanCollector {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                self.names
+                    .lock()
+                    .unwrap()
+                    .push(span.metadata().name().to_string());
+                let id = self
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                tracing::span::Id::from_u64(id)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let shared_names: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(SpanCollector {
+            names: Arc::clone(&shared_names),
+            next_id: AtomicU64::new(0),
+        });
+
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let addr = start_echo_server(&config).await;
+
+        let client = RpcClient::connect(Arc::new(config), uuid::Uuid::new_v4(), addr)
+            .await
+            .unwrap();
+
+        let _ = client
+            .send(
+                Message::Ping {
+                    nonce: 42,
+                    sent_at: 0,
+                },
+                Lane::Data,
+            )
+            .await;
+
+        let recorded = shared_names.lock().unwrap();
+        assert!(
+            recorded.iter().any(|n| n == "net.rpc"),
+            "expected 'net.rpc' span, got: {:?}",
+            *recorded
         );
     }
 }
