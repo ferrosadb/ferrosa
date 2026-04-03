@@ -734,12 +734,18 @@ impl ModeController {
                 }
                 None => {
                     tracing::warn!(
-                        "raft leader election timed out after 30s — reverting to Pair mode"
+                        "raft leader election timed out after ~30s — reverting to Pair mode"
                     );
                     // Revert to Pair mode — formation failed. The Raft instance
-                    // is stored but non-functional (no leader). Writes stay on
-                    // Pair semantics with the original peer.
+                    // is stored but non-functional (no leader).
                     mode_swap.store(Arc::new(DeploymentMode::Pair));
+                    // Restore DDL path from Blocked to Direct (single-node fallback).
+                    // Without this, DDL stays blocked indefinitely after failed formation.
+                    ddl_path.store(Arc::new(DdlPath::Direct {
+                        schema: schema_for_replay.clone(),
+                        engine: storage_for_bootstrap.clone(),
+                    }));
+                    tracing::info!("DDL path restored to Direct after formation timeout");
                 }
             }
 
