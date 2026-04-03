@@ -324,6 +324,44 @@ graph LR
 | Hint store | `hints/` | Pending hints per peer, replay rate | Divergence indicator |
 | Commit log segments | `commitlog/` | Active segments, closed-pending-upload | Archive lag |
 
+### Layer 9: On-Demand Flame Charts (code hot path analysis)
+
+`tracing-flame` writes a folded stack line per span close — **always-on cost is too high for
+production** (write per span at thousands of req/sec). Instead, use an on-demand model:
+
+**Design:** The flame layer is NOT installed in the subscriber at startup. When an operator
+requests a profile, the system temporarily adds a `FlameLayer` with a `BufWriter<Vec<u8>>`,
+captures for N seconds, removes the layer, and returns an SVG flame chart.
+
+**Endpoint:** `GET /api/debug/flamechart?seconds=30`
+
+- Zero overhead when not profiling (layer not installed)
+- During profiling window: ~5-10% overhead (buffered write per span close)
+- Returns `image/svg+xml` flame chart rendered by `inferno`
+- Auth-gated (requires superuser or `FERROSA_DEBUG_ENABLED=true`)
+- Only one profile at a time (mutex-guarded)
+
+**Crate additions:**
+- `tracing-flame` — folded stack capture (only used during profiling window)
+- `inferno` — flamegraph SVG rendering
+
+**Implementation:**
+
+```rust
+// No flame layer in normal subscriber stack.
+// On /api/debug/flamechart request:
+let (flame_layer, guard) = FlameLayer::with_file("/tmp/ferrosa-flame.folded")?;
+let handle = subscriber.with(flame_layer);  // temporarily add layer
+tokio::time::sleep(Duration::from_secs(seconds)).await;
+drop(handle);  // remove layer
+drop(guard);   // flush writer
+// Read folded stacks, render SVG via inferno, return to client
+```
+
+**What this shows:** CPU time distribution across span hierarchy — "60% of time in
+`storage.read`, of which 40% in `sstable.decompress`". Identifies code-level hot paths
+that span-level latency alone can't pinpoint.
+
 ---
 
 ## Context Propagation
@@ -373,6 +411,7 @@ The internode propagation requires a wire format change:
 | O3.3 | Contention metrics | M | Memtable shard contention, transition guard hold time, S3 upload queue depth |
 | O3.4 | Network bandwidth metrics | S | `ferrosa_net_bytes_sent_total`, `ferrosa_net_bytes_received_total` by peer + lane |
 | O3.5 | In-flight RPC gauge | S | `ferrosa_net_rpc_inflight` per peer |
+| O3.6 | On-demand flame chart endpoint | M | `GET /api/debug/flamechart?seconds=N` — temporarily installs `tracing-flame` layer, captures span stacks, renders SVG via `inferno`. Zero overhead when not profiling. Auth-gated. |
 
 ### O4: Native Web UI Panels
 
