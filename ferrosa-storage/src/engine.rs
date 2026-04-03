@@ -272,14 +272,6 @@ impl StorageEngine {
         Ok(engine)
     }
 
-    /// Returns the data directory path for this storage engine.
-    ///
-    /// Used by SSTable-based bootstrap streaming to locate component files
-    /// on disk (SSTables live at `{data_dir}/sstables/{keyspace}.{table}/`).
-    pub fn data_dir(&self) -> &std::path::Path {
-        &self.config.data_dir
-    }
-
     /// Probe the configured object store for conditional put support.
     ///
     /// Call this once after construction when an S3 store is configured.
@@ -1064,6 +1056,11 @@ impl StorageEngine {
         row: Row,
         timestamp: i64,
     ) -> ferrosa_common::Result<()> {
+        let _span = tracing::info_span!(
+            "storage.write",
+            table = %table_id,
+        )
+        .entered();
         // 1. Append to commit log for durability.
         let mutation = Mutation::new(
             table_id.keyspace.clone(),
@@ -1091,44 +1088,6 @@ impl StorageEngine {
         self.dispatch_sync_observers(table_id, &mutation);
         self.dispatch_async_observers(table_id, &mutation);
 
-        Ok(())
-    }
-
-    /// Writes a row to an observability table (system_observability.*).
-    ///
-    /// Same as `write()` but skips observer dispatch to prevent telemetry
-    /// writes from generating new tracing spans (feedback loop avoidance).
-    /// The table must already be registered via `register_table()`.
-    pub fn write_observability(
-        &self,
-        table_id: &TableId,
-        key: &DecoratedKey,
-        row: Row,
-        timestamp: i64,
-    ) -> ferrosa_common::Result<()> {
-        // 1. Append to commit log for durability.
-        let mutation = Mutation::new(
-            table_id.keyspace.clone(),
-            table_id.table.clone(),
-            key.clone(),
-            vec![row.clone()],
-            timestamp,
-        );
-        let cl_pos = self.commit_log.append(&mutation)?;
-
-        // 2. Write to the table's memtable and track commit log position.
-        let tables = self.tables.read();
-        let state = tables.get(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
-        state.store.write(key, row)?;
-        *state.last_commit_log_position.lock() = Some(cl_pos);
-        state
-            .first_unflushed_write_at
-            .lock()
-            .get_or_insert_with(std::time::Instant::now);
-
-        // Note: no observer dispatch — prevents telemetry feedback loops.
         Ok(())
     }
 
@@ -1246,6 +1205,11 @@ impl StorageEngine {
         table_id: &TableId,
         key: &DecoratedKey,
     ) -> ferrosa_common::Result<Option<Partition>> {
+        let _span = tracing::info_span!(
+            "storage.read",
+            table = %table_id,
+        )
+        .entered();
         let tables = self.tables.read();
         match tables.get(table_id) {
             Some(state) => state.store.read(key),
@@ -1557,6 +1521,11 @@ impl StorageEngine {
     /// to the compaction executor. For pinned tables, S3 upload is skipped
     /// and max_bytes eviction is enforced if configured.
     pub fn flush(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        let _span = tracing::info_span!(
+            "storage.flush",
+            table = %table_id,
+        )
+        .entered();
         // Flush + index submit under read lock, then release before write lock.
         let (gen, is_pinned, cl_position) = {
             let tables = self.tables.read();
@@ -6874,40 +6843,84 @@ mod tests {
     }
 
     #[test]
-    fn write_observability_bypasses_cql() {
-        use ferrosa_schema::system::observability;
+    fn storage_engine_creates_spans() {
+        use std::sync::atomic::AtomicU64;
+
+        struct SpanCollector {
+            names: Arc<std::sync::Mutex<Vec<String>>>,
+            next_id: AtomicU64,
+        }
+
+        impl tracing::Subscriber for SpanCollector {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                self.names
+                    .lock()
+                    .unwrap()
+                    .push(span.metadata().name().to_string());
+                let id = self
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                tracing::span::Id::from_u64(id)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let shared_names: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let _guard = tracing::subscriber::set_default(SpanCollector {
+            names: Arc::clone(&shared_names),
+            next_id: AtomicU64::new(0),
+        });
 
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig::test_config(dir.path());
         let engine = StorageEngine::new(config, None).unwrap();
 
-        // Register the spans table.
-        let schema = observability::spans_table_schema();
+        let schema = ferrosa_common::schema::TableSchema {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::schema::ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
         engine.register_table(schema).unwrap();
 
-        let tid = TableId::new(observability::KEYSPACE, "spans");
-        let key = make_key("trace-001");
-        let ts = 1_000_000i64;
-        let row = Row {
-            clustering: vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8], // start_us = 1000
-            cells: vec![(0, CellValue::live(b"span-name".to_vec(), ts))],
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        let table_id = TableId::new("ks", "tbl");
+        let key = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(b"pk1".to_vec()));
+        let row = ferrosa_sstable::types::Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"val".to_vec(), 1))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
         };
 
-        // write_observability should succeed and be readable.
-        engine
-            .write_observability(&tid, &key, row, ts)
-            .expect("write_observability must succeed");
+        engine.write(&table_id, &key, row, 1).unwrap();
+        let _ = engine.read(&table_id, &key);
 
-        let partition = engine
-            .read(&tid, &key)
-            .expect("read must succeed")
-            .expect("partition must exist after write_observability");
-        assert_eq!(partition.key.key.as_bytes(), b"trace-001");
+        let recorded = shared_names.lock().unwrap();
         assert!(
-            !partition.rows.is_empty(),
-            "written row must be readable via standard read path"
+            recorded.iter().any(|n| n == "storage.write"),
+            "expected 'storage.write' span, got: {:?}",
+            *recorded
+        );
+        assert!(
+            recorded.iter().any(|n| n == "storage.read"),
+            "expected 'storage.read' span, got: {:?}",
+            *recorded
         );
     }
 }
