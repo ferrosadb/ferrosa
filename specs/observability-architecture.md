@@ -24,26 +24,30 @@ Following CMU-PDL-14-102's four design axes:
 graph TD
     App["Application Code<br/>#[instrument] spans"]
     Sub["tracing subscriber<br/>fmt + telemetry + otel layers"]
-    TL["FerrosaTelemetryLayer<br/>batch spans in bounded channel"]
-    OTL["tracing-opentelemetry layer<br/>(optional, enterprise)"]
-    CQL["CqlClient<br/>INSERT INTO system_observability.*"]
-    DB["Ferrosa Node<br/>(local or remote endpoint)"]
-    UI["ferrosa-dbaas<br/>control plane UI"]
-    OTLP["OTLP Collector / Jaeger / Datadog<br/>(enterprise customer's stack)"]
+    TL["FerrosaTelemetryLayer<br/>try_send to bounded channel<br/>drop oldest on full"]
+    OTL["tracing-opentelemetry layer<br/>(enterprise, sanitized data only)"]
+    SE["StorageEngine::write_observability()<br/>direct write, bypasses CQL"]
+    CQL_R["CQL SELECT<br/>system_observability.*"]
+    UI["ferrosa web console<br/>+ ferrosa-dbaas"]
+    OTLP["Enterprise OTLP endpoint<br/>(no query text, no data values)"]
+    SIGN["Billing records<br/>cryptographically signed<br/>(DBaaS key)"]
 
     App -->|"span open/close"| Sub
     Sub -->|"sampled spans"| TL
     Sub -.->|"if FERROSA_OTEL_ENDPOINT set"| OTL
-    TL -->|"batched CQL writes"| CQL
-    OTL -.->|"OTLP gRPC export"| OTLP
-    CQL -->|"system_observability.spans<br/>system_observability.metrics<br/>system_observability.slow_queries"| DB
-    DB -->|"SELECT via CQL"| UI
+    TL -->|"batched direct writes<br/>(no CQL parse, no feedback loop)"| SE
+    TL -->|"billing data"| SIGN
+    SIGN --> SE
+    OTL -.->|"sanitized metrics only<br/>(no query text/data)"| OTLP
+    SE -->|"read via CQL"| CQL_R
+    CQL_R --> UI
 
     style TL fill:#f9f,stroke:#333
-    style DB fill:#bbf,stroke:#333
+    style SE fill:#bbf,stroke:#333
     style UI fill:#bfb,stroke:#333
     style OTL fill:#ffd,stroke:#333
     style OTLP fill:#ffd,stroke:#333
+    style SIGN fill:#fbb,stroke:#333
 ```
 
 **Dual export architecture:**
@@ -373,9 +377,11 @@ Per CMU-PDL-14-102 Section 4, use hybrid fixed-width metadata:
 3. **Across nodes (CQL):** Extract trace flag from CQL v5 custom payload (driver-initiated tracing)
 
 The internode propagation requires a wire format change:
-- Add optional `trace_context: Option<[u8; 32]>` to the codec frame
-- When present: 16-byte trace_id + 8-byte span_id + 8-byte flags
-- Backward compatible: old nodes ignore the extension
+- Add `trace_context: [u8; 32]` to the codec frame (REQUIRED, not optional)
+- Layout: 16-byte trace_id + 8-byte span_id + 8-byte flags
+- All-zero = no active trace (equivalent to unsampled)
+- Mixed observable/non-observable clusters are a non-goal — all nodes must support trace context
+- In high-security mode, invalid/malformed trace context triggers warning log and optional node ejection
 
 ---
 
@@ -386,7 +392,7 @@ The internode propagation requires a wire format change:
 | # | Task | Size | Description |
 |---|------|------|-------------|
 | O1.1 | Create `system_observability` schema | S | Tables: `spans`, `metrics`, `slow_queries` — auto-created at startup like other system keyspaces |
-| O1.2 | Build `FerrosaTelemetryLayer` | L | Custom `tracing::Layer` that batches closed spans in a bounded channel and writes to ferrosa via `CqlClient`. **CRITICAL (OF1):** Telemetry CQL writes MUST run under `tracing::dispatcher::with_default(no_op)` to prevent self-write feedback loop (RPN 504). Configurable endpoint, sample rate, batch size (default 100 spans / 1s flush). |
+| O1.2 | Build `FerrosaTelemetryLayer` | L | Custom `tracing::Layer` that batches closed spans in a bounded channel and writes DIRECTLY to the storage engine (bypassing CQL parse/route/execute). **CRITICAL (OF1):** This eliminates the self-write feedback loop architecturally — observability writes never generate spans. Channel uses try_send; drops oldest on full with alerting. Cancel-safe. Configurable sample rate, batch size (default 100 spans / 1s flush). |
 | O1.3 | Configure telemetry subscriber in main.rs | M | Add `FerrosaTelemetryLayer` conditionally when `FERROSA_TELEMETRY_ENABLED=true`. Stack with existing fmt layer. |
 | O1.4 | Instrument CQL request lifecycle | M | `#[instrument]` on server accept, parse, route, execute — generates spans that flow into self-hosted storage |
 | O1.5 | Slow query table + threshold logging | S | Queries exceeding `FERROSA_SLOW_QUERY_THRESHOLD_MS` written to `system_observability.slow_queries` with trace_id link. **CRITICAL (OBS-T3):** Store parameterized form only (replace literals with `?`), never raw query text in CQL tables. |
@@ -454,9 +460,14 @@ The internode propagation requires a wire format change:
 ## Design Principles
 
 1. **Native first, enterprise export optional:** All observability is built into the ferrosa web console and CQL virtual tables. No external tools required. Enterprise customers optionally export via OTLP/Prometheus.
-2. **Trigger-preserving causality:** Every span shows the critical path of the triggering request, not background work attributed to it.
-3. **Contention visibility first:** Prioritize instrumenting lock contention, queue depths, and backpressure over exhaustive function tracing.
-4. **Coherent sampling:** Head-based, decided at CQL request entry. All spans within a sampled request are captured.
-5. **Backward-compatible wire format:** Trace context in internode frames is optional; old nodes ignore it.
-6. **Telemetry writes are best-effort:** If the telemetry endpoint is down or slow, spans are dropped silently. Telemetry never blocks the data path.
-7. **Standard CQL interface:** All telemetry is queryable via normal CQL SELECT. No proprietary query language. `ferrosa-dbaas` reads the same tables any CQL client can.
+2. **Write-path bypass, CQL read-path:** Observability table writes go directly to the storage layer — NOT through CQL parse/route/execute. This eliminates the self-write feedback loop architecturally (FMEA OF1, RPN 504). Reads happen via standard CQL `SELECT` against `system_observability.*` tables.
+3. **Trigger-preserving causality:** Every span shows the critical path of the triggering request, not background work attributed to it.
+4. **Contention visibility first:** Prioritize instrumenting lock contention, queue depths, and backpressure over exhaustive function tracing.
+5. **Coherent sampling:** Head-based, decided at CQL request entry. All spans within a sampled request are captured.
+6. **Homogeneous observability:** All nodes in a cluster have observability enabled or none do. Mixed observable/non-observable clusters are a non-goal. Trace context in internode frames is REQUIRED, not optional.
+7. **Cancel-safe, crash-proof:** All telemetry paths use try-send (non-blocking). Channel full → drop oldest with alerting. Bad/excessive monitoring MUST NEVER crash the node.
+8. **Signed billing data:** Billing records in `client_usage` are cryptographically signed by a key created by the DBaaS. Even DB admins cannot modify billing records. Non-repudiation for consumption billing.
+9. **Data-safe external export:** External OTLP export NEVER includes query text, data values, or any information that could compromise user data. Only operational metrics (latency, counts, error rates) and sanitized span names are exported. Query analysis is admin-only, on-system only.
+10. **High-security mode:** `FERROSA_HIGH_SECURITY_MODE=true` enables node ejection on detection of potentially malicious internode behavior (spoofed trace context, replay attacks).
+11. **Standard CQL interface:** All telemetry is queryable via normal CQL SELECT. No proprietary query language. `ferrosa-dbaas` reads the same tables any CQL client can.
+12. **Configurable billing path:** Billing endpoint is configurable separately from the telemetry endpoint (`FERROSA_BILLING_ENDPOINT`) since the DBaaS billing system may differ from the performance monitoring system.
