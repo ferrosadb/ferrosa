@@ -355,6 +355,11 @@ impl Segment {
     /// Uses incremental flush: only writes bytes since the last flush.
     /// Waits for all in-flight writers to complete before reading the buffer.
     pub fn flush_to_disk(&self) -> ferrosa_common::Result<()> {
+        let _span = tracing::info_span!(
+            "commitlog.sync",
+            segment_id = self.id,
+        )
+        .entered();
         // Snapshot position BEFORE waiting. This captures only data from
         // writers who have already allocated. New allocations after this
         // point will be flushed on the next call.
