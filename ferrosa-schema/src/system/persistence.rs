@@ -469,14 +469,16 @@ pub fn role_permissions_table_schema() -> TableSchema {
 
 /// Returns all system table schemas for registration at bootstrap.
 pub fn all_system_table_schemas() -> Vec<TableSchema> {
-    vec![
+    let mut schemas = vec![
         keyspaces_table_schema(),
         tables_table_schema(),
         columns_table_schema(),
         roles_table_schema(),
         role_members_table_schema(),
         role_permissions_table_schema(),
-    ]
+    ];
+    schemas.extend(super::observability::all_observability_table_schemas());
+    schemas
 }
 
 #[cfg(test)]
@@ -567,9 +569,9 @@ mod tests {
     }
 
     #[test]
-    fn all_system_table_schemas_returns_six() {
+    fn all_system_table_schemas_returns_nine() {
         let schemas = all_system_table_schemas();
-        assert_eq!(schemas.len(), 6);
+        assert_eq!(schemas.len(), 9);
         let names: Vec<_> = schemas.iter().map(|s| (&s.keyspace, &s.table)).collect();
         assert!(names.contains(&(&"system_schema".to_string(), &"keyspaces".to_string())));
         assert!(names.contains(&(&"system_schema".to_string(), &"tables".to_string())));
@@ -577,6 +579,9 @@ mod tests {
         assert!(names.contains(&(&"system_auth".to_string(), &"roles".to_string())));
         assert!(names.contains(&(&"system_auth".to_string(), &"role_members".to_string())));
         assert!(names.contains(&(&"system_auth".to_string(), &"role_permissions".to_string())));
+        assert!(names.contains(&(&"system_observability".to_string(), &"spans".to_string())));
+        assert!(names.contains(&(&"system_observability".to_string(), &"metrics".to_string())));
+        assert!(names.contains(&(&"system_observability".to_string(), &"slow_queries".to_string())));
     }
 
     // -- Task 4: SystemTableMutation tests --

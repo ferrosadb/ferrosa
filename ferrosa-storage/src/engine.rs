@@ -1094,6 +1094,44 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Writes a row to an observability table (system_observability.*).
+    ///
+    /// Same as `write()` but skips observer dispatch to prevent telemetry
+    /// writes from generating new tracing spans (feedback loop avoidance).
+    /// The table must already be registered via `register_table()`.
+    pub fn write_observability(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        row: Row,
+        timestamp: i64,
+    ) -> ferrosa_common::Result<()> {
+        // 1. Append to commit log for durability.
+        let mutation = Mutation::new(
+            table_id.keyspace.clone(),
+            table_id.table.clone(),
+            key.clone(),
+            vec![row.clone()],
+            timestamp,
+        );
+        let cl_pos = self.commit_log.append(&mutation)?;
+
+        // 2. Write to the table's memtable and track commit log position.
+        let tables = self.tables.read();
+        let state = tables.get(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state.store.write(key, row)?;
+        *state.last_commit_log_position.lock() = Some(cl_pos);
+        state
+            .first_unflushed_write_at
+            .lock()
+            .get_or_insert_with(std::time::Instant::now);
+
+        // Note: no observer dispatch — prevents telemetry feedback loops.
+        Ok(())
+    }
+
     /// Writes multiple rows to a table in a single call.
     ///
     /// Each mutation is (key, row, timestamp). Mutations are appended to the
@@ -6832,6 +6870,44 @@ mod tests {
         assert_eq!(
             missing, 0,
             "data loss: {missing}/{total} keys missing after concurrent write+flush+compact"
+        );
+    }
+
+    #[test]
+    fn write_observability_bypasses_cql() {
+        use ferrosa_schema::system::observability;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // Register the spans table.
+        let schema = observability::spans_table_schema();
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new(observability::KEYSPACE, "spans");
+        let key = make_key("trace-001");
+        let ts = 1_000_000i64;
+        let row = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8], // start_us = 1000
+            cells: vec![(0, CellValue::live(b"span-name".to_vec(), ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        };
+
+        // write_observability should succeed and be readable.
+        engine
+            .write_observability(&tid, &key, row, ts)
+            .expect("write_observability must succeed");
+
+        let partition = engine
+            .read(&tid, &key)
+            .expect("read must succeed")
+            .expect("partition must exist after write_observability");
+        assert_eq!(partition.key.key.as_bytes(), b"trace-001");
+        assert!(
+            !partition.rows.is_empty(),
+            "written row must be readable via standard read path"
         );
     }
 }
