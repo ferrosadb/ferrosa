@@ -6230,7 +6230,12 @@ mod tests {
         let mut opts = std::collections::HashMap::new();
         opts.insert("datacenter1".to_string(), "3".to_string());
         opts.insert("datacenter2".to_string(), "2".to_string());
-        create_test_keyspace(&state.schema, "test_multi_dc", "NetworkTopologyStrategy", opts);
+        create_test_keyspace(
+            &state.schema,
+            "test_multi_dc",
+            "NetworkTopologyStrategy",
+            opts,
+        );
         assert_eq!(keyspace_rf(&state.schema, "test_multi_dc"), 5);
     }
 

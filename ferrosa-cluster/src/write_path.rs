@@ -221,9 +221,17 @@ mod tests {
         let strategy = ReplicationStrategy::Simple {
             replication_factor: 1,
         };
-        WritePath::write(&wp, &table_id, &key, row, 1000, ConsistencyLevel::One, &strategy)
-            .await
-            .unwrap();
+        WritePath::write(
+            &wp,
+            &table_id,
+            &key,
+            row,
+            1000,
+            ConsistencyLevel::One,
+            &strategy,
+        )
+        .await
+        .unwrap();
 
         // Verify data was written
         let result = storage.read(&table_id, &key).unwrap();
