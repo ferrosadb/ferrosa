@@ -290,7 +290,7 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &StorageEngine) -> R
 /// [`Message::PairDdlAck`].  The leader runs a
 /// [`ClusterDdlForwardHandler`] that calls `execute_via_raft` locally —
 /// since the leader is the Raft leader, the proposal succeeds immediately.
-async fn forward_ddl_to_leader(
+pub(crate) async fn forward_ddl_to_leader(
     peer_manager: &PeerManager,
     leader_uuid: Uuid,
     op: DdlOperation,

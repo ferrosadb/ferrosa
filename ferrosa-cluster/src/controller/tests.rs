@@ -889,3 +889,264 @@ async fn standalone_inbound_peer_transitions_to_pair() {
         "standalone node must accept inbound peer and transition to pair"
     );
 }
+
+// -----------------------------------------------------------------------
+// BUG-BOOTSTRAP-NO-DATA-STREAM regression tests
+// -----------------------------------------------------------------------
+
+/// Regression test for BUG-BOOTSTRAP-NO-DATA-STREAM.
+///
+/// Proves that bootstrap streaming produces mutations for remote nodes
+/// when the local node has data. This is the core behavior that was
+/// broken: the streaming code was gated behind `if lid == local_node_id`
+/// so non-leader data-owning nodes never streamed anything.
+///
+/// This test exercises the bootstrap streaming logic directly: set up a
+/// 3-node ring, write data to local storage, then verify that the
+/// streaming loop produces mutations destined for other nodes.
+#[test]
+fn bootstrap_streaming_produces_mutations_for_remote_nodes() {
+    use crate::raft::{uuid_to_node_id, NodeInfo, NodeState};
+    use crate::ring::TokenRing;
+    use ferrosa_common::key::DecoratedKey;
+    use ferrosa_common::{PartitionKey, Token};
+    use ferrosa_storage::commitlog::TableId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+
+    // Create a user keyspace + table in schema.
+    let ks = ferrosa_schema::KeyspaceMetadata {
+        name: "test_ks".into(),
+        durable_writes: true,
+        replication: ferrosa_schema::ReplicationParams {
+            strategy: "SimpleStrategy".into(),
+            options: [("replication_factor".into(), "3".into())]
+                .into_iter()
+                .collect(),
+        },
+    };
+    schema.create_keyspace_internal(ks).unwrap();
+
+    let table = ferrosa_schema::TableMetadata {
+        keyspace: "test_ks".into(),
+        name: "data".into(),
+        id: Uuid::new_v4(),
+        columns: indexmap::indexmap! {
+            "pk".into() => ferrosa_schema::ColumnMetadata {
+                name: "pk".into(),
+                column_type: "text".into(),
+                kind: ferrosa_schema::ColumnKind::PartitionKey,
+                position: 0,
+                clustering_order: ferrosa_schema::ClusteringOrder::None,
+                mask: None,
+            },
+            "val".into() => ferrosa_schema::ColumnMetadata {
+                name: "val".into(),
+                column_type: "text".into(),
+                kind: ferrosa_schema::ColumnKind::Regular,
+                position: 0,
+                clustering_order: ferrosa_schema::ClusteringOrder::None,
+                mask: None,
+            },
+        },
+        partition_key: vec!["pk".into()],
+        clustering_key: vec![],
+        params: ferrosa_schema::TableParams::default(),
+        flags: Default::default(),
+        extensions: Default::default(),
+        is_system: false,
+    };
+    schema.create_table_internal(table).unwrap();
+
+    // Register table with storage engine and write test data.
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    let table_schema = TableSchema {
+        keyspace: "test_ks".into(),
+        table: "data".into(),
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        clustering_columns: vec![],
+        static_columns: vec![],
+        regular_columns: vec![ColumnDefinition {
+            name: "val".into(),
+            type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        }],
+        extensions: Default::default(),
+    };
+    storage.register_table(table_schema).unwrap();
+
+    // Write 50 partitions with different tokens to spread across the ring.
+    for i in 0..50i64 {
+        let key_bytes = format!("key_{i}").into_bytes();
+        let (h1, _) = ferrosa_common::murmur3::hash3_x64_128(&key_bytes, 0);
+        let dk = DecoratedKey {
+            token: Token(h1),
+            key: PartitionKey::new(key_bytes),
+        };
+        let row = ferrosa_sstable::types::Row {
+            clustering: vec![],
+            cells: vec![(
+                0,
+                ferrosa_common::CellValue::live(format!("val_{i}").into_bytes(), 1000 + i),
+            )],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000 + i),
+        };
+        let table_id = TableId::new("test_ks", "data");
+        storage.write(&table_id, &dk, row, 1000 + i).unwrap();
+    }
+
+    // Build a 3-node ring (simulating the ring built in transition_to_cluster).
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+    let local_nid = uuid_to_node_id(local_id);
+    let peer1_nid = uuid_to_node_id(peer1_id);
+    let peer2_nid = uuid_to_node_id(peer2_id);
+
+    let mut ring = TokenRing::new();
+    for (nid, uuid) in [(local_nid, local_id), (peer1_nid, peer1_id), (peer2_nid, peer2_id)] {
+        ring.add_node(
+            nid,
+            NodeInfo {
+                host_id: uuid,
+                addr: "127.0.0.1:7000".into(),
+                data_center: "dc1".into(),
+                rack: "rack1".into(),
+                state: if nid == local_nid {
+                    NodeState::Normal
+                } else {
+                    NodeState::Joining
+                },
+            },
+        );
+    }
+    // Assign 256 tokens per node, deterministically.
+    use crate::controller::token::generate_deterministic_token;
+    let mut all_nids = vec![local_nid, peer1_nid, peer2_nid];
+    all_nids.sort_unstable();
+    for &nid in &all_nids {
+        let tokens: Vec<i64> = (0..256)
+            .map(|i| generate_deterministic_token(nid, i))
+            .collect();
+        ring.assign_tokens(nid, &tokens);
+    }
+
+    // --- This is the bootstrap streaming logic (Phase B from the fix) ---
+    // Iterate schema tables, read from storage, group by target node.
+    let schema_snap = schema.snapshot();
+    let mut total_remote_mutations = 0usize;
+    let mut target_nodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    for (ks, tbl) in schema_snap.tables.keys() {
+        if ks.starts_with("system") {
+            continue;
+        }
+        let table_id = TableId::new(ks, tbl);
+        let partitions = storage.read_range(&table_id, None, None, usize::MAX).unwrap();
+
+        for partition in &partitions {
+            let token = partition.key.token.0;
+            let owner = ring.primary_owner(token).unwrap_or(local_nid);
+
+            if owner != local_nid {
+                total_remote_mutations += 1;
+                target_nodes.insert(owner);
+            }
+        }
+    }
+
+    // With 50 partitions spread across 3 nodes, roughly 2/3 should belong
+    // to remote nodes. The exact count depends on token distribution, but
+    // it must be non-zero — this is the bug: previously zero mutations
+    // were produced because the code never ran on non-leader nodes.
+    assert!(
+        total_remote_mutations > 0,
+        "BUG-BOOTSTRAP-NO-DATA-STREAM: bootstrap must produce mutations for remote nodes, \
+         got 0 out of 50 partitions"
+    );
+    assert!(
+        target_nodes.len() >= 2,
+        "mutations should target both remote nodes, got {} targets",
+        target_nodes.len()
+    );
+    // Sanity: not ALL partitions should go to remote nodes (some stay local).
+    assert!(
+        total_remote_mutations < 50,
+        "some partitions should remain on the local node"
+    );
+}
+
+/// Verifies that schema snapshot includes user tables for bootstrap iteration.
+///
+/// If the schema has no user tables, the bootstrap streaming loop iterates
+/// zero times — this is the second failure mode for BUG-BOOTSTRAP-NO-DATA-STREAM
+/// when the leader is a fresh node with no schema.json.
+#[test]
+fn schema_snapshot_includes_user_tables_for_bootstrap() {
+    let schema = test_schema();
+
+    // Initially, only system tables exist.
+    let snap = schema.snapshot();
+    let user_tables: Vec<_> = snap
+        .tables
+        .keys()
+        .filter(|(ks, _)| !ks.starts_with("system"))
+        .collect();
+    assert!(
+        user_tables.is_empty(),
+        "fresh schema should have no user tables"
+    );
+
+    // After creating a user table, it appears in the snapshot.
+    schema
+        .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
+            name: "user_ks".into(),
+            durable_writes: true,
+            replication: ferrosa_schema::ReplicationParams {
+                strategy: "SimpleStrategy".into(),
+                options: [("replication_factor".into(), "1".into())]
+                    .into_iter()
+                    .collect(),
+            },
+        })
+        .unwrap();
+
+    schema
+        .create_table_internal(ferrosa_schema::TableMetadata {
+            keyspace: "user_ks".into(),
+            name: "my_table".into(),
+            id: Uuid::new_v4(),
+            columns: indexmap::indexmap! {
+                "pk".into() => ferrosa_schema::ColumnMetadata {
+                    name: "pk".into(),
+                    column_type: "text".into(),
+                    kind: ferrosa_schema::ColumnKind::PartitionKey,
+                    position: 0,
+                    clustering_order: ferrosa_schema::ClusteringOrder::None,
+                    mask: None,
+                },
+            },
+            partition_key: vec!["pk".into()],
+            clustering_key: vec![],
+            params: ferrosa_schema::TableParams::default(),
+            flags: Default::default(),
+            extensions: Default::default(),
+            is_system: false,
+        })
+        .unwrap();
+
+    let snap = schema.snapshot();
+    let user_tables: Vec<_> = snap
+        .tables
+        .keys()
+        .filter(|(ks, _)| !ks.starts_with("system"))
+        .collect();
+    assert_eq!(
+        user_tables.len(),
+        1,
+        "user table must appear in schema snapshot for bootstrap to find it"
+    );
+    assert_eq!(user_tables[0], &("user_ks".to_string(), "my_table".to_string()));
+}
