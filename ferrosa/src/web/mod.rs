@@ -25,6 +25,8 @@
 
 pub mod api;
 pub mod auth;
+pub mod debug;
+pub mod observability;
 pub mod snapshots;
 pub mod static_files;
 pub mod ws;
@@ -76,6 +78,8 @@ pub struct WebAppState {
     /// Host UUID — used as the `node_id` when creating snapshots.
     pub host_id: uuid::Uuid,
     pub auth_disabled: bool,
+    /// Debug profiler state (shared mutex for single-session profiling).
+    pub debug: Option<debug::DebugState>,
 }
 
 impl FromRef<WebAppState> for Arc<VirtualTableRegistry> {
@@ -99,7 +103,9 @@ pub fn build_router(state: WebAppState) -> Router {
     let api = Router::new()
         .nest("/api", api::routes())
         .nest("/api", snapshots::snapshot_routes())
+        .nest("/api", observability::routes())
         .nest("/api/cluster", api::cluster_routes())
+        .nest("/api/debug", debug::debug_routes())
         .route("/api/ws", get(ws::ws_handler))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

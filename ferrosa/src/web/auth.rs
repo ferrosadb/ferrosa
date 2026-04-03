@@ -244,6 +244,7 @@ mod tests {
             storage,
             host_id,
             auth_disabled,
+            debug: None,
         };
 
         let router = Router::new()
