@@ -386,10 +386,10 @@ The internode propagation requires a wire format change:
 | # | Task | Size | Description |
 |---|------|------|-------------|
 | O1.1 | Create `system_observability` schema | S | Tables: `spans`, `metrics`, `slow_queries` — auto-created at startup like other system keyspaces |
-| O1.2 | Build `FerrosaTelemetryLayer` | L | Custom `tracing::Layer` that batches closed spans in a bounded channel and writes to ferrosa via `CqlClient`. Configurable endpoint, sample rate, batch size (default 100 spans / 1s flush). |
+| O1.2 | Build `FerrosaTelemetryLayer` | L | Custom `tracing::Layer` that batches closed spans in a bounded channel and writes to ferrosa via `CqlClient`. **CRITICAL (OF1):** Telemetry CQL writes MUST run under `tracing::dispatcher::with_default(no_op)` to prevent self-write feedback loop (RPN 504). Configurable endpoint, sample rate, batch size (default 100 spans / 1s flush). |
 | O1.3 | Configure telemetry subscriber in main.rs | M | Add `FerrosaTelemetryLayer` conditionally when `FERROSA_TELEMETRY_ENABLED=true`. Stack with existing fmt layer. |
 | O1.4 | Instrument CQL request lifecycle | M | `#[instrument]` on server accept, parse, route, execute — generates spans that flow into self-hosted storage |
-| O1.5 | Slow query table + threshold logging | S | Queries exceeding `FERROSA_SLOW_QUERY_THRESHOLD_MS` written to `system_observability.slow_queries` with trace_id link |
+| O1.5 | Slow query table + threshold logging | S | Queries exceeding `FERROSA_SLOW_QUERY_THRESHOLD_MS` written to `system_observability.slow_queries` with trace_id link. **CRITICAL (OBS-T3):** Store parameterized form only (replace literals with `?`), never raw query text in CQL tables. |
 | O1.6 | CQL request metrics (counter + histogram) | M | `ferrosa_cql_requests_total`, `ferrosa_cql_request_duration_seconds` — written to `metrics` table on configurable interval |
 
 ### O2: Cluster + Storage Spans
@@ -411,7 +411,7 @@ The internode propagation requires a wire format change:
 | O3.3 | Contention metrics | M | Memtable shard contention, transition guard hold time, S3 upload queue depth |
 | O3.4 | Network bandwidth metrics | S | `ferrosa_net_bytes_sent_total`, `ferrosa_net_bytes_received_total` by peer + lane |
 | O3.5 | In-flight RPC gauge | S | `ferrosa_net_rpc_inflight` per peer |
-| O3.6 | On-demand flame chart endpoint | M | `GET /api/debug/flamechart?seconds=N` — temporarily installs `tracing-flame` layer, captures span stacks, renders SVG via `inferno`. Zero overhead when not profiling. Auth-gated. |
+| O3.6 | On-demand flame chart endpoint | M | `GET /api/debug/flamechart?seconds=N` — temporarily installs `tracing-flame` layer, captures span stacks, renders SVG via `inferno`. Zero overhead when not profiling. **CRITICAL (OF3, OBS-T1):** Cap seconds to 60, BufWriter to 64 MB, mutex (1 concurrent), superuser auth, rate limit 1/5min. Strip sensitive attributes from output (OBS-T2). |
 
 ### O4: Native Web UI Panels
 
@@ -432,11 +432,11 @@ The internode propagation requires a wire format change:
 
 | # | Task | Size | Description |
 |---|------|------|-------------|
-| O5.1 | `client_usage` virtual table + per-request byte metering | M | Track `bytes_in`, `bytes_out`, `compute_us` per CQL request attributed to `client_address` + `keyspace`. Aggregate in 1-minute buckets. |
+| O5.1 | `client_usage` virtual table + per-request byte metering | M | Track `bytes_in`, `bytes_out`, `compute_us` per CQL request attributed to `client_address` + `keyspace`. Aggregate in 1-minute buckets. **CRITICAL (OF10):** Flush counters to commit log every 10s; replay on startup to recover partial buckets. |
 | O5.2 | `keyspace_storage` virtual table | M | Periodic scan of storage engine for per-keyspace/table disk + S3 byte totals. Refresh every 60s. |
 | O5.3 | `query_fingerprints` virtual table + AST extraction | L | On every CQL parse, extract parameterized fingerprint hash + column access patterns. Aggregate by fingerprint with count, avg latency, p99. Ring buffer of top 10k fingerprints. |
 | O5.4 | `column_access` virtual table | M | Accumulate per-column usage counters (in_select, in_where_eq, in_where_range, in_order_by) from parsed AST. |
-| O5.5 | `partition_hotspots` virtual table | M | Sample partition key hashes on read/write. Top-k (1000) by access count in a min-heap. Identify skewed access patterns. |
+| O5.5 | `partition_hotspots` virtual table | M | **CRITICAL (OF7):** Use count-min sketch (not naive sampling) for frequency estimation. Require minimum 1000 samples before reporting hot. Include confidence score in advisor output. |
 | O5.6 | `full_scan_reasons` virtual table | S | When `index.plan` chooses FullScan, record the predicate column + operator that caused it. Aggregate by column. |
 | O5.7 | `table_access_summary` virtual table | S | Derive from existing storage.read/write spans: point vs range vs full scan counts, read/write ratio. |
 | O5.8 | `s3_egress` virtual table with keyspace attribution | S | Add `keyspace` label to S3 upload spans, aggregate bytes by keyspace. |
