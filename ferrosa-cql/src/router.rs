@@ -530,11 +530,8 @@ async fn route_select(
             let rows: Vec<Vec<Option<CqlValue>>> = peers
                 .iter()
                 .map(|p| {
-                    let tokens_set: Vec<CqlValue> = p
-                        .tokens
-                        .iter()
-                        .map(|t| CqlValue::Text(t.clone()))
-                        .collect();
+                    let tokens_set: Vec<CqlValue> =
+                        p.tokens.iter().map(|t| CqlValue::Text(t.clone())).collect();
                     vec![
                         Some(CqlValue::Inet(p.peer)),
                         Some(CqlValue::Int(p.peer_port as i32)),

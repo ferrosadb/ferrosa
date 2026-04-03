@@ -576,9 +576,7 @@ mod tests {
             let tokens_col = peer_cols
                 .iter()
                 .find(|r| r.column_name == "tokens")
-                .unwrap_or_else(|| {
-                    panic!("system.{table} must have a 'tokens' column")
-                });
+                .unwrap_or_else(|| panic!("system.{table} must have a 'tokens' column"));
             assert_eq!(tokens_col.column_type, "set<varchar>");
             assert_eq!(tokens_col.kind, "regular");
         }

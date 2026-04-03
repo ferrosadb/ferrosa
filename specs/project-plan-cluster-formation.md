@@ -46,7 +46,7 @@ Implement the cluster formation state machine as specified in `specs/cluster-for
 | 1.10 | Add transition lock (CAS or mutex) for mode changes | S | Hazard P1-3, CF-T6 | Unit: concurrent transitions don't double-fire | `ArcSwap::compare_and_swap` or dedicated transition lock |
 | 1.11 | ClusterInvite: dedup by initiator + epoch, rate limit, independent handshake validation | M | CF-T1, CF-T2, CF-T3 | Unit: poisoned invite rejected; duplicate ignored; rate > 5/min rejected | Invite format includes epoch counter; peers validated via mTLS before trust |
 | 1.12 | Freeze peer list on entering Forming — only seed calls Raft::initialize() | M | CF-T15, CF-T17 | Unit: late arrivals not in initial membership; only 1 node calls initialize() | Canonical sorted membership from ClusterInvite; other nodes wait for AppendEntries |
-| 1.13 | FERROSA_CLUSTER_MODE=pair enforcement (reject 3rd peer) | S | CF-T4 | Unit: pair mode rejects additional peer connections | Config guard in on_peer_connected |
+| ~~1.13~~ | ~~FERROSA_CLUSTER_MODE=pair enforcement~~ | — | — | — | **Removed** — `FERROSA_CLUSTER_MODE` config was removed (commit 83943a5). Progressive state machine is the only supported mode. |
 
 **Sprint 1 Definition of Done:**
 - `cargo test -p ferrosa-cluster` passes

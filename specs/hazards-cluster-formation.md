@@ -38,6 +38,12 @@
 
 **Most critical:** L950 spawns the entire Raft initialization (~150 lines). If this panics, the node appears to be in Cluster mode but has no functioning Raft instance. Writes will silently fail or hang.
 
+**Partial mitigation:** The LazyRaft pattern (commit 7b057b0) partially addresses
+the Raft init spawn by synchronizing handler readiness — Raft RPC handlers are
+registered before the async init task is spawned, so handler registration is no
+longer dependent on the spawned task completing. The spawned task itself is still
+fire-and-forget.
+
 **Fix:** Store `JoinHandle`s, use `tokio::task::JoinSet`, or at minimum add `.instrument()` tracing and panic hooks.
 
 ### P1-3: Race Between on_peer_connected and transition_to_cluster

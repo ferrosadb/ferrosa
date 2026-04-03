@@ -10,12 +10,12 @@
 |----|-----------|-------------|--------|-----|-----|-----|-----|
 | F3 | T3 Forming→Cluster | DDL race during Forming window — DDL via Direct path never reaches followers | Schema divergence: leader has tables followers lack. Writes to those tables fail silently on followers. | 9 | 6 | 7 | **378** |
 | F5 | T2/T3 | Missing reverse outbound pools for late peers — Raft init proceeds without waiting | Raft AppendEntries fails to unconnected peers. Quorum may not form. Schema replay silently drops. | 8 | 7 | 5 | **280** |
-| F1 | T2 Pair→Forming | No ClusterInvite — non-seed nodes never discover each other | Nodes stuck in Pair. Raft can't form quorum. Cluster is non-functional. | 9 | 10 | 3 | **270** |
+| F1 | T2 Pair→Forming | ClusterInvite not received — non-seed nodes fail to discover each other | Nodes stuck in Pair. Raft can't form quorum. Cluster is non-functional. **Partially mitigated:** ClusterInvite now sent on Data lane with 10-attempt retry (808b72b), and ClusterInvite handler triggers cluster transition on receiving nodes (ba7599a). Remaining risk: all 10 retries fail under sustained network partition. | 9 | 4 | 3 | **108** |
 | F2 | T2 Pair→Forming | No Forming state — jumps Pair→Cluster. If pool not ready, Raft fails. | Raft init hangs. DDL on Direct forever. Cluster appears formed but inoperable. | 8 | 8 | 4 | **256** |
 | F6 | T2/T3 | No Forming→Pair fallback — 3rd node disconnects, seed stuck in Cluster with no quorum | Permanent Raft quorum loss. Writes fail indefinitely. Requires operator restart. | 8 | 4 | 8 | **256** |
 | F4 | T5a Decommission | No data streaming before removal — LeaveNode via Raft but data not transferred | Token ranges unavailable. Unflushed data permanently lost. | 10 | 5 | 5 | **250** |
 | F13 | T6c Quorum Lost | Surviving node serves stale reads with no client-visible warning | Clients read stale data believing current. Application consistency violations. | 7 | 4 | 7 | **196** |
-| F20 | T1/T2/T3 | PairSchemaSync arrives before handler registered (race with sleep-based timing) | Schema sync dropped. Secondary starts with empty schema. Writes fail. | 7 | 4 | 7 | **196** |
+| F20 | T1/T2/T3 | PairSchemaSync arrives before handler registered (race with sleep-based timing) | Schema sync dropped. Secondary starts with empty schema. Writes fail. **Mitigated:** LazyRaft pattern (7b057b0) registers Raft handlers before async init, eliminating the handler registration race for Raft messages. PairSchemaSync handler registration timing is also improved. | 7 | 2 | 4 | **56** |
 | F7 | T4 Add Member | Approval check outside Raft proposal — TOCTOU race | Unapproved node's JoinNode committed to Raft. Security boundary violated. | 7 | 3 | 9 | **189** |
 | F10 | T3 Forming→Cluster | Node crash during Raft init — between mode swap and Raft::new | Ghost member in Raft membership. Other nodes can't reach it. Prevents quorum. | 9 | 3 | 7 | **189** |
 | F9 | T1 Standalone→Pair | Reverse outbound pool fails (500ms delay, single attempt, no retry) | Primary can't send PairSchemaSync. Silent schema divergence. | 7 | 4 | 6 | **168** |
@@ -48,11 +48,14 @@ Reverse pool creation at L760-778 is fire-and-forget. Raft init at L950 proceeds
 
 **Fix:** `PeerManager::wait_for_peer(host_id, timeout)` before Raft init.
 
-### CRITICAL-3: No ClusterInvite Message (F1, RPN=270)
+### CRITICAL-3: ClusterInvite Delivery (F1, RPN=270 -> 108)
 
-No `Message::ClusterInvite` variant exists. Hub-and-spoke topology → non-seed nodes never discover each other → cluster formation broken.
+**Partially mitigated.** ClusterInvite is now implemented and sent on the Data lane
+with a 10-attempt retry loop (808b72b). The ClusterInvite handler triggers cluster
+transition on receiving nodes (ba7599a). Remaining risk: all 10 retries fail under
+sustained network partition.
 
-**Fix:** Implement ClusterInvite / ClusterInviteAck as specified.
+**Remaining fix:** Persistent retry or operator-triggered re-invite for partition scenarios.
 
 ### CRITICAL-4: No Forming State + No Fallback (F2+F6, RPN=256)
 

@@ -172,15 +172,26 @@ sequenceDiagram
     N2->>N2: Pair → Forming
     N3->>N3: Pair → Forming
 
-    Note over N1,N3: Phase 4: Raft Init
+    Note over N1,N3: Phase 4: Handler Registration + ClusterInvite
+    N1->>N1: Register Raft handlers via LazyRaft (before async init)
+    N2->>N2: Register Raft handlers via LazyRaft
+    N3->>N3: Register Raft handlers via LazyRaft
+    N1->>N2: ClusterInvite on Data lane (10-attempt retry)
+    N1->>N3: ClusterInvite on Data lane (10-attempt retry)
+
+    Note over N1,N3: Phase 5: Raft Init
     N1->>N1: Raft::initialize([N1, N2, N3])
     N2->>N2: Raft::initialize([N1, N2, N3])
     N3->>N3: Raft::initialize([N1, N2, N3])
     N1-->>N2: RaftVote (N1 wins — was primary)
     N1-->>N3: RaftVote
     N1->>N1: Forming → Cluster (leader)
-    N1->>N2: schema replay via Raft
-    N1->>N3: schema replay via Raft
+
+    Note over N1,N3: Phase 6: Bootstrap (A/B/C)
+    N1->>N2: Phase A: schema replay via Raft
+    N1->>N3: Phase A: schema replay via Raft
+    Note over N1,N3: Phase B: all nodes stream local data to new token owners
+    N1->>N1: Phase C: propose Joining → Normal for all nodes
     N2->>N2: Forming → Cluster (follower)
     N3->>N3: Forming → Cluster (follower)
 ```
@@ -230,15 +241,15 @@ The orchestrator. Implements `PeerEventListener` (from ferrosa-net) and `Inbound
 | `on_peer_disconnected` | 1251-1266 | PeerManager callback | Pair→Degraded, Cluster→Raft handles |
 | `transition_to_pair` | 536-730 | 1st peer | Create PairCoordinator, swap WritePath/DdlPath |
 | `transition_to_forming` | NEW | 2nd peer or ClusterInvite | Broadcast ClusterInvite, start mesh formation |
-| `transition_to_cluster` | 741-1105 | All peers connected + Raft ready | Init Raft, TokenRing, ClusterCoordinator |
+| `transition_to_cluster` | 741-1105 | All peers connected + Raft ready | Register handlers via LazyRaft, deliver ClusterInvite on Data lane, init Raft, TokenRing, ClusterCoordinator |
 | `force_promote` | 489-504 | Operator command | Emergency: Degraded_Pair → Standalone primary |
 | `switchover` | 509-534 | Operator command | Swap Primary/Secondary roles |
 | `trigger_cluster_join` | 1112-1192 | Peer connects in Cluster mode | Propose JoinNode + AssignTokens via Raft |
 
-### ClusterInvite Protocol (NEW — not yet implemented)
+### ClusterInvite Protocol
 
 ```rust
-// ferrosa-net/src/message.rs — new variants
+// ferrosa-net/src/message.rs
 Message::ClusterInvite {
     initiator: Uuid,
     peers: Vec<(Uuid, SocketAddr)>,
@@ -248,10 +259,28 @@ Message::ClusterInviteAck {
 }
 ```
 
+**Delivery:** ClusterInvite is sent on the **Data lane** (not the Raft lane) with
+a 10-attempt retry loop, **synchronously before Raft init starts** (commits
+808b72b, 30768c0). This ensures the invite is delivered even when Raft handlers
+are not yet registered on the receiving node.
+
 **Handler logic:**
-1. For each peer in invite not already connected: initiate `PriorityPool::connect()`
-2. If connected_peers ≥ 2: transition to Forming
-3. Re-broadcast ClusterInvite to newly connected peers (propagation guarantee)
+1. ClusterInvite handler triggers cluster transition on receiving nodes (commit ba7599a)
+2. For each peer in invite not already connected: initiate `PriorityPool::connect()`
+3. If connected_peers >= 2: transition to Forming
+4. Re-broadcast ClusterInvite to newly connected peers (propagation guarantee)
+
+### Bootstrap Phases (all nodes)
+
+After Raft leader election, bootstrap streaming runs on ALL nodes in 3 phases:
+
+- **Phase A — Schema convergence:** Leader replays local schema state through Raft.
+  Non-leaders replay schema via `PairDdlForward` to ensure DDL applied during
+  the Pair/Direct window is captured on all nodes.
+- **Phase B — Data streaming:** ALL nodes stream their local data to the new
+  token owners based on the initial token ring assignment.
+- **Phase C — Leader promotes:** Leader proposes state changes from `Joining`
+  to `Normal` for all nodes via Raft.
 
 ### Role Assignment
 
@@ -316,12 +345,14 @@ Message::ClusterInviteAck {
 
 ### ADR-3: ClusterInvite with Propagation
 
-**Decision:** Add `ClusterInvite` message type with mandatory re-broadcast to newly discovered peers.
+**Decision:** Add `ClusterInvite` message type with mandatory re-broadcast to newly discovered peers. Deliver on Data lane with 10-attempt retry, synchronously before Raft init.
 
-**Context:** In hub-and-spoke topology (single seed), non-seed nodes never discover each other. The invite propagates the full peer list transitively.
+**Context:** In hub-and-spoke topology (single seed), non-seed nodes never discover each other. The invite propagates the full peer list transitively. Sending on the Raft lane failed because Raft handlers may not be registered on the receiving node yet (commit 808b72b). Delivering synchronously before Raft init (commit 30768c0) ensures the invite arrives before any Raft traffic.
 
 **Consequences:**
-- New `MsgType::ClusterInvite` and `MsgType::ClusterInviteAck` in ferrosa-net codec
-- New handler registered in ModeController during Forming state
+- `MsgType::ClusterInvite` and `MsgType::ClusterInviteAck` in ferrosa-net codec
+- Handler registered in ModeController; triggers cluster transition on receiving nodes (commit ba7599a)
+- Sent on Data lane (not Raft lane) with 10-attempt retry loop
+- Delivered synchronously before Raft init starts
 - Convergence: all nodes eventually know all peers (bounded by peer count)
-- DoS risk: attacker could send large peer lists → mitigate with max_peers config + cluster name validation
+- DoS risk: attacker could send large peer lists -> mitigate with max_peers config + cluster name validation
