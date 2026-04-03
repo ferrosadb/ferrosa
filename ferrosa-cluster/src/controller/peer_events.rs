@@ -89,6 +89,9 @@ impl PeerEventListener for ModeController {
             peers.retain(|(id, _)| *id != host_id);
         }
 
+        // Hold the transition guard to prevent a disconnect handler from racing
+        // with a connect handler during mode transition.
+        let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
         match current_mode {
             DeploymentMode::Pair => {
