@@ -31,9 +31,9 @@ use ferrosa_storage::TableId;
 use crate::error::{ClusterError, Result};
 
 use super::{
-    compute_checksum, sstable_transfer::SSTableAssembler, StreamChunkPayload, StreamEndPayload,
-    StreamStartPayload, StreamedMutation, SstableStreamChunkPayload, SstableStreamEndPayload,
-    SstableStreamStartPayload,
+    compute_checksum, sstable_transfer::SSTableAssembler, SstableStreamChunkPayload,
+    SstableStreamEndPayload, SstableStreamStartPayload, StreamChunkPayload, StreamEndPayload,
+    StreamStartPayload, StreamedMutation,
 };
 
 // ---------------------------------------------------------------------------
@@ -254,11 +254,12 @@ impl SstableStreamSession {
         self.hasher.update(&chunk.data);
         self.bytes_received += chunk.data.len() as u64;
 
-        self.assembler.add_chunk(super::sstable_transfer::FileChunk {
-            component_name: chunk.component,
-            offset: chunk.offset,
-            data: chunk.data,
-        });
+        self.assembler
+            .add_chunk(super::sstable_transfer::FileChunk {
+                component_name: chunk.component,
+                offset: chunk.offset,
+                data: chunk.data,
+            });
 
         Ok(())
     }
@@ -290,9 +291,10 @@ impl SstableStreamSession {
         }
 
         // Write files to disk.
-        let written_files = self.assembler.write_all().map_err(|e| {
-            ClusterError::Internal(format!("sstable_stream: write files: {e}"))
-        })?;
+        let written_files = self
+            .assembler
+            .write_all()
+            .map_err(|e| ClusterError::Internal(format!("sstable_stream: write files: {e}")))?;
 
         tracing::info!(
             session_id = self.start.session_id,

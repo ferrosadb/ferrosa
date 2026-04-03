@@ -22,9 +22,9 @@ use ferrosa_net::peer::PeerManager;
 use crate::error::{ClusterError, Result};
 
 use super::{
-    batch_mutations, compute_checksum, sstable_transfer, StreamChunkPayload, StreamConfig,
-    StreamEndPayload, StreamStartPayload, StreamedMutation, SstableStreamChunkPayload,
-    SstableStreamEndPayload, SstableStreamStartPayload,
+    batch_mutations, compute_checksum, sstable_transfer, SstableStreamChunkPayload,
+    SstableStreamEndPayload, SstableStreamStartPayload, StreamChunkPayload, StreamConfig,
+    StreamEndPayload, StreamStartPayload, StreamedMutation,
 };
 
 /// Parameters for an SSTable file-based streaming request.
@@ -255,9 +255,8 @@ impl StreamSender {
             components: components.clone(),
             total_bytes,
         };
-        let start_bytes = bincode::serialize(&start).map_err(|e| {
-            ClusterError::Internal(format!("sstable_stream: serialise start: {e}"))
-        })?;
+        let start_bytes = bincode::serialize(&start)
+            .map_err(|e| ClusterError::Internal(format!("sstable_stream: serialise start: {e}")))?;
         peer_manager
             .send(
                 peer_id,
@@ -274,10 +273,7 @@ impl StreamSender {
         for component in &components {
             let file_path = sstable_dir.join(&component.name);
             let data = std::fs::read(&file_path).map_err(|e| {
-                ClusterError::Internal(format!(
-                    "sstable_stream: read {}: {e}",
-                    file_path.display()
-                ))
+                ClusterError::Internal(format!("sstable_stream: read {}: {e}", file_path.display()))
             })?;
 
             let mut offset = 0u64;
@@ -314,9 +310,8 @@ impl StreamSender {
             total_bytes: bytes_sent,
             checksum,
         };
-        let end_bytes = bincode::serialize(&end).map_err(|e| {
-            ClusterError::Internal(format!("sstable_stream: serialise end: {e}"))
-        })?;
+        let end_bytes = bincode::serialize(&end)
+            .map_err(|e| ClusterError::Internal(format!("sstable_stream: serialise end: {e}")))?;
         peer_manager
             .send(
                 peer_id,

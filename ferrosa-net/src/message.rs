@@ -549,9 +549,7 @@ impl Message {
             MsgType::SstableStreamChunk => {
                 Self::SstableStreamChunk(body.split_to(body.remaining()))
             }
-            MsgType::SstableStreamEnd => {
-                Self::SstableStreamEnd(body.split_to(body.remaining()))
-            }
+            MsgType::SstableStreamEnd => Self::SstableStreamEnd(body.split_to(body.remaining())),
             MsgType::PairWriteForward => Self::PairWriteForward(body.split_to(body.remaining())),
             MsgType::PairWriteAck => Self::PairWriteAck(body.split_to(body.remaining())),
             MsgType::PairCatchUpResponse => {
