@@ -473,17 +473,23 @@ impl ClusterCoordinator {
                     }
                     (Some(newer_partition), stale)
                 } else {
-                    // Re-fetch failed -- return what we have, repair mismatched remotes.
+                    // Re-fetch failed — we know a newer version exists but
+                    // cannot retrieve it. Returning stale data here would
+                    // violate linearizability (a write visible on one replica
+                    // becomes invisible to a subsequent read). Return an error
+                    // so the client retries rather than seeing stale state.
                     tracing::warn!(
                         table = %table_id,
-                        "full re-fetch from newer replica failed; returning stale data"
+                        full_ts,
+                        newest_remote_ts,
+                        "full re-fetch from newer replica failed; refusing to return stale data"
                     );
-                    let stale: Vec<uuid::Uuid> = digest_responses
-                        .iter()
-                        .filter(|(d, _, _)| *d != full_d)
-                        .filter_map(|(_, _, h)| *h)
-                        .collect();
-                    (full_partition.clone(), stale)
+                    return Err(ClusterError::ReadTimeout {
+                        consistency: cl.to_string(),
+                        received,
+                        required,
+                        data_present: true,
+                    });
                 }
             } else {
                 (full_partition.clone(), vec![])
@@ -498,25 +504,20 @@ impl ClusterCoordinator {
             (full_partition.clone(), stale)
         };
 
-        // Spawn async fire-and-forget repair task.
+        // Send repair writes to stale replicas. Awaited inline so that
+        // the repair completes before the coordinator returns. This prevents
+        // a race where a subsequent read through a different replica sees
+        // stale data because the repair hasn't landed yet.
         if !stale_host_ids.is_empty() {
             if let Some(ref partition) = result_partition {
-                let peer_mgr = self.peer_manager.clone();
-                let metrics = self.repair_metrics.clone();
-                let repair_table_id = table_id.clone();
-                let repair_partition = partition.clone();
-                let stale = stale_host_ids;
-
-                tokio::spawn(async move {
-                    send_repair_writes(
-                        &peer_mgr,
-                        &metrics,
-                        &repair_table_id,
-                        &repair_partition,
-                        &stale,
-                    )
-                    .await;
-                });
+                send_repair_writes(
+                    &self.peer_manager,
+                    &self.repair_metrics,
+                    table_id,
+                    partition,
+                    &stale_host_ids,
+                )
+                .await;
             }
         }
 

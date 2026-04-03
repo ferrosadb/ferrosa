@@ -155,6 +155,10 @@ impl ClusterCoordinator {
         // Hints ensure replay can fix the divergence without waiting for
         // anti-entropy repair. When zero replicas ACK'd the mutation is
         // still recorded as a hint so it can be replayed when nodes recover.
+        //
+        // Hint store failures are logged as errors (not warnings) so they
+        // are visible in monitoring. The write still proceeds — hint loss
+        // means anti-entropy repair must eventually fix divergence.
         if !failed_replicas.is_empty() {
             if let Some(ref hint_store) = self.hint_store {
                 let hint_row = body.to_vec();
@@ -168,12 +172,18 @@ impl ClusterCoordinator {
                         hint_row.clone(),
                         timestamp,
                     ) {
-                        tracing::warn!(
+                        tracing::error!(
                             peer = %peer_id,
-                            "failed to store hint for replica: {e}"
+                            %e,
+                            "hint store failed — divergent replica will require anti-entropy repair"
                         );
                     }
                 }
+            } else {
+                tracing::error!(
+                    failed_count = failed_replicas.len(),
+                    "no hint store available — divergent replicas will require anti-entropy repair"
+                );
             }
         }
 

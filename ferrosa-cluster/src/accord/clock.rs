@@ -87,8 +87,15 @@ pub struct ClockValidator {
 
 impl Default for ClockValidator {
     fn default() -> Self {
+        // Allow override via FERROSA_CLOCK_MAX_SKEW_SECS for test harnesses
+        // (e.g., Jepsen) that may introduce clock drift. Default 5s matches
+        // the Accord spec's recommended upper bound for NTP drift.
+        let secs = std::env::var("FERROSA_CLOCK_MAX_SKEW_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5);
         Self {
-            max_skew: Duration::from_secs(5),
+            max_skew: Duration::from_secs(secs),
         }
     }
 }
