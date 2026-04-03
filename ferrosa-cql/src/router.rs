@@ -1030,6 +1030,8 @@ async fn route_select_user_table(
         &state.schema,
     );
 
+    let read_strategy = keyspace_strategy(&state.schema, ks);
+
     let rows = if let Ok(pk_values) = pk_result {
         // PK present — single partition lookup
         let pk_types: Vec<CqlType> = table_meta
@@ -1038,7 +1040,12 @@ async fn route_select_user_table(
             .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
             .collect::<Result<Vec<_>, _>>()?;
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-        let mut pk_rows = match state.engine.read(&table_id, &decorated_key)? {
+        let mut pk_rows = match state
+            .write_path
+            .load()
+            .pk_read(&table_id, &decorated_key, ctx.consistency, &read_strategy)
+            .await?
+        {
             Some(partition) => bridge::partition_to_rows(
                 &partition,
                 &all_col_names,
