@@ -86,6 +86,19 @@ pub(super) struct PairContext {
     pub(super) peer_addr: SocketAddr,
 }
 
+/// Maximum number of tracked connected peers. Well beyond any realistic
+/// single-DC cluster — exceeding this indicates a bug or DoS.
+const MAX_CONNECTED_PEERS: usize = 1000;
+
+/// Maximum number of pending join requests tracked simultaneously.
+const MAX_PENDING_JOINS: usize = 100;
+
+/// Maximum number of seen invite initiators per formation epoch.
+/// Used by [`ModeController::record_invite_initiator`] when invite
+/// deduplication is wired in.
+#[allow(dead_code)]
+const MAX_SEEN_INVITE_INITIATORS: usize = 100;
+
 /// Manages deployment mode transitions at runtime.
 ///
 /// Created at startup with standalone mode. When peers connect/disconnect,
@@ -141,6 +154,7 @@ pub struct ModeController {
     /// Used to reject stale ClusterInvite messages from previous formation attempts.
     pub(super) formation_epoch: std::sync::atomic::AtomicU64,
     /// Initiators already seen in this formation epoch. Deduplicates invites.
+    /// Capped at [`MAX_SEEN_INVITE_INITIATORS`].
     pub(super) seen_invite_initiators: Mutex<BTreeSet<Uuid>>,
     /// Tracks all spawned background tasks. Replaces fire-and-forget spawns
     /// so panics are detected and tasks can be cancelled on shutdown.
@@ -152,6 +166,13 @@ pub struct ModeController {
     /// Used for quorum calculations instead of the dynamic connected count
     /// to prevent false quorum restoration after network partitions.
     pub(super) committed_cluster_size: AtomicUsize,
+    /// Receiver for DDL operations queued during Forming state.
+    /// Created in `transition_to_forming`, drained after Raft leader election.
+    pub(super) ddl_queue_rx: Arc<
+        parking_lot::Mutex<
+            Option<tokio::sync::mpsc::UnboundedReceiver<crate::pair::ddl::DdlOperation>>,
+        >,
+    >,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -232,6 +253,7 @@ impl ModeController {
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
+            ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
         });
 
         let handles = ModeControllerHandles {
@@ -285,6 +307,7 @@ impl ModeController {
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
+            ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 
@@ -338,6 +361,7 @@ impl ModeController {
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
+            ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 
@@ -462,6 +486,30 @@ impl ModeController {
     /// without going through a full peer-connection lifecycle.
     pub fn set_token_ring(&self, ring: Arc<TokenRing>) {
         self.ring.store(Arc::new(Some(ring)));
+    }
+
+    /// Record an invite initiator, returning `true` if it was newly inserted.
+    ///
+    /// Enforces [`MAX_SEEN_INVITE_INITIATORS`] — if the set is at capacity the
+    /// smallest UUID is evicted and a warning is logged.
+    ///
+    /// Ready for use when invite deduplication logic is wired in.
+    #[allow(dead_code)]
+    pub(super) fn record_invite_initiator(&self, initiator: Uuid) -> bool {
+        let mut set = self.seen_invite_initiators.lock();
+        if set.contains(&initiator) {
+            return false;
+        }
+        if set.len() >= MAX_SEEN_INVITE_INITIATORS {
+            tracing::warn!(
+                cap = MAX_SEEN_INVITE_INITIATORS,
+                "seen_invite_initiators at capacity — evicting oldest entry"
+            );
+            if let Some(&first) = set.iter().next() {
+                set.remove(&first);
+            }
+        }
+        set.insert(initiator)
     }
 
     /// Return a reference to the shared hint store.

@@ -45,12 +45,14 @@ pub enum DdlPath {
         /// the same up-to-date mapping without a separate sync mechanism.
         node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
     },
-    /// Blocked: cluster formation in progress (Forming state).
+    /// Forming: cluster formation in progress.
     ///
-    /// DDL is rejected because the node has left Pair mode but Raft has not
-    /// yet elected a leader.  Any DDL applied now would use `Direct` path
-    /// and never replicate, causing silent schema divergence (FMEA F3).
-    Blocked,
+    /// DDL operations are queued and replayed after Raft leader election
+    /// in `transition_to_cluster`. The client receives a retriable error
+    /// so it can retry after formation completes (FMEA F3).
+    Forming {
+        queue: tokio::sync::mpsc::UnboundedSender<DdlOperation>,
+    },
     /// Degraded: peer lost, DDL rejected until operator promotes.
     Unavailable,
 }
@@ -115,10 +117,16 @@ impl DdlPath {
                     Err(other) => Err(other),
                 }
             }
-            Self::Blocked => Err(ClusterError::Internal(
-                "DDL unavailable: cluster formation in progress, retry after Raft leader election"
-                    .into(),
-            )),
+            Self::Forming { queue } => {
+                // Queue the operation for replay after leader election.
+                // Still return an error to the client so they know to retry
+                // (the DDL will be applied automatically but the client can't
+                // observe the result until formation completes).
+                let _ = queue.send(op);
+                Err(ClusterError::Internal(
+                    "DDL unavailable: cluster formation in progress, will be applied after leader election — retry shortly".into(),
+                ))
+            }
             Self::Unavailable => Err(ClusterError::Internal(
                 "DDL unavailable: peer lost, wait for operator action".into(),
             )),
@@ -860,15 +868,22 @@ mod tests {
     /// because openraft's `Raft::new` is async and needs a running cluster.
     /// We verify the message-type guard in the handler at the codec level.
     #[tokio::test]
-    async fn test_blocked_ddl_path_returns_error() {
-        let ddl = DdlPath::Blocked;
-        let op = DdlOperation::CreateKeyspace(simple_keyspace("should_fail"));
+    async fn test_forming_ddl_path_queues_and_returns_error() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ddl = DdlPath::Forming { queue: tx };
+        let op = DdlOperation::CreateKeyspace(simple_keyspace("should_queue"));
         let err = ddl.execute(op).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("formation in progress"),
-            "Blocked error must mention 'formation in progress', got: {msg}"
+            "Forming error must mention 'formation in progress', got: {msg}"
         );
+        // Verify the operation was queued
+        let queued = rx.try_recv().expect("DDL should be queued");
+        match queued {
+            DdlOperation::CreateKeyspace(ks) => assert_eq!(ks.name, "should_queue"),
+            other => panic!("expected CreateKeyspace, got: {other:?}"),
+        }
     }
 
     #[test]

@@ -21,6 +21,8 @@
 //! normal writes. This means the commit log and memtable both receive each
 //! mutation, providing the same durability guarantees.
 
+use std::path::PathBuf;
+
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::{PartitionKey, Token};
 use ferrosa_storage::engine::StorageEngine;
@@ -29,7 +31,9 @@ use ferrosa_storage::TableId;
 use crate::error::{ClusterError, Result};
 
 use super::{
-    compute_checksum, StreamChunkPayload, StreamEndPayload, StreamStartPayload, StreamedMutation,
+    compute_checksum, sstable_transfer::SSTableAssembler, SstableStreamChunkPayload,
+    SstableStreamEndPayload, SstableStreamStartPayload, StreamChunkPayload, StreamEndPayload,
+    StreamStartPayload, StreamedMutation,
 };
 
 // ---------------------------------------------------------------------------
@@ -209,6 +213,164 @@ impl StreamReceiver {
             )));
         }
 
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSTable file-based streaming receiver
+// ---------------------------------------------------------------------------
+
+/// Summary produced when an SSTable streaming session completes.
+#[derive(Debug)]
+pub struct SstableStreamResult {
+    pub session_id: u64,
+    /// Paths of all component files written to disk.
+    pub written_files: Vec<PathBuf>,
+    /// Total bytes received and written.
+    pub total_bytes: u64,
+}
+
+/// In-progress SSTable streaming session.
+pub struct SstableStreamSession {
+    pub(crate) start: SstableStreamStartPayload,
+    pub(crate) assembler: SSTableAssembler,
+    /// Running CRC32 hasher — fed chunk data in receive order.
+    pub(crate) hasher: crc32fast::Hasher,
+    /// Running count of bytes received.
+    pub(crate) bytes_received: u64,
+}
+
+impl SstableStreamSession {
+    /// Accept one `SstableStreamChunk`.
+    pub fn apply_chunk(&mut self, chunk: SstableStreamChunkPayload) -> Result<()> {
+        if chunk.session_id != self.start.session_id {
+            return Err(ClusterError::Internal(format!(
+                "sstable_stream: session_id mismatch: expected {}, got {}",
+                self.start.session_id, chunk.session_id
+            )));
+        }
+
+        self.hasher.update(&chunk.data);
+        self.bytes_received += chunk.data.len() as u64;
+
+        self.assembler
+            .add_chunk(super::sstable_transfer::FileChunk {
+                component_name: chunk.component,
+                offset: chunk.offset,
+                data: chunk.data,
+            });
+
+        Ok(())
+    }
+
+    /// Validate `SstableStreamEnd` and write all component files to disk.
+    pub fn finish(self, end: SstableStreamEndPayload) -> Result<SstableStreamResult> {
+        if end.session_id != self.start.session_id {
+            return Err(ClusterError::Internal(format!(
+                "sstable_stream: session_id mismatch in end: expected {}, got {}",
+                self.start.session_id, end.session_id
+            )));
+        }
+
+        // Validate total bytes.
+        if self.bytes_received != end.total_bytes {
+            return Err(ClusterError::Internal(format!(
+                "sstable_stream: byte count mismatch: received {}, end says {}",
+                self.bytes_received, end.total_bytes
+            )));
+        }
+
+        // Validate checksum.
+        let computed = self.hasher.finalize();
+        if computed != end.checksum {
+            return Err(ClusterError::Internal(format!(
+                "sstable_stream: checksum mismatch: computed {:#010x}, end says {:#010x}",
+                computed, end.checksum
+            )));
+        }
+
+        // Write files to disk.
+        let written_files = self
+            .assembler
+            .write_all()
+            .map_err(|e| ClusterError::Internal(format!("sstable_stream: write files: {e}")))?;
+
+        tracing::info!(
+            session_id = self.start.session_id,
+            files = written_files.len(),
+            bytes = self.bytes_received,
+            "sstable_stream: session written to disk"
+        );
+
+        Ok(SstableStreamResult {
+            session_id: self.start.session_id,
+            written_files,
+            total_bytes: self.bytes_received,
+        })
+    }
+}
+
+/// Stateless namespace for inbound SSTable streaming.
+pub struct SstableStreamReceiver;
+
+impl SstableStreamReceiver {
+    /// Begin a new SSTable streaming session.
+    ///
+    /// `dest_dir` is the directory where SSTable component files will be
+    /// written. Typically `{data_dir}/sstables/{keyspace}.{table}/{sstable_id}`.
+    pub fn begin(start: SstableStreamStartPayload, dest_dir: PathBuf) -> SstableStreamSession {
+        tracing::info!(
+            session_id = start.session_id,
+            source_node = start.source_node,
+            keyspace = %start.keyspace,
+            table = %start.table,
+            sstable_id = %start.sstable_id,
+            components = start.components.len(),
+            total_bytes = start.total_bytes,
+            "sstable_stream: session started"
+        );
+        SstableStreamSession {
+            start,
+            assembler: SSTableAssembler::new(dest_dir),
+            hasher: crc32fast::Hasher::new(),
+            bytes_received: 0,
+        }
+    }
+
+    /// Convenience: accumulate all chunks and finish in one call.
+    pub fn receive_and_write(
+        start: SstableStreamStartPayload,
+        chunks: Vec<SstableStreamChunkPayload>,
+        end: SstableStreamEndPayload,
+        dest_dir: PathBuf,
+    ) -> Result<SstableStreamResult> {
+        let mut session = Self::begin(start, dest_dir);
+        for chunk in chunks {
+            session.apply_chunk(chunk)?;
+        }
+        session.finish(end)
+    }
+
+    /// Validate an `SstableStreamEnd` payload against expected values.
+    #[allow(dead_code)]
+    pub(crate) fn validate_end(
+        bytes_received: u64,
+        computed_checksum: u32,
+        end: &SstableStreamEndPayload,
+    ) -> Result<()> {
+        if bytes_received != end.total_bytes {
+            return Err(ClusterError::Internal(format!(
+                "sstable_stream: byte count mismatch: received {bytes_received}, end says {}",
+                end.total_bytes
+            )));
+        }
+        if computed_checksum != end.checksum {
+            return Err(ClusterError::Internal(format!(
+                "sstable_stream: checksum mismatch: computed {computed_checksum:#010x}, end says {:#010x}",
+                end.checksum
+            )));
+        }
         Ok(())
     }
 }
@@ -559,5 +721,239 @@ mod tests {
             "clustering keys must be preserved"
         );
         assert_eq!(stored_row.cells.len(), 2, "both cells must be preserved");
+    }
+
+    // =======================================================================
+    // SSTable file-based streaming tests
+    // =======================================================================
+
+    // -----------------------------------------------------------------------
+    // 8. SSTable stream roundtrip: write files, stream, reassemble
+    // -----------------------------------------------------------------------
+    #[test]
+    fn sstable_stream_roundtrip_writes_files() {
+        use super::{
+            SstableStreamChunkPayload, SstableStreamEndPayload, SstableStreamStartPayload,
+        };
+        use crate::streaming::sstable_transfer::SSTableComponent;
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dest_path = dst_dir.path().join("received-sstable");
+
+        // Create fake SSTable component files on the "sender" side.
+        let data_content = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+        let index_content = vec![0x01, 0x02, 0x03];
+        std::fs::write(src_dir.path().join("Data.db"), &data_content).unwrap();
+        std::fs::write(src_dir.path().join("Index.db"), &index_content).unwrap();
+
+        // Build the start payload (simulating what the sender would create).
+        let start = SstableStreamStartPayload {
+            session_id: 100,
+            source_node: 1,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            sstable_id: "mc-001".to_string(),
+            components: vec![
+                SSTableComponent {
+                    name: "Data.db".to_string(),
+                    size: data_content.len() as u64,
+                },
+                SSTableComponent {
+                    name: "Index.db".to_string(),
+                    size: index_content.len() as u64,
+                },
+            ],
+            total_bytes: (data_content.len() + index_content.len()) as u64,
+        };
+
+        // Build chunks (split Data.db into two chunks of 3 bytes each).
+        let mut hasher = crc32fast::Hasher::new();
+        let mut chunks = Vec::new();
+
+        // Data.db chunk 1
+        hasher.update(&data_content[..3]);
+        chunks.push(SstableStreamChunkPayload {
+            session_id: 100,
+            component: "Data.db".to_string(),
+            offset: 0,
+            data: data_content[..3].to_vec(),
+        });
+        // Data.db chunk 2
+        hasher.update(&data_content[3..]);
+        chunks.push(SstableStreamChunkPayload {
+            session_id: 100,
+            component: "Data.db".to_string(),
+            offset: 3,
+            data: data_content[3..].to_vec(),
+        });
+        // Index.db single chunk
+        hasher.update(&index_content);
+        chunks.push(SstableStreamChunkPayload {
+            session_id: 100,
+            component: "Index.db".to_string(),
+            offset: 0,
+            data: index_content.clone(),
+        });
+
+        let checksum = hasher.finalize();
+        let end = SstableStreamEndPayload {
+            session_id: 100,
+            total_bytes: (data_content.len() + index_content.len()) as u64,
+            checksum,
+        };
+
+        // Receive and write.
+        let result =
+            SstableStreamReceiver::receive_and_write(start, chunks, end, dest_path.clone())
+                .unwrap();
+
+        assert_eq!(result.session_id, 100);
+        assert_eq!(result.written_files.len(), 2);
+        assert_eq!(result.total_bytes, 9);
+
+        // Verify file contents on disk.
+        let written_data = std::fs::read(dest_path.join("Data.db")).unwrap();
+        assert_eq!(written_data, data_content);
+
+        let written_index = std::fs::read(dest_path.join("Index.db")).unwrap();
+        assert_eq!(written_index, index_content);
+    }
+
+    // -----------------------------------------------------------------------
+    // 9. SSTable stream rejects bad checksum
+    // -----------------------------------------------------------------------
+    #[test]
+    fn sstable_stream_rejects_bad_checksum() {
+        use super::{
+            SstableStreamChunkPayload, SstableStreamEndPayload, SstableStreamStartPayload,
+        };
+        use crate::streaming::sstable_transfer::SSTableComponent;
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dest_path = dst_dir.path().join("bad-checksum");
+
+        let start = SstableStreamStartPayload {
+            session_id: 200,
+            source_node: 1,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            sstable_id: "mc-002".to_string(),
+            components: vec![SSTableComponent {
+                name: "Data.db".to_string(),
+                size: 4,
+            }],
+            total_bytes: 4,
+        };
+
+        let chunks = vec![SstableStreamChunkPayload {
+            session_id: 200,
+            component: "Data.db".to_string(),
+            offset: 0,
+            data: vec![1, 2, 3, 4],
+        }];
+
+        let end = SstableStreamEndPayload {
+            session_id: 200,
+            total_bytes: 4,
+            checksum: 0xBAD_BEEF, // intentionally wrong
+        };
+
+        let result = SstableStreamReceiver::receive_and_write(start, chunks, end, dest_path);
+        assert!(
+            matches!(result, Err(ClusterError::Internal(ref msg)) if msg.contains("checksum")),
+            "bad checksum must produce ClusterError::Internal with checksum message"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 10. SSTable stream rejects byte count mismatch
+    // -----------------------------------------------------------------------
+    #[test]
+    fn sstable_stream_rejects_byte_count_mismatch() {
+        use super::{
+            SstableStreamChunkPayload, SstableStreamEndPayload, SstableStreamStartPayload,
+        };
+        use crate::streaming::sstable_transfer::SSTableComponent;
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dest_path = dst_dir.path().join("count-mismatch");
+
+        let start = SstableStreamStartPayload {
+            session_id: 300,
+            source_node: 1,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            sstable_id: "mc-003".to_string(),
+            components: vec![SSTableComponent {
+                name: "Data.db".to_string(),
+                size: 4,
+            }],
+            total_bytes: 4,
+        };
+
+        let data = vec![1, 2, 3, 4];
+        let mut h = crc32fast::Hasher::new();
+        h.update(&data);
+        let checksum = h.finalize();
+
+        let chunks = vec![SstableStreamChunkPayload {
+            session_id: 300,
+            component: "Data.db".to_string(),
+            offset: 0,
+            data,
+        }];
+
+        let end = SstableStreamEndPayload {
+            session_id: 300,
+            total_bytes: 999, // wrong
+            checksum,
+        };
+
+        let result = SstableStreamReceiver::receive_and_write(start, chunks, end, dest_path);
+        assert!(
+            matches!(result, Err(ClusterError::Internal(ref msg)) if msg.contains("byte count")),
+            "byte count mismatch must produce ClusterError::Internal"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 11. SSTable stream rejects session_id mismatch in chunk
+    // -----------------------------------------------------------------------
+    #[test]
+    fn sstable_stream_rejects_session_id_mismatch_in_chunk() {
+        use super::{SstableStreamChunkPayload, SstableStreamStartPayload};
+        use crate::streaming::sstable_transfer::SSTableComponent;
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dest_path = dst_dir.path().join("session-mismatch");
+
+        let start = SstableStreamStartPayload {
+            session_id: 400,
+            source_node: 1,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            sstable_id: "mc-004".to_string(),
+            components: vec![SSTableComponent {
+                name: "Data.db".to_string(),
+                size: 4,
+            }],
+            total_bytes: 4,
+        };
+
+        let mut session = SstableStreamReceiver::begin(start, dest_path);
+
+        let chunk = SstableStreamChunkPayload {
+            session_id: 999, // wrong
+            component: "Data.db".to_string(),
+            offset: 0,
+            data: vec![1, 2, 3, 4],
+        };
+
+        let result = session.apply_chunk(chunk);
+        assert!(
+            matches!(result, Err(ClusterError::Internal(_))),
+            "session_id mismatch in chunk must be rejected"
+        );
     }
 }

@@ -20,6 +20,13 @@ impl PeerEventListener for ModeController {
         {
             let mut peers = self.connected_peers.lock();
             if !peers.iter().any(|(id, _)| *id == host_id) {
+                if peers.len() >= super::MAX_CONNECTED_PEERS {
+                    tracing::warn!(
+                        cap = super::MAX_CONNECTED_PEERS,
+                        "connected_peers at capacity — evicting oldest entry"
+                    );
+                    peers.remove(0);
+                }
                 peers.push((host_id, addr));
             }
         }
@@ -89,6 +96,9 @@ impl PeerEventListener for ModeController {
             peers.retain(|(id, _)| *id != host_id);
         }
 
+        // Hold the transition guard to prevent a disconnect handler from racing
+        // with a connect handler during mode transition.
+        let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
         match current_mode {
             DeploymentMode::Pair => {
@@ -183,6 +193,13 @@ impl InboundPeerCallback for ModeController {
         {
             let mut peers = self.connected_peers.lock();
             if !peers.iter().any(|(id, _)| *id == host_id) {
+                if peers.len() >= super::MAX_CONNECTED_PEERS {
+                    tracing::warn!(
+                        cap = super::MAX_CONNECTED_PEERS,
+                        "connected_peers at capacity — evicting oldest entry"
+                    );
+                    peers.remove(0);
+                }
                 peers.push((host_id, addr));
             }
         }

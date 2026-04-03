@@ -118,10 +118,14 @@ pub enum Message {
     RangeReadRequest(Bytes),
     RangeReadResponse(Bytes),
 
-    // Streaming — opaque payloads
+    // Streaming (row-based) — opaque payloads
     StreamStart(Bytes),
     StreamChunk(Bytes),
     StreamEnd(Bytes),
+    // Streaming (SSTable file-based) — opaque payloads
+    SstableStreamStart(Bytes),
+    SstableStreamChunk(Bytes),
+    SstableStreamEnd(Bytes),
 
     // Pair mode
     PairWriteForward(Bytes),
@@ -173,6 +177,16 @@ pub enum Message {
     AccordApplyOK(Bytes),
     AccordRecover(Bytes),
     AccordRecoverOK(Bytes),
+
+    // Bootstrap coordination
+    /// Sent by a non-leader node to the leader after bootstrap streaming completes.
+    /// Leader waits for this from all joining nodes before promoting them to Normal.
+    BootstrapComplete {
+        /// The sending node's host_id.
+        node_id: uuid::Uuid,
+    },
+    /// Leader acknowledges receipt of BootstrapComplete.
+    BootstrapCompleteAck,
 }
 
 impl Message {
@@ -199,6 +213,9 @@ impl Message {
             Self::StreamStart(_) => MsgType::StreamStart,
             Self::StreamChunk(_) => MsgType::StreamChunk,
             Self::StreamEnd(_) => MsgType::StreamEnd,
+            Self::SstableStreamStart(_) => MsgType::SstableStreamStart,
+            Self::SstableStreamChunk(_) => MsgType::SstableStreamChunk,
+            Self::SstableStreamEnd(_) => MsgType::SstableStreamEnd,
             Self::PairWriteForward(_) => MsgType::PairWriteForward,
             Self::PairWriteAck(_) => MsgType::PairWriteAck,
             Self::PairCatchUp { .. } => MsgType::PairCatchUp,
@@ -225,6 +242,8 @@ impl Message {
             Self::AccordApplyOK(_) => MsgType::AccordApplyOK,
             Self::AccordRecover(_) => MsgType::AccordRecover,
             Self::AccordRecoverOK(_) => MsgType::AccordRecoverOK,
+            Self::BootstrapComplete { .. } => MsgType::BootstrapComplete,
+            Self::BootstrapCompleteAck => MsgType::BootstrapCompleteAck,
         }
     }
 
@@ -339,6 +358,9 @@ impl Message {
             | Self::StreamStart(b)
             | Self::StreamChunk(b)
             | Self::StreamEnd(b)
+            | Self::SstableStreamStart(b)
+            | Self::SstableStreamChunk(b)
+            | Self::SstableStreamEnd(b)
             | Self::PairWriteForward(b)
             | Self::PairWriteAck(b)
             | Self::PairCatchUpResponse(b)
@@ -363,6 +385,8 @@ impl Message {
             | Self::AccordApplyOK(b)
             | Self::AccordRecover(b)
             | Self::AccordRecoverOK(b) => buf.put_slice(b),
+            Self::BootstrapComplete { node_id } => buf.put_slice(node_id.as_bytes()),
+            Self::BootstrapCompleteAck => {} // no payload
         }
         Ok(())
     }
@@ -519,6 +543,13 @@ impl Message {
             MsgType::StreamStart => Self::StreamStart(body.split_to(body.remaining())),
             MsgType::StreamChunk => Self::StreamChunk(body.split_to(body.remaining())),
             MsgType::StreamEnd => Self::StreamEnd(body.split_to(body.remaining())),
+            MsgType::SstableStreamStart => {
+                Self::SstableStreamStart(body.split_to(body.remaining()))
+            }
+            MsgType::SstableStreamChunk => {
+                Self::SstableStreamChunk(body.split_to(body.remaining()))
+            }
+            MsgType::SstableStreamEnd => Self::SstableStreamEnd(body.split_to(body.remaining())),
             MsgType::PairWriteForward => Self::PairWriteForward(body.split_to(body.remaining())),
             MsgType::PairWriteAck => Self::PairWriteAck(body.split_to(body.remaining())),
             MsgType::PairCatchUpResponse => {
@@ -547,6 +578,16 @@ impl Message {
             MsgType::AccordApplyOK => Self::AccordApplyOK(body.split_to(body.remaining())),
             MsgType::AccordRecover => Self::AccordRecover(body.split_to(body.remaining())),
             MsgType::AccordRecoverOK => Self::AccordRecoverOK(body.split_to(body.remaining())),
+            MsgType::BootstrapComplete => {
+                let mut id_bytes = [0u8; 16];
+                if body.remaining() >= 16 {
+                    body.copy_to_slice(&mut id_bytes);
+                }
+                Self::BootstrapComplete {
+                    node_id: uuid::Uuid::from_bytes(id_bytes),
+                }
+            }
+            MsgType::BootstrapCompleteAck => Self::BootstrapCompleteAck,
         })
     }
 }

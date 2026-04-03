@@ -272,6 +272,14 @@ impl StorageEngine {
         Ok(engine)
     }
 
+    /// Returns the data directory path for this storage engine.
+    ///
+    /// Used by SSTable-based bootstrap streaming to locate component files
+    /// on disk (SSTables live at `{data_dir}/sstables/{keyspace}.{table}/`).
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.config.data_dir
+    }
+
     /// Probe the configured object store for conditional put support.
     ///
     /// Call this once after construction when an S3 store is configured.
