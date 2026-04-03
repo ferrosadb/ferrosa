@@ -49,6 +49,12 @@ pub struct ClusterConfig {
     /// When set, overrides the internode address for native_address.
     /// Parsed from FERROSA_CQL_BROADCAST env var.
     pub cql_broadcast: Option<String>,
+    /// Raft heartbeat interval in milliseconds. Default: 300.
+    pub raft_heartbeat_ms: u64,
+    /// Raft minimum election timeout in milliseconds. Default: 1000.
+    pub raft_election_timeout_min_ms: u64,
+    /// Raft maximum election timeout in milliseconds. Default: 2000.
+    pub raft_election_timeout_max_ms: u64,
 }
 
 impl Default for ClusterConfig {
@@ -66,6 +72,9 @@ impl Default for ClusterConfig {
             node_role: NodeRole::Both,
             formation_timeout_secs: None,
             cql_broadcast: None,
+            raft_heartbeat_ms: 300,
+            raft_election_timeout_min_ms: 1000,
+            raft_election_timeout_max_ms: 2000,
         }
     }
 }
@@ -120,6 +129,21 @@ impl ClusterConfig {
         }
         if let Ok(addr) = std::env::var("FERROSA_CQL_BROADCAST") {
             config.cql_broadcast = Some(addr);
+        }
+        if let Ok(val) = std::env::var("FERROSA_RAFT_HEARTBEAT_MS") {
+            if let Ok(n) = val.parse() {
+                config.raft_heartbeat_ms = n;
+            }
+        }
+        if let Ok(val) = std::env::var("FERROSA_RAFT_ELECTION_MIN_MS") {
+            if let Ok(n) = val.parse() {
+                config.raft_election_timeout_min_ms = n;
+            }
+        }
+        if let Ok(val) = std::env::var("FERROSA_RAFT_ELECTION_MAX_MS") {
+            if let Ok(n) = val.parse() {
+                config.raft_election_timeout_max_ms = n;
+            }
         }
 
         config

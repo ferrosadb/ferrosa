@@ -326,6 +326,9 @@ impl ModeController {
         let all_node_ids_for_bootstrap = all_node_ids.clone();
         let cluster_name = self.config.cluster_name.clone();
         let config_for_promotion = self.config.clone();
+        let raft_heartbeat_ms = self.config.raft_heartbeat_ms;
+        let raft_election_min_ms = self.config.raft_election_timeout_min_ms;
+        let raft_election_max_ms = self.config.raft_election_timeout_max_ms;
         let schema_for_replay = self.schema.clone();
 
         // Register Raft RPC handlers BEFORE spawning the init task.
@@ -409,9 +412,9 @@ impl ModeController {
             // Build openraft Config
             let raft_config = match (openraft::Config {
                 cluster_name,
-                heartbeat_interval: 300,
-                election_timeout_min: 1000,
-                election_timeout_max: 2000,
+                heartbeat_interval: raft_heartbeat_ms,
+                election_timeout_min: raft_election_min_ms,
+                election_timeout_max: raft_election_max_ms,
                 max_payload_entries: 100,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
                 ..Default::default()
