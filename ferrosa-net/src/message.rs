@@ -173,6 +173,16 @@ pub enum Message {
     AccordApplyOK(Bytes),
     AccordRecover(Bytes),
     AccordRecoverOK(Bytes),
+
+    // Bootstrap coordination
+    /// Sent by a non-leader node to the leader after bootstrap streaming completes.
+    /// Leader waits for this from all joining nodes before promoting them to Normal.
+    BootstrapComplete {
+        /// The sending node's host_id.
+        node_id: uuid::Uuid,
+    },
+    /// Leader acknowledges receipt of BootstrapComplete.
+    BootstrapCompleteAck,
 }
 
 impl Message {
@@ -225,6 +235,8 @@ impl Message {
             Self::AccordApplyOK(_) => MsgType::AccordApplyOK,
             Self::AccordRecover(_) => MsgType::AccordRecover,
             Self::AccordRecoverOK(_) => MsgType::AccordRecoverOK,
+            Self::BootstrapComplete { .. } => MsgType::BootstrapComplete,
+            Self::BootstrapCompleteAck => MsgType::BootstrapCompleteAck,
         }
     }
 
@@ -363,6 +375,8 @@ impl Message {
             | Self::AccordApplyOK(b)
             | Self::AccordRecover(b)
             | Self::AccordRecoverOK(b) => buf.put_slice(b),
+            Self::BootstrapComplete { node_id } => buf.put_slice(node_id.as_bytes()),
+            Self::BootstrapCompleteAck => {} // no payload
         }
         Ok(())
     }
@@ -547,6 +561,16 @@ impl Message {
             MsgType::AccordApplyOK => Self::AccordApplyOK(body.split_to(body.remaining())),
             MsgType::AccordRecover => Self::AccordRecover(body.split_to(body.remaining())),
             MsgType::AccordRecoverOK => Self::AccordRecoverOK(body.split_to(body.remaining())),
+            MsgType::BootstrapComplete => {
+                let mut id_bytes = [0u8; 16];
+                if body.remaining() >= 16 {
+                    body.copy_to_slice(&mut id_bytes);
+                }
+                Self::BootstrapComplete {
+                    node_id: uuid::Uuid::from_bytes(id_bytes),
+                }
+            }
+            MsgType::BootstrapCompleteAck => Self::BootstrapCompleteAck,
         })
     }
 }
