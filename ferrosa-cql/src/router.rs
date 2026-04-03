@@ -177,8 +177,7 @@ fn try_match_uuid(bytes: &[u8], start: usize) -> Option<usize> {
     }
 
     // Ensure the UUID is not followed by a word character (would be an identifier).
-    if start + 36 < len
-        && (bytes[start + 36].is_ascii_alphanumeric() || bytes[start + 36] == b'_')
+    if start + 36 < len && (bytes[start + 36].is_ascii_alphanumeric() || bytes[start + 36] == b'_')
     {
         return None;
     }
@@ -340,9 +339,7 @@ pub async fn route(
         cql.consistency_level = %ctx.consistency,
     );
 
-    route_inner(state, ctx, stmt)
-        .instrument(route_span)
-        .await
+    route_inner(state, ctx, stmt).instrument(route_span).await
 }
 
 /// Inner dispatch, instrumented with `cql.route` span by the caller.
@@ -363,185 +360,183 @@ async fn route_inner(
         &ctx.auth.role,
     );
 
-    let execute_span = tracing::info_span!(
-        "cql.execute",
-        cql.rows_returned = tracing::field::Empty,
-    );
+    let execute_span =
+        tracing::info_span!("cql.execute", cql.rows_returned = tracing::field::Empty,);
 
     let result = async {
-    match stmt {
-        Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
-        Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
-        Statement::Update(u) => route_update(state, ctx, u).await.map(RouteResult::Result),
-        Statement::Delete(d) => route_delete(state, ctx, d).await.map(RouteResult::Result),
-        Statement::Batch(b) => route_batch(state, ctx, b).await.map(RouteResult::Result),
-        Statement::CreateKeyspace(ck) => route_create_keyspace(state, ctx, ck)
-            .await
-            .map(RouteResult::Result),
-        Statement::CreateTable(ct) => route_create_table(state, ctx, ct)
-            .await
-            .map(RouteResult::Result),
-        Statement::AlterTable(at) => route_alter_table(state, ctx, at)
-            .await
-            .map(RouteResult::Result),
-        Statement::DropTable(dt) => route_drop_table(state, ctx, dt)
-            .await
-            .map(RouteResult::Result),
-        Statement::AlterKeyspace(ak) => route_alter_keyspace(state, ctx, ak)
-            .await
-            .map(RouteResult::Result),
-        Statement::DropKeyspace(dk) => route_drop_keyspace(state, ctx, dk)
-            .await
-            .map(RouteResult::Result),
-        Statement::CreateRole(cr) => route_create_role(state, ctx, cr)
-            .await
-            .map(RouteResult::Result),
-        Statement::AlterRole(ar) => route_alter_role(state, ctx, ar)
-            .await
-            .map(RouteResult::Result),
-        Statement::DropRole(dr) => route_drop_role(state, ctx, dr)
-            .await
-            .map(RouteResult::Result),
-        Statement::Grant(g) => route_grant(state, ctx, g).await.map(RouteResult::Result),
-        Statement::Revoke(r) => route_revoke(state, ctx, r).await.map(RouteResult::Result),
-        Statement::Use(u) => {
-            let body = result::encode_set_keyspace(&u.keyspace);
-            Ok(RouteResult::SetKeyspace(u.keyspace, body))
-        }
-        Statement::Truncate(t) => route_truncate(state, ctx, t).map(RouteResult::Result),
-        Statement::CreateIndex(ci) => route_create_index(state, ctx, ci)
-            .await
-            .map(RouteResult::Result),
-        Statement::DropIndex(di) => route_drop_index(state, ctx, di)
-            .await
-            .map(RouteResult::Result),
-        Statement::Subscribe {
-            inner,
-            interval,
-            delta,
-        } => {
-            // Validate: inner must be a Select
-            match inner.as_ref() {
-                Statement::Select(s) => {
-                    let ks = s
-                        .keyspace
-                        .as_deref()
-                        .or(ctx.current_keyspace.as_deref())
-                        .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
-                    state.schema.check_permission(
-                        ctx.auth,
-                        Permission::Select,
-                        &Resource::Table(ks.to_string(), s.table.clone()),
-                    )?;
-                }
-                _ => {
-                    return Err(CqlError::Invalid(
-                        "SUBSCRIBE requires a SELECT statement".into(),
-                    ))
-                }
+        match stmt {
+            Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
+            Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
+            Statement::Update(u) => route_update(state, ctx, u).await.map(RouteResult::Result),
+            Statement::Delete(d) => route_delete(state, ctx, d).await.map(RouteResult::Result),
+            Statement::Batch(b) => route_batch(state, ctx, b).await.map(RouteResult::Result),
+            Statement::CreateKeyspace(ck) => route_create_keyspace(state, ctx, ck)
+                .await
+                .map(RouteResult::Result),
+            Statement::CreateTable(ct) => route_create_table(state, ctx, ct)
+                .await
+                .map(RouteResult::Result),
+            Statement::AlterTable(at) => route_alter_table(state, ctx, at)
+                .await
+                .map(RouteResult::Result),
+            Statement::DropTable(dt) => route_drop_table(state, ctx, dt)
+                .await
+                .map(RouteResult::Result),
+            Statement::AlterKeyspace(ak) => route_alter_keyspace(state, ctx, ak)
+                .await
+                .map(RouteResult::Result),
+            Statement::DropKeyspace(dk) => route_drop_keyspace(state, ctx, dk)
+                .await
+                .map(RouteResult::Result),
+            Statement::CreateRole(cr) => route_create_role(state, ctx, cr)
+                .await
+                .map(RouteResult::Result),
+            Statement::AlterRole(ar) => route_alter_role(state, ctx, ar)
+                .await
+                .map(RouteResult::Result),
+            Statement::DropRole(dr) => route_drop_role(state, ctx, dr)
+                .await
+                .map(RouteResult::Result),
+            Statement::Grant(g) => route_grant(state, ctx, g).await.map(RouteResult::Result),
+            Statement::Revoke(r) => route_revoke(state, ctx, r).await.map(RouteResult::Result),
+            Statement::Use(u) => {
+                let body = result::encode_set_keyspace(&u.keyspace);
+                Ok(RouteResult::SetKeyspace(u.keyspace, body))
             }
-            Ok(RouteResult::Subscribe {
+            Statement::Truncate(t) => route_truncate(state, ctx, t).map(RouteResult::Result),
+            Statement::CreateIndex(ci) => route_create_index(state, ctx, ci)
+                .await
+                .map(RouteResult::Result),
+            Statement::DropIndex(di) => route_drop_index(state, ctx, di)
+                .await
+                .map(RouteResult::Result),
+            Statement::Subscribe {
                 inner,
                 interval,
                 delta,
-            })
+            } => {
+                // Validate: inner must be a Select
+                match inner.as_ref() {
+                    Statement::Select(s) => {
+                        let ks = s
+                            .keyspace
+                            .as_deref()
+                            .or(ctx.current_keyspace.as_deref())
+                            .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
+                        state.schema.check_permission(
+                            ctx.auth,
+                            Permission::Select,
+                            &Resource::Table(ks.to_string(), s.table.clone()),
+                        )?;
+                    }
+                    _ => {
+                        return Err(CqlError::Invalid(
+                            "SUBSCRIBE requires a SELECT statement".into(),
+                        ))
+                    }
+                }
+                Ok(RouteResult::Subscribe {
+                    inner,
+                    interval,
+                    delta,
+                })
+            }
+            Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
+            Statement::CreateType {
+                keyspace,
+                name,
+                if_not_exists,
+                fields,
+            } => route_create_type(state, ctx, keyspace, name, if_not_exists, fields)
+                .await
+                .map(RouteResult::Result),
+            Statement::AlterType {
+                keyspace,
+                name,
+                alterations,
+            } => route_alter_type(state, ctx, keyspace, name, alterations)
+                .await
+                .map(RouteResult::Result),
+            Statement::DropType {
+                keyspace,
+                name,
+                if_exists,
+            } => route_drop_type(state, ctx, keyspace, name, if_exists)
+                .await
+                .map(RouteResult::Result),
+            Statement::CreateFunction {
+                keyspace,
+                name,
+                or_replace,
+                if_not_exists,
+                params,
+                called_on_null,
+                return_type,
+                language,
+                body,
+            } => route_create_function(
+                state,
+                ctx,
+                keyspace,
+                name,
+                or_replace,
+                if_not_exists,
+                params,
+                called_on_null,
+                return_type,
+                language,
+                body,
+            )
+            .await
+            .map(RouteResult::Result),
+            Statement::DropFunction {
+                keyspace,
+                name,
+                arg_types,
+                if_exists,
+            } => route_drop_function(state, ctx, keyspace, name, arg_types, if_exists)
+                .await
+                .map(RouteResult::Result),
+            Statement::CreateAggregate {
+                keyspace,
+                name,
+                or_replace,
+                if_not_exists,
+                arg_types,
+                state_func,
+                state_type,
+                final_func,
+                init_cond,
+            } => route_create_aggregate(
+                state,
+                ctx,
+                keyspace,
+                name,
+                or_replace,
+                if_not_exists,
+                arg_types,
+                state_func,
+                state_type,
+                final_func,
+                init_cond,
+            )
+            .await
+            .map(RouteResult::Result),
+            Statement::DropAggregate {
+                keyspace,
+                name,
+                arg_types,
+                if_exists,
+            } => route_drop_aggregate(state, ctx, keyspace, name, arg_types, if_exists)
+                .await
+                .map(RouteResult::Result),
+            Statement::Explain(s) => route_explain(state, ctx, *s).map(RouteResult::Result),
+            // Accord transaction control statements are handled at the session/connection
+            // level, not in the router. If they reach here, return a void result.
+            Statement::BeginTransaction | Statement::Commit | Statement::Rollback => {
+                Ok(RouteResult::Result(crate::result::encode_void()))
+            }
         }
-        Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
-        Statement::CreateType {
-            keyspace,
-            name,
-            if_not_exists,
-            fields,
-        } => route_create_type(state, ctx, keyspace, name, if_not_exists, fields)
-            .await
-            .map(RouteResult::Result),
-        Statement::AlterType {
-            keyspace,
-            name,
-            alterations,
-        } => route_alter_type(state, ctx, keyspace, name, alterations)
-            .await
-            .map(RouteResult::Result),
-        Statement::DropType {
-            keyspace,
-            name,
-            if_exists,
-        } => route_drop_type(state, ctx, keyspace, name, if_exists)
-            .await
-            .map(RouteResult::Result),
-        Statement::CreateFunction {
-            keyspace,
-            name,
-            or_replace,
-            if_not_exists,
-            params,
-            called_on_null,
-            return_type,
-            language,
-            body,
-        } => route_create_function(
-            state,
-            ctx,
-            keyspace,
-            name,
-            or_replace,
-            if_not_exists,
-            params,
-            called_on_null,
-            return_type,
-            language,
-            body,
-        )
-        .await
-        .map(RouteResult::Result),
-        Statement::DropFunction {
-            keyspace,
-            name,
-            arg_types,
-            if_exists,
-        } => route_drop_function(state, ctx, keyspace, name, arg_types, if_exists)
-            .await
-            .map(RouteResult::Result),
-        Statement::CreateAggregate {
-            keyspace,
-            name,
-            or_replace,
-            if_not_exists,
-            arg_types,
-            state_func,
-            state_type,
-            final_func,
-            init_cond,
-        } => route_create_aggregate(
-            state,
-            ctx,
-            keyspace,
-            name,
-            or_replace,
-            if_not_exists,
-            arg_types,
-            state_func,
-            state_type,
-            final_func,
-            init_cond,
-        )
-        .await
-        .map(RouteResult::Result),
-        Statement::DropAggregate {
-            keyspace,
-            name,
-            arg_types,
-            if_exists,
-        } => route_drop_aggregate(state, ctx, keyspace, name, arg_types, if_exists)
-            .await
-            .map(RouteResult::Result),
-        Statement::Explain(s) => route_explain(state, ctx, *s).map(RouteResult::Result),
-        // Accord transaction control statements are handled at the session/connection
-        // level, not in the router. If they reach here, return a void result.
-        Statement::BeginTransaction | Statement::Commit | Statement::Rollback => {
-            Ok(RouteResult::Result(crate::result::encode_void()))
-        }
-    }
     }
     .instrument(execute_span)
     .await;
@@ -10833,10 +10828,7 @@ mod tests {
     #[test]
     fn parameterize_query_replaces_blob_literals() {
         let q = "INSERT INTO ks.t (data) VALUES (0xDEADBEEF)";
-        assert_eq!(
-            parameterize_query(q),
-            "INSERT INTO ks.t (data) VALUES (?)"
-        );
+        assert_eq!(parameterize_query(q), "INSERT INTO ks.t (data) VALUES (?)");
     }
 
     #[test]
@@ -10850,10 +10842,7 @@ mod tests {
     #[test]
     fn parameterize_query_handles_escaped_quotes() {
         let q = "INSERT INTO ks.t (v) VALUES ('it''s fine')";
-        assert_eq!(
-            parameterize_query(q),
-            "INSERT INTO ks.t (v) VALUES (?)"
-        );
+        assert_eq!(parameterize_query(q), "INSERT INTO ks.t (v) VALUES (?)");
     }
 
     #[test]

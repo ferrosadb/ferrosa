@@ -75,7 +75,7 @@ impl FerrosaTelemetryLayer {
         if interval == 0 {
             return true;
         }
-        n % interval == 0
+        n.is_multiple_of(interval)
     }
 
     /// Returns the number of sampled spans.

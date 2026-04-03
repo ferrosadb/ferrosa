@@ -281,8 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        let telemetry_layer =
-            ferrosa_cluster::telemetry::FerrosaTelemetryLayer::new(sample_rate);
+        let telemetry_layer = ferrosa_cluster::telemetry::FerrosaTelemetryLayer::new(sample_rate);
 
         tracing_subscriber::registry()
             .with(env_filter)
@@ -290,9 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with(telemetry_layer)
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
     tracing::info!("ferrosa starting");

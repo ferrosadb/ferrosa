@@ -28,10 +28,7 @@ const MAX_COLLECTION_ELEMENTS: usize = 65_536;
 
 /// Parse a CQL statement from the given input string.
 pub fn parse(input: &str) -> Result<Statement, CqlError> {
-    let span = tracing::info_span!(
-        "cql.parse",
-        cql.statement_type = tracing::field::Empty,
-    );
+    let span = tracing::info_span!("cql.parse", cql.statement_type = tracing::field::Empty,);
     let _entered = span.enter();
     let lexer = Lexer::new(input)?;
     let mut parser = Parser::new(lexer);
