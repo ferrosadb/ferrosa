@@ -230,7 +230,89 @@ Enterprise customers who want Prometheus/OTLP get it via the optional `otel` fea
 data is also exported as Prometheus-compatible metrics via the existing `/metrics` endpoint and
 spans are exported via OTLP gRPC. This is additive — the native web UI always works.
 
-### Layer 6: Contention-Specific Instrumentation
+### Layer 6: Resource Attribution (consumption billing)
+
+Tracks per-client, per-keyspace resource consumption for billing and capacity planning.
+The analysis system in `ferrosa-dbaas` aggregates these into billing periods.
+
+**Virtual tables:**
+
+| Virtual Table | Key Columns | Why |
+|---------------|-------------|-----|
+| `system_observability.client_usage` | `client_address`, `keyspace`, `bucket`, `reads`, `writes`, `bytes_read`, `bytes_written`, `compute_us` | Per-client resource attribution for consumption billing |
+| `system_observability.keyspace_storage` | `keyspace`, `table`, `disk_bytes`, `s3_bytes`, `sstable_count`, `memtable_bytes` | Per-keyspace/table storage footprint for storage billing |
+| `system_observability.s3_egress` | `keyspace`, `bucket`, `bytes_uploaded`, `bytes_downloaded`, `requests` | S3 usage per keyspace for cloud cost attribution |
+
+**Span attributes to add:**
+
+| Existing Span | New Attributes | Why |
+|---------------|----------------|-----|
+| `cql.request` | `cql.tenant_id` (from auth role), `cql.bytes_in`, `cql.bytes_out` | Per-request byte metering |
+| `storage.write` | `storage.bytes_written` (total, including index overhead) | Write amplification visibility |
+| `storage.read` | `storage.bytes_read` (memtable + SSTable I/O) | Read cost attribution |
+| `storage.s3_upload` | `s3.keyspace` | Attribute S3 cost to keyspace |
+
+### Layer 7: Query Fingerprints + Access Patterns (optimization advisor)
+
+Captures the data an analysis system needs to suggest table layouts, indexes, and query rewrites.
+This is the foundation for automatic database optimization in `ferrosa-dbaas`.
+
+**Virtual tables:**
+
+| Virtual Table | Key Columns | Why |
+|---------------|-------------|-----|
+| `system_observability.query_fingerprints` | `fingerprint_hash`, `keyspace`, `table`, `parameterized_text`, `count`, `avg_us`, `p99_us`, `last_seen`, `plan_type` | ALL queries (not just slow), grouped by parameterized fingerprint. Frequency + latency = optimization priority. |
+| `system_observability.column_access` | `keyspace`, `table`, `column`, `in_select`, `in_where_eq`, `in_where_range`, `in_order_by`, `in_group_by` | Which columns are accessed how — the input for "create index on X" and "change clustering key" recommendations |
+| `system_observability.partition_hotspots` | `keyspace`, `table`, `partition_key_hash`, `reads`, `writes`, `last_access` | Hot partition detection — identifies data model problems (e.g., unbounded partition growth) |
+| `system_observability.full_scan_reasons` | `keyspace`, `table`, `predicate_column`, `operator`, `count`, `suggested_index_type` | Why full scans happened — directly maps to "CREATE INDEX" recommendations |
+| `system_observability.table_access_summary` | `keyspace`, `table`, `reads`, `writes`, `point_lookups`, `range_scans`, `full_scans`, `rw_ratio` | Read/write ratio per table — input for compaction strategy selection (STCS vs LCS vs TWCS) |
+
+**Span attributes to add:**
+
+| Existing Span | New Attributes | Why |
+|---------------|----------------|-----|
+| `cql.parse` | `cql.fingerprint_hash`, `cql.select_columns`, `cql.where_columns`, `cql.where_operators` | Structured access pattern extraction from parsed AST |
+| `cql.execute` | `cql.scan_type` (point/range/full), `cql.partition_key_hash` | Point vs range vs full scan classification + hot partition tracking |
+| `index.plan` | `index.full_scan_reason` (column + operator that forced scan) | Root cause for missing index |
+
+**How the ferrosa-dbaas optimization advisor uses this:**
+
+```mermaid
+graph LR
+    QF["query_fingerprints<br/>frequency + latency"]
+    CA["column_access<br/>WHERE/SELECT/ORDER BY patterns"]
+    PH["partition_hotspots<br/>hot partition detection"]
+    FS["full_scan_reasons<br/>missing index identification"]
+    TA["table_access_summary<br/>read/write ratio"]
+    
+    QF --> Advisor["ferrosa-dbaas<br/>Optimization Advisor"]
+    CA --> Advisor
+    PH --> Advisor
+    FS --> Advisor
+    TA --> Advisor
+    
+    Advisor --> IDX["CREATE INDEX<br/>recommendations"]
+    Advisor --> MV["Materialized View<br/>/ query alias candidates"]
+    Advisor --> CS["Compaction Strategy<br/>recommendations"]
+    Advisor --> PK["Partition Key<br/>redesign suggestions"]
+    Advisor --> CK["Clustering Key<br/>reorder suggestions"]
+
+    style Advisor fill:#f9f,stroke:#333
+```
+
+**Optimization rules the advisor can derive:**
+
+| Signal | Recommendation |
+|--------|----------------|
+| `full_scan_reasons` shows column X with >100 scans | "CREATE INDEX ON table(X) USING 'btree'" |
+| `column_access` shows WHERE on non-PK column with high frequency | "Consider materialized view with X as partition key" |
+| `table_access_summary` shows write-heavy table on STCS | "ALTER TABLE ... WITH compaction = {'class': 'LeveledCompactionStrategy'}" |
+| `table_access_summary` shows time-series pattern (append-only, range reads) | "ALTER TABLE ... WITH compaction = {'class': 'TimeWindowCompactionStrategy'}" |
+| `partition_hotspots` shows single partition with >90% of traffic | "Partition key has low cardinality — consider adding a bucket column" |
+| `query_fingerprints` shows same table queried with different PK order | "Create query alias (materialized view) for the alternate access pattern" |
+| `column_access` shows ORDER BY on non-clustering column | "Add column to clustering key or create secondary index" |
+
+### Layer 8: Contention-Specific Instrumentation (unchanged from original)
 
 | Point | Location | What to capture | Why |
 |-------|----------|-----------------|-----|
@@ -307,13 +389,26 @@ The internode propagation requires a wire format change:
 | O4.9 | Metrics rollup background task | M | Aggregate fine-grained counters into hourly/daily buckets, TTL old data (7 days raw, 90 days rolled up) |
 | O4.10 | Alert evaluator | M | Background task evaluates threshold rules (slow query rate, S3 queue > 100, hint backlog growing). Writes to `system_observability.alerts`, shown in web UI banner. |
 
-### O5: Enterprise OTLP Export (optional, behind `otel` feature flag)
+### O5: Billing + Query Optimization Foundation
 
 | # | Task | Size | Description |
 |---|------|------|-------------|
-| O5.1 | Add `otel` feature flag to ferrosa crate | S | `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk` compiled only with `--features otel` |
-| O5.2 | OTLP span exporter layer | M | When `FERROSA_OTEL_ENDPOINT` set, add `tracing-opentelemetry` layer to subscriber. Runs alongside native layer. |
-| O5.3 | Prometheus `/metrics` from virtual tables | S | Render all `system_observability.*` virtual table data as Prometheus text exposition format at existing `/metrics` endpoint. Enterprise customers scrape this. |
+| O5.1 | `client_usage` virtual table + per-request byte metering | M | Track `bytes_in`, `bytes_out`, `compute_us` per CQL request attributed to `client_address` + `keyspace`. Aggregate in 1-minute buckets. |
+| O5.2 | `keyspace_storage` virtual table | M | Periodic scan of storage engine for per-keyspace/table disk + S3 byte totals. Refresh every 60s. |
+| O5.3 | `query_fingerprints` virtual table + AST extraction | L | On every CQL parse, extract parameterized fingerprint hash + column access patterns. Aggregate by fingerprint with count, avg latency, p99. Ring buffer of top 10k fingerprints. |
+| O5.4 | `column_access` virtual table | M | Accumulate per-column usage counters (in_select, in_where_eq, in_where_range, in_order_by) from parsed AST. |
+| O5.5 | `partition_hotspots` virtual table | M | Sample partition key hashes on read/write. Top-k (1000) by access count in a min-heap. Identify skewed access patterns. |
+| O5.6 | `full_scan_reasons` virtual table | S | When `index.plan` chooses FullScan, record the predicate column + operator that caused it. Aggregate by column. |
+| O5.7 | `table_access_summary` virtual table | S | Derive from existing storage.read/write spans: point vs range vs full scan counts, read/write ratio. |
+| O5.8 | `s3_egress` virtual table with keyspace attribution | S | Add `keyspace` label to S3 upload spans, aggregate bytes by keyspace. |
+
+### O6: Enterprise OTLP Export (formerly O5) (optional, behind `otel` feature flag)
+
+| # | Task | Size | Description |
+|---|------|------|-------------|
+| O6.1 | Add `otel` feature flag to ferrosa crate | S | `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk` compiled only with `--features otel` |
+| O6.2 | OTLP span exporter layer | M | When `FERROSA_OTEL_ENDPOINT` set, add `tracing-opentelemetry` layer to subscriber. Runs alongside native layer. |
+| O6.3 | Prometheus `/metrics` from virtual tables | S | Render all `system_observability.*` virtual table data as Prometheus text exposition format at existing `/metrics` endpoint. Enterprise customers scrape this. |
 
 ---
 
