@@ -50,13 +50,19 @@ impl PeerEventListener for ModeController {
                 tracing::info!(peer = %host_id, "peer reconnected in degraded pair mode");
             }
             DeploymentMode::DegradedCluster => {
-                // Check if quorum is restored
+                // Check if quorum is restored using committed cluster size
+                // (not the dynamic connected count) to prevent false quorum
+                // restoration after network partitions.
                 let connected = self.connected_peers.lock().len();
-                let total = connected + 1;
+                let committed = self
+                    .committed_cluster_size
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let total = if committed > 0 { committed } else { connected + 1 };
                 let quorum = (total / 2) + 1;
                 if connected + 1 >= quorum {
                     tracing::info!(
                         connected,
+                        committed_size = total,
                         quorum,
                         "quorum restored — transitioning back to Cluster"
                     );
@@ -86,17 +92,18 @@ impl PeerEventListener for ModeController {
             }
             DeploymentMode::Cluster => {
                 // Check if remaining connected peers can form a quorum.
-                // Quorum = (total_members / 2) + 1. If connected < quorum - 1
-                // (minus self), we've lost quorum.
+                // Use committed cluster size (not dynamic connected count)
+                // to prevent premature quorum claims after partitions.
                 let connected = self.connected_peers.lock().len();
-                // Total members = connected peers + self
-                let total = connected + 1;
+                let committed = self
+                    .committed_cluster_size
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let total = if committed > 0 { committed } else { connected + 1 };
                 let quorum = (total / 2) + 1;
-                // We need at least quorum - 1 connected peers (self counts as 1)
                 if connected + 1 < quorum {
                     tracing::warn!(
                         connected,
-                        total,
+                        committed_size = total,
                         quorum,
                         "quorum lost — transitioning to DegradedCluster"
                     );

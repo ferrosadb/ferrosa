@@ -23,7 +23,7 @@ pub(crate) use token::generate_deterministic_token;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -148,6 +148,10 @@ pub struct ModeController {
     /// Cancellation token — cancelled during shutdown to signal all background
     /// tasks to stop. Passed to spawned tasks that should respect graceful shutdown.
     pub(super) cancel: tokio_util::sync::CancellationToken,
+    /// Committed cluster size — set when transitioning to Cluster mode.
+    /// Used for quorum calculations instead of the dynamic connected count
+    /// to prevent false quorum restoration after network partitions.
+    pub(super) committed_cluster_size: AtomicUsize,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -227,6 +231,7 @@ impl ModeController {
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
+            committed_cluster_size: AtomicUsize::new(0),
         });
 
         let handles = ModeControllerHandles {
@@ -279,6 +284,7 @@ impl ModeController {
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
+            committed_cluster_size: AtomicUsize::new(0),
         })
     }
 
@@ -331,6 +337,7 @@ impl ModeController {
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
+            committed_cluster_size: AtomicUsize::new(0),
         })
     }
 
