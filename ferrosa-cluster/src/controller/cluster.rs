@@ -293,7 +293,11 @@ impl ModeController {
         // Swap cluster state to Raft-based
         self.cluster_state
             .store(Arc::new(ClusterStateHolder::Cluster(
-                RaftClusterState::new(ring_arc, local_node_id),
+                RaftClusterState::with_peer_manager(
+                    ring_arc,
+                    local_node_id,
+                    peer_manager_for_bootstrap.clone(),
+                ),
             )));
 
         // Clear pair context — no longer in pair mode

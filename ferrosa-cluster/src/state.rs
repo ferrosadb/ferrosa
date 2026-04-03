@@ -65,9 +65,12 @@ impl ClusterState for PairClusterState {
 /// ClusterState implementation for Raft cluster mode.
 ///
 /// Reads node metadata from the token ring to produce the peer list.
+/// Uses PeerManager to look up CQL broadcast addresses exchanged during
+/// the internode handshake (for system.peers.native_address).
 pub struct RaftClusterState {
     ring: Arc<ArcSwap<TokenRing>>,
     local_node_id: u64,
+    peer_manager: Option<Arc<ferrosa_net::peer::PeerManager>>,
 }
 
 impl RaftClusterState {
@@ -75,6 +78,20 @@ impl RaftClusterState {
         Self {
             ring,
             local_node_id,
+            peer_manager: None,
+        }
+    }
+
+    /// Create with a PeerManager reference for CQL broadcast lookups.
+    pub fn with_peer_manager(
+        ring: Arc<ArcSwap<TokenRing>>,
+        local_node_id: u64,
+        peer_manager: Arc<ferrosa_net::peer::PeerManager>,
+    ) -> Self {
+        Self {
+            ring,
+            local_node_id,
+            peer_manager: Some(peer_manager),
         }
     }
 }
@@ -89,10 +106,17 @@ impl ClusterState for RaftClusterState {
                 let info = ring.get_node(id)?;
                 // Parse addr string "host:port" into IP + port.
                 let (ip, port) = parse_addr(&info.addr)?;
-                // Use cql_broadcast if set (host-reachable address for
-                // port-mapped container clusters), otherwise fall back to
-                // the internode IP.
-                let (native_addr, native_port) = if let Some(ref broadcast) = info.cql_broadcast {
+                // Use cql_broadcast for native_address (host-reachable address
+                // for port-mapped container clusters). Check three sources:
+                // 1. NodeInfo.cql_broadcast (set during ring construction for local node)
+                // 2. PeerManager broadcast (exchanged during internode handshake)
+                // 3. Fall back to internode IP with port 9042
+                let peer_broadcast = info.cql_broadcast.clone().or_else(|| {
+                    let pm = self.peer_manager.as_ref()?;
+                    // PeerManager uses async RwLock; use try_read to avoid blocking.
+                    pm.get_peer_cql_broadcast_sync(info.host_id)
+                });
+                let (native_addr, native_port) = if let Some(ref broadcast) = peer_broadcast {
                     parse_addr(broadcast).unwrap_or((ip, 9042))
                 } else {
                     (ip, 9042)

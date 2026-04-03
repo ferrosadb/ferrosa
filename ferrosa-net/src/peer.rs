@@ -283,6 +283,15 @@ impl PeerManager {
     pub async fn get_peer_cql_broadcast(&self, host_id: uuid::Uuid) -> Option<String> {
         self.peer_cql_broadcasts.read().await.get(&host_id).cloned()
     }
+
+    /// Non-blocking version for synchronous contexts (e.g., system.peers query).
+    /// Returns None if the lock is contended.
+    pub fn get_peer_cql_broadcast_sync(&self, host_id: uuid::Uuid) -> Option<String> {
+        self.peer_cql_broadcasts
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.get(&host_id).cloned())
+    }
 }
 
 #[cfg(test)]
