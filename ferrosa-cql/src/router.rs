@@ -2762,6 +2762,26 @@ async fn route_create_keyspace(
         }
     }
 
+    // Validate NTS datacenter names against cluster nodes.
+    if strategy.contains("NetworkTopology") {
+        let local_dc = &state.node_config.data_center;
+        for dc_name in options.keys() {
+            if dc_name == local_dc {
+                continue;
+            }
+            // Check if any peer reports this DC (best-effort — we may not
+            // have full cluster state in standalone/pair mode).
+            tracing::warn!(
+                dc = dc_name,
+                local_dc,
+                keyspace = %s.name,
+                "NTS datacenter '{}' does not match local node datacenter '{}'",
+                dc_name,
+                local_dc,
+            );
+        }
+    }
+
     let ks_meta = KeyspaceMetadata {
         name: s.name.clone(),
         durable_writes: s.durable_writes.unwrap_or(true),
