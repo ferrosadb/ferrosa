@@ -28,6 +28,11 @@ const MAX_COLLECTION_ELEMENTS: usize = 65_536;
 
 /// Parse a CQL statement from the given input string.
 pub fn parse(input: &str) -> Result<Statement, CqlError> {
+    let span = tracing::info_span!(
+        "cql.parse",
+        cql.statement_type = tracing::field::Empty,
+    );
+    let _entered = span.enter();
     let lexer = Lexer::new(input)?;
     let mut parser = Parser::new(lexer);
     let stmt = parser.parse_statement()?;
@@ -41,7 +46,36 @@ pub fn parse(input: &str) -> Result<Statement, CqlError> {
             tok.kind, tok.pos
         )));
     }
+    // Record the statement type now that parsing succeeded.
+    span.record("cql.statement_type", statement_type_name(&stmt));
     Ok(stmt)
+}
+
+/// Returns a short name for the statement variant (e.g. "SELECT", "INSERT").
+fn statement_type_name(stmt: &Statement) -> &'static str {
+    match stmt {
+        Statement::Select(_) => "SELECT",
+        Statement::Insert(_) => "INSERT",
+        Statement::Update(_) => "UPDATE",
+        Statement::Delete(_) => "DELETE",
+        Statement::Batch(_) => "BATCH",
+        Statement::CreateKeyspace(_) => "CREATE_KEYSPACE",
+        Statement::AlterKeyspace(_) => "ALTER_KEYSPACE",
+        Statement::DropKeyspace(_) => "DROP_KEYSPACE",
+        Statement::CreateTable(_) => "CREATE_TABLE",
+        Statement::AlterTable(_) => "ALTER_TABLE",
+        Statement::DropTable(_) => "DROP_TABLE",
+        Statement::CreateRole(_) => "CREATE_ROLE",
+        Statement::AlterRole(_) => "ALTER_ROLE",
+        Statement::DropRole(_) => "DROP_ROLE",
+        Statement::Grant(_) => "GRANT",
+        Statement::Revoke(_) => "REVOKE",
+        Statement::Use(_) => "USE",
+        Statement::Truncate(_) => "TRUNCATE",
+        Statement::CreateIndex(_) => "CREATE_INDEX",
+        Statement::DropIndex(_) => "DROP_INDEX",
+        _ => "OTHER",
+    }
 }
 
 /// Parser state wrapping a [`Lexer`] and tracking nesting depth.
@@ -4126,5 +4160,27 @@ mod proptests {
         fn parser_never_panics(input in "\\PC{0,200}") {
             let _ = super::parse(&input);
         }
+    }
+}
+
+#[cfg(test)]
+mod tracing_tests {
+    use super::*;
+
+    #[test]
+    fn parse_creates_cql_parse_span_with_statement_type() {
+        // Verify that parse() successfully produces a statement and that
+        // statement_type_name returns the expected label.
+        let stmt = parse("SELECT * FROM ks.t").unwrap();
+        assert_eq!(statement_type_name(&stmt), "SELECT");
+
+        let stmt = parse("INSERT INTO ks.t (a) VALUES (1)").unwrap();
+        assert_eq!(statement_type_name(&stmt), "INSERT");
+
+        let stmt = parse("DELETE FROM ks.t WHERE a = 1").unwrap();
+        assert_eq!(statement_type_name(&stmt), "DELETE");
+
+        let stmt = parse("UPDATE ks.t SET b = 2 WHERE a = 1").unwrap();
+        assert_eq!(statement_type_name(&stmt), "UPDATE");
     }
 }

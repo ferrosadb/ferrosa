@@ -31,6 +31,7 @@ use ferrosa_schema::{
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
 use ferrosa_udf::UdfExecutor;
+use tracing::Instrument;
 
 use crate::ast::*;
 use crate::bridge;
@@ -194,6 +195,22 @@ pub async fn route(
     ctx: &RequestContext<'_>,
     stmt: Statement,
 ) -> Result<RouteResult, CqlError> {
+    let route_span = tracing::info_span!(
+        "cql.route",
+        cql.consistency_level = %ctx.consistency,
+    );
+
+    route_inner(state, ctx, stmt)
+        .instrument(route_span)
+        .await
+}
+
+/// Inner dispatch, instrumented with `cql.route` span by the caller.
+async fn route_inner(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    stmt: Statement,
+) -> Result<RouteResult, CqlError> {
     // Track the query for observability; the guard calls complete() on drop.
     let query_desc: String = format!("{:?}", &stmt).chars().take(200).collect();
     let keyspace = ctx.current_keyspace.as_deref().unwrap_or("");
@@ -204,6 +221,12 @@ pub async fn route(
         &ctx.auth.role,
     );
 
+    let execute_span = tracing::info_span!(
+        "cql.execute",
+        cql.rows_returned = tracing::field::Empty,
+    );
+
+    let result = async {
     match stmt {
         Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
         Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
@@ -377,6 +400,11 @@ pub async fn route(
             Ok(RouteResult::Result(crate::result::encode_void()))
         }
     }
+    }
+    .instrument(execute_span)
+    .await;
+
+    result
 }
 
 // ── SELECT ───────────────────────────────────────────────────────────────
@@ -10584,6 +10612,32 @@ mod tests {
         assert!(
             result.is_ok(),
             "REVOKE EXECUTE ON ALL FUNCTIONS should succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    // ── Tracing instrumentation tests ───────────────────────────────────
+
+    /// Verify that route() succeeds when tracing spans are active.
+    /// This exercises the cql.route and cql.execute span creation paths
+    /// to ensure they don't panic or interfere with query execution.
+    #[tokio::test]
+    async fn route_creates_tracing_spans() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("system".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "127.0.0.1:9999".into(),
+        };
+        // SELECT from a system table exercises the full span path.
+        let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "route with tracing spans should succeed, got: {:?}",
             result.err()
         );
     }
