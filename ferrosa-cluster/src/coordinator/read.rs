@@ -750,11 +750,19 @@ impl ClusterCoordinator {
                                 {
                                     Ok(ferrosa_net::message::Message::RangeReadResponse(b)) => {
                                         match bincode::deserialize::<RangeReadResponsePayload>(&b) {
-                                            Ok(resp) => resp
-                                                .partitions
-                                                .into_iter()
-                                                .map(partition_from_wire)
-                                                .collect(),
+                                            Ok(resp) => {
+                                                if resp.truncated {
+                                                    tracing::warn!(
+                                                        peer = %hid,
+                                                        "range read response truncated at 1M partitions; \
+                                                         results may be incomplete"
+                                                    );
+                                                }
+                                                resp.partitions
+                                                    .into_iter()
+                                                    .map(partition_from_wire)
+                                                    .collect()
+                                            }
                                             Err(e) => {
                                                 tracing::warn!(
                                                     "coordinate_range_read: \

@@ -663,6 +663,9 @@ pub struct RangeReadRequestPayload {
 pub struct RangeReadResponsePayload {
     /// All partitions held locally for this table, in token order.
     pub partitions: Vec<PartitionWire>,
+    /// `true` when the result set hit the 1M partition cap and may be incomplete.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Handles inbound `RangeReadRequest` RPCs from remote coordinators.
@@ -706,9 +709,11 @@ impl RpcHandler for RangeReadHandler {
             }
         };
 
+        let truncated = partitions.len() >= 1_000_000;
         let wire_partitions = partitions.into_iter().map(partition_to_wire).collect();
         let payload = RangeReadResponsePayload {
             partitions: wire_partitions,
+            truncated,
         };
 
         let resp_bytes = bincode::serialize(&payload)
