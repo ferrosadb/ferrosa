@@ -222,12 +222,10 @@ impl RpcServer {
             let msg_type = frame.header.msg_type;
             let stream_id = frame.header.stream_id;
             // Track inbound bytes.
-            self.bandwidth
-                .bytes_received
-                .fetch_add(
-                    frame.body.len() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+            self.bandwidth.bytes_received.fetch_add(
+                frame.body.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let msg = Message::decode(msg_type, &mut frame.body.clone())?;
 
             if let Some(response) = self.registry.dispatch(peer_id, msg_type, msg).await {
@@ -238,10 +236,7 @@ impl RpcServer {
                 // Track outbound bytes.
                 self.bandwidth
                     .bytes_sent
-                    .fetch_add(
-                        body_len as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    .fetch_add(body_len as u64, std::sync::atomic::Ordering::Relaxed);
                 let resp_frame = Frame {
                     header: FrameHeader::new(
                         response.msg_type(),

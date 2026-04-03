@@ -109,8 +109,10 @@ impl ContentionMetrics {
     pub fn record_guard_hold(&self, duration: std::time::Duration) {
         self.transition_guard_acquires
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.transition_guard_hold_ns
-            .fetch_add(duration.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.transition_guard_hold_ns.fetch_add(
+            duration.as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 

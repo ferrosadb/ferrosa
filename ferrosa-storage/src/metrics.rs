@@ -338,11 +338,7 @@ mod tests {
     #[test]
     fn storage_operation_metrics_increment() {
         let m = StorageOperationMetrics::new();
-        assert_eq!(
-            m.flush_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
+        assert_eq!(m.flush_count.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         m.inc_flush();
         m.inc_flush();
@@ -350,19 +346,14 @@ mod tests {
         m.add_bytes_flushed(4096);
         m.add_bytes_flushed(2048);
 
-        assert_eq!(
-            m.flush_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            2
-        );
+        assert_eq!(m.flush_count.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(
             m.compaction_count
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
         assert_eq!(
-            m.bytes_flushed
-                .load(std::sync::atomic::Ordering::Relaxed),
+            m.bytes_flushed.load(std::sync::atomic::Ordering::Relaxed),
             6144
         );
     }

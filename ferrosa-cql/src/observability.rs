@@ -221,30 +221,21 @@ mod tests {
         assert_eq!(rows.len(), 9);
 
         // Verify the SELECT row has opcode label as text and count as bigint bytes.
-        assert_eq!(
-            rows[0].cells[0],
-            CellValue::live(b"SELECT".to_vec(), 0)
-        );
+        assert_eq!(rows[0].cells[0], CellValue::live(b"SELECT".to_vec(), 0));
         assert_eq!(
             rows[0].cells[1],
             CellValue::live(1u64.to_be_bytes().to_vec(), 0)
         );
 
         // Verify the BATCH row (index 4).
-        assert_eq!(
-            rows[4].cells[0],
-            CellValue::live(b"BATCH".to_vec(), 0)
-        );
+        assert_eq!(rows[4].cells[0], CellValue::live(b"BATCH".to_vec(), 0));
         assert_eq!(
             rows[4].cells[1],
             CellValue::live(1u64.to_be_bytes().to_vec(), 0)
         );
 
         // Verify ERRORS row (last).
-        assert_eq!(
-            rows[8].cells[0],
-            CellValue::live(b"ERRORS".to_vec(), 0)
-        );
+        assert_eq!(rows[8].cells[0], CellValue::live(b"ERRORS".to_vec(), 0));
         assert_eq!(
             rows[8].cells[1],
             CellValue::live(1u64.to_be_bytes().to_vec(), 0)
