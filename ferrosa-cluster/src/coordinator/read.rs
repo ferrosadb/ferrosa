@@ -302,7 +302,7 @@ impl ClusterCoordinator {
                                     .flat_map(|r| r.cells.iter().map(|(_, c)| c.timestamp))
                                     .max()
                                     .unwrap_or(i64::MIN);
-                                let digest = Some(compute_partition_digest(&p));
+                                let digest = compute_partition_digest(&p).ok();
                                 ReplicaRead::Digest {
                                     digest,
                                     timestamp: ts,
@@ -375,7 +375,7 @@ impl ClusterCoordinator {
                 ReplicaRead::Full(opt_partition) => {
                     let d = opt_partition
                         .as_ref()
-                        .map(crate::raft::handlers::compute_partition_digest);
+                        .and_then(|p| crate::raft::handlers::compute_partition_digest(p).ok());
                     full_digest = Some(d);
                     full_partition = Some(opt_partition);
                     received += 1;
