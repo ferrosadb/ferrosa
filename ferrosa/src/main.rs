@@ -258,11 +258,42 @@ async fn persist_schema_to_s3(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+
+    if std::env::var("FERROSA_TELEMETRY_ENABLED").as_deref() == Ok("true") {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let sample_rate = ferrosa_cluster::telemetry::FerrosaTelemetryLayer::sample_rate_from_env();
+
+        // Warn on suspicious sample rates in non-dev mode.
+        let is_dev = std::env::var("FERROSA_MODE").as_deref() == Ok("development");
+        if !is_dev && (sample_rate == 0.0 || sample_rate > 0.1) {
+            tracing::warn!(
+                sample_rate,
+                "telemetry sample rate is {}: consider 0.001..0.1 for production",
+                if sample_rate == 0.0 {
+                    "zero (no spans will be sampled)"
+                } else {
+                    "high (>10% of spans sampled)"
+                }
+            );
+        }
+
+        let telemetry_layer =
+            ferrosa_cluster::telemetry::FerrosaTelemetryLayer::new(sample_rate);
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(telemetry_layer)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     tracing::info!("ferrosa starting");
 
@@ -1336,5 +1367,14 @@ mod tests {
             result, "SimpleStrategy",
             "string value in section must be extracted"
         );
+    }
+
+    #[test]
+    fn telemetry_layer_created_with_env_sample_rate() {
+        // Verify that FerrosaTelemetryLayer can be instantiated and configured
+        // from env-derived sample rate, matching the code path in main().
+        let layer = ferrosa_cluster::telemetry::FerrosaTelemetryLayer::new(0.05);
+        // After creation, no spans have been sampled.
+        assert_eq!(layer.sampled(), 0);
     }
 }

@@ -16,6 +16,7 @@ pub mod ring;
 pub mod state;
 pub mod streaming;
 pub mod system_table_loader;
+pub mod telemetry;
 pub mod system_table_writer;
 pub mod telemetry;
 pub mod write_path;
