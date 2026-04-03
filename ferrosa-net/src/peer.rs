@@ -54,8 +54,18 @@ impl PeerManager {
     }
 
     /// Add a connected peer with a real connection pool.
+    ///
+    /// If the pool's handshake received a CQL broadcast address from the peer,
+    /// it is stored for system.peers.native_address lookups.
     pub async fn add_peer(&self, peer_id: PeerId, pool: PriorityPool) {
         let (host_id, _addr) = peer_id;
+        // Extract the peer's CQL broadcast from the handshake before wrapping in Arc.
+        if let Some(broadcast) = pool.peer_cql_broadcast() {
+            self.peer_cql_broadcasts
+                .write()
+                .await
+                .insert(host_id, broadcast.to_string());
+        }
         let state = PeerState {
             pool: Some(Arc::new(pool)),
             peer_id,

@@ -40,6 +40,8 @@ pub struct PriorityPool {
     peer_host_id: Uuid,
     /// Resolved socket address from the initial connection.
     resolved_addr: SocketAddr,
+    /// Peer's CQL broadcast address from handshake (if provided).
+    peer_cql_broadcast: Option<String>,
     raft: LaneHandle,
     data: LaneHandle,
     bulk: LaneHandle,
@@ -92,6 +94,7 @@ impl PriorityPool {
         .await?;
 
         let peer_host_id = raft_client.peer_host_id();
+        let peer_cql_broadcast = raft_client.peer_cql_broadcast().map(String::from);
         let peer_host = peer_host.to_owned();
 
         // Spawn a lane actor for each connection.  The ctx_builder closure
@@ -131,6 +134,7 @@ impl PriorityPool {
         Ok(Self {
             peer_host_id,
             resolved_addr: peer_addr,
+            peer_cql_broadcast,
             raft,
             data,
             bulk,
@@ -140,6 +144,11 @@ impl PriorityPool {
     /// The peer's host_id, obtained during the handshake on the first connection.
     pub fn peer_host_id(&self) -> Uuid {
         self.peer_host_id
+    }
+
+    /// Peer's CQL broadcast address from the handshake, if provided.
+    pub fn peer_cql_broadcast(&self) -> Option<&str> {
+        self.peer_cql_broadcast.as_deref()
     }
 
     /// The socket address resolved during the initial connection.
