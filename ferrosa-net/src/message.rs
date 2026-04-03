@@ -118,10 +118,14 @@ pub enum Message {
     RangeReadRequest(Bytes),
     RangeReadResponse(Bytes),
 
-    // Streaming — opaque payloads
+    // Streaming (row-based) — opaque payloads
     StreamStart(Bytes),
     StreamChunk(Bytes),
     StreamEnd(Bytes),
+    // Streaming (SSTable file-based) — opaque payloads
+    SstableStreamStart(Bytes),
+    SstableStreamChunk(Bytes),
+    SstableStreamEnd(Bytes),
 
     // Pair mode
     PairWriteForward(Bytes),
@@ -209,6 +213,9 @@ impl Message {
             Self::StreamStart(_) => MsgType::StreamStart,
             Self::StreamChunk(_) => MsgType::StreamChunk,
             Self::StreamEnd(_) => MsgType::StreamEnd,
+            Self::SstableStreamStart(_) => MsgType::SstableStreamStart,
+            Self::SstableStreamChunk(_) => MsgType::SstableStreamChunk,
+            Self::SstableStreamEnd(_) => MsgType::SstableStreamEnd,
             Self::PairWriteForward(_) => MsgType::PairWriteForward,
             Self::PairWriteAck(_) => MsgType::PairWriteAck,
             Self::PairCatchUp { .. } => MsgType::PairCatchUp,
@@ -351,6 +358,9 @@ impl Message {
             | Self::StreamStart(b)
             | Self::StreamChunk(b)
             | Self::StreamEnd(b)
+            | Self::SstableStreamStart(b)
+            | Self::SstableStreamChunk(b)
+            | Self::SstableStreamEnd(b)
             | Self::PairWriteForward(b)
             | Self::PairWriteAck(b)
             | Self::PairCatchUpResponse(b)
@@ -533,6 +543,15 @@ impl Message {
             MsgType::StreamStart => Self::StreamStart(body.split_to(body.remaining())),
             MsgType::StreamChunk => Self::StreamChunk(body.split_to(body.remaining())),
             MsgType::StreamEnd => Self::StreamEnd(body.split_to(body.remaining())),
+            MsgType::SstableStreamStart => {
+                Self::SstableStreamStart(body.split_to(body.remaining()))
+            }
+            MsgType::SstableStreamChunk => {
+                Self::SstableStreamChunk(body.split_to(body.remaining()))
+            }
+            MsgType::SstableStreamEnd => {
+                Self::SstableStreamEnd(body.split_to(body.remaining()))
+            }
             MsgType::PairWriteForward => Self::PairWriteForward(body.split_to(body.remaining())),
             MsgType::PairWriteAck => Self::PairWriteAck(body.split_to(body.remaining())),
             MsgType::PairCatchUpResponse => {

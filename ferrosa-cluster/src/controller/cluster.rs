@@ -28,7 +28,10 @@ use crate::raft::state_machine::FerrosStateMachine;
 use crate::raft::{uuid_to_node_id, FerrosRaft, NodeInfo, NodeState};
 use crate::ring::TokenRing;
 use crate::state::RaftClusterState;
-use crate::streaming::{sender::StreamSender, StreamConfig, StreamedMutation};
+use crate::streaming::{
+    sender::{SstableSendRequest, StreamSender},
+    StreamConfig, StreamedMutation,
+};
 use crate::write_path::WritePath;
 
 use super::token::generate_deterministic_token;
@@ -623,7 +626,20 @@ impl ModeController {
                     // Every node reads from its local storage and streams
                     // partitions that belong to other nodes per the new ring.
                     // Nodes with no data complete instantly (zero iterations).
+                    //
+                    // Two paths:
+                    //   1. Row-based (default): serialize each partition's rows
+                    //      individually via bincode. Good for small tables.
+                    //   2. SSTable file-based (bulk): when partition count exceeds
+                    //      BOOTSTRAP_SSTABLE_THRESHOLD, flush the table to disk and
+                    //      stream the SSTable component files directly. Much faster
+                    //      for large datasets since it avoids per-row serialization.
                     tracing::info!("starting bootstrap streaming to new token owners");
+
+                    /// Partition count threshold above which we switch from
+                    /// per-row streaming to SSTable file-based bulk transfer.
+                    const BOOTSTRAP_SSTABLE_THRESHOLD: usize = 1_000;
+
                     if let Some(ring) = &**ring_for_bootstrap.load() {
                         let schema_snap = schema_for_bootstrap.snapshot();
                         let config = StreamConfig::default();
@@ -652,6 +668,103 @@ impl ModeController {
                                 }
                             };
 
+                            // --- SSTable bulk path ---
+                            // When partition count exceeds the threshold, flush
+                            // the table to an SSTable on disk and stream the raw
+                            // component files. This is O(file-size) rather than
+                            // O(partitions * rows * cells).
+                            if partitions.len() >= BOOTSTRAP_SSTABLE_THRESHOLD {
+                                tracing::info!(
+                                    ks,
+                                    tbl,
+                                    partitions = partitions.len(),
+                                    "bootstrap: using SSTable bulk transfer (threshold: {BOOTSTRAP_SSTABLE_THRESHOLD})"
+                                );
+
+                                // Ensure data is flushed to disk before streaming.
+                                if let Err(e) = storage_for_bootstrap.flush_all() {
+                                    tracing::warn!(%e, ks, tbl, "bootstrap: flush before SSTable stream failed, falling back to row path");
+                                    // Fall through to the row-based path below.
+                                } else {
+                                    // Look for SSTable directories for this table.
+                                    let sstable_base = storage_for_bootstrap
+                                        .data_dir()
+                                        .join("sstables")
+                                        .join(table_id.to_string());
+
+                                    let sstable_dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(&sstable_base) {
+                                        Ok(entries) => entries
+                                            .filter_map(|e| e.ok())
+                                            .filter(|e| e.path().is_dir())
+                                            .map(|e| e.path())
+                                            .collect(),
+                                        Err(_) => {
+                                            tracing::debug!(ks, tbl, "bootstrap: no SSTable dir at {}, using row path", sstable_base.display());
+                                            vec![]
+                                        }
+                                    };
+
+                                    if !sstable_dirs.is_empty() {
+                                        // Stream each SSTable directory to all non-local peers.
+                                        // TODO(S4): partition SSTables by target node token range
+                                        // instead of broadcasting all SSTables to all peers.
+                                        let mut sstable_streamed = false;
+                                        for sstable_dir in &sstable_dirs {
+                                            let sstable_id = sstable_dir
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| "unknown".to_string());
+
+                                            for (&target_node_id, &target_uuid) in &node_map {
+                                                if target_node_id == local_node_id {
+                                                    continue;
+                                                }
+                                                session_counter += 1;
+                                                let request = SstableSendRequest {
+                                                    sstable_dir,
+                                                    keyspace: ks,
+                                                    table: tbl,
+                                                    sstable_id: &sstable_id,
+                                                    session_id: session_counter,
+                                                    source_node: local_node_id,
+                                                    chunk_size: config.chunk_size_bytes,
+                                                };
+                                                match StreamSender::send_sstable_files(
+                                                    &request,
+                                                    &peer_manager_for_bootstrap,
+                                                    target_uuid,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(bytes) => {
+                                                        tracing::info!(
+                                                            target = target_node_id,
+                                                            bytes,
+                                                            sstable_id = %sstable_id,
+                                                            "bootstrap: SSTable streamed {ks}.{tbl}"
+                                                        );
+                                                        sstable_streamed = true;
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            %e,
+                                                            target = target_node_id,
+                                                            sstable_id = %sstable_id,
+                                                            "bootstrap: SSTable stream failed for {ks}.{tbl}"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if sstable_streamed {
+                                            continue; // Skip row-based path for this table.
+                                        }
+                                        // If all SSTable streams failed, fall through to row path.
+                                    }
+                                }
+                            }
+
+                            // --- Row-based path (default / fallback) ---
                             // Group partitions by target node (using all nodes, including
                             // Joining — they need the data even though they're not serving yet)
                             let mut by_node: std::collections::HashMap<u64, Vec<StreamedMutation>> =

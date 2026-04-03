@@ -14,7 +14,7 @@ pub mod receiver;
 pub mod sender;
 pub mod sstable_transfer;
 
-pub use receiver::{StreamReceiver, StreamResult};
+pub use receiver::{SstableStreamReceiver, SstableStreamResult, StreamReceiver, StreamResult};
 pub use sender::StreamSender;
 
 // ---------------------------------------------------------------------------
@@ -60,6 +60,57 @@ pub struct StreamEndPayload {
     /// Total number of mutations sent across all chunks.
     pub total_mutations: u64,
     /// CRC32 checksum computed over all serialised `StreamedMutation` bytes in order.
+    pub checksum: u32,
+}
+
+// ---------------------------------------------------------------------------
+// SSTable file-based streaming wire types
+// ---------------------------------------------------------------------------
+
+/// Payload carried in an `SstableStreamStart` message.
+///
+/// Announces a session that will transfer SSTable component files
+/// (Data.db, Index.db, Filter.db, etc.) as raw byte chunks.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SstableStreamStartPayload {
+    /// Unique identifier for this streaming session.
+    pub session_id: u64,
+    /// Raft node-id of the node initiating the stream.
+    pub source_node: u64,
+    /// Keyspace owning the SSTable.
+    pub keyspace: String,
+    /// Table owning the SSTable.
+    pub table: String,
+    /// SSTable generation/identifier.
+    pub sstable_id: String,
+    /// Component files with their sizes — receiver uses this to know when
+    /// all data has arrived.
+    pub components: Vec<sstable_transfer::SSTableComponent>,
+    /// Total bytes across all components.
+    pub total_bytes: u64,
+}
+
+/// Payload carried in an `SstableStreamChunk` message.
+///
+/// Each chunk carries a contiguous slice of one component file.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SstableStreamChunkPayload {
+    pub session_id: u64,
+    /// Component name (e.g. "Data.db").
+    pub component: String,
+    /// Byte offset within the component file.
+    pub offset: u64,
+    /// Raw file data.
+    pub data: Vec<u8>,
+}
+
+/// Payload carried in an `SstableStreamEnd` message.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SstableStreamEndPayload {
+    pub session_id: u64,
+    /// Total bytes sent across all chunks.
+    pub total_bytes: u64,
+    /// CRC32 checksum computed over all chunk data bytes in send order.
     pub checksum: u32,
 }
 
@@ -263,5 +314,47 @@ mod tests {
             matches!(result, Err(ClusterError::Internal(_))),
             "bad checksum must produce ClusterError::Internal"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. SSTable streaming payloads round-trip through bincode
+    // -----------------------------------------------------------------------
+    #[test]
+    fn sstable_stream_payloads_serialize() {
+        let start = SstableStreamStartPayload {
+            session_id: 1,
+            source_node: 42,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            sstable_id: "mc-001".to_string(),
+            components: vec![sstable_transfer::SSTableComponent {
+                name: "Data.db".to_string(),
+                size: 4096,
+            }],
+            total_bytes: 4096,
+        };
+        let encoded = bincode::serialize(&start).unwrap();
+        let decoded: SstableStreamStartPayload = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.session_id, 1);
+        assert_eq!(decoded.sstable_id, "mc-001");
+
+        let chunk = SstableStreamChunkPayload {
+            session_id: 1,
+            component: "Data.db".to_string(),
+            offset: 0,
+            data: vec![0xFF; 100],
+        };
+        let encoded = bincode::serialize(&chunk).unwrap();
+        let decoded: SstableStreamChunkPayload = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.data.len(), 100);
+
+        let end = SstableStreamEndPayload {
+            session_id: 1,
+            total_bytes: 4096,
+            checksum: 0xCAFE,
+        };
+        let encoded = bincode::serialize(&end).unwrap();
+        let decoded: SstableStreamEndPayload = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.checksum, 0xCAFE);
     }
 }

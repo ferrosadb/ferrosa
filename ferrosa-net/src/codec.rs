@@ -69,10 +69,14 @@ pub enum MsgType {
     RepairWrite = 0x24,
     RangeReadRequest = 0x25,
     RangeReadResponse = 0x26,
-    // Streaming
+    // Streaming (row-based)
     StreamStart = 0x30,
     StreamChunk = 0x31,
     StreamEnd = 0x32,
+    // Streaming (SSTable file-based)
+    SstableStreamStart = 0x33,
+    SstableStreamChunk = 0x34,
+    SstableStreamEnd = 0x35,
     // Pair
     PairWriteForward = 0x40,
     PairWriteAck = 0x41,
@@ -135,6 +139,9 @@ impl TryFrom<u8> for MsgType {
             0x30 => Ok(Self::StreamStart),
             0x31 => Ok(Self::StreamChunk),
             0x32 => Ok(Self::StreamEnd),
+            0x33 => Ok(Self::SstableStreamStart),
+            0x34 => Ok(Self::SstableStreamChunk),
+            0x35 => Ok(Self::SstableStreamEnd),
             0x40 => Ok(Self::PairWriteForward),
             0x41 => Ok(Self::PairWriteAck),
             0x42 => Ok(Self::PairCatchUp),
