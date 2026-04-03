@@ -914,8 +914,11 @@ impl RpcHandler for ClusterInviteHandler {
             new_peers.push((*peer_id, *peer_addr));
         }
 
-        // Connect to unknown peers.
+        // Connect to unknown peers using a local JoinSet so we can await
+        // completion before re-broadcasting (replaces raw tokio::spawn +
+        // fixed 500ms sleep).
         let internode_port = self.net_config.bind_addr.port();
+        let mut connect_tasks = tokio::task::JoinSet::new();
         for (peer_id, peer_addr) in &new_peers {
             let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
             let pm = self.peer_manager.clone();
@@ -924,8 +927,7 @@ impl RpcHandler for ClusterInviteHandler {
             let uuid = *peer_id;
             let addr = reverse_addr;
 
-            // Connect in background to avoid blocking the handler.
-            tokio::spawn(async move {
+            connect_tasks.spawn(async move {
                 match PriorityPool::connect(cfg, local_id, &addr.to_string()).await {
                     Ok(pool) => {
                         pm.add_peer((uuid, addr), pool).await;
@@ -946,26 +948,33 @@ impl RpcHandler for ClusterInviteHandler {
             });
         }
 
-        // Re-broadcast the invite to newly connected peers (after a short delay
-        // to allow connections to establish).
+        // Wait for all connection tasks to complete, then re-broadcast
+        // immediately. This replaces the previous raw tokio::spawn + 500ms
+        // sleep, providing both panic visibility and faster re-broadcast.
         if !new_peers.is_empty() {
             let pm = self.peer_manager.clone();
             let invite = Message::ClusterInvite {
                 initiator,
                 peers: peers.clone(),
             };
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                for (peer_id, _) in &new_peers {
-                    if let Err(e) = pm.fire(*peer_id, invite.clone(), Lane::Data).await {
-                        tracing::debug!(
-                            peer = %peer_id,
-                            %e,
-                            "cluster invite: re-broadcast failed (peer may not be connected yet)"
-                        );
-                    }
+
+            // Drain the JoinSet — log any panicked tasks.
+            while let Some(result) = connect_tasks.join_next().await {
+                if let Err(e) = result {
+                    tracing::error!("invite handler connection task panicked: {e}");
                 }
-            });
+            }
+
+            // Re-broadcast immediately now that connections are established.
+            for (peer_id, _) in &new_peers {
+                if let Err(e) = pm.fire(*peer_id, invite.clone(), Lane::Data).await {
+                    tracing::debug!(
+                        peer = %peer_id,
+                        %e,
+                        "cluster invite: re-broadcast failed (peer may not be connected yet)"
+                    );
+                }
+            }
         }
 
         // If this node is in Pair mode, the invite signals that a 3rd node
