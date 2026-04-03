@@ -22,30 +22,39 @@ impl ClusterState for SingleNodeClusterState {
 /// ClusterState implementation for pair mode.
 ///
 /// Returns the single peer as the only entry in `peers()`.
+/// Maintains a cached result via `ArcSwap` so that `RwLock` contention
+/// returns the last known peer list instead of an empty vec.
 pub struct PairClusterState {
     config: Arc<ClusterConfig>,
     state: Arc<RwLock<PairState>>,
+    /// Cached peers result — returned on `RwLock` contention instead of
+    /// an empty vec. Updated each time `peers()` successfully reads state.
+    cached_peers: ArcSwap<Vec<PeerInfo>>,
 }
 
 impl PairClusterState {
     pub fn new(config: Arc<ClusterConfig>, state: Arc<RwLock<PairState>>) -> Self {
-        Self { config, state }
+        Self {
+            config,
+            state,
+            cached_peers: ArcSwap::from_pointee(Vec::new()),
+        }
     }
 }
 
 impl ClusterState for PairClusterState {
     fn peers(&self) -> Vec<PeerInfo> {
-        // Use try_read to avoid blocking. If locked, return empty.
+        // Use try_read to avoid blocking. On contention, return cached result.
         let state = match self.state.try_read() {
             Ok(s) => s,
-            Err(_) => return vec![],
+            Err(_) => return (**self.cached_peers.load()).clone(),
         };
 
         let peer_addr = state.peer_addr;
         let ip = peer_addr.ip();
         let port = peer_addr.port();
 
-        vec![PeerInfo {
+        let result = vec![PeerInfo {
             peer: ip,
             peer_port: port,
             data_center: self.config.data_center.clone(),
@@ -58,7 +67,12 @@ impl ClusterState for PairClusterState {
             schema_version: uuid::Uuid::nil(),
             tokens: vec![],
             release_version: ferrosa_schema::system::RELEASE_VERSION.to_string(),
-        }]
+        }];
+
+        // Update the cache for future contention cases.
+        self.cached_peers.store(Arc::new(result.clone()));
+
+        result
     }
 }
 
