@@ -14,6 +14,29 @@ use crate::error::{NetError, Result};
 use crate::handshake::initiate_handshake;
 use crate::message::Message;
 
+/// Atomic counters for network bandwidth tracking.
+pub struct BandwidthMetrics {
+    /// Total bytes sent (request bodies).
+    pub bytes_sent: std::sync::atomic::AtomicU64,
+    /// Total bytes received (response bodies).
+    pub bytes_received: std::sync::atomic::AtomicU64,
+}
+
+impl BandwidthMetrics {
+    pub fn new() -> Self {
+        Self {
+            bytes_sent: std::sync::atomic::AtomicU64::new(0),
+            bytes_received: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for BandwidthMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct RpcClient {
     #[allow(dead_code)] // used in future phases (reconnection, pool management)
     config: Arc<NetConfig>,
@@ -26,6 +49,8 @@ pub struct RpcClient {
     next_stream_id: Arc<AtomicU32>,
     /// Signals `false` when the TCP connection drops.
     alive_tx: watch::Sender<bool>,
+    /// Per-client bandwidth counters.
+    pub bandwidth: Arc<BandwidthMetrics>,
 }
 
 impl RpcClient {
@@ -145,6 +170,7 @@ impl RpcClient {
             tx,
             next_stream_id: Arc::new(AtomicU32::new(1)),
             alive_tx,
+            bandwidth: Arc::new(BandwidthMetrics::new()),
         })
     }
 
@@ -176,6 +202,9 @@ impl RpcClient {
         msg.encode(&mut body)?;
         let body_len = u32::try_from(body.len())
             .map_err(|_| NetError::Protocol("request body exceeds u32::MAX".into()))?;
+        self.bandwidth
+            .bytes_sent
+            .fetch_add(body_len as u64, std::sync::atomic::Ordering::Relaxed);
         let frame = Frame {
             header: FrameHeader::new(msg.msg_type(), lane, stream_id, body_len),
             body: body.freeze(),
@@ -185,10 +214,20 @@ impl RpcClient {
             .await
             .map_err(|_| NetError::Protocol("connection closed".into()))?;
 
-        tokio::time::timeout(lane.timeout(), resp_rx)
+        let response = tokio::time::timeout(lane.timeout(), resp_rx)
             .await
             .map_err(|_| NetError::Timeout(format!("{:?} lane timeout", lane)))?
-            .map_err(|_| NetError::Protocol("response channel dropped".into()))
+            .map_err(|_| NetError::Protocol("response channel dropped".into()))?;
+
+        // Track received bytes (approximate from response encode size).
+        let mut resp_buf = BytesMut::new();
+        if response.encode(&mut resp_buf).is_ok() {
+            self.bandwidth
+                .bytes_received
+                .fetch_add(resp_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        Ok(response)
     }
 
     pub async fn fire(&self, msg: Message, lane: Lane) -> Result<()> {
