@@ -1049,6 +1049,30 @@ impl StorageEngine {
     ///
     /// The commit log append provides durability; the memtable write provides
     /// read visibility. Both are lock-free on the hot path.
+    /// Return the data directory path.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.config.data_dir
+    }
+
+    /// Write directly to storage for observability tables.
+    /// Same as `write()` but skips observer dispatch to prevent telemetry
+    /// feedback loops (observability writes must not generate new spans).
+    pub fn write_observability(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        row: Row,
+        _timestamp: i64,
+    ) -> ferrosa_common::Result<()> {
+        // Skip commit log for observability (best-effort, not durable).
+        let tables = self.tables.read();
+        let state = tables.get(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidData(format!("observability table not found: {table_id}"))
+        })?;
+        state.store.write(key, row)?;
+        Ok(())
+    }
+
     pub fn write(
         &self,
         table_id: &TableId,

@@ -28,6 +28,14 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
+/// Maximum tracked connected peers before eviction (prevents unbounded growth).
+pub(super) const MAX_CONNECTED_PEERS: usize = 1000;
+/// Maximum pending join requests before eviction.
+pub(super) const MAX_PENDING_JOINS: usize = 100;
+/// Maximum seen invite initiators before eviction.
+#[allow(dead_code)]
+pub(super) const MAX_SEEN_INVITE_INITIATORS: usize = 100;
+
 use parking_lot::Mutex;
 
 use arc_swap::ArcSwap;
@@ -188,6 +196,12 @@ pub struct ModeController {
     /// Used for quorum calculations instead of the dynamic connected count
     /// to prevent false quorum restoration after network partitions.
     pub(super) committed_cluster_size: AtomicUsize,
+    /// Receiver for DDL operations queued during Forming state.
+    pub(super) ddl_queue_rx: Arc<
+        parking_lot::Mutex<
+            Option<tokio::sync::mpsc::UnboundedReceiver<crate::pair::ddl::DdlOperation>>,
+        >,
+    >,
     /// Contention metrics for the transition guard.
     pub contention_metrics: Arc<ContentionMetrics>,
 }
@@ -270,6 +284,7 @@ impl ModeController {
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
+            ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
         });
 
@@ -324,6 +339,7 @@ impl ModeController {
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
+            ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
         })
     }
@@ -378,6 +394,7 @@ impl ModeController {
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
+            ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
         })
     }
