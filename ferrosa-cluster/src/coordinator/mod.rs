@@ -529,4 +529,88 @@ mod tests {
             1
         );
     }
+
+    #[tokio::test]
+    async fn coordinator_write_read_creates_spans() {
+        use std::sync::atomic::AtomicU64;
+
+        struct SpanCollector {
+            names: Arc<std::sync::Mutex<Vec<String>>>,
+            next_id: AtomicU64,
+        }
+
+        impl tracing::Subscriber for SpanCollector {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                self.names
+                    .lock()
+                    .unwrap()
+                    .push(span.metadata().name().to_string());
+                let id = self
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                tracing::span::Id::from_u64(id)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let shared_names: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let _guard = tracing::subscriber::set_default(SpanCollector {
+            names: Arc::clone(&shared_names),
+            next_id: AtomicU64::new(0),
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            Arc::new(PeerManager::new(
+                Arc::new(ferrosa_net::config::NetConfig::default()),
+                Uuid::new_v4(),
+                Arc::new(NoopListener),
+            )),
+            local_node_id,
+            storage,
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        let row = test_row();
+
+        coordinator
+            .coordinate_write(&table_id, &key, row, 1000)
+            .await
+            .unwrap();
+        coordinator.coordinate_read(&table_id, &key).await.unwrap();
+
+        let recorded = shared_names.lock().unwrap();
+        assert!(
+            recorded.iter().any(|n| n == "cluster.write"),
+            "expected 'cluster.write' span, got: {:?}",
+            *recorded
+        );
+        assert!(
+            recorded.iter().any(|n| n == "cluster.read"),
+            "expected 'cluster.read' span, got: {:?}",
+            *recorded
+        );
+    }
 }
