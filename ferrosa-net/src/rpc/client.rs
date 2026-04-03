@@ -51,6 +51,8 @@ pub struct RpcClient {
     alive_tx: watch::Sender<bool>,
     /// Per-client bandwidth counters.
     pub bandwidth: Arc<BandwidthMetrics>,
+    /// In-flight RPC gauge: incremented on send, decremented on response/timeout.
+    pub in_flight: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl RpcClient {
@@ -171,6 +173,7 @@ impl RpcClient {
             next_stream_id: Arc::new(AtomicU32::new(1)),
             alive_tx,
             bandwidth: Arc::new(BandwidthMetrics::new()),
+            in_flight: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         })
     }
 
@@ -214,10 +217,20 @@ impl RpcClient {
             .await
             .map_err(|_| NetError::Protocol("connection closed".into()))?;
 
-        let response = tokio::time::timeout(lane.timeout(), resp_rx)
+        // Increment in-flight gauge now that the request is on the wire.
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let result = tokio::time::timeout(lane.timeout(), resp_rx)
             .await
-            .map_err(|_| NetError::Timeout(format!("{:?} lane timeout", lane)))?
-            .map_err(|_| NetError::Protocol("response channel dropped".into()))?;
+            .map_err(|_| NetError::Timeout(format!("{:?} lane timeout", lane)))
+            .and_then(|r| r.map_err(|_| NetError::Protocol("response channel dropped".into())));
+
+        // Decrement in-flight gauge on response or timeout.
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+        let response = result?;
 
         // Track received bytes (approximate from response encode size).
         let mut resp_buf = BytesMut::new();
@@ -501,6 +514,44 @@ mod tests {
             recorded.iter().any(|n| n == "net.rpc"),
             "expected 'net.rpc' span, got: {:?}",
             *recorded
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_gauge_returns_to_zero() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let addr = start_echo_server(&config).await;
+
+        let client = RpcClient::connect(Arc::new(config), uuid::Uuid::new_v4(), addr)
+            .await
+            .unwrap();
+
+        // Before any send, in-flight should be 0.
+        assert_eq!(
+            client.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "in-flight should start at 0"
+        );
+
+        // After a completed send, in-flight should return to 0.
+        let _resp = client
+            .send(
+                Message::Ping {
+                    nonce: 99,
+                    sent_at: 0,
+                },
+                Lane::Data,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            client.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "in-flight should return to 0 after response received"
         );
     }
 }
