@@ -510,6 +510,7 @@ async fn route_select(
                 "native_port",
                 "schema_version",
                 "release_version",
+                "tokens",
             ]
             .into_iter()
             .map(String::from)
@@ -524,10 +525,16 @@ async fn route_select(
                 CqlType::Int,
                 CqlType::Uuid,
                 CqlType::Varchar,
+                CqlType::Set(Box::new(CqlType::Varchar)),
             ];
             let rows: Vec<Vec<Option<CqlValue>>> = peers
                 .iter()
                 .map(|p| {
+                    let tokens_set: Vec<CqlValue> = p
+                        .tokens
+                        .iter()
+                        .map(|t| CqlValue::Text(t.clone()))
+                        .collect();
                     vec![
                         Some(CqlValue::Inet(p.peer)),
                         Some(CqlValue::Int(p.peer_port as i32)),
@@ -538,6 +545,7 @@ async fn route_select(
                         Some(CqlValue::Int(p.native_port as i32)),
                         Some(CqlValue::Uuid(p.schema_version)),
                         Some(CqlValue::Text(p.release_version.clone())),
+                        Some(CqlValue::Set(tokens_set)),
                     ]
                 })
                 .collect();

@@ -212,6 +212,7 @@ fn system_column_rows() -> Vec<ColumnRow> {
         ("native_port", "regular", "int", -1),
         ("schema_version", "regular", "uuid", -1),
         ("release_version", "regular", "text", -1),
+        ("tokens", "regular", "set<varchar>", -1),
     ];
     for table in &["peers", "peers_v2"] {
         for (name, kind, cql_type, pos) in peer_cols {
@@ -557,5 +558,29 @@ mod tests {
             .expect("system.local must have a 'tokens' column");
         assert_eq!(tokens_col.column_type, "set<varchar>");
         assert_eq!(tokens_col.kind, "regular");
+    }
+
+    /// Regression test for BUG-SYSTEM-PEERS-MISSING-TOKENS.
+    /// cdrs-tokio requires `tokens` in system.peers to build its
+    /// token-aware routing map. Without it, the driver enters an
+    /// infinite error-retry loop and never establishes a session.
+    #[test]
+    fn system_peers_columns_include_tokens() {
+        let snap = SchemaSnapshot::new();
+        let rows = query_columns(&snap);
+        for table in &["peers", "peers_v2"] {
+            let peer_cols: Vec<_> = rows
+                .iter()
+                .filter(|r| r.keyspace_name == "system" && r.table_name == *table)
+                .collect();
+            let tokens_col = peer_cols
+                .iter()
+                .find(|r| r.column_name == "tokens")
+                .unwrap_or_else(|| {
+                    panic!("system.{table} must have a 'tokens' column")
+                });
+            assert_eq!(tokens_col.column_type, "set<varchar>");
+            assert_eq!(tokens_col.kind, "regular");
+        }
     }
 }
