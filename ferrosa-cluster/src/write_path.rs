@@ -17,6 +17,7 @@ use ferrosa_storage::{Mutation, TableId};
 use crate::consistency::ConsistencyLevel;
 use crate::coordinator::ClusterCoordinator;
 use crate::pair::coordinator::PairCoordinator;
+use crate::ring::strategy::ReplicationStrategy;
 
 /// The active write path. Swapped atomically via `ArcSwap` when the
 /// deployment mode changes (standalone → pair → cluster).
@@ -114,8 +115,8 @@ impl WritePath {
     /// Write a row. In standalone mode this goes directly to storage.
     /// In pair mode this goes through the PairCoordinator which handles
     /// replication (primary) or forwarding (secondary).
-    /// In cluster mode the client's consistency level and keyspace RF are
-    /// forwarded to the coordinator for proper CL enforcement.
+    /// In cluster mode the replication strategy determines whether to use
+    /// SimpleStrategy or NetworkTopologyStrategy DC-aware coordination.
     pub async fn write(
         &self,
         table_id: &TableId,
@@ -123,7 +124,7 @@ impl WritePath {
         row: Row,
         timestamp: i64,
         cl: ConsistencyLevel,
-        rf: usize,
+        strategy: &ReplicationStrategy,
     ) -> ferrosa_common::Result<()> {
         match self {
             Self::Direct(engine) => engine.write(table_id, key, row, timestamp),
@@ -143,10 +144,16 @@ impl WritePath {
                     .await
                     .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}")))
             }
-            Self::Cluster(coordinator) => coordinator
-                .coordinate_write_with(table_id, key, row, timestamp, cl, rf)
-                .await
-                .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+            Self::Cluster(coordinator) => match strategy {
+                ReplicationStrategy::Simple { replication_factor } => coordinator
+                    .coordinate_write_with(table_id, key, row, timestamp, cl, *replication_factor)
+                    .await
+                    .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+                ReplicationStrategy::NetworkTopology { .. } => coordinator
+                    .coordinate_write_nts(table_id, key, row, timestamp, cl, strategy)
+                    .await
+                    .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+            },
         }
     }
 }
@@ -154,6 +161,7 @@ impl WritePath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ring::strategy::ReplicationStrategy;
     use ferrosa_common::{CellValue, PartitionKey, Token};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
 
@@ -210,7 +218,10 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1000),
         };
 
-        WritePath::write(&wp, &table_id, &key, row, 1000, ConsistencyLevel::One, 1)
+        let strategy = ReplicationStrategy::Simple {
+            replication_factor: 1,
+        };
+        WritePath::write(&wp, &table_id, &key, row, 1000, ConsistencyLevel::One, &strategy)
             .await
             .unwrap();
 

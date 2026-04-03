@@ -55,7 +55,7 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             cluster_name: "ferrosa".to_string(),
-            data_center: "dc1".to_string(),
+            data_center: "datacenter1".to_string(),
             rack: "rack1".to_string(),
             num_tokens: 256,
             default_cl: ConsistencyLevel::Quorum,
@@ -134,7 +134,7 @@ mod tests {
     fn default_config_values() {
         let config = ClusterConfig::default();
         assert_eq!(config.cluster_name, "ferrosa");
-        assert_eq!(config.data_center, "dc1");
+        assert_eq!(config.data_center, "datacenter1");
         assert_eq!(config.rack, "rack1");
         assert_eq!(config.num_tokens, 256);
         assert_eq!(config.default_cl, ConsistencyLevel::Quorum);

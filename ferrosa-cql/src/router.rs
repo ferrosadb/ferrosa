@@ -1766,7 +1766,7 @@ async fn route_insert(
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
     let table_id = TableId::new(ks, &s.table);
-    let rf = keyspace_rf(&state.schema, ks);
+    let strategy = keyspace_strategy(&state.schema, ks);
 
     // BUG-0016: IF NOT EXISTS — check whether the row already exists before writing.
     if s.if_not_exists {
@@ -1831,7 +1831,7 @@ async fn route_insert(
             row,
             timestamp,
             ctx.consistency,
-            rf,
+            &strategy,
         )
         .await?;
 
@@ -2146,7 +2146,7 @@ async fn route_update(
     }
 
     let row = bridge::build_row(&regular_cells, &ck_values, timestamp, s.using_ttl);
-    let rf = keyspace_rf(&state.schema, ks);
+    let strategy = keyspace_strategy(&state.schema, ks);
 
     state
         .write_path
@@ -2157,7 +2157,7 @@ async fn route_update(
             row,
             timestamp,
             ctx.consistency,
-            rf,
+            &strategy,
         )
         .await?;
     Ok(result::encode_void())
@@ -2329,7 +2329,7 @@ async fn route_delete(
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
     let row = bridge::build_delete_row(&delete_columns, &ck_values, timestamp);
     let table_id = TableId::new(ks, &s.table);
-    let rf = keyspace_rf(&state.schema, ks);
+    let strategy = keyspace_strategy(&state.schema, ks);
 
     state
         .write_path
@@ -2340,7 +2340,7 @@ async fn route_delete(
             row,
             timestamp,
             ctx.consistency,
-            rf,
+            &strategy,
         )
         .await?;
     Ok(result::encode_void())
@@ -3883,16 +3883,30 @@ fn resolve_keyspace<'a>(
         .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))
 }
 
-/// Look up the replication factor for a keyspace from the schema.
+/// Look up the replication strategy for a keyspace from the schema.
 ///
-/// Falls back to 1 if the keyspace is not found or the RF is not set.
-fn keyspace_rf(schema: &Schema, ks: &str) -> usize {
+/// Falls back to SimpleStrategy RF=1 if the keyspace is not found or parsing fails.
+fn keyspace_strategy(
+    schema: &Schema,
+    ks: &str,
+) -> ferrosa_cluster::ring::strategy::ReplicationStrategy {
+    use ferrosa_cluster::ring::strategy::ReplicationStrategy;
     let snap = schema.snapshot();
     snap.keyspaces
         .get(ks)
-        .and_then(|km| km.replication.options.get("replication_factor"))
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1)
+        .and_then(|km| ReplicationStrategy::try_from(&km.replication).ok())
+        .unwrap_or(ReplicationStrategy::Simple {
+            replication_factor: 1,
+        })
+}
+
+/// Look up the effective replication factor for a keyspace from the schema.
+///
+/// For SimpleStrategy, returns `replication_factor`.
+/// For NetworkTopologyStrategy, returns the sum of all per-DC replication factors.
+/// Falls back to 1 if the keyspace is not found or parsing fails.
+fn keyspace_rf(schema: &Schema, ks: &str) -> usize {
+    keyspace_strategy(schema, ks).replication_factor()
 }
 
 /// Build column names and types for a SELECT result.
@@ -6107,7 +6121,7 @@ mod tests {
 
         let node_config = Arc::new(NodeConfig {
             cluster_name: "test".into(),
-            data_center: "dc1".into(),
+            data_center: "datacenter1".into(),
             rack: "rack1".into(),
             rpc_port: 9042,
             host_id: uuid::Uuid::new_v4(),
@@ -6161,6 +6175,69 @@ mod tests {
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
         }
+    }
+
+    fn superuser_auth() -> ferrosa_schema::AuthContext {
+        ferrosa_schema::AuthContext {
+            role: "cassandra".into(),
+            is_superuser: true,
+            must_change_password: false,
+        }
+    }
+
+    fn create_test_keyspace(
+        schema: &Schema,
+        name: &str,
+        strategy: &str,
+        opts: std::collections::HashMap<String, String>,
+    ) {
+        schema
+            .create_keyspace(
+                ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+                    name: name.to_string(),
+                    durable_writes: true,
+                    replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+                        strategy: strategy.to_string(),
+                        options: opts,
+                    },
+                },
+                &superuser_auth(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn keyspace_rf_returns_rf_for_simple_strategy() {
+        let (state, _dir) = setup();
+        let mut opts = std::collections::HashMap::new();
+        opts.insert("replication_factor".to_string(), "3".to_string());
+        create_test_keyspace(&state.schema, "test_ss", "SimpleStrategy", opts);
+        assert_eq!(keyspace_rf(&state.schema, "test_ss"), 3);
+    }
+
+    #[test]
+    fn keyspace_rf_returns_total_rf_for_nts() {
+        let (state, _dir) = setup();
+        let mut opts = std::collections::HashMap::new();
+        opts.insert("datacenter1".to_string(), "3".to_string());
+        create_test_keyspace(&state.schema, "test_nts", "NetworkTopologyStrategy", opts);
+        assert_eq!(keyspace_rf(&state.schema, "test_nts"), 3);
+    }
+
+    #[test]
+    fn keyspace_rf_returns_sum_for_multi_dc_nts() {
+        let (state, _dir) = setup();
+        let mut opts = std::collections::HashMap::new();
+        opts.insert("datacenter1".to_string(), "3".to_string());
+        opts.insert("datacenter2".to_string(), "2".to_string());
+        create_test_keyspace(&state.schema, "test_multi_dc", "NetworkTopologyStrategy", opts);
+        assert_eq!(keyspace_rf(&state.schema, "test_multi_dc"), 5);
+    }
+
+    #[test]
+    fn keyspace_rf_returns_1_when_keyspace_not_found() {
+        let (state, _dir) = setup();
+        assert_eq!(keyspace_rf(&state.schema, "nonexistent"), 1);
     }
 
     #[tokio::test]
