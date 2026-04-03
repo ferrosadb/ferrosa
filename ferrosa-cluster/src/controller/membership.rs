@@ -176,14 +176,9 @@ impl ModeController {
                             // Serialize all rows via RowWire for full fidelity
                             // (clustering keys, all cells, deletion, liveness).
                             use crate::raft::handlers::RowWire;
-                            let wire_rows: Vec<RowWire> = partition
-                                .rows
-                                .iter()
-                                .cloned()
-                                .map(RowWire::from)
-                                .collect();
-                            let row_bytes = bincode::serialize(&wire_rows)
-                                .unwrap_or_default();
+                            let wire_rows: Vec<RowWire> =
+                                partition.rows.iter().cloned().map(RowWire::from).collect();
+                            let row_bytes = bincode::serialize(&wire_rows).unwrap_or_default();
                             let ts = partition
                                 .rows
                                 .first()
