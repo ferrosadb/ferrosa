@@ -31,8 +31,8 @@
 | **Likelihood** | 3 |
 | **Impact** | 4 |
 | **Risk** | **12** |
-| **Mitigation** | (1) Hard cap `seconds` parameter to 60. (2) Mutex ensures only one concurrent profile — reject with 429 if in progress. (3) Require superuser auth or `FERROSA_DEBUG_ENABLED=true`. (4) Memory-bound the BufWriter (cap at 64 MB, drop spans beyond). (5) Rate-limit: max 1 profile per 5 minutes per node. |
-| **Status** | **Partial** — mutex and auth gate designed; memory cap and rate limit are gaps |
+| **Mitigation** | (1) Require admin auth token (not just superuser role) — dedicated token separate from CQL credentials. (2) Optional IP whitelist via `FERROSA_DEBUG_IP_WHITELIST` env var for faster, more secure access control. (3) Hard cap `seconds` parameter to 60. (4) Mutex ensures only one concurrent profile — reject with 429 if in progress. (5) Memory-bound the BufWriter (cap at 64 MB, drop spans beyond). (6) Rate-limit: max 1 profile per 5 minutes per node. All mitigations implemented together to prevent admin foot-gun scenarios. |
+| **Status** | **APPROVED** — implement all |
 
 #### OBS-T2: Flamechart Information Disclosure (Risk 8 — High)
 
@@ -44,7 +44,7 @@
 | **Impact** | 4 |
 | **Risk** | **8** |
 | **Mitigation** | (1) Auth-gate behind superuser role (not just env var). (2) Strip sensitive span attributes from flame output — include only span names, not attribute maps. (3) Bind endpoint to localhost by default; require explicit config to expose externally. |
-| **Status** | **Gap** |
+| **Status** | **APPROVED** — implement all |
 
 ### 2. Slow Query Log
 
@@ -57,8 +57,8 @@
 | **Likelihood** | 4 |
 | **Impact** | 3 |
 | **Risk** | **12** |
-| **Mitigation** | (1) Store only parameterized form (replace literals with `?`) in `query_text`. (2) Store raw text only at DEBUG level in local logs, never in CQL tables. (3) Grant SELECT on `system_observability.slow_queries` only to superuser role. (4) TTL slow query rows (default 7 days). |
-| **Status** | **Gap** — current design stores full query text |
+| **Mitigation** | (1) Store ONLY `?`-masked (parameterized) queries in `query_text` — never raw literals in CQL tables. (2) Store raw text only at DEBUG level in local logs, never in CQL tables. (3) Grant SELECT on `system_observability.slow_queries` only to superuser role. (4) TTL slow query rows — default 7 days, configurable via `FERROSA_SLOW_QUERY_TTL_DAYS` env var. |
+| **Status** | **APPROVED** |
 
 #### OBS-T4: Slow Query Threshold Manipulation (Risk 4 — Medium)
 
@@ -69,8 +69,8 @@
 | **Likelihood** | 2 |
 | **Impact** | 2 |
 | **Risk** | **4** |
-| **Mitigation** | (1) Enforce minimum threshold (100ms floor). (2) Rate-limit slow query writes (max 100/sec per node). (3) Log warning when threshold is below 500ms. |
-| **Status** | **Gap** |
+| **Mitigation** | (1) Enforce minimum threshold (100ms floor) for fingerprint capture. (2) Rate-limit slow query writes (max 100/sec per node). (3) Log warning when threshold is below 500ms. (4) Maintain an all-query counter (total request count by opcode) even for queries below the fingerprint threshold — this counter does not store query text, only aggregate counts. |
+| **Status** | **APPROVED** — with all-query opcode counter addition |
 
 ### 3. Query Fingerprints
 
@@ -83,8 +83,8 @@
 | **Likelihood** | 3 |
 | **Impact** | 2 |
 | **Risk** | **6** |
-| **Mitigation** | (1) Restrict SELECT on `system_observability.query_fingerprints` to superuser or dedicated monitoring role. (2) Consider hashing table/column names in fingerprints (trade-off: reduces advisor utility). (3) Document that fingerprint tables are admin-only. |
-| **Status** | **Gap** |
+| **Mitigation** | (1) Restrict SELECT on `system_observability.query_fingerprints` to DB superuser only. (2) Consider hashing table/column names in fingerprints (trade-off: reduces advisor utility). (3) Document that only DB superusers can read billing and fingerprint data. |
+| **Status** | **APPROVED** |
 
 ### 4. Billing Data
 
@@ -97,8 +97,8 @@
 | **Likelihood** | 2 |
 | **Impact** | 5 |
 | **Risk** | **10** |
-| **Mitigation** | (1) Make `system_observability.client_usage` a virtual table (read-only from CQL — no INSERT/UPDATE/DELETE). (2) Append-only design: each bucket is a new row, never updated. (3) `ferrosa-dbaas` aggregator cross-checks node-reported totals against coordinator-level counters. (4) Sign usage records with node key for non-repudiation. |
-| **Status** | **Gap** — virtual tables are read-only by design, but cross-validation and signing are not implemented |
+| **Mitigation** | (1) Make `system_observability.client_usage` a virtual table (read-only from CQL — no INSERT/UPDATE/DELETE). (2) Append-only design: each bucket is a new row, never updated. (3) `ferrosa-dbaas` aggregator cross-checks node-reported totals against coordinator-level counters. (4) Billing data is SIGNED for non-repudiation — the DBaaS layer creates the signing key. Even a DB admin cannot modify signed billing records. This provides a strong integrity guarantee for the billing pipeline. |
+| **Status** | **APPROVED** — add signing |
 
 #### OBS-T7: Billing Data Loss During Restart (Risk 6 — High)
 
@@ -109,8 +109,8 @@
 | **Likelihood** | 3 |
 | **Impact** | 2 |
 | **Risk** | **6** |
-| **Mitigation** | (1) Flush billing counters to commit log every 10 seconds. (2) On restart, replay commit log to recover partial-bucket usage. (3) `ferrosa-dbaas` flags nodes with billing gaps (missing expected buckets). |
-| **Status** | **Gap** |
+| **Mitigation** | (1) Flush billing counters to commit log every 10 seconds (acceptable loss window). (2) On restart, replay commit log to recover partial-bucket usage. (3) `ferrosa-dbaas` flags nodes with billing gaps (missing expected buckets). |
+| **Status** | **APPROVED** |
 
 ### 5. Self-Hosted Telemetry Write Path
 
