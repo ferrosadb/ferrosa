@@ -148,7 +148,7 @@ impl PeerEventListener for ModeController {
 }
 
 impl InboundPeerCallback for ModeController {
-    fn on_inbound_peer(&self, peer_id: PeerId) {
+    fn on_inbound_peer(&self, peer_id: PeerId, _cql_broadcast: Option<String>) {
         let (host_id, addr) = peer_id;
         tracing::info!(peer = %host_id, %addr, "inbound peer connected");
 

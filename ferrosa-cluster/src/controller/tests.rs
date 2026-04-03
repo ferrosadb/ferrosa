@@ -164,7 +164,7 @@ async fn promote_from_degraded_pair_restores_writes() {
 
     // Enter pair mode via inbound connection (Primary)
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.on_inbound_peer((peer_id, peer_addr));
+    controller.on_inbound_peer((peer_id, peer_addr), None);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     assert_eq!(controller.role(), Some(PairRole::Primary));
 
@@ -209,7 +209,7 @@ async fn degraded_pair_serves_stale_reads() {
 
     // Enter pair mode
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.on_inbound_peer((peer_id, peer_addr));
+    controller.on_inbound_peer((peer_id, peer_addr), None);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
 
     // Peer disconnects → DegradedPair
@@ -801,7 +801,11 @@ async fn cluster_invite_triggers_transition_from_pair_mode() {
         registry,
     );
 
-    let pm = Arc::new(PeerManager::new(net_config.clone(), local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        controller.clone(),
+    ));
     controller.set_peer_manager(pm.clone());
 
     // Put node into pair mode by connecting first peer.
@@ -810,12 +814,8 @@ async fn cluster_invite_triggers_transition_from_pair_mode() {
 
     // Now simulate receiving a ClusterInvite with 3 peers (including self).
     // The handler should trigger transition_to_cluster.
-    let handler = cluster::ClusterInviteHandler::new(
-        local_id,
-        pm,
-        net_config,
-        Arc::downgrade(&controller),
-    );
+    let handler =
+        cluster::ClusterInviteHandler::new(local_id, pm, net_config, Arc::downgrade(&controller));
 
     let invite = ferrosa_net::message::Message::ClusterInvite {
         initiator: peer1_id,
@@ -826,7 +826,10 @@ async fn cluster_invite_triggers_transition_from_pair_mode() {
         ],
     };
 
-    let from = (peer1_id, "10.0.0.2:7000".parse::<std::net::SocketAddr>().unwrap());
+    let from = (
+        peer1_id,
+        "10.0.0.2:7000".parse::<std::net::SocketAddr>().unwrap(),
+    );
     let response = handler.handle(from, invite).await;
     assert!(response.is_some(), "handler should reply with ack");
 
@@ -870,7 +873,11 @@ async fn cluster_invite_transition_registers_raft_handlers() {
         registry.clone(),
     );
 
-    let pm = Arc::new(PeerManager::new(net_config.clone(), local_id, controller.clone()));
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        controller.clone(),
+    ));
     controller.set_peer_manager(pm.clone());
 
     // Put into pair mode.
@@ -884,12 +891,8 @@ async fn cluster_invite_transition_registers_raft_handlers() {
     );
 
     // ClusterInvite triggers cluster transition.
-    let handler = cluster::ClusterInviteHandler::new(
-        local_id,
-        pm,
-        net_config,
-        Arc::downgrade(&controller),
-    );
+    let handler =
+        cluster::ClusterInviteHandler::new(local_id, pm, net_config, Arc::downgrade(&controller));
     let invite = ferrosa_net::message::Message::ClusterInvite {
         initiator: peer1_id,
         peers: vec![
@@ -1032,7 +1035,7 @@ async fn standalone_inbound_peer_transitions_to_pair() {
 
     // Inbound connection — should also transition, not reject.
     use ferrosa_net::rpc::InboundPeerCallback;
-    controller.on_inbound_peer((peer_id, "10.0.0.2:7000".parse().unwrap()));
+    controller.on_inbound_peer((peer_id, "10.0.0.2:7000".parse().unwrap()), None);
 
     assert_eq!(
         controller.mode(),

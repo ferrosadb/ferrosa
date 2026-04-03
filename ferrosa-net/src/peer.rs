@@ -27,6 +27,8 @@ pub struct PeerManager {
     local_host_id: uuid::Uuid,
     peers: RwLock<HashMap<uuid::Uuid, PeerState>>,
     listener: Arc<dyn PeerEventListener>,
+    /// CQL broadcast addresses learned from peer handshakes.
+    peer_cql_broadcasts: RwLock<HashMap<uuid::Uuid, String>>,
 }
 
 struct PeerState {
@@ -47,6 +49,7 @@ impl PeerManager {
             local_host_id,
             peers: RwLock::new(HashMap::new()),
             listener,
+            peer_cql_broadcasts: RwLock::new(HashMap::new()),
         }
     }
 
@@ -269,6 +272,16 @@ impl PeerManager {
             state.last_heartbeat = tokio::time::Instant::now();
             state.missed_heartbeats = 0;
         }
+    }
+
+    /// Store a peer's CQL broadcast address learned during handshake.
+    pub async fn set_peer_cql_broadcast(&self, host_id: uuid::Uuid, addr: String) {
+        self.peer_cql_broadcasts.write().await.insert(host_id, addr);
+    }
+
+    /// Retrieve a peer's CQL broadcast address (if known from handshake).
+    pub async fn get_peer_cql_broadcast(&self, host_id: uuid::Uuid) -> Option<String> {
+        self.peer_cql_broadcasts.read().await.get(&host_id).cloned()
     }
 }
 

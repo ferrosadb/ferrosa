@@ -17,7 +17,7 @@ use crate::rpc::handler::{HandlerRegistry, PeerId};
 
 /// Callback invoked when the server accepts an inbound peer connection.
 pub trait InboundPeerCallback: Send + Sync {
-    fn on_inbound_peer(&self, peer_id: PeerId);
+    fn on_inbound_peer(&self, peer_id: PeerId, cql_broadcast: Option<String>);
 }
 
 pub struct RpcServer {
@@ -135,6 +135,7 @@ impl RpcServer {
                             chosen_compression: 0,
                             accepted: false,
                             reason: "overloaded".to_string(),
+                            cql_broadcast: None,
                         };
                         let mut body = bytes::BytesMut::new();
                         if ack.encode(&mut body).is_ok() {
@@ -197,7 +198,7 @@ impl RpcServer {
         let mut framed = Framed::new(stream, InternodeCodec::new(self.config.max_frame_body_size));
 
         // Handshake with timeout (T5)
-        let peer_host_id = tokio::time::timeout(
+        let (peer_host_id, peer_cql_broadcast) = tokio::time::timeout(
             self.config.handshake_timeout,
             accept_handshake(&mut framed, &self.config, self.local_host_id),
         )
@@ -209,7 +210,7 @@ impl RpcServer {
 
         // Notify callback about inbound peer
         if let Some(cb) = &self.inbound_callback {
-            cb.on_inbound_peer(peer_id);
+            cb.on_inbound_peer(peer_id, peer_cql_broadcast);
         }
 
         // Message dispatch loop
@@ -285,7 +286,7 @@ mod tests {
         let client_id = uuid::Uuid::new_v4();
         let stream = TcpStream::connect(addr).await.unwrap();
         let mut framed = Framed::new(stream, InternodeCodec::new(config.max_frame_body_size));
-        let peer = initiate_handshake(&mut framed, &config, client_id)
+        let (peer, _cql_broadcast) = initiate_handshake(&mut framed, &config, client_id)
             .await
             .unwrap();
         assert_eq!(peer, server_id);
