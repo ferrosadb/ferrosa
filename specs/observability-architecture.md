@@ -20,16 +20,24 @@ Following CMU-PDL-14-102's four design axes:
 
 ## Stack
 
-```
-Application Code
-    ↓ #[instrument] spans + tracing::info_span!
-tracing crate (subscriber)
-    ↓ custom FerrosaTelemetryLayer
-CQL client (ferrosa-cql::CqlClient)
-    ↓ INSERT INTO system_observability.spans / .metrics
-Ferrosa itself (local or remote node)
-    ↓
-ferrosa-dbaas UI (../ferrosa-dbaas control plane)
+```mermaid
+graph TD
+    App["Application Code<br/>#[instrument] spans"]
+    Sub["tracing subscriber<br/>fmt layer + telemetry layer"]
+    TL["FerrosaTelemetryLayer<br/>batch spans in bounded channel"]
+    CQL["CqlClient<br/>INSERT INTO system_observability.*"]
+    DB["Ferrosa Node<br/>(local or remote endpoint)"]
+    UI["ferrosa-dbaas<br/>control plane UI"]
+
+    App -->|"span open/close"| Sub
+    Sub -->|"sampled spans"| TL
+    TL -->|"batched CQL writes"| CQL
+    CQL -->|"system_observability.spans<br/>system_observability.metrics<br/>system_observability.slow_queries"| DB
+    DB -->|"SELECT via CQL"| UI
+
+    style TL fill:#f9f,stroke:#333
+    style DB fill:#bbf,stroke:#333
+    style UI fill:#bfb,stroke:#333
 ```
 
 **Self-hosted observability:** Ferrosa writes its own telemetry to a ferrosa
