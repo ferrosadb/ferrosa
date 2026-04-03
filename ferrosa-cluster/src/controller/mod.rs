@@ -154,7 +154,11 @@ pub struct ModeController {
     pub(super) committed_cluster_size: AtomicUsize,
     /// Receiver for DDL operations queued during Forming state.
     /// Created in `transition_to_forming`, drained after Raft leader election.
-    pub(super) ddl_queue_rx: Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::pair::ddl::DdlOperation>>>>,
+    pub(super) ddl_queue_rx: Arc<
+        parking_lot::Mutex<
+            Option<tokio::sync::mpsc::UnboundedReceiver<crate::pair::ddl::DdlOperation>>,
+        >,
+    >,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.

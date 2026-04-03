@@ -52,7 +52,8 @@ impl ModeController {
         // election instead of being rejected (FMEA F3).
         let (ddl_tx, ddl_rx) = tokio::sync::mpsc::unbounded_channel();
         *self.ddl_queue_rx.lock() = Some(ddl_rx);
-        self.ddl_path.store(Arc::new(DdlPath::Forming { queue: ddl_tx }));
+        self.ddl_path
+            .store(Arc::new(DdlPath::Forming { queue: ddl_tx }));
         self.formation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.seen_invite_initiators.lock().clear();
