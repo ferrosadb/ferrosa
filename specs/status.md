@@ -8,8 +8,10 @@
 Ferrosa is a **distributed CQL-compatible database** with graph query support,
 built-in observability, Accord consensus transactions, and S3-backed storage.
 
-**Completed milestones (2026-03-30):**
+**Completed milestones (2026-04-02):**
 
+- **P0 NTS fix** — `keyspace_rf()` returned RF=1 for NetworkTopologyStrategy keyspaces; writes went to coordinator only. Fixed: RF extraction via `ReplicationStrategy` parser, `WritePath` dispatches to `coordinate_write_nts()` for NTS, default datacenter changed to `datacenter1`.
+- **Cluster formation** — Progressive join (Standalone→Pair→Forming→Cluster), ClusterInvite protocol, LazyRaft handler registration, all-node bootstrap streaming, CQL broadcast propagation via PeerManager, system.peers tokens/native_address, connection slot leak fix with RAII guard.
 - **Accord transactions** — 7 sprints (A1-A7) complete: PreAccept/Accept/Commit/Execute, LWT, BEGIN TRANSACTION, cross-shard conflict detection, crash recovery, electorate reconfiguration, 2,808+ tests
 - **Correctness sprints** — C1-C7 complete: BUG-021-026 fixed, P0 storage hazards closed, Jepsen infrastructure wired, SSTable Cassandra compat validated, Accord failure mode coverage, compaction S3 lifecycle complete. C4 (live Jepsen runs) and C8 (all-drivers compat) remain.
 - **NVMe table pinning** — Per-table `storage.pin = nvme` attribute: skip S3 upload, pin in local cache, max_bytes enforcement, ALTER TABLE pin/unpin transitions, Prometheus metrics

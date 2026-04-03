@@ -1,6 +1,6 @@
 # Data Flow
 
-> Last updated: 2026-03-30
+> Last updated: 2026-04-02
 > Status: Approved
 
 ## Overview
@@ -773,9 +773,89 @@ sequenceDiagram
 
 **Implementation status**: The `SubscriptionObserver` (`ferrosa-storage/src/subscription_observer.rs`) implements `WriteObserver` with `ObserverMode::Async`. It maintains ref-counted `table_watch_counts` so multiple subscriptions to the same table are handled correctly — only when the last subscription is removed does `watches_table()` return false. Currently, `on_write()` returns an empty vec; notification delivery via tokio channels is deferred (T19). The `SubscriptionState` per-connection tracking and `SUBSCRIBE` AST parsing are also follow-on work.
 
+## Cluster Formation Flow
+
+Progressive join: Standalone → Pair → Forming → Cluster. No config flag — mode transitions automatically as peers connect.
+
+```mermaid
+sequenceDiagram
+    participant N1 as Node 1 (Seed)
+    participant N2 as Node 2
+    participant N3 as Node 3
+
+    Note over N1: Standalone mode
+
+    N2->>N1: Connect (handshake + CQL broadcast exchange)
+    N1->>N1: transition_to_pair() — N1=Primary, N2=Secondary
+    N1-->>N2: Reverse connection pool
+
+    Note over N1,N2: Pair mode — write forwarding, DDL replication
+
+    N3->>N1: Connect (handshake + CQL broadcast exchange)
+    N1->>N1: transition_to_forming() — DDL blocked
+    N1->>N2: ClusterInvite{initiator=N1, peers=[N1,N2,N3]} (Data lane, 10 retries)
+    N1->>N3: ClusterInvite{initiator=N1, peers=[N1,N2,N3]} (Data lane, 10 retries)
+
+    par Hub-and-spoke → full mesh
+        N2->>N3: Connect (learned from invite)
+        N3->>N2: Connect (learned from invite)
+    end
+
+    Note over N1,N3: Forming mode — DDL unavailable
+
+    N1->>N1: Register Raft handlers via LazyRaft (before init)
+    N1->>N1: Raft initialize (seed only)
+    N1-->>N2: AppendEntries (N2 joins via Raft, not initialize)
+    N1-->>N3: AppendEntries (N3 joins via Raft, not initialize)
+
+    rect rgb(230,245,255)
+        Note over N1,N3: Phase A — Schema convergence
+        N1->>N1: Replay user keyspaces/tables through Raft
+        N1-->>N2: Raft commit schema
+        N1-->>N3: Raft commit schema
+    end
+
+    rect rgb(230,255,230)
+        Note over N1,N3: Phase B — Bootstrap streaming
+        N1->>N2: Stream mutations for N2's token ranges
+        N1->>N3: Stream mutations for N3's token ranges
+        N2->>N1: Stream mutations for N1's token ranges
+        N2->>N3: Stream mutations for N3's token ranges
+        N3->>N1: Stream mutations for N1's token ranges
+        N3->>N2: Stream mutations for N2's token ranges
+    end
+
+    rect rgb(255,245,230)
+        Note over N1,N3: Phase C — Promotion (5s delay, TODO: RPC barrier)
+        N1->>N1: Raft command: promote Joining → Normal
+    end
+
+    Note over N1,N3: Cluster mode — Raft consensus, tunable CL, Accord
+```
+
+### CQL Broadcast Address Resolution
+
+Three-tier fallback for `system.peers.native_address`:
+
+```
+1. NodeInfo.cql_broadcast (set at ring construction, local node only)
+   ↓ (not available for remote peers)
+2. PeerManager.get_peer_cql_broadcast_sync(host_id) (learned from handshake)
+   ↓ (try_read — non-blocking to avoid stalling CQL queries)
+3. Fallback: internode_address:9042
+```
+
+`FERROSA_CQL_BROADCAST` env var enables container/NAT scenarios where the CQL listen address differs from the internode address (e.g., port-mapped Docker: internal `:9042` → external `:19042`). Hostname resolution is supported.
+
+### Connection Lifecycle
+
+CQL connections use RAII `IpSlotGuard` — per-IP connection slots are released on any exit (normal, panic, task cancellation). TCP keepalive is configured at 30s probe / 10s interval to detect dead peers within ~60s instead of the OS default 2+ hours.
+
 ## Related Specs
 
 - [Overview](overview.md) — system overview
 - [Components](components.md) — crate architecture
 - [Accord](accord.md) — Accord consensus protocol specification
+- [Cluster Formation Architecture](cluster-formation-architecture.md) — detailed formation spec
+- [Cluster Formation State Machine](cluster-formation-state-machine.md) — state machine design
 - [Testing](testing.md) — data integrity and chaos tests

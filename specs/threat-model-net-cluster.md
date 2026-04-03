@@ -1,9 +1,10 @@
 # Threat Model — ferrosa-net and ferrosa-cluster
 
-> **Date:** 2026-03-13
-> **Scope:** New attack surface introduced by distributed operation (ferrosa-net + ferrosa-cluster)
+> **Date:** 2026-03-13 (updated 2026-04-02)
+> **Scope:** Base attack surface from distributed operation (ferrosa-net + ferrosa-cluster)
 > **Methodology:** STRIDE per element
 > **Design Spec:** `superpowers/specs/2026-03-13-ferrosa-net-cluster-design.md`
+> **Companion:** [threat-model-cluster-formation.md](threat-model-cluster-formation.md) — incremental threats from progressive join, ClusterInvite protocol, LazyRaft handler registration (CF-T1 through CF-T18)
 
 ## System Overview
 
