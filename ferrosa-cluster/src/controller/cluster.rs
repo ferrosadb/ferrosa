@@ -363,7 +363,8 @@ impl ModeController {
             // local_host_id is captured via the `peers` vec (all peers except self).
             let invite_initiator = {
                 // Recover the local UUID from the node_map.
-                let map = node_map_for_bootstrap.read().unwrap();
+                // Read through poison — a poisoned lock still has valid data.
+                let map = node_map_for_bootstrap.read().unwrap_or_else(|e| e.into_inner());
                 map.get(&local_node_id).copied().unwrap_or_default()
             };
             let invite = Message::ClusterInvite {
@@ -548,7 +549,7 @@ impl ModeController {
                             } else {
                                 // Resolve leader NodeId → Uuid for RPC.
                                 let leader_uuid = {
-                                    let map = node_map_for_bootstrap.read().unwrap();
+                                    let map = node_map_for_bootstrap.read().unwrap_or_else(|e| e.into_inner());
                                     map.get(&lid).copied()
                                 };
                                 if let Some(leader_uuid) = leader_uuid {
@@ -597,7 +598,7 @@ impl ModeController {
                     if let Some(ring) = &**ring_for_bootstrap.load() {
                         let schema_snap = schema_for_bootstrap.snapshot();
                         let config = StreamConfig::default();
-                        let node_map = node_map_for_bootstrap.read().unwrap().clone();
+                        let node_map = node_map_for_bootstrap.read().unwrap_or_else(|e| e.into_inner()).clone();
                         let mut session_counter = 0_u64;
 
                         for (ks, tbl) in schema_snap.tables.keys() {
@@ -639,8 +640,17 @@ impl ModeController {
                                         .cloned()
                                         .map(RowWire::from)
                                         .collect();
-                                    let row_bytes = bincode::serialize(&wire_rows)
-                                        .unwrap_or_default();
+                                    let row_bytes = match bincode::serialize(&wire_rows) {
+                                        Ok(bytes) => bytes,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                %e,
+                                                partition_key = ?partition.key,
+                                                "bootstrap: failed to serialize rows, skipping partition (data loss avoided)"
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     let ts = partition.rows.first()
                                         .and_then(|r| r.cells.first())
                                         .map(|(_, cv)| cv.timestamp)
