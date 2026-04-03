@@ -48,9 +48,11 @@ impl ModeController {
         // Record committed cluster size for quorum calculations (peers + self).
         self.committed_cluster_size
             .store(peers.len() + 1, std::sync::atomic::Ordering::Relaxed);
-        // Block DDL during formation — prevents schema divergence (FMEA F3, RPN 378).
-        // DDL will be re-enabled after Raft leader election in transition_to_cluster.
-        self.ddl_path.store(Arc::new(DdlPath::Blocked));
+        // Queue DDL during formation — operations are replayed after Raft leader
+        // election instead of being rejected (FMEA F3).
+        let (ddl_tx, ddl_rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.ddl_queue_rx.lock() = Some(ddl_rx);
+        self.ddl_path.store(Arc::new(DdlPath::Forming { queue: ddl_tx }));
         self.formation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.seen_invite_initiators.lock().clear();
@@ -330,6 +332,7 @@ impl ModeController {
         let raft_election_min_ms = self.config.raft_election_timeout_min_ms;
         let raft_election_max_ms = self.config.raft_election_timeout_max_ms;
         let schema_for_replay = self.schema.clone();
+        let ddl_queue_rx = self.ddl_queue_rx.clone();
 
         // Register Raft RPC handlers BEFORE spawning the init task.
         // Handlers use LazyRaft to wait for the instance to be ready.
@@ -514,6 +517,24 @@ impl ModeController {
                         peer_manager: peer_manager_for_ddl,
                         node_map: node_map_for_ddl,
                     }));
+
+                    // Drain any DDL operations queued during Forming state.
+                    // Take the receiver outside the lock guard scope to avoid
+                    // holding parking_lot::MutexGuard across an await point.
+                    let maybe_rx = ddl_queue_rx.lock().take();
+                    if let Some(mut rx) = maybe_rx {
+                        let mut replayed = 0usize;
+                        while let Ok(op) = rx.try_recv() {
+                            if let Err(e) = execute_via_raft(&raft_arc, op).await {
+                                tracing::warn!(%e, "failed to replay queued DDL operation");
+                            } else {
+                                replayed += 1;
+                            }
+                        }
+                        if replayed > 0 {
+                            tracing::info!(count = replayed, "replayed queued DDL operations from Forming state");
+                        }
+                    }
 
                     // --- Phase A: Schema convergence (all nodes) ---
                     //

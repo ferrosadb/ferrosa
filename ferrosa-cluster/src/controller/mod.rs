@@ -152,6 +152,9 @@ pub struct ModeController {
     /// Used for quorum calculations instead of the dynamic connected count
     /// to prevent false quorum restoration after network partitions.
     pub(super) committed_cluster_size: AtomicUsize,
+    /// Receiver for DDL operations queued during Forming state.
+    /// Created in `transition_to_forming`, drained after Raft leader election.
+    pub(super) ddl_queue_rx: Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::pair::ddl::DdlOperation>>>>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -232,6 +235,7 @@ impl ModeController {
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
+            ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
         });
 
         let handles = ModeControllerHandles {
@@ -285,6 +289,7 @@ impl ModeController {
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
+            ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 
@@ -338,6 +343,7 @@ impl ModeController {
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
             committed_cluster_size: AtomicUsize::new(0),
+            ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 
