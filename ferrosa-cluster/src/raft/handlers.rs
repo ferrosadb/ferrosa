@@ -247,7 +247,9 @@ pub struct ReadResponsePayload {
 /// Uses `crc32fast` for speed.  The digest is over the bincode-serialized
 /// [`PartitionWire`] so that it is byte-for-byte identical on every node that
 /// holds the same partition.
-pub fn compute_partition_digest(partition: &Partition) -> u32 {
+///
+/// Returns an error if the partition cannot be serialized to bincode.
+pub fn compute_partition_digest(partition: &Partition) -> Result<u32, bincode::Error> {
     // Clone into a wire type so we can serialize without mutating the caller's value.
     let wire = PartitionWire {
         token: partition.key.token.0,
@@ -260,10 +262,10 @@ pub fn compute_partition_digest(partition: &Partition) -> u32 {
         rows: partition.rows.iter().cloned().map(RowWire::from).collect(),
     };
 
-    let bytes = bincode::serialize(&wire).unwrap_or_default();
+    let bytes = bincode::serialize(&wire)?;
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&bytes);
-    hasher.finalize()
+    Ok(hasher.finalize())
 }
 
 /// Extract the newest timestamp from any row in the partition (including the
@@ -326,25 +328,65 @@ impl LazyRaft {
         (tx, Self { rx })
     }
 
-    /// Wait up to 10 seconds for the Raft instance to be initialized.
+    /// Wait for the Raft instance to be initialized, retrying with backoff.
+    ///
+    /// Makes up to 3 attempts with 5-second backoff between retries (total
+    /// ~20 seconds worst case). Returns `None` only after all retries are
+    /// exhausted.
     async fn get(&self) -> Option<Arc<super::FerrosRaft>> {
-        let mut rx = self.rx.clone();
         // If already available, return immediately.
-        if rx.borrow().is_some() {
-            return rx.borrow().clone();
+        // Scope the borrow so the RwLockReadGuard is dropped before any await.
+        let cached = { self.rx.borrow().clone() };
+        if cached.is_some() {
+            return cached;
         }
-        // Wait for the sender to publish the instance.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            rx.wait_for(|v| v.is_some()),
-        )
-        .await;
-        match result {
-            Ok(Ok(guard)) => guard.clone(),
-            _ => {
-                tracing::warn!("LazyRaft: timed out waiting for Raft initialization");
-                None
+
+        for attempt in 1..=3u32 {
+            // Try a single wait attempt. The helper maps away the non-Send
+            // watch::Ref so the extracted result is Send-safe.
+            let extracted = Self::try_wait(&self.rx, std::time::Duration::from_secs(5)).await;
+            match extracted {
+                Ok(value) => return value,
+                Err(true) => {
+                    // Channel closed.
+                    tracing::warn!(
+                        attempt,
+                        "LazyRaft: channel closed before Raft initialization"
+                    );
+                    return None;
+                }
+                Err(false) => {
+                    // Timeout.
+                    if attempt < 3 {
+                        tracing::warn!(
+                            attempt,
+                            "LazyRaft: timed out waiting for Raft initialization, retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
             }
+        }
+
+        tracing::warn!("LazyRaft: all 3 attempts exhausted waiting for Raft initialization");
+        None
+    }
+
+    /// Single wait attempt that maps the non-Send `watch::Ref` into an owned
+    /// value before returning. Returns:
+    /// - `Ok(value)` if the watch fires with a value
+    /// - `Err(true)` if the channel is closed
+    /// - `Err(false)` if the timeout expired
+    async fn try_wait(
+        rx: &tokio::sync::watch::Receiver<Option<Arc<super::FerrosRaft>>>,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Arc<super::FerrosRaft>>, bool> {
+        let mut rx = rx.clone();
+        let result = tokio::time::timeout(timeout, rx.wait_for(|v| v.is_some())).await;
+        match result {
+            Ok(Ok(guard)) => Ok(guard.clone()),
+            Ok(Err(_)) => Err(true),
+            Err(_) => Err(false),
         }
     }
 }
@@ -561,7 +603,13 @@ impl RpcHandler for ReadRequestHandler {
         let payload = match self.storage.read(&table_id, &key) {
             Ok(Some(partition)) => {
                 let ts = newest_timestamp(&partition);
-                let digest = Some(compute_partition_digest(&partition));
+                let digest = match compute_partition_digest(&partition) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        tracing::warn!("ReadRequestHandler: digest computation failed: {e}");
+                        None
+                    }
+                };
                 let wire_partition = if req.digest_only {
                     None
                 } else {
@@ -809,8 +857,8 @@ mod tests {
     #[test]
     fn partition_digest_is_deterministic() {
         let p = make_partition(b"abc", 999);
-        let d1 = compute_partition_digest(&p);
-        let d2 = compute_partition_digest(&p);
+        let d1 = compute_partition_digest(&p).unwrap();
+        let d2 = compute_partition_digest(&p).unwrap();
         assert_eq!(d1, d2, "same partition must produce the same digest");
     }
 
@@ -821,8 +869,8 @@ mod tests {
         // Change the cell value
         p2.rows[0].cells[0].1.value = Some(b"different".to_vec());
 
-        let d1 = compute_partition_digest(&p1);
-        let d2 = compute_partition_digest(&p2);
+        let d1 = compute_partition_digest(&p1).unwrap();
+        let d2 = compute_partition_digest(&p2).unwrap();
         assert_ne!(
             d1, d2,
             "different partition data must produce different digest"
@@ -834,8 +882,8 @@ mod tests {
         let p1 = make_partition(b"key1", 100);
         let p2 = make_partition(b"key2", 100);
         assert_ne!(
-            compute_partition_digest(&p1),
-            compute_partition_digest(&p2),
+            compute_partition_digest(&p1).unwrap(),
+            compute_partition_digest(&p2).unwrap(),
             "different keys must produce different digest"
         );
     }
@@ -855,8 +903,8 @@ mod tests {
 
         // Sanity: the same partition is equal to itself.
         assert_eq!(
-            compute_partition_digest(&p1),
-            compute_partition_digest(&p1),
+            compute_partition_digest(&p1).unwrap(),
+            compute_partition_digest(&p1).unwrap(),
             "same partition must be equal to itself"
         );
 
@@ -865,8 +913,8 @@ mod tests {
 
         // Different row counts must produce different digests.
         assert_ne!(
-            compute_partition_digest(&p1),
-            compute_partition_digest(&p2),
+            compute_partition_digest(&p1).unwrap(),
+            compute_partition_digest(&p2).unwrap(),
             "different row counts must produce different digest"
         );
 
@@ -878,8 +926,8 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(500),
         });
         assert_eq!(
-            compute_partition_digest(&p1),
-            compute_partition_digest(&p2),
+            compute_partition_digest(&p1).unwrap(),
+            compute_partition_digest(&p2).unwrap(),
             "identical row counts and content must produce the same digest"
         );
     }

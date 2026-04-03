@@ -89,6 +89,51 @@ impl WritePath {
         }
     }
 
+    /// Read a single partition by key with CL enforcement.
+    ///
+    /// - `Direct` / `Pair`: reads from local storage (single-node case).
+    /// - `Cluster`: routes through ClusterCoordinator with digest protocol.
+    /// - `Unavailable`: returns an error.
+    pub async fn pk_read(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> ferrosa_common::Result<Option<Partition>> {
+        match self {
+            Self::Direct(engine) => engine.read(table_id, key),
+            Self::Pair(coordinator) => coordinator.local_storage().read(table_id, key),
+            Self::Cluster(coordinator) => {
+                let rows_opt = match strategy {
+                    ReplicationStrategy::Simple { replication_factor } => {
+                        coordinator
+                            .coordinate_read_with(table_id, key, cl, *replication_factor)
+                            .await
+                    }
+                    ReplicationStrategy::NetworkTopology { .. } => {
+                        coordinator
+                            .coordinate_read_nts(table_id, key, cl, strategy)
+                            .await
+                    }
+                };
+                match rows_opt {
+                    Ok(Some(rows)) if !rows.is_empty() => Ok(Some(Partition {
+                        key: key.clone(),
+                        deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                        static_row: None,
+                        rows,
+                    })),
+                    Ok(_) => Ok(None),
+                    Err(e) => Err(ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+                }
+            }
+            Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, reads rejected until operator promotes".into(),
+            )),
+        }
+    }
+
     /// Scatter a full-table range read to all nodes that hold data for
     /// `table_id` and return the deduplicated union of all partitions.
     ///

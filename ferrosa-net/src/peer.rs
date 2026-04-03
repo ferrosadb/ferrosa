@@ -284,6 +284,16 @@ impl PeerManager {
         }
     }
 
+    /// Remove a peer and clean up all associated state (connection pool,
+    /// CQL broadcast entry). Fires `on_peer_disconnected` if the peer existed.
+    pub async fn remove_peer(&self, host_id: uuid::Uuid) {
+        let removed = self.peers.write().await.remove(&host_id);
+        self.peer_cql_broadcasts.write().await.remove(&host_id);
+        if let Some(state) = removed {
+            self.listener.on_peer_disconnected(state.peer_id);
+        }
+    }
+
     /// Store a peer's CQL broadcast address learned during handshake.
     pub async fn set_peer_cql_broadcast(&self, host_id: uuid::Uuid, addr: String) {
         self.peer_cql_broadcasts.write().await.insert(host_id, addr);
@@ -470,6 +480,39 @@ mod tests {
             0,
             "no pool means no reconnect and therefore no recovered event"
         );
+    }
+
+    #[tokio::test]
+    async fn remove_peer_cleans_up_broadcast_map() {
+        let config = Arc::new(NetConfig::default());
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(config, uuid::Uuid::new_v4(), listener.clone());
+
+        let host_id = uuid::Uuid::new_v4();
+        let peer_id = (host_id, "127.0.0.1:7000".parse().unwrap());
+        pm.add_peer_entry(peer_id).await;
+        pm.set_peer_cql_broadcast(host_id, "10.0.0.1:9042".to_string())
+            .await;
+
+        assert!(pm.get_peer_cql_broadcast(host_id).await.is_some());
+        assert!(pm.has_peer(host_id));
+
+        pm.remove_peer(host_id).await;
+
+        assert!(pm.get_peer_cql_broadcast(host_id).await.is_none());
+        assert!(!pm.has_peer(host_id));
+        assert_eq!(listener.disconnected_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_peer_noop_for_unknown() {
+        let config = Arc::new(NetConfig::default());
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(config, uuid::Uuid::new_v4(), listener.clone());
+
+        // Should not panic or fire disconnected.
+        pm.remove_peer(uuid::Uuid::new_v4()).await;
+        assert_eq!(listener.disconnected_count.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

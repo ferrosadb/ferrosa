@@ -278,7 +278,7 @@ graph BT
   - `controller/cluster.rs` — `transition_to_forming()`, `transition_to_cluster()` with 3-phase bootstrap (A: schema convergence, B: all-node streaming, C: promote Joining→Normal), `ClusterInviteHandler` (RPC handler for peer discovery + re-broadcast), reverse connection pool setup, `LazyRaft` channel for pre-init handler registration
   - `controller/mod.rs` — `ModeController` (Standalone→Pair→Forming→Cluster→DegradedPair→DegradedCluster), `formation_epoch` + `seen_invite_initiators` for idempotent invite dedup, tracked `JoinSet` for background tasks
   - `controller/peer_events.rs` — `on_inbound_peer()` with CQL broadcast extraction from handshake, progressive join transitions
-  - `write_path.rs` — `WritePath` enum (Direct/Pair/Cluster/Unavailable) for atomic write routing
+  - `write_path.rs` — `WritePath` enum (Direct/Pair/Cluster/Unavailable) for atomic write routing, `WritePath::pk_read()` for PK reads routed through cluster coordinator with NTS support
   - `ddl_path.rs` — `DdlPath` enum (Direct/Pair/Cluster/Unavailable) for atomic DDL routing
   - `pair/coordinator.rs` — `PairCoordinator` (write forwarding + replication)
   - `pair/ddl.rs` — `DdlOperation`, `DdlCoordinator`, `PairDdlForwardHandler`, `PairSchemaSyncHandler`, `WireSchemaSnapshot`
@@ -297,8 +297,8 @@ graph BT
   - `coordinator/write.rs` — Write fan-out with tunable CL enforcement (`blockFor(CL)` ACK collection)
   - `coordinator/read.rs` — Read fan-out with local-replica optimization
   - `consistency.rs` — `ConsistencyLevel` with `blockFor()` + property tests
-  - `state.rs` — `RaftClusterState` with `PeerManager` binding for 3-tier CQL broadcast resolution (ring → PeerManager → internode fallback), `system.peers` native_address/tokens population
-  - `config.rs` — `ClusterConfig` with `cql_broadcast: Option<String>` (`FERROSA_CQL_BROADCAST`), `formation_timeout_secs`, `auto_join`, `node_role`
+  - `state.rs` — `RaftClusterState` with `BroadcastResolver` trait for decoupled CQL broadcast resolution (ring → PeerManager → internode fallback), `system.peers` native_address/tokens population
+  - `config.rs` — `ClusterConfig` with `cql_broadcast: Option<String>` (`FERROSA_CQL_BROADCAST`), `formation_timeout_secs`, `auto_join`, `node_role`, tunable Raft timing (`FERROSA_RAFT_HEARTBEAT_MS`, `FERROSA_RAFT_ELECTION_MIN_MS`, `FERROSA_RAFT_ELECTION_MAX_MS`)
   - `error.rs`, `mode.rs`
   - `accord/state_machine.rs` — `AccordStateMachine` (core consensus state machine, 39 tests)
   - `accord/coordinator.rs` — `AccordCoordinator` (fast path 3/4 quorum, slow path majority, quorum formulas)

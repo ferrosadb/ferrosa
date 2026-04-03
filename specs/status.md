@@ -14,6 +14,7 @@ built-in observability, Accord consensus transactions, and S3-backed storage.
 - **Cluster formation** — Progressive join (Standalone→Pair→Forming→Cluster), ClusterInvite protocol, LazyRaft handler registration, all-node bootstrap streaming, CQL broadcast propagation via PeerManager, system.peers tokens/native_address, connection slot leak fix with RAII guard.
 - **Accord transactions** — 7 sprints (A1-A7) complete: PreAccept/Accept/Commit/Execute, LWT, BEGIN TRANSACTION, cross-shard conflict detection, crash recovery, electorate reconfiguration, 2,808+ tests
 - **Correctness sprints** — C1-C7 complete: BUG-021-026 fixed, P0 storage hazards closed, Jepsen infrastructure wired, SSTable Cassandra compat validated, Accord failure mode coverage, compaction S3 lifecycle complete. C4 (live Jepsen runs) and C8 (all-drivers compat) remain.
+- **Cluster correctness sprints S1-S3** — 22 tasks complete: P0/P1 hazards closed (IpConnectionTracker parking_lot, spawn_tracked, quorum calc committed_cluster_size, bootstrap read_range capped), NTS read path wired (WritePath::pk_read), hints stored for all failed replicas, full RowWire streaming, BroadcastResolver trait, tunable Raft config, LazyRaft 3x retry, configurable promotion delay, compute_partition_digest returns Result. S4 (Jepsen/driver compat) active.
 - **NVMe table pinning** — Per-table `storage.pin = nvme` attribute: skip S3 upload, pin in local cache, max_bytes enforcement, ALTER TABLE pin/unpin transitions, Prometheus metrics
 - **Full-text indexing** — Inverted index pipeline: StandardAnalyzer (lowercase + stop words + Porter stemmer), FTI sidecar files built on flush, BM25 ranked search, AND/OR/NOT/Prefix queries, CQL `fts_match()` function, compaction merge
 - **Secondary + vector indexes** — BTree, Hash, Composite, Phonetic, Filtered, Vector (HNSW, IVFFlat), FullText — 11 index types with query planner integration
@@ -25,7 +26,7 @@ built-in observability, Accord consensus transactions, and S3-backed storage.
 | Crates | 13 (12 core + ferrosa-jepsen) |
 | Source files | ~320+ |
 | Source LOC | ~140,000+ |
-| Test functions | ~3,100+ |
+| Test functions | ~3,212+ |
 | Integration test files | 40+ |
 | CQL parser coverage | 81.8% (707/864 Cassandra doc examples) |
 | Index types | 11 (BTree, Hash, Composite, Phonetic, Filtered, Vector HNSW/IVFFlat, FullText) |
@@ -482,7 +483,7 @@ jepsen         ██████   █████░  ████░░   █
 | ~~SSTable expiring cell (TTL) serialization~~ | — | Done (P0 data corruption fix) |
 | ~~SSTable reader fuzz testing~~ | — | Done (proptest, 9 fuzz tests) |
 | ~~Cassandra Murmur3Partitioner compat~~ | — | Done |
-| Cluster formation hardening | fix/standalone-progressive-join | Active — LazyRaft (7b057b0), ClusterInvite Data lane + retry (808b72b, 30768c0), ClusterInvite triggers transition (ba7599a), FERROSA_CLUSTER_MODE removed (83943a5), all-nodes bootstrap (ae5ba57), IpSlotGuard + keepalive (5063ca6), system.peers tokens (d7a951e), FERROSA_CQL_BROADCAST handshake exchange (ce72f32, efea71c) |
+| Cluster formation hardening (S1-S3) | fix/standalone-progressive-join | S1-S3 complete — S1: DDL blocked, pk_read, NTS DC validation, parking_lot, spawn_tracked, quorum committed_size, formation timeout. S2: hints all replicas, RowWire streaming, read_range capped, promotion delay configurable. S3: broadcast map cleanup, LazyRaft 3x retry, BroadcastResolver trait, Raft config tunable, digest Result. S4 active. |
 | Temporal v1.31.0 on ferrosa | ferrosa-temporal | Running (shard acquisition WIP) |
 | Beta release v1.0.0-beta.4 | — | Sprints complete |
 | NetworkTopologyStrategy (multi-DC) | — | Planned |

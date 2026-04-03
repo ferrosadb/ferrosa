@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 use std::time::Duration;
 
 use futures::SinkExt;
@@ -73,7 +75,7 @@ impl IpConnectionTracker {
     /// Try to acquire a connection slot for the given IP.
     /// Returns true if under limit, false if at/over limit.
     fn try_acquire(&self, ip: IpAddr, limit: usize) -> bool {
-        let mut counts = self.counts.write().unwrap();
+        let mut counts = self.counts.write();
         let count = counts.entry(ip).or_insert(0);
         if *count >= limit {
             return false;
@@ -84,7 +86,7 @@ impl IpConnectionTracker {
 
     /// Release a connection slot for the given IP.
     fn release(&self, ip: IpAddr) {
-        let mut counts = self.counts.write().unwrap();
+        let mut counts = self.counts.write();
         if let Some(count) = counts.get_mut(&ip) {
             *count = count.saturating_sub(1);
             if *count == 0 {

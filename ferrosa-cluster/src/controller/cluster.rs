@@ -45,6 +45,9 @@ impl ModeController {
         }
 
         self.mode.store(Arc::new(DeploymentMode::Forming));
+        // Record committed cluster size for quorum calculations (peers + self).
+        self.committed_cluster_size
+            .store(peers.len() + 1, std::sync::atomic::Ordering::Relaxed);
         // Block DDL during formation — prevents schema divergence (FMEA F3, RPN 378).
         // DDL will be re-enabled after Raft leader election in transition_to_cluster.
         self.ddl_path.store(Arc::new(DdlPath::Blocked));
@@ -115,7 +118,7 @@ impl ModeController {
                 let cfg = net_cfg.clone();
                 let uuid = *peer_uuid;
                 let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
-                tokio::spawn(async move {
+                self.spawn_tracked(async move {
                     match PriorityPool::connect(cfg, local_id, &reverse_addr.to_string()).await {
                         Ok(pool) => {
                             pm.add_peer((uuid, reverse_addr), pool).await;
@@ -322,6 +325,10 @@ impl ModeController {
         let ring_for_bootstrap = self.ring.clone();
         let all_node_ids_for_bootstrap = all_node_ids.clone();
         let cluster_name = self.config.cluster_name.clone();
+        let config_for_promotion = self.config.clone();
+        let raft_heartbeat_ms = self.config.raft_heartbeat_ms;
+        let raft_election_min_ms = self.config.raft_election_timeout_min_ms;
+        let raft_election_max_ms = self.config.raft_election_timeout_max_ms;
         let schema_for_replay = self.schema.clone();
 
         // Register Raft RPC handlers BEFORE spawning the init task.
@@ -405,9 +412,9 @@ impl ModeController {
             // Build openraft Config
             let raft_config = match (openraft::Config {
                 cluster_name,
-                heartbeat_interval: 300,
-                election_timeout_min: 1000,
-                election_timeout_max: 2000,
+                heartbeat_interval: raft_heartbeat_ms,
+                election_timeout_min: raft_election_min_ms,
+                election_timeout_max: raft_election_max_ms,
                 max_payload_entries: 100,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
                 ..Default::default()
@@ -606,11 +613,15 @@ impl ModeController {
                                 continue;
                             }
                             let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
+                            // Cap per-table read to 100k partitions to prevent OOM.
+                            // Tables larger than this will have partial bootstrap;
+                            // anti-entropy repair catches the rest.
+                            const BOOTSTRAP_READ_LIMIT: usize = 100_000;
                             let partitions = match storage_for_bootstrap.read_range(
                                 &table_id,
                                 None,
                                 None,
-                                usize::MAX,
+                                BOOTSTRAP_READ_LIMIT,
                             ) {
                                 Ok(p) => p,
                                 Err(e) => {
@@ -705,9 +716,21 @@ impl ModeController {
                     //
                     // Wait for non-leader streaming to settle, then promote all
                     // Joining nodes to Normal via Raft.
-                    // TODO: Replace fixed delay with proper BootstrapComplete RPC barrier.
+                    //
+                    // TODO(S4): Replace delay with BootstrapComplete RPC — each node
+                    // sends a message when streaming finishes; leader waits for all.
+                    // For now, use a configurable delay (default 10s) that's long enough
+                    // for typical bootstrap but not a hard guarantee.
                     if lid == local_node_id {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let promotion_delay = config_for_promotion
+                            .formation_timeout_secs
+                            .map(|s| s / 6)
+                            .unwrap_or(10);
+                        tracing::info!(
+                            delay_secs = promotion_delay,
+                            "waiting for bootstrap streaming to settle before promotion"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(promotion_delay)).await;
                         for &nid in &all_node_ids_for_bootstrap {
                             if nid != local_node_id {
                                 let cmd = crate::raft::RaftCommand {
@@ -731,12 +754,18 @@ impl ModeController {
                 }
                 None => {
                     tracing::warn!(
-                        "raft leader election timed out after 30s — reverting to Pair mode"
+                        "raft leader election timed out after ~30s — reverting to Pair mode"
                     );
                     // Revert to Pair mode — formation failed. The Raft instance
-                    // is stored but non-functional (no leader). Writes stay on
-                    // Pair semantics with the original peer.
+                    // is stored but non-functional (no leader).
                     mode_swap.store(Arc::new(DeploymentMode::Pair));
+                    // Restore DDL path from Blocked to Direct (single-node fallback).
+                    // Without this, DDL stays blocked indefinitely after failed formation.
+                    ddl_path.store(Arc::new(DdlPath::Direct {
+                        schema: schema_for_replay.clone(),
+                        engine: storage_for_bootstrap.clone(),
+                    }));
+                    tracing::info!("DDL path restored to Direct after formation timeout");
                 }
             }
 

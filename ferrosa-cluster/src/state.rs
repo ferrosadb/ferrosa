@@ -62,15 +62,32 @@ impl ClusterState for PairClusterState {
     }
 }
 
+/// Trait for resolving CQL broadcast addresses for peers.
+///
+/// Decouples state.rs from ferrosa-net::PeerManager. Implementations
+/// provide broadcast addresses learned during internode handshakes.
+pub trait BroadcastResolver: Send + Sync {
+    /// Look up the CQL broadcast address for a peer by host_id.
+    /// Non-blocking — returns None if the address is unavailable.
+    fn resolve_broadcast(&self, host_id: uuid::Uuid) -> Option<String>;
+}
+
+/// PeerManager implements BroadcastResolver via its broadcast map.
+impl BroadcastResolver for ferrosa_net::peer::PeerManager {
+    fn resolve_broadcast(&self, host_id: uuid::Uuid) -> Option<String> {
+        self.get_peer_cql_broadcast_sync(host_id)
+    }
+}
+
 /// ClusterState implementation for Raft cluster mode.
 ///
 /// Reads node metadata from the token ring to produce the peer list.
-/// Uses PeerManager to look up CQL broadcast addresses exchanged during
-/// the internode handshake (for system.peers.native_address).
+/// Uses a BroadcastResolver to look up CQL broadcast addresses exchanged
+/// during the internode handshake (for system.peers.native_address).
 pub struct RaftClusterState {
     ring: Arc<ArcSwap<TokenRing>>,
     local_node_id: u64,
-    peer_manager: Option<Arc<ferrosa_net::peer::PeerManager>>,
+    broadcast_resolver: Option<Arc<dyn BroadcastResolver>>,
 }
 
 impl RaftClusterState {
@@ -78,11 +95,11 @@ impl RaftClusterState {
         Self {
             ring,
             local_node_id,
-            peer_manager: None,
+            broadcast_resolver: None,
         }
     }
 
-    /// Create with a PeerManager reference for CQL broadcast lookups.
+    /// Create with a broadcast resolver for CQL broadcast lookups.
     pub fn with_peer_manager(
         ring: Arc<ArcSwap<TokenRing>>,
         local_node_id: u64,
@@ -91,7 +108,7 @@ impl RaftClusterState {
         Self {
             ring,
             local_node_id,
-            peer_manager: Some(peer_manager),
+            broadcast_resolver: Some(peer_manager as Arc<dyn BroadcastResolver>),
         }
     }
 }
@@ -112,9 +129,8 @@ impl ClusterState for RaftClusterState {
                 // 2. PeerManager broadcast (exchanged during internode handshake)
                 // 3. Fall back to internode IP with port 9042
                 let peer_broadcast = info.cql_broadcast.clone().or_else(|| {
-                    let pm = self.peer_manager.as_ref()?;
-                    // PeerManager uses async RwLock; use try_read to avoid blocking.
-                    pm.get_peer_cql_broadcast_sync(info.host_id)
+                    let resolver = self.broadcast_resolver.as_ref()?;
+                    resolver.resolve_broadcast(info.host_id)
                 });
                 let (native_addr, native_port) = if let Some(ref broadcast) = peer_broadcast {
                     parse_addr(broadcast).unwrap_or((ip, 9042))

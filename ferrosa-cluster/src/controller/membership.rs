@@ -173,12 +173,12 @@ impl ModeController {
                                 .get_node(target_nid)
                                 .map(|n| n.host_id)
                                 .unwrap_or_default();
-                            let row_bytes = partition
-                                .rows
-                                .first()
-                                .and_then(|r| r.cells.first())
-                                .and_then(|(_, cv)| cv.value.clone())
-                                .unwrap_or_default();
+                            // Serialize all rows via RowWire for full fidelity
+                            // (clustering keys, all cells, deletion, liveness).
+                            use crate::raft::handlers::RowWire;
+                            let wire_rows: Vec<RowWire> =
+                                partition.rows.iter().cloned().map(RowWire::from).collect();
+                            let row_bytes = bincode::serialize(&wire_rows).unwrap_or_default();
                             let ts = partition
                                 .rows
                                 .first()
