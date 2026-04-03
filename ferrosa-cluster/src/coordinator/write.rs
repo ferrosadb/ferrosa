@@ -31,7 +31,7 @@ impl ClusterCoordinator {
     /// 2. Verify enough replicas available for the consistency level.
     /// 3. Fan out concurrently: local write if self is replica, `MutationForward` for remote.
     /// 4. Collect ACKs until `block_for(CL)` reached.
-    /// 5. If quorum met, store hints for any failed remote replicas.
+    /// 5. Store hints for ALL failed remote replicas (regardless of quorum).
     /// 6. Return success or `WriteTimeout`.
     pub async fn coordinate_write(
         &self,
@@ -149,11 +149,13 @@ impl ClusterCoordinator {
             }
         }
 
-        // Store hints for replicas that failed to ack, as long as at least
-        // one replica succeeded. Even if quorum wasn't met, the successful
-        // replicas have the data and the failed ones need it for convergence.
-        // Without hints, the only path to consistency is anti-entropy repair.
-        if acks > 0 && !failed_replicas.is_empty() {
+        // Store hints for ALL replicas that failed to ack, regardless of
+        // whether quorum was met. Even if the write returns an error to the
+        // client, the replicas that DID succeed now have divergent state.
+        // Hints ensure replay can fix the divergence without waiting for
+        // anti-entropy repair. When zero replicas ACK'd the mutation is
+        // still recorded as a hint so it can be replayed when nodes recover.
+        if !failed_replicas.is_empty() {
             if let Some(ref hint_store) = self.hint_store {
                 let hint_row = body.to_vec();
                 let hint_key = key.key.as_bytes().to_vec();
@@ -330,20 +332,27 @@ impl ClusterCoordinator {
             _ => total_acks >= required,
         };
 
-        // Store hints for failed replicas whenever at least one replica ACK'd.
-        if total_acks > 0 && !failed_replicas.is_empty() {
+        // Store hints for ALL failed replicas regardless of quorum outcome.
+        // Even when the write fails (below quorum), hints record the mutation
+        // so replay can fix divergence when nodes recover.
+        if !failed_replicas.is_empty() {
             if let Some(ref hint_store) = self.hint_store {
                 let hint_row = body.to_vec();
                 let hint_key = key.key.as_bytes().to_vec();
                 for peer_id in &failed_replicas {
-                    let _ = hint_store.store(
+                    if let Err(e) = hint_store.store(
                         *peer_id,
                         &table_id.keyspace,
                         &table_id.table,
                         hint_key.clone(),
                         hint_row.clone(),
                         timestamp,
-                    );
+                    ) {
+                        tracing::warn!(
+                            peer = %peer_id,
+                            "failed to store hint for NTS replica: {e}"
+                        );
+                    }
                 }
             }
         }
