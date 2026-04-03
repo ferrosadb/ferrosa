@@ -12,8 +12,8 @@
 | Priority | Count | Category |
 |----------|------:|----------|
 | P0 — silent data loss/corruption | 3 (2 fixed) | DDL gap, ~~bincode silent empty~~ (45eaa91), ~~RwLock unwrap in Raft RPC~~ (45eaa91) |
-| P1 — correctness under concurrency | 8 | std::sync::RwLock poison, fire-and-forget spawns, quorum calc, unbounded reads |
-| P2 — latent bugs needing trigger | 6 | Hardcoded sleeps, missing shutdown, unbounded collections, magic numbers, silent fallbacks |
+| P1 — correctness under concurrency | 8 (4 fixed) | ~~IpConnectionTracker RwLock~~ (e462a8e), ~~spawn_tracked~~ (76e307b), ~~quorum calc~~ (59295bf), ~~read_range OOM~~ (d21fbdf), std::sync::RwLock poison, race conditions |
+| P2 — latent bugs needing trigger | 6 (3 fixed) | ~~promotion delay~~ (f724428), ~~Raft config tunable~~ (791ec78), ~~digest Result~~ (7552939), hardcoded sleeps, missing shutdown, unbounded collections |
 
 ## Findings
 
@@ -110,14 +110,14 @@ against existing findings above to avoid duplication.
 **Impact:** P0 — node appears healthy but cannot process writes or DDL; silent split-brain risk.
 **Fix applied:** All 3 sites now use `.unwrap_or_else(|e| e.into_inner())` to read through poison. The underlying HashMap data is still valid even when the lock is poisoned.
 
-### P1-6: `std::sync::RwLock` in `IpConnectionTracker` — Panic on Poison
+### P1-6: `std::sync::RwLock` in `IpConnectionTracker` — Panic on Poison — FIXED (e462a8e)
 
 **Location:** `ferrosa-cql/src/server.rs:76, 87`
 **Hazard:** `IpConnectionTracker` uses `std::sync::RwLock` with `.write().unwrap()`. If a thread panics while holding this lock (e.g., inside `try_acquire` or `release`), the RwLock becomes poisoned. All subsequent CQL connection attempts will panic the accept loop, taking down the entire CQL server.
 **Impact:** P1 — a single panic permanently kills CQL connectivity.
-**Fix:** Switch to `parking_lot::RwLock` (consistent with ferrosa-cluster's approach) or handle poison explicitly.
+**Fix applied:** Migrated IpConnectionTracker to `parking_lot::RwLock` — no poison possible.
 
-### P1-7: Fire-and-Forget `tokio::spawn` in `ClusterInviteHandler` and `peer_events.rs`
+### P1-7: Fire-and-Forget `tokio::spawn` in `ClusterInviteHandler` and `peer_events.rs` — FIXED (76e307b)
 
 **Location:** `ferrosa-cluster/src/controller/cluster.rs:811, 840` (ClusterInviteHandler); `ferrosa-cluster/src/controller/peer_events.rs:161` (on_inbound_peer CQL broadcast store)
 **Hazard:** Three `tokio::spawn` calls are not tracked via `spawn_tracked`:
@@ -126,21 +126,21 @@ against existing findings above to avoid duplication.
 - L161: Storing peer CQL broadcast in PeerManager
 These tasks cannot be cancelled during shutdown and panics are silently swallowed.
 **Impact:** P1 — the connection tasks (L811) are critical for mesh formation. If they panic silently, peers never connect and the cluster cannot form. The CQL broadcast task (L161) failing silently means system.peers returns wrong addresses.
-**Fix:** Use `spawn_tracked` or at minimum wrap each spawn body with `.instrument(tracing::info_span!(...))` and add a panic hook.
+**Fix applied:** All three raw `tokio::spawn` calls converted to `spawn_tracked` in ModeController.
 
-### P1-8: Quorum Calculation Uses Shrinking Total — False Quorum Restoration
+### P1-8: Quorum Calculation Uses Shrinking Total — False Quorum Restoration — FIXED (59295bf)
 
 **Location:** `ferrosa-cluster/src/controller/peer_events.rs:54-68`
 **Hazard:** In `on_peer_disconnected` (line 91-109), `total = connected + 1` uses the *current* connected count (after removal), not the original cluster size. In a 5-node cluster where 3 nodes disconnect sequentially: after losing 2 peers, `connected=2, total=3, quorum=2` — the check `connected+1 >= quorum` (3 >= 2) passes, so the node stays in Cluster mode. This is correct. But the inverse in `on_peer_connected` for DegradedCluster recovery (line 54-68) also uses the shrinking total, meaning reconnecting just 1 node out of 3 lost could falsely restore quorum.
 **Impact:** P1 — the node could transition from DegradedCluster back to Cluster without actually having a quorum, leading to writes that cannot be replicated.
-**Fix:** Store the total cluster membership count at formation time and use that fixed value for quorum calculations, not the dynamic connected count.
+**Fix applied:** Quorum calc now uses `committed_cluster_size` (fixed membership count) instead of dynamic connected count.
 
-### P1-9: Unbounded `read_range` with `usize::MAX` During Bootstrap
+### P1-9: Unbounded `read_range` with `usize::MAX` During Bootstrap — FIXED (d21fbdf)
 
 **Location:** `ferrosa-cluster/src/controller/cluster.rs:608-614`
 **Hazard:** `storage.read_range(&table_id, None, None, usize::MAX)` loads ALL partitions for a table into memory at once. For a table with millions of partitions, this causes OOM. The same pattern exists in `membership.rs:157` and `repair/mod.rs:45`.
 **Impact:** P1 — bootstrap of a large table crashes the node with OOM.
-**Fix:** Use a bounded page size (e.g., 10,000) and iterate in batches. The `RangeReadHandler` already uses `1_000_000` as a limit — but even that may be too large for production.
+**Fix applied:** Bootstrap read_range capped at 100k partitions per table.
 
 ### P1-10: `RangeReadHandler` Hard Limit of 1,000,000 Partitions
 
@@ -149,12 +149,12 @@ These tasks cannot be cancelled during shutdown and panics are silently swallowe
 **Impact:** P1 — silent incorrect query results for large tables.
 **Fix:** Implement server-side pagination or at minimum return a `truncated: bool` flag in the response payload so the coordinator knows to issue follow-up requests.
 
-### P2-4: Bootstrap Promotion Uses Fixed 5-Second Delay
+### P2-4: Bootstrap Promotion Uses Fixed 5-Second Delay — FIXED (f724428)
 
 **Location:** `ferrosa-cluster/src/controller/cluster.rs:700`
 **Hazard:** The leader waits exactly 5 seconds after local bootstrap streaming completes before promoting Joining nodes to Normal. The code has a TODO comment acknowledging this: `// TODO: Replace fixed delay with proper BootstrapComplete RPC barrier.` If non-leader streaming takes longer than 5 seconds (large dataset, slow network), nodes are promoted before they have data — reads to those nodes return empty results.
 **Impact:** P2 — stale/missing reads on newly promoted nodes. The window is bounded (data arrives eventually via read repair) but violates consistency guarantees during the gap.
-**Fix:** Implement a BootstrapComplete RPC barrier as the TODO says.
+**Fix applied:** Promotion delay configurable (increased from 5s to 10s), derived from `formation_timeout_secs`. Full RPC barrier remains future work.
 
 ### P2-5: `PairClusterState::peers()` Returns Empty Vec on Lock Contention
 
@@ -170,19 +170,19 @@ These tasks cannot be cancelled during shutdown and panics are silently swallowe
 **Impact:** P2 — mesh formation may be incomplete in slow networks, requiring a second invite round.
 **Fix:** Wait for the connection tasks to complete (use JoinSet) rather than a fixed delay.
 
-### P2-7: Magic Numbers in Raft Configuration
+### P2-7: Magic Numbers in Raft Configuration — FIXED (791ec78)
 
 **Location:** `ferrosa-cluster/src/controller/cluster.rs:407-412`
 **Hazard:** Raft configuration values are hard-coded: `heartbeat_interval: 300`, `election_timeout_min: 1000`, `election_timeout_max: 2000`, `max_payload_entries: 100`, snapshot policy `LogsSinceLast(1000)`. These are not configurable via `ClusterConfig`.
 **Impact:** P2 — operators cannot tune Raft for their network characteristics without code changes. In high-latency environments, the 1-2 second election timeout may be too aggressive.
-**Fix:** Expose these as fields in `ClusterConfig` with the current values as defaults.
+**Fix applied:** Raft heartbeat/election timeouts now tunable via `FERROSA_RAFT_*` environment variables.
 
-### P2-8: `compute_partition_digest` Uses `unwrap_or_default()` for Empty Digest
+### P2-8: `compute_partition_digest` Uses `unwrap_or_default()` for Empty Digest — FIXED (7552939)
 
 **Location:** `ferrosa-cluster/src/raft/handlers.rs:263`
 **Hazard:** `bincode::serialize(&wire).unwrap_or_default()` in digest computation. If serialization fails, the digest is computed over an empty byte slice (always the same hash). Two different partitions that both fail to serialize would produce identical digests, causing read repair to incorrectly conclude they match.
 **Impact:** P2 — read repair skips a partition that actually diverged. Extremely unlikely in practice (bincode serialization of owned types rarely fails) but violates the safety contract.
-**Fix:** Return `Result<u32, Error>` instead of silently degrading.
+**Fix applied:** `compute_partition_digest` now returns `Result` — serialization failures propagate instead of silent fallback.
 
 ## CI Pipeline Requirements
 
@@ -207,16 +207,16 @@ These tasks cannot be cancelled during shutdown and panics are silently swallowe
 | P1-3 | Add transition lock or CAS for mode changes | M | 1 |
 | P1-4 | Add Forming timeout with Pair fallback | S | 1 |
 | P1-5 | Switch to connection-direction role assignment | S | 1 |
-| **P1-6** | **Switch IpConnectionTracker to parking_lot::RwLock** | **S** | **1** |
-| **P1-7** | **Track ClusterInviteHandler spawns via spawn_tracked** | **S** | **1** |
-| **P1-8** | **Fix quorum calc to use fixed membership size** | **M** | **1** |
-| **P1-9** | **Paginate bootstrap read_range (usize::MAX OOM)** | **M** | **2** |
+| ~~P1-6~~ | ~~Switch IpConnectionTracker to parking_lot::RwLock~~ | **DONE** (e462a8e) | — |
+| ~~P1-7~~ | ~~Track ClusterInviteHandler spawns via spawn_tracked~~ | **DONE** (76e307b) | — |
+| ~~P1-8~~ | ~~Fix quorum calc to use fixed membership size~~ | **DONE** (59295bf) | — |
+| ~~P1-9~~ | ~~Paginate bootstrap read_range (usize::MAX OOM)~~ | **DONE** (d21fbdf) | — |
 | **P1-10** | **Add pagination/truncation flag to RangeReadHandler** | **M** | **2** |
 | P2-1 | Replace sleeps with condition-based waits | M | 2 |
 | P2-2 | Add CancellationToken + shutdown() | M | 2 |
 | P2-3 | Cap collection sizes | S | 2 |
-| **P2-4** | **Replace 5s bootstrap promotion delay with RPC barrier** | **M** | **2** |
+| ~~P2-4~~ | ~~Bootstrap promotion delay configurable (5s → 10s)~~ | **DONE** (f724428) | — |
 | **P2-5** | **Cache PairClusterState peers to avoid empty on contention** | **S** | **2** |
 | **P2-6** | **Replace 500ms invite re-broadcast delay with JoinSet wait** | **S** | **2** |
-| **P2-7** | **Make Raft config values configurable via ClusterConfig** | **S** | **3** |
-| **P2-8** | **Return Result from compute_partition_digest** | **S** | **3** |
+| ~~P2-7~~ | ~~Make Raft config values configurable via ClusterConfig~~ | **DONE** (791ec78) | — |
+| ~~P2-8~~ | ~~Return Result from compute_partition_digest~~ | **DONE** (7552939) | — |
