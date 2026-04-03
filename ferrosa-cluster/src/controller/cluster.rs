@@ -609,11 +609,15 @@ impl ModeController {
                                 continue;
                             }
                             let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
+                            // Cap per-table read to 100k partitions to prevent OOM.
+                            // Tables larger than this will have partial bootstrap;
+                            // anti-entropy repair catches the rest.
+                            const BOOTSTRAP_READ_LIMIT: usize = 100_000;
                             let partitions = match storage_for_bootstrap.read_range(
                                 &table_id,
                                 None,
                                 None,
-                                usize::MAX,
+                                BOOTSTRAP_READ_LIMIT,
                             ) {
                                 Ok(p) => p,
                                 Err(e) => {
