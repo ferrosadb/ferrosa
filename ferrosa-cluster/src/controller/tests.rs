@@ -1023,6 +1023,7 @@ fn bootstrap_streaming_produces_mutations_for_remote_nodes() {
                 } else {
                     NodeState::Joining
                 },
+                cql_broadcast: None,
             },
         );
     }

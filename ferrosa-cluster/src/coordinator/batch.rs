@@ -419,6 +419,7 @@ mod tests {
             data_center: "dc1".to_string(),
             rack: "rack1".to_string(),
             state: crate::raft::NodeState::Normal,
+            cql_broadcast: None,
         }
     }
 

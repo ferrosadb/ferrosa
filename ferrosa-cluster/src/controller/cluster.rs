@@ -183,6 +183,7 @@ impl ModeController {
                 data_center: self.config.data_center.clone(),
                 rack: self.config.rack.clone(),
                 state: NodeState::Normal,
+                cql_broadcast: self.config.cql_broadcast.clone(),
             },
         );
 
@@ -200,6 +201,9 @@ impl ModeController {
                     // streaming completes. Joining nodes don't serve reads for
                     // their token ranges until they have the data.
                     state: NodeState::Joining,
+                    // Peer's cql_broadcast is unknown at this point; it will be
+                    // propagated through Raft NodeInfo once the peer joins.
+                    cql_broadcast: None,
                 },
             );
         }

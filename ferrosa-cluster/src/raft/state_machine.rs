@@ -996,6 +996,7 @@ mod tests {
             data_center: "dc1".to_string(),
             rack: "rack1".to_string(),
             state: NodeState::Normal,
+            cql_broadcast: None,
         };
         let node_id = super::super::uuid_to_node_id(host_id);
 
@@ -1077,6 +1078,7 @@ mod tests {
                 data_center: "dc1".to_string(),
                 rack: "rack1".to_string(),
                 state: NodeState::Normal,
+                cql_broadcast: None,
             }),
             RaftOp::AssignTokens {
                 node_id: super::super::uuid_to_node_id(Uuid::nil()),
@@ -1135,6 +1137,7 @@ mod tests {
                     data_center: "dc1".to_string(),
                     rack: "rack1".to_string(),
                     state: NodeState::Normal,
+                    cql_broadcast: None,
                 }),
             ),
         ];
@@ -1459,6 +1462,7 @@ mod tests {
             data_center: "dc1".to_string(),
             rack: "rack1".to_string(),
             state: NodeState::Normal,
+            cql_broadcast: None,
         };
 
         let entries = vec![
@@ -1504,6 +1508,7 @@ mod tests {
             data_center: "dc1".to_string(),
             rack: "rack1".to_string(),
             state: NodeState::Normal,
+            cql_broadcast: None,
         };
 
         // Join, assign tokens, then leave.
@@ -2094,6 +2099,7 @@ mod tests {
                 data_center: "dc1".into(),
                 rack: "rack1".into(),
                 state: NodeState::Joining,
+                cql_broadcast: None,
             }),
             schema_version: Uuid::new_v4(),
         });
@@ -2123,6 +2129,7 @@ mod tests {
                     data_center: "dc1".into(),
                     rack: "rack1".into(),
                     state: NodeState::Normal,
+                    cql_broadcast: None,
                 }),
                 schema_version: Uuid::new_v4(),
             });
@@ -2184,6 +2191,7 @@ mod tests {
                     data_center: "dc1".into(),
                     rack: "rack1".into(),
                     state: NodeState::Normal,
+                    cql_broadcast: None,
                 }),
                 schema_version: Uuid::new_v4(),
             };
@@ -2285,6 +2293,7 @@ mod tests {
                     data_center: "dc1".into(),
                     rack: "rack1".into(),
                     state: NodeState::Normal,
+                    cql_broadcast: None,
                 }),
                 schema_version: Uuid::new_v4(),
             });

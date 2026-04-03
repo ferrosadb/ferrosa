@@ -45,6 +45,10 @@ pub struct ClusterConfig {
     /// Maximum seconds to wait in Forming state before falling back to Pair.
     /// `None` uses the default of 60 seconds.
     pub formation_timeout_secs: Option<u64>,
+    /// CQL broadcast address (host:port) for system.peers.
+    /// When set, overrides the internode address for native_address.
+    /// Parsed from FERROSA_CQL_BROADCAST env var.
+    pub cql_broadcast: Option<String>,
 }
 
 impl Default for ClusterConfig {
@@ -61,6 +65,7 @@ impl Default for ClusterConfig {
             raft_data_dir: None,
             node_role: NodeRole::Both,
             formation_timeout_secs: None,
+            cql_broadcast: None,
         }
     }
 }
@@ -112,6 +117,9 @@ impl ClusterConfig {
                 "both" => NodeRole::Both,
                 _ => NodeRole::Both,
             };
+        }
+        if let Ok(addr) = std::env::var("FERROSA_CQL_BROADCAST") {
+            config.cql_broadcast = Some(addr);
         }
 
         config

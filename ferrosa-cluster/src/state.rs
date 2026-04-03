@@ -89,6 +89,14 @@ impl ClusterState for RaftClusterState {
                 let info = ring.get_node(id)?;
                 // Parse addr string "host:port" into IP + port.
                 let (ip, port) = parse_addr(&info.addr)?;
+                // Use cql_broadcast if set (host-reachable address for
+                // port-mapped container clusters), otherwise fall back to
+                // the internode IP.
+                let (native_addr, native_port) = if let Some(ref broadcast) = info.cql_broadcast {
+                    parse_addr(broadcast).unwrap_or((ip, 9042))
+                } else {
+                    (ip, 9042)
+                };
                 Some(PeerInfo {
                     peer: ip,
                     peer_port: port,
@@ -97,8 +105,8 @@ impl ClusterState for RaftClusterState {
                     host_id: info.host_id,
                     preferred_ip: None,
                     preferred_port: None,
-                    native_address: ip,
-                    native_port: 9042,
+                    native_address: native_addr,
+                    native_port,
                     schema_version: uuid::Uuid::nil(),
                     tokens: vec![],
                     release_version: ferrosa_schema::system::RELEASE_VERSION.to_string(),
@@ -140,6 +148,99 @@ mod tests {
         assert_eq!(peers[0].host_id, peer_id);
         assert_eq!(peers[0].peer, "10.0.1.5".parse::<IpAddr>().unwrap());
         assert_eq!(peers[0].peer_port, 7000);
+    }
+
+    #[test]
+    fn raft_cluster_state_uses_cql_broadcast_for_native_address() {
+        use crate::raft::{NodeInfo, NodeState};
+        use crate::ring::TokenRing;
+
+        let local_id = 1_u64;
+        let peer_id = 2_u64;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            local_id,
+            NodeInfo {
+                host_id: Uuid::new_v4(),
+                addr: "172.17.0.2:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            },
+        );
+        ring.add_node(
+            peer_id,
+            NodeInfo {
+                host_id: Uuid::new_v4(),
+                addr: "172.17.0.3:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("192.168.1.100:19043".to_string()),
+            },
+        );
+
+        let ring_arc = Arc::new(ArcSwap::from_pointee(ring));
+        let state = RaftClusterState::new(ring_arc, local_id);
+        let peers = state.peers();
+
+        assert_eq!(peers.len(), 1);
+        // native_address must be the CQL broadcast, not the container IP.
+        assert_eq!(
+            peers[0].native_address,
+            "192.168.1.100".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(peers[0].native_port, 19043);
+        // peer (internode) address stays as the container IP.
+        assert_eq!(peers[0].peer, "172.17.0.3".parse::<IpAddr>().unwrap());
+        assert_eq!(peers[0].peer_port, 7000);
+    }
+
+    #[test]
+    fn raft_cluster_state_falls_back_to_internode_ip() {
+        use crate::raft::{NodeInfo, NodeState};
+        use crate::ring::TokenRing;
+
+        let local_id = 1_u64;
+        let peer_id = 2_u64;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            local_id,
+            NodeInfo {
+                host_id: Uuid::new_v4(),
+                addr: "10.0.1.1:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            },
+        );
+        ring.add_node(
+            peer_id,
+            NodeInfo {
+                host_id: Uuid::new_v4(),
+                addr: "10.0.1.2:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: None, // no broadcast set
+            },
+        );
+
+        let ring_arc = Arc::new(ArcSwap::from_pointee(ring));
+        let state = RaftClusterState::new(ring_arc, local_id);
+        let peers = state.peers();
+
+        assert_eq!(peers.len(), 1);
+        // Without cql_broadcast, native_address falls back to internode IP.
+        assert_eq!(
+            peers[0].native_address,
+            "10.0.1.2".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(peers[0].native_port, 9042);
     }
 
     /// BUG-020: system.peers release_version must match system.local
