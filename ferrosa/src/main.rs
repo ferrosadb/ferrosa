@@ -635,6 +635,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ));
 
+    // T-18: Register Batch 5 observability virtual tables.
+    let alert_registry = Arc::new(ferrosa_cql::virtual_tables::AlertRegistry::new());
+    schema
+        .virtual_tables()
+        .register(Arc::new(ferrosa_cql::virtual_tables::AlertsTable::new(
+            alert_registry.clone(),
+        )));
+    let billing_meter = Arc::new(ferrosa_cql::virtual_tables::BillingMeter::new());
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::BillingMetersTable::new(billing_meter.clone()),
+    ));
+    let fingerprint_tracker = Arc::new(ferrosa_cql::virtual_tables::QueryFingerprintTracker::new());
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::QueryFingerprintsTable::new(fingerprint_tracker.clone()),
+    ));
+    let full_scan_tracker = Arc::new(ferrosa_cql::virtual_tables::FullScanTracker::new());
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::FullScanReasonsTable::new(full_scan_tracker.clone()),
+    ));
+    let table_access_tracker = Arc::new(ferrosa_cql::virtual_tables::TableAccessTracker::new());
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::TableAccessSummaryTable::new(table_access_tracker.clone()),
+    ));
+
+    // T-27: Spawn the alert evaluator background task.
+    ferrosa_cql::virtual_tables::alerts::spawn_alert_evaluator(
+        alert_registry.clone(),
+        schema.virtual_tables_arc(),
+    );
+
+    // Register stub virtual tables for deferred observability features.
+    ferrosa_cql::virtual_tables::register_all_stubs(schema.virtual_tables());
+
     let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state);
     let cql_addr = cql_server.start_background().await?;
     tracing::info!(%cql_addr, "CQL server listening");
@@ -647,6 +680,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage: storage.clone(),
         host_id,
         auth_disabled,
+        debug: Some(web::debug::DebugState::new()),
     };
     let web_config = web::WebConfig::from_env();
     let web_addr = web::start_web_server(&web_config, web_state).await?;
