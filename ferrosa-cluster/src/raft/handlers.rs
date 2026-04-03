@@ -326,25 +326,65 @@ impl LazyRaft {
         (tx, Self { rx })
     }
 
-    /// Wait up to 10 seconds for the Raft instance to be initialized.
+    /// Wait for the Raft instance to be initialized, retrying with backoff.
+    ///
+    /// Makes up to 3 attempts with 5-second backoff between retries (total
+    /// ~20 seconds worst case). Returns `None` only after all retries are
+    /// exhausted.
     async fn get(&self) -> Option<Arc<super::FerrosRaft>> {
-        let mut rx = self.rx.clone();
         // If already available, return immediately.
-        if rx.borrow().is_some() {
-            return rx.borrow().clone();
+        // Scope the borrow so the RwLockReadGuard is dropped before any await.
+        let cached = { self.rx.borrow().clone() };
+        if cached.is_some() {
+            return cached;
         }
-        // Wait for the sender to publish the instance.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            rx.wait_for(|v| v.is_some()),
-        )
-        .await;
-        match result {
-            Ok(Ok(guard)) => guard.clone(),
-            _ => {
-                tracing::warn!("LazyRaft: timed out waiting for Raft initialization");
-                None
+
+        for attempt in 1..=3u32 {
+            // Try a single wait attempt. The helper maps away the non-Send
+            // watch::Ref so the extracted result is Send-safe.
+            let extracted = Self::try_wait(&self.rx, std::time::Duration::from_secs(5)).await;
+            match extracted {
+                Ok(value) => return value,
+                Err(true) => {
+                    // Channel closed.
+                    tracing::warn!(
+                        attempt,
+                        "LazyRaft: channel closed before Raft initialization"
+                    );
+                    return None;
+                }
+                Err(false) => {
+                    // Timeout.
+                    if attempt < 3 {
+                        tracing::warn!(
+                            attempt,
+                            "LazyRaft: timed out waiting for Raft initialization, retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
             }
+        }
+
+        tracing::warn!("LazyRaft: all 3 attempts exhausted waiting for Raft initialization");
+        None
+    }
+
+    /// Single wait attempt that maps the non-Send `watch::Ref` into an owned
+    /// value before returning. Returns:
+    /// - `Ok(value)` if the watch fires with a value
+    /// - `Err(true)` if the channel is closed
+    /// - `Err(false)` if the timeout expired
+    async fn try_wait(
+        rx: &tokio::sync::watch::Receiver<Option<Arc<super::FerrosRaft>>>,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Arc<super::FerrosRaft>>, bool> {
+        let mut rx = rx.clone();
+        let result = tokio::time::timeout(timeout, rx.wait_for(|v| v.is_some())).await;
+        match result {
+            Ok(Ok(guard)) => Ok(guard.clone()),
+            Ok(Err(_)) => Err(true),
+            Err(_) => Err(false),
         }
     }
 }
