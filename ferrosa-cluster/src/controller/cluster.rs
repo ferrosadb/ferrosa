@@ -115,7 +115,7 @@ impl ModeController {
                 let cfg = net_cfg.clone();
                 let uuid = *peer_uuid;
                 let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
-                tokio::spawn(async move {
+                self.spawn_tracked(async move {
                     match PriorityPool::connect(cfg, local_id, &reverse_addr.to_string()).await {
                         Ok(pool) => {
                             pm.add_peer((uuid, reverse_addr), pool).await;
