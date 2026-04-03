@@ -67,17 +67,33 @@
 
 ---
 
-## Sprint S4: Jepsen, Drivers, Polish
+## Sprint S4: Close All Remaining Gaps + SSTable Streaming
 
-**Gate:** Jepsen standard tier zero anomalies, all 6 CQL drivers pass, SSTable-based streaming operational.
+**Gate:** All open hazards (P0-1 through P2-6) closed, SSTable-based streaming operational, `cargo test` 3200+ green, 0 clippy warnings. C4/C8 (Jepsen + drivers) deferred to S5 since they require external infrastructure.
 
 | # | Task | Source | Size | Success Criteria | Tests |
 |---|------|--------|------|-----------------|-------|
-| S4.1 | C4 live Jepsen runs | Correctness sprint C4 | L | `ferrosa-jepsen run --tier standard` on 3-node cluster reports zero anomalies. Elle/Knossos verification passes. | `FERROSA_TEST_CLUSTER_NODES` |
-| S4.2 | C8 all-drivers CQL compat | Correctness sprint C8 | L | Python, Go, Node.js, Java, C#, Rust drivers execute full workload matrix against 3-node NTS cluster. T-032 standard. | Docker compose + driver test suites |
-| S4.3 | SSTable-based streaming | Correctness gap #8 | L | Bootstrap sends SSTable component files via Bulk lane instead of per-row mutations. Order-of-magnitude faster for large datasets. | `sstable_streaming_roundtrip` |
-| S4.4 | Connection-direction role assignment | P1-5 | S | Primary/Secondary determined by connection direction (who initiated), not UUID comparison. Eliminates tie-breaking edge cases. | `connection_direction_determines_role` |
-| S4.5 | Remaining P2 polish | P2-1, P2-2, P2-3 | M | Replace sleeps with condition waits, add CancellationToken + shutdown(), cap unbounded collections. | Existing tests stay green |
+| S4.1 | Queue DDL during Forming (not just block) | P0-1, F3 | M | DDL requests during Forming are queued and replayed after Raft leader election, not rejected. Prevents user-visible errors during formation. | `ddl_queued_during_forming_replayed_after_election` |
+| S4.2 | Track ClusterInviteHandler spawns | P1-2 | S | Pass a `JoinSet` handle into ClusterInviteHandler so its 2 `tokio::spawn` calls are tracked. Panics detected, tasks cancellable on shutdown. | `invite_handler_spawns_tracked` |
+| S4.3 | Transition guard for all mode changes | P1-3 | M | All mode transitions (not just on_peer_connected) acquire transition_guard. Prevents concurrent on_peer_disconnected + on_inbound_peer from both triggering transitions. | `concurrent_connect_disconnect_serialized` |
+| S4.4 | Connection-direction role assignment | P1-5 | S | Primary/Secondary determined by who initiated the connection, not UUID comparison. Eliminates tie-breaking edge cases. | `connection_direction_determines_role` |
+| S4.5 | RangeReadHandler truncation flag | P1-10 | M | Response includes `truncated: bool` when result set hits 1M limit. Coordinator issues follow-up reads for remaining data. | `range_read_truncation_flag_set` |
+| S4.6 | Replace sleeps with condition-based waits | P2-1 | M | Fixed `tokio::time::sleep` calls replaced with `tokio::sync::Notify` or `watch` channels. Formation and bootstrap proceed as fast as the system allows. | Existing tests stay green, faster bootstrap |
+| S4.7 | CancellationToken + graceful shutdown | P2-2 | M | All background tasks check `cancel` token. `ModeController::shutdown()` cancels all tasks and waits for completion. Clean exit on ctrl-c. | `shutdown_cancels_background_tasks` |
+| S4.8 | Cap unbounded collections | P2-3 | S | `connected_peers`, `pending_joins`, `seen_invite_initiators` have max size. Excess entries evicted with warning. | `collection_cap_enforced` |
+| S4.9 | Cache PairClusterState peers | P2-5 | S | `PairClusterState::peers()` caches result to avoid returning empty vec on RwLock contention. Cache invalidated on peer change. | `pair_peers_returns_cached_on_contention` |
+| S4.10 | Replace invite re-broadcast delay with JoinSet wait | P2-6 | S | ClusterInviteHandler waits for connection JoinSet completion instead of fixed 500ms sleep. Re-broadcast sent when connections are established. | `invite_rebroadcast_after_connect_completes` |
+| S4.11 | SSTable-based streaming | Correctness gap #8 | L | Bootstrap sends SSTable component files via Bulk lane instead of per-row mutations. Order-of-magnitude faster for large datasets. | `sstable_streaming_roundtrip` |
+| S4.12 | BootstrapComplete RPC barrier | S2.6 follow-up | M | Leader waits for `BootstrapComplete` message from all joining nodes before promoting. Replaces configurable delay with a proper coordination protocol. | `promotion_waits_for_all_nodes_complete` |
+
+---
+
+## Deferred to S5 (requires external infrastructure)
+
+| # | Task | Source | Size | Requires |
+|---|------|--------|------|----------|
+| S5.1 | C4 live Jepsen runs | Correctness sprint C4 | L | `FERROSA_TEST_FIRECRACKER` or `FERROSA_TEST_CLUSTER_NODES` |
+| S5.2 | C8 all-drivers CQL compat | Correctness sprint C8 | L | Docker compose with 3-node NTS cluster |
 
 ---
 
@@ -85,11 +101,10 @@
 
 | Risk | Probability | Impact | Mitigation |
 |------|------------|--------|-----------|
-| NTS read path has subtle LOCAL_QUORUM bugs | Medium | High | S1.2 has dedicated test; follow with Jepsen in S4 |
-| Anti-entropy repair is a large new module | Medium | Medium | Reuse existing streaming; start with single-table repair |
-| Jepsen finds new bugs during S4 | High | Medium | Expected — log as BUG-### and fix in-sprint |
+| DDL queue during Forming may reorder operations | Medium | High | Queue is FIFO; replay in order after leader election |
 | SSTable streaming changes wire format | Low | High | Version the stream protocol; old mutation-based still works |
-| Driver compat surfaces new CQL parser gaps | High | Medium | Fix as discovered; parser coverage already 81.8% |
+| Transition guard serialization may add latency | Low | Medium | Guard is held <1ms; only during mode transitions |
+| Collection caps may drop legitimate entries | Low | Low | Caps set generously (1000+); log warnings on eviction |
 
 ---
 
@@ -97,15 +112,12 @@
 
 ```mermaid
 graph LR
-    S1.1 --> S2.6
-    S1.2 --> S4.1
-    S1.6 --> S3.1
-    S2.1 --> S4.1
-    S2.2 --> S4.1
-    S2.3 --> S4.3
-    S2.6 --> S3.3
-    S3.1 --> S4.1
-    S3.3 --> S4.1
+    S4.1 --> S4.12
+    S4.2 --> S4.7
+    S4.3 --> S4.6
+    S4.6 --> S4.10
+    S4.6 --> S4.12
+    S4.11 --> S4.12
 ```
 
-S1 blocks S2 (hazards must be closed before correctness work). S2+S3 block S4 (Jepsen runs need correct read/write paths). S3.3 (repair) depends on S2.6 (streaming completion barrier).
+S4.1 (DDL queue) must complete before S4.12 (BootstrapComplete RPC) since both touch the formation lifecycle. S4.6 (condition waits) unblocks S4.10 (invite wait) and S4.12 (promotion barrier). S4.11 (SSTable streaming) feeds into S4.12 (promotion needs to wait for SSTable transfer completion).
