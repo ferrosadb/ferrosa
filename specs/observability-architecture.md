@@ -23,32 +23,36 @@ Following CMU-PDL-14-102's four design axes:
 ```mermaid
 graph TD
     App["Application Code<br/>#[instrument] spans"]
-    Sub["tracing subscriber<br/>fmt layer + telemetry layer"]
+    Sub["tracing subscriber<br/>fmt + telemetry + otel layers"]
     TL["FerrosaTelemetryLayer<br/>batch spans in bounded channel"]
+    OTL["tracing-opentelemetry layer<br/>(optional, enterprise)"]
     CQL["CqlClient<br/>INSERT INTO system_observability.*"]
     DB["Ferrosa Node<br/>(local or remote endpoint)"]
     UI["ferrosa-dbaas<br/>control plane UI"]
+    OTLP["OTLP Collector / Jaeger / Datadog<br/>(enterprise customer's stack)"]
 
     App -->|"span open/close"| Sub
     Sub -->|"sampled spans"| TL
+    Sub -.->|"if FERROSA_OTEL_ENDPOINT set"| OTL
     TL -->|"batched CQL writes"| CQL
+    OTL -.->|"OTLP gRPC export"| OTLP
     CQL -->|"system_observability.spans<br/>system_observability.metrics<br/>system_observability.slow_queries"| DB
     DB -->|"SELECT via CQL"| UI
 
     style TL fill:#f9f,stroke:#333
     style DB fill:#bbf,stroke:#333
     style UI fill:#bfb,stroke:#333
+    style OTL fill:#ffd,stroke:#333
+    style OTLP fill:#ffd,stroke:#333
 ```
 
-**Self-hosted observability:** Ferrosa writes its own telemetry to a ferrosa
-instance (local node or a designated observability endpoint). No external
-databases, no Jaeger, no Tempo. The UI lives in `ferrosa-dbaas` which
-already has a control plane and can query the telemetry tables via CQL.
+**Dual export architecture:**
+- **Always:** Self-hosted `FerrosaTelemetryLayer` writes to ferrosa via CQL. No external deps. UI in `ferrosa-dbaas`.
+- **Optional (enterprise):** When `FERROSA_OTEL_ENDPOINT` is set, an additional `tracing-opentelemetry` layer exports spans via OTLP gRPC to the customer's existing observability stack (Jaeger, Datadog, Grafana Tempo, etc.). Both layers run concurrently — self-hosted telemetry is always available, OTLP is additive.
 
-**Crate additions (minimal):**
-- No `opentelemetry` / `opentelemetry-otlp` / `opentelemetry_sdk`
-- Custom `tracing::Layer` that batches spans and writes via `CqlClient`
-- Reuse existing `ferrosa-cql::CqlClient` for writes
+**Crate additions:**
+- Custom `tracing::Layer` (`FerrosaTelemetryLayer`) — batches spans, writes via `CqlClient`
+- `tracing-opentelemetry` + `opentelemetry` + `opentelemetry-otlp` + `opentelemetry_sdk` — behind `otel` feature flag, only compiled when enterprise OTLP export is needed
 
 **Schema (created in `system_observability` keyspace):**
 
@@ -92,6 +96,8 @@ CREATE TABLE system_observability.slow_queries (
 - `FERROSA_TELEMETRY_SAMPLE_RATE` — sampling ratio 0.0-1.0 (default: 1.0 in dev, 0.01 in prod)
 - `FERROSA_TELEMETRY_ENABLED` — master switch (default: true)
 - `FERROSA_SLOW_QUERY_THRESHOLD_MS` — slow query threshold (default: 1000)
+- `FERROSA_OTEL_ENDPOINT` — OTLP gRPC endpoint for enterprise export (default: disabled). When set, adds `tracing-opentelemetry` layer alongside the self-hosted layer.
+- `FERROSA_OTEL_SERVICE_NAME` — OTel service name (default: "ferrosa")
 
 ---
 
@@ -108,6 +114,43 @@ CREATE TABLE system_observability.slow_queries (
 | `cql.prepared` | `prepared.rs` cache lookup | `cql.cache_hit` | Prepared statement cache effectiveness |
 
 **Slow query detection:** Log at WARN when `cql.execute` span exceeds configurable threshold (default 1s). Include full query text at DEBUG level.
+
+### Layer 1b: Graph Engine (Cypher queries, Bolt protocol, HTTP)
+
+| Span | Location | Attributes | Why |
+|------|----------|------------|-----|
+| `graph.request` | `http.rs` POST /graph/query | `graph.query_text`, `client.address` | Top-level graph query span |
+| `graph.parse` | `parser/` Cypher parser | `graph.node_labels`, `graph.hop_count` | Parse latency, query complexity |
+| `graph.plan` | `planner/logical.rs` + `physical.rs` | `graph.plan_type`, `graph.hops` | Plan generation latency |
+| `graph.execute` | `executor/expand.rs` | `graph.rows_returned`, `graph.fan_out`, `graph.timeout` | Execution time — traversal depth + result size |
+| `graph.explain` | `engine.rs` explain API | `graph.plan_summary` | Explain (no execution) |
+| `bolt.session` | Bolt v5 handler | `bolt.version`, `client.address`, `bolt.state` | Bolt connection lifecycle |
+| `bolt.run` | Bolt RUN message handler | `bolt.query`, `bolt.params_count` | Per-statement execution via Bolt |
+| `graph.adjacency_build` | `adjacency/observer.rs` | `graph.keyspace`, `graph.entries_written` | Adjacency index build latency on flush |
+| `graph.reconcile` | `adjacency/reconcile.rs` | `graph.divergence_count`, `graph.repaired` | Background reconciliation cycle |
+
+### Layer 1c: Index Usage (which indexes are hit, build times)
+
+| Span | Location | Attributes | Why |
+|------|----------|------------|-----|
+| `index.plan` | `planner.rs` ScanPlan | `index.type`, `index.name`, `index.table`, `plan` (PrimaryKey/SingleIndex/IndexIntersection/FullScan) | Tracks which plan was chosen — did we use an index or full scan? |
+| `index.lookup` | `IndexReader` implementations | `index.type`, `index.keyspace`, `index.table`, `index.column`, `index.rows_matched` | Per-index lookup latency + selectivity |
+| `index.build` | `index/scheduler.rs` | `index.type`, `index.table`, `index.priority`, `index.duration_ms`, `index.entries` | Background index build time per SSTable |
+| `index.fts_search` | `fts_match()` function | `index.query_terms`, `index.results`, `index.bm25_top_score` | Full-text search latency + result quality |
+| `index.vector_ann` | `vector/hnsw.rs`, `vector/ivfflat.rs` | `index.k`, `index.ef_search`, `index.distance_fn`, `index.candidates_scanned` | ANN query latency + search depth |
+
+**Metrics:**
+
+| Metric | Type | Labels | Why |
+|--------|------|--------|-----|
+| `ferrosa_index_lookups_total` | counter | `type`, `keyspace`, `table` | Index usage frequency — are indexes being used? |
+| `ferrosa_index_full_scans_total` | counter | `keyspace`, `table` | Full scans — indicates missing index |
+| `ferrosa_index_build_duration_seconds` | histogram | `type` | Build latency distribution |
+| `ferrosa_index_staleness` | gauge | `keyspace`, `table`, `type` | Current/Building/Stale/Failed per index |
+| `ferrosa_graph_queries_total` | counter | `endpoint` (http/bolt) | Graph query rate |
+| `ferrosa_graph_query_duration_seconds` | histogram | `endpoint` | Graph query latency |
+| `ferrosa_graph_traversal_depth` | histogram | — | Hop count distribution |
+| `ferrosa_bolt_connections_active` | gauge | — | Active Bolt sessions |
 
 ### Layer 2: Cluster Coordination (contention, consensus)
 
