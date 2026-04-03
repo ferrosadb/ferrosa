@@ -24,22 +24,66 @@ Following CMU-PDL-14-102's four design axes:
 Application Code
     ↓ #[instrument] spans + tracing::info_span!
 tracing crate (subscriber)
-    ↓ tracing-opentelemetry layer
-opentelemetry SDK (BatchSpanProcessor)
-    ↓ OTLP gRPC exporter
-Jaeger / Grafana Tempo / OTEL Collector
+    ↓ custom FerrosaTelemetryLayer
+CQL client (ferrosa-cql::CqlClient)
+    ↓ INSERT INTO system_observability.spans / .metrics
+Ferrosa itself (local or remote node)
+    ↓
+ferrosa-dbaas UI (../ferrosa-dbaas control plane)
 ```
 
-**Crate additions:**
-- `tracing-opentelemetry` — bridge tracing spans to OTel
-- `opentelemetry` + `opentelemetry-otlp` — OTLP export
-- `opentelemetry_sdk` — batch processor, sampling config
-- `metrics` crate (optional) — for histogram/counter if we outgrow atomics
+**Self-hosted observability:** Ferrosa writes its own telemetry to a ferrosa
+instance (local node or a designated observability endpoint). No external
+databases, no Jaeger, no Tempo. The UI lives in `ferrosa-dbaas` which
+already has a control plane and can query the telemetry tables via CQL.
+
+**Crate additions (minimal):**
+- No `opentelemetry` / `opentelemetry-otlp` / `opentelemetry_sdk`
+- Custom `tracing::Layer` that batches spans and writes via `CqlClient`
+- Reuse existing `ferrosa-cql::CqlClient` for writes
+
+**Schema (created in `system_observability` keyspace):**
+
+```sql
+CREATE TABLE system_observability.spans (
+    trace_id    uuid,
+    span_id     uuid,
+    parent_id   uuid,
+    node_id     uuid,
+    name        text,
+    start_us    bigint,      -- microseconds since epoch
+    duration_us bigint,
+    status      text,        -- ok / error
+    attributes  map<text, text>,
+    PRIMARY KEY (trace_id, start_us, span_id)
+) WITH CLUSTERING ORDER BY (start_us ASC, span_id ASC);
+
+CREATE TABLE system_observability.metrics (
+    node_id     uuid,
+    metric_name text,
+    bucket      bigint,      -- epoch second, rounded to interval
+    value       double,
+    labels      map<text, text>,
+    PRIMARY KEY ((node_id, metric_name), bucket)
+) WITH CLUSTERING ORDER BY (bucket DESC);
+
+CREATE TABLE system_observability.slow_queries (
+    node_id     uuid,
+    timestamp   bigint,
+    duration_us bigint,
+    keyspace    text,
+    query_text  text,
+    client_addr text,
+    trace_id    uuid,
+    PRIMARY KEY (node_id, timestamp)
+) WITH CLUSTERING ORDER BY (timestamp DESC);
+```
 
 **Configuration (env vars):**
-- `FERROSA_OTEL_ENDPOINT` — OTLP gRPC endpoint (default: disabled)
-- `FERROSA_OTEL_SAMPLE_RATE` — sampling ratio 0.0-1.0 (default: 1.0)
-- `FERROSA_OTEL_SERVICE_NAME` — service name (default: "ferrosa")
+- `FERROSA_TELEMETRY_ENDPOINT` — CQL endpoint for telemetry writes (default: `127.0.0.1:9042` — self)
+- `FERROSA_TELEMETRY_SAMPLE_RATE` — sampling ratio 0.0-1.0 (default: 1.0 in dev, 0.01 in prod)
+- `FERROSA_TELEMETRY_ENABLED` — master switch (default: true)
+- `FERROSA_SLOW_QUERY_THRESHOLD_MS` — slow query threshold (default: 1000)
 
 ---
 
@@ -146,15 +190,16 @@ The internode propagation requires a wire format change:
 
 ## Sprint Plan
 
-### O1: Foundation (tracing + OTel export)
+### O1: Foundation (self-hosted telemetry layer)
 
 | # | Task | Size | Description |
 |---|------|------|-------------|
-| O1.1 | Add OTel dependencies to workspace | S | `tracing-opentelemetry`, `opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk` |
-| O1.2 | Configure OTel subscriber in main.rs | M | Conditional OTLP layer when `FERROSA_OTEL_ENDPOINT` set, with sampling config |
-| O1.3 | Instrument CQL request lifecycle | M | `#[instrument]` on server accept, parse, route, execute |
-| O1.4 | Slow query logging | S | Threshold-based WARN log with query text when execution > 1s |
-| O1.5 | CQL request metrics (counter + histogram) | M | `ferrosa_cql_requests_total`, `ferrosa_cql_request_duration_seconds` |
+| O1.1 | Create `system_observability` schema | S | Tables: `spans`, `metrics`, `slow_queries` — auto-created at startup like other system keyspaces |
+| O1.2 | Build `FerrosaTelemetryLayer` | L | Custom `tracing::Layer` that batches closed spans in a bounded channel and writes to ferrosa via `CqlClient`. Configurable endpoint, sample rate, batch size (default 100 spans / 1s flush). |
+| O1.3 | Configure telemetry subscriber in main.rs | M | Add `FerrosaTelemetryLayer` conditionally when `FERROSA_TELEMETRY_ENABLED=true`. Stack with existing fmt layer. |
+| O1.4 | Instrument CQL request lifecycle | M | `#[instrument]` on server accept, parse, route, execute — generates spans that flow into self-hosted storage |
+| O1.5 | Slow query table + threshold logging | S | Queries exceeding `FERROSA_SLOW_QUERY_THRESHOLD_MS` written to `system_observability.slow_queries` with trace_id link |
+| O1.6 | CQL request metrics (counter + histogram) | M | `ferrosa_cql_requests_total`, `ferrosa_cql_request_duration_seconds` — written to `metrics` table on configurable interval |
 
 ### O2: Cluster + Storage Spans
 
@@ -171,25 +216,29 @@ The internode propagation requires a wire format change:
 | # | Task | Size | Description |
 |---|------|------|-------------|
 | O3.1 | Instrument internode RPC | M | Span on send/receive with peer, msg_type, bytes, latency |
-| O3.2 | Trace context propagation across nodes | L | 32-byte trace header in internode frames, inject/extract |
+| O3.2 | Trace context propagation across nodes | L | 32-byte trace header in internode frames, inject/extract — enables cross-node trace stitching |
 | O3.3 | Contention metrics | M | Memtable shard contention, transition guard hold time, S3 upload queue depth |
 | O3.4 | Network bandwidth metrics | S | `ferrosa_net_bytes_sent_total`, `ferrosa_net_bytes_received_total` by peer + lane |
 | O3.5 | In-flight RPC gauge | S | `ferrosa_net_rpc_inflight` per peer |
 
-### O4: Dashboard + Alerts
+### O4: ferrosa-dbaas Integration
 
 | # | Task | Size | Description |
 |---|------|------|-------------|
-| O4.1 | Grafana dashboard JSON | M | Pre-built dashboard with CQL latency, cluster write/read, storage I/O, network panels |
-| O4.2 | Alert rules | S | Slow query rate > threshold, S3 upload queue > 100, hint store growing, compaction falling behind |
-| O4.3 | Web console integration | M | Expose OTel trace links in `ferrosa-ctl` and web console |
+| O4.1 | CQL query API for telemetry | S | Document the `system_observability.*` schema so `ferrosa-dbaas` can query spans, metrics, slow queries via standard CQL |
+| O4.2 | Trace reconstruction query | M | Helper CQL queries to reconstruct a full distributed trace from `spans` table (SELECT by trace_id, ORDER BY start_us) |
+| O4.3 | Metrics rollup | M | Background task that aggregates fine-grained metrics into hourly/daily rollups, TTL old data (default 7 days raw, 90 days rolled up) |
+| O4.4 | Alert virtual table | S | `system_observability.alerts` — threshold-based rules (slow query rate, S3 queue depth, hint backlog) written by background evaluator, queryable by dbaas |
+| O4.5 | Web console trace link | S | `ferrosa-ctl` and web console show trace_id for recent queries, clickable link to dbaas trace viewer |
 
 ---
 
 ## Design Principles
 
-1. **Always-on, low overhead:** Spans are cheap when not exported. OTel export is optional (env var). Target <1% overhead with 1% sampling.
+1. **Self-hosted, zero external deps:** Telemetry writes to ferrosa itself. No Jaeger, no Tempo, no Prometheus server. The `ferrosa-dbaas` control plane provides the UI.
 2. **Trigger-preserving causality:** Every span shows the critical path of the triggering request, not background work attributed to it.
 3. **Contention visibility first:** Prioritize instrumenting lock contention, queue depths, and backpressure over exhaustive function tracing.
 4. **Coherent sampling:** Head-based, decided at CQL request entry. All spans within a sampled request are captured.
 5. **Backward-compatible wire format:** Trace context in internode frames is optional; old nodes ignore it.
+6. **Telemetry writes are best-effort:** If the telemetry endpoint is down or slow, spans are dropped silently. Telemetry never blocks the data path.
+7. **Standard CQL interface:** All telemetry is queryable via normal CQL SELECT. No proprietary query language. `ferrosa-dbaas` reads the same tables any CQL client can.
