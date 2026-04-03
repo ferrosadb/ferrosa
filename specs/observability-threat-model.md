@@ -123,8 +123,8 @@
 | **Likelihood** | 3 |
 | **Impact** | 3 |
 | **Risk** | **9** |
-| **Mitigation** | (1) Telemetry CQL writes MUST be excluded from instrumentation — use a dedicated `CqlClient` that bypasses the tracing subscriber (no `#[instrument]` on telemetry writes). (2) Tag telemetry-origin spans and filter them in the layer. (3) Bounded channel with backpressure: if channel is full, drop spans (never block data path). (4) Circuit breaker: if telemetry write latency exceeds 500ms, pause writes for 30s. |
-| **Status** | **Gap** — design principle #6 says "best effort" but no explicit feedback loop break |
+| **Mitigation** | (1) **Architectural fix:** System table writes go directly to the storage layer, NOT through CQL parsing. CQL is the READ path only for observability data. This eliminates the feedback loop architecturally — observability writes never enter the CQL instrumentation path. (2) Tag telemetry-origin spans and filter them in the layer as defense-in-depth. (3) Bounded channel with backpressure: if channel is full, drop spans (never block data path). (4) Circuit breaker: if telemetry write latency exceeds 500ms, pause writes for 30s. |
+| **Status** | **APPROVED** — architectural fix (bypass CQL write path) |
 
 #### OBS-T9: Telemetry Write Backpressure Stalls Data Path (Risk 8 — High)
 
@@ -135,8 +135,8 @@
 | **Likelihood** | 2 |
 | **Impact** | 4 |
 | **Risk** | **8** |
-| **Mitigation** | (1) Use `try_send()` not `send()` — drop on full channel. (2) Counter for dropped spans, exposed in `system_observability.backpressure`. (3) Alert when drop rate exceeds threshold. (4) Design review: telemetry layer must NEVER call `.await` in the `on_close` path. |
-| **Status** | **Gap** |
+| **Mitigation** | (1) Use `try_send()` (non-blocking) — drop OLDEST span on full channel (not newest — preserves recent data). (2) Counter for dropped spans, exposed in `system_observability.backpressure`. (3) Alert when drop rate exceeds threshold — monitor with alerting when drops occur. (4) Design review: telemetry layer must NEVER call `.await` in the `on_close` path. (5) MUST be cancel-safe — bad/excessive monitoring must never crash the system. |
+| **Status** | **APPROVED** |
 
 ### 6. Enterprise OTLP Export
 
@@ -149,8 +149,8 @@
 | **Likelihood** | 2 |
 | **Impact** | 4 |
 | **Risk** | **8** |
-| **Mitigation** | (1) Log a WARN on startup when OTLP export is enabled, including the target endpoint. (2) Attribute scrubbing: strip `partition_key_hash`, `query_text`, `client_addr` from OTLP-exported spans. (3) Allow-list of exportable span attributes in config. (4) mTLS for OTLP connection (verify server cert). |
-| **Status** | **Gap** |
+| **Mitigation** | (1) Log a WARN on startup when OTLP export is enabled, including the target endpoint. (2) Use `?` for ALL data values in any externally exported spans — do NOT ship query text or data values to external endpoints. (3) External OTEL data limited to ONLY metrics that do not compromise data (span names, durations, status codes). (4) Allow-list of exportable span attributes in config. (5) mTLS for OTLP connection (verify server cert). (6) Query analysis (full text, fingerprints) available only to admins on the system — never exported externally. |
+| **Status** | **APPROVED** — data-safe export only |
 
 #### OBS-T11: OTLP Export as Covert Channel (Risk 4 — Medium)
 
@@ -161,8 +161,8 @@
 | **Likelihood** | 1 |
 | **Impact** | 4 |
 | **Risk** | **4** |
-| **Mitigation** | (1) Allow-list of permitted attribute keys for OTLP export. (2) Cap attribute value length (256 bytes). (3) Code review: no user-controlled data in span attributes without sanitization. |
-| **Status** | **Gap** |
+| **Mitigation** | (1) Allow-list of permitted attribute keys for OTLP export — modifiable ONLY by admin. (2) Cap attribute value length (256 bytes). (3) Code review: no user-controlled data in span attributes without sanitization. Matches OBS-T10 restriction: only data-safe attributes are exportable. |
+| **Status** | **APPROVED** |
 
 ### 7. Trace Data
 
@@ -175,8 +175,8 @@
 | **Likelihood** | 2 |
 | **Impact** | 4 |
 | **Risk** | **8** |
-| **Mitigation** | (1) Coding standard: NEVER instrument functions with sensitive parameters. CI lint rule to flag `#[instrument]` on auth/credential functions. (2) Attribute scrub list in `FerrosaTelemetryLayer` — drop keys matching `password`, `token`, `secret`, `key`, `credential`. (3) TTL on spans table (7 days default). |
-| **Status** | **Gap** |
+| **Mitigation** | (1) Coding standard: NEVER instrument functions with sensitive parameters. CI lint rule to flag `#[instrument]` on auth/credential functions. (2) Attribute scrub list in `FerrosaTelemetryLayer` — drop keys matching `password`, `token`, `secret`, `key`, `credential`. (3) TTL on spans table (7 days default). Belt-and-suspenders: implement all three layers of defense. |
+| **Status** | **APPROVED** — all mitigations |
 
 ### 8. Internode Trace Context
 
@@ -189,8 +189,8 @@
 | **Likelihood** | 2 |
 | **Impact** | 2 |
 | **Risk** | **4** |
-| **Mitigation** | (1) Trace context is informational, not authorization — no security decisions based on trace_id. (2) Validate trace_id format (UUID v4 structure). (3) Rate-limit: if a peer sends >10k unique trace_ids/sec, flag as anomalous. (4) mTLS already authenticates the peer — spoofing requires a compromised node. |
-| **Status** | **Acceptable** — mTLS provides peer authentication; trace context is advisory |
+| **Mitigation** | (1) Trace context is informational, not authorization — no security decisions based on trace_id. (2) Validate trace_id format (UUID v4 structure). (3) Rate-limit: if a peer sends >10k unique trace_ids/sec, flag as anomalous. (4) mTLS already authenticates the peer — spoofing requires a compromised node. (5) Log WARNING when invalid/spoofed trace context is detected, identifying the potentially malicious node. (6) HIGH SECURITY MODE (`FERROSA_HIGH_SECURITY_MODE=true`): eject the suspicious node from the cluster entirely when spoofed trace context is detected. |
+| **Status** | **APPROVED** — with node ejection option |
 
 #### OBS-T14: Trace Context as Side Channel (Risk 3 — Low)
 
@@ -201,27 +201,27 @@
 | **Likelihood** | 1 |
 | **Impact** | 3 |
 | **Risk** | **3** |
-| **Mitigation** | (1) Validate flags field — only defined bits should be set; reject or zero unknown bits. (2) Log anomalous flag patterns. (3) Low priority — requires two compromised nodes, at which point many covert channels exist. |
-| **Status** | **Acceptable** |
+| **Mitigation** | (1) Validate flags field — only defined bits should be set; reject or zero unknown bits. (2) Log anomalous flag patterns with WARNING identifying the source node. (3) Rate-limit: flag nodes sending anomalous patterns above threshold. (4) HIGH SECURITY MODE (`FERROSA_HIGH_SECURITY_MODE=true`): eject the suspicious node from the cluster (same mechanism as OBS-T13). |
+| **Status** | **APPROVED** — with node ejection option |
 
 ## Risk Summary (sorted by risk score)
 
 | ID | Threat | STRIDE | L | I | Risk | Status |
 |----|--------|--------|---|---|------|--------|
-| OBS-T1 | Flamechart DoS | DoS | 3 | 4 | **12** | Partial |
-| OBS-T3 | Sensitive data in slow query text | Info Disclosure | 4 | 3 | **12** | Gap |
-| OBS-T6 | Billing counter tampering | Tampering | 2 | 5 | **10** | Gap |
-| OBS-T8 | Feedback loop amplification | DoS | 3 | 3 | **9** | Gap |
-| OBS-T2 | Flamechart info disclosure | Info Disclosure | 2 | 4 | **8** | Gap |
-| OBS-T9 | Telemetry backpressure stalls data path | DoS | 2 | 4 | **8** | Gap |
-| OBS-T10 | OTLP data exfiltration | Info Disclosure | 2 | 4 | **8** | Gap |
-| OBS-T12 | Sensitive data in span attributes | Info Disclosure | 2 | 4 | **8** | Gap |
-| OBS-T5 | Schema recon via fingerprints | Info Disclosure | 3 | 2 | **6** | Gap |
-| OBS-T7 | Billing data loss on restart | Repudiation | 3 | 2 | **6** | Gap |
-| OBS-T4 | Slow query threshold manipulation | Tampering | 2 | 2 | **4** | Gap |
-| OBS-T11 | OTLP covert channel | Info Disclosure | 1 | 4 | **4** | Gap |
-| OBS-T13 | Trace context spoofing | Spoofing | 2 | 2 | **4** | Acceptable |
-| OBS-T14 | Trace context side channel | Info Disclosure | 1 | 3 | **3** | Acceptable |
+| OBS-T1 | Flamechart DoS | DoS | 3 | 4 | **12** | APPROVED — implement all |
+| OBS-T3 | Sensitive data in slow query text | Info Disclosure | 4 | 3 | **12** | APPROVED |
+| OBS-T6 | Billing counter tampering | Tampering | 2 | 5 | **10** | APPROVED — add signing |
+| OBS-T8 | Feedback loop amplification | DoS | 3 | 3 | **9** | APPROVED — architectural fix |
+| OBS-T2 | Flamechart info disclosure | Info Disclosure | 2 | 4 | **8** | APPROVED |
+| OBS-T9 | Telemetry backpressure stalls data path | DoS | 2 | 4 | **8** | APPROVED |
+| OBS-T10 | OTLP data exfiltration | Info Disclosure | 2 | 4 | **8** | APPROVED — data-safe export only |
+| OBS-T12 | Sensitive data in span attributes | Info Disclosure | 2 | 4 | **8** | APPROVED — all mitigations |
+| OBS-T5 | Schema recon via fingerprints | Info Disclosure | 3 | 2 | **6** | APPROVED |
+| OBS-T7 | Billing data loss on restart | Repudiation | 3 | 2 | **6** | APPROVED |
+| OBS-T4 | Slow query threshold manipulation | Tampering | 2 | 2 | **4** | APPROVED — with addition |
+| OBS-T11 | OTLP covert channel | Info Disclosure | 1 | 4 | **4** | APPROVED |
+| OBS-T13 | Trace context spoofing | Spoofing | 2 | 2 | **4** | APPROVED — with node ejection option |
+| OBS-T14 | Trace context side channel | Info Disclosure | 1 | 3 | **3** | APPROVED — with node ejection option |
 
 ## Key Findings
 
