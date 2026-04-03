@@ -31,6 +31,7 @@ rustls-pemfile = "2"
 tokio-rustls = "0.26"
 tracing = "0.1"
 snap = "1"
+socket2 = "0.6"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

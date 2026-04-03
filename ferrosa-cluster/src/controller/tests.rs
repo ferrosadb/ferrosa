@@ -1006,7 +1006,11 @@ fn bootstrap_streaming_produces_mutations_for_remote_nodes() {
     let peer2_nid = uuid_to_node_id(peer2_id);
 
     let mut ring = TokenRing::new();
-    for (nid, uuid) in [(local_nid, local_id), (peer1_nid, peer1_id), (peer2_nid, peer2_id)] {
+    for (nid, uuid) in [
+        (local_nid, local_id),
+        (peer1_nid, peer1_id),
+        (peer2_nid, peer2_id),
+    ] {
         ring.add_node(
             nid,
             NodeInfo {
@@ -1044,7 +1048,9 @@ fn bootstrap_streaming_produces_mutations_for_remote_nodes() {
             continue;
         }
         let table_id = TableId::new(ks, tbl);
-        let partitions = storage.read_range(&table_id, None, None, usize::MAX).unwrap();
+        let partitions = storage
+            .read_range(&table_id, None, None, usize::MAX)
+            .unwrap();
 
         for partition in &partitions {
             let token = partition.key.token.0;
@@ -1148,5 +1154,8 @@ fn schema_snapshot_includes_user_tables_for_bootstrap() {
         1,
         "user table must appear in schema snapshot for bootstrap to find it"
     );
-    assert_eq!(user_tables[0], &("user_ks".to_string(), "my_table".to_string()));
+    assert_eq!(
+        user_tables[0],
+        &("user_ks".to_string(), "my_table".to_string())
+    );
 }
