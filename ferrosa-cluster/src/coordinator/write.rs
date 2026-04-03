@@ -67,13 +67,15 @@ impl ClusterCoordinator {
         let replicas = ring.replicas(key.token.0, rf);
         let required = cl.block_for(rf);
 
-        let _span = tracing::info_span!(
-            "cluster.write",
-            cl = %cl,
-            rf = rf,
-            replicas = replicas.len(),
-        )
-        .entered();
+        {
+            let span = tracing::info_span!(
+                "cluster.write",
+                cl = %cl,
+                rf = rf,
+                replicas = replicas.len(),
+            );
+            let _enter = span.enter();
+        }
 
         if replicas.len() < required {
             return Err(ClusterError::Unavailable {
@@ -223,13 +225,15 @@ impl ClusterCoordinator {
         let ring = self.ring.load();
         let replicas = ring.replicas_for_strategy(key.token.0, strategy);
 
-        let _span = tracing::info_span!(
-            "cluster.write",
-            cl = %cl,
-            rf = strategy.replication_factor(),
-            replicas = replicas.len(),
-        )
-        .entered();
+        {
+            let span = tracing::info_span!(
+                "cluster.write",
+                cl = %cl,
+                rf = strategy.replication_factor(),
+                replicas = replicas.len(),
+            );
+            let _enter = span.enter();
+        }
 
         let local_dc = ring
             .get_node(self.local_node_id)
