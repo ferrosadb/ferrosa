@@ -770,6 +770,157 @@ async fn cluster_invite_handler_replies_with_ack() {
     }
 }
 
+/// ClusterInvite triggers cluster transition on a pair-mode node.
+///
+/// Regression test for BUG-RAFT-HANDLER-RACE: node2/node3 stayed in pair
+/// mode forever because ClusterInviteHandler didn't trigger the transition.
+/// The fix (ba7599a) added controller.upgrade() → transition_to_cluster().
+#[tokio::test]
+async fn cluster_invite_triggers_transition_from_pair_mode() {
+    use ferrosa_net::rpc::RpcHandler;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config.clone(), local_id, controller.clone()));
+    controller.set_peer_manager(pm.clone());
+
+    // Put node into pair mode by connecting first peer.
+    controller.on_peer_connected((peer1_id, "10.0.0.2:7000".parse().unwrap()));
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+
+    // Now simulate receiving a ClusterInvite with 3 peers (including self).
+    // The handler should trigger transition_to_cluster.
+    let handler = cluster::ClusterInviteHandler::new(
+        local_id,
+        pm,
+        net_config,
+        Arc::downgrade(&controller),
+    );
+
+    let invite = ferrosa_net::message::Message::ClusterInvite {
+        initiator: peer1_id,
+        peers: vec![
+            (local_id, "10.0.0.1:7000".parse().unwrap()),
+            (peer1_id, "10.0.0.2:7000".parse().unwrap()),
+            (peer2_id, "10.0.0.3:7000".parse().unwrap()),
+        ],
+    };
+
+    let from = (peer1_id, "10.0.0.2:7000".parse::<std::net::SocketAddr>().unwrap());
+    let response = handler.handle(from, invite).await;
+    assert!(response.is_some(), "handler should reply with ack");
+
+    // The node should have transitioned out of Pair mode.
+    let mode = controller.mode();
+    assert!(
+        mode == DeploymentMode::Forming || mode == DeploymentMode::Cluster,
+        "ClusterInvite with 3 peers must trigger cluster transition from Pair, got {mode:?}"
+    );
+}
+
+/// After ClusterInvite triggers transition, Raft handlers are registered.
+///
+/// This verifies the fix for the "no handler registered msg_type=RaftVote"
+/// symptom. When a pair-mode node receives ClusterInvite and transitions
+/// to cluster mode, it must register Raft handlers (via LazyRaft) so
+/// incoming vote/append requests are handled instead of dropped.
+#[tokio::test]
+async fn cluster_invite_transition_registers_raft_handlers() {
+    use ferrosa_net::rpc::RpcHandler;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry.clone(),
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config.clone(), local_id, controller.clone()));
+    controller.set_peer_manager(pm.clone());
+
+    // Put into pair mode.
+    controller.on_peer_connected((peer1_id, "10.0.0.2:7000".parse().unwrap()));
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+
+    // No Raft handlers yet.
+    assert!(
+        !registry.has_handler(MsgType::RaftVote),
+        "Raft handlers should not be registered in pair mode"
+    );
+
+    // ClusterInvite triggers cluster transition.
+    let handler = cluster::ClusterInviteHandler::new(
+        local_id,
+        pm,
+        net_config,
+        Arc::downgrade(&controller),
+    );
+    let invite = ferrosa_net::message::Message::ClusterInvite {
+        initiator: peer1_id,
+        peers: vec![
+            (local_id, "10.0.0.1:7000".parse().unwrap()),
+            (peer1_id, "10.0.0.2:7000".parse().unwrap()),
+            (peer2_id, "10.0.0.3:7000".parse().unwrap()),
+        ],
+    };
+    handler
+        .handle((peer1_id, "10.0.0.2:7000".parse().unwrap()), invite)
+        .await;
+
+    // Give the background Raft init task time to register handlers.
+    // LazyRaft registers handlers synchronously before the async task,
+    // so they should appear quickly.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    assert!(
+        registry.has_handler(MsgType::RaftVote),
+        "RaftVote handler must be registered after ClusterInvite triggers cluster transition"
+    );
+    assert!(
+        registry.has_handler(MsgType::RaftAppendEntries),
+        "RaftAppendEntries handler must be registered"
+    );
+    assert!(
+        registry.has_handler(MsgType::RaftInstallSnapshot),
+        "RaftInstallSnapshot handler must be registered"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Progressive join: standalone → pair → cluster
 // -----------------------------------------------------------------------
