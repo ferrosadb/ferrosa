@@ -185,30 +185,50 @@ CREATE TABLE system_observability.slow_queries (
 | `net.handshake` | `handshake.rs` | `peer`, `protocol_version` | Connection establishment time |
 | `net.pool` | `pool.rs` | `peer`, `lane`, `active_rpcs` | Connection pool utilization |
 
-### Layer 5: Metrics (counters + histograms via atomics)
+### Layer 5: Native Metrics (virtual tables + web UI)
 
-Extend the existing Prometheus metrics with:
+All metrics are exposed as **CQL virtual tables** in `system_observability` and rendered
+natively in the **ferrosa web console** (port 9090). No Prometheus server needed.
+Enterprise customers who want Prometheus/OTLP get it via the optional `otel` feature flag export.
 
-| Metric | Type | Labels | Why |
-|--------|------|--------|-----|
-| `ferrosa_cql_requests_total` | counter | `opcode`, `keyspace`, `status` | Request rate by type |
-| `ferrosa_cql_request_duration_seconds` | histogram | `opcode`, `keyspace` | Latency distribution (p50/p95/p99) |
-| `ferrosa_cql_slow_queries_total` | counter | `keyspace` | Slow query count |
-| `ferrosa_cql_connections_active` | gauge | — | Current CQL connection count |
-| `ferrosa_cluster_write_duration_seconds` | histogram | `cl`, `status` | Coordinator write latency |
-| `ferrosa_cluster_read_duration_seconds` | histogram | `cl`, `status` | Coordinator read latency |
-| `ferrosa_storage_flush_duration_seconds` | histogram | `table` | Flush latency distribution |
-| `ferrosa_storage_compaction_duration_seconds` | histogram | `strategy` | Compaction latency |
-| `ferrosa_storage_s3_upload_duration_seconds` | histogram | — | S3 upload latency |
-| `ferrosa_storage_memtable_bytes` | gauge | `table` | Current memtable size |
-| `ferrosa_storage_sstable_count` | gauge | `table` | SSTable count per table |
-| `ferrosa_net_rpc_duration_seconds` | histogram | `msg_type`, `peer` | RPC latency per message type |
-| `ferrosa_net_rpc_inflight` | gauge | `peer` | In-flight RPCs per peer |
-| `ferrosa_net_bytes_sent_total` | counter | `peer`, `lane` | Network egress |
-| `ferrosa_net_bytes_received_total` | counter | `peer`, `lane` | Network ingress |
-| `ferrosa_commitlog_sync_duration_seconds` | histogram | `strategy` | fsync latency |
-| `ferrosa_raft_proposal_duration_seconds` | histogram | `op_type` | Raft proposal latency |
-| `ferrosa_mode_transitions_total` | counter | `from`, `to` | Mode transition count |
+**Virtual tables (queryable via CQL, auto-refreshed in web UI):**
+
+| Virtual Table | Key Columns | Why |
+|---------------|-------------|-----|
+| `system_observability.cql_stats` | `opcode`, `keyspace`, `requests`, `errors`, `p50_us`, `p95_us`, `p99_us` | CQL request rate + latency by operation type |
+| `system_observability.slow_queries` | `timestamp`, `duration_us`, `keyspace`, `query_text`, `trace_id` | Slow query log with trace link |
+| `system_observability.cluster_stats` | `operation` (write/read), `cl`, `requests`, `errors`, `p50_us`, `p99_us` | Coordinator write/read latency by CL |
+| `system_observability.storage_stats` | `table`, `memtable_bytes`, `sstable_count`, `flush_count`, `compaction_count` | Per-table storage health (extends existing) |
+| `system_observability.compaction_history` | `table`, `started_at`, `duration_ms`, `input_bytes`, `output_bytes`, `strategy` | Compaction event log |
+| `system_observability.s3_uploads` | `component`, `bytes`, `duration_ms`, `retry_count`, `status` | S3 upload latency + failures |
+| `system_observability.commitlog_stats` | `sync_strategy`, `segments_active`, `segments_pending_upload`, `sync_p99_us` | Commit log health + fsync timing |
+| `system_observability.net_stats` | `peer`, `lane`, `bytes_sent`, `bytes_received`, `rpcs_inflight`, `rpc_p99_us` | Per-peer network health |
+| `system_observability.raft_stats` | `proposals`, `leader_elections`, `snapshot_count`, `proposal_p99_us` | Raft consensus health |
+| `system_observability.index_stats` | `keyspace`, `table`, `index_name`, `type`, `lookups`, `full_scans`, `build_duration_ms`, `state` | Index usage — are indexes being used? |
+| `system_observability.graph_stats` | `endpoint` (http/bolt), `queries`, `errors`, `p50_us`, `p99_us`, `avg_depth` | Graph query performance |
+| `system_observability.mode_transitions` | `timestamp`, `from_mode`, `to_mode`, `reason` | Cluster mode change audit log |
+| `system_observability.contention` | `resource`, `lock_waits`, `avg_hold_us`, `max_hold_us` | Lock contention hot spots |
+| `system_observability.backpressure` | `queue_name`, `depth`, `drain_rate`, `max_depth` | Internal queue health (S3 upload, hints, commit log archive) |
+
+**Web UI panels (ferrosa web console, port 9090):**
+
+| Panel | Data Source | Visualization |
+|-------|------------|---------------|
+| **CQL Throughput** | `cql_stats` | Requests/sec by opcode, live chart |
+| **CQL Latency** | `cql_stats` | p50/p95/p99 by keyspace, live chart |
+| **Slow Queries** | `slow_queries` | Table with duration, query text, trace link |
+| **Cluster Health** | `cluster_stats` + `mode_transitions` | Write/read latency, mode history |
+| **Storage** | `storage_stats` + `compaction_history` | Memtable size, SSTable count, compaction timeline |
+| **S3 Pipeline** | `s3_uploads` + `backpressure` | Upload latency, queue depth gauge |
+| **Network** | `net_stats` | Per-peer bandwidth, RPC latency, in-flight gauge |
+| **Indexes** | `index_stats` | Lookups vs full scans ratio, build times, staleness |
+| **Graph** | `graph_stats` | Query rate, latency, traversal depth histogram |
+| **Contention** | `contention` | Lock hot spots, hold times |
+| **Traces** | `spans` | Recent traces, drill-down by trace_id (links to ferrosa-dbaas) |
+
+**Enterprise OTLP export (optional):** When `FERROSA_OTEL_ENDPOINT` is set, all virtual table
+data is also exported as Prometheus-compatible metrics via the existing `/metrics` endpoint and
+spans are exported via OTLP gRPC. This is additive — the native web UI always works.
 
 ### Layer 6: Contention-Specific Instrumentation
 
@@ -272,21 +292,34 @@ The internode propagation requires a wire format change:
 | O3.4 | Network bandwidth metrics | S | `ferrosa_net_bytes_sent_total`, `ferrosa_net_bytes_received_total` by peer + lane |
 | O3.5 | In-flight RPC gauge | S | `ferrosa_net_rpc_inflight` per peer |
 
-### O4: ferrosa-dbaas Integration
+### O4: Native Web UI Panels
 
 | # | Task | Size | Description |
 |---|------|------|-------------|
-| O4.1 | CQL query API for telemetry | S | Document the `system_observability.*` schema so `ferrosa-dbaas` can query spans, metrics, slow queries via standard CQL |
-| O4.2 | Trace reconstruction query | M | Helper CQL queries to reconstruct a full distributed trace from `spans` table (SELECT by trace_id, ORDER BY start_us) |
-| O4.3 | Metrics rollup | M | Background task that aggregates fine-grained metrics into hourly/daily rollups, TTL old data (default 7 days raw, 90 days rolled up) |
-| O4.4 | Alert virtual table | S | `system_observability.alerts` — threshold-based rules (slow query rate, S3 queue depth, hint backlog) written by background evaluator, queryable by dbaas |
-| O4.5 | Web console trace link | S | `ferrosa-ctl` and web console show trace_id for recent queries, clickable link to dbaas trace viewer |
+| O4.1 | Virtual table registry for all `system_observability.*` tables | M | Register 14 virtual tables with `VirtualTableRegistry`. Each backed by atomic counters + ring buffers, queryable via CQL. |
+| O4.2 | Web console: CQL dashboard panel | M | Throughput + latency charts (requests/sec, p50/p95/p99) in `web/index.html` auto-refreshing from `/api/observability/cql` |
+| O4.3 | Web console: Storage + S3 panel | M | Memtable bytes, SSTable counts, compaction timeline, S3 queue depth from `/api/observability/storage` |
+| O4.4 | Web console: Network + Cluster panel | M | Per-peer bandwidth, RPC latency, mode transition history from `/api/observability/cluster` |
+| O4.5 | Web console: Index usage panel | S | Lookups vs full scans, build times, staleness heatmap from `/api/observability/indexes` |
+| O4.6 | Web console: Graph panel | S | Query rate, latency, depth histogram from `/api/observability/graph` |
+| O4.7 | Web console: Slow queries + traces panel | M | Slow query table with trace_id drill-down, recent traces list. Links to ferrosa-dbaas for full trace view. |
+| O4.8 | Web console: Contention + backpressure panel | S | Lock hot spots, queue depths, fsync timing from `/api/observability/contention` |
+| O4.9 | Metrics rollup background task | M | Aggregate fine-grained counters into hourly/daily buckets, TTL old data (7 days raw, 90 days rolled up) |
+| O4.10 | Alert evaluator | M | Background task evaluates threshold rules (slow query rate, S3 queue > 100, hint backlog growing). Writes to `system_observability.alerts`, shown in web UI banner. |
+
+### O5: Enterprise OTLP Export (optional, behind `otel` feature flag)
+
+| # | Task | Size | Description |
+|---|------|------|-------------|
+| O5.1 | Add `otel` feature flag to ferrosa crate | S | `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk` compiled only with `--features otel` |
+| O5.2 | OTLP span exporter layer | M | When `FERROSA_OTEL_ENDPOINT` set, add `tracing-opentelemetry` layer to subscriber. Runs alongside native layer. |
+| O5.3 | Prometheus `/metrics` from virtual tables | S | Render all `system_observability.*` virtual table data as Prometheus text exposition format at existing `/metrics` endpoint. Enterprise customers scrape this. |
 
 ---
 
 ## Design Principles
 
-1. **Self-hosted, zero external deps:** Telemetry writes to ferrosa itself. No Jaeger, no Tempo, no Prometheus server. The `ferrosa-dbaas` control plane provides the UI.
+1. **Native first, enterprise export optional:** All observability is built into the ferrosa web console and CQL virtual tables. No external tools required. Enterprise customers optionally export via OTLP/Prometheus.
 2. **Trigger-preserving causality:** Every span shows the critical path of the triggering request, not background work attributed to it.
 3. **Contention visibility first:** Prioritize instrumenting lock contention, queue depths, and backpressure over exhaustive function tracing.
 4. **Coherent sampling:** Head-based, decided at CQL request entry. All spans within a sampled request are captured.
