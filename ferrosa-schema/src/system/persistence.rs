@@ -581,7 +581,10 @@ mod tests {
         assert!(names.contains(&(&"system_auth".to_string(), &"role_permissions".to_string())));
         assert!(names.contains(&(&"system_observability".to_string(), &"spans".to_string())));
         assert!(names.contains(&(&"system_observability".to_string(), &"metrics".to_string())));
-        assert!(names.contains(&(&"system_observability".to_string(), &"slow_queries".to_string())));
+        assert!(names.contains(&(
+            &"system_observability".to_string(),
+            &"slow_queries".to_string()
+        )));
     }
 
     // -- Task 4: SystemTableMutation tests --

@@ -166,7 +166,11 @@ mod tests {
         assert_eq!(schema.clustering_columns[0].name, "start_us");
         assert_eq!(schema.clustering_columns[1].name, "span_id");
         assert_eq!(schema.regular_columns.len(), 6);
-        let col_names: Vec<&str> = schema.regular_columns.iter().map(|c| c.name.as_str()).collect();
+        let col_names: Vec<&str> = schema
+            .regular_columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
         assert!(col_names.contains(&"parent_id"));
         assert!(col_names.contains(&"node_id"));
         assert!(col_names.contains(&"name"));
