@@ -54,7 +54,7 @@ impl FerrosaTelemetryLayer {
     /// Read the configured sample rate from the environment.
     ///
     /// Returns the value of `FERROSA_TELEMETRY_SAMPLE_RATE` parsed as `f64`,
-    /// or `0.01` if the variable is absent or unparseable.
+    /// or `0.01` if the variable is absent or unparsable.
     pub fn sample_rate_from_env() -> f64 {
         std::env::var("FERROSA_TELEMETRY_SAMPLE_RATE")
             .ok()
