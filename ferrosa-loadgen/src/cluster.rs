@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use ferrosa_cql::client::CqlClient;
 use rand::SeedableRng;
 
+use crate::ground_truth::GroundTruth;
 use crate::profile::LoadProfile;
 use crate::resource_monitor::{self, LeakVerdict, ResourceMonitor, ResourceSnapshot};
 use crate::stats::{FinalizeContext, LoadStats, StatsCollector};
@@ -46,6 +47,7 @@ fn web_port(cql_addr: &SocketAddr) -> u16 {
 }
 
 /// Set up the test keyspace and table on the cluster.
+/// Truncates any existing data so back-to-back runs start clean.
 async fn setup_schema(client: &mut CqlClient, rf: usize) -> Result<(), String> {
     client
         .query(&format!(
@@ -71,6 +73,13 @@ async fn setup_schema(client: &mut CqlClient, rf: usize) -> Result<(), String> {
         )
         .await
         .map_err(|e| format!("CREATE TABLE failed: {e}"))?;
+
+    // Truncate stale data from previous runs so integrity checks
+    // only verify keys written in this session.
+    client
+        .query("TRUNCATE data")
+        .await
+        .map_err(|e| format!("TRUNCATE failed: {e}"))?;
 
     Ok(())
 }
@@ -183,6 +192,8 @@ async fn run_cluster_load_test_async(
     let stats = Arc::new(StatsCollector::new());
     let stop = Arc::new(AtomicBool::new(false));
     let bytes_written = Arc::new(AtomicU64::new(0));
+    let bytes_read = Arc::new(AtomicU64::new(0));
+    let ground_truth = Arc::new(GroundTruth::new());
     let mut resource_mon = ResourceMonitor::new(4);
     let mut abort_reason: Option<String> = None;
     let mut throughput_history: Vec<u64> = Vec::new();
@@ -209,6 +220,8 @@ async fn run_cluster_load_test_async(
         let sc = Arc::clone(&stats);
         let st = Arc::clone(&stop);
         let bw = Arc::clone(&bytes_written);
+        let br = Arc::clone(&bytes_read);
+        let gt = Arc::clone(&ground_truth);
 
         handles.push(tokio::spawn(async move {
             let mut client = match CqlClient::connect(node).await {
@@ -235,7 +248,16 @@ async fn run_cluster_load_test_async(
                     let cql = format!("SELECT val FROM data WHERE pk = '{key_str}' AND ck = 1");
                     let t0 = Instant::now();
                     match client.query(&cql).await {
-                        Ok(_) => sc.record_read(t0.elapsed()),
+                        Ok(result) => {
+                            sc.record_read(t0.elapsed());
+                            if let Some(Some(v)) = result
+                                .rows
+                                .first()
+                                .map(|r| r.columns.first().and_then(|c| c.as_ref()))
+                            {
+                                br.fetch_add(v.len() as u64, Ordering::Relaxed);
+                            }
+                        }
                         Err(_) => sc.record_read_error(),
                     }
                 } else {
@@ -253,6 +275,7 @@ async fn run_cluster_load_test_async(
                         Ok(_) => {
                             sc.record_write(t0.elapsed());
                             bw.fetch_add(val_len as u64, Ordering::Relaxed);
+                            gt.record_write(&key_str, &value, local_ts);
                         }
                         Err(e) => {
                             sc.record_write_error();
@@ -381,19 +404,25 @@ async fn run_cluster_load_test_async(
     // Final server metrics.
     let final_server = rt_poll_server(&http, &web_url).await;
 
+    // CQL-based integrity verification: sample keys from ground truth and
+    // read them back via CQL to verify values match.
+    let integrity = verify_via_cql(nodes, &ground_truth, 1000).await;
+
     let stats = Arc::try_unwrap(stats)
         .unwrap_or_else(|_| panic!("worker tasks still hold Arc<StatsCollector>"));
+    let br_final = bytes_read.load(Ordering::Relaxed);
     stats.finalize(FinalizeContext {
         profile_name: &format!("{} (cluster: {} nodes)", profile.name, nodes.len()),
         bytes_written: bw_final,
+        bytes_read: br_final,
         compaction_tasks: 0,
         s3_uploads: final_server.s3_object_count,
         s3_deletes: 0,
         bytes_reclaimed: final_server.s3_bytes,
         sstable_count_final: final_server.sstable_count,
-        missing_keys: 0,
-        data_mismatches: 0,
-        keys_verified: 0,
+        missing_keys: integrity.missing,
+        data_mismatches: integrity.mismatched,
+        keys_verified: integrity.checked,
         resource_summary,
         abort_reason,
     })
@@ -402,6 +431,120 @@ async fn run_cluster_load_test_async(
 /// Poll server metrics (used at end of test for final report).
 async fn rt_poll_server(http: &reqwest::Client, web_url: &str) -> ServerMetrics {
     poll_server_metrics(http, web_url).await
+}
+
+struct IntegrityResult {
+    checked: u64,
+    missing: u64,
+    mismatched: u64,
+}
+
+/// Verify data integrity by reading a sample of keys back via CQL and
+/// comparing against ground truth.  Runs after all writers have stopped,
+/// so there are no concurrent mutations — the snapshot is stable.
+async fn verify_via_cql(
+    nodes: &[SocketAddr],
+    ground_truth: &GroundTruth,
+    max_sample: usize,
+) -> IntegrityResult {
+    let snapshot = ground_truth.snapshot();
+    if snapshot.is_empty() {
+        return IntegrityResult {
+            checked: 0,
+            missing: 0,
+            mismatched: 0,
+        };
+    }
+
+    // Connect to the first node for verification reads.
+    let mut client = match CqlClient::connect(nodes[0]).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("integrity: connect failed: {e}");
+            return IntegrityResult {
+                checked: 0,
+                missing: 0,
+                mismatched: 0,
+            };
+        }
+    };
+    if let Err(e) = client.query("USE load_test").await {
+        eprintln!("integrity: USE failed: {e}");
+        return IntegrityResult {
+            checked: 0,
+            missing: 0,
+            mismatched: 0,
+        };
+    }
+
+    // Deterministic stride-based sampling.
+    let total = snapshot.len();
+    let step = if total <= max_sample {
+        1
+    } else {
+        total / max_sample
+    };
+    let mut checked = 0u64;
+    let mut missing = 0u64;
+    let mut mismatched = 0u64;
+
+    let keys: Vec<_> = snapshot.keys().collect();
+    for (i, key) in keys.iter().enumerate() {
+        if i % step != 0 {
+            continue;
+        }
+        if checked >= max_sample as u64 {
+            break;
+        }
+        checked += 1;
+
+        let (expected_val, _ts, is_deleted) = &snapshot[*key];
+        let cql = format!("SELECT val FROM data WHERE pk = '{key}' AND ck = 1");
+        match client.query(&cql).await {
+            Ok(result) => {
+                if *is_deleted {
+                    // Deleted key — either no rows or a row is acceptable.
+                    continue;
+                }
+                if result.rows.is_empty() {
+                    missing += 1;
+                    if missing <= 5 {
+                        eprintln!("integrity: missing key '{key}'");
+                    }
+                } else if let Some(got) = result.rows[0].columns.first().and_then(|c| c.as_deref())
+                {
+                    if got != expected_val.as_slice() {
+                        mismatched += 1;
+                        if mismatched <= 5 {
+                            eprintln!(
+                                "integrity: mismatch key '{key}': expected {} bytes, got {} bytes",
+                                expected_val.len(),
+                                got.len()
+                            );
+                        }
+                    }
+                } else {
+                    mismatched += 1;
+                    if mismatched <= 5 {
+                        eprintln!("integrity: key '{key}' returned NULL value");
+                    }
+                }
+            }
+            Err(e) => {
+                mismatched += 1;
+                if mismatched <= 5 {
+                    eprintln!("integrity: read error for '{key}': {e}");
+                }
+            }
+        }
+    }
+
+    eprintln!("Integrity: {checked} keys verified, {missing} missing, {mismatched} mismatches");
+    IntegrityResult {
+        checked,
+        missing,
+        mismatched,
+    }
 }
 
 #[cfg(test)]

@@ -779,8 +779,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tokio::select! {
                 _ = flush_interval.tick() => {
-                    if let Err(e) = maintenance_engine.flush_if_needed() {
-                        tracing::warn!(%e, "periodic flush failed");
+                    // Run flush on a blocking thread so synchronous disk I/O
+                    // (6 file writes + renames per SSTable) doesn't starve the
+                    // async runtime.  spawn_blocking is cancel-safe: the closure
+                    // runs to completion even if the JoinHandle is dropped.
+                    let engine = maintenance_engine.clone();
+                    match tokio::task::spawn_blocking(move || engine.flush_if_needed()).await {
+                        Ok(Err(e)) => tracing::warn!(%e, "periodic flush failed"),
+                        Err(e) => tracing::error!(%e, "flush task panicked"),
+                        _ => {}
                     }
 
                     // After flush, sync new SSTables to S3.
@@ -814,10 +821,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let snap = maintenance_schema.snapshot();
                     if snap.version != last_schema_version {
                         // Flush all memtables before persisting schema so SSTables
-                        // on disk match the schema snapshot.
-                        if let Err(e) = maintenance_engine.flush_all() {
-                            tracing::warn!(%e, "pre-schema-persist flush failed, skipping schema persist");
-                            continue; // Don't persist schema without data — retry next tick
+                        // on disk match the schema snapshot.  spawn_blocking is
+                        // cancel-safe: the flush runs to completion even on drop.
+                        let engine = maintenance_engine.clone();
+                        let flush_result =
+                            tokio::task::spawn_blocking(move || engine.flush_all()).await;
+                        match flush_result {
+                            Ok(Err(e)) => {
+                                tracing::warn!(%e, "pre-schema-persist flush failed, skipping schema persist");
+                                continue; // Don't persist schema without data — retry next tick
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, "pre-schema-persist flush task panicked");
+                                continue;
+                            }
+                            _ => {}
                         }
 
                         // Always persist schema locally for restart recovery.
