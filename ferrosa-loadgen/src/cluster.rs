@@ -500,7 +500,7 @@ async fn verify_via_cql(
 
         let (expected_val, _ts, is_deleted) = &snapshot[*key];
         let cql = format!("SELECT val FROM data WHERE pk = '{key}' AND ck = 1");
-        match client.query(&cql).await {
+        match client.query_quorum(&cql).await {
             Ok(result) => {
                 if *is_deleted {
                     // Deleted key — either no rows or a row is acceptable.
