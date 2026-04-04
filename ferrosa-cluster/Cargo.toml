@@ -23,6 +23,7 @@ sled = "0.34"
 tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "io-util"] }
 tokio-util = "0.7"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

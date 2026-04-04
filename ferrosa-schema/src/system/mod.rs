@@ -8,6 +8,7 @@ pub mod auth_tables;
 pub mod function_tables;
 pub mod index_tables;
 pub mod local;
+pub mod observability;
 pub mod peers;
 pub mod persistence;
 pub mod schema_tables;

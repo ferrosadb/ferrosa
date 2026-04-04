@@ -10,6 +10,7 @@ repository.workspace = true
 arc-swap = "1.7"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+dashmap = "6"
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-index = { path = "../ferrosa-index" }

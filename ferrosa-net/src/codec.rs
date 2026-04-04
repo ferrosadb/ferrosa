@@ -4,8 +4,18 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::error::{NetError, Result};
 
 /// Header size in bytes: version(1) + flags(1) + lane(1) + msg_type(1)
-/// + stream_id(4) + length(4) = 12.
-pub const HEADER_SIZE: usize = 12;
+/// + stream_id(4) + length(4) + trace_context(32) = 44.
+///
+/// The trace context is a fixed 32-byte field:
+/// - bytes 0..16:  trace_id (128-bit)
+/// - bytes 16..24: span_id  (64-bit)
+/// - bytes 24..32: flags    (64-bit)
+///
+/// All-zero means no active trace.
+pub const HEADER_SIZE: usize = 44;
+
+/// Size of the trace context field in the frame header.
+pub const TRACE_CONTEXT_SIZE: usize = 32;
 
 /// Flag bits.
 pub const FLAG_COMPRESSED: u8 = 0x01;
@@ -175,7 +185,64 @@ impl TryFrom<u8> for MsgType {
     }
 }
 
-/// 12-byte wire frame header.
+/// 32-byte trace context embedded in every internode frame header.
+///
+/// Layout: `trace_id(16) + span_id(8) + flags(8)`.
+/// All zeros means no active trace context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceContext {
+    /// 128-bit trace identifier.
+    pub trace_id: [u8; 16],
+    /// 64-bit span identifier.
+    pub span_id: [u8; 8],
+    /// 64-bit flags (e.g. sampled bit).
+    pub flags: [u8; 8],
+}
+
+impl TraceContext {
+    /// An empty trace context (no active trace).
+    pub const EMPTY: Self = Self {
+        trace_id: [0; 16],
+        span_id: [0; 8],
+        flags: [0; 8],
+    };
+
+    /// Returns true if this context carries no trace information.
+    pub fn is_empty(&self) -> bool {
+        self.trace_id == [0; 16] && self.span_id == [0; 8] && self.flags == [0; 8]
+    }
+
+    /// Encode the trace context into 32 bytes.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_slice(&self.trace_id);
+        buf.put_slice(&self.span_id);
+        buf.put_slice(&self.flags);
+    }
+
+    /// Decode 32 bytes into a trace context.
+    pub fn decode(buf: &[u8]) -> Self {
+        assert!(buf.len() >= TRACE_CONTEXT_SIZE, "trace context too short");
+        let mut trace_id = [0u8; 16];
+        trace_id.copy_from_slice(&buf[0..16]);
+        let mut span_id = [0u8; 8];
+        span_id.copy_from_slice(&buf[16..24]);
+        let mut flags = [0u8; 8];
+        flags.copy_from_slice(&buf[24..32]);
+        Self {
+            trace_id,
+            span_id,
+            flags,
+        }
+    }
+}
+
+impl Default for TraceContext {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+/// 44-byte wire frame header (12 legacy + 32 trace context).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameHeader {
     pub version: u8,
@@ -184,10 +251,12 @@ pub struct FrameHeader {
     pub msg_type: MsgType,
     pub stream_id: u32,
     pub length: u32,
+    /// Distributed trace context propagated across internode RPCs.
+    pub trace_context: TraceContext,
 }
 
 impl FrameHeader {
-    /// Create a new frame header with version=1 and flags=0.
+    /// Create a new frame header with version=1, flags=0, and empty trace context.
     pub fn new(msg_type: MsgType, lane: Lane, stream_id: u32, length: u32) -> Self {
         Self {
             version: 1,
@@ -196,6 +265,26 @@ impl FrameHeader {
             msg_type,
             stream_id,
             length,
+            trace_context: TraceContext::EMPTY,
+        }
+    }
+
+    /// Create a new frame header with the given trace context.
+    pub fn with_trace(
+        msg_type: MsgType,
+        lane: Lane,
+        stream_id: u32,
+        length: u32,
+        trace_context: TraceContext,
+    ) -> Self {
+        Self {
+            version: 1,
+            flags: 0,
+            lane,
+            msg_type,
+            stream_id,
+            length,
+            trace_context,
         }
     }
 
@@ -206,6 +295,7 @@ impl FrameHeader {
         buf.put_u8(self.msg_type as u8);
         buf.put_u32(self.stream_id);
         buf.put_u32(self.length);
+        self.trace_context.encode(buf);
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
@@ -218,6 +308,7 @@ impl FrameHeader {
                 "unsupported internode protocol version: {version}"
             )));
         }
+        let trace_context = TraceContext::decode(&buf[12..44]);
         Ok(Self {
             version,
             flags: buf[1],
@@ -225,6 +316,7 @@ impl FrameHeader {
             msg_type: MsgType::try_from(buf[3])?,
             stream_id: u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
             length: u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            trace_context,
         })
     }
 }
@@ -316,6 +408,7 @@ mod tests {
             msg_type: MsgType::Ping,
             stream_id: 42,
             length: 1024,
+            trace_context: TraceContext::EMPTY,
         };
         let mut buf = BytesMut::with_capacity(HEADER_SIZE);
         header.encode(&mut buf);
@@ -327,6 +420,7 @@ mod tests {
         assert_eq!(decoded.msg_type, MsgType::Ping);
         assert_eq!(decoded.stream_id, 42);
         assert_eq!(decoded.length, 1024);
+        assert!(decoded.trace_context.is_empty());
     }
 
     #[test]
@@ -340,6 +434,7 @@ mod tests {
             msg_type: MsgType::Ping,
             stream_id: 1,
             length: 4,
+            trace_context: TraceContext::EMPTY,
         };
         header.encode(&mut buf);
         buf.put_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -367,6 +462,7 @@ mod tests {
             msg_type: MsgType::Ping,
             stream_id: 0,
             length: 100,
+            trace_context: TraceContext::EMPTY,
         };
         header.encode(&mut buf);
         buf.put_slice(&[0u8; 50]); // only 50 of 100 bytes
@@ -384,6 +480,7 @@ mod tests {
             msg_type: MsgType::Ping,
             stream_id: 0,
             length: 2048,
+            trace_context: TraceContext::EMPTY,
         };
         header.encode(&mut buf);
         let err = codec.decode(&mut buf).unwrap_err();
@@ -422,6 +519,7 @@ mod tests {
                 msg_type: MsgType::StreamChunk,
                 stream_id: 99,
                 length: 0, // set by encoder
+                trace_context: TraceContext::EMPTY,
             },
             body: bytes::Bytes::from_static(b"hello world"),
         };
@@ -433,5 +531,43 @@ mod tests {
         assert_eq!(decoded.header.msg_type, MsgType::StreamChunk);
         assert_eq!(decoded.header.stream_id, 99);
         assert_eq!(decoded.body, bytes::Bytes::from_static(b"hello world"));
+    }
+
+    #[test]
+    fn trace_context_roundtrip() {
+        let ctx = TraceContext {
+            trace_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            span_id: [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44],
+            flags: [0x01, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let mut buf = BytesMut::new();
+        ctx.encode(&mut buf);
+        assert_eq!(buf.len(), TRACE_CONTEXT_SIZE);
+        let decoded = TraceContext::decode(&buf);
+        assert_eq!(decoded, ctx);
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn trace_context_empty_is_all_zeros() {
+        let ctx = TraceContext::EMPTY;
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn trace_context_propagated_across_rpc() {
+        let trace_ctx = TraceContext {
+            trace_id: [1; 16],
+            span_id: [2; 8],
+            flags: [0x01, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let header = FrameHeader::with_trace(MsgType::MutationForward, Lane::Data, 7, 0, trace_ctx);
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        let decoded = FrameHeader::decode(&buf).unwrap();
+        assert_eq!(decoded.trace_context.trace_id, [1; 16]);
+        assert_eq!(decoded.trace_context.span_id, [2; 8]);
+        assert_eq!(decoded.trace_context.flags[0], 0x01);
+        assert!(!decoded.trace_context.is_empty());
     }
 }

@@ -35,6 +35,7 @@ use ferrosa_udf::UdfExecutor;
 use crate::ast::*;
 use crate::bridge;
 use crate::error::CqlError;
+use crate::observability::{CqlMetrics, CqlOpcode};
 use crate::planner::{self, ScanPlan};
 use crate::prepared::PreparedCache;
 use crate::result;
@@ -152,6 +153,8 @@ pub struct SharedState {
     pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
     /// Mode controller for checking CQL readiness (pair mode gating).
     pub mode_controller: Arc<ferrosa_cluster::ModeController>,
+    /// CQL request metrics (per-opcode counters and error counter).
+    pub cql_metrics: Arc<CqlMetrics>,
 }
 
 /// Per-request context: authentication, current keyspace, and consistency level.
@@ -204,7 +207,36 @@ pub async fn route(
         &ctx.auth.role,
     );
 
-    match stmt {
+    // Classify the statement opcode for metrics before matching.
+    let opcode = match &stmt {
+        Statement::Select(_) => CqlOpcode::Select,
+        Statement::Insert(_) => CqlOpcode::Insert,
+        Statement::Update(_) => CqlOpcode::Update,
+        Statement::Delete(_) => CqlOpcode::Delete,
+        Statement::Batch(_) => CqlOpcode::Batch,
+        Statement::CreateKeyspace(_)
+        | Statement::AlterKeyspace(_)
+        | Statement::DropKeyspace(_)
+        | Statement::CreateTable(_)
+        | Statement::AlterTable(_)
+        | Statement::DropTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_)
+        | Statement::CreateRole(_)
+        | Statement::AlterRole(_)
+        | Statement::DropRole(_)
+        | Statement::CreateType { .. }
+        | Statement::AlterType { .. }
+        | Statement::DropType { .. }
+        | Statement::CreateFunction { .. }
+        | Statement::DropFunction { .. }
+        | Statement::CreateAggregate { .. }
+        | Statement::DropAggregate { .. }
+        | Statement::Truncate(_) => CqlOpcode::Ddl,
+        _ => CqlOpcode::Other,
+    };
+
+    let result = match stmt {
         Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
         Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
         Statement::Update(u) => route_update(state, ctx, u).await.map(RouteResult::Result),
@@ -376,7 +408,15 @@ pub async fn route(
         Statement::BeginTransaction | Statement::Commit | Statement::Rollback => {
             Ok(RouteResult::Result(crate::result::encode_void()))
         }
+    };
+
+    // Track CQL metrics: increment per-opcode counter, and error counter on failure.
+    state.cql_metrics.inc_request(opcode);
+    if result.is_err() {
+        state.cql_metrics.inc_error();
     }
+
+    result
 }
 
 // ── SELECT ───────────────────────────────────────────────────────────────
@@ -6180,6 +6220,7 @@ mod tests {
             udf_executor,
             event_sender: tokio::sync::broadcast::channel(64).0,
             mode_controller,
+            cql_metrics: Arc::new(CqlMetrics::new()),
         };
         (state, dir)
     }

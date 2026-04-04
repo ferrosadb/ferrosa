@@ -38,6 +38,9 @@ pub struct ShardedBTreeMemtable {
     size: AtomicUsize,
     /// Number of distinct partitions stored.
     count: AtomicUsize,
+    /// Number of times a shard write lock experienced contention
+    /// (try_write failed, had to block). Zero contention is the ideal case.
+    pub write_contention_count: AtomicUsize,
 }
 
 impl ShardedBTreeMemtable {
@@ -52,6 +55,7 @@ impl ShardedBTreeMemtable {
             num_shards,
             size: AtomicUsize::new(0),
             count: AtomicUsize::new(0),
+            write_contention_count: AtomicUsize::new(0),
         }
     }
 
@@ -98,7 +102,14 @@ impl ShardedBTreeMemtable {
 impl Memtable for ShardedBTreeMemtable {
     fn put(&self, key: &DecoratedKey, row: Row, _schema: &TableSchema) -> Result<()> {
         let idx = self.shard_index(key);
-        let mut shard = self.shards[idx].write();
+        let mut shard = match self.shards[idx].try_write() {
+            Some(guard) => guard,
+            None => {
+                // Lock was contended — record and fall back to blocking.
+                self.write_contention_count.fetch_add(1, Ordering::Relaxed);
+                self.shards[idx].write()
+            }
+        };
 
         if let Some(existing) = shard.get_mut(key) {
             // Compute old size for delta
@@ -467,5 +478,26 @@ mod tests {
                 assert!(mem.get(&key).unwrap().is_some(), "missing t{t}_k{k}");
             }
         }
+    }
+
+    #[test]
+    fn write_contention_counter_starts_at_zero() {
+        let mem = ShardedBTreeMemtable::with_default_shards();
+        assert_eq!(
+            mem.write_contention_count.load(Ordering::Relaxed),
+            0,
+            "contention counter should start at zero"
+        );
+
+        // Write a single key — no contention expected.
+        let key = make_key("single");
+        let row = make_row(0, b"val", 1000);
+        mem.put(&key, row, &test_schema()).unwrap();
+        // Counter should still be zero (single-threaded, uncontended).
+        assert_eq!(
+            mem.write_contention_count.load(Ordering::Relaxed),
+            0,
+            "single-threaded write should not show contention"
+        );
     }
 }

@@ -258,11 +258,39 @@ async fn persist_schema_to_s3(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+
+    if std::env::var("FERROSA_TELEMETRY_ENABLED").as_deref() == Ok("true") {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let sample_rate = ferrosa_cluster::telemetry::FerrosaTelemetryLayer::sample_rate_from_env();
+
+        // Warn on suspicious sample rates in non-dev mode.
+        let is_dev = std::env::var("FERROSA_MODE").as_deref() == Ok("development");
+        if !is_dev && (sample_rate == 0.0 || sample_rate > 0.1) {
+            tracing::warn!(
+                sample_rate,
+                "telemetry sample rate is {}: consider 0.001..0.1 for production",
+                if sample_rate == 0.0 {
+                    "zero (no spans will be sampled)"
+                } else {
+                    "high (>10% of spans sampled)"
+                }
+            );
+        }
+
+        let telemetry_layer = ferrosa_cluster::telemetry::FerrosaTelemetryLayer::new(sample_rate);
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(telemetry_layer)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     tracing::info!("ferrosa starting");
 
@@ -567,6 +595,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         udf_executor,
         event_sender: tokio::sync::broadcast::channel(64).0,
         mode_controller: Arc::clone(&mode_controller),
+        cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
     });
     let auth_disabled = cql_config.auth_disabled;
 
@@ -606,6 +635,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ));
 
+    // T-18: Register Batch 5 observability virtual tables.
+    let alert_registry = Arc::new(ferrosa_cql::virtual_tables::AlertRegistry::new());
+    schema
+        .virtual_tables()
+        .register(Arc::new(ferrosa_cql::virtual_tables::AlertsTable::new(
+            alert_registry.clone(),
+        )));
+    let billing_meter = Arc::new(ferrosa_cql::virtual_tables::BillingMeter::new());
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::BillingMetersTable::new(billing_meter.clone()),
+    ));
+    let fingerprint_tracker = Arc::new(ferrosa_cql::virtual_tables::QueryFingerprintTracker::new());
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::QueryFingerprintsTable::new(fingerprint_tracker.clone()),
+    ));
+    let full_scan_tracker = Arc::new(ferrosa_cql::virtual_tables::FullScanTracker::new());
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::FullScanReasonsTable::new(full_scan_tracker.clone()),
+    ));
+    let table_access_tracker = Arc::new(ferrosa_cql::virtual_tables::TableAccessTracker::new());
+    schema.virtual_tables().register(Arc::new(
+        ferrosa_cql::virtual_tables::TableAccessSummaryTable::new(table_access_tracker.clone()),
+    ));
+
+    // T-27: Spawn the alert evaluator background task.
+    ferrosa_cql::virtual_tables::alerts::spawn_alert_evaluator(
+        alert_registry.clone(),
+        schema.virtual_tables_arc(),
+    );
+
+    // Register stub virtual tables for deferred observability features.
+    ferrosa_cql::virtual_tables::register_all_stubs(schema.virtual_tables());
+
     let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state);
     let cql_addr = cql_server.start_background().await?;
     tracing::info!(%cql_addr, "CQL server listening");
@@ -618,6 +680,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage: storage.clone(),
         host_id,
         auth_disabled,
+        debug: Some(web::debug::DebugState::new()),
     };
     let web_config = web::WebConfig::from_env();
     let web_addr = web::start_web_server(&web_config, web_state).await?;
@@ -1354,5 +1417,14 @@ mod tests {
             result, "SimpleStrategy",
             "string value in section must be extracted"
         );
+    }
+
+    #[test]
+    fn telemetry_layer_created_with_env_sample_rate() {
+        // Verify that FerrosaTelemetryLayer can be instantiated and configured
+        // from env-derived sample rate, matching the code path in main().
+        let layer = ferrosa_cluster::telemetry::FerrosaTelemetryLayer::new(0.05);
+        // After creation, no spans have been sampled.
+        assert_eq!(layer.sampled(), 0);
     }
 }

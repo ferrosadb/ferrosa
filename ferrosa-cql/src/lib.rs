@@ -25,6 +25,7 @@ pub mod error;
 pub mod event;
 pub mod frame;
 pub mod lexer;
+pub mod observability;
 pub mod paging;
 pub mod parser;
 pub mod planner;

@@ -110,6 +110,7 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         udf_executor,
         event_sender: tokio::sync::broadcast::channel(64).0,
         mode_controller,
+        cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
     });
     (state, dir)
 }
