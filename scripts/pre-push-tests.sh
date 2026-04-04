@@ -61,10 +61,12 @@ else
     CARGO_ARGS="$CARGO_ARGS -p $crate"
   done
 
+  # Skip binary_smoke tests — they spawn cargo run as a subprocess and
+  # take minutes.  Gated behind FERROSA_TEST_LOADGEN=1 for explicit use.
   echo ""
   if command -v cargo-llvm-cov &> /dev/null; then
     echo "=== Running cargo llvm-cov$CARGO_ARGS ==="
-    COV_OUTPUT=$(cargo llvm-cov --all-features $CARGO_ARGS --summary-only 2>&1)
+    COV_OUTPUT=$(cargo llvm-cov --all-features $CARGO_ARGS --summary-only -- --skip binary_ 2>&1)
     echo "$COV_OUTPUT"
     # Check 80% coverage threshold (matches CI)
     COVERAGE=$(echo "$COV_OUTPUT" | grep 'TOTAL' | awk '{print $10}' | tr -d '%')
@@ -79,7 +81,7 @@ else
   else
     echo "=== Running cargo test$CARGO_ARGS ==="
     echo "(install cargo-llvm-cov for coverage: cargo install cargo-llvm-cov)"
-    cargo test --all-features $CARGO_ARGS
+    cargo test --all-features $CARGO_ARGS -- --skip binary_
   fi
 fi
 
