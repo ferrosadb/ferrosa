@@ -14,7 +14,9 @@
 | **S1** | P0/P1 hazards + NTS read path | 1 week | `cargo test` green, NTS reads work on all replicas | **COMPLETE** |
 | **S2** | Correctness gaps (read fallback, hints, streaming) | 1 week | CL=ONE reads, hints stored on failure, full row streaming | **COMPLETE** |
 | **S3** | Formation robustness + repair | 1 week | Forming timeout tested, promotion epoch, anti-entropy | **COMPLETE** |
-| **S4** | Polish + Jepsen/driver compat | 1 week | C4 Jepsen runs, C8 driver compat, DSM coupling reduction | Active |
+| **S4** | Close all hazards + SSTable streaming | 1 week | All hazards closed, SSTable streaming, BootstrapComplete RPC | **COMPLETE** |
+| **O1-O6** | Observability (self-hosted telemetry) | 1 week | 25+ spans, slow queries, fingerprints, billing, flame charts, OTLP flag | **COMPLETE** |
+| **S5** | Jepsen + drivers (needs infrastructure) | TBD | C4 Jepsen runs, C8 all-drivers compat | Deferred |
 
 ---
 

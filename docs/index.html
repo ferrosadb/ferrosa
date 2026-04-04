@@ -1193,14 +1193,15 @@
       <div class="feature-icon observe">📊</div>
       <h3>Built-In Observability</h3>
       <p>
-        Query cluster state through <code>system_observability</code> virtual tables
-        — connections, storage stats, active queries, topology — all queryable via
-        standard CQL SELECT. Native Prometheus <code>/metrics</code> endpoint with no
-        exporter needed. Web console with REST API and WebSocket live updates.
-        <code>ferrosa-ctl</code> CLI with TUI dashboard for real-time monitoring.
-        SUBSCRIBE to any view for streaming updates.
+        Self-hosted distributed tracing, metrics, and query analysis — no external
+        tools required. 25+ tracing spans across CQL, consensus, storage, and network
+        paths. Slow query detection with parameterized logging. Query fingerprint
+        tracking for automatic optimization recommendations. Per-client billing
+        metering. On-demand flame charts for CPU hot path analysis. All data in
+        <code>system_observability</code> virtual tables, queryable via standard CQL.
+        Optional OTLP export for enterprise monitoring stacks.
       </p>
-      <span class="metric">system_observability virtual tables · /metrics · WebSocket · ferrosa-ctl TUI</span>
+      <span class="metric">25+ spans · slow query log · query fingerprints · billing metering · flame charts · OTLP export</span>
     </div>
 
     <!-- Production Cluster -->
@@ -1400,17 +1401,20 @@ user = session.execute(stmt, [user_id])
 <span class="cm"># Batch operations, async queries, retry policies —</span>
 <span class="cm"># everything your driver supports works unchanged.</span></pre>
 
-    <pre class="code-block" id="tab-observe"><span class="cm">-- Built-in observability via CQL virtual tables</span>
-<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.active_queries;
-<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.storage_stats;
-<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.connections;
+    <pre class="code-block" id="tab-observe"><span class="cm">-- Self-hosted observability via CQL virtual tables</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.cql_stats;
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.slow_queries;
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.query_fingerprints;
 
-<span class="cm">-- Stream live updates with SUBSCRIBE</span>
-<span class="kw">SUBSCRIBE</span> system_observability.connections
-  <span class="kw">EVERY</span> <span class="num">5</span>s;
+<span class="cm">-- Find queries causing full table scans</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.full_scan_reasons;
 
-<span class="cm">-- Or subscribe to your own data for CDC-style streaming</span>
-<span class="kw">SUBSCRIBE</span> social.users;
+<span class="cm">-- Per-client billing metering</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.client_usage;
+
+<span class="cm">-- Distributed traces (self-hosted, no Jaeger needed)</span>
+<span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> system_observability.spans
+  <span class="kw">WHERE</span> trace_id <span class="op">=</span> <span class="str">?</span>;
 
 <span class="cm">-- Prometheus metrics at /metrics, CLI: ferrosa-ctl monitor (TUI)</span>
 <span class="cm">-- WebSocket push: ws://host:9090/api/ws (subscribe/unsubscribe)</span></pre>

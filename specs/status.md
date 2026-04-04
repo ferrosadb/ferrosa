@@ -8,13 +8,16 @@
 Ferrosa is a **distributed CQL-compatible database** with graph query support,
 built-in observability, Accord consensus transactions, and S3-backed storage.
 
-**Completed milestones (2026-04-02):**
+**Completed milestones (2026-04-03):**
 
-- **P0 NTS fix** — `keyspace_rf()` returned RF=1 for NetworkTopologyStrategy keyspaces; writes went to coordinator only. Fixed: RF extraction via `ReplicationStrategy` parser, `WritePath` dispatches to `coordinate_write_nts()` for NTS, default datacenter changed to `datacenter1`.
-- **Cluster formation** — Progressive join (Standalone→Pair→Forming→Cluster), ClusterInvite protocol, LazyRaft handler registration, all-node bootstrap streaming, CQL broadcast propagation via PeerManager, system.peers tokens/native_address, connection slot leak fix with RAII guard.
+- **Observability (O1-O6)** — Self-hosted telemetry: FerrosaTelemetryLayer with direct StorageEngine writes (no feedback loop), 25+ tracing spans across CQL/coordinator/Accord/storage/network, slow query detection with parameterized text, query fingerprint tracker (top 10k), billing metering per client, alert evaluator, table access summary, full scan reasons, internode trace context propagation (32-byte header), on-demand flame chart endpoint, 13 virtual tables in `system_observability.*`, `otel` feature flag for enterprise export.
+- **S4 close all hazards** — DDL queued during Forming (not rejected), ClusterInviteHandler spawns tracked, transition guard on disconnect, RangeReadHandler truncation flag, capped unbounded collections, PairClusterState peer cache, SSTable-based streaming, BootstrapComplete RPC barrier.
+- **P0 NTS fix** — `keyspace_rf()` returned RF=1 for NTS; writes went to coordinator only. Fixed: RF extraction via `ReplicationStrategy` parser, `WritePath` dispatches to `coordinate_write_nts()`, default datacenter `datacenter1`.
+- **Jepsen readiness** — 4 linearizability fixes: stale read on re-fetch failure returns error, read repair awaited inline, hint store failures logged at error, clock skew configurable. Raft node_map reads through poison.
+- **Cluster formation** — Progressive join (Standalone→Pair→Forming→Cluster), ClusterInvite protocol, LazyRaft handler registration, all-node bootstrap streaming, CQL broadcast propagation, system.peers tokens/native_address, connection slot leak fix.
+- **Cluster correctness S1-S3** — 22 tasks: all P0/P1 hazards closed, NTS read path, hints for all failures, RowWire streaming, BroadcastResolver trait, tunable Raft config, quorum committed_cluster_size.
 - **Accord transactions** — 7 sprints (A1-A7) complete: PreAccept/Accept/Commit/Execute, LWT, BEGIN TRANSACTION, cross-shard conflict detection, crash recovery, electorate reconfiguration, 2,808+ tests
-- **Correctness sprints** — C1-C7 complete: BUG-021-026 fixed, P0 storage hazards closed, Jepsen infrastructure wired, SSTable Cassandra compat validated, Accord failure mode coverage, compaction S3 lifecycle complete. C4 (live Jepsen runs) and C8 (all-drivers compat) remain.
-- **Cluster correctness sprints S1-S3** — 22 tasks complete: P0/P1 hazards closed (IpConnectionTracker parking_lot, spawn_tracked, quorum calc committed_cluster_size, bootstrap read_range capped), NTS read path wired (WritePath::pk_read), hints stored for all failed replicas, full RowWire streaming, BroadcastResolver trait, tunable Raft config, LazyRaft 3x retry, configurable promotion delay, compute_partition_digest returns Result. S4 (Jepsen/driver compat) active.
+- **Correctness sprints** — C1-C7 complete: BUG-021-026 fixed, P0 storage hazards closed, Jepsen infrastructure wired, SSTable Cassandra compat validated. C4 (live Jepsen) and C8 (all-drivers compat) remain.
 - **NVMe table pinning** — Per-table `storage.pin = nvme` attribute: skip S3 upload, pin in local cache, max_bytes enforcement, ALTER TABLE pin/unpin transitions, Prometheus metrics
 - **Full-text indexing** — Inverted index pipeline: StandardAnalyzer (lowercase + stop words + Porter stemmer), FTI sidecar files built on flush, BM25 ranked search, AND/OR/NOT/Prefix queries, CQL `fts_match()` function, compaction merge
 - **Secondary + vector indexes** — BTree, Hash, Composite, Phonetic, Filtered, Vector (HNSW, IVFFlat), FullText — 11 index types with query planner integration
@@ -24,9 +27,9 @@ built-in observability, Accord consensus transactions, and S3-backed storage.
 | Metric | Value |
 |--------|-------|
 | Crates | 13 (12 core + ferrosa-jepsen) |
-| Source files | ~320+ |
-| Source LOC | ~140,000+ |
-| Test functions | ~3,212+ |
+| Source files | ~378 |
+| Source LOC | ~258,000+ |
+| Test functions | ~3,499+ |
 | Integration test files | 40+ |
 | CQL parser coverage | 81.8% (707/864 Cassandra doc examples) |
 | Index types | 11 (BTree, Hash, Composite, Phonetic, Filtered, Vector HNSW/IVFFlat, FullText) |

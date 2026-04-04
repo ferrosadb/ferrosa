@@ -33,6 +33,7 @@ impl PeerEventListener for ModeController {
 
         // Hold the transition guard across mode-check-and-transition to prevent
         // two simultaneous peer connections from both triggering transition_to_pair.
+        let guard_start = std::time::Instant::now();
         let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
         match current_mode {
@@ -84,6 +85,11 @@ impl PeerEventListener for ModeController {
                 }
             }
         }
+
+        // Record how long the transition guard was held.
+        drop(_guard);
+        self.contention_metrics
+            .record_guard_hold(guard_start.elapsed());
     }
 
     fn on_peer_disconnected(&self, peer: PeerId) {

@@ -482,6 +482,7 @@ mod tests {
             storage,
             host_id,
             auth_disabled: true,
+            debug: None,
         }
     }
 

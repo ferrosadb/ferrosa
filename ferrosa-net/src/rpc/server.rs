@@ -30,6 +30,8 @@ pub struct RpcServer {
     #[allow(dead_code)]
     bound_addr_rx: tokio::sync::watch::Receiver<Option<std::net::SocketAddr>>,
     inbound_callback: Option<Arc<dyn InboundPeerCallback>>,
+    /// Aggregate bandwidth counters across all inbound connections.
+    pub bandwidth: Arc<super::client::BandwidthMetrics>,
 }
 
 impl RpcServer {
@@ -48,6 +50,7 @@ impl RpcServer {
             bound_addr,
             bound_addr_rx,
             inbound_callback: None,
+            bandwidth: Arc::new(super::client::BandwidthMetrics::new()),
         }
     }
 
@@ -218,6 +221,11 @@ impl RpcServer {
             let frame = frame_result?;
             let msg_type = frame.header.msg_type;
             let stream_id = frame.header.stream_id;
+            // Track inbound bytes.
+            self.bandwidth.bytes_received.fetch_add(
+                frame.body.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let msg = Message::decode(msg_type, &mut frame.body.clone())?;
 
             if let Some(response) = self.registry.dispatch(peer_id, msg_type, msg).await {
@@ -225,6 +233,10 @@ impl RpcServer {
                 response.encode(&mut body)?;
                 let body_len = u32::try_from(body.len())
                     .map_err(|_| NetError::Protocol("response body exceeds u32::MAX".into()))?;
+                // Track outbound bytes.
+                self.bandwidth
+                    .bytes_sent
+                    .fetch_add(body_len as u64, std::sync::atomic::Ordering::Relaxed);
                 let resp_frame = Frame {
                     header: FrameHeader::new(
                         response.msg_type(),
@@ -516,5 +528,65 @@ mod tests {
 
         // After shutdown the active connection counter must be zero.
         assert_eq!(server.active_connections.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn bandwidth_metrics_track_bytes() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        let client =
+            crate::rpc::client::RpcClient::connect(Arc::new(config), uuid::Uuid::new_v4(), addr)
+                .await
+                .unwrap();
+
+        let _resp = client
+            .send(
+                Message::Ping {
+                    nonce: 7,
+                    sent_at: 0,
+                },
+                Lane::Raft,
+            )
+            .await
+            .unwrap();
+
+        // Client should have tracked bytes sent > 0.
+        let sent = client
+            .bandwidth
+            .bytes_sent
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(sent > 0, "client bytes_sent should be > 0, got {sent}");
+
+        // Client should have tracked bytes received > 0.
+        let received = client
+            .bandwidth
+            .bytes_received
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            received > 0,
+            "client bytes_received should be > 0, got {received}"
+        );
+
+        // Server-side bandwidth counters may need a small delay for the
+        // dispatch loop to process; check that the server has the counters
+        // available (non-zero after processing at least one request).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let server_recv = server
+            .bandwidth
+            .bytes_received
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            server_recv > 0,
+            "server bytes_received should be > 0, got {server_recv}"
+        );
     }
 }

@@ -519,6 +519,7 @@ mod tests {
             storage,
             host_id: uuid::Uuid::new_v4(),
             auth_disabled: true,
+            debug: None,
         }
     }
 

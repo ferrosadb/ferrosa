@@ -300,6 +300,8 @@ graph BT
   - `state.rs` — `RaftClusterState` with `BroadcastResolver` trait for decoupled CQL broadcast resolution (ring → PeerManager → internode fallback), `system.peers` native_address/tokens population
   - `config.rs` — `ClusterConfig` with `cql_broadcast: Option<String>` (`FERROSA_CQL_BROADCAST`), `formation_timeout_secs`, `auto_join`, `node_role`, tunable Raft timing (`FERROSA_RAFT_HEARTBEAT_MS`, `FERROSA_RAFT_ELECTION_MIN_MS`, `FERROSA_RAFT_ELECTION_MAX_MS`)
   - `error.rs`, `mode.rs`
+  - `telemetry/layer.rs` — `FerrosaTelemetryLayer` (`tracing::Layer` impl), head-based coherent sampling, bounded mpsc try_send, drop counter
+  - `telemetry/writer.rs` — `TelemetryWriter` background task, batched direct writes to `StorageEngine::write_observability()` (bypasses CQL), cancel-safe via `CancellationToken`
   - `accord/state_machine.rs` — `AccordStateMachine` (core consensus state machine, 39 tests)
   - `accord/coordinator.rs` — `AccordCoordinator` (fast path 3/4 quorum, slow path majority, quorum formulas)
   - `accord/conflict_index.rs` — `ConflictIndex` (key-range conflict detection for concurrent transactions)

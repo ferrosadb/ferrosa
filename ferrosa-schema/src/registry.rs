@@ -174,6 +174,27 @@ impl Schema {
         };
         snapshot.roles.insert("cassandra".to_string(), role);
 
+        // Bootstrap system keyspaces so they are visible in the schema snapshot.
+        use crate::metadata::keyspace::ReplicationParams;
+        for ks_name in &[
+            "system",
+            "system_schema",
+            "system_auth",
+            "system_observability",
+        ] {
+            snapshot.keyspaces.insert(
+                ks_name.to_string(),
+                KeyspaceMetadata {
+                    name: ks_name.to_string(),
+                    durable_writes: true,
+                    replication: ReplicationParams {
+                        strategy: "LocalStrategy".to_string(),
+                        options: HashMap::new(),
+                    },
+                },
+            );
+        }
+
         let mut default_password_roles = HashSet::new();
         if is_default {
             default_password_roles.insert("cassandra".to_string());
@@ -3445,5 +3466,42 @@ mod tests {
             serde_json::from_str(&json).expect("Deserialized SchemaSnapshot must round-trip");
         let key = ("mykeyspace".to_string(), "my_avg".to_string(), arg_types);
         assert!(back.aggregates.contains_key(&key));
+    }
+
+    // ---- system_observability tests (T-01) ----
+
+    #[test]
+    fn system_observability_keyspace_exists_after_init() {
+        let schema = Schema::new_for_test();
+        let snap = schema.snapshot();
+        assert!(
+            snap.keyspaces.contains_key("system_observability"),
+            "system_observability keyspace must exist after Schema::new()"
+        );
+        let ks = &snap.keyspaces["system_observability"];
+        assert_eq!(ks.replication.strategy, "LocalStrategy");
+    }
+
+    #[test]
+    fn observability_tables_registered() {
+        use crate::system::persistence::all_system_table_schemas;
+        let schemas = all_system_table_schemas();
+        let obs_tables: Vec<_> = schemas
+            .iter()
+            .filter(|s| s.keyspace == "system_observability")
+            .collect();
+        assert_eq!(
+            obs_tables.len(),
+            3,
+            "expected 3 observability tables, found {}",
+            obs_tables.len()
+        );
+        let table_names: Vec<&str> = obs_tables.iter().map(|s| s.table.as_str()).collect();
+        assert!(table_names.contains(&"spans"), "missing spans table");
+        assert!(table_names.contains(&"metrics"), "missing metrics table");
+        assert!(
+            table_names.contains(&"slow_queries"),
+            "missing slow_queries table"
+        );
     }
 }

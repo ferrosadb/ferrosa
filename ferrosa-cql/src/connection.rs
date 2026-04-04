@@ -18,7 +18,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-use tracing::{debug, warn};
+use tracing::{debug, warn, Instrument};
 
 use crate::ast::{Assignment, SelectColumn, Statement, Term};
 use crate::auth::{
@@ -195,16 +195,26 @@ pub async fn handle_connection<S>(
                 let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);
                 let was_ready = matches!(phase, ConnectionPhase::Ready);
 
-                match handle_frame(
-                    &mut phase,
-                    &mut auth_context,
-                    &mut current_keyspace,
-                    &state,
-                    auth_disabled,
-                    &maybe_frame,
-                    &mut pending_compression,
-                    peer,
-                )
+                let request_span = tracing::info_span!(
+                    "cql.request",
+                    cql.opcode = ?maybe_frame.header.opcode,
+                    client.address = %peer,
+                );
+
+                match async {
+                    handle_frame(
+                        &mut phase,
+                        &mut auth_context,
+                        &mut current_keyspace,
+                        &state,
+                        auth_disabled,
+                        &maybe_frame,
+                        &mut pending_compression,
+                        peer,
+                    )
+                    .await
+                }
+                .instrument(request_span)
                 .await
                 {
                     HandleResult::Reply(opcode, body) => {

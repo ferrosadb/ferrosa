@@ -20,7 +20,9 @@ ferrosa-net = { path = "../ferrosa-net" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-udf = { path = "../ferrosa-udf" }
+dashmap = "6"
 futures = "0.3"
+inferno = { version = "0.12", default-features = false, features = ["nameattr"] }
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -28,8 +30,36 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = []
+otel = [
+    "tracing-opentelemetry",
+    "opentelemetry",
+    "opentelemetry-otlp",
+    "opentelemetry_sdk",
+]
+
+# Optional OTel dependencies, gated behind the `otel` feature.
+[dependencies.tracing-opentelemetry]
+version = "0.30"
+optional = true
+
+[dependencies.opentelemetry]
+version = "0.29"
+optional = true
+
+[dependencies.opentelemetry-otlp]
+version = "0.29"
+optional = true
+features = ["grpc-tonic"]
+
+[dependencies.opentelemetry_sdk]
+version = "0.29"
+optional = true
+features = ["rt-tokio"]
 
 [dev-dependencies]
 tempfile = "3"

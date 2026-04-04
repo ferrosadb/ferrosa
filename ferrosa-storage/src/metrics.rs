@@ -200,6 +200,53 @@ impl Default for PinMetrics {
     }
 }
 
+/// Atomic counters for flush and compaction operations.
+///
+/// Shared across the storage engine; incremented on each flush/compaction
+/// and readable through the `system_observability.storage_stats` virtual table.
+pub struct StorageOperationMetrics {
+    /// Number of memtable flushes completed.
+    pub flush_count: std::sync::atomic::AtomicU64,
+    /// Number of compaction runs completed.
+    pub compaction_count: std::sync::atomic::AtomicU64,
+    /// Total bytes flushed to SSTables.
+    pub bytes_flushed: std::sync::atomic::AtomicU64,
+}
+
+impl StorageOperationMetrics {
+    pub fn new() -> Self {
+        Self {
+            flush_count: std::sync::atomic::AtomicU64::new(0),
+            compaction_count: std::sync::atomic::AtomicU64::new(0),
+            bytes_flushed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Increment the flush counter by 1.
+    pub fn inc_flush(&self) {
+        self.flush_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increment the compaction counter by 1.
+    pub fn inc_compaction(&self) {
+        self.compaction_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Add `bytes` to the total bytes flushed.
+    pub fn add_bytes_flushed(&self, bytes: u64) {
+        self.bytes_flushed
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Default for StorageOperationMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +333,28 @@ mod tests {
         m.set_pinned_bytes(99999);
         let text = m.to_prometheus_text();
         assert!(text.contains("ferrosa_nvme_pinned_bytes 99999"));
+    }
+
+    #[test]
+    fn storage_operation_metrics_increment() {
+        let m = StorageOperationMetrics::new();
+        assert_eq!(m.flush_count.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        m.inc_flush();
+        m.inc_flush();
+        m.inc_compaction();
+        m.add_bytes_flushed(4096);
+        m.add_bytes_flushed(2048);
+
+        assert_eq!(m.flush_count.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            m.compaction_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            m.bytes_flushed.load(std::sync::atomic::Ordering::Relaxed),
+            6144
+        );
     }
 }
