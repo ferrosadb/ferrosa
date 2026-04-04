@@ -331,4 +331,400 @@ mod tests {
         let lock = state.profiling_lock.try_lock();
         assert!(lock.is_ok());
     }
+
+    // -----------------------------------------------------------------------
+    // DebugState — profiling lock semantics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn debug_state_lock_is_exclusive() {
+        let state = DebugState::new();
+        let guard1 = state.profiling_lock.try_lock();
+        assert!(guard1.is_ok(), "first lock acquisition should succeed");
+        // While guard1 is held, a second try_lock should fail.
+        let guard2 = state.profiling_lock.try_lock();
+        assert!(
+            guard2.is_err(),
+            "second lock acquisition should fail while first is held"
+        );
+    }
+
+    #[test]
+    fn debug_state_lock_released_after_drop() {
+        let state = DebugState::new();
+        {
+            let _guard = state.profiling_lock.try_lock().expect("first lock");
+            // guard goes out of scope here
+        }
+        let guard2 = state.profiling_lock.try_lock();
+        assert!(
+            guard2.is_ok(),
+            "lock should be available after guard is dropped"
+        );
+    }
+
+    #[test]
+    fn debug_state_clone_shares_lock() {
+        let state1 = DebugState::new();
+        let state2 = state1.clone();
+        let _guard = state1.profiling_lock.try_lock().expect("lock via state1");
+        // Clone shares the Arc, so lock should be held via state2 too.
+        let result = state2.profiling_lock.try_lock();
+        assert!(
+            result.is_err(),
+            "cloned DebugState should share the same profiling lock"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FlamechartParams deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flamechart_params_default_seconds() {
+        let params: FlamechartParams = serde_json::from_str("{}").expect("empty object");
+        assert!(
+            params.seconds.is_none(),
+            "seconds should be None when omitted"
+        );
+    }
+
+    #[test]
+    fn flamechart_params_with_seconds() {
+        let params: FlamechartParams =
+            serde_json::from_str(r#"{"seconds": 30}"#).expect("valid params");
+        assert_eq!(params.seconds, Some(30));
+    }
+
+    #[test]
+    fn flamechart_params_seconds_capped_at_max() {
+        let params: FlamechartParams =
+            serde_json::from_str(r#"{"seconds": 120}"#).expect("valid params");
+        // The params struct stores the raw value; capping happens in the handler.
+        assert_eq!(params.seconds, Some(120));
+        // Verify the handler logic: unwrap_or(5).min(MAX_SECONDS)
+        let capped = params.seconds.unwrap_or(5).min(MAX_SECONDS);
+        assert_eq!(capped, MAX_SECONDS, "should be capped at MAX_SECONDS");
+    }
+
+    // -----------------------------------------------------------------------
+    // check_auth — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_auth_rejects_empty_bearer_token() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_AUTH_TOKEN", "nonempty");
+        }
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer ".parse().unwrap(),
+        );
+        let result = check_auth(&headers);
+        assert!(result.is_err(), "empty Bearer token should be rejected");
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_AUTH_TOKEN");
+        }
+    }
+
+    #[test]
+    fn check_auth_rejects_missing_authorization_header() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_AUTH_TOKEN", "secret");
+        }
+        let headers = axum::http::HeaderMap::new();
+        let result = check_auth(&headers);
+        assert!(
+            result.is_err(),
+            "missing Authorization header should be rejected"
+        );
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_AUTH_TOKEN");
+        }
+    }
+
+    #[test]
+    fn check_auth_rejects_non_bearer_scheme() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_AUTH_TOKEN", "secret");
+        }
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Basic secret".parse().unwrap(),
+        );
+        let result = check_auth(&headers);
+        assert!(result.is_err(), "non-Bearer auth scheme should be rejected");
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_AUTH_TOKEN");
+        }
+    }
+
+    #[test]
+    fn check_auth_rejects_empty_env_token() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_AUTH_TOKEN", "");
+        }
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer anything".parse().unwrap(),
+        );
+        let result = check_auth(&headers);
+        assert!(
+            result.is_err(),
+            "empty FERROSA_DEBUG_AUTH_TOKEN should be treated as unconfigured"
+        );
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_AUTH_TOKEN");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // check_ip_whitelist — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ip_whitelist_allows_listed_ip() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", "10.0.0.1,192.168.1.1");
+        }
+        let result = check_ip_whitelist(Some("192.168.1.1".parse().unwrap()));
+        assert!(result.is_ok(), "listed IP should be allowed");
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_IP_WHITELIST");
+        }
+    }
+
+    #[test]
+    fn ip_whitelist_rejects_unlisted_ip() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", "10.0.0.1");
+        }
+        let result = check_ip_whitelist(Some("10.0.0.2".parse().unwrap()));
+        assert!(result.is_err(), "unlisted IP should be rejected");
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_IP_WHITELIST");
+        }
+    }
+
+    #[test]
+    fn ip_whitelist_rejects_none_remote_when_configured() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", "10.0.0.1");
+        }
+        // None remote IP => 0.0.0.0, which is not in the whitelist.
+        let result = check_ip_whitelist(None);
+        assert!(
+            result.is_err(),
+            "None remote IP should be rejected when whitelist is configured"
+        );
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_IP_WHITELIST");
+        }
+    }
+
+    #[test]
+    fn ip_whitelist_allows_all_when_empty_string() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", "");
+        }
+        let result = check_ip_whitelist(Some("1.2.3.4".parse().unwrap()));
+        assert!(
+            result.is_ok(),
+            "empty whitelist string should allow all IPs"
+        );
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_IP_WHITELIST");
+        }
+    }
+
+    #[test]
+    fn ip_whitelist_handles_whitespace_in_entries() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", " 10.0.0.1 , 10.0.0.2 ");
+        }
+        let result = check_ip_whitelist(Some("10.0.0.2".parse().unwrap()));
+        assert!(
+            result.is_ok(),
+            "whitespace-padded IP entries should be parsed correctly"
+        );
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_IP_WHITELIST");
+        }
+    }
+
+    #[test]
+    fn ip_whitelist_allows_when_only_invalid_entries() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_IP_WHITELIST", "not-an-ip,also-bad");
+        }
+        // All entries are unparsable, so allowed list is empty => allow all.
+        let result = check_ip_whitelist(Some("1.2.3.4".parse().unwrap()));
+        assert!(
+            result.is_ok(),
+            "unparsable entries should result in empty allowed list (allow all)"
+        );
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_IP_WHITELIST");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // render_flamegraph — additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_flamegraph_single_idle_stack() {
+        let stacks = vec!["ferrosa;idle 1".to_string()];
+        let svg = render_flamegraph(&stacks).expect("should render SVG from single stack");
+        let svg_str = String::from_utf8_lossy(&svg);
+        assert!(
+            svg_str.contains("<svg"),
+            "output should contain SVG element"
+        );
+    }
+
+    #[test]
+    fn render_flamegraph_svg_has_title() {
+        let stacks = vec!["ferrosa;cql;ks;SELECT 5".to_string()];
+        let svg = render_flamegraph(&stacks).expect("should render");
+        let svg_str = String::from_utf8_lossy(&svg);
+        assert!(
+            svg_str.contains("Ferrosa Flame Chart"),
+            "SVG should contain the configured title"
+        );
+    }
+
+    #[test]
+    fn render_flamegraph_empty_input_produces_error_or_svg() {
+        // Empty folded stacks: inferno may error or produce a minimal SVG.
+        // Either is acceptable — we just verify no panic.
+        let stacks: Vec<String> = vec![];
+        let _ = render_flamegraph(&stacks);
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn max_seconds_is_reasonable() {
+        const {
+            assert!(MAX_SECONDS > 0, "MAX_SECONDS must be positive");
+            assert!(
+                MAX_SECONDS <= 300,
+                "MAX_SECONDS should be bounded to prevent extremely long profiling"
+            );
+        }
+    }
+
+    #[test]
+    fn max_collect_bytes_is_reasonable() {
+        const {
+            assert!(
+                MAX_COLLECT_BYTES >= 1024 * 1024,
+                "MAX_COLLECT_BYTES should be at least 1 MB"
+            );
+            assert!(
+                MAX_COLLECT_BYTES <= 256 * 1024 * 1024,
+                "MAX_COLLECT_BYTES should not exceed 256 MB"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Route-level tests — GET /api/debug/flamechart
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn flamechart_endpoint_is_routable() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/debug/flamechart")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(router, req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GET /api/debug/flamechart must not return 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn flamechart_rejects_without_auth_token() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        // Ensure no debug auth token is set.
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_AUTH_TOKEN");
+        }
+        let req = axum::http::Request::builder()
+            .uri("/api/debug/flamechart")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(router, req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "should return 403 when FERROSA_DEBUG_AUTH_TOKEN is not configured"
+        );
+    }
+
+    /// Build a minimal `WebAppState` for debug tests.
+    fn make_state() -> crate::web::WebAppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_config = ferrosa_storage::StorageEngineConfig {
+            commit_log: ferrosa_storage::commitlog::CommitLogConfig {
+                log_dir: dir.path().join("commitlog"),
+                checkpoint_dir: dir.path().join("commitlog"),
+                archive: None,
+                ..ferrosa_storage::commitlog::CommitLogConfig::default()
+            },
+            compaction: ferrosa_storage::compaction::CompactionConfig::from_env(
+                dir.path().join("compaction"),
+            ),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            flush_threshold_bytes: 4096,
+            flush_max_age_secs: 5,
+            data_dir: dir.path().to_path_buf(),
+        };
+        let storage =
+            Arc::new(ferrosa_storage::StorageEngine::new(storage_config, None).expect("storage"));
+        let rpc_registry = Arc::new(ferrosa_net::rpc::HandlerRegistry::new());
+        let schema = Arc::new(
+            ferrosa_schema::Schema::new(ferrosa_schema::SchemaConfig {
+                hasher: ferrosa_schema::PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+                auth_method: ferrosa_schema::AuthMethod::Password,
+                rate_limit: ferrosa_schema::RateLimitConfig::default(),
+                audit_sink: Box::new(ferrosa_schema::TestAuditSink::new()),
+                secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+                mode: ferrosa_schema::DeploymentMode::Development,
+            })
+            .expect("schema"),
+        );
+        let host_id = uuid::Uuid::new_v4();
+        let (mc, _) = ferrosa_cluster::ModeController::new(
+            Arc::new(ferrosa_cluster::ClusterConfig::default()),
+            Arc::new(ferrosa_net::config::NetConfig::default()),
+            host_id,
+            storage.clone(),
+            schema.clone(),
+            rpc_registry,
+        );
+        crate::web::WebAppState {
+            registry: Arc::new(ferrosa_schema::VirtualTableRegistry::new()),
+            mode_controller: mc,
+            schema,
+            storage,
+            host_id,
+            auth_disabled: true,
+            debug: Some(DebugState::new()),
+        }
+    }
 }

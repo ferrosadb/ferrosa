@@ -503,28 +503,13 @@ fn fmt_count(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
-    #[test]
-    fn fmt_bytes_formats_correctly() {
-        assert_eq!(fmt_bytes(0), "0 B");
-        assert_eq!(fmt_bytes(512), "512 B");
-        assert_eq!(fmt_bytes(1024), "1.0 KB");
-        assert_eq!(fmt_bytes(1024 * 1024), "1.0 MB");
-        assert_eq!(fmt_bytes(2 * 1024 * 1024 * 1024), "2.0 GB");
-    }
+    // ── Helpers ──────────────────────────────────────────────────────
 
-    #[test]
-    fn fmt_count_formats_correctly() {
-        assert_eq!(fmt_count(0), "0");
-        assert_eq!(fmt_count(999), "999");
-        assert_eq!(fmt_count(1000), "1.0K");
-        assert_eq!(fmt_count(1_500_000), "1.5M");
-    }
-
-    #[test]
-    fn tui_frame_can_be_constructed() {
-        let frame = TuiFrame {
-            profile_name: "test".to_string(),
+    fn test_frame() -> TuiFrame {
+        TuiFrame {
+            profile_name: "test_profile".to_string(),
             elapsed_secs: 10.0,
             duration_secs: 60.0,
             total_writes: 1000,
@@ -560,7 +545,766 @@ mod tests {
             throughput_history: vec![100, 110, 105, 120, 115],
             abort_reason: None,
             leak_warnings: 0,
+        }
+    }
+
+    fn test_resource_snapshot() -> ResourceSnapshot {
+        ResourceSnapshot {
+            open_fds: 128,
+            fd_limit: 1024,
+            rss_bytes: 256 * 1024 * 1024,
+            vsz_bytes: 1024 * 1024 * 1024,
+            tcp_sockets: 42,
+            unix_sockets: 5,
+            thread_count: 16,
+            commit_log_closed_segments: 3,
+            sstable_count: 10,
+            tmp_files: 0,
+        }
+    }
+
+    /// Render a full dashboard frame into a string via TestBackend.
+    fn render_to_string(frame: &TuiFrame) -> String {
+        render_to_string_sized(frame, 120, 40)
+    }
+
+    fn render_to_string_sized(frame: &TuiFrame, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| draw_dashboard(f, frame))
+            .expect("draw should succeed");
+        terminal.backend().to_string()
+    }
+
+    /// Render a single draw_* function into a string.
+    fn render_widget_to_string<F>(width: u16, height: u16, draw_fn: F) -> String
+    where
+        F: FnOnce(&mut Frame, Rect),
+    {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal creation");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_fn(f, area);
+            })
+            .expect("draw should succeed");
+        terminal.backend().to_string()
+    }
+
+    // ── fmt_bytes tests ──────────────────────────────────────────────
+
+    #[test]
+    fn fmt_bytes_formats_correctly() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(1024), "1.0 KB");
+        assert_eq!(fmt_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(fmt_bytes(2 * 1024 * 1024 * 1024), "2.0 GB");
+    }
+
+    #[test]
+    fn fmt_bytes_edge_cases() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(1), "1 B");
+        assert_eq!(fmt_bytes(1023), "1023 B");
+        // Exact KB boundary.
+        assert_eq!(fmt_bytes(1024), "1.0 KB");
+        assert_eq!(fmt_bytes(1025), "1.0 KB");
+        // Just below MB boundary.
+        assert_eq!(fmt_bytes(1024 * 1024 - 1), "1024.0 KB");
+        // Exact MB boundary.
+        assert_eq!(fmt_bytes(1024 * 1024), "1.0 MB");
+        // Exact GB boundary.
+        assert_eq!(fmt_bytes(1024 * 1024 * 1024), "1.0 GB");
+        // Fractional values.
+        assert_eq!(fmt_bytes(1536), "1.5 KB");
+        assert_eq!(fmt_bytes(1536 * 1024), "1.5 MB");
+        // Large value.
+        assert_eq!(fmt_bytes(10 * 1024 * 1024 * 1024), "10.0 GB");
+    }
+
+    // ── fmt_count tests ──────────────────────────────────────────────
+
+    #[test]
+    fn fmt_count_formats_correctly() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1000), "1.0K");
+        assert_eq!(fmt_count(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn fmt_count_edge_cases() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(1), "1");
+        assert_eq!(fmt_count(999), "999");
+        // Exact K boundary.
+        assert_eq!(fmt_count(1_000), "1.0K");
+        // Exact M boundary.
+        assert_eq!(fmt_count(1_000_000), "1.0M");
+        // Fractional K and M.
+        assert_eq!(fmt_count(2_500), "2.5K");
+        assert_eq!(fmt_count(2_500_000), "2.5M");
+        // Large values.
+        assert_eq!(fmt_count(10_000), "10.0K");
+        assert_eq!(fmt_count(10_000_000), "10.0M");
+        assert_eq!(fmt_count(999_999), "1000.0K");
+        assert_eq!(fmt_count(999_999_999), "1000.0M");
+    }
+
+    // ── TuiFrame construction ────────────────────────────────────────
+
+    #[test]
+    fn tui_frame_can_be_constructed() {
+        let frame = test_frame();
+        assert_eq!(frame.profile_name, "test_profile");
+        assert_eq!(frame.elapsed_secs, 10.0);
+        assert_eq!(frame.total_writes, 1000);
+    }
+
+    // ── Full dashboard rendering tests ───────────────────────────────
+
+    #[test]
+    fn render_produces_output() {
+        let frame = test_frame();
+        let output = render_to_string(&frame);
+
+        // Profile name appears in the header gauge label.
+        assert!(
+            output.contains("test_profile"),
+            "output should contain profile name"
+        );
+        // Top-level title.
+        assert!(
+            output.contains("ferrosa-loadgen"),
+            "output should contain 'ferrosa-loadgen' title"
+        );
+        // Section headers.
+        assert!(
+            output.contains("Throughput"),
+            "output should contain Throughput section"
+        );
+        assert!(
+            output.contains("Latency"),
+            "output should contain Latency section"
+        );
+        assert!(
+            output.contains("Storage"),
+            "output should contain Storage section"
+        );
+        assert!(
+            output.contains("Resources"),
+            "output should contain Resources section"
+        );
+        // Footer status.
+        assert!(
+            output.contains("RUNNING"),
+            "output should show RUNNING status"
+        );
+        assert!(
+            output.contains("q: quit"),
+            "output should show key help text"
+        );
+    }
+
+    #[test]
+    fn render_with_zero_elapsed() {
+        let frame = TuiFrame {
+            elapsed_secs: 0.001,
+            ..test_frame()
         };
-        assert_eq!(frame.profile_name, "test");
+        let output = render_to_string(&frame);
+        // No division-by-zero artifacts.
+        assert!(!output.contains("NaN"), "output should not contain NaN");
+        assert!(!output.contains("inf"), "output should not contain inf");
+        assert!(
+            output.contains("test_profile"),
+            "should still render profile name"
+        );
+    }
+
+    #[test]
+    fn render_with_large_values() {
+        let big = u64::MAX / 2;
+        let frame = TuiFrame {
+            total_writes: big,
+            total_reads: big,
+            total_updates: big,
+            total_deletes: big,
+            write_errors: big,
+            read_errors: big,
+            bytes_written: big,
+            memtable_bytes: big,
+            bytes_reclaimed: big,
+            writes_per_sec: big as f64,
+            reads_per_sec: big as f64,
+            write_latency: LatencyPercentiles {
+                p50_us: big,
+                p95_us: big,
+                p99_us: big,
+                p100_us: big,
+                mean_us: big as f64,
+                count: big,
+            },
+            read_latency: LatencyPercentiles {
+                p50_us: big,
+                p95_us: big,
+                p99_us: big,
+                p100_us: big,
+                mean_us: big as f64,
+                count: big,
+            },
+            ..test_frame()
+        };
+        // Must not panic or overflow.
+        let output = render_to_string(&frame);
+        assert!(
+            !output.is_empty(),
+            "output should not be empty for large values"
+        );
+    }
+
+    #[test]
+    fn render_with_abort_reason() {
+        let frame = TuiFrame {
+            abort_reason: Some("test abort reason".into()),
+            ..test_frame()
+        };
+        let output = render_to_string(&frame);
+        assert!(
+            output.contains("ABORTED"),
+            "output should contain ABORTED status"
+        );
+        assert!(
+            output.contains("test abort reason"),
+            "output should contain the abort reason text"
+        );
+        // RUNNING should not appear when aborted.
+        assert!(
+            !output.contains("RUNNING"),
+            "output should not show RUNNING when aborted"
+        );
+    }
+
+    #[test]
+    fn render_with_resources() {
+        let frame = TuiFrame {
+            resources: Some(test_resource_snapshot()),
+            ..test_frame()
+        };
+        let output = render_to_string(&frame);
+
+        assert!(
+            output.contains("File descriptors"),
+            "output should contain File descriptors label"
+        );
+        assert!(
+            output.contains("128"),
+            "output should contain open_fds value"
+        );
+        assert!(output.contains("RSS"), "output should contain RSS label");
+        assert!(
+            output.contains("TCP sockets"),
+            "output should contain TCP sockets label"
+        );
+        assert!(
+            output.contains("Threads"),
+            "output should contain Threads label"
+        );
+        assert!(
+            output.contains("CL segments"),
+            "output should contain CL segments label"
+        );
+        // "waiting for first sample" should NOT appear when resources are present.
+        assert!(
+            !output.contains("waiting for first sample"),
+            "should not show waiting message when resources exist"
+        );
+    }
+
+    #[test]
+    fn render_without_resources_shows_waiting() {
+        let frame = TuiFrame {
+            resources: None,
+            ..test_frame()
+        };
+        let output = render_to_string(&frame);
+        assert!(
+            output.contains("waiting for first sample"),
+            "should show 'waiting for first sample' when resources is None"
+        );
+    }
+
+    #[test]
+    fn render_with_throughput_history() {
+        let frame = TuiFrame {
+            throughput_history: vec![50, 100, 150, 200, 250, 300, 350, 400],
+            ..test_frame()
+        };
+        let output = render_to_string(&frame);
+        assert!(
+            output.contains("Writes/sec"),
+            "output should contain Writes/sec sparkline header"
+        );
+    }
+
+    #[test]
+    fn render_with_empty_throughput_history() {
+        let frame = TuiFrame {
+            throughput_history: vec![],
+            ..test_frame()
+        };
+        // Empty history renders the block without sparkline data (no panic).
+        let output = render_to_string(&frame);
+        assert!(
+            output.contains("Writes/sec"),
+            "output should contain Writes/sec section even with empty history"
+        );
+    }
+
+    #[test]
+    fn render_with_long_throughput_history() {
+        let frame = TuiFrame {
+            throughput_history: (0..200).collect(),
+            ..test_frame()
+        };
+        let output = render_to_string(&frame);
+        assert!(
+            !output.is_empty(),
+            "should render with long throughput history"
+        );
+    }
+
+    #[test]
+    fn render_with_leak_warnings() {
+        let frame = TuiFrame {
+            leak_warnings: 5,
+            resources: Some(test_resource_snapshot()),
+            ..test_frame()
+        };
+        let output = render_to_string(&frame);
+        // When leak_warnings > 0, the Resources title gets a [!] marker.
+        assert!(
+            output.contains("[!]"),
+            "output should contain [!] marker when leak warnings exist"
+        );
+        assert!(
+            output.contains("Leak warnings"),
+            "output should contain 'Leak warnings' label"
+        );
+    }
+
+    #[test]
+    fn render_with_errors() {
+        let frame = TuiFrame {
+            write_errors: 42,
+            read_errors: 17,
+            ..test_frame()
+        };
+        let output = render_to_string(&frame);
+        assert!(
+            output.contains("42"),
+            "output should contain write_errors count"
+        );
+        assert!(
+            output.contains("17"),
+            "output should contain read_errors count"
+        );
+    }
+
+    #[test]
+    fn render_with_zero_duration() {
+        // duration_secs == 0 should not panic (progress clamped to 0.0).
+        let frame = TuiFrame {
+            elapsed_secs: 0.0,
+            duration_secs: 0.0,
+            ..test_frame()
+        };
+        let output = render_to_string(&frame);
+        assert!(
+            !output.is_empty(),
+            "output should not be empty for zero duration"
+        );
+        assert!(!output.contains("NaN"), "should not produce NaN");
+    }
+
+    // ── Terminal size variation tests ─────────────────────────────────
+
+    #[test]
+    fn render_narrow_terminal() {
+        let frame = test_frame();
+        // 40 columns is very narrow -- should not panic.
+        let output = render_to_string_sized(&frame, 40, 20);
+        assert!(!output.is_empty(), "should render on narrow terminal");
+    }
+
+    #[test]
+    fn render_tall_terminal() {
+        let frame = test_frame();
+        let output = render_to_string_sized(&frame, 120, 80);
+        assert!(
+            output.contains("test_profile"),
+            "should render correctly on tall terminal"
+        );
+    }
+
+    #[test]
+    fn render_minimum_size() {
+        let frame = test_frame();
+        // Minimum meaningful size -- should not panic.
+        let output = render_to_string_sized(&frame, 20, 10);
+        assert!(!output.is_empty(), "should render on minimum size terminal");
+    }
+
+    // ── Individual draw_* function tests ─────────────────────────────
+
+    #[test]
+    fn draw_header_shows_progress_and_profile() {
+        let frame = test_frame();
+        let output = render_widget_to_string(100, 3, |f, area| {
+            draw_header(f, area, &frame);
+        });
+        assert!(
+            output.contains("test_profile"),
+            "header should contain profile name"
+        );
+        assert!(
+            output.contains("remaining"),
+            "header should contain 'remaining' text"
+        );
+        assert!(
+            output.contains("ferrosa-loadgen"),
+            "header should contain ferrosa-loadgen title"
+        );
+    }
+
+    #[test]
+    fn draw_header_progress_clamped_when_elapsed_exceeds_duration() {
+        // elapsed > duration should clamp progress to 1.0 (no panic).
+        let frame = TuiFrame {
+            elapsed_secs: 120.0,
+            duration_secs: 60.0,
+            ..test_frame()
+        };
+        let output = render_widget_to_string(100, 3, |f, area| {
+            draw_header(f, area, &frame);
+        });
+        // Remaining should be 0 (clamped via max(0.0)).
+        assert!(
+            output.contains("0s remaining"),
+            "remaining should be 0 when elapsed > duration"
+        );
+    }
+
+    #[test]
+    fn draw_header_zero_duration_no_panic() {
+        let frame = TuiFrame {
+            elapsed_secs: 0.0,
+            duration_secs: 0.0,
+            ..test_frame()
+        };
+        // Should not panic from division by zero.
+        let output = render_widget_to_string(100, 3, |f, area| {
+            draw_header(f, area, &frame);
+        });
+        assert!(
+            !output.is_empty(),
+            "header should render with zero duration"
+        );
+    }
+
+    #[test]
+    fn draw_throughput_renders_all_fields() {
+        let frame = test_frame();
+        let output = render_widget_to_string(80, 10, |f, area| {
+            draw_throughput(f, area, &frame);
+        });
+        assert!(output.contains("Writes/sec"), "should contain Writes/sec");
+        assert!(output.contains("Reads/sec"), "should contain Reads/sec");
+        assert!(output.contains("Total ops"), "should contain Total ops");
+        assert!(output.contains("Errors"), "should contain Errors label");
+        assert!(
+            output.contains("Throughput"),
+            "should contain Throughput section title"
+        );
+    }
+
+    #[test]
+    fn draw_latency_renders_percentile_headers() {
+        let frame = test_frame();
+        let output = render_widget_to_string(80, 10, |f, area| {
+            draw_latency(f, area, &frame);
+        });
+        assert!(output.contains("p50"), "should contain p50 header");
+        assert!(output.contains("p95"), "should contain p95 header");
+        assert!(output.contains("p99"), "should contain p99 header");
+        assert!(output.contains("p100"), "should contain p100 header");
+        assert!(output.contains("Write"), "should contain Write row");
+        assert!(output.contains("Read"), "should contain Read row");
+        assert!(output.contains("Mean"), "should contain Mean row");
+        assert!(output.contains("Samples"), "should contain Samples row");
+    }
+
+    #[test]
+    fn draw_storage_renders_all_fields() {
+        let frame = test_frame();
+        let output = render_widget_to_string(60, 10, |f, area| {
+            draw_storage(f, area, &frame);
+        });
+        assert!(output.contains("Memtable"), "should contain Memtable");
+        assert!(output.contains("SSTables"), "should contain SSTables");
+        assert!(
+            output.contains("Data written"),
+            "should contain Data written"
+        );
+        assert!(output.contains("S3 uploads"), "should contain S3 uploads");
+        assert!(output.contains("Reclaimed"), "should contain Reclaimed");
+    }
+
+    #[test]
+    fn draw_resources_with_snapshot() {
+        let frame = TuiFrame {
+            resources: Some(test_resource_snapshot()),
+            ..test_frame()
+        };
+        let output = render_widget_to_string(60, 12, |f, area| {
+            draw_resources(f, area, &frame);
+        });
+        assert!(output.contains("File descriptors"), "should show FD info");
+        assert!(output.contains("RSS"), "should show RSS");
+        assert!(output.contains("VSZ"), "should show VSZ");
+        assert!(output.contains("TCP sockets"), "should show TCP sockets");
+        assert!(output.contains("Threads"), "should show Threads");
+        assert!(output.contains("CL segments"), "should show CL segments");
+        assert!(
+            output.contains("Leak warnings"),
+            "should show Leak warnings"
+        );
+    }
+
+    #[test]
+    fn draw_resources_without_snapshot() {
+        let frame = TuiFrame {
+            resources: None,
+            ..test_frame()
+        };
+        let output = render_widget_to_string(60, 6, |f, area| {
+            draw_resources(f, area, &frame);
+        });
+        assert!(
+            output.contains("waiting for first sample"),
+            "should show waiting message when no resources"
+        );
+    }
+
+    #[test]
+    fn draw_resources_fd_limit_zero_no_panic() {
+        // fd_limit == 0 should not panic (division guard produces 0%).
+        let frame = TuiFrame {
+            resources: Some(ResourceSnapshot {
+                open_fds: 0,
+                fd_limit: 0,
+                rss_bytes: 0,
+                vsz_bytes: 0,
+                tcp_sockets: 0,
+                unix_sockets: 0,
+                thread_count: 1,
+                commit_log_closed_segments: 0,
+                sstable_count: 0,
+                tmp_files: 0,
+            }),
+            ..test_frame()
+        };
+        let output = render_widget_to_string(60, 12, |f, area| {
+            draw_resources(f, area, &frame);
+        });
+        assert!(
+            output.contains("0%"),
+            "FD percentage should be 0% when fd_limit is 0"
+        );
+    }
+
+    #[test]
+    fn draw_resources_high_fd_usage() {
+        // FD usage > 70% should trigger red color (we verify the percentage).
+        let frame = TuiFrame {
+            resources: Some(ResourceSnapshot {
+                open_fds: 900,
+                fd_limit: 1024,
+                rss_bytes: 0,
+                vsz_bytes: 0,
+                tcp_sockets: 0,
+                unix_sockets: 0,
+                thread_count: 1,
+                commit_log_closed_segments: 0,
+                sstable_count: 0,
+                tmp_files: 0,
+            }),
+            ..test_frame()
+        };
+        let output = render_widget_to_string(60, 12, |f, area| {
+            draw_resources(f, area, &frame);
+        });
+        assert!(output.contains("900"), "should show the open_fds count");
+        assert!(output.contains("88%"), "should show ~88% FD usage");
+    }
+
+    #[test]
+    fn draw_resources_medium_fd_usage() {
+        // FD usage between 50-70% should trigger yellow color.
+        let frame = TuiFrame {
+            resources: Some(ResourceSnapshot {
+                open_fds: 600,
+                fd_limit: 1024,
+                rss_bytes: 0,
+                vsz_bytes: 0,
+                tcp_sockets: 0,
+                unix_sockets: 0,
+                thread_count: 1,
+                commit_log_closed_segments: 0,
+                sstable_count: 0,
+                tmp_files: 0,
+            }),
+            ..test_frame()
+        };
+        let output = render_widget_to_string(60, 12, |f, area| {
+            draw_resources(f, area, &frame);
+        });
+        assert!(output.contains("59%"), "should show ~59% FD usage");
+    }
+
+    #[test]
+    fn draw_footer_running() {
+        let frame = test_frame();
+        let output = render_widget_to_string(80, 3, |f, area| {
+            draw_footer(f, area, &frame);
+        });
+        assert!(
+            output.contains("RUNNING"),
+            "running frame should show RUNNING"
+        );
+        assert!(output.contains("q: quit"), "footer should contain key help");
+        assert!(
+            output.contains("p: pause"),
+            "footer should contain pause help"
+        );
+    }
+
+    #[test]
+    fn draw_footer_aborted() {
+        let frame = TuiFrame {
+            abort_reason: Some("oom killed".into()),
+            ..test_frame()
+        };
+        let output = render_widget_to_string(80, 3, |f, area| {
+            draw_footer(f, area, &frame);
+        });
+        assert!(
+            output.contains("ABORTED"),
+            "aborted frame should show ABORTED"
+        );
+        assert!(output.contains("oom killed"), "should contain abort reason");
+    }
+
+    #[test]
+    fn draw_sparkline_with_data() {
+        let frame = TuiFrame {
+            throughput_history: vec![10, 20, 30, 40, 50],
+            ..test_frame()
+        };
+        let output = render_widget_to_string(60, 6, |f, area| {
+            draw_sparkline(f, area, &frame);
+        });
+        assert!(
+            output.contains("Writes/sec"),
+            "sparkline should show its block title"
+        );
+    }
+
+    #[test]
+    fn draw_sparkline_empty() {
+        let frame = TuiFrame {
+            throughput_history: vec![],
+            ..test_frame()
+        };
+        let output = render_widget_to_string(60, 6, |f, area| {
+            draw_sparkline(f, area, &frame);
+        });
+        assert!(
+            output.contains("Writes/sec"),
+            "empty sparkline should still show the block title"
+        );
+    }
+
+    // ── Helper function tests ────────────────────────────────────────
+
+    #[test]
+    fn latency_color_thresholds() {
+        // <= 10ms (10_000us): default style
+        assert_eq!(latency_color(0), Style::default());
+        assert_eq!(latency_color(5_000), Style::default());
+        assert_eq!(latency_color(10_000), Style::default());
+
+        // > 10ms, <= 100ms: yellow
+        assert_eq!(latency_color(10_001), Style::default().fg(Color::Yellow));
+        assert_eq!(latency_color(50_000), Style::default().fg(Color::Yellow));
+        assert_eq!(latency_color(100_000), Style::default().fg(Color::Yellow));
+
+        // > 100ms: red
+        assert_eq!(latency_color(100_001), Style::default().fg(Color::Red));
+        assert_eq!(latency_color(200_000), Style::default().fg(Color::Red));
+        assert_eq!(latency_color(u64::MAX), Style::default().fg(Color::Red));
+    }
+
+    #[test]
+    fn kv_line_produces_two_spans() {
+        let line = kv_line("TestKey", "TestValue", Color::Cyan);
+        assert_eq!(line.spans.len(), 2, "kv_line should produce 2 spans");
+        // First span contains the key padded to 20 chars.
+        let key_text = line.spans[0].content.to_string();
+        assert!(
+            key_text.contains("TestKey"),
+            "first span should contain the key"
+        );
+        // Second span is the value.
+        assert_eq!(line.spans[1].content, "TestValue");
+        // Value should have the specified color.
+        assert_eq!(line.spans[1].style, Style::default().fg(Color::Cyan));
+    }
+
+    #[test]
+    fn kv_line_key_padding() {
+        let line = kv_line("K", "V", Color::White);
+        let key_text = line.spans[0].content.to_string();
+        // "  K" padded to 22 chars total (2 leading spaces + 20 char field).
+        assert_eq!(key_text.len(), 22, "key should be padded to 22 chars");
+    }
+
+    #[test]
+    fn section_block_renders_title() {
+        let output = render_widget_to_string(40, 3, |f, area| {
+            let block = section_block(" Test Section ");
+            f.render_widget(block, area);
+        });
+        assert!(
+            output.contains("Test Section"),
+            "section block should contain its title"
+        );
+    }
+
+    // ── poll_quit test ───────────────────────────────────────────────
+
+    #[test]
+    fn poll_quit_returns_false_initially() {
+        // In a non-interactive test environment with no pending input
+        // events, crossterm::event::poll(0ms) returns false. We verify
+        // this baseline -- it is what poll_quit relies on to return false.
+        let result = crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false);
+        assert!(
+            !result,
+            "poll with zero timeout should return false in test environment"
+        );
     }
 }

@@ -613,4 +613,69 @@ mod tests {
         assert_eq!(stats.snapshots[0].s3_uploads, 2);
         assert_eq!(stats.snapshots[0].bytes_reclaimed, 1000);
     }
+
+    #[test]
+    fn stats_display_includes_bytes_read() {
+        let sc = StatsCollector::new();
+        let stats = sc.finalize(FinalizeContext {
+            bytes_read: 5000,
+            ..test_ctx("bytes_read_test")
+        });
+        let output = format!("{stats}");
+        assert!(
+            output.contains("Bytes read:"),
+            "output should contain 'Bytes read:' line, got:\n{output}"
+        );
+        assert!(
+            output.contains("5000"),
+            "output should contain '5000', got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn stats_display_includes_throughput_mbs() {
+        let sc = StatsCollector::new();
+        let stats = sc.finalize(FinalizeContext {
+            bytes_written: 10 * 1024 * 1024,
+            bytes_read: 20 * 1024 * 1024,
+            ..test_ctx("throughput_test")
+        });
+        let output = format!("{stats}");
+        assert!(
+            output.contains("Write throughput:"),
+            "output should contain 'Write throughput:', got:\n{output}"
+        );
+        assert!(
+            output.contains("Read throughput:"),
+            "output should contain 'Read throughput:', got:\n{output}"
+        );
+        assert!(
+            output.contains("MB/s"),
+            "output should contain 'MB/s', got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn stats_display_zero_bytes_read() {
+        let sc = StatsCollector::new();
+        let stats = sc.finalize(FinalizeContext {
+            bytes_read: 0,
+            ..test_ctx("zero_bytes_read_test")
+        });
+        let output = format!("{stats}");
+        assert!(
+            output.contains("Bytes read:"),
+            "output should contain 'Bytes read:' line, got:\n{output}"
+        );
+        // The "Bytes read:" line should show 0 bytes and 0.0 MB.
+        // Find the specific line to verify the value is 0.
+        let bytes_read_line = output
+            .lines()
+            .find(|l| l.contains("Bytes read:"))
+            .expect("should have a 'Bytes read:' line");
+        assert!(
+            bytes_read_line.contains("0"),
+            "Bytes read line should contain '0', got: {bytes_read_line}"
+        );
+    }
 }

@@ -224,3 +224,330 @@ async fn handle_socket(socket: WebSocket, registry: Arc<VirtualTableRegistry>) {
     drop(tx);
     let _ = sender_task.await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // -----------------------------------------------------------------------
+    // ClientMessage deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_subscribe_message() {
+        let raw = r#"{"type": "subscribe", "table": "connections"}"#;
+        let msg: ClientMessage = serde_json::from_str(raw).expect("valid subscribe");
+        assert_eq!(msg.msg_type, "subscribe");
+        assert_eq!(msg.table.as_deref(), Some("connections"));
+    }
+
+    #[test]
+    fn parse_unsubscribe_message() {
+        let raw = r#"{"type": "unsubscribe", "table": "connections"}"#;
+        let msg: ClientMessage = serde_json::from_str(raw).expect("valid unsubscribe");
+        assert_eq!(msg.msg_type, "unsubscribe");
+        assert_eq!(msg.table.as_deref(), Some("connections"));
+    }
+
+    #[test]
+    fn parse_subscribe_missing_table_field() {
+        let raw = r#"{"type": "subscribe"}"#;
+        let msg: ClientMessage = serde_json::from_str(raw).expect("table is optional in struct");
+        assert_eq!(msg.msg_type, "subscribe");
+        assert!(msg.table.is_none(), "table should be None when omitted");
+    }
+
+    #[test]
+    fn parse_unknown_message_type() {
+        let raw = r#"{"type": "ping", "table": "connections"}"#;
+        let msg: ClientMessage = serde_json::from_str(raw).expect("unknown type still parses");
+        assert_eq!(msg.msg_type, "ping");
+    }
+
+    #[test]
+    fn parse_invalid_json_fails() {
+        let raw = "not valid json";
+        let result = serde_json::from_str::<ClientMessage>(raw);
+        assert!(result.is_err(), "invalid JSON must fail to parse");
+    }
+
+    #[test]
+    fn parse_empty_object_fails() {
+        // `type` field is required (via `msg_type`).
+        let raw = "{}";
+        let result = serde_json::from_str::<ClientMessage>(raw);
+        assert!(
+            result.is_err(),
+            "empty object missing required 'type' field must fail"
+        );
+    }
+
+    #[test]
+    fn parse_null_table_field() {
+        let raw = r#"{"type": "subscribe", "table": null}"#;
+        let msg: ClientMessage = serde_json::from_str(raw).expect("null table is valid");
+        assert_eq!(msg.msg_type, "subscribe");
+        assert!(msg.table.is_none(), "null table should deserialize as None");
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol message formatting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_message_format_invalid_json() {
+        let err = json!({"type": "error", "message": "invalid JSON"});
+        let serialized = err.to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serialized).expect("round-trip must work");
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["message"], "invalid JSON");
+    }
+
+    #[test]
+    fn error_message_format_missing_table() {
+        let err = json!({"type": "error", "message": "missing table field"});
+        let serialized = err.to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["message"], "missing table field");
+    }
+
+    #[test]
+    fn error_message_format_unknown_table() {
+        let table_name = "nonexistent";
+        let err = json!({
+            "type": "error",
+            "message": format!("unknown table: {table_name}")
+        });
+        let serialized = err.to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert!(parsed["message"].as_str().unwrap().contains("nonexistent"));
+    }
+
+    #[test]
+    fn error_message_format_unknown_type() {
+        let msg_type = "foo";
+        let err = json!({
+            "type": "error",
+            "message": format!("unknown message type: {msg_type}")
+        });
+        let serialized = err.to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert!(parsed["message"].as_str().unwrap().contains("foo"));
+    }
+
+    #[test]
+    fn data_message_format() {
+        let table_name = "connections";
+        let rows = json!([{"host": "127.0.0.1"}]);
+        let data = json!({"type": "data", "table": table_name, "rows": rows});
+        let serialized = data.to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed["type"], "data");
+        assert_eq!(parsed["table"], "connections");
+        assert!(parsed["rows"].is_array());
+        assert_eq!(parsed["rows"][0]["host"], "127.0.0.1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn outbound_channel_capacity_is_nonzero() {
+        let capacity = OUTBOUND_CHANNEL_CAPACITY;
+        assert!(capacity > 0, "channel capacity must be positive");
+    }
+
+    #[test]
+    fn default_poll_interval_is_reasonable() {
+        let interval = DEFAULT_POLL_INTERVAL;
+        assert!(
+            interval >= Duration::from_millis(100),
+            "poll interval must be at least 100ms to avoid busy-looping"
+        );
+        assert!(
+            interval <= Duration::from_secs(60),
+            "poll interval must be at most 60s to remain responsive"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ClientMessage — additional deserialization edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_subscribe_with_extra_fields_ignored() {
+        let raw = r#"{"type": "subscribe", "table": "connections", "extra": 42}"#;
+        let msg: ClientMessage = serde_json::from_str(raw).expect("extra fields should be ignored");
+        assert_eq!(msg.msg_type, "subscribe");
+        assert_eq!(msg.table.as_deref(), Some("connections"));
+    }
+
+    #[test]
+    fn parse_empty_string_table_field() {
+        let raw = r#"{"type": "subscribe", "table": ""}"#;
+        let msg: ClientMessage = serde_json::from_str(raw).expect("empty string is valid");
+        assert_eq!(msg.table.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn parse_subscribe_with_integer_type_fails() {
+        let raw = r#"{"type": 123}"#;
+        let result = serde_json::from_str::<ClientMessage>(raw);
+        assert!(result.is_err(), "integer type field must fail to parse");
+    }
+
+    #[test]
+    fn parse_subscribe_preserves_table_case() {
+        let raw = r#"{"type": "subscribe", "table": "ActiveQueries"}"#;
+        let msg: ClientMessage = serde_json::from_str(raw).expect("case-sensitive");
+        assert_eq!(msg.table.as_deref(), Some("ActiveQueries"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol message formatting — round-trip consistency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn data_message_with_empty_rows() {
+        let table_name = "connections";
+        let rows: Vec<serde_json::Value> = vec![];
+        let data = json!({"type": "data", "table": table_name, "rows": rows});
+        let serialized = data.to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed["type"], "data");
+        assert_eq!(parsed["table"], "connections");
+        assert!(parsed["rows"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn data_message_with_multiple_rows() {
+        let rows = json!([
+            {"host": "10.0.0.1", "port": 9042},
+            {"host": "10.0.0.2", "port": 9043},
+        ]);
+        let data = json!({"type": "data", "table": "connections", "rows": rows});
+        let serialized = data.to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["rows"][0]["host"], "10.0.0.1");
+        assert_eq!(parsed["rows"][1]["port"], 9043);
+    }
+
+    #[test]
+    fn error_messages_always_have_type_and_message_fields() {
+        let test_cases = vec![
+            "invalid JSON",
+            "missing table field",
+            "unknown table: foo",
+            "unknown message type: bar",
+        ];
+
+        for msg_text in test_cases {
+            let err = json!({"type": "error", "message": msg_text});
+            let serialized = err.to_string();
+            let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(
+                parsed["type"], "error",
+                "error message should have type=error for: {msg_text}"
+            );
+            assert_eq!(
+                parsed["message"], msg_text,
+                "error message text mismatch for: {msg_text}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // WsSubscription cancellation token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cancellation_token_starts_uncancelled() {
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(
+            !token.is_cancelled(),
+            "new CancellationToken should not be cancelled"
+        );
+    }
+
+    #[test]
+    fn cancellation_token_clone_propagates() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let child = token.clone();
+        token.cancel();
+        assert!(
+            child.is_cancelled(),
+            "cloned token should be cancelled when original is cancelled"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SubscriptionMode — interval selection logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pollable_mode_uses_default_interval() {
+        let mode = ferrosa_schema::SubscriptionMode::Pollable;
+        let interval = match mode {
+            ferrosa_schema::SubscriptionMode::DemandDriven { default_interval } => default_interval,
+            _ => DEFAULT_POLL_INTERVAL,
+        };
+        assert_eq!(interval, DEFAULT_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn demand_driven_mode_uses_custom_interval() {
+        let custom = Duration::from_millis(500);
+        let mode = ferrosa_schema::SubscriptionMode::DemandDriven {
+            default_interval: custom,
+        };
+        let interval = match mode {
+            ferrosa_schema::SubscriptionMode::DemandDriven { default_interval } => default_interval,
+            _ => DEFAULT_POLL_INTERVAL,
+        };
+        assert_eq!(interval, custom);
+    }
+
+    #[test]
+    fn none_mode_does_not_match_pollable_branch() {
+        let mode = ferrosa_schema::SubscriptionMode::None;
+        let is_polling = matches!(
+            mode,
+            ferrosa_schema::SubscriptionMode::Pollable
+                | ferrosa_schema::SubscriptionMode::DemandDriven { .. }
+        );
+        assert!(
+            !is_polling,
+            "SubscriptionMode::None should not match the polling branch"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Channel capacity — bounded channel does not panic
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn outbound_channel_respects_capacity() {
+        let (tx, _rx) = mpsc::channel::<String>(OUTBOUND_CHANNEL_CAPACITY);
+        // Fill the channel up to capacity.
+        for i in 0..OUTBOUND_CHANNEL_CAPACITY {
+            let result = tx.try_send(format!("msg-{i}"));
+            assert!(
+                result.is_ok(),
+                "should be able to send up to capacity, failed at {i}"
+            );
+        }
+        // One more should fail (channel full).
+        let overflow = tx.try_send("overflow".to_string());
+        assert!(
+            overflow.is_err(),
+            "channel should be full after sending capacity messages"
+        );
+    }
+}
