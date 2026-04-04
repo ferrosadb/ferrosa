@@ -2814,7 +2814,7 @@ mod tests {
     /// CompactionMetadata (component 1) bytes from a real Cassandra 5.0.7 nb-format
     /// Statistics.db (test_ks.test_table with pk text + ck int + val text).
     /// 19 bytes — HyperLogLog cardinality estimate for a minimal table.
-    const CASSANDRA_COMPACTION_METADATA_HEX: &str = "0000000ffffffffe0d190102deb87192a7b71c";
+    const CASSANDRA_COMPACTION_METADATA_HEX: &str = "0000000ffffffffe0d190102deb87192a7b71c"; // pragma: allowlist secret
 
     /// StatsMetadata (component 2) bytes from a Cassandra 5 BTI-format (da) SSTable
     /// (test_ks.test_table with pk text + ck int + val text, 2-row table).

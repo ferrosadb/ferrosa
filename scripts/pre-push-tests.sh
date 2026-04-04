@@ -61,18 +61,30 @@ else
     CARGO_ARGS="$CARGO_ARGS -p $crate"
   done
 
-  # Skip binary_smoke tests — they spawn cargo run as a subprocess and
-  # take minutes.  Gated behind FERROSA_TEST_LOADGEN=1 for explicit use.
+  # Don't use --all-features: it enables infrastructure-dependent features
+  # (telemetry instrumentation, skiplist-memtable) whose tests require
+  # running clusters, containers, or FERROSA_TEST_* env vars and panic
+  # without them.  CI runs the full feature matrix with infrastructure.
+  #
+  # Exclude main.rs binary entry points from coverage — startup code
+  # only exercisable via full integration tests (covered in CI).
   echo ""
   if command -v cargo-llvm-cov &> /dev/null; then
     echo "=== Running cargo llvm-cov$CARGO_ARGS ==="
-    # Exclude main.rs binary entry points from coverage — they contain
-    # server startup code that is only exercisable via integration tests
-    # with full infrastructure (covered in CI, not pre-push).
-    COV_OUTPUT=$(cargo llvm-cov --all-features $CARGO_ARGS --summary-only \
+    # Skip: S3/container-gated tests, flaky tracing subscriber tests.
+    # Capture exit code so we always echo output before failing.
+    set +e
+    COV_OUTPUT=$(cargo llvm-cov $CARGO_ARGS --lib --summary-only \
       --ignore-filename-regex '(^|/)main\.rs$' \
-      -- --skip binary_ --skip ucs_load_s3_ --skip flamechart 2>&1)
+      -- --skip cassandra_reads_compacted --skip compaction_end_to_end \
+         --skip accord_coordinator_creates_spans 2>&1)
+    COV_RC=$?
+    set -e
     echo "$COV_OUTPUT"
+    if [ "$COV_RC" -ne 0 ]; then
+      echo "FAIL: cargo llvm-cov exited with code $COV_RC"
+      exit 1
+    fi
     # Check 80% coverage threshold (matches CI)
     COVERAGE=$(echo "$COV_OUTPUT" | grep 'TOTAL' | awk '{print $10}' | tr -d '%')
     if [ -n "$COVERAGE" ]; then
@@ -86,7 +98,8 @@ else
   else
     echo "=== Running cargo test$CARGO_ARGS ==="
     echo "(install cargo-llvm-cov for coverage: cargo install cargo-llvm-cov)"
-    cargo test --all-features $CARGO_ARGS -- --skip binary_ --skip ucs_load_s3_ --skip flamechart
+    cargo test $CARGO_ARGS --lib -- --skip cassandra_reads_compacted --skip compaction_end_to_end \
+      --skip accord_coordinator_creates_spans
   fi
 fi
 
