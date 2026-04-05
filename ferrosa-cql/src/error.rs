@@ -31,6 +31,10 @@ pub enum CqlError {
     AlreadyExists { keyspace: String, table: String },
     /// 0x2500 — unknown prepared statement ID.
     Unprepared([u8; 16]),
+    /// Client requested a protocol version we don't support (e.g., v5).
+    /// The connection handler should reply with an ERROR frame using the
+    /// supported version so the driver falls back.
+    ProtocolVersionMismatch { requested: u8, supported: u8 },
 }
 
 impl CqlError {
@@ -38,7 +42,7 @@ impl CqlError {
     pub fn error_code(&self) -> u32 {
         match self {
             Self::ServerError(_) => 0x0000,
-            Self::Protocol(_) => 0x000A,
+            Self::Protocol(_) | Self::ProtocolVersionMismatch { .. } => 0x000A,
             Self::BadCredentials => 0x0100,
             Self::Unavailable => 0x1000,
             Self::Overloaded(_) => 0x1100,
@@ -107,6 +111,14 @@ impl std::fmt::Display for CqlError {
                 }
                 Ok(())
             }
+            Self::ProtocolVersionMismatch {
+                requested,
+                supported,
+            } => write!(
+                f,
+                "Invalid or unsupported protocol version ({requested}); \
+                 the lowest supported version is 3 and the greatest is {supported}"
+            ),
         }
     }
 }

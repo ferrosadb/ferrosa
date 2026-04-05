@@ -113,6 +113,7 @@ pub async fn handle_connection<S>(
     let mut current_keyspace: Option<String> = None;
     let mut subscription_state = SubscriptionState::new(8);
     let mut pending_compression: Option<Compression> = None;
+    let mut client_protocol_version: u8 = 4; // default; updated from STARTUP frame
 
     // Channel for subscription tasks to push streaming frames.
     let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<crate::subscribe::SubscriptionPush>(64);
@@ -127,6 +128,28 @@ pub async fn handle_connection<S>(
             result = timeout(IDLE_TIMEOUT, framed.next()) => {
                 match result {
                     Ok(Some(Ok(frame))) => FrameOrPush::ClientFrame(frame),
+                    Ok(Some(Err(CqlError::ProtocolVersionMismatch { requested, supported }))) => {
+                        warn!(
+                            "protocol version mismatch from {peer}: \
+                             requested v{requested}, max supported v{supported}"
+                        );
+                        // Send an ERROR response using v4 framing so the
+                        // driver knows to fall back to a lower version.
+                        let err = CqlError::ProtocolVersionMismatch { requested, supported };
+                        let body = err.encode_body();
+                        let resp = CqlFrame {
+                            header: FrameHeader {
+                                version: VERSION_RESPONSE,
+                                flags: 0,
+                                stream_id: 0,
+                                opcode: Opcode::Error,
+                                length: body.len() as u32,
+                            },
+                            body: body.freeze(),
+                        };
+                        let _ = framed.send(resp).await;
+                        break;
+                    }
                     Ok(Some(Err(e))) => {
                         warn!("frame decode error from {peer}: {e}");
                         break;
@@ -192,6 +215,10 @@ pub async fn handle_connection<S>(
                     None
                 };
 
+                // Track the client's protocol version from the first frame.
+                if matches!(phase, ConnectionPhase::AwaitingStartup) {
+                    client_protocol_version = maybe_frame.header.version;
+                }
                 let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);
                 let was_ready = matches!(phase, ConnectionPhase::Ready);
 
@@ -235,9 +262,15 @@ pub async fn handle_connection<S>(
                         }
 
                         let body_bytes = body.freeze();
+                        // Use the correct response version: 0x84 for v4, 0x85 for v5.
+                        let response_version = if client_protocol_version >= 0x05 {
+                            0x85
+                        } else {
+                            VERSION_RESPONSE // 0x84
+                        };
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: response_version,
                                 flags: 0,
                                 stream_id,
                                 opcode,
@@ -249,15 +282,20 @@ pub async fn handle_connection<S>(
                             break;
                         }
 
-                        if (opcode == Opcode::Ready || opcode == Opcode::AuthSuccess)
-                            && pending_compression.is_some()
-                        {
-                            let compression = pending_compression.take().unwrap();
-                            debug!(
-                                "enabling {} compression for {peer}",
-                                compression.protocol_name()
-                            );
-                            framed.codec_mut().set_compression(compression);
+                        // After READY or AUTH_SUCCESS, enable post-handshake features.
+                        if opcode == Opcode::Ready || opcode == Opcode::AuthSuccess {
+                            if let Some(compression) = pending_compression.take() {
+                                debug!(
+                                    "enabling {} compression for {peer}",
+                                    compression.protocol_name()
+                                );
+                                framed.codec_mut().set_compression(compression);
+                            }
+                            // CQL v5 switches to framed mode (CRC24/CRC32) after READY.
+                            if client_protocol_version >= 0x05 {
+                                debug!("enabling v5 framing for {peer}");
+                                framed.codec_mut().enable_v5_framing();
+                            }
                         }
                     }
                     HandleResult::StartSubscription {
