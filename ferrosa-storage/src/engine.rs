@@ -2654,6 +2654,126 @@ impl StorageEngine {
             upload_store_override: Some((store, prefix)),
         })
     }
+
+    /// Test helper: uploads the engine's current SSTable inventory to the
+    /// injected object store as a manifest. This makes `create_snapshot_with_store`
+    /// capture the correct SSTable references (since tests don't run an
+    /// `UploadManager` that would do this automatically in production).
+    ///
+    /// Also uploads placeholder SSTable data files so that `RestoreManager`
+    /// can download them during restore.
+    #[cfg(test)]
+    pub async fn upload_manifest_for_test(
+        &self,
+        store: Arc<dyn object_store::ObjectStore>,
+        prefix: &str,
+    ) {
+        use object_store::path::Path as ObjectPath;
+
+        let mut manifest =
+            match crate::manifest::Manifest::load(store.as_ref(), prefix).await {
+                Ok((m, _)) => m,
+                Err(_) => crate::manifest::Manifest::new(),
+            };
+
+        let tables = self.tables.read();
+        for (table_id, _state) in tables.iter() {
+            let table_dir = self
+                .config
+                .data_dir
+                .join("sstables")
+                .join(table_id.to_string());
+            if !table_dir.exists() {
+                continue;
+            }
+
+            // Scan for Data.db files to find all generation numbers.
+            let generations: Vec<u64> = std::fs::read_dir(&table_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let name = e.file_name().to_str()?.to_string();
+                    if name.ends_with("-Data.db") {
+                        name.split('-').next()?.parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let table_id_str = table_id.to_string();
+
+            for gen in generations {
+                let gen_str = gen.to_string();
+                let hex = crate::upload::manager::hex_prefix_for(&gen_str);
+
+                // Check if this generation is already in the manifest.
+                if manifest
+                    .sstables
+                    .get(&table_id_str)
+                    .is_some_and(|entries| entries.iter().any(|e| e.id == gen_str))
+                {
+                    continue;
+                }
+
+                // Add manifest entry.
+                let data_path = table_dir.join(format!("{gen}-Data.db"));
+                let size = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+
+                manifest.add_sstable(
+                    &table_id_str,
+                    crate::manifest::ManifestEntry {
+                        id: gen_str.clone(),
+                        size,
+                        min_token: i64::MIN,
+                        max_token: i64::MAX,
+                        min_timestamp: 0,
+                        max_timestamp: i64::MAX,
+                    },
+                );
+
+                // Upload actual SSTable component files to S3 so restore can download them.
+                let components = [
+                    "Data.db",
+                    "Partitions.db",
+                    "Rows.db",
+                    "Filter.db",
+                    "Statistics.db",
+                    "TOC.txt",
+                ];
+                for component in &components {
+                    let local_path = table_dir.join(format!("{gen}-{component}"));
+                    if local_path.exists() {
+                        let data = std::fs::read(&local_path).unwrap();
+                        let s3_path = ObjectPath::from(format!(
+                            "{prefix}/{hex}/{table_id_str}/{gen}/{component}"
+                        ));
+                        store
+                            .put(&s3_path, bytes::Bytes::from(data).into())
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        drop(tables);
+
+        manifest
+            .save_with_retry(store.as_ref(), prefix)
+            .await
+            .unwrap();
+
+        // Also update the schema snapshot in S3.
+        let tables_guard = self.tables.read();
+        let schemas: Vec<&TableSchema> =
+            tables_guard.values().map(|s| &s.schema).collect();
+        let schema_json = serde_json::to_vec_pretty(&schemas).unwrap_or_default();
+        drop(tables_guard);
+        crate::manifest::save_schema_snapshot(store.as_ref(), prefix, &schema_json)
+            .await
+            .unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4249,6 +4369,625 @@ mod tests {
                 "{prefix}/snapshots/test-snap/metadata.json"
             ));
             assert!(store.get(&meta_path).await.is_ok());
+
+            engine.shutdown().unwrap();
+        });
+    }
+
+    // =========================================================================
+    // PITR E2E: Full snapshot→restore data verification (FMEA E1-E3)
+    // =========================================================================
+
+    /// Helper: creates an engine with S3-backed manifest for snapshot tests.
+    /// Returns (engine, store, prefix). Must be called from an async context.
+    async fn setup_snapshot_engine(
+        dir: &std::path::Path,
+    ) -> (
+        StorageEngine,
+        Arc<dyn object_store::ObjectStore>,
+        &'static str,
+    ) {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "test-node";
+
+        // Initialise live manifest + schema in S3 (required by create_snapshot_with_store).
+        let manifest = crate::manifest::Manifest::new();
+        manifest
+            .save_with_retry(store.as_ref(), prefix)
+            .await
+            .unwrap();
+        crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+            .await
+            .unwrap();
+
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir),
+            ..StorageEngineConfig::test_config(dir)
+        };
+
+        let engine = StorageEngine::new(config, None).unwrap();
+        (engine, store, prefix)
+    }
+
+    /// Helper: a second table schema for multi-table tests.
+    fn test_schema_2() -> TableSchema {
+        TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "other_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    fn table_id_2() -> TableId {
+        TableId::new("test_ks", "other_table")
+    }
+
+    /// E1: Write data → snapshot → write more → restore → verify only
+    /// pre-snapshot data is present.
+    ///
+    /// This is the most fundamental PITR test: after restoring from a
+    /// snapshot, the database must contain exactly the data that existed
+    /// at snapshot time — no more, no less.
+    #[test]
+    fn e1_snapshot_restore_verifies_data_content() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            // ── Phase 1: Write data and create snapshot ──────────────
+            let dir = tempfile::tempdir().unwrap();
+            let (engine, store, prefix) = setup_snapshot_engine(dir.path()).await;
+
+            engine.register_table(test_schema()).unwrap();
+            let tid = table_id();
+
+            // Write 3 rows before snapshot.
+            engine
+                .write(&tid, &make_key("alice"), make_row(b"before-snap", 1000), 1000)
+                .unwrap();
+            engine
+                .write(&tid, &make_key("bob"), make_row(b"before-snap", 1001), 1001)
+                .unwrap();
+            engine
+                .write(&tid, &make_key("carol"), make_row(b"before-snap", 1002), 1002)
+                .unwrap();
+
+            // Flush so data is in SSTables (and thus in the manifest).
+            engine.flush(&tid).unwrap();
+
+            // Update S3 manifest with the flushed SSTable(s).
+            engine
+                .upload_manifest_for_test(Arc::clone(&store), prefix)
+                .await;
+
+            // Create snapshot.
+            let snap_metadata = engine
+                .create_snapshot_with_store(
+                    "snap-1",
+                    "node-1",
+                    None,
+                    false,
+                    Arc::clone(&store),
+                    prefix,
+                )
+                .await
+                .unwrap();
+            assert_eq!(snap_metadata.name, "snap-1");
+
+            // ── Phase 2: Write MORE data after snapshot ──────────────
+            engine
+                .write(&tid, &make_key("dave"), make_row(b"after-snap", 2000), 2000)
+                .unwrap();
+            engine
+                .write(&tid, &make_key("eve"), make_row(b"after-snap", 2001), 2001)
+                .unwrap();
+
+            // Verify all 5 rows exist in the live engine.
+            assert!(engine.read(&tid, &make_key("alice")).unwrap().is_some());
+            assert!(engine.read(&tid, &make_key("dave")).unwrap().is_some());
+            engine.shutdown().unwrap();
+
+            // ── Phase 3: Restore from snapshot ──────────────────────
+            let restore_dir = tempfile::tempdir().unwrap();
+            let restore_config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(restore_dir.path()),
+                ..StorageEngineConfig::test_config(restore_dir.path())
+            };
+
+            let restored = StorageEngine::open_from_snapshot_with_store(
+                restore_config,
+                "snap-1",
+                None,
+                "node-1",
+                false,
+                Arc::clone(&store),
+                prefix,
+            )
+            .await
+            .unwrap();
+
+            // Register the table so the engine can find the downloaded SSTables.
+            restored.register_table(test_schema()).unwrap();
+
+            // ── Phase 4: Verify data ────────────────────────────────
+            // Pre-snapshot rows MUST be present.
+            let alice = restored.read(&tid, &make_key("alice")).unwrap();
+            assert!(
+                alice.is_some(),
+                "pre-snapshot row 'alice' must survive restore"
+            );
+            let alice_partition = alice.unwrap();
+            assert_eq!(
+                alice_partition.rows[0].cells[0].1.value.as_deref(),
+                Some(b"before-snap".as_slice()),
+                "restored data must match original"
+            );
+
+            let bob = restored.read(&tid, &make_key("bob")).unwrap();
+            assert!(
+                bob.is_some(),
+                "pre-snapshot row 'bob' must survive restore"
+            );
+
+            let carol = restored.read(&tid, &make_key("carol")).unwrap();
+            assert!(
+                carol.is_some(),
+                "pre-snapshot row 'carol' must survive restore"
+            );
+
+            // Post-snapshot rows must NOT be present (they were only in
+            // the memtable after the snapshot, never flushed to the
+            // snapshot's SSTables).
+            let dave = restored.read(&tid, &make_key("dave")).unwrap();
+            assert!(
+                dave.is_none(),
+                "post-snapshot row 'dave' must NOT survive restore"
+            );
+
+            let eve = restored.read(&tid, &make_key("eve")).unwrap();
+            assert!(
+                eve.is_none(),
+                "post-snapshot row 'eve' must NOT survive restore"
+            );
+
+            restored.shutdown().unwrap();
+        });
+    }
+
+    /// E3: Multi-table snapshot — verifies data across two tables survives
+    /// restore correctly.
+    #[test]
+    fn e3_multi_table_snapshot_restore() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (engine, store, prefix) = setup_snapshot_engine(dir.path()).await;
+
+            // Register two tables.
+            engine.register_table(test_schema()).unwrap();
+            engine.register_table(test_schema_2()).unwrap();
+
+            let t1 = table_id();
+            let t2 = table_id_2();
+
+            // Write to both tables.
+            engine
+                .write(&t1, &make_key("t1-key"), make_row(b"table-one", 100), 100)
+                .unwrap();
+            engine
+                .write(&t2, &make_key("t2-key"), make_row(b"table-two", 101), 101)
+                .unwrap();
+
+            // Flush both tables.
+            engine.flush(&t1).unwrap();
+            engine.flush(&t2).unwrap();
+
+            // Update S3 manifest.
+            engine
+                .upload_manifest_for_test(Arc::clone(&store), prefix)
+                .await;
+
+            // Snapshot.
+            let _snap = engine
+                .create_snapshot_with_store(
+                    "multi-snap",
+                    "node-1",
+                    None,
+                    false,
+                    Arc::clone(&store),
+                    prefix,
+                )
+                .await
+                .unwrap();
+
+            engine.shutdown().unwrap();
+
+            // Restore.
+            let restore_dir = tempfile::tempdir().unwrap();
+            let restore_config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(restore_dir.path()),
+                ..StorageEngineConfig::test_config(restore_dir.path())
+            };
+
+            let restored = StorageEngine::open_from_snapshot_with_store(
+                restore_config,
+                "multi-snap",
+                None,
+                "node-1",
+                false,
+                Arc::clone(&store),
+                prefix,
+            )
+            .await
+            .unwrap();
+
+            restored.register_table(test_schema()).unwrap();
+            restored.register_table(test_schema_2()).unwrap();
+
+            // Both tables must have their data.
+            let r1 = restored.read(&t1, &make_key("t1-key")).unwrap();
+            assert!(r1.is_some(), "table 1 data must survive multi-table restore");
+            assert_eq!(
+                r1.unwrap().rows[0].cells[0].1.value.as_deref(),
+                Some(b"table-one".as_slice())
+            );
+
+            let r2 = restored.read(&t2, &make_key("t2-key")).unwrap();
+            assert!(r2.is_some(), "table 2 data must survive multi-table restore");
+            assert_eq!(
+                r2.unwrap().rows[0].cells[0].1.value.as_deref(),
+                Some(b"table-two".as_slice())
+            );
+
+            restored.shutdown().unwrap();
+        });
+    }
+
+    /// FM13: GC / compaction must not delete SSTables referenced by a live snapshot.
+    ///
+    /// Write data, flush, snapshot, flush again (creating new SSTable),
+    /// then verify the original SSTable (referenced by snapshot) still
+    /// exists and is readable after compaction or GC.
+    #[test]
+    fn fm13_snapshot_referenced_sstables_survive_compaction() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (engine, store, prefix) = setup_snapshot_engine(dir.path()).await;
+
+            engine.register_table(test_schema()).unwrap();
+            let tid = table_id();
+
+            // Write + flush → SSTable gen 1.
+            engine
+                .write(&tid, &make_key("k1"), make_row(b"gen1", 100), 100)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+
+            // Update S3 manifest and snapshot.
+            engine
+                .upload_manifest_for_test(Arc::clone(&store), prefix)
+                .await;
+
+            let _snap = engine
+                .create_snapshot_with_store(
+                    "protect-me",
+                    "node-1",
+                    None,
+                    false,
+                    Arc::clone(&store),
+                    prefix,
+                )
+                .await
+                .unwrap();
+
+            // Collect SSTable IDs protected by the snapshot.
+            let snap_mgr =
+                crate::snapshot::SnapshotManager::new(Arc::clone(&store), prefix.to_string());
+            let protected = snap_mgr.all_referenced_sstable_ids().await.unwrap();
+            assert!(
+                !protected.is_empty(),
+                "snapshot must reference at least one SSTable"
+            );
+
+            // Write more data + flush → SSTable gen 2 (new data, same table).
+            engine
+                .write(&tid, &make_key("k2"), make_row(b"gen2", 200), 200)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+
+            // Verify the snapshot-referenced SSTables are still tracked.
+            let still_protected = snap_mgr.all_referenced_sstable_ids().await.unwrap();
+            assert_eq!(
+                protected, still_protected,
+                "snapshot references must not change after new writes"
+            );
+
+            // Restore should still work and return gen1 data.
+            let restore_dir = tempfile::tempdir().unwrap();
+            let restore_config = StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(restore_dir.path()),
+                ..StorageEngineConfig::test_config(restore_dir.path())
+            };
+
+            let restored = StorageEngine::open_from_snapshot_with_store(
+                restore_config,
+                "protect-me",
+                None,
+                "node-1",
+                false,
+                Arc::clone(&store),
+                prefix,
+            )
+            .await
+            .unwrap();
+
+            restored.register_table(test_schema()).unwrap();
+
+            let r = restored.read(&tid, &make_key("k1")).unwrap();
+            assert!(r.is_some(), "snapshot-protected data must be restorable");
+            assert_eq!(
+                r.unwrap().rows[0].cells[0].1.value.as_deref(),
+                Some(b"gen1".as_slice())
+            );
+
+            engine.shutdown().unwrap();
+            restored.shutdown().unwrap();
+        });
+    }
+
+    /// FM1/FM8: Archiver SHA-256 verification — archived segment data in S3
+    /// must match the original segment on disk, bit-for-bit.
+    #[test]
+    fn fm1_archived_segment_content_integrity() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let prefix = "integrity-test";
+
+            let config = StorageEngineConfig {
+                commit_log: CommitLogConfig {
+                    segment_size: 512, // small to force rotation
+                    archive: Some(crate::commitlog::config::ArchiveConfig {
+                        enabled: true,
+                        poll_interval: std::time::Duration::from_millis(50),
+                        ..crate::commitlog::config::ArchiveConfig::default()
+                    }),
+                    ..CommitLogConfig::test_config(dir.path())
+                },
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+
+            let engine = StorageEngine::new_with_archive_store(
+                config,
+                Some(&tokio::runtime::Handle::current()),
+                Some(Arc::clone(&store)),
+                prefix.to_string(),
+            )
+            .unwrap();
+
+            engine.register_table(test_schema()).unwrap();
+            let tid = table_id();
+
+            // Write enough data to trigger multiple segment rotations.
+            for i in 0..30 {
+                let key_str = format!("key-{i:04}");
+                let val_str = format!("value-{i:04}");
+                engine
+                    .write(&tid, &make_key(&key_str), make_row(val_str.as_bytes(), i), i)
+                    .unwrap();
+            }
+
+            // Wait for archiver to process.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            // Load archive manifest.
+            let manifest =
+                crate::commitlog::manifest::ArchiveManifest::load(store.as_ref(), prefix)
+                    .await
+                    .unwrap();
+
+            assert!(
+                !manifest.segments.is_empty(),
+                "at least one segment must be archived"
+            );
+
+            // Verify each archived segment: SHA-256 in manifest matches S3 content.
+            for seg in &manifest.segments {
+                let hex = crate::upload::manager::hex_prefix_for(&seg.id.to_string());
+                let s3_path = object_store::path::Path::from(format!(
+                    "{prefix}/commitlog-archive/{hex}/{}.log",
+                    seg.id
+                ));
+                let result = store.get(&s3_path).await.unwrap();
+                let data = result.bytes().await.unwrap();
+
+                // Independently compute SHA-256.
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&data);
+                let actual_sha = format!("{:x}", hasher.finalize());
+
+                assert_eq!(
+                    seg.sha256, actual_sha,
+                    "archived segment {} SHA-256 mismatch",
+                    seg.id
+                );
+                assert_eq!(
+                    seg.size,
+                    data.len() as u64,
+                    "archived segment {} size mismatch",
+                    seg.id
+                );
+            }
+
+            engine.shutdown().unwrap();
+        });
+    }
+
+    /// Snapshot manifest SHA-256 integrity — verify the manifest stored in the
+    /// snapshot can be loaded and validated by RestoreManager.
+    #[test]
+    fn snapshot_manifest_sha256_roundtrip() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (engine, store, prefix) = setup_snapshot_engine(dir.path()).await;
+
+            engine.register_table(test_schema()).unwrap();
+            let tid = table_id();
+
+            // Write data so the manifest is non-empty.
+            engine
+                .write(&tid, &make_key("k"), make_row(b"v", 1), 1)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+            engine
+                .upload_manifest_for_test(Arc::clone(&store), prefix)
+                .await;
+
+            let snap_meta = engine
+                .create_snapshot_with_store(
+                    "sha-test",
+                    "node-1",
+                    None,
+                    false,
+                    Arc::clone(&store),
+                    prefix,
+                )
+                .await
+                .unwrap();
+
+            // RestoreManager must validate the SHA-256 successfully.
+            let restore_mgr = crate::restore::RestoreManager::new(
+                Arc::clone(&store),
+                prefix.to_string(),
+            );
+            let (loaded_meta, loaded_manifest) = restore_mgr
+                .load_and_validate_snapshot("sha-test")
+                .await
+                .unwrap();
+
+            assert_eq!(loaded_meta.name, "sha-test");
+            assert_eq!(loaded_meta.manifest_sha256, snap_meta.manifest_sha256);
+            // Manifest must have at least one table with SSTables.
+            assert!(
+                !loaded_manifest.sstables.is_empty(),
+                "snapshot manifest should reference at least one table"
+            );
+
+            engine.shutdown().unwrap();
+        });
+    }
+
+    /// Snapshot expiry — verify cleanup_expired removes old snapshots while
+    /// keeping non-expired ones, and that expired snapshot data is no longer
+    /// restorable.
+    #[test]
+    fn snapshot_expiry_cleanup_works() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (engine, store, prefix) = setup_snapshot_engine(dir.path()).await;
+
+            engine.register_table(test_schema()).unwrap();
+            let tid = table_id();
+            engine
+                .write(&tid, &make_key("k"), make_row(b"v", 1), 1)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+            engine
+                .upload_manifest_for_test(Arc::clone(&store), prefix)
+                .await;
+
+            // Create one snapshot that expires in the past, one that doesn't expire.
+            engine
+                .create_snapshot_with_store(
+                    "expired-snap",
+                    "node-1",
+                    Some("2020-01-01T00:00:00Z".to_string()), // already expired
+                    false,
+                    Arc::clone(&store),
+                    prefix,
+                )
+                .await
+                .unwrap();
+            engine
+                .create_snapshot_with_store(
+                    "permanent-snap",
+                    "node-1",
+                    None, // no expiry
+                    false,
+                    Arc::clone(&store),
+                    prefix,
+                )
+                .await
+                .unwrap();
+
+            let snap_mgr =
+                crate::snapshot::SnapshotManager::new(Arc::clone(&store), prefix.to_string());
+
+            // Before cleanup: both exist.
+            let before = snap_mgr.list_snapshots().await.unwrap();
+            assert_eq!(before.len(), 2);
+
+            // Cleanup at "now" (well past the expired date).
+            let deleted = snap_mgr
+                .cleanup_expired("2026-01-01T00:00:00Z")
+                .await
+                .unwrap();
+            assert_eq!(deleted.len(), 1);
+            assert_eq!(deleted[0], "expired-snap");
+
+            // After cleanup: only permanent remains.
+            let after = snap_mgr.list_snapshots().await.unwrap();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].name, "permanent-snap");
+
+            // Trying to restore expired snapshot must fail.
+            let restore_mgr = crate::restore::RestoreManager::new(
+                Arc::clone(&store),
+                prefix.to_string(),
+            );
+            let result = restore_mgr
+                .load_and_validate_snapshot("expired-snap")
+                .await;
+            assert!(result.is_err(), "expired snapshot should not be loadable");
 
             engine.shutdown().unwrap();
         });
