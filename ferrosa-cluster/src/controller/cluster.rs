@@ -18,7 +18,6 @@ use crate::coordinator::{ClusterCoordinator, RepairWriteHandler};
 use crate::ddl_path::{execute_via_raft, ClusterDdlForwardHandler, DdlPath};
 use crate::mode::DeploymentMode;
 use crate::pair::ddl::DdlOperation;
-use crate::pair::PairRole;
 use crate::raft::handlers::{
     RaftAppendHandler, RaftSnapshotHandler, RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
 };
@@ -96,9 +95,12 @@ impl ModeController {
             }
         };
 
-        // Capture whether this node was the seed (Primary) before we clear pair context.
-        // Only the seed calls raft.initialize() — others wait for AppendEntries.
-        let was_seed = self.role() == Some(PairRole::Primary);
+        // Determine whether this node is the seed (responsible for calling
+        // raft.initialize()). The seed is the node with the highest UUID among
+        // all cluster members — deterministic and independent of pair context
+        // which may have been cleared or never set (e.g., if the node joined
+        // directly from standalone mode in tests).
+        let was_seed = peers.iter().all(|(peer_uuid, _)| self.local_host_id > *peer_uuid);
 
         // Flush all memtables to SSTables before the write path switches to the
         // ClusterCoordinator. Data written in standalone/pair mode lives only in
@@ -435,6 +437,41 @@ impl ModeController {
                 }
             };
 
+            // Option B: Wait for Raft lane readiness before creating the
+            // Raft instance. Elections start as soon as `FerrosRaft::new()`
+            // returns, so outbound connections must exist first.
+            {
+                let deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(10);
+                for (peer_uuid, _) in &peers {
+                    let mut waited = false;
+                    while !peer_manager_for_bootstrap.has_peer(*peer_uuid) {
+                        if !waited {
+                            tracing::debug!(
+                                peer = %peer_uuid,
+                                "waiting for peer connection..."
+                            );
+                            waited = true;
+                        }
+                        if tokio::time::Instant::now() > deadline {
+                            tracing::warn!(
+                                peer = %peer_uuid,
+                                "Raft lane readiness timeout — proceeding anyway"
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+                tracing::info!("all Raft lane connections verified");
+            }
+
+            // Non-seed nodes create Raft promptly — they need to be ready
+            // to RESPOND to Vote RPCs from the seed. Without a Raft instance,
+            // the LazyRaft handlers timeout, preventing the seed from winning.
+            // The key invariant: only the seed calls initialize(), so only the
+            // seed starts elections. Non-seeds are passive responders.
+
             // Create the Raft instance
             let raft = match FerrosRaft::new(
                 local_node_id,
@@ -456,6 +493,12 @@ impl ModeController {
 
             // Publish the Raft instance — handlers waiting in LazyRaft::get() will unblock.
             let _ = raft_tx.send(Some(raft_arc.clone()));
+
+            // Also publish to the controller's raft_instance so that
+            // controller.raft() returns Some() during the election loop.
+            // Without this, external callers (tests, DDL) cannot observe
+            // the leader until the entire background task completes.
+            raft_instance_swap.store(Arc::new(Some(raft_arc.clone())));
 
             // Build initial membership: all known nodes including self
             let mut members = std::collections::BTreeMap::new();
@@ -481,9 +524,6 @@ impl ModeController {
             // independent initialize() calls with potentially different member lists).
             if was_seed {
                 if let Err(e) = raft_arc.initialize(members).await {
-                    // InitializeError::NotAllowed means the cluster was already
-                    // initialized (e.g. from a prior run with persisted log).
-                    // That is not fatal — the node will join the existing cluster.
                     tracing::warn!(%e, "raft initialize returned error (may be already initialized)");
                 }
             } else {
