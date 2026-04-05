@@ -24,6 +24,10 @@ use crate::pair::coordinator::decode_mutation;
 use crate::raft::state_machine::RaftState;
 use crate::ring::TokenRing;
 
+/// Maximum concurrent in-flight writes. Provides backpressure when the cluster
+/// is saturated, preventing runtime starvation of Raft heartbeat processing.
+const WRITE_CONCURRENCY_LIMIT: usize = 128;
+
 /// Coordinates writes and reads across replicas in cluster mode.
 pub struct ClusterCoordinator {
     pub(crate) ring: Arc<ArcSwap<TokenRing>>,
@@ -40,6 +44,9 @@ pub struct ClusterCoordinator {
     pub repair_metrics: Arc<ReadRepairMetrics>,
     /// Optional snapshot of Raft state for index-aware replica selection.
     pub(crate) raft_state: Option<Arc<ArcSwap<RaftState>>>,
+    /// Bounded semaphore limiting concurrent in-flight writes. Prevents bulk
+    /// CQL inserts from saturating the tokio runtime and starving Raft.
+    pub(crate) write_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl ClusterCoordinator {
@@ -61,6 +68,7 @@ impl ClusterCoordinator {
             hint_store: None,
             repair_metrics: Arc::new(ReadRepairMetrics::new()),
             raft_state: None,
+            write_semaphore: Arc::new(tokio::sync::Semaphore::new(WRITE_CONCURRENCY_LIMIT)),
         }
     }
 

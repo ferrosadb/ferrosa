@@ -9,7 +9,9 @@ use crate::error::NetError;
 use crate::codec::Lane;
 use crate::config::NetConfig;
 use crate::error::Result;
-use crate::lane_actor::{spawn_lane_actor, ActorReconnectContext, LaneHandle, LaneStatusReport};
+use crate::lane_actor::{
+    spawn_lane_actor, spawn_raft_lane_actor, ActorReconnectContext, LaneHandle, LaneStatusReport,
+};
 use crate::message::Message;
 use crate::reconnect::LaneState;
 use crate::rpc::client::RpcClient;
@@ -100,16 +102,23 @@ impl PriorityPool {
         // Spawn a lane actor for each connection.  The ctx_builder closure
         // captures the shared config/TLS state and wires up the reconnect
         // context with a handle back to the actor itself.
-        let raft = spawn_lane_actor(Lane::Raft, LaneState::Connected(raft_client), |h| {
-            ActorReconnectContext {
+        let peer_label = format!("{}", peer_host_id.as_fields().0);
+        let raft_config = Arc::clone(&config);
+        let raft_peer_host = peer_host.clone();
+        let raft_tls = tls_connector.clone();
+        let raft = spawn_raft_lane_actor(
+            Lane::Raft,
+            LaneState::Connected(raft_client),
+            peer_label,
+            move |h| ActorReconnectContext {
                 lane: Lane::Raft,
-                config: Arc::clone(&config),
+                config: raft_config,
                 local_host_id,
-                peer_host: peer_host.clone(),
-                tls_connector: tls_connector.clone(),
+                peer_host: raft_peer_host,
+                tls_connector: raft_tls,
                 handle: h,
-            }
-        });
+            },
+        );
         let data = spawn_lane_actor(Lane::Data, LaneState::Connected(data_client), |h| {
             ActorReconnectContext {
                 lane: Lane::Data,

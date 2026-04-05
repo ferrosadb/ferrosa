@@ -22,7 +22,7 @@ use crate::reconnect::{connect_with_retry, spawn_alive_watcher, ExponentialBacko
 use crate::rpc::client::RpcClient;
 
 /// Channel capacity for lane actor commands.
-const LANE_CHANNEL_CAPACITY: usize = 64;
+const LANE_CHANNEL_CAPACITY: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -230,6 +230,36 @@ pub(crate) fn spawn_lane_actor(
     let handle = LaneHandle { tx, lane };
     let ctx = ctx_builder(handle.clone());
     tokio::spawn(lane_actor_loop(lane, initial_state, rx, ctx));
+    handle
+}
+
+/// Spawns a lane actor on a **dedicated OS thread** with its own single-threaded
+/// tokio runtime. Used for the Raft lane to guarantee heartbeat processing cannot
+/// be starved by data-path saturation on the shared runtime.
+///
+/// The actor loop logic is identical to [`spawn_lane_actor`]; only the execution
+/// context differs.
+pub(crate) fn spawn_raft_lane_actor(
+    lane: Lane,
+    initial_state: LaneState,
+    peer_label: String,
+    ctx_builder: impl FnOnce(LaneHandle) -> ActorReconnectContext + Send + 'static,
+) -> LaneHandle {
+    let (tx, rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
+    let handle = LaneHandle { tx, lane };
+    let ctx = ctx_builder(handle.clone());
+
+    std::thread::Builder::new()
+        .name(format!("raft-lane-{peer_label}"))
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("raft lane runtime");
+            rt.block_on(lane_actor_loop(lane, initial_state, rx, ctx));
+        })
+        .expect("spawn raft lane thread");
+
     handle
 }
 

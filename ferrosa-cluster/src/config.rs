@@ -73,8 +73,8 @@ impl Default for ClusterConfig {
             formation_timeout_secs: None,
             cql_broadcast: None,
             raft_heartbeat_ms: 300,
-            raft_election_timeout_min_ms: 1000,
-            raft_election_timeout_max_ms: 2000,
+            raft_election_timeout_min_ms: 3000,
+            raft_election_timeout_max_ms: 6000,
         }
     }
 }
