@@ -84,7 +84,12 @@ async fn handle_sparql_post(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("rdf");
 
-    execute_and_respond(&state, &query_str, keyspace)
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    execute_and_respond(&state, &query_str, keyspace, accept)
 }
 
 /// GET /sparql?query=... — execute a SPARQL query via URL parameter.
@@ -101,9 +106,15 @@ fn default_keyspace() -> String {
 
 async fn handle_sparql_get(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     AxumQuery(params): AxumQuery<SparqlGetParams>,
 ) -> Response {
-    execute_and_respond(&state, &params.query, &params.keyspace)
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    execute_and_respond(&state, &params.query, &params.keyspace, accept)
 }
 
 /// POST /sparql/update — execute a SPARQL UPDATE (INSERT DATA, DELETE DATA).
@@ -150,17 +161,19 @@ async fn handle_health() -> Response {
 
 /// Execute a SPARQL query and build the HTTP response.
 ///
-/// **BUG-S7 note:** Content negotiation is not yet implemented. This endpoint
-/// always returns `application/sparql-results+json`. Clients requesting
-/// Turtle, N-Triples, or XML will still receive JSON. A future sprint will
-/// parse the `Accept` header and dispatch to the appropriate serializer.
-fn execute_and_respond(state: &AppState, query: &str, keyspace: &str) -> Response {
+/// Parses the `Accept` header to determine the response format. Supports:
+/// - `text/turtle` -> Turtle serialization
+/// - `application/n-triples` -> N-Triples serialization
+/// - Default -> `application/sparql-results+json`
+fn execute_and_respond(state: &AppState, query: &str, keyspace: &str, accept: &str) -> Response {
+    let format = crate::results::ResultFormat::from_accept(accept);
+
     match state.engine.execute(query, keyspace) {
-        Ok(result) => match result.to_json() {
-            Ok(json_bytes) => (
+        Ok(result) => match result.serialize(format) {
+            Ok(bytes) => (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/sparql-results+json")],
-                json_bytes,
+                [(header::CONTENT_TYPE, format.content_type())],
+                bytes,
             )
                 .into_response(),
             Err(e) => error_response(

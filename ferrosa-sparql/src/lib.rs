@@ -11,6 +11,7 @@ pub mod filter;
 pub mod http;
 pub mod namespace;
 pub mod planner;
+pub mod property_path;
 pub mod rdf_star;
 pub mod results;
 pub mod triple_store;

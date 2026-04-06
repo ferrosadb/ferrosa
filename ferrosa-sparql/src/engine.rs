@@ -24,6 +24,34 @@ impl SparqlResult {
             Self::Ask(result) => serde_json::to_vec(result),
         }
     }
+
+    /// Serialize to N-Triples bytes.
+    pub fn to_ntriples(&self) -> Vec<u8> {
+        match self {
+            Self::Select(results) => results.to_ntriples(),
+            Self::Ask(result) => format!("# boolean: {}\n", result.boolean).into_bytes(),
+        }
+    }
+
+    /// Serialize to Turtle bytes (currently N-Triples subset).
+    pub fn to_turtle(&self) -> Vec<u8> {
+        match self {
+            Self::Select(results) => results.to_turtle(),
+            Self::Ask(result) => format!("# boolean: {}\n", result.boolean).into_bytes(),
+        }
+    }
+
+    /// Serialize to the requested format.
+    pub fn serialize(
+        &self,
+        format: crate::results::ResultFormat,
+    ) -> Result<Vec<u8>, serde_json::Error> {
+        match format {
+            crate::results::ResultFormat::Json => self.to_json(),
+            crate::results::ResultFormat::Turtle => Ok(self.to_turtle()),
+            crate::results::ResultFormat::NTriples => Ok(self.to_ntriples()),
+        }
+    }
 }
 
 /// Configuration for the SPARQL engine.

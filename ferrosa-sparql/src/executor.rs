@@ -64,21 +64,76 @@ fn evaluate_triple_patterns(
     let mut binding_sets: Vec<HashMap<String, Binding>> = vec![HashMap::new()];
 
     for (tp, op) in &plan.ops {
-        let rows = fetch_triples(op, storage)?;
-        let mut new_bindings = Vec::new();
-
-        for existing in &binding_sets {
-            for triple in &rows {
-                if let Some(row) = try_bind_triple(tp, triple, existing) {
-                    new_bindings.push(row);
-                }
-            }
-        }
-
+        let new_bindings = match op {
+            TripleOp::PropertyPath {
+                graph,
+                subject,
+                path,
+                object,
+            } => evaluate_path_op(graph, subject, path, object, &binding_sets, storage)?,
+            _ => evaluate_standard_op(tp, op, &binding_sets, storage)?,
+        };
         binding_sets = new_bindings;
     }
 
     Ok(binding_sets)
+}
+
+/// Evaluate a property path op via BFS traversal.
+fn evaluate_path_op(
+    graph: &str,
+    subject: &spargebra::term::TermPattern,
+    path: &spargebra::algebra::PropertyPathExpression,
+    object: &spargebra::term::TermPattern,
+    existing_bindings: &[HashMap<String, Binding>],
+    storage: &Arc<StorageEngine>,
+) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
+    let results =
+        crate::property_path::evaluate_property_path(subject, path, object, graph, storage)?;
+    let path_bindings = crate::property_path::path_results_to_bindings(subject, object, &results);
+
+    let mut new_bindings = Vec::new();
+    for existing in existing_bindings {
+        for pb in &path_bindings {
+            if let Some(merged) = try_merge_bindings(existing, pb) {
+                new_bindings.push(merged);
+            }
+        }
+    }
+    Ok(new_bindings)
+}
+
+/// Evaluate a standard (non-path) triple pattern op.
+fn evaluate_standard_op(
+    tp: &spargebra::term::TriplePattern,
+    op: &TripleOp,
+    existing_bindings: &[HashMap<String, Binding>],
+    storage: &Arc<StorageEngine>,
+) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
+    let rows = fetch_triples(op, storage)?;
+    let mut new_bindings = Vec::new();
+    for existing in existing_bindings {
+        for triple in &rows {
+            if let Some(row) = try_bind_triple(tp, triple, existing) {
+                new_bindings.push(row);
+            }
+        }
+    }
+    Ok(new_bindings)
+}
+
+/// Merge two binding sets if compatible (no conflicting values).
+fn try_merge_bindings(
+    a: &HashMap<String, Binding>,
+    b: &HashMap<String, Binding>,
+) -> Option<HashMap<String, Binding>> {
+    let mut merged = a.clone();
+    for (key, val) in b {
+        if !try_insert_binding(&mut merged, key, val) {
+            return None;
+        }
+    }
+    Some(merged)
 }
 
 /// Try to bind a fetched triple into an existing binding row.
@@ -199,6 +254,42 @@ type FetchedTriple = (
     Option<String>,
 );
 
+/// Maximum number of partitions returned by a range scan.
+const SCAN_ROW_CAP: usize = 10_000;
+
+/// Name of the secondary index on the object column.
+const OBJECT_INDEX_NAME: &str = "rdf_triples_object_idx";
+
+/// Attempt to fetch partitions matching an object value via secondary index.
+///
+/// Falls back to a full range scan with post-fetch filtering if the index
+/// does not exist. Logs a warning on fallback and on truncation.
+fn fetch_by_object_index(
+    table_id: &ferrosa_storage::TableId,
+    object: &str,
+    storage: &Arc<StorageEngine>,
+) -> Result<Vec<ferrosa_sstable::types::Partition>, SparqlError> {
+    let index_key = ferrosa_index::IndexKey(object.as_bytes().to_vec());
+    let indexed = storage.read_by_index(table_id, OBJECT_INDEX_NAME, &index_key)?;
+    if !indexed.is_empty() {
+        return Ok(indexed);
+    }
+
+    // Fallback: no index or no matches — use range scan.
+    tracing::warn!(
+        object,
+        "ObjectScan: no secondary index hit; falling back to full scan with filtering"
+    );
+    let results = storage.read_range(table_id, None, None, SCAN_ROW_CAP)?;
+    if results.len() >= SCAN_ROW_CAP {
+        tracing::warn!(
+            cap = SCAN_ROW_CAP,
+            "ObjectScan results truncated at row cap; results may be incomplete"
+        );
+    }
+    Ok(results)
+}
+
 /// Fetch triples from storage for a single triple pattern operation.
 fn fetch_triples(
     op: &TripleOp,
@@ -210,6 +301,10 @@ fn fetch_triples(
         | TripleOp::PredicateScan { graph, .. }
         | TripleOp::ObjectScan { graph, .. }
         | TripleOp::FullScan { graph, .. } => graph.as_str(),
+        TripleOp::PropertyPath { .. } => {
+            // PropertyPath ops are handled in evaluate_path_op; this is unreachable.
+            return Ok(vec![]);
+        }
     };
     let table_id = triple_store::triples_table_id(graph);
 
@@ -221,9 +316,18 @@ fn fetch_triples(
                 None => vec![],
             }
         }
-        TripleOp::PredicateScan { .. }
-        | TripleOp::ObjectScan { .. }
-        | TripleOp::FullScan { .. } => storage.read_range(&table_id, None, None, 10_000)?,
+        TripleOp::ObjectScan { object, .. } => fetch_by_object_index(&table_id, object, storage)?,
+        TripleOp::PredicateScan { .. } | TripleOp::FullScan { .. } => {
+            let results = storage.read_range(&table_id, None, None, SCAN_ROW_CAP)?;
+            if results.len() >= SCAN_ROW_CAP {
+                tracing::warn!(
+                    cap = SCAN_ROW_CAP,
+                    "scan results truncated at row cap; results may be incomplete"
+                );
+            }
+            results
+        }
+        TripleOp::PropertyPath { .. } => return Ok(vec![]),
     };
 
     let mut triples = Vec::new();
@@ -395,6 +499,20 @@ fn extract_clustering_string(clustering: &[u8], position: usize) -> String {
         "clustering key: fell through component loop without finding position"
     );
     String::new()
+}
+
+/// Extract the subject string from a partition's composite key.
+///
+/// Public wrapper for use by [`crate::property_path`].
+pub fn extract_subject_from_key(partition: &ferrosa_sstable::types::Partition) -> String {
+    extract_subject_from_partition_key(partition.key.key.as_bytes())
+}
+
+/// Extract a clustering key component by position.
+///
+/// Public wrapper for use by [`crate::property_path`].
+pub fn clustering_component(clustering: &[u8], position: usize) -> String {
+    extract_clustering_string(clustering, position)
 }
 
 #[cfg(test)]
@@ -619,6 +737,100 @@ mod tests {
         apply_scan_filters(&op, &mut triples);
         assert_eq!(triples.len(), 1);
         assert_eq!(triples[0].0, "s2");
+    }
+
+    // --- ObjectScan index + post-filter tests ---
+
+    #[test]
+    fn object_scan_post_filter_retains_matching_object() {
+        // Verify that ObjectScan applies post-fetch object filter even
+        // when results come from a range scan (no index).
+        let mut triples = vec![
+            triple("s1", "p1", "target", "uri"),
+            triple("s2", "p2", "other", "uri"),
+            triple("s3", "p3", "target", "uri"),
+        ];
+        let op = TripleOp::ObjectScan {
+            graph: "default".into(),
+            object: "target".into(),
+        };
+        apply_scan_filters(&op, &mut triples);
+        assert_eq!(
+            triples.len(),
+            2,
+            "only triples with object=target should remain"
+        );
+        assert!(triples.iter().all(|(_, _, o, _, _, _)| o == "target"));
+    }
+
+    #[test]
+    fn scan_row_cap_constant_is_10k() {
+        assert_eq!(SCAN_ROW_CAP, 10_000, "scan cap must be 10,000");
+    }
+
+    #[test]
+    fn object_index_name_is_correct() {
+        assert_eq!(
+            OBJECT_INDEX_NAME, "rdf_triples_object_idx",
+            "index name must match the DDL"
+        );
+    }
+
+    // --- try_merge_bindings ---
+
+    #[test]
+    fn merge_bindings_compatible() {
+        let mut a = HashMap::new();
+        a.insert(
+            "s".into(),
+            Binding {
+                binding_type: "uri".into(),
+                value: "http://ex/alice".into(),
+                datatype: None,
+                lang: None,
+            },
+        );
+        let mut b = HashMap::new();
+        b.insert(
+            "o".into(),
+            Binding {
+                binding_type: "uri".into(),
+                value: "http://ex/bob".into(),
+                datatype: None,
+                lang: None,
+            },
+        );
+        let merged = try_merge_bindings(&a, &b);
+        assert!(merged.is_some(), "disjoint bindings must merge");
+        let m = merged.unwrap();
+        assert!(m.contains_key("s"));
+        assert!(m.contains_key("o"));
+    }
+
+    #[test]
+    fn merge_bindings_conflict() {
+        let mut a = HashMap::new();
+        a.insert(
+            "s".into(),
+            Binding {
+                binding_type: "uri".into(),
+                value: "http://ex/alice".into(),
+                datatype: None,
+                lang: None,
+            },
+        );
+        let mut b = HashMap::new();
+        b.insert(
+            "s".into(),
+            Binding {
+                binding_type: "uri".into(),
+                value: "http://ex/bob".into(),
+                datatype: None,
+                lang: None,
+            },
+        );
+        let merged = try_merge_bindings(&a, &b);
+        assert!(merged.is_none(), "conflicting bindings must not merge");
     }
 
     // --- Helpers ---

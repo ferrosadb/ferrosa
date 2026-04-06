@@ -24,6 +24,13 @@ pub enum TripleOp {
     ObjectScan { graph: String, object: String },
     /// Full table scan (no bound terms) — expensive, requires LIMIT.
     FullScan { graph: String },
+    /// Property path traversal (BFS/DFS) — evaluates transitive closure.
+    PropertyPath {
+        graph: String,
+        subject: spargebra::term::TermPattern,
+        path: spargebra::algebra::PropertyPathExpression,
+        object: spargebra::term::TermPattern,
+    },
 }
 
 /// A sort ordering for ORDER BY.
@@ -261,28 +268,29 @@ fn collect_ops(
             path,
             object,
         } => {
-            // Property paths (e.g., foaf:knows+, foaf:knows*, foaf:knows?)
-            // are translated to a series of triple patterns with the
-            // predicate extracted from the path expression. Full BFS/DFS
-            // evaluation is deferred to Sprint 2; for now we evaluate
-            // single-step paths (iri) and warn on transitive closures.
-            let pred_iri = extract_predicate_from_path(path);
-            match pred_iri {
-                Some(iri) => {
-                    // Create a synthetic triple pattern for the path.
-                    let tp = TriplePattern {
-                        subject: subject.clone(),
-                        predicate: NamedNodePattern::NamedNode(
-                            spargebra::term::NamedNode::new_unchecked(&iri),
-                        ),
-                        object: object.clone(),
-                    };
-                    let op = plan_triple_pattern(&tp, default_graph);
-                    ops.push((tp, op));
-                }
-                None => {
-                    tracing::warn!(?path, "complex property path — evaluating as single hop");
-                }
+            // Property paths: check if it is a simple named node (single hop)
+            // or a closure operator (+, *, ?) requiring BFS traversal.
+            if is_simple_named_path(path) {
+                let iri = extract_predicate_from_path(path).unwrap();
+                let tp = TriplePattern {
+                    subject: subject.clone(),
+                    predicate: NamedNodePattern::NamedNode(
+                        spargebra::term::NamedNode::new_unchecked(&iri),
+                    ),
+                    object: object.clone(),
+                };
+                let op = plan_triple_pattern(&tp, default_graph);
+                ops.push((tp, op));
+            } else {
+                // Transitive/closure path — emit PropertyPath op for BFS.
+                let tp = build_path_triple_pattern(subject, path, object);
+                let op = TripleOp::PropertyPath {
+                    graph: default_graph.to_string(),
+                    subject: subject.clone(),
+                    path: path.clone(),
+                    object: object.clone(),
+                };
+                ops.push((tp, op));
             }
         }
         GraphPattern::Union { left, right } => {
@@ -334,6 +342,31 @@ fn collect_ops(
         }
     }
     Ok(())
+}
+
+/// Check whether a property path is a simple named node (single hop, no closure).
+fn is_simple_named_path(path: &spargebra::algebra::PropertyPathExpression) -> bool {
+    matches!(
+        path,
+        spargebra::algebra::PropertyPathExpression::NamedNode(_)
+    )
+}
+
+/// Build a synthetic TriplePattern for a property path operation.
+///
+/// Uses the base predicate extracted from the path as the predicate component.
+fn build_path_triple_pattern(
+    subject: &spargebra::term::TermPattern,
+    path: &spargebra::algebra::PropertyPathExpression,
+    object: &spargebra::term::TermPattern,
+) -> TriplePattern {
+    let iri =
+        extract_predicate_from_path(path).unwrap_or_else(|| "urn:ferrosa:unknown-path".into());
+    TriplePattern {
+        subject: subject.clone(),
+        predicate: NamedNodePattern::NamedNode(spargebra::term::NamedNode::new_unchecked(&iri)),
+        object: object.clone(),
+    }
 }
 
 /// Extract the predicate IRI from a property path expression.
@@ -523,5 +556,50 @@ mod tests {
             }
             other => panic!("expected SubjectLookup, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_property_path_one_or_more_emits_path_op() {
+        let query = spargebra::SparqlParser::new()
+            .parse_query(
+                "SELECT ?o WHERE { <http://example.org/alice> <http://xmlns.com/foaf/0.1/knows>+ ?o }",
+            )
+            .unwrap();
+        let plan = plan_query(&query, "default").unwrap();
+        assert_eq!(plan.ops.len(), 1);
+        assert!(
+            matches!(plan.ops[0].1, TripleOp::PropertyPath { .. }),
+            "OneOrMore path must produce PropertyPath op, got {:?}",
+            plan.ops[0].1
+        );
+    }
+
+    #[test]
+    fn plan_property_path_zero_or_more_emits_path_op() {
+        let query = spargebra::SparqlParser::new()
+            .parse_query(
+                "SELECT ?o WHERE { <http://example.org/alice> <http://xmlns.com/foaf/0.1/knows>* ?o }",
+            )
+            .unwrap();
+        let plan = plan_query(&query, "default").unwrap();
+        assert!(
+            matches!(plan.ops[0].1, TripleOp::PropertyPath { .. }),
+            "ZeroOrMore path must produce PropertyPath op"
+        );
+    }
+
+    #[test]
+    fn plan_simple_named_path_emits_standard_op() {
+        // A simple named path (no closure operator) should NOT produce PropertyPath.
+        let query = spargebra::SparqlParser::new()
+            .parse_query(
+                "SELECT ?o WHERE { <http://example.org/alice> <http://xmlns.com/foaf/0.1/knows> ?o }",
+            )
+            .unwrap();
+        let plan = plan_query(&query, "default").unwrap();
+        assert!(
+            !matches!(plan.ops[0].1, TripleOp::PropertyPath { .. }),
+            "simple BGP should not produce PropertyPath op"
+        );
     }
 }
