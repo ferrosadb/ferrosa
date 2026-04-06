@@ -121,9 +121,29 @@ impl RpcHandler for MutationForwardHandler {
         let mutation = decode_mutation(&body).ok()?;
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
         for row in &mutation.rows {
-            let _ = self
+            if let Err(e) = self
                 .storage
-                .write(&table_id, &mutation.key, row.clone(), mutation.timestamp);
+                .write(&table_id, &mutation.key, row.clone(), mutation.timestamp)
+            {
+                // CRITICAL: Do NOT return MutationAck when the write fails.
+                // Returning ACK here would make the coordinator count this as a
+                // successful replica write, but the data is NOT stored. This is
+                // a phantom ACK that violates consistency guarantees.
+                //
+                // Common failure causes:
+                // - Schema propagation lag: table not yet registered via Raft
+                // - Storage errors: disk full, I/O failure
+                //
+                // By returning None (no response), the coordinator's send()
+                // will timeout, treating this as a failed replica. The coordinator
+                // will then store a hint for later replay.
+                tracing::warn!(
+                    %e,
+                    table = %table_id,
+                    "MutationForward write failed — not sending ACK"
+                );
+                return None;
+            }
         }
         Some(Message::MutationAck(Bytes::new()))
     }
@@ -435,6 +455,43 @@ mod tests {
         fn on_peer_suspected(&self, _peer: PeerId) {}
         fn on_peer_recovered(&self, _peer_id: uuid::Uuid) {}
         fn on_peer_failed(&self, _peer_id: uuid::Uuid) {}
+    }
+
+    /// MutationForwardHandler must NOT return ACK when the write fails.
+    /// Returning ACK on failure is a phantom acknowledgement that makes
+    /// the coordinator believe the replica has the data when it doesn't.
+    #[tokio::test]
+    async fn mutation_forward_handler_no_ack_on_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        // Deliberately do NOT register the test table — simulates schema
+        // propagation lag where the table doesn't exist on this node yet.
+
+        let handler = MutationForwardHandler::new(storage.clone());
+
+        let mutation = Mutation {
+            mutation_id: [0x91u8; 16],
+            keyspace: "nonexistent_ks".to_string(),
+            table: "nonexistent_tbl".to_string(),
+            key: test_key(),
+            rows: vec![test_row()],
+            timestamp: 1000,
+        };
+        let body = encode_mutation(&mutation);
+        let msg = Message::MutationForward(body);
+
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let response = handler.handle(peer_id, msg).await;
+
+        // The handler must NOT return MutationAck when the write fails.
+        // Returning None causes the coordinator's send() to timeout,
+        // which correctly counts as a failed replica.
+        assert!(
+            response.is_none(),
+            "MutationForwardHandler must NOT return ACK when write fails — \
+             this would be a phantom ACK causing the coordinator to think the \
+             replica has the data when it doesn't"
+        );
     }
 
     #[test]
