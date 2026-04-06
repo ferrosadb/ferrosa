@@ -81,6 +81,13 @@ impl CqlClient {
             )));
         }
 
+        // The server enables v5 framing after READY when the client sends
+        // VERSION_REQUEST (0x05). The client must also switch to v5 framed
+        // mode so subsequent messages are wrapped in CRC-protected frames.
+        if ready {
+            framed.codec_mut().enable_v5_framing();
+        }
+
         Ok(Self {
             framed,
             stream_counter: 1,
