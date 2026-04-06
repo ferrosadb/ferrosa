@@ -147,16 +147,21 @@ async fn handle_sparql_update(
     }
 }
 
-/// GET /sparql/health — health check (intentionally unauthenticated).
+/// GET /sparql/health — basic health check.
 ///
-/// Load balancers and k8s probes need to reach this without credentials.
-/// This matches the pattern in ferrosa-graph's `/graph/health` endpoint.
-async fn handle_health() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "ok", "service": "sparql"})),
-    )
-        .into_response()
+/// Returns service status. When auth is enabled, returns a minimal
+/// response that does not reveal internal details.
+async fn handle_health(State(state): State<AppState>) -> Response {
+    if state.auth_disabled {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "service": "sparql"})),
+        )
+            .into_response()
+    } else {
+        // With auth enabled, return just the status without service details.
+        (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
+    }
 }
 
 /// Execute a SPARQL query and build the HTTP response.

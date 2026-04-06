@@ -80,8 +80,28 @@ pub struct SparqlEngine {
 
 impl SparqlEngine {
     /// Create a new SPARQL engine.
+    ///
+    /// Registers the `rdf_triples` table schema for the default graph
+    /// keyspace so that INSERT/DELETE/SELECT queries can execute without
+    /// requiring external DDL.
     pub fn new(storage: Arc<StorageEngine>, config: SparqlConfig) -> Self {
+        // Register the RDF triples table for the default keyspace.
+        let schema = crate::triple_store::rdf_triples_schema(&config.default_graph);
+        if let Err(e) = storage.register_table(schema) {
+            tracing::warn!(%e, "failed to register rdf_triples table for default graph");
+        }
         Self { storage, config }
+    }
+
+    /// Ensure the rdf_triples table is registered for a given keyspace.
+    ///
+    /// Called lazily when a query targets a keyspace other than the default.
+    fn ensure_table_registered(&self, keyspace: &str) {
+        let schema = crate::triple_store::rdf_triples_schema(keyspace);
+        if let Err(e) = self.storage.register_table(schema) {
+            // register_table returns Ok(()) if already registered.
+            tracing::debug!(%e, keyspace, "rdf_triples table registration");
+        }
     }
 
     /// Execute a SPARQL UPDATE and return the result.
@@ -100,6 +120,7 @@ impl SparqlEngine {
                 "invalid keyspace name: {ks}"
             )));
         }
+        self.ensure_table_registered(ks);
         crate::update::execute_update(update_str, ks, &self.storage)
     }
 
@@ -127,6 +148,9 @@ impl SparqlEngine {
                 "invalid keyspace name: {graph}"
             )));
         }
+
+        // Ensure rdf_triples table exists for this keyspace.
+        self.ensure_table_registered(graph);
 
         let plan = planner::plan_query(&query, graph)?;
 
