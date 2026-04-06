@@ -8,7 +8,25 @@ use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::SparqlError;
 use crate::planner;
-use crate::results::SparqlJsonResults;
+use crate::results::{SparqlAskResult, SparqlJsonResults};
+
+/// Result of a SPARQL query execution, supporting both SELECT and ASK forms.
+pub enum SparqlResult {
+    /// SELECT query result (binding sets).
+    Select(SparqlJsonResults),
+    /// ASK query result (boolean).
+    Ask(SparqlAskResult),
+}
+
+impl SparqlResult {
+    /// Serialize to JSON bytes.
+    pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
+        match self {
+            Self::Select(results) => results.to_json(),
+            Self::Ask(result) => serde_json::to_vec(result),
+        }
+    }
+}
 
 /// Configuration for the SPARQL engine.
 #[derive(Debug, Clone)]
@@ -40,25 +58,37 @@ impl SparqlEngine {
         Self { storage, config }
     }
 
-    /// Execute a SPARQL query and return JSON results.
-    pub fn execute(
-        &self,
-        query_str: &str,
-        keyspace: &str,
-    ) -> Result<SparqlJsonResults, SparqlError> {
-        let _keyspace = keyspace; // Used in Sprint 2 for keyspace-scoped graphs.
-
+    /// Execute a SPARQL query and return results.
+    ///
+    /// The `keyspace` parameter scopes the query to a specific tenant/keyspace.
+    /// ASK queries return a boolean result; SELECT queries return binding sets.
+    pub fn execute(&self, query_str: &str, keyspace: &str) -> Result<SparqlResult, SparqlError> {
         // 1. Parse SPARQL → algebra.
         let query =
             Query::parse(query_str, None).map_err(|e| SparqlError::Parse(format!("{e}")))?;
 
         // 2. Plan: algebra → storage operations.
-        let plan = planner::plan_query(&query, &self.config.default_graph)?;
+        // BUG-S1 fix: use caller-supplied keyspace instead of default_graph.
+        let graph = if keyspace.is_empty() {
+            &self.config.default_graph
+        } else {
+            keyspace
+        };
+        let plan = planner::plan_query(&query, graph)?;
 
         // 3. Execute plan against storage.
         let results = crate::executor::execute(&plan, &self.storage)?;
 
-        Ok(results)
+        // BUG-S6 fix: ASK queries return boolean result format.
+        if plan.is_ask {
+            let has_results = !results.results.bindings.is_empty();
+            return Ok(SparqlResult::Ask(SparqlAskResult {
+                head: crate::results::ResultHead { vars: vec![] },
+                boolean: has_results,
+            }));
+        }
+
+        Ok(SparqlResult::Select(results))
     }
 }
 

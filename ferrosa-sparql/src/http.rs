@@ -108,9 +108,15 @@ async fn handle_health() -> Response {
         .into_response()
 }
 
+/// Execute a SPARQL query and build the HTTP response.
+///
+/// **BUG-S7 note:** Content negotiation is not yet implemented. This endpoint
+/// always returns `application/sparql-results+json`. Clients requesting
+/// Turtle, N-Triples, or XML will still receive JSON. A future sprint will
+/// parse the `Accept` header and dispatch to the appropriate serializer.
 fn execute_and_respond(state: &AppState, query: &str, keyspace: &str) -> Response {
     match state.engine.execute(query, keyspace) {
-        Ok(results) => match results.to_json() {
+        Ok(result) => match result.to_json() {
             Ok(json_bytes) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/sparql-results+json")],

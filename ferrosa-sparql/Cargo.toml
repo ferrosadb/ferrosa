@@ -16,6 +16,7 @@ oxrdf = "0.1"
 
 # Internal ferrosa crates
 ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 
