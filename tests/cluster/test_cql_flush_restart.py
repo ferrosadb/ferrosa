@@ -26,13 +26,15 @@ from cassandra.cluster import Cluster
 from cassandra.query import SimpleStatement, ConsistencyLevel
 
 CQL_PORTS = [
-    int(os.environ.get("CQL_PORT_1", "30042")),
-    int(os.environ.get("CQL_PORT_2", "30043")),
-    int(os.environ.get("CQL_PORT_3", "30044")),
+    int(os.environ.get("CQL_PORT_1", "19042")),
+    int(os.environ.get("CQL_PORT_2", "19043")),
+    int(os.environ.get("CQL_PORT_3", "19044")),
 ]
 CQL_HOST = os.environ.get("CQL_HOST", "127.0.0.1")
-COMPOSE_FILE = os.path.join(
-    os.path.dirname(__file__), "docker-compose.cql-integration.yml"
+# Default to ferrosa-memory cluster compose; override with CQL_COMPOSE_FILE env
+COMPOSE_FILE = os.environ.get(
+    "CQL_COMPOSE_FILE",
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "ferrosa-memory", "docker-compose.yml"),
 )
 TENANT = uuid.UUID("9a5f8fbf-d842-4d30-8ea5-1aa931e618a8")
 SESSION_ID = uuid.UUID("00000000-0000-0000-0000-000000000000")
