@@ -3277,6 +3277,95 @@ mod tests {
         );
     }
 
+    /// Reproduce bug-data-loss-after-drop-table: DROP TABLE on one table
+    /// must NOT affect data in other tables in the same keyspace.
+    #[test]
+    fn drop_one_table_does_not_affect_other_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // Two tables in the same keyspace.
+        let schema_a = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "entity_store".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let schema_b = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "co_occurs_with".to_string(),
+            ..schema_a.clone()
+        };
+
+        let tid_a = TableId::new("test_ks", "entity_store");
+        let tid_b = TableId::new("test_ks", "co_occurs_with");
+
+        engine.register_table(schema_a.clone()).unwrap();
+        engine.register_table(schema_b).unwrap();
+
+        // Write data to BOTH tables and flush to SSTable files on disk.
+        let key_a = make_key("entity_1");
+        engine
+            .write(&tid_a, &key_a, make_row(b"important_data", 1), 1)
+            .unwrap();
+        engine.flush(&tid_a).unwrap();
+
+        let key_b = make_key("edge_1");
+        engine
+            .write(&tid_b, &key_b, make_row(b"will_be_dropped", 2), 2)
+            .unwrap();
+        engine.flush(&tid_b).unwrap();
+
+        // Verify both tables have data.
+        assert!(
+            engine.read(&tid_a, &key_a).unwrap().is_some(),
+            "entity_store should have data"
+        );
+        assert!(
+            engine.read(&tid_b, &key_b).unwrap().is_some(),
+            "co_occurs_with should have data"
+        );
+
+        // DROP TABLE co_occurs_with.
+        engine.unregister_table(&tid_b).unwrap();
+
+        // CRITICAL: entity_store data must STILL be present.
+        let result = engine.read(&tid_a, &key_a).unwrap();
+        assert!(
+            result.is_some(),
+            "BUG: DROP TABLE on co_occurs_with destroyed entity_store data!"
+        );
+        assert_eq!(
+            result.unwrap().rows[0].cells[0].1.value.as_deref(),
+            Some(b"important_data".as_slice()),
+            "entity_store data must be intact after dropping a different table"
+        );
+
+        // Verify the SSTable directory for entity_store still exists.
+        let entity_dir = dir.path().join("sstables").join("test_ks.entity_store");
+        assert!(
+            entity_dir.exists(),
+            "entity_store SSTable directory must survive DROP of co_occurs_with"
+        );
+
+        // Verify co_occurs_with directory is gone.
+        let cooccurs_dir = dir.path().join("sstables").join("test_ks.co_occurs_with");
+        assert!(
+            !cooccurs_dir.exists(),
+            "co_occurs_with SSTable directory should be deleted"
+        );
+    }
+
     #[test]
     fn truncate_deletes_flushed_data() {
         let dir = tempfile::tempdir().unwrap();
