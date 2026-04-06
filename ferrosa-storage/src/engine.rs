@@ -3986,6 +3986,242 @@ mod tests {
         }
     }
 
+    /// Flush → drop engine → re-open from disk → read back.
+    ///
+    /// Simulates a node restart. The second engine instance loads SSTables
+    /// from disk via `load_existing_sstables_and_sidecars`, exactly like
+    /// production startup. If the SSTable files are corrupt (wrong header,
+    /// generation collision, serialization mismatch), this test catches it.
+    ///
+    /// Uses entity_store schema (CompositeType PK, UUID CK, multiple columns)
+    /// to match the production table that showed 98% data loss on restart.
+    #[test]
+    fn flush_restart_roundtrip_entity_store_schema() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let schema = TableSchema {
+            keyspace: "agent_memory".to_string(),
+            table: "entity_store".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                org.apache.cassandra.db.marshal.UUIDType,\
+                org.apache.cassandra.db.marshal.UUIDType)"
+                .to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "entity_id".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "entity_name".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "entity_type".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+        let tid = TableId::new("agent_memory", "entity_store");
+
+        // Phase 1: Write data and flush
+        let total_rows = 200usize;
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+
+            // Composite PK: [u16 len][uuid bytes][0x00][u16 len][uuid bytes][0x00]
+            let tenant_uuid = [0x11u8; 16];
+            let session_uuid = [0x22u8; 16];
+            let mut pk_bytes = Vec::new();
+            pk_bytes.extend_from_slice(&(16u16).to_be_bytes());
+            pk_bytes.extend_from_slice(&tenant_uuid);
+            pk_bytes.push(0x00);
+            pk_bytes.extend_from_slice(&(16u16).to_be_bytes());
+            pk_bytes.extend_from_slice(&session_uuid);
+            pk_bytes.push(0x00);
+            let pk = DecoratedKey::new(PartitionKey::new(pk_bytes));
+
+            for i in 0..total_rows {
+                let mut entity_uuid = [0u8; 16];
+                entity_uuid[14] = (i >> 8) as u8;
+                entity_uuid[15] = i as u8;
+
+                let row = Row {
+                    clustering: entity_uuid.to_vec(),
+                    cells: vec![
+                        (
+                            0,
+                            CellValue::live(format!("entity_{i}").into_bytes(), (i + 1) as i64),
+                        ),
+                        (1, CellValue::live(b"concept".to_vec(), (i + 1) as i64)),
+                    ],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
+                };
+                engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+            }
+            engine.flush(&tid).unwrap();
+
+            // Verify pre-drop: data is readable
+            let pre = engine.read(&tid, &pk).unwrap().unwrap();
+            assert_eq!(
+                pre.rows.len(),
+                total_rows,
+                "pre-restart: all rows must be present"
+            );
+        }
+        // Engine dropped here — simulates process exit
+
+        // Phase 2: Re-open from same directory (simulates restart)
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema).unwrap();
+
+            let tenant_uuid = [0x11u8; 16];
+            let session_uuid = [0x22u8; 16];
+            let mut pk_bytes = Vec::new();
+            pk_bytes.extend_from_slice(&(16u16).to_be_bytes());
+            pk_bytes.extend_from_slice(&tenant_uuid);
+            pk_bytes.push(0x00);
+            pk_bytes.extend_from_slice(&(16u16).to_be_bytes());
+            pk_bytes.extend_from_slice(&session_uuid);
+            pk_bytes.push(0x00);
+            let pk = DecoratedKey::new(PartitionKey::new(pk_bytes));
+
+            let result = engine.read(&tid, &pk);
+            assert!(
+                result.is_ok(),
+                "post-restart read should not error: {:?}",
+                result.err()
+            );
+            let partition = result.unwrap().expect("partition must exist after restart");
+            assert_eq!(
+                partition.rows.len(),
+                total_rows,
+                "post-restart: SSTable lost rows — data corruption on restart"
+            );
+        }
+    }
+
+    /// Multiple flushes → drop engine → re-open from disk → read back.
+    ///
+    /// Simulates the production scenario: many writes triggering multiple
+    /// auto-flushes, resulting in multiple SSTables per table. On restart,
+    /// all SSTables must be loaded and merged correctly.
+    #[test]
+    fn multi_flush_restart_roundtrip_preserves_all_data() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let schema = TableSchema {
+            keyspace: "agent_memory".to_string(),
+            table: "entity_store".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                org.apache.cassandra.db.marshal.UUIDType,\
+                org.apache.cassandra.db.marshal.UUIDType)"
+                .to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "entity_id".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "entity_name".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "entity_type".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+        let tid = TableId::new("agent_memory", "entity_store");
+        let total_rows = 500usize;
+        let flushes = 5;
+        let rows_per_flush = total_rows / flushes;
+
+        // Phase 1: Write in batches with explicit flushes
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+
+            let pk = make_entity_store_pk([0x11; 16], [0x22; 16]);
+
+            for batch in 0..flushes {
+                for i in 0..rows_per_flush {
+                    let idx = batch * rows_per_flush + i;
+                    let mut entity_uuid = [0u8; 16];
+                    entity_uuid[12..16].copy_from_slice(&(idx as u32).to_be_bytes());
+
+                    let row = Row {
+                        clustering: entity_uuid.to_vec(),
+                        cells: vec![
+                            (
+                                0,
+                                CellValue::live(
+                                    format!("entity_{idx}").into_bytes(),
+                                    (idx + 1) as i64,
+                                ),
+                            ),
+                            (1, CellValue::live(b"concept".to_vec(), (idx + 1) as i64)),
+                        ],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp((idx + 1) as i64),
+                    };
+                    engine.write(&tid, &pk, row, (idx + 1) as i64).unwrap();
+                }
+                engine.flush(&tid).unwrap();
+            }
+
+            assert!(
+                engine.sstable_count(&tid) >= flushes,
+                "should have {} SSTables, got {}",
+                flushes,
+                engine.sstable_count(&tid)
+            );
+        }
+
+        // Phase 2: Re-open and verify all data survived
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema).unwrap();
+
+            let pk = make_entity_store_pk([0x11; 16], [0x22; 16]);
+            let partition = engine
+                .read(&tid, &pk)
+                .expect("read should not error")
+                .expect("partition must exist after restart");
+
+            assert_eq!(
+                partition.rows.len(),
+                total_rows,
+                "post-restart: expected {total_rows} rows, got {} — \
+                 data lost across {} SSTables",
+                partition.rows.len(),
+                flushes,
+            );
+        }
+    }
+
+    /// Helper: build CompositeType PK for entity_store.
+    fn make_entity_store_pk(tenant: [u8; 16], session: [u8; 16]) -> DecoratedKey {
+        let mut pk = Vec::new();
+        pk.extend_from_slice(&(16u16).to_be_bytes());
+        pk.extend_from_slice(&tenant);
+        pk.push(0x00);
+        pk.extend_from_slice(&(16u16).to_be_bytes());
+        pk.extend_from_slice(&session);
+        pk.push(0x00);
+        DecoratedKey::new(PartitionKey::new(pk))
+    }
+
     /// SSTable compaction roundtrip: 4 flushes → STCS compaction → verify all rows.
     #[test]
     fn sstable_compaction_roundtrip_preserves_data() {
