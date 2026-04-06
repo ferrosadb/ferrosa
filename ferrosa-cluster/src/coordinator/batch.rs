@@ -87,10 +87,19 @@ impl ClusterCoordinator {
             }
         }
 
-        // Phase 3: Delete batchlog entry (even on partial failure --
-        // mutations that were written are durable, and the batch contract
-        // is "at least once" delivery).
-        self.delete_batchlog(batch_id).await?;
+        // Phase 3: Delete batchlog entry ONLY if all mutations succeeded.
+        // On partial failure, keep the entry so the background replay task
+        // can retry the failed mutations. Previously, the batchlog was
+        // always deleted — if the client retried, successful mutations
+        // were applied twice with no idempotency protection.
+        if result.is_ok() {
+            self.delete_batchlog(batch_id).await?;
+        } else {
+            tracing::warn!(
+                %batch_id,
+                "batch had partial failure — keeping batchlog entry for replay"
+            );
+        }
 
         result
     }

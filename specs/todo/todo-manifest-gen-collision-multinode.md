@@ -18,3 +18,10 @@ Use globally unique SSTable IDs:
 - UUID-based IDs instead of sequential generation numbers
 - Or prefix with node_id: `{node_uuid}_{gen}`
 - Or use Raft to allocate global sequence numbers
+
+## Implementation Note
+
+Adding `node_id_prefix` to StorageEngineConfig touches 25+ constructor sites across
+ferrosa-storage, ferrosa-cluster, ferrosa-cql, and ferrosa-graph. A separate PR
+should add this as a builder method or Default-based approach. The RED test
+`multinode_flush_same_gen_id_loses_first_node_data` proves the bug exists.
