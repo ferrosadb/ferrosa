@@ -4,8 +4,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Ferrosa — Cassandra Reimagined in Rust, Backed by S3</title>
-  <meta name="description" content="Ferrosa is a drop-in Cassandra replacement built in Rust with S3-backed storage. Zero GC pauses, ephemeral nodes, production cluster mode with Raft consensus, and 10x lower storage costs. Currently in beta.">
+  <title>Ferrosa — AI Native Database</title>
+  <meta name="description" content="Ferrosa is an AI native database built in Rust with S3-backed storage. One database for search, vectors, graph, SPARQL, transactions, and CDC. CQL compatible, Cypher + Bolt v5, SPARQL 1.1, zero GC pauses. Currently in beta.">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <style>
     :root {
@@ -737,6 +737,7 @@
       <li><a href="#progress">Scaling</a></li>
       <li><a href="#download">Download</a></li>
       <li><a href="cypher.html">Cypher</a></li>
+      <li><a href="sparql.html">SPARQL</a></li>
     </ul>
     <a href="#get-started" class="nav-cta">Get Started</a>
   </div>
@@ -753,16 +754,15 @@
     v1.0.0-beta.4 — active development
   </div>
   <h1>
-    Cassandra. <span class="gradient">Reimagined.</span><br>
-    Rust-native. S3-backed.
+    One database. <span class="gradient">Many workloads.</span><br>
+    AI native. S3-backed.
   </h1>
   <p>
-    Drop-in CQL compatibility. No GC pauses. Ephemeral nodes that recover in seconds.
-    Strict serializable transactions via Accord — not Paxos.
-    Your data lives in S3 — no EBS snapshots, no backup jobs. Point-in-time recovery
-    for 10 TB costs $2/month, not $2,250. Start on a single node, scale to a full
+    Search, vectors, graph, SPARQL, transactions, and real-time CDC on the same tables —
+    not separate stores. CQL compatible. Cypher + Bolt v5. SPARQL 1.1.
+    Strict serializable transactions via Accord. Your data lives in S3 — nodes recover
+    in seconds. Rust-native, zero GC pauses. Start on a single node, scale to a full
     production cluster — same binary, same config, no migration.
-    Cheap, fast, easy — pick all three.
   </p>
   <div class="hero-actions">
     <a href="#get-started" class="btn-primary">Get Started</a>
@@ -848,7 +848,7 @@
   <p class="section-label centered">Core Capabilities</p>
   <h2 class="section-title centered">Everything you need.<br>Nothing you don't.</h2>
   <p class="section-subtitle centered">
-    Ferrosa keeps the architecture that made Cassandra great and replaces everything that held it back.
+    One database for AI-native workloads. Search, vectors, graph, SPARQL, transactions, and CDC — unified on S3.
   </p>
 
   <div class="features-grid">
@@ -1006,21 +1006,22 @@
         toJson(), counter increment/decrement, collection types (map, set, list)
         with full UPDATE +/- operators and collection bind values in prepared statements — all there.
       </p>
-      <span class="metric">protocol v4/v5 · cdrs-tokio · 0 driver changes required</span>
+      <span class="metric">CQL v4/v5 · Bolt v5 · SPARQL 1.1 · 0 driver changes required</span>
     </div>
 
     <!-- Graph -->
     <div class="feature-card">
       <div class="feature-icon graph">◈</div>
-      <h3>Graph Engine with Cypher Query Support</h3>
+      <h3>Graph Engine: Cypher + SPARQL</h3>
       <p>
-        Full Cypher query engine on your CQL tables. No separate graph database.
+        Full Cypher and SPARQL 1.1 query engines on your CQL tables. No separate graph database.
         Vertices and edges are normal tables with schema extensions.
-        Variable-length paths, aggregations (count, sum, avg), expression evaluation,
+        Variable-length paths, aggregations, expression evaluation,
         and worst-case optimal joins via leapfrog triejoin for cyclic pattern matching.
-        Bolt v5 wire protocol for Neo4j driver compatibility alongside HTTP/JSON.
+        Bolt v5 wire protocol for Neo4j drivers, HTTP/JSON for Cypher, and
+        W3C SPARQL Protocol for semantic web and RDF workloads.
       </p>
-      <span class="metric">Cypher · Bolt v5 · HTTP/JSON · leapfrog triejoin · SUBSCRIBE</span>
+      <span class="metric">Cypher · SPARQL 1.1 · Bolt v5 · HTTP/JSON · RDF* · property paths</span>
     </div>
 
     <!-- Real-time pub/sub — key differentiator, full width -->
@@ -1427,7 +1428,7 @@ user = session.execute(stmt, [user_id])
     <p class="section-label centered">How We Compare</p>
     <h2 class="section-title centered">Ferrosa vs. the alternatives</h2>
     <p class="section-subtitle centered">
-      The performance of ScyllaDB. The compatibility of Cassandra. The cost of object storage.
+      Search, vectors, graph, SPARQL, transactions, CDC. One database. AI native.
     </p>
 
     <table class="comparison-table">
@@ -1718,7 +1719,7 @@ user = session.execute(stmt, [user_id])
   <div class="use-cases">
     <div class="use-case">
       <p class="use-case-label migrate">Migration</p>
-      <h3>Move off Cassandra without rewriting</h3>
+      <h3>CQL compatible — no rewriting</h3>
       <p>
         Same CQL protocol, same drivers, same consistency model. Import existing SSTables directly.
         Migrate one keyspace at a time with dual-read verification. Your application never knows the difference.
@@ -1738,7 +1739,7 @@ user = session.execute(stmt, [user_id])
       <p class="use-case-label graph-uc">Graph + Relational</p>
       <h3>One database for tables and relationships</h3>
       <p>
-        Stop running Cassandra alongside Neo4j. Ferrosa speaks CQL for your transactional workloads
+        Stop running separate databases for each workload. Ferrosa speaks CQL for your transactional workloads
         and Cypher for graph traversals — same tables, same cluster, same operational surface.
       </p>
     </div>
@@ -1820,7 +1821,7 @@ user = session.execute(stmt, [user_id])
       </a>
       <a href="migration.html" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; text-decoration: none; transition: border-color 0.2s;" onmouseover="this.style.borderColor='var(--accent)'" onmouseout="this.style.borderColor='var(--border)'">
         <h4 style="font-size: 0.9375rem; font-weight: 700; color: var(--text-primary); margin-bottom: 0.5rem;">Migration Guide</h4>
-        <p style="font-size: 0.875rem; color: var(--text-muted); margin: 0; line-height: 1.6;">Move from Apache Cassandra to Ferrosa without rewriting your application.</p>
+        <p style="font-size: 0.875rem; color: var(--text-muted); margin: 0; line-height: 1.6;">CQL, Cypher, SPARQL, and vector search — one database for all your workloads.</p>
       </a>
     </div>
   </div>

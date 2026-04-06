@@ -129,3 +129,10 @@ Combine Option A (staggered init) with Option B (connection readiness). Option C
 - `specs/cluster-formation-architecture.md` -- Architecture design for progressive join
 - `specs/fmea-cluster-formation.md` -- CF-T17 (membership race) was identified but the current mitigation is insufficient
 - `specs/hazards-cluster-formation.md` -- Related hazard analysis
+
+## Final Verification (2026-04-05, commit 74a33ff)
+
+Both cluster_formation tests pass:
+- `three_node_cluster_elects_raft_leader`: Leader elected in 21s, all 3 nodes agree on leader ID 72057594037927936
+- `progressive_join_mode_transitions`: Mode transitions standalone→pair→cluster work correctly
+- **Status: VERIFIED FIXED**

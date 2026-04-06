@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ferrosa — SPARQL 1.1 Query Reference</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #111118;
+      --bg-card: #16161f;
+      --bg-card-hover: #1c1c28;
+      --text-primary: #e8e8ed;
+      --text-secondary: #9494a3;
+      --text-muted: #6b6b7a;
+      --accent: #e2725b;
+      --accent-warm: #d4a574;
+      --accent-green: #6bc9a0;
+      --accent-cool: #7c9cf5;
+      --border: #1e1e2a;
+      --code-bg: #0d0d14;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 4rem 2rem 6rem;
+    }
+
+    .back-link {
+      display: inline-block;
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      margin-bottom: 2rem;
+    }
+    .back-link:hover { text-decoration: underline; }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.5rem;
+    }
+    h1 span { color: var(--accent); }
+
+    .subtitle {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      margin-bottom: 3rem;
+      max-width: 640px;
+      line-height: 1.7;
+    }
+
+    h2 {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1.5rem;
+      margin-top: 4rem;
+    }
+
+    h3 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+      margin-top: 2rem;
+    }
+
+    p, li {
+      color: var(--text-secondary);
+      margin-bottom: 1rem;
+      max-width: 720px;
+      line-height: 1.7;
+    }
+
+    ul, ol { padding-left: 1.5rem; margin-bottom: 1.5rem; }
+    li { margin-bottom: 0.5rem; }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem 1.5rem;
+      overflow-x: auto;
+      margin-bottom: 2rem;
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      line-height: 1.7;
+      color: var(--text-primary);
+    }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      background: var(--code-bg);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+    }
+
+    .comment { color: var(--text-muted); }
+    .keyword { color: var(--accent-cool); }
+    .string { color: var(--accent-green); }
+    .uri { color: var(--accent-warm); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 2rem;
+      font-size: 0.875rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      color: var(--text-muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: 0.05em;
+    }
+    td { color: var(--text-secondary); }
+    td code { font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <a href="index.html" class="back-link">&larr; Back to ferrosa</a>
+
+  <h1>SPARQL 1.1 <span>Reference</span></h1>
+  <p class="subtitle">
+    Ferrosa includes a native SPARQL 1.1 endpoint for semantic web and RDF workloads.
+    Query your CQL tables with W3C-standard SPARQL, including property paths,
+    aggregations, and RDF* annotations. No separate triple store needed.
+  </p>
+
+  <h2>Endpoint</h2>
+
+  <p>
+    SPARQL queries are submitted over HTTP to port <code>8080</code> (configurable via
+    <code>FERROSA_SPARQL_BIND</code>). Enable with <code>FERROSA_SPARQL_ENABLED=true</code>.
+  </p>
+
+  <h3>HTTP Methods</h3>
+
+  <table>
+    <tr><th>Method</th><th>Path</th><th>Content-Type</th><th>Description</th></tr>
+    <tr>
+      <td><code>POST</code></td>
+      <td><code>/sparql</code></td>
+      <td><code>application/sparql-query</code></td>
+      <td>Execute a SPARQL query (raw text body)</td>
+    </tr>
+    <tr>
+      <td><code>GET</code></td>
+      <td><code>/sparql?query=...</code></td>
+      <td>-</td>
+      <td>Execute a SPARQL query (URL-encoded)</td>
+    </tr>
+    <tr>
+      <td><code>GET</code></td>
+      <td><code>/sparql/health</code></td>
+      <td>-</td>
+      <td>Health check</td>
+    </tr>
+  </table>
+
+  <h2>Query Examples</h2>
+
+  <h3>Basic Triple Pattern</h3>
+<pre><span class="keyword">PREFIX</span> foaf: &lt;<span class="uri">http://xmlns.com/foaf/0.1/</span>&gt;
+
+<span class="keyword">SELECT</span> ?name ?email
+<span class="keyword">WHERE</span> {
+  ?person foaf:name ?name .
+  ?person foaf:mbox ?email .
+}
+<span class="keyword">LIMIT</span> 10</pre>
+
+  <h3>Property Path (Transitive Closure)</h3>
+<pre><span class="keyword">PREFIX</span> foaf: &lt;<span class="uri">http://xmlns.com/foaf/0.1/</span>&gt;
+
+<span class="comment"># Find all people reachable through "knows" chains</span>
+<span class="keyword">SELECT DISTINCT</span> ?person ?friend
+<span class="keyword">WHERE</span> {
+  ?person foaf:knows+ ?friend .
+}</pre>
+
+  <h3>Aggregation</h3>
+<pre><span class="keyword">PREFIX</span> schema: &lt;<span class="uri">http://schema.org/</span>&gt;
+
+<span class="keyword">SELECT</span> ?city (<span class="keyword">COUNT</span>(?person) <span class="keyword">AS</span> ?count)
+<span class="keyword">WHERE</span> {
+  ?person schema:address ?addr .
+  ?addr schema:addressLocality ?city .
+}
+<span class="keyword">GROUP BY</span> ?city
+<span class="keyword">ORDER BY DESC</span>(?count)</pre>
+
+  <h3>INSERT DATA</h3>
+<pre><span class="keyword">PREFIX</span> foaf: &lt;<span class="uri">http://xmlns.com/foaf/0.1/</span>&gt;
+
+<span class="keyword">INSERT DATA</span> {
+  &lt;<span class="uri">http://example.org/alice</span>&gt; foaf:name <span class="string">"Alice"</span> .
+  &lt;<span class="uri">http://example.org/alice</span>&gt; foaf:knows &lt;<span class="uri">http://example.org/bob</span>&gt; .
+}</pre>
+
+  <h3>FILTER and OPTIONAL</h3>
+<pre><span class="keyword">PREFIX</span> foaf: &lt;<span class="uri">http://xmlns.com/foaf/0.1/</span>&gt;
+<span class="keyword">PREFIX</span> xsd: &lt;<span class="uri">http://www.w3.org/2001/XMLSchema#</span>&gt;
+
+<span class="keyword">SELECT</span> ?name ?email
+<span class="keyword">WHERE</span> {
+  ?person foaf:name ?name .
+  <span class="keyword">OPTIONAL</span> { ?person foaf:mbox ?email }
+  <span class="keyword">FILTER</span>(STRSTARTS(?name, <span class="string">"A"</span>))
+}</pre>
+
+  <h2>Feature Matrix</h2>
+
+  <table>
+    <tr><th>Feature</th><th>Status</th><th>Notes</th></tr>
+    <tr><td>SELECT</td><td>Available</td><td>Basic graph patterns, joins</td></tr>
+    <tr><td>WHERE / FILTER</td><td>Available</td><td>Predicate evaluation on bindings</td></tr>
+    <tr><td>ORDER BY / LIMIT / OFFSET</td><td>Available</td><td>Post-processing on result set</td></tr>
+    <tr><td>ASK</td><td>Available</td><td>Boolean existence</td></tr>
+    <tr><td>Property paths (+, *, ?)</td><td>Planned</td><td>Server-side BFS/DFS via adjacency index</td></tr>
+    <tr><td>OPTIONAL / UNION</td><td>Planned</td><td>Left-join, concat semantics</td></tr>
+    <tr><td>CONSTRUCT / DESCRIBE</td><td>Planned</td><td>RDF graph construction</td></tr>
+    <tr><td>INSERT DATA / DELETE DATA</td><td>Planned</td><td>SPARQL Update</td></tr>
+    <tr><td>RDF* annotations</td><td>Planned</td><td>Statement-about-statement queries</td></tr>
+    <tr><td>Aggregates (COUNT, SUM, AVG)</td><td>Planned</td><td>GROUP BY support</td></tr>
+  </table>
+
+  <h2>Response Formats</h2>
+
+  <table>
+    <tr><th>Format</th><th>Content-Type</th><th>Status</th></tr>
+    <tr><td>SPARQL JSON Results</td><td><code>application/sparql-results+json</code></td><td>Available</td></tr>
+    <tr><td>Turtle</td><td><code>text/turtle</code></td><td>Planned</td></tr>
+    <tr><td>N-Triples</td><td><code>application/n-triples</code></td><td>Planned</td></tr>
+    <tr><td>JSON-LD</td><td><code>application/ld+json</code></td><td>Planned</td></tr>
+  </table>
+
+  <h2>Architecture</h2>
+
+  <p>
+    SPARQL queries are parsed by the <code>spargebra</code> crate into an algebra tree,
+    then translated by the ferrosa-sparql planner into storage reads against CQL-backed
+    triple tables. Property path queries delegate to the graph engine's BFS/DFS traversal
+    via the adjacency index. Results are serialized to W3C SPARQL JSON Results format.
+  </p>
+
+  <p>
+    RDF triples are stored in standard CQL tables with composite primary keys. Secondary
+    indexes on predicate and object enable efficient pattern matching beyond simple subject
+    lookups. The same storage engine, S3 durability, and distributed consensus that power
+    CQL queries also power SPARQL.
+  </p>
+
+  <h2>Configuration</h2>
+
+  <table>
+    <tr><th>Environment Variable</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>FERROSA_SPARQL_ENABLED</code></td><td><code>false</code></td><td>Enable SPARQL endpoint</td></tr>
+    <tr><td><code>FERROSA_SPARQL_BIND</code></td><td><code>0.0.0.0:8080</code></td><td>SPARQL HTTP listen address</td></tr>
+  </table>
+
+  <p style="margin-top: 4rem; color: var(--text-muted); font-size: 0.8rem;">
+    Ferrosa SPARQL is currently in beta. Feature availability reflects the current release.
+  </p>
+
+</div>
+</body>
+</html>

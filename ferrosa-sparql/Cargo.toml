@@ -1,0 +1,43 @@
+[package]
+name = "ferrosa-sparql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPARQL 1.1 Query and Update endpoint for Ferrosa"
+
+[dependencies]
+# SPARQL parser → algebra tree
+spargebra = { version = "0.4", features = ["sparql-12"] }
+# SPARQL results serialization (JSON, XML, CSV)
+sparesults = { version = "0.3", features = ["sparql-12"] }
+# RDF terms (IRI, Literal, BlankNode)
+oxrdf = { version = "0.3", features = ["rdf-12"] }
+
+# Internal ferrosa crates
+ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-index = { path = "../ferrosa-index" }
+ferrosa-sstable = { path = "../ferrosa-sstable" }
+ferrosa-storage = { path = "../ferrosa-storage" }
+ferrosa-schema = { path = "../ferrosa-schema" }
+
+# HTTP server
+axum = "0.8"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tower-http = { version = "0.6", features = ["catch-panic", "limit"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Observability
+tracing = "0.1"
+
+# Auth
+base64 = "0.22"
+
+# URL form decoding
+serde_urlencoded = "0.7"
+
+# Misc
+uuid = { version = "1", features = ["v4"] }
