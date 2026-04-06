@@ -1,11 +1,11 @@
 # System Overview
 
-> Last updated: 2026-03-30
+> Last updated: 2026-04-05
 > Status: Approved
 
 ## Overview
 
-Ferrosa is a distributed database that speaks CQL, backed by S3-compatible object storage for durability and ephemeral local storage for performance. It is built as independent Rust crates, informed by a deep analysis of Apache Cassandra's architecture but designed as idiomatic Rust from the ground up.
+Ferrosa is a distributed database that speaks CQL, Cypher, and SPARQL, backed by S3-compatible object storage for durability and ephemeral local storage for performance. It is built as independent Rust crates, informed by a deep analysis of Apache Cassandra's architecture but designed as idiomatic Rust from the ground up.
 
 ## System Diagram
 
@@ -16,11 +16,13 @@ graph TB
         D2[cqlsh]
         D3[ferrosa-ctl<br/>CLI + TUI Monitor]
         D4[Graph Clients<br/>Bolt / HTTP]
+        D5[SPARQL Clients<br/>HTTP]
     end
 
     subgraph "Ferrosa Node"
         CQL[ferrosa-cql<br/>CQL Protocol v4/v5]
         Graph[ferrosa-graph<br/>Cypher + Bolt v5]
+        SPARQL[ferrosa-sparql<br/>SPARQL 1.1 Query/Update]
         Schema[ferrosa-schema<br/>DDL, Auth, Audit]
         Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
         Accord[Accord Consensus<br/>Transactions, LWT]
@@ -45,6 +47,7 @@ graph TB
     D1 & D2 -->|CQL Native Protocol v4/v5| CQL
     D3 -->|CQL + HTTP| CQL & Web
     D4 -->|Bolt v5 / HTTP| Graph
+    D5 -->|HTTP SPARQL Protocol| SPARQL
     CQL --> Schema
     CQL --> Storage
     CQL --> Cluster
@@ -53,6 +56,8 @@ graph TB
     CQL --> UDF
     Graph --> Schema
     Graph --> Storage
+    SPARQL --> Schema
+    SPARQL --> Storage
     Accord --> Cluster
     Accord --> Storage
     Cluster --> Storage
@@ -96,7 +101,9 @@ graph LR
         R4 --> R5[ferrosa-cql]
         R5 --> R6[ferrosa-net]
         R6 --> R7[ferrosa-cluster]
+        R3 --> R9[ferrosa-sparql]
         R7 --> R8[ferrosa binary]
+        R9 --> R8
         R8 --> R9[ferrosa-ctl]
     end
 

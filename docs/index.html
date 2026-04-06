@@ -737,6 +737,7 @@
       <li><a href="#progress">Scaling</a></li>
       <li><a href="#download">Download</a></li>
       <li><a href="cypher.html">Cypher</a></li>
+      <li><a href="sparql.html">SPARQL</a></li>
     </ul>
     <a href="#get-started" class="nav-cta">Get Started</a>
   </div>
@@ -1006,21 +1007,22 @@
         toJson(), counter increment/decrement, collection types (map, set, list)
         with full UPDATE +/- operators and collection bind values in prepared statements — all there.
       </p>
-      <span class="metric">protocol v4/v5 · cdrs-tokio · 0 driver changes required</span>
+      <span class="metric">CQL v4/v5 · Bolt v5 · SPARQL 1.1 · 0 driver changes required</span>
     </div>
 
     <!-- Graph -->
     <div class="feature-card">
       <div class="feature-icon graph">◈</div>
-      <h3>Graph Engine with Cypher Query Support</h3>
+      <h3>Graph Engine: Cypher + SPARQL</h3>
       <p>
-        Full Cypher query engine on your CQL tables. No separate graph database.
+        Full Cypher and SPARQL 1.1 query engines on your CQL tables. No separate graph database.
         Vertices and edges are normal tables with schema extensions.
-        Variable-length paths, aggregations (count, sum, avg), expression evaluation,
+        Variable-length paths, aggregations, expression evaluation,
         and worst-case optimal joins via leapfrog triejoin for cyclic pattern matching.
-        Bolt v5 wire protocol for Neo4j driver compatibility alongside HTTP/JSON.
+        Bolt v5 wire protocol for Neo4j drivers, HTTP/JSON for Cypher, and
+        W3C SPARQL Protocol for semantic web and RDF workloads.
       </p>
-      <span class="metric">Cypher · Bolt v5 · HTTP/JSON · leapfrog triejoin · SUBSCRIBE</span>
+      <span class="metric">Cypher · SPARQL 1.1 · Bolt v5 · HTTP/JSON · RDF* · property paths</span>
     </div>
 
     <!-- Real-time pub/sub — key differentiator, full width -->
