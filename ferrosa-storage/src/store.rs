@@ -296,18 +296,15 @@ impl<F: FlushTarget> TableStore<F> {
         let guard = self.view.load();
 
         let mut sources: Vec<Partition> = Vec::new();
-        let mut source_labels: Vec<&str> = Vec::new();
 
         // Active memtable
         if let Some(p) = guard.active.get(key)? {
-            source_labels.push("active_memtable");
             sources.push((*p).clone());
         }
 
         // Flushing memtable
         if let Some(ref flushing) = guard.flushing {
             if let Some(p) = flushing.get(key)? {
-                source_labels.push("flushing_memtable");
                 sources.push((*p).clone());
             }
         }
@@ -319,12 +316,6 @@ impl<F: FlushTarget> TableStore<F> {
         for (i, sstable) in guard.sstables.iter().enumerate() {
             match sstable.get_partition(key) {
                 Ok(Some(p)) => {
-                    source_labels.push("sstable");
-                    tracing::trace!(
-                        sstable_index = i,
-                        rows = p.rows.len(),
-                        "read: found partition in SSTable"
-                    );
                     sources.push(p);
                 }
                 Ok(None) => {}
@@ -344,19 +335,7 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(None);
         }
 
-        let total_source_rows: usize = sources.iter().map(|p| p.rows.len()).sum();
-        let merged = merge::merge_partitions(sources);
-        if merged.rows.len() < total_source_rows {
-            tracing::debug!(
-                sources = source_labels.len(),
-                total_source_rows,
-                merged_rows = merged.rows.len(),
-                dropped = total_source_rows - merged.rows.len(),
-                "read merge: row count decreased — possible duplicate clustering keys or tombstones"
-            );
-        }
-
-        Ok(Some(merged))
+        Ok(Some(merge::merge_partitions(sources)))
     }
 
     /// Flush the active memtable to an SSTable.

@@ -212,10 +212,11 @@ impl ModeController {
                     addr: addr.to_string(),
                     data_center: self.config.data_center.clone(),
                     rack: self.config.rack.clone(),
-                    // Start as Joining — only promoted to Normal after bootstrap
-                    // streaming completes. Joining nodes don't serve reads for
-                    // their token ranges until they have the data.
-                    state: NodeState::Joining,
+                    // Start as Normal — all nodes in a pair→cluster transition
+                    // already have data (replicated via pair mode). Marking them
+                    // as Joining caused every coordinator to only consider ITSELF
+                    // as a valid replica, scattering writes across all nodes.
+                    state: NodeState::Normal,
                     // Peer's cql_broadcast is unknown at this point; it will be
                     // propagated through Raft NodeInfo once the peer joins.
                     cql_broadcast: None,

@@ -128,22 +128,38 @@ impl ClusterCoordinator {
                 let local_node_id = self.local_node_id;
 
                 async move {
-                    if replica_id == local_node_id {
+                    let is_local = replica_id == local_node_id;
+                    if is_local {
                         match storage.write(&table_id, &key, row, timestamp) {
                             Ok(()) => ReplicaResult::Ack,
-                            Err(_) => ReplicaResult::Failure { host_id: None },
+                            Err(e) => {
+                                tracing::warn!(%e, "local write failed");
+                                ReplicaResult::Failure { host_id: None }
+                            }
                         }
                     } else {
                         match host_id {
-                            None => ReplicaResult::Failure { host_id: None }, // node not in ring metadata
+                            None => {
+                                tracing::warn!(
+                                    replica_id,
+                                    "no host_id for replica — dropping write"
+                                );
+                                ReplicaResult::Failure { host_id: None }
+                            }
                             Some(hid) => {
                                 match peer_manager
                                     .send(hid, Message::MutationForward(body), Lane::Data)
                                     .await
                                 {
                                     Ok(Message::MutationAck(_)) => ReplicaResult::Ack,
-                                    Ok(_) => ReplicaResult::Failure { host_id: Some(hid) }, // unexpected response
-                                    Err(_) => ReplicaResult::Failure { host_id: Some(hid) }, // replica failed
+                                    Ok(other) => {
+                                        tracing::warn!(?other, "unexpected response from replica");
+                                        ReplicaResult::Failure { host_id: Some(hid) }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(%e, %hid, "MutationForward failed");
+                                        ReplicaResult::Failure { host_id: Some(hid) }
+                                    }
                                 }
                             }
                         }
