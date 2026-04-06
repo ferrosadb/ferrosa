@@ -90,6 +90,7 @@ fn delete_ground_quad(
     let object = match &quad.object {
         spargebra::term::GroundTerm::NamedNode(n) => n.as_str().to_string(),
         spargebra::term::GroundTerm::Literal(l) => l.value().to_string(),
+        spargebra::term::GroundTerm::Triple(t) => format!("<<{t}>>"),
     };
 
     let table_id = triple_store::triples_table_id(keyspace);
@@ -210,6 +211,7 @@ fn term_to_rdf(
         spargebra::term::Term::BlankNode(b) => {
             Ok((format!("_:{}", b.as_str()), "bnode".into(), None, None))
         }
+        spargebra::term::Term::Triple(t) => Ok((format!("<<{t}>>"), "triple".into(), None, None)),
     }
 }
 

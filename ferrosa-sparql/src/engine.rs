@@ -220,4 +220,29 @@ mod tests {
         );
         assert!(update.is_ok(), "spargebra should parse INSERT DATA");
     }
+
+    #[test]
+    fn parse_rdf_star_quoted_triple() {
+        // RDF* / SPARQL-star: quoted triple pattern << ?s ?p ?o >>
+        let query = spargebra::SparqlParser::new().parse_query(
+            "SELECT ?conf WHERE { << <http://ex/a> <http://ex/link> <http://ex/b> >> <http://ex/confidence> ?conf }",
+        );
+        assert!(
+            query.is_ok(),
+            "spargebra with sparql-12 should parse RDF* quoted triples, got: {:?}",
+            query.err()
+        );
+    }
+
+    #[test]
+    fn parse_rdf_star_with_variables() {
+        let query = spargebra::SparqlParser::new().parse_query(
+            "SELECT ?s ?p ?o ?who WHERE { << ?s ?p ?o >> <http://ex/created_by> ?who }",
+        );
+        assert!(
+            query.is_ok(),
+            "spargebra should parse RDF* with variable triple, got: {:?}",
+            query.err()
+        );
+    }
 }
