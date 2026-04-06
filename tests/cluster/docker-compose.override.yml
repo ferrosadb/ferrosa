@@ -1,12 +1,14 @@
 # Override: use pre-built ferrosa image instead of building from source.
-# Usage: podman compose -f tests/docker-compose.cluster.yml -f tests/cluster/docker-compose.override.yml --profile trio up -d
+# Build image first: podman build -t localhost/ferrosa-test:latest -f Dockerfile .
+# Then: podman compose -f tests/docker-compose.cluster.yml -f tests/cluster/docker-compose.override.yml --profile trio up -d
+#
+# Note: podman-compose 1.5 doesn't support !reset, so we override the
+# build context to use the pre-built image via the image field. The build
+# key is ignored when image is specified and no --build flag is passed.
 services:
   node1:
-    build: !reset null
-    image: localhost/drivers_ferrosa:latest
+    image: localhost/ferrosa-test:latest
   node2:
-    build: !reset null
-    image: localhost/drivers_ferrosa:latest
+    image: localhost/ferrosa-test:latest
   node3:
-    build: !reset null
-    image: localhost/drivers_ferrosa:latest
+    image: localhost/ferrosa-test:latest

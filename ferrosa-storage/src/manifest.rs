@@ -166,17 +166,35 @@ impl Manifest {
         store: &dyn ObjectStore,
         prefix: &str,
     ) -> ferrosa_common::Result<()> {
+        self.save_with_retry_and_removals(store, prefix, &[]).await
+    }
+
+    /// Save the manifest with CAS retry, applying both additions and removals.
+    ///
+    /// On CAS conflict, re-loads the latest manifest, merges new entries from
+    /// `self`, then re-applies `removals` to ensure compaction cleanup is not
+    /// lost during merge. Without this, `merge_into` would re-introduce entries
+    /// from the latest version that we intended to remove.
+    pub async fn save_with_retry_and_removals(
+        &self,
+        store: &dyn ObjectStore,
+        prefix: &str,
+        removals: &[(String, Vec<String>)],
+    ) -> ferrosa_common::Result<()> {
         for attempt in 0..MAX_CAS_RETRIES {
-            // Re-load the LATEST manifest from S3 and MERGE our entries
-            // into it. This ensures that entries added by other nodes
-            // since we loaded our copy are preserved.
+            // Re-load the LATEST manifest from S3, apply removals to it
+            // FIRST (so old entries are gone), then merge in our new entries.
             //
-            // BUG FIX: Previously, this re-loaded only the version (etag)
-            // but saved `self` (the caller's stale snapshot). If another
-            // node had added entries in the meantime, those entries were
-            // silently overwritten — causing data loss.
-            let (latest, version) = Self::load(store, prefix).await?;
+            // Order matters: if compaction output reuses an input's ID
+            // (gen collision), removing after merge would delete the new
+            // entry. Removing from latest first ensures the old entry is
+            // gone before self's replacement is merged in.
+            let (mut latest, version) = Self::load(store, prefix).await?;
+            for (table_id, ids) in removals {
+                latest.remove_sstables(table_id, ids);
+            }
             let merged = self.merge_into(&latest);
+
             match merged.save(store, prefix, version).await {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < MAX_CAS_RETRIES - 1 => {
@@ -211,10 +229,13 @@ impl Manifest {
         let mut merged = base.clone();
         for (table_id, entries) in &self.sstables {
             let existing = merged.sstables.entry(table_id.clone()).or_default();
-            let existing_ids: std::collections::HashSet<String> =
-                existing.iter().map(|e| e.id.clone()).collect();
             for entry in entries {
-                if !existing_ids.contains(&entry.id) {
+                // Replace existing entries with the same ID (compaction output
+                // can reuse an input's generation number). If self has a newer
+                // entry for the same ID, it should win over base's version.
+                if let Some(pos) = existing.iter().position(|e| e.id == entry.id) {
+                    existing[pos] = entry.clone();
+                } else {
                     existing.push(entry.clone());
                 }
             }
@@ -526,5 +547,97 @@ mod tests {
             let loaded = load_schema_snapshot(&store, "").await.unwrap();
             assert!(loaded.is_none());
         });
+    }
+
+    /// RED TEST: proves that save_with_retry (without removals) loses
+    /// compaction deletions. This test MUST FAIL to demonstrate the bug.
+    ///
+    /// The bug: save_with_retry calls merge_into which starts from the
+    /// latest S3 manifest (which still has old entries) and only adds new
+    /// entries from self. Removals applied to self are lost.
+    #[tokio::test]
+    async fn save_with_retry_loses_compaction_removals() {
+        let store = InMemory::new();
+
+        // Initial manifest: 3 SSTables
+        let mut initial = Manifest::new();
+        initial.add_sstable("ks.t", sample_entry("sst1"));
+        initial.add_sstable("ks.t", sample_entry("sst2"));
+        initial.add_sstable("ks.t", sample_entry("sst3"));
+        initial.save_with_retry(&store, "test").await.unwrap();
+
+        // Simulate compaction: remove sst1 + sst2, add sst4
+        let (mut manifest, _version) = Manifest::load(&store, "test").await.unwrap();
+        manifest.remove_sstables("ks.t", &["sst1".to_string(), "sst2".to_string()]);
+        manifest.add_sstable("ks.t", sample_entry("sst4"));
+
+        // Save using the OLD API (no removals parameter) — this is how
+        // the engine currently calls it for compaction
+        manifest.save_with_retry(&store, "test").await.unwrap();
+
+        // Verify: sst1 and sst2 should NOT be in the manifest
+        let (final_manifest, _) = Manifest::load(&store, "test").await.unwrap();
+        let ids: Vec<&str> = final_manifest.sstables["ks.t"]
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+
+        // This FAILS — proving the bug: removals are lost through save_with_retry
+        assert!(
+            !ids.contains(&"sst1"),
+            "BUG: sst1 was removed but reappeared through save_with_retry merge; got: {ids:?}"
+        );
+    }
+
+    /// GREEN TEST: save_with_retry_and_removals preserves compaction deletions.
+    #[tokio::test]
+    async fn compaction_removal_persists_through_save_with_retry_and_removals() {
+        let store = InMemory::new();
+
+        // Initial manifest: 3 SSTables
+        let mut initial = Manifest::new();
+        initial.add_sstable("ks.t", sample_entry("sst1"));
+        initial.add_sstable("ks.t", sample_entry("sst2"));
+        initial.add_sstable("ks.t", sample_entry("sst3"));
+        initial.save_with_retry(&store, "test").await.unwrap();
+
+        // Simulate compaction: remove sst1 + sst2, add sst4
+        let (mut manifest, _version) = Manifest::load(&store, "test").await.unwrap();
+        manifest.remove_sstables("ks.t", &["sst1".to_string(), "sst2".to_string()]);
+        manifest.add_sstable("ks.t", sample_entry("sst4"));
+
+        // Save with removals — the fix
+        let removals = vec![(
+            "ks.t".to_string(),
+            vec!["sst1".to_string(), "sst2".to_string()],
+        )];
+        manifest
+            .save_with_retry_and_removals(&store, "test", &removals)
+            .await
+            .unwrap();
+
+        // Verify: sst1 and sst2 must NOT be in the manifest
+        let (final_manifest, _) = Manifest::load(&store, "test").await.unwrap();
+        let ids: Vec<&str> = final_manifest.sstables["ks.t"]
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+
+        assert!(
+            !ids.contains(&"sst1"),
+            "sst1 must be removed after compaction; got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"sst2"),
+            "sst2 must be removed after compaction; got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"sst3"),
+            "sst3 must still be present; got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"sst4"),
+            "sst4 (compaction output) must be present; got: {ids:?}"
+        );
     }
 }

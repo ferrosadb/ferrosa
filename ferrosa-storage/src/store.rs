@@ -1594,6 +1594,71 @@ mod tests {
         );
     }
 
+    /// RED TEST: consecutive flushes must produce SSTables with rows in
+    /// sorted clustering key order. The prev_flushing merge path (extend)
+    /// can produce unsorted rows, which corrupts the SSTable — the reader
+    /// misaligns and skips data, causing data loss after compaction.
+    #[test]
+    fn consecutive_flushes_produce_sorted_rows_in_sstable() {
+        let store = test_store();
+        let key = make_key("pk1");
+
+        // Batch 1: write rows with clustering keys 1, 3, 5 (odd)
+        for ck in [1u32, 3, 5] {
+            let row = Row {
+                clustering: ck.to_be_bytes().to_vec(),
+                cells: vec![(
+                    0,
+                    ferrosa_common::CellValue::live(format!("batch1_ck{ck}").into_bytes(), 1000),
+                )],
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1000),
+            };
+            store.write(&key, row).unwrap();
+        }
+        store.flush().unwrap();
+
+        // Batch 2: write rows with clustering keys 2, 4, 6 (even)
+        // These interleave with batch 1's keys.
+        for ck in [2u32, 4, 6] {
+            let row = Row {
+                clustering: ck.to_be_bytes().to_vec(),
+                cells: vec![(
+                    0,
+                    ferrosa_common::CellValue::live(format!("batch2_ck{ck}").into_bytes(), 2000),
+                )],
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(2000),
+            };
+            store.write(&key, row).unwrap();
+        }
+        store.flush().unwrap();
+
+        // Read back: all 6 rows must be present and in sorted order
+        let result = store.read(&key).unwrap().expect("partition must exist");
+        assert_eq!(
+            result.rows.len(),
+            6,
+            "expected 6 rows (3 from batch1 + 3 from batch2), got {}",
+            result.rows.len()
+        );
+
+        // Verify rows are in sorted clustering key order
+        let clustering_keys: Vec<u32> = result
+            .rows
+            .iter()
+            .map(|r| u32::from_be_bytes(r.clustering[..4].try_into().unwrap()))
+            .collect();
+        let mut sorted = clustering_keys.clone();
+        sorted.sort();
+        assert_eq!(
+            clustering_keys, sorted,
+            "rows must be in sorted clustering key order after flush merge, \
+             got {:?}",
+            clustering_keys
+        );
+    }
+
     /// Reproduces the P0 data loss bug: flush stores SSTables with empty
     /// PathBuf, but compaction passes the real path. If swap matches on
     /// (id, path), the inputs are never removed — leaving stale references

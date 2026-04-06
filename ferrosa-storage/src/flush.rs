@@ -145,9 +145,14 @@ pub fn build_serialization_header(
         }
     }
 
-    // If no real timestamps were found, use sentinel value
+    // If no real timestamps were found, use safe defaults.
+    // Both must be reset symmetrically — a stale NO_TIMESTAMP min with a
+    // real max would cause delta-encoding underflow in the SSTable writer.
     if max_timestamp == i64::MIN {
         max_timestamp = i64::MAX;
+    }
+    if min_timestamp == NO_TIMESTAMP {
+        min_timestamp = 0;
     }
 
     SerializationHeader {

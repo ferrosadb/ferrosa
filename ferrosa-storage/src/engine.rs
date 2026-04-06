@@ -2014,7 +2014,14 @@ impl StorageEngine {
                             max_timestamp: result.output.max_timestamp,
                         },
                     );
-                    if let Err(e) = manifest.save_with_retry(store.as_ref(), &prefix).await {
+                    // Pass removals explicitly so CAS retry re-applies them
+                    // after merging with the latest manifest. Without this,
+                    // merge_into re-introduces the entries we removed.
+                    let removals = vec![(table_id_str.clone(), input_ids.clone())];
+                    if let Err(e) = manifest
+                        .save_with_retry_and_removals(store.as_ref(), &prefix, &removals)
+                        .await
+                    {
                         eprintln!("[compaction] manifest save failed for {sstable_id}: {e}");
                     } else {
                         eprintln!(
@@ -2160,6 +2167,34 @@ impl StorageEngine {
     }
 
     /// Checks if compaction should be triggered after a flush.
+    /// Force compaction for all tables, ignoring the STCS threshold.
+    ///
+    /// Useful for testing and debugging compaction issues. Submits a compaction
+    /// task for every table that has at least 2 SSTables, regardless of size
+    /// bucketing or min_threshold.
+    pub fn force_compact_all(&self) {
+        let tables = self.tables.read();
+        for (table_id, state) in tables.iter() {
+            let metadata = self.collect_sstable_metadata(table_id, state);
+            eprintln!(
+                "[force-compact] table {}: {} SSTables",
+                table_id,
+                metadata.len()
+            );
+            if metadata.len() >= 2 {
+                let task = crate::compaction::metadata::CompactionTask {
+                    inputs: metadata,
+                    output_dir: self.config.compaction.output_dir.clone(),
+                    schema: state.schema.clone(),
+                    table_id: table_id.clone(),
+                };
+                if let Err(e) = self.compaction_executor.submit(task) {
+                    eprintln!("[force-compact] submit failed for {table_id}: {e}");
+                }
+            }
+        }
+    }
+
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) {
         let metadata = self.collect_sstable_metadata(table_id, state);
         let strategy = self.strategy_for_table(state);

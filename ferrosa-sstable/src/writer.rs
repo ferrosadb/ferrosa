@@ -353,6 +353,13 @@ impl SSTableWriter {
 
         // Row-level deletion (unsigned varint deltas)
         if flags & HAS_DELETION != 0 {
+            assert!(
+                row.deletion.marked_for_delete_at >= self.header.min_timestamp,
+                "SSTable writer: row deletion timestamp {} < header min_timestamp {} — \
+                 delta would underflow and corrupt the SSTable",
+                row.deletion.marked_for_delete_at,
+                self.header.min_timestamp
+            );
             let ts_delta = (row.deletion.marked_for_delete_at - self.header.min_timestamp) as u64;
             push_unsigned_vint_to(&mut row_body, ts_delta);
             let ldt_delta = (row.deletion.local_deletion_time as i64
@@ -552,11 +559,13 @@ fn serialize_cell(
     if !use_row_timestamp {
         // Safety: if cell.timestamp < header.min_timestamp, the cast to u64
         // wraps to a huge value, producing a corrupt varint that will be
-        // misread as a garbage length later. Assert to catch this at write time.
-        debug_assert!(
+        // misread as a garbage length later. This MUST be a hard assert
+        // (not debug_assert) — release builds must catch this corruption
+        // at write time, not produce silently corrupt SSTables.
+        assert!(
             cell.timestamp >= header.min_timestamp,
             "SSTable writer: cell timestamp {} < header min_timestamp {} — \
-             delta would underflow",
+             delta would underflow and corrupt the SSTable",
             cell.timestamp,
             header.min_timestamp
         );
@@ -1567,5 +1576,53 @@ mod tests {
             "key bounds last={:?} should match token-sorted last={:?}",
             last_key, write_last
         );
+    }
+
+    /// RED TEST: A partition with a row whose deletion timestamp is lower
+    /// than the header's min_timestamp must be caught during writing.
+    ///
+    /// This simulates what happens during compaction when merge produces a
+    /// row with an old deletion timestamp. Without the fix, the delta
+    /// underflows to a huge u64, producing a corrupt varint that misaligns
+    /// the reader — the root cause of post-compaction data loss.
+    #[test]
+    #[should_panic(expected = "delta would underflow")]
+    fn row_deletion_timestamp_below_header_min_panics() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000, // header min is 1M
+            min_local_deletion_time: 100,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        };
+
+        // Row with deletion timestamp 500 < header min 1_000_000
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::from(b"pk1".as_slice())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![0x00, 0x00, 0x00, 0x01],
+                cells: vec![(0, CellValue::live(b"val".to_vec(), 1_000_000))],
+                deletion: DeletionTime::new(500, 100), // OLD deletion timestamp!
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000_000),
+            }],
+        };
+
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+        let mut writer = SSTableWriter::new(options, header);
+        // This MUST panic — writing a row with deletion ts < header min
+        // would produce a corrupt SSTable (varint underflow)
+        writer.add_partition(&partition).unwrap();
     }
 }

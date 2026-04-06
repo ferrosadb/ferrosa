@@ -1,0 +1,15 @@
+# Override: small flush threshold + low compaction threshold to force compaction during tests.
+# Usage: podman compose -f tests/docker-compose.cluster.yml -f tests/cluster/docker-compose.compaction-test.yml --profile trio up -d
+services:
+  node1:
+    environment:
+      FERROSA_FLUSH_THRESHOLD_BYTES: "8192"
+      FERROSA_COMPACTION_MIN_THRESHOLD: "2"
+  node2:
+    environment:
+      FERROSA_FLUSH_THRESHOLD_BYTES: "8192"
+      FERROSA_COMPACTION_MIN_THRESHOLD: "2"
+  node3:
+    environment:
+      FERROSA_FLUSH_THRESHOLD_BYTES: "8192"
+      FERROSA_COMPACTION_MIN_THRESHOLD: "2"
