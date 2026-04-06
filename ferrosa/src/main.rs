@@ -971,8 +971,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 13. Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
+    // 13. Wait for shutdown signal (SIGINT or SIGTERM)
+    //
+    // Docker/Podman sends SIGTERM on `stop`. Without this, the process
+    // only handles Ctrl-C (SIGINT) and gets killed after the stop timeout
+    // WITHOUT flushing memtables — causing 100% data loss on restart.
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
 
     // 14. Graceful shutdown: flush memtables, sync to S3, stop compaction
     tracing::info!("shutdown signal received, draining...");
