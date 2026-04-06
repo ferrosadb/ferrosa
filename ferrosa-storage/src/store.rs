@@ -846,13 +846,20 @@ impl<F: FlushTarget> TableStore<F> {
         let _guard = self.flush_guard.lock();
         let current = self.view.load();
 
-        // Keep SSTables whose (id, path) is NOT in the compaction input set.
+        // Keep SSTables whose ID is NOT in the compaction input set.
+        // Match on ID only — the path in the view may be empty (from flush)
+        // while the compaction task resolves it to the table directory. Matching
+        // on (id, path) caused inputs to never be removed, leaving stale
+        // references to deleted files that silently lost data on reads.
+        let input_id_set: std::collections::HashSet<&str> =
+            input_ids.iter().map(|(id, _)| id.as_str()).collect();
+
         let mut new_sstables = Vec::with_capacity(current.sstables.len());
         let mut new_ids = Vec::with_capacity(current.sstable_ids.len());
         let mut new_sidecars = Vec::with_capacity(current.sidecar_indexes.len());
 
         for (i, id_entry) in current.sstable_ids.iter().enumerate() {
-            if !input_ids.contains(id_entry) {
+            if !input_id_set.contains(id_entry.0.as_str()) {
                 new_sstables.push(Arc::clone(&current.sstables[i]));
                 new_ids.push(id_entry.clone());
                 if i < current.sidecar_indexes.len() {
@@ -1510,6 +1517,75 @@ mod tests {
                     .iter()
                     .any(|entry| entry == &(id.clone(), path.clone())),
                 "input {id} should be removed"
+            );
+        }
+    }
+
+    /// Reproduces the P0 data loss bug: flush stores SSTables with empty
+    /// PathBuf, but compaction passes the real path. If swap matches on
+    /// (id, path), the inputs are never removed — leaving stale references
+    /// to files that will be deleted, causing silent data loss.
+    #[test]
+    fn swap_compacted_sstables_matches_by_id_not_path() {
+        let store = test_store();
+
+        // Flush 2 SSTables — they get PathBuf::new() in the view.
+        store.write(&make_key("a"), make_row(b"val_a", 1)).unwrap();
+        store.flush().unwrap();
+        store.write(&make_key("b"), make_row(b"val_b", 2)).unwrap();
+        store.flush().unwrap();
+        assert_eq!(store.sstable_count(), 2);
+
+        // Get the IDs (they have empty paths from flush).
+        let view = store.view.load();
+        let ids: Vec<String> = view.sstable_ids.iter().map(|(id, _)| id.clone()).collect();
+        drop(view);
+        assert_eq!(ids.len(), 2);
+
+        // Simulate what compaction does: pass the IDs with a REAL path
+        // (not the empty PathBuf that flush stored).
+        let fake_path = std::path::PathBuf::from("/data/sstables/test_ks.test_table");
+        let input_ids_with_real_path: Vec<(String, std::path::PathBuf)> = ids
+            .iter()
+            .map(|id| (id.clone(), fake_path.clone()))
+            .collect();
+
+        // Create a compaction output SSTable.
+        store
+            .write(&make_key("merged"), make_row(b"merged", 3))
+            .unwrap();
+        store.flush().unwrap();
+        let view = store.view.load();
+        let output_sst = Arc::clone(&view.sstables[0]);
+        drop(view);
+
+        // Swap: this MUST remove the 2 inputs even though their paths
+        // don't match the view's empty PathBuf.
+        store
+            .swap_compacted_sstables(
+                &input_ids_with_real_path,
+                "output".to_string(),
+                fake_path,
+                output_sst,
+                HashMap::new(),
+            )
+            .unwrap();
+
+        // Before the fix, this was 4 (2 inputs kept + output + merged).
+        // After the fix, inputs are removed: 3 - 2 + 1 = 2.
+        assert_eq!(
+            store.sstable_count(),
+            2,
+            "compaction swap must remove inputs by ID regardless of path mismatch"
+        );
+
+        // Verify input IDs are gone from the view.
+        let view = store.view.load();
+        let remaining_ids: Vec<&str> = view.sstable_ids.iter().map(|(id, _)| id.as_str()).collect();
+        for id in &ids {
+            assert!(
+                !remaining_ids.contains(&id.as_str()),
+                "input SSTable {id} must be removed after compaction swap"
             );
         }
     }
