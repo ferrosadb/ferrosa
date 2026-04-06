@@ -168,21 +168,24 @@ impl WritePath {
     ///
     /// - `Direct` / `Pair`: reads from local storage only (single-node case).
     /// - `Cluster`: fans out to every ring node and merges results.
-    /// - `Unavailable`: returns an empty vec (degraded mode).
-    pub async fn range_read(&self, table_id: &TableId) -> Vec<Partition> {
+    /// - `Unavailable`: returns error (degraded mode).
+    ///
+    /// Errors are propagated — callers MUST handle them. Silently returning
+    /// empty results on failure causes data loss (see BUG: large-write-causes-
+    /// data-loss-in-partition).
+    pub async fn range_read(&self, table_id: &TableId) -> crate::error::Result<Vec<Partition>> {
         match self {
             Self::Direct(engine) => engine
                 .read_range(table_id, None, None, 1_000_000)
-                .unwrap_or_default(),
+                .map_err(crate::error::ClusterError::Storage),
             Self::Pair(coordinator) => coordinator
                 .local_storage()
                 .read_range(table_id, None, None, 1_000_000)
-                .unwrap_or_default(),
-            Self::Cluster(coordinator) => coordinator
-                .coordinate_range_read(table_id)
-                .await
-                .unwrap_or_default(),
-            Self::Unavailable => vec![],
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Cluster(coordinator) => coordinator.coordinate_range_read(table_id).await,
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "range read unavailable: write path is in degraded mode".into(),
+            )),
         }
     }
 

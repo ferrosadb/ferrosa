@@ -742,6 +742,12 @@ impl ClusterCoordinator {
     /// coordinator deduplicates partitions that appear on multiple nodes
     /// (e.g. due to replication or token overlap) by merging replicas with
     /// the same partition key using last-write-wins cell semantics.
+    /// Range-read timeout for remote nodes. Full-table scans can return
+    /// large payloads (hundreds of MB for wide partitions), so we use a
+    /// much longer timeout than the default Data lane (10s). This is
+    /// analogous to Cassandra's `range_request_timeout`.
+    const RANGE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     pub async fn coordinate_range_read(
         &self,
         table_id: &TableId,
@@ -763,6 +769,7 @@ impl ClusterCoordinator {
         let req_body = Bytes::from(bincode::serialize(&req_payload).unwrap_or_default());
 
         // Fan out to all nodes concurrently.
+        // Each future returns Result — errors are NOT silently swallowed.
         let local_id = self.local_node_id;
         let storage = self.storage.clone();
         let peer_manager = self.peer_manager.clone();
@@ -780,60 +787,91 @@ impl ClusterCoordinator {
                     if node_id == local_id {
                         storage
                             .read_range(&table_id, None, None, 1_000_000)
-                            .unwrap_or_default()
+                            .map_err(ClusterError::Storage)
                     } else {
-                        match host_id {
-                            None => vec![],
-                            Some(hid) => {
-                                match peer_manager
-                                    .send(
-                                        hid,
-                                        ferrosa_net::message::Message::RangeReadRequest(req_body),
-                                        Lane::Data,
-                                    )
-                                    .await
-                                {
-                                    Ok(ferrosa_net::message::Message::RangeReadResponse(b)) => {
-                                        match bincode::deserialize::<RangeReadResponsePayload>(&b) {
-                                            Ok(resp) => {
-                                                if resp.truncated {
-                                                    tracing::warn!(
-                                                        peer = %hid,
-                                                        "range read response truncated at 1M partitions; \
-                                                         results may be incomplete"
-                                                    );
-                                                }
-                                                resp.partitions
-                                                    .into_iter()
-                                                    .map(partition_from_wire)
-                                                    .collect()
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "coordinate_range_read: \
-                                                     failed to decode response: {e}"
-                                                );
-                                                vec![]
-                                            }
-                                        }
-                                    }
-                                    _ => vec![],
+                        let hid = host_id.ok_or_else(|| {
+                            ClusterError::Internal(format!(
+                                "range read: node {node_id} has no host_id"
+                            ))
+                        })?;
+
+                        let resp = peer_manager
+                            .send_with_timeout(
+                                hid,
+                                Message::RangeReadRequest(req_body),
+                                Lane::Data,
+                                Self::RANGE_READ_TIMEOUT,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ClusterError::Internal(format!(
+                                    "range read from node {node_id} ({hid}): {e}"
+                                ))
+                            })?;
+
+                        match resp {
+                            Message::RangeReadResponse(b) => {
+                                let payload =
+                                    bincode::deserialize::<RangeReadResponsePayload>(&b)
+                                        .map_err(|e| {
+                                            ClusterError::Internal(format!(
+                                                "range read: failed to decode response \
+                                                 from node {node_id} ({hid}): {e}"
+                                            ))
+                                        })?;
+                                if payload.truncated {
+                                    tracing::warn!(
+                                        peer = %hid,
+                                        "range read response truncated at 1M partitions; \
+                                         results may be incomplete"
+                                    );
                                 }
+                                Ok(payload
+                                    .partitions
+                                    .into_iter()
+                                    .map(partition_from_wire)
+                                    .collect())
                             }
+                            other => Err(ClusterError::Internal(format!(
+                                "range read: unexpected response type {:?} from node {node_id} ({hid})",
+                                other.msg_type()
+                            ))),
                         }
                     }
                 }
             })
             .collect();
 
-        // Collect all partitions.
+        // Collect results. If ANY node fails, the range read is incomplete
+        // and we must surface the error — silent partial results cause data loss.
         let mut all_partitions: Vec<ferrosa_sstable::types::Partition> = Vec::new();
-        while let Some(batch) = futs.next().await {
-            all_partitions.extend(batch);
+        let mut first_error: Option<ClusterError> = None;
+        let mut failed_nodes = 0usize;
+
+        while let Some(result) = futs.next().await {
+            match result {
+                Ok(batch) => all_partitions.extend(batch),
+                Err(e) => {
+                    tracing::error!("coordinate_range_read: {e}");
+                    failed_nodes += 1;
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = first_error {
+            tracing::error!(
+                failed_nodes,
+                partitions_received = all_partitions.len(),
+                "coordinate_range_read: incomplete — {failed_nodes} node(s) failed, \
+                 returning error instead of partial data"
+            );
+            return Err(err);
         }
 
         // Deduplicate: group by token, merge replicas with the same partition key.
-        use std::collections::BTreeMap;
         let mut by_token: BTreeMap<i64, Vec<ferrosa_sstable::types::Partition>> = BTreeMap::new();
         for p in all_partitions {
             by_token.entry(p.key.token.0).or_default().push(p);
@@ -1886,6 +1924,112 @@ mod tests {
         assert!(
             result.is_some(),
             "should find data on local replica even when listed second"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG: coordinate_range_read silent data loss
+    // -----------------------------------------------------------------------
+
+    /// When remote nodes are unreachable, coordinate_range_read must return
+    /// an error — NOT silently return partial results. Returning only local
+    /// data as Ok(partial) is indistinguishable from success and causes
+    /// silent data loss (the P0 bug: 15K entities → 2K after compaction).
+    #[tokio::test]
+    async fn coordinate_range_read_errors_when_remote_nodes_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let remote_uuid_2 = Uuid::new_v4();
+        let remote_uuid_3 = Uuid::new_v4();
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        // Add peers with no connection pools — sends will fail.
+        pm.add_peer_entry((remote_uuid_2, "10.0.0.2:7000".parse().unwrap()))
+            .await;
+        pm.add_peer_entry((remote_uuid_3, "10.0.0.3:7000".parse().unwrap()))
+            .await;
+
+        let mut node2 = make_node("10.0.0.2:7000");
+        node2.host_id = remote_uuid_2;
+        let mut node3 = make_node("10.0.0.3:7000");
+        node3.host_id = remote_uuid_3;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.add_node(2u64, node2);
+        ring.add_node(3u64, node3);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+        ring.assign_tokens(3u64, &[200]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm,
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        storage
+            .write(&table_id, &key, test_row(1000), 1000)
+            .unwrap();
+
+        // coordinate_range_read fans out to all 3 nodes.
+        // Remote nodes have no pools → sends fail.
+        // Must return Err, NOT Ok(partial_data).
+        let result = coordinator.coordinate_range_read(&table_id).await;
+        assert!(
+            result.is_err(),
+            "range read with unreachable nodes must return error, not partial data; \
+             got {} partitions — this is silent data loss!",
+            result.as_ref().map(|v| v.len()).unwrap_or(0)
+        );
+    }
+
+    /// Single-node range read should succeed (no remote nodes to fail).
+    #[tokio::test]
+    async fn coordinate_range_read_single_node_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        storage
+            .write(&table_id, &key, test_row(1000), 1000)
+            .unwrap();
+
+        let result = coordinator.coordinate_range_read(&table_id).await;
+        assert!(result.is_ok(), "single-node range read should succeed");
+        let partitions = result.unwrap();
+        assert_eq!(
+            partitions.len(),
+            1,
+            "should return the one written partition"
         );
     }
 }

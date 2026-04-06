@@ -1,3 +1,39 @@
+---
+implemented-by: claude-code
+updated: 2026-04-06
+---
+
+## Implementation Notes
+
+### Root Cause (confirmed)
+
+Two independent bugs combined to cause silent data loss:
+
+**Bug 1: Silent error swallowing in `coordinate_range_read`** (`ferrosa-cluster/src/coordinator/read.rs`)
+- Remote node failures (timeout, decode error, missing host_id) returned `vec![]` instead of `Err`
+- `WritePath::range_read` further swallowed errors with `.unwrap_or_default()`
+- Result: query appeared to succeed but returned only local node's data (1/3 on 3-node RF=1)
+
+**Bug 2: Range reads used Data lane (10s timeout)** for full-table scans
+- A 209MB partition response exceeds the 10s Data lane timeout
+- `NetError::Timeout` was caught by the `_ => vec![]` catch-all in Bug 1
+
+### Fix Applied
+
+1. **`coordinator/read.rs` — `coordinate_range_read`**: Each per-node future now returns `Result`. Errors are collected and propagated. If ANY node fails, the function returns `Err` with the first error and logs all failures at ERROR level. Range reads now use `send_with_timeout` with 120s (`RANGE_READ_TIMEOUT`).
+
+2. **`write_path.rs` — `range_read`**: Return type changed from `Vec<Partition>` to `Result<Vec<Partition>>`. All variants propagate errors. `Unavailable` variant returns explicit error instead of empty vec.
+
+3. **`ferrosa-cql/src/router.rs`**: All 4 call sites updated to use `?` — errors propagate as `CqlError::ServerError` via existing `From<ClusterError>` impl.
+
+### Tests Added
+
+- `coordinate_range_read_errors_when_remote_nodes_unreachable` — 3-node ring, remote nodes have no pool. Asserts `Err` (was silently returning partial data).
+- `coordinate_range_read_single_node_succeeds` — single-node ring, no remote nodes to fail. Asserts `Ok`.
+
+### Pre-existing Fix (already in codebase)
+
+- `encode_signed_bytes` sign bit preservation (`ferrosa-sstable/src/trie/node.rs:241-248`) — fixes BTI trie partition index corruption for negative values near byte boundaries.
 
 ## Analysis After Fix dacb814
 
@@ -148,3 +184,14 @@ Flush logs show `partitions_size=215` per SSTable. But `typed_edges` has PK `(te
 **This points to the flush draining a PARTIAL memtable.** The memtable has 209MB of data for this partition, but the flush only serializes the first ~5.5MB worth of rows before stopping. The index records the full 209MB expected size but the data writer stops early.
 
 **Check:** Is the memtable being drained/cleared DURING the flush? If new writes arrive while the flush is serializing, does the memtable iterator see the new rows or does it snapshot at flush start? A non-snapshot iterator that races with writes could produce a short data file with a stale size estimate.
+
+## Re-test After Fix 9a11092
+
+**Result: STILL FAILING.**
+
+```
+IMMEDIATE: 15,427 entities, 70,271 edges, canaries: 100/100
+AFTER 120s: 2,197 entities, 34,451 edges, canaries: 3/100
+```
+
+Same pattern. The flush fix did not resolve the partial memtable serialization.

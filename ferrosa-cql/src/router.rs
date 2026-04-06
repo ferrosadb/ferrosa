@@ -1162,7 +1162,7 @@ async fn route_select_user_table(
                 // values that can't be coerced to the PK column type) but
                 // the planner still sees Eq predicates on all PK columns.
                 // Fall through to a full scan rather than panicking.
-                let partitions = state.write_path.load().range_read(&table_id).await;
+                let partitions = state.write_path.load().range_read(&table_id).await?;
                 let mut all_rows = Vec::new();
                 for partition in &partitions {
                     let mut prows = bridge::partition_to_rows(
@@ -1234,7 +1234,7 @@ async fn route_select_user_table(
                 // may not be wired yet (Sprint I-3). Fall back to full scan so
                 // queries still return correct results.
                 let partitions = if partitions.is_empty() {
-                    state.write_path.load().range_read(&table_id).await
+                    state.write_path.load().range_read(&table_id).await?
                 } else {
                     partitions
                 };
@@ -1295,7 +1295,7 @@ async fn route_select_user_table(
                         .read_by_index(&table_id, first_idx_name, &index_key)?;
 
                 let partitions = if partitions.is_empty() {
-                    state.write_path.load().range_read(&table_id).await
+                    state.write_path.load().range_read(&table_id).await?
                 } else {
                     partitions
                 };
@@ -1355,7 +1355,7 @@ async fn route_select_user_table(
 
                 // Use a large scan window — LIMIT is applied *after* filtering,
                 // not before, to avoid cutting off matching rows (FRSA-BUG-003).
-                let partitions = state.write_path.load().range_read(&table_id).await;
+                let partitions = state.write_path.load().range_read(&table_id).await?;
                 let mut all_rows = Vec::new();
                 for partition in &partitions {
                     let mut prows = bridge::partition_to_rows(
