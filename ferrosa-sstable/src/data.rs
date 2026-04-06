@@ -281,6 +281,13 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 let mut vbuf = vec![0u8; vlen];
                 self.reader.read_exact_at(&mut vbuf, self.pos)?;
                 self.pos += vlen as u64;
+
+                // For multi-column CK, add u16 BE length prefix per component
+                // so the CQL layer's decode_clustering can split them back.
+                // Single-column CK uses raw bytes (no prefix).
+                if num_clustering > 1 {
+                    ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
+                }
                 ck_bytes.extend_from_slice(&vbuf);
             }
             ck_bytes
