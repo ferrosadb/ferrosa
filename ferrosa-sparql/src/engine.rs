@@ -2,8 +2,6 @@
 
 use std::sync::Arc;
 
-use spargebra::Query;
-
 use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::SparqlError;
@@ -58,14 +56,34 @@ impl SparqlEngine {
         Self { storage, config }
     }
 
+    /// Execute a SPARQL UPDATE and return the result.
+    pub fn execute_update(
+        &self,
+        update_str: &str,
+        keyspace: &str,
+    ) -> Result<crate::update::UpdateResult, SparqlError> {
+        let ks = if keyspace.is_empty() {
+            &self.config.default_graph
+        } else {
+            keyspace
+        };
+        if !ks.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(SparqlError::KeyspaceNotFound(format!(
+                "invalid keyspace name: {ks}"
+            )));
+        }
+        crate::update::execute_update(update_str, ks, &self.storage)
+    }
+
     /// Execute a SPARQL query and return results.
     ///
     /// The `keyspace` parameter scopes the query to a specific tenant/keyspace.
     /// ASK queries return a boolean result; SELECT queries return binding sets.
     pub fn execute(&self, query_str: &str, keyspace: &str) -> Result<SparqlResult, SparqlError> {
         // 1. Parse SPARQL → algebra.
-        let query =
-            Query::parse(query_str, None).map_err(|e| SparqlError::Parse(format!("{e}")))?;
+        let query = spargebra::SparqlParser::new()
+            .parse_query(query_str)
+            .map_err(|e| SparqlError::Parse(format!("{e}")))?;
 
         // 2. Plan: algebra → storage operations.
         // BUG-S1 fix: use caller-supplied keyspace instead of default_graph.
@@ -74,6 +92,14 @@ impl SparqlEngine {
         } else {
             keyspace
         };
+
+        // BUG-S12 fix: validate keyspace name (alphanumeric + underscore only).
+        if !graph.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(SparqlError::KeyspaceNotFound(format!(
+                "invalid keyspace name: {graph}"
+            )));
+        }
+
         let plan = planner::plan_query(&query, graph)?;
 
         // 3. Execute plan against storage.
@@ -94,56 +120,51 @@ impl SparqlEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn parse_simple_select() {
         // Verify spargebra parses without error.
-        let query = Query::parse("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", None);
+        let query =
+            spargebra::SparqlParser::new().parse_query("SELECT ?s ?p ?o WHERE { ?s ?p ?o }");
         assert!(query.is_ok(), "spargebra should parse basic SELECT");
     }
 
     #[test]
     fn parse_select_with_filter() {
-        let query = Query::parse(
+        let query = spargebra::SparqlParser::new().parse_query(
             "SELECT ?name WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?name . FILTER(?name = \"Alice\") }",
-            None,
         );
         assert!(query.is_ok(), "spargebra should parse SELECT with FILTER");
     }
 
     #[test]
     fn parse_select_with_prefix() {
-        let query = Query::parse(
+        let query = spargebra::SparqlParser::new().parse_query(
             "PREFIX foaf: <http://xmlns.com/foaf/0.1/> SELECT ?name WHERE { ?s foaf:name ?name }",
-            None,
         );
         assert!(query.is_ok(), "spargebra should parse SELECT with PREFIX");
     }
 
     #[test]
     fn parse_ask_query() {
-        let query = Query::parse(
+        let query = spargebra::SparqlParser::new().parse_query(
             "ASK { <http://example.org/alice> <http://xmlns.com/foaf/0.1/name> ?name }",
-            None,
         );
         assert!(query.is_ok(), "spargebra should parse ASK");
     }
 
     #[test]
     fn parse_property_path() {
-        let query = Query::parse(
+        let query = spargebra::SparqlParser::new().parse_query(
             "SELECT ?o WHERE { <http://example.org/alice> <http://xmlns.com/foaf/0.1/knows>+ ?o }",
-            None,
         );
         assert!(query.is_ok(), "spargebra should parse property paths");
     }
 
     #[test]
     fn parse_insert_data() {
-        let update = spargebra::Update::parse(
+        let update = spargebra::SparqlParser::new().parse_update(
             "INSERT DATA { <http://example.org/alice> <http://xmlns.com/foaf/0.1/name> \"Alice\" }",
-            None,
         );
         assert!(update.is_ok(), "spargebra should parse INSERT DATA");
     }

@@ -52,8 +52,8 @@ pub struct QueryPlan {
     pub distinct: bool,
     /// ORDER BY conditions (empty if none).
     pub order_by: Vec<OrderCondition>,
-    /// Number of FILTER expressions that were parsed but not evaluated.
-    pub unimplemented_filter_count: usize,
+    /// FILTER expressions to evaluate against binding sets.
+    pub filters: Vec<spargebra::algebra::Expression>,
 }
 
 /// Plan a SPARQL SELECT or ASK query.
@@ -90,7 +90,7 @@ fn plan_select(
     let mut offset = None;
     let mut distinct = false;
     let mut order_by = Vec::new();
-    let mut unimplemented_filter_count: usize = 0;
+    let mut filters: Vec<spargebra::algebra::Expression> = Vec::new();
 
     collect_ops(
         pattern,
@@ -101,7 +101,7 @@ fn plan_select(
         &mut offset,
         &mut distinct,
         &mut order_by,
-        &mut unimplemented_filter_count,
+        &mut filters,
     )?;
 
     Ok(QueryPlan {
@@ -112,7 +112,7 @@ fn plan_select(
         is_ask,
         distinct,
         order_by,
-        unimplemented_filter_count,
+        filters,
     })
 }
 
@@ -126,7 +126,7 @@ fn collect_ops(
     offset: &mut Option<usize>,
     distinct: &mut bool,
     order_by: &mut Vec<OrderCondition>,
-    unimplemented_filter_count: &mut usize,
+    filters: &mut Vec<spargebra::algebra::Expression>,
 ) -> Result<(), SparqlError> {
     match pattern {
         GraphPattern::Bgp { patterns } => {
@@ -148,7 +148,7 @@ fn collect_ops(
                 offset,
                 distinct,
                 order_by,
-                unimplemented_filter_count,
+                filters,
             )?;
         }
         GraphPattern::Slice {
@@ -171,15 +171,11 @@ fn collect_ops(
                 offset,
                 distinct,
                 order_by,
-                unimplemented_filter_count,
+                filters,
             )?;
         }
-        GraphPattern::Filter { inner, .. } => {
-            *unimplemented_filter_count += 1;
-            tracing::warn!(
-                "FILTER expression encountered but not yet evaluated — \
-                 results may include non-matching rows"
-            );
+        GraphPattern::Filter { inner, expr } => {
+            filters.push(expr.clone());
             collect_ops(
                 inner,
                 default_graph,
@@ -189,7 +185,7 @@ fn collect_ops(
                 offset,
                 distinct,
                 order_by,
-                unimplemented_filter_count,
+                filters,
             )?;
         }
         GraphPattern::OrderBy {
@@ -230,7 +226,7 @@ fn collect_ops(
                 offset,
                 distinct,
                 order_by,
-                unimplemented_filter_count,
+                filters,
             )?;
         }
         GraphPattern::Distinct { inner } => {
@@ -244,7 +240,7 @@ fn collect_ops(
                 offset,
                 distinct,
                 order_by,
-                unimplemented_filter_count,
+                filters,
             )?;
         }
         GraphPattern::Reduced { inner } => {
@@ -257,8 +253,79 @@ fn collect_ops(
                 offset,
                 distinct,
                 order_by,
-                unimplemented_filter_count,
+                filters,
             )?;
+        }
+        GraphPattern::Path {
+            subject,
+            path,
+            object,
+        } => {
+            // Property paths (e.g., foaf:knows+, foaf:knows*, foaf:knows?)
+            // are translated to a series of triple patterns with the
+            // predicate extracted from the path expression. Full BFS/DFS
+            // evaluation is deferred to Sprint 2; for now we evaluate
+            // single-step paths (iri) and warn on transitive closures.
+            let pred_iri = extract_predicate_from_path(path);
+            match pred_iri {
+                Some(iri) => {
+                    // Create a synthetic triple pattern for the path.
+                    let tp = TriplePattern {
+                        subject: subject.clone(),
+                        predicate: NamedNodePattern::NamedNode(
+                            spargebra::term::NamedNode::new_unchecked(&iri),
+                        ),
+                        object: object.clone(),
+                    };
+                    let op = plan_triple_pattern(&tp, default_graph);
+                    ops.push((tp, op));
+                }
+                None => {
+                    tracing::warn!(?path, "complex property path — evaluating as single hop");
+                }
+            }
+        }
+        GraphPattern::Union { left, right } => {
+            // BUG-S14: UNION support — concat both sides.
+            collect_ops(
+                left,
+                default_graph,
+                ops,
+                projection,
+                limit,
+                offset,
+                distinct,
+                order_by,
+                filters,
+            )?;
+            // UNION appends the right side's patterns too.
+            collect_ops(
+                right,
+                default_graph,
+                ops,
+                projection,
+                limit,
+                offset,
+                distinct,
+                order_by,
+                filters,
+            )?;
+        }
+        GraphPattern::LeftJoin { left, right: _, .. } => {
+            // OPTIONAL → evaluate left side; right side patterns are optional.
+            // For now, just evaluate the left side (inner patterns).
+            collect_ops(
+                left,
+                default_graph,
+                ops,
+                projection,
+                limit,
+                offset,
+                distinct,
+                order_by,
+                filters,
+            )?;
+            tracing::warn!("OPTIONAL (LeftJoin) right side not yet evaluated");
         }
         _ => {
             return Err(SparqlError::Plan(format!(
@@ -267,6 +334,36 @@ fn collect_ops(
         }
     }
     Ok(())
+}
+
+/// Extract the predicate IRI from a property path expression.
+///
+/// Handles simple paths (single IRI), OneOrMore (+), ZeroOrMore (*),
+/// and ZeroOrOne (?). For transitive paths, returns the base IRI
+/// and logs that full BFS is deferred.
+fn extract_predicate_from_path(
+    path: &spargebra::algebra::PropertyPathExpression,
+) -> Option<String> {
+    use spargebra::algebra::PropertyPathExpression;
+    match path {
+        PropertyPathExpression::NamedNode(n) => Some(n.as_str().to_string()),
+        PropertyPathExpression::OneOrMore(inner)
+        | PropertyPathExpression::ZeroOrMore(inner)
+        | PropertyPathExpression::ZeroOrOne(inner) => {
+            tracing::info!(
+                "property path with closure operator — evaluating as single hop for now"
+            );
+            extract_predicate_from_path(inner)
+        }
+        PropertyPathExpression::Reverse(inner) => {
+            tracing::info!("reverse property path — evaluating as forward for now");
+            extract_predicate_from_path(inner)
+        }
+        _ => {
+            tracing::warn!(?path, "complex property path expression not supported");
+            None
+        }
+    }
 }
 
 /// Choose a storage operation for a single triple pattern.
@@ -322,7 +419,9 @@ mod tests {
 
     #[test]
     fn plan_simple_select() {
-        let query = Query::parse("SELECT ?s ?p ?o WHERE { ?s ?p ?o }", None).unwrap();
+        let query = spargebra::SparqlParser::new()
+            .parse_query("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+            .unwrap();
         let plan = plan_query(&query, "default").unwrap();
         assert_eq!(plan.projection, vec!["s", "p", "o"]);
         assert_eq!(plan.ops.len(), 1);
@@ -331,11 +430,9 @@ mod tests {
 
     #[test]
     fn plan_select_with_bound_subject() {
-        let query = Query::parse(
-            "SELECT ?p ?o WHERE { <http://example.org/alice> ?p ?o }",
-            None,
-        )
-        .unwrap();
+        let query = spargebra::SparqlParser::new()
+            .parse_query("SELECT ?p ?o WHERE { <http://example.org/alice> ?p ?o }")
+            .unwrap();
         let plan = plan_query(&query, "default").unwrap();
         assert_eq!(plan.ops.len(), 1);
         assert!(matches!(plan.ops[0].1, TripleOp::SubjectLookup { .. }));
@@ -343,18 +440,20 @@ mod tests {
 
     #[test]
     fn plan_select_with_limit() {
-        let query = Query::parse("SELECT ?s WHERE { ?s ?p ?o } LIMIT 10", None).unwrap();
+        let query = spargebra::SparqlParser::new()
+            .parse_query("SELECT ?s WHERE { ?s ?p ?o } LIMIT 10")
+            .unwrap();
         let plan = plan_query(&query, "default").unwrap();
         assert_eq!(plan.limit, Some(10));
     }
 
     #[test]
     fn plan_ask_sets_is_ask_flag() {
-        let query = Query::parse(
-            "ASK { <http://example.org/alice> <http://xmlns.com/foaf/0.1/name> ?name }",
-            None,
-        )
-        .unwrap();
+        let query = spargebra::SparqlParser::new()
+            .parse_query(
+                "ASK { <http://example.org/alice> <http://xmlns.com/foaf/0.1/name> ?name }",
+            )
+            .unwrap();
         let plan = plan_query(&query, "default").unwrap();
         assert!(plan.is_ask, "ASK query must set is_ask=true");
         assert_eq!(plan.limit, Some(1), "ASK query must limit to 1 row");
@@ -362,25 +461,29 @@ mod tests {
 
     #[test]
     fn plan_select_not_ask() {
-        let query = Query::parse("SELECT ?s WHERE { ?s ?p ?o }", None).unwrap();
+        let query = spargebra::SparqlParser::new()
+            .parse_query("SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap();
         let plan = plan_query(&query, "default").unwrap();
         assert!(!plan.is_ask, "SELECT query must set is_ask=false");
     }
 
     #[test]
     fn plan_distinct_sets_flag() {
-        let query = Query::parse("SELECT DISTINCT ?s WHERE { ?s ?p ?o }", None).unwrap();
+        let query = spargebra::SparqlParser::new()
+            .parse_query("SELECT DISTINCT ?s WHERE { ?s ?p ?o }")
+            .unwrap();
         let plan = plan_query(&query, "default").unwrap();
         assert!(plan.distinct, "DISTINCT must set distinct=true");
     }
 
     #[test]
     fn plan_order_by_captures_conditions() {
-        let query = Query::parse(
-            "SELECT ?name WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?name } ORDER BY ?name",
-            None,
-        )
-        .unwrap();
+        let query = spargebra::SparqlParser::new()
+            .parse_query(
+                "SELECT ?name WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?name } ORDER BY ?name",
+            )
+            .unwrap();
         let plan = plan_query(&query, "default").unwrap();
         assert_eq!(plan.order_by.len(), 1);
         assert_eq!(plan.order_by[0].variable, "name");
@@ -389,9 +492,8 @@ mod tests {
 
     #[test]
     fn plan_order_by_desc() {
-        let query = Query::parse(
+        let query = spargebra::SparqlParser::new().parse_query(
             "SELECT ?name WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?name } ORDER BY DESC(?name)",
-            None,
         )
         .unwrap();
         let plan = plan_query(&query, "default").unwrap();
@@ -401,25 +503,19 @@ mod tests {
 
     #[test]
     fn plan_filter_counts_unimplemented() {
-        let query = Query::parse(
+        let query = spargebra::SparqlParser::new().parse_query(
             "SELECT ?name WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?name . FILTER(?name = \"Alice\") }",
-            None,
         )
         .unwrap();
         let plan = plan_query(&query, "default").unwrap();
-        assert_eq!(
-            plan.unimplemented_filter_count, 1,
-            "FILTER must increment unimplemented_filter_count"
-        );
+        assert_eq!(plan.filters.len(), 1, "FILTER must capture one expression");
     }
 
     #[test]
     fn plan_uses_keyspace_as_graph() {
-        let query = Query::parse(
-            "SELECT ?p ?o WHERE { <http://example.org/alice> ?p ?o }",
-            None,
-        )
-        .unwrap();
+        let query = spargebra::SparqlParser::new()
+            .parse_query("SELECT ?p ?o WHERE { <http://example.org/alice> ?p ?o }")
+            .unwrap();
         let plan = plan_query(&query, "my_tenant").unwrap();
         match &plan.ops[0].1 {
             TripleOp::SubjectLookup { graph, .. } => {

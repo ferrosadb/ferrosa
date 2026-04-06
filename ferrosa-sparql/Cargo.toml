@@ -8,11 +8,11 @@ description = "SPARQL 1.1 Query and Update endpoint for Ferrosa"
 
 [dependencies]
 # SPARQL parser → algebra tree
-spargebra = "0.3"
+spargebra = "0.4"
 # SPARQL results serialization (JSON, XML, CSV)
 sparesults = "0.3"
 # RDF terms (IRI, Literal, BlankNode)
-oxrdf = "0.1"
+oxrdf = "0.3"
 
 # Internal ferrosa crates
 ferrosa-common = { path = "../ferrosa-common" }

@@ -50,11 +50,18 @@ pub async fn start_sparql_http(config: &SparqlHttpConfig, state: AppState) -> st
     Ok(())
 }
 
+/// Maximum query body size: 1 MiB. Prevents DoS via oversized requests (BUG-S17).
+const MAX_QUERY_BODY: usize = 1024 * 1024;
+
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/sparql", post(handle_sparql_post))
         .route("/sparql", get(handle_sparql_get))
+        .route("/sparql/update", post(handle_sparql_update))
         .route("/sparql/health", get(handle_health))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            MAX_QUERY_BODY,
+        ))
         .with_state(state)
 }
 
@@ -97,6 +104,36 @@ async fn handle_sparql_get(
     AxumQuery(params): AxumQuery<SparqlGetParams>,
 ) -> Response {
     execute_and_respond(&state, &params.query, &params.keyspace)
+}
+
+/// POST /sparql/update — execute a SPARQL UPDATE (INSERT DATA, DELETE DATA).
+async fn handle_sparql_update(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let update_str = match extract_query_from_post(&headers, &body) {
+        Ok(q) => q,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+
+    let keyspace = headers
+        .get("X-Keyspace")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("rdf");
+
+    match state.engine.execute_update(&update_str, keyspace) {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "triples_inserted": result.triples_inserted,
+                "triples_deleted": result.triples_deleted,
+            })),
+        )
+            .into_response(),
+        Err(crate::error::SparqlError::Parse(msg)) => error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 /// GET /sparql/health — health check.

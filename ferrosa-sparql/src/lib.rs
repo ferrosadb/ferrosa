@@ -7,8 +7,10 @@
 pub mod engine;
 pub mod error;
 pub mod executor;
+pub mod filter;
 pub mod http;
 pub mod namespace;
 pub mod planner;
 pub mod results;
 pub mod triple_store;
+pub mod update;

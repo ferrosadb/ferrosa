@@ -19,15 +19,16 @@ pub fn execute(
     plan: &QueryPlan,
     storage: &Arc<StorageEngine>,
 ) -> Result<SparqlJsonResults, SparqlError> {
-    // BUG-S13: warn about unimplemented FILTER expressions.
-    if plan.unimplemented_filter_count > 0 {
-        tracing::warn!(
-            count = plan.unimplemented_filter_count,
-            "FILTER expressions are not yet evaluated; results may include extra rows"
-        );
-    }
-
     let mut binding_sets = evaluate_triple_patterns(plan, storage)?;
+
+    // Apply FILTER expressions to binding sets.
+    if !plan.filters.is_empty() {
+        binding_sets.retain(|row| {
+            plan.filters
+                .iter()
+                .all(|expr| crate::filter::eval_filter(expr, row))
+        });
+    }
 
     // BUG-S13: apply ORDER BY.
     apply_order_by(&mut binding_sets, &plan.order_by);
@@ -93,9 +94,11 @@ fn try_bind_triple(
     let mut row = existing.clone();
 
     // Bind or check subject.
+    // BUG-S11 fix: detect blank nodes by `_:` prefix instead of assuming URI.
     if let spargebra::term::TermPattern::Variable(var) = &tp.subject {
+        let subject_type = if s.starts_with("_:") { "bnode" } else { "uri" };
         let binding = Binding {
-            binding_type: "uri".into(),
+            binding_type: subject_type.into(),
             value: s.clone(),
             datatype: None,
             lang: None,
@@ -284,13 +287,21 @@ fn extract_rows_from_partition(rows: &[Row], subject: &str, triples: &mut Vec<Fe
         let predicate = extract_clustering_string(&row.clustering, 0);
         let object = extract_clustering_string(&row.clustering, 1);
 
-        let obj_type = row
+        // BUG-S18 fix: validate object type against known values.
+        let raw_obj_type = row
             .cells
             .iter()
             .find(|(idx, _)| *idx == triple_store::COL_OBJECT_TYPE)
             .and_then(|(_, cell)| cell.value.as_ref())
             .map(|v| String::from_utf8_lossy(v).to_string())
             .unwrap_or_else(|| "literal".into());
+        let obj_type = match raw_obj_type.as_str() {
+            "uri" | "literal" | "bnode" => raw_obj_type,
+            other => {
+                tracing::warn!(value = other, "invalid object type, defaulting to literal");
+                "literal".into()
+            }
+        };
 
         let datatype = row
             .cells
