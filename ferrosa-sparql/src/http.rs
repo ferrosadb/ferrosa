@@ -136,7 +136,10 @@ async fn handle_sparql_update(
     }
 }
 
-/// GET /sparql/health — health check.
+/// GET /sparql/health — health check (intentionally unauthenticated).
+///
+/// Load balancers and k8s probes need to reach this without credentials.
+/// This matches the pattern in ferrosa-graph's `/graph/health` endpoint.
 async fn handle_health() -> Response {
     (
         StatusCode::OK,

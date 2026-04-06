@@ -75,16 +75,51 @@ fn insert_quad(
     )
 }
 
-/// Delete a single ground quad from storage.
+/// Delete a single ground quad from storage by writing a tombstone row.
 fn delete_ground_quad(
     quad: &GroundQuad,
-    _keyspace: &str,
-    _storage: &Arc<StorageEngine>,
+    keyspace: &str,
+    storage: &Arc<StorageEngine>,
 ) -> Result<(), SparqlError> {
-    // Deletion requires reading the partition, finding the matching row,
-    // and writing a tombstone. Partially implemented — log for now.
-    let _subject = quad.subject.as_str().to_string();
-    tracing::warn!("DELETE DATA: tombstone write not yet implemented");
+    let graph = match &quad.graph_name {
+        spargebra::term::GraphName::NamedNode(n) => n.as_str().to_string(),
+        spargebra::term::GraphName::DefaultGraph => "default".to_string(),
+    };
+    let subject = quad.subject.as_str().to_string();
+    let predicate = quad.predicate.as_str().to_string();
+    let object = match &quad.object {
+        spargebra::term::GroundTerm::NamedNode(n) => n.as_str().to_string(),
+        spargebra::term::GroundTerm::Literal(l) => l.value().to_string(),
+    };
+
+    let table_id = triple_store::triples_table_id(keyspace);
+    let key = triple_store::partition_key(&graph, &subject);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let timestamp = now.as_micros() as i64;
+
+    // Build clustering key matching the triple to delete.
+    let mut clustering = Vec::new();
+    clustering.extend_from_slice(&(predicate.len() as u16).to_be_bytes());
+    clustering.extend_from_slice(predicate.as_bytes());
+    clustering.push(0);
+    clustering.extend_from_slice(&(object.len() as u16).to_be_bytes());
+    clustering.extend_from_slice(object.as_bytes());
+    clustering.push(0);
+
+    // Write a tombstone row (deletion marker).
+    let row = Row {
+        clustering,
+        cells: vec![],
+        deletion: DeletionTime {
+            marked_for_delete_at: timestamp,
+            local_deletion_time: now.as_secs() as u32,
+        },
+        primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+    };
+
+    storage.write(&table_id, &key, row, timestamp)?;
     Ok(())
 }
 
