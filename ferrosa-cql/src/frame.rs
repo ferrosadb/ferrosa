@@ -513,6 +513,16 @@ fn decompress_snappy(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 ///
 /// Cassandra uses the CRC-24 variant defined in the native protocol v5 spec.
 /// The polynomial is 0x875060, initial value 0x875060, no final XOR.
+/// Public CRC24 for test use.
+pub fn crc24_public(data: &[u8]) -> u32 {
+    crc24(data)
+}
+
+/// Public CRC32 for test use.
+pub fn crc32_public(data: &[u8]) -> u32 {
+    crc32_castagnoli(data)
+}
+
 fn crc24(data: &[u8]) -> u32 {
     let mut crc: u32 = 0x87_5060;
     for &byte in data {
