@@ -725,12 +725,40 @@ impl StorageEngine {
 
     /// Unregisters a table from the storage engine.
     ///
-    /// Removes the `TableState` from the engine's table map. Any in-progress
-    /// reads holding an `Arc` reference to the underlying `TableStore` or its
-    /// SSTables will complete normally; the data is freed once those references drop.
-    /// Called as part of `DROP TABLE` / `DROP KEYSPACE` in pair mode.
+    /// Removes the `TableState` from the engine's table map AND deletes the
+    /// local SSTable directory so that a subsequent `CREATE TABLE` with the
+    /// same name starts empty. Any in-progress reads holding an `Arc`
+    /// reference to the underlying `TableStore` or its SSTables will complete
+    /// normally; the data is freed once those references drop.
+    ///
+    /// S3-side SSTable cleanup is handled by the manifest GC sweep (separate
+    /// from this path). Local deletion is sufficient to prevent stale data
+    /// from being loaded on re-creation.
     pub fn unregister_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         self.tables.write().remove(table_id);
+
+        // Delete local SSTable directory so DROP+CREATE starts empty.
+        let table_dir = self
+            .config
+            .data_dir
+            .join("sstables")
+            .join(table_id.to_string());
+        if table_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&table_dir) {
+                tracing::warn!(
+                    table = %table_id,
+                    path = %table_dir.display(),
+                    %e,
+                    "failed to delete SSTable directory on DROP TABLE"
+                );
+            } else {
+                tracing::info!(
+                    table = %table_id,
+                    "deleted local SSTable directory on DROP TABLE"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -1351,7 +1379,28 @@ impl StorageEngine {
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
+        // Clear in-memory state (memtable + SSTable references).
         state.store.truncate();
+        drop(tables);
+
+        // Delete local SSTable files so data doesn't reappear on restart.
+        let table_dir = self
+            .config
+            .data_dir
+            .join("sstables")
+            .join(table_id.to_string());
+        if table_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&table_dir) {
+                tracing::warn!(
+                    table = %table_id,
+                    %e,
+                    "TRUNCATE: failed to delete local SSTable directory"
+                );
+            }
+            // Re-create empty directory so future flushes have a target.
+            let _ = std::fs::create_dir_all(&table_dir);
+        }
+
         Ok(())
     }
 
@@ -3192,6 +3241,70 @@ mod tests {
         // Write should now fail — table is no longer registered.
         let result = engine.write(&tid, &make_key("after"), make_row(b"v", 2), 2);
         assert!(result.is_err(), "write to unregistered table should fail");
+    }
+
+    #[test]
+    fn drop_table_then_recreate_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+
+        engine.register_table(test_schema()).unwrap();
+
+        // Write and flush so data is in SSTables on disk.
+        let key = make_key("old_data");
+        engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Verify data exists.
+        let result = engine.read(&tid, &key).unwrap();
+        assert!(result.is_some(), "data should exist before DROP");
+
+        // DROP TABLE (unregister).
+        engine.unregister_table(&tid).unwrap();
+
+        // Re-create the table.
+        engine.register_table(test_schema()).unwrap();
+
+        // Old data must NOT be visible — the DROP should have deleted
+        // the local SSTable directory.
+        let result = engine.read(&tid, &key).unwrap();
+        assert!(
+            result.is_none(),
+            "data must be gone after DROP+CREATE — got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn truncate_deletes_flushed_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+
+        engine.register_table(test_schema()).unwrap();
+
+        let key = make_key("trunc_data");
+        engine
+            .write(&tid, &key, make_row(b"will_be_gone", 1), 1)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Verify data exists.
+        assert!(engine.read(&tid, &key).unwrap().is_some());
+
+        // TRUNCATE.
+        engine.truncate(&tid).unwrap();
+
+        // Data must be gone.
+        let result = engine.read(&tid, &key).unwrap();
+        assert!(
+            result.is_none(),
+            "data must be gone after TRUNCATE — got {:?}",
+            result
+        );
     }
 
     #[test]
