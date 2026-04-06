@@ -225,12 +225,25 @@ impl ModeController {
 
         // Assign deterministic tokens to all nodes (256 per node).
         // Uses node_id XOR with index to produce deterministic, well-distributed tokens.
+        //
+        // CRITICAL: all_node_ids must include EVERY cluster member (self + all peers).
+        // If any node builds the ring with a different member set, token assignments
+        // diverge and writes scatter across nodes instead of landing on the correct
+        // single replica.
         let num_tokens = self.config.num_tokens as usize;
         let mut all_node_ids: Vec<u64> = vec![local_node_id];
         for (peer_uuid, _) in &peers {
             all_node_ids.push(uuid_to_node_id(*peer_uuid));
         }
         all_node_ids.sort_unstable(); // deterministic order
+
+        tracing::info!(
+            local = local_node_id,
+            peer_count = peers.len(),
+            member_count = all_node_ids.len(),
+            member_ids = ?all_node_ids,
+            "building token ring"
+        );
 
         for &nid in &all_node_ids {
             let tokens: Vec<i64> = (0..num_tokens)
@@ -289,7 +302,7 @@ impl ModeController {
 
         let repair_metrics_for_handler = coordinator.repair_metrics.clone();
 
-        // 6. Swap write path — cluster coordinator handles replica routing
+        // 6. Swap write path — cluster coordinator handles replica routing.
         self.write_path
             .store(Arc::new(WritePath::cluster(coordinator)));
 
@@ -565,6 +578,7 @@ impl ModeController {
                         peer_manager: peer_manager_for_ddl,
                         node_map: node_map_for_ddl,
                     }));
+
 
                     // Drain any DDL operations queued during Forming state.
                     // Take the receiver outside the lock guard scope to avoid
