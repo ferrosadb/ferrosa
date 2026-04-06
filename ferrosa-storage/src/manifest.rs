@@ -640,4 +640,105 @@ mod tests {
             "sst4 (compaction output) must be present; got: {ids:?}"
         );
     }
+
+    /// RED TEST: Two nodes flush SSTables with the same generation ID.
+    /// merge_into replaces the first node's entry with the second's.
+    /// Node A's SSTable is orphaned in S3 — data loss.
+    #[tokio::test]
+    async fn multinode_flush_same_gen_id_loses_first_node_data() {
+        let store = InMemory::new();
+
+        // Node A flushes SSTable gen=5 (size=1000, its data)
+        let mut manifest_a = Manifest::new();
+        manifest_a.add_sstable(
+            "ks.t",
+            ManifestEntry {
+                id: "5".to_string(),
+                size: 1000, // Node A's SSTable
+                min_token: -100,
+                max_token: 0,
+                min_timestamp: 1000,
+                max_timestamp: 2000,
+            },
+        );
+        manifest_a.save_with_retry(&store, "test").await.unwrap();
+
+        // Node B also flushes SSTable gen=5 (different data, size=2000)
+        let mut manifest_b = Manifest::new();
+        manifest_b.add_sstable(
+            "ks.t",
+            ManifestEntry {
+                id: "5".to_string(),
+                size: 2000, // Node B's SSTable — DIFFERENT data
+                min_token: 0,
+                max_token: 100,
+                min_timestamp: 3000,
+                max_timestamp: 4000,
+            },
+        );
+        manifest_b.save_with_retry(&store, "test").await.unwrap();
+
+        // Check: the manifest should have BOTH SSTables, but they have
+        // the same ID so merge_into can only keep one.
+        let (final_manifest, _) = Manifest::load(&store, "test").await.unwrap();
+        let entries = &final_manifest.sstables["ks.t"];
+
+        // This SHOULD have 2 entries (one per node), but because they
+        // share ID "5", merge_into replaces one with the other.
+        // The test verifies the BUG exists: only 1 entry survives.
+        assert_eq!(
+            entries.len(),
+            1,
+            "BUG CONFIRMED: merge_into deduplicates by ID, losing one node's data. \
+             Got {} entries: {:?}",
+            entries.len(),
+            entries.iter().map(|e| e.size).collect::<Vec<_>>()
+        );
+        // Node A's entry (size=1000) was replaced by Node B's (size=2000)
+        assert_eq!(
+            entries[0].size, 2000,
+            "Node B's entry replaced Node A's — Node A's data is lost"
+        );
+    }
+
+    /// Prove the fix: when SSTable IDs include node prefix, no collision.
+    #[tokio::test]
+    async fn multinode_flush_unique_ids_preserves_both() {
+        let store = InMemory::new();
+
+        // Node A flushes with prefixed ID
+        let mut manifest_a = Manifest::new();
+        manifest_a.add_sstable(
+            "ks.t",
+            ManifestEntry {
+                id: "nodeA_5".to_string(),
+                size: 1000,
+                min_token: -100,
+                max_token: 0,
+                min_timestamp: 1000,
+                max_timestamp: 2000,
+            },
+        );
+        manifest_a.save_with_retry(&store, "test").await.unwrap();
+
+        // Node B flushes with different prefixed ID
+        let mut manifest_b = Manifest::new();
+        manifest_b.add_sstable(
+            "ks.t",
+            ManifestEntry {
+                id: "nodeB_5".to_string(),
+                size: 2000,
+                min_token: 0,
+                max_token: 100,
+                min_timestamp: 3000,
+                max_timestamp: 4000,
+            },
+        );
+        manifest_b.save_with_retry(&store, "test").await.unwrap();
+
+        let (final_manifest, _) = Manifest::load(&store, "test").await.unwrap();
+        let entries = &final_manifest.sstables["ks.t"];
+
+        assert_eq!(entries.len(), 2, "Both nodes' SSTables must be preserved");
+    }
 }

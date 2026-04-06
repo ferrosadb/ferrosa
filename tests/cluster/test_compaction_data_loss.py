@@ -244,6 +244,72 @@ class TestCompactionDataLoss:
             f"got {total_found}. {len(lost_partitions)} partitions affected."
         )
 
+    def test_multi_table_concurrent_compaction(self, session, schema):
+        """Write to multiple tables simultaneously, force compaction on all.
+
+        This exercises the compaction output directory collision bug:
+        if all tables compact to the same shared directory, generation
+        IDs collide and one table's output overwrites another's.
+        """
+        # Create a second table
+        session.execute(
+            f"CREATE TABLE IF NOT EXISTS {KEYSPACE}.entities2 ("
+            "  partition_id text,"
+            "  row_id int,"
+            "  data text,"
+            "  PRIMARY KEY (partition_id, row_id)"
+            ")"
+        )
+
+        total_per_table = 3000
+        data_payload = "z" * 200
+
+        # Write to both tables
+        for i in range(total_per_table):
+            session.execute(
+                f"INSERT INTO {KEYSPACE}.{TABLE} "
+                f"(partition_id, row_id, data) "
+                f"VALUES ('multi_t1', {i}, '{data_payload}')"
+            )
+            session.execute(
+                f"INSERT INTO {KEYSPACE}.entities2 "
+                f"(partition_id, row_id, data) "
+                f"VALUES ('multi_t2', {i}, '{data_payload}')"
+            )
+            if (i + 1) % 1000 == 0:
+                print(f"  Written: {i+1}/{total_per_table} to both tables")
+
+        # Force compaction on all nodes
+        print("\nForcing compaction...")
+        for port in NODE_WEB_PORTS:
+            try:
+                requests.post(
+                    f"http://{FERROSA_HOST}:{port}/api/debug/force-compact",
+                    timeout=30,
+                )
+            except Exception:
+                pass
+        time.sleep(15)
+
+        # Verify both tables
+        t1_count = count_rows(session, "multi_t1")
+        t2_count = list(session.execute(
+            f"SELECT count(*) FROM {KEYSPACE}.entities2 "
+            "WHERE partition_id = 'multi_t2'"
+        ))[0].count
+
+        print(f"\nTable 1: {t1_count}/{total_per_table}")
+        print(f"Table 2: {t2_count}/{total_per_table}")
+
+        assert t1_count == total_per_table, (
+            f"TABLE 1 DATA LOSS: {total_per_table - t1_count} rows lost "
+            f"(compaction directory collision between tables?)"
+        )
+        assert t2_count == total_per_table, (
+            f"TABLE 2 DATA LOSS: {total_per_table - t2_count} rows lost "
+            f"(compaction directory collision between tables?)"
+        )
+
     def test_interleaved_writes_and_compaction(self, session, schema):
         """Write in waves with pauses to trigger multiple compaction rounds."""
         partition = "wave_test"
