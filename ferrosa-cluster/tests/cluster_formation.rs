@@ -25,13 +25,13 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use ferrosa_cluster::config::ClusterConfig;
-use ferrosa_cluster::mode::DeploymentMode;
 use ferrosa_cluster::controller::{ModeController, ModeControllerHandles};
+use ferrosa_cluster::mode::DeploymentMode;
 use ferrosa_net::config::NetConfig;
 use ferrosa_net::peer::{PeerEventListener, PeerManager};
+use ferrosa_net::pool::PriorityPool;
 use ferrosa_net::rpc::server::RpcServer;
 use ferrosa_net::rpc::HandlerRegistry;
-use ferrosa_net::pool::PriorityPool;
 use ferrosa_storage::engine::{StorageEngine, StorageEngineConfig};
 use ferrosa_storage::{CommitLogConfig, CompactionConfig};
 
@@ -143,11 +143,7 @@ impl TestClusterNode {
         controller.set_peer_manager(pm.clone());
 
         // Start the RPC server on a random port
-        let server = Arc::new(RpcServer::new(
-            (*net_config).clone(),
-            host_id,
-            registry,
-        ));
+        let server = Arc::new(RpcServer::new((*net_config).clone(), host_id, registry));
         let addr = server.start_and_get_addr().await.unwrap();
 
         Self {
@@ -164,13 +160,9 @@ impl TestClusterNode {
     /// Establish an outbound connection to another node.
     async fn connect_to(&self, other: &TestClusterNode) {
         let net_config = Arc::new(test_net_config());
-        let pool = PriorityPool::connect(
-            net_config,
-            self.host_id,
-            &other.bound_addr.to_string(),
-        )
-        .await
-        .expect("failed to connect to peer");
+        let pool = PriorityPool::connect(net_config, self.host_id, &other.bound_addr.to_string())
+            .await
+            .expect("failed to connect to peer");
 
         self.peer_manager
             .add_peer((other.host_id, other.bound_addr), pool)

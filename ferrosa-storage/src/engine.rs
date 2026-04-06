@@ -2670,11 +2670,10 @@ impl StorageEngine {
     ) {
         use object_store::path::Path as ObjectPath;
 
-        let mut manifest =
-            match crate::manifest::Manifest::load(store.as_ref(), prefix).await {
-                Ok((m, _)) => m,
-                Err(_) => crate::manifest::Manifest::new(),
-            };
+        let mut manifest = match crate::manifest::Manifest::load(store.as_ref(), prefix).await {
+            Ok((m, _)) => m,
+            Err(_) => crate::manifest::Manifest::new(),
+        };
 
         let tables = self.tables.read();
         for (table_id, _state) in tables.iter() {
@@ -2766,8 +2765,7 @@ impl StorageEngine {
 
         // Also update the schema snapshot in S3.
         let tables_guard = self.tables.read();
-        let schemas: Vec<&TableSchema> =
-            tables_guard.values().map(|s| &s.schema).collect();
+        let schemas: Vec<&TableSchema> = tables_guard.values().map(|s| &s.schema).collect();
         let schema_json = serde_json::to_vec_pretty(&schemas).unwrap_or_default();
         drop(tables_guard);
         crate::manifest::save_schema_snapshot(store.as_ref(), prefix, &schema_json)
@@ -4456,13 +4454,23 @@ mod tests {
 
             // Write 3 rows before snapshot.
             engine
-                .write(&tid, &make_key("alice"), make_row(b"before-snap", 1000), 1000)
+                .write(
+                    &tid,
+                    &make_key("alice"),
+                    make_row(b"before-snap", 1000),
+                    1000,
+                )
                 .unwrap();
             engine
                 .write(&tid, &make_key("bob"), make_row(b"before-snap", 1001), 1001)
                 .unwrap();
             engine
-                .write(&tid, &make_key("carol"), make_row(b"before-snap", 1002), 1002)
+                .write(
+                    &tid,
+                    &make_key("carol"),
+                    make_row(b"before-snap", 1002),
+                    1002,
+                )
                 .unwrap();
 
             // Flush so data is in SSTables (and thus in the manifest).
@@ -4537,10 +4545,7 @@ mod tests {
             );
 
             let bob = restored.read(&tid, &make_key("bob")).unwrap();
-            assert!(
-                bob.is_some(),
-                "pre-snapshot row 'bob' must survive restore"
-            );
+            assert!(bob.is_some(), "pre-snapshot row 'bob' must survive restore");
 
             let carol = restored.read(&tid, &make_key("carol")).unwrap();
             assert!(
@@ -4643,14 +4648,20 @@ mod tests {
 
             // Both tables must have their data.
             let r1 = restored.read(&t1, &make_key("t1-key")).unwrap();
-            assert!(r1.is_some(), "table 1 data must survive multi-table restore");
+            assert!(
+                r1.is_some(),
+                "table 1 data must survive multi-table restore"
+            );
             assert_eq!(
                 r1.unwrap().rows[0].cells[0].1.value.as_deref(),
                 Some(b"table-one".as_slice())
             );
 
             let r2 = restored.read(&t2, &make_key("t2-key")).unwrap();
-            assert!(r2.is_some(), "table 2 data must survive multi-table restore");
+            assert!(
+                r2.is_some(),
+                "table 2 data must survive multi-table restore"
+            );
             assert_eq!(
                 r2.unwrap().rows[0].cells[0].1.value.as_deref(),
                 Some(b"table-two".as_slice())
@@ -4801,7 +4812,12 @@ mod tests {
                 let key_str = format!("key-{i:04}");
                 let val_str = format!("value-{i:04}");
                 engine
-                    .write(&tid, &make_key(&key_str), make_row(val_str.as_bytes(), i), i)
+                    .write(
+                        &tid,
+                        &make_key(&key_str),
+                        make_row(val_str.as_bytes(), i),
+                        i,
+                    )
                     .unwrap();
             }
 
@@ -4890,10 +4906,8 @@ mod tests {
                 .unwrap();
 
             // RestoreManager must validate the SHA-256 successfully.
-            let restore_mgr = crate::restore::RestoreManager::new(
-                Arc::clone(&store),
-                prefix.to_string(),
-            );
+            let restore_mgr =
+                crate::restore::RestoreManager::new(Arc::clone(&store), prefix.to_string());
             let (loaded_meta, loaded_manifest) = restore_mgr
                 .load_and_validate_snapshot("sha-test")
                 .await
@@ -4980,13 +4994,9 @@ mod tests {
             assert_eq!(after[0].name, "permanent-snap");
 
             // Trying to restore expired snapshot must fail.
-            let restore_mgr = crate::restore::RestoreManager::new(
-                Arc::clone(&store),
-                prefix.to_string(),
-            );
-            let result = restore_mgr
-                .load_and_validate_snapshot("expired-snap")
-                .await;
+            let restore_mgr =
+                crate::restore::RestoreManager::new(Arc::clone(&store), prefix.to_string());
+            let result = restore_mgr.load_and_validate_snapshot("expired-snap").await;
             assert!(result.is_err(), "expired snapshot should not be loadable");
 
             engine.shutdown().unwrap();

@@ -1048,7 +1048,13 @@ mod tests {
         assert!(result.is_err(), "v6 frames should be rejected");
         let err = result.unwrap_err();
         assert!(
-            matches!(err, CqlError::ProtocolVersionMismatch { requested: 6, supported: 5 }),
+            matches!(
+                err,
+                CqlError::ProtocolVersionMismatch {
+                    requested: 6,
+                    supported: 5
+                }
+            ),
             "should be ProtocolVersionMismatch, got: {err}"
         );
     }

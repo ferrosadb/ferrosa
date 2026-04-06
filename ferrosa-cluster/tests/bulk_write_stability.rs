@@ -129,7 +129,14 @@ async fn setup_pair() -> (PairNode, PairNode, Arc<StorageEngine>, Arc<StorageEng
 
     // Start primary pointing to secondary.
     let net1 = Arc::new(test_net_config());
-    let node1 = PairNode::new(config, net1, id_primary, id_secondary, addr2, storage1.clone());
+    let node1 = PairNode::new(
+        config,
+        net1,
+        id_primary,
+        id_secondary,
+        addr2,
+        storage1.clone(),
+    );
     let addr1 = node1.start().await.unwrap();
 
     // Connect secondary → primary.
@@ -182,7 +189,10 @@ async fn sequential_bulk_writes_complete_without_timeout() {
 
     // Sort latencies for percentile calculation.
     latencies.sort();
-    let p50 = latencies.get(latencies.len() / 2).copied().unwrap_or_default();
+    let p50 = latencies
+        .get(latencies.len() / 2)
+        .copied()
+        .unwrap_or_default();
     let p99 = latencies
         .get(latencies.len() * 99 / 100)
         .copied()
@@ -234,7 +244,10 @@ async fn concurrent_burst_writes_measure_lane_saturation() {
     let writes_per_level = 500u64;
 
     eprintln!("--- concurrent burst write results ---");
-    eprintln!("{:>12} {:>12} {:>12} {:>12} {:>8}", "concurrency", "writes/s", "p50", "p99", "errors");
+    eprintln!(
+        "{:>12} {:>12} {:>12} {:>12} {:>8}",
+        "concurrency", "writes/s", "p50", "p99", "errors"
+    );
 
     for concurrency in concurrency_levels {
         let coordinator = node1.coordinator().clone();
@@ -255,10 +268,8 @@ async fn concurrent_burst_writes_measure_lane_saturation() {
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                let mutation = make_mutation(
-                    i + concurrency as u64 * 10_000,
-                    (i + 1) as i64 * 1000,
-                );
+                let mutation =
+                    make_mutation(i + concurrency as u64 * 10_000, (i + 1) as i64 * 1000);
                 let t0 = Instant::now();
                 match coordinator.coordinate_write(&mutation).await {
                     Ok(()) => {
@@ -282,7 +293,10 @@ async fn concurrent_burst_writes_measure_lane_saturation() {
         let elapsed = start.elapsed();
 
         latencies.sort();
-        let p50 = latencies.get(latencies.len() / 2).copied().unwrap_or_default();
+        let p50 = latencies
+            .get(latencies.len() / 2)
+            .copied()
+            .unwrap_or_default();
         let p99 = latencies
             .get(latencies.len() * 99 / 100)
             .copied()
@@ -290,9 +304,7 @@ async fn concurrent_burst_writes_measure_lane_saturation() {
         let err_count = errors.load(Ordering::Relaxed);
         let throughput = writes_per_level as f64 / elapsed.as_secs_f64();
 
-        eprintln!(
-            "{concurrency:>12} {throughput:>12.0} {p50:>12.1?} {p99:>12.1?} {err_count:>8}"
-        );
+        eprintln!("{concurrency:>12} {throughput:>12.0} {p50:>12.1?} {p99:>12.1?} {err_count:>8}");
 
         // At concurrency <= 64 (lane capacity), errors should be zero.
         if concurrency <= 64 {

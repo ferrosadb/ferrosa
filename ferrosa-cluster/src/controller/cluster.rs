@@ -100,7 +100,9 @@ impl ModeController {
         // all cluster members — deterministic and independent of pair context
         // which may have been cleared or never set (e.g., if the node joined
         // directly from standalone mode in tests).
-        let was_seed = peers.iter().all(|(peer_uuid, _)| self.local_host_id > *peer_uuid);
+        let was_seed = peers
+            .iter()
+            .all(|(peer_uuid, _)| self.local_host_id > *peer_uuid);
 
         // Flush all memtables to SSTables before the write path switches to the
         // ClusterCoordinator. Data written in standalone/pair mode lives only in

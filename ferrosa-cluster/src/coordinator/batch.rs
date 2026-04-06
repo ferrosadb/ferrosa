@@ -65,9 +65,7 @@ impl ClusterCoordinator {
             let table_id = ferrosa_storage::TableId::new(&m.keyspace, &m.table);
             for row in &m.rows {
                 let permit = sem.clone().acquire_owned().await.map_err(|_| {
-                    crate::error::ClusterError::Internal(
-                        "batch semaphore closed".to_string(),
-                    )
+                    crate::error::ClusterError::Internal("batch semaphore closed".to_string())
                 })?;
                 let key = m.key.clone();
                 let row = row.clone();
