@@ -296,15 +296,18 @@ impl<F: FlushTarget> TableStore<F> {
         let guard = self.view.load();
 
         let mut sources: Vec<Partition> = Vec::new();
+        let mut source_labels: Vec<&str> = Vec::new();
 
         // Active memtable
         if let Some(p) = guard.active.get(key)? {
+            source_labels.push("active_memtable");
             sources.push((*p).clone());
         }
 
         // Flushing memtable
         if let Some(ref flushing) = guard.flushing {
             if let Some(p) = flushing.get(key)? {
+                source_labels.push("flushing_memtable");
                 sources.push((*p).clone());
             }
         }
@@ -313,13 +316,22 @@ impl<F: FlushTarget> TableStore<F> {
         // Tolerate I/O errors from individual SSTables — a corrupt or
         // format-incompatible SSTable should not prevent reading data
         // that exists in other SSTables or the memtable (FRSA-BUG-026).
-        for sstable in guard.sstables.iter() {
+        for (i, sstable) in guard.sstables.iter().enumerate() {
             match sstable.get_partition(key) {
-                Ok(Some(p)) => sources.push(p),
+                Ok(Some(p)) => {
+                    source_labels.push("sstable");
+                    tracing::trace!(
+                        sstable_index = i,
+                        rows = p.rows.len(),
+                        "read: found partition in SSTable"
+                    );
+                    sources.push(p);
+                }
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
+                        sstable_index = i,
                         "skipping corrupt SSTable partition during read — data may be incomplete"
                     );
                     self.sstable_read_errors
@@ -332,7 +344,19 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(None);
         }
 
-        Ok(Some(merge::merge_partitions(sources)))
+        let total_source_rows: usize = sources.iter().map(|p| p.rows.len()).sum();
+        let merged = merge::merge_partitions(sources);
+        if merged.rows.len() < total_source_rows {
+            tracing::debug!(
+                sources = source_labels.len(),
+                total_source_rows,
+                merged_rows = merged.rows.len(),
+                dropped = total_source_rows - merged.rows.len(),
+                "read merge: row count decreased — possible duplicate clustering keys or tombstones"
+            );
+        }
+
+        Ok(Some(merged))
     }
 
     /// Flush the active memtable to an SSTable.
@@ -381,20 +405,44 @@ impl<F: FlushTarget> TableStore<F> {
         // Also capture any late writes from the PREVIOUS flushing memtable
         // (kept alive since the last flush). These are writes that landed
         // between the previous snapshot and the view swap.
+        let prev_flushing_present = old_view_flushing.is_some();
         let mut partitions = old_active.snapshot();
         if let Some(ref prev_flushing) = old_view_flushing {
             let prev_parts = prev_flushing.snapshot();
-            // Merge previous flushing data: only include keys NOT already
-            // in the current snapshot (the SSTable should have them, but
-            // late writes wouldn't be there).
-            let existing_keys: std::collections::BTreeSet<ferrosa_common::key::DecoratedKey> =
-                partitions.iter().map(|p| p.key.clone()).collect();
+            // Merge previous flushing data with current snapshot.
+            // When the same partition key exists in both, MERGE the rows
+            // (different clustering keys = different rows that must all
+            // be included). The old code skipped the entire partition
+            // from prev_flushing if the key existed in the current
+            // snapshot, silently dropping rows with different clustering
+            // keys — this was the P0 data loss bug.
+            let mut existing_map: std::collections::BTreeMap<
+                ferrosa_common::key::DecoratedKey,
+                usize,
+            > = partitions
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.key.clone(), i))
+                .collect();
             for p in prev_parts {
-                if !existing_keys.contains(&p.key) {
+                if let Some(&idx) = existing_map.get(&p.key) {
+                    // Same partition key: merge rows from both.
+                    partitions[idx].rows.extend(p.rows);
+                } else {
+                    let idx = partitions.len();
+                    existing_map.insert(p.key.clone(), idx);
                     partitions.push(p);
                 }
             }
         }
+
+        let total_rows: usize = partitions.iter().map(|p| p.rows.len()).sum();
+        tracing::debug!(
+            partitions = partitions.len(),
+            total_rows,
+            prev_flushing = prev_flushing_present,
+            "flush: memtable snapshot captured"
+        );
 
         // Step 3: No-op if the memtable was empty.
         if partitions.is_empty() {
@@ -527,6 +575,11 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // Step 6: Prepend new SSTable and sidecar, clear flushing.
+        tracing::debug!(
+            gen,
+            prior_sstable_count = self.sstable_count(),
+            "flush: SSTable written, updating view"
+        );
         let current_view = self.view.load();
         let mut new_sstables = vec![new_reader];
         new_sstables.extend(current_view.sstables.iter().cloned());
@@ -1519,6 +1572,47 @@ mod tests {
                 "input {id} should be removed"
             );
         }
+    }
+
+    /// P0 data loss: two flushes to same partition key, different clustering
+    /// keys. The second flush must include rows from both memtables, not
+    /// just the latest. The old code skipped prev_flushing rows when the
+    /// partition key already existed in the current snapshot.
+    #[test]
+    fn consecutive_flushes_same_partition_merge_rows() {
+        let store = test_store();
+
+        // Batch 1: write row with clustering key "ck1".
+        let key = make_key("pk1");
+        let row1 = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01], // ck = 1
+            cells: vec![(0, ferrosa_common::CellValue::live(b"batch1".to_vec(), 100))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(100),
+        };
+        store.write(&key, row1).unwrap();
+        store.flush().unwrap();
+
+        // Batch 2: write row with DIFFERENT clustering key "ck2" to SAME partition.
+        let row2 = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x02], // ck = 2
+            cells: vec![(0, ferrosa_common::CellValue::live(b"batch2".to_vec(), 200))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(200),
+        };
+        store.write(&key, row2).unwrap();
+        store.flush().unwrap();
+
+        // Read: BOTH rows must be present.
+        let result = store.read(&key).unwrap();
+        assert!(result.is_some(), "partition must exist");
+        let partition = result.unwrap();
+        assert!(
+            partition.rows.len() >= 2,
+            "BUG: expected 2 rows (ck=1 from batch1, ck=2 from batch2), got {}. \
+             Rows from first flush were dropped during second flush.",
+            partition.rows.len()
+        );
     }
 
     /// Reproduces the P0 data loss bug: flush stores SSTables with empty
