@@ -32,3 +32,15 @@ Then update executor's ObjectScan to query the materialized view.
 ## Estimated Effort
 
 1-2 days (DDL + executor update + testing).
+
+## Verification (2026-04-05)
+
+Tested against feat/sparql-endpoint (commit 4a361b6):
+- Cannot verify directly (RDF triple store table not created, so no data to scan)
+- ObjectScan uses post-fetch filter (workaround in place) but no reverse index materialized view
+- **Status: NOT FIXED** (workaround exists but reverse index missing)
+## Verification Proof (2026-04-05)
+
+Tested on feat/sparql-endpoint commit 8133168:
+- `?s <link> <c>` correctly returns b (and a from 2-hop)
+- Reverse scan produces correct results

@@ -20,3 +20,16 @@ Option B: Implement transitive closure via graph engine's BFS/DFS internal API (
 ## Estimated Effort
 
 Option A: 10 minutes. Option B: 2-3 days.
+
+## Verification (2026-04-05)
+
+Tested against feat/sparql-endpoint (commit 4a361b6):
+- `SELECT ?s ?o WHERE { ?s <http://test/knows>+ ?o }` returns empty results without error
+- No error or warning returned to client
+- Property path `+` silently degraded to single hop
+- **Status: NOT FIXED**
+## Verification Proof (2026-04-05)
+
+Tested on feat/sparql-endpoint commit 8133168:
+- `<link>+` query: returns both b (1-hop) and c (2-hop via BFS)
+- Transitive closure working correctly

@@ -93,3 +93,11 @@ Or more practically, detect `<< ... >>` patterns with regex, extract (s, p, o, p
 2. `SELECT ?s ?o ?who WHERE { << ?s ?p ?o >> <http://t/created_by> ?who }` — returns provenance
 3. `SELECT ?s ?o WHERE { << ?s ?p ?o >> <http://t/confidence> ?c . FILTER(?c > 0.8) }` — filtered annotations
 4. Standard SPARQL (no RDF*) still works unchanged after fix
+
+## Final Verification (2026-04-05, commit 5059ea8)
+
+spargebra upgraded with `sparql-12` feature flag. RDF* now works:
+- `INSERT DATA { << <t/alice> <t/knows> <t/bob> >> <t/confidence> "0.95" . }` → triples_inserted: 2
+- `SELECT ?val WHERE { << ?s <t/knows> ?o >> <t/confidence> ?val }` → returns "0.95"
+- `SELECT ?prop ?val WHERE { << <t/alice> <t/knows> <t/bob> >> ?prop ?val }` → returns all annotations
+- **Status: VERIFIED FIXED**

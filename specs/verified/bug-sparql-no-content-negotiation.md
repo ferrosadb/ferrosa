@@ -19,3 +19,14 @@ Parse `Accept` header, dispatch to appropriate formatter in results module. Defa
 ## Estimated Effort
 
 30 minutes.
+
+## Verification (2026-04-05)
+
+Tested against feat/sparql-endpoint (commit 4a361b6):
+- `curl -H "Accept: text/turtle"` returns empty body (no turtle formatting)
+- JSON format always returned regardless of Accept header
+- **Status: NOT FIXED**
+## Verification Proof (2026-04-05)
+
+Tested on feat/sparql-endpoint commit 8133168:
+- Accept: text/turtle returns N-Triples format: `<alice> <knows> "bob" .`

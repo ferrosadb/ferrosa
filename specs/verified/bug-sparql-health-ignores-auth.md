@@ -15,3 +15,10 @@ Check `AppState.auth_disabled` flag. Return 401 if auth is required and no crede
 ## Estimated Effort
 
 5 minutes.
+
+## Verification (2026-04-05)
+
+Tested against feat/sparql-endpoint (commit 4a361b6):
+- Health returns 200 unconditionally
+- Cluster running with FERROSA_AUTH_DISABLED=true so auth path untestable in current config
+- **Status: NOT FIXED** (code review confirms no auth check in handle_health)
