@@ -937,8 +937,9 @@ pub fn build_delete_row(
             primary_key_liveness: LivenessInfo::NONE,
         }
     } else {
-        // Column-level deletion: tombstone each specified column
-        let cells: Vec<(u16, CellValue)> = delete_columns
+        // Column-level deletion: tombstone each specified column.
+        // Must be sorted by column index — same requirement as build_row.
+        let mut cells: Vec<(u16, CellValue)> = delete_columns
             .iter()
             .map(|&idx| {
                 // CellValue.local_deletion_time is i32, DeletionTime.local_deletion_time is u32
@@ -946,6 +947,7 @@ pub fn build_delete_row(
                 (idx, CellValue::tombstone(timestamp, ldt))
             })
             .collect();
+        cells.sort_by_key(|(idx, _)| *idx);
 
         Row {
             clustering,
