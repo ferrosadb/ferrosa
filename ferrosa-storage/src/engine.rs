@@ -491,6 +491,82 @@ impl StorageEngine {
         Ok((engine, pending_mutations))
     }
 
+    /// Replays pending S3 uploads that were interrupted by a crash.
+    ///
+    /// Reads the pending-uploads.log and re-submits upload tasks for each
+    /// entry. The upload is idempotent (S3 PUT overwrites). Call this after
+    /// the engine is opened and tables are registered.
+    pub async fn replay_pending_uploads(&self) {
+        let pending_log_path = self.config.data_dir.join("pending-uploads.log");
+        let pending_log = match crate::upload::PendingUploadsLog::open(&pending_log_path) {
+            Ok(log) => log,
+            Err(_) => return, // No log file — nothing to replay
+        };
+
+        let entries = match pending_log.pending_entries() {
+            Ok(e) if e.is_empty() => return,
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("failed to read pending-uploads.log: {e}");
+                return;
+            }
+        };
+
+        let Some(upload_mgr) = self.upload_manager.as_ref() else {
+            tracing::warn!(
+                "pending-uploads.log has {} entries but no upload manager configured — \
+                 these SSTables may not be in S3",
+                entries.len()
+            );
+            return;
+        };
+
+        tracing::info!(
+            count = entries.len(),
+            "replaying pending S3 uploads from crash recovery"
+        );
+
+        for (table_id_str, sstable_id) in &entries {
+            // Find the SSTable files on disk
+            let table_dir = self.config.data_dir.join("sstables").join(table_id_str);
+            let files = Self::collect_sstable_files(&table_dir, sstable_id.parse().unwrap_or(0));
+            if files.is_empty() {
+                // Also check compaction output directory
+                let compaction_dir = self.config.compaction.output_dir.join(table_id_str);
+                let files2 =
+                    Self::collect_sstable_files(&compaction_dir, sstable_id.parse().unwrap_or(0));
+                if files2.is_empty() {
+                    tracing::warn!(
+                        table = table_id_str,
+                        sstable = sstable_id,
+                        "pending upload: SSTable files not found on disk — cannot replay"
+                    );
+                    continue;
+                }
+                let task = crate::upload::UploadTask::SSTable {
+                    table_id: table_id_str.clone(),
+                    sstable_id: sstable_id.clone(),
+                    files: files2,
+                    on_complete: None,
+                };
+                if let Err(e) = upload_mgr.submit(task).await {
+                    tracing::error!(sstable = sstable_id, "pending upload replay failed: {e}");
+                }
+                continue;
+            }
+
+            let task = crate::upload::UploadTask::SSTable {
+                table_id: table_id_str.clone(),
+                sstable_id: sstable_id.clone(),
+                files,
+                on_complete: None,
+            };
+            if let Err(e) = upload_mgr.submit(task).await {
+                tracing::error!(sstable = sstable_id, "pending upload replay failed: {e}");
+            }
+        }
+    }
+
     /// Replays a set of pending mutations into their respective table memtables.
     ///
     /// This is called after [`open`](Self::open) and after all table schemas
@@ -2515,26 +2591,48 @@ impl StorageEngine {
 
                 let total_size: u64 = files.iter().map(|(_, data)| data.len() as u64).sum();
 
+                // Wait for S3 upload confirmation before adding to manifest.
+                // Previously, manifest was updated immediately after submit
+                // (fire-and-forget), causing phantom entries if upload failed.
+                let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
                 let task = crate::upload::UploadTask::SSTable {
                     table_id: table_id_str.clone(),
                     sstable_id: gen_str.clone(),
                     files,
-                    on_complete: None,
+                    on_complete: Some(tx),
                 };
                 upload_mgr.submit(task).await?;
 
-                manifest.add_sstable(
-                    table_id_str,
-                    crate::manifest::ManifestEntry {
-                        id: gen_str,
-                        size: total_size,
-                        min_token: i64::MIN,
-                        max_token: i64::MAX,
-                        min_timestamp: 0,
-                        max_timestamp: 0,
-                    },
-                );
-                uploaded += 1;
+                match rx.await {
+                    Ok(Ok(())) => {
+                        manifest.add_sstable(
+                            table_id_str,
+                            crate::manifest::ManifestEntry {
+                                id: gen_str,
+                                size: total_size,
+                                min_token: i64::MIN,
+                                max_token: i64::MAX,
+                                min_timestamp: 0,
+                                max_timestamp: 0,
+                            },
+                        );
+                        uploaded += 1;
+                    }
+                    Ok(Err(msg)) => {
+                        tracing::error!(
+                            table = table_id_str,
+                            sstable = gen_str,
+                            "S3 upload failed — NOT adding to manifest: {msg}"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            table = table_id_str,
+                            sstable = gen_str,
+                            "S3 upload worker dropped channel — NOT adding to manifest"
+                        );
+                    }
+                }
             }
         }
 

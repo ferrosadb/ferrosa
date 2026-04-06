@@ -349,6 +349,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let storage = Arc::new(storage);
 
+    // Replay any pending S3 uploads that were interrupted by a crash.
+    storage.replay_pending_uploads().await;
+
     // 4. Create Schema
     let schema_config = ferrosa_schema::SchemaConfig {
         hasher: ferrosa_schema::PasswordHasher::default(),

@@ -120,7 +120,19 @@ impl HintDeliveryTask {
             tokio::time::sleep(Duration::from_millis(config.delivery_interval_ms)).await;
         }
 
-        tracing::info!(%peer_id, delivered, "hint delivery: all hints replayed");
+        // Check if hints were evicted during the downtime — if so, some
+        // mutations were permanently lost and anti-entropy repair is required.
+        if hint_store.needs_repair(peer_id) {
+            tracing::error!(
+                %peer_id,
+                delivered,
+                "hint delivery complete but HINTS WERE EVICTED — some mutations \
+                 were permanently lost. Anti-entropy repair is REQUIRED for this \
+                 peer to reach consistency."
+            );
+        } else {
+            tracing::info!(%peer_id, delivered, "hint delivery: all hints replayed");
+        }
         hint_store.cleanup(peer_id);
     }
 }

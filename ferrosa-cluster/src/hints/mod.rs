@@ -291,9 +291,10 @@ impl HintStore {
                     tracing::warn!("hints: failed to delete segment {:?}: {e}", path);
                 } else {
                     state.total_bytes = state.total_bytes.saturating_sub(file_size);
-                    tracing::warn!(
+                    tracing::error!(
                         peer = %peer_id,
-                        "hints: evicted segment {} due to byte cap exceeded",
+                        "HINT DATA LOSS: evicted segment {} — mutations in this segment \
+                         will never be delivered. Anti-entropy repair required.",
                         n
                     );
                 }
