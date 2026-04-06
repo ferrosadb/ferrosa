@@ -314,44 +314,31 @@ impl SSTableWriter {
         //   header varint (0 = all non-null/non-empty) + per-component value bytes.
         //   Fixed-length types: raw bytes only. Variable-length: varint(len) + bytes.
         //
-        // The row.clustering Vec<u8> is a flat concatenation of all component
-        // bytes. We split it back into per-component slices using the type
-        // information from the serialization header — fixed-length types
-        // consume a known number of bytes, variable-length types consume
-        // whatever remains after all fixed-length components are accounted for.
+        // For single-column CK, row.clustering is raw component bytes.
+        // For multi-column CK, the CQL bridge encodes as u16-prefixed
+        // per-component: [u16 len][bytes][u16 len][bytes]...
+        // We must extract each component and write it in BTI format.
         if !is_static {
             push_unsigned_vint_to(&mut self.data_buf, 0); // header: all non-null, non-empty
 
             let num_ck = self.header.clustering_types.len();
-            if num_ck > 0 {
-                // Split flat clustering bytes into per-component slices.
-                // Fixed-length types consume a known number of bytes;
-                // variable-length types get whatever remains after all
-                // subsequent fixed-length components are subtracted.
-                let ck = &row.clustering;
-                let mut offset = 0usize;
-
-                for (i, type_name) in self.header.clustering_types.iter().enumerate() {
-                    match crate::marshal::value_length_if_fixed(type_name) {
-                        Some(fixed_len) => {
-                            let end = (offset + fixed_len).min(ck.len());
-                            self.data_buf.extend_from_slice(&ck[offset..end]);
-                            offset = end;
-                        }
-                        None => {
-                            // Sum fixed bytes for all components AFTER this one.
-                            let subsequent_fixed: usize = self.header.clustering_types[i + 1..]
-                                .iter()
-                                .map(|t| crate::marshal::value_length_if_fixed(t).unwrap_or(0))
-                                .sum();
-                            let available = ck.len().saturating_sub(offset);
-                            let component_len = available.saturating_sub(subsequent_fixed);
-                            let end = offset + component_len;
-                            push_unsigned_vint_to(&mut self.data_buf, component_len as u64);
-                            self.data_buf.extend_from_slice(&ck[offset..end]);
-                            offset = end;
-                        }
+            if num_ck == 1 {
+                // Single CK column: raw bytes (no u16 prefix).
+                let type_name = &self.header.clustering_types[0];
+                if crate::marshal::value_length_if_fixed(type_name).is_none() {
+                    push_unsigned_vint_to(&mut self.data_buf, row.clustering.len() as u64);
+                }
+                self.data_buf.extend_from_slice(&row.clustering);
+            } else if num_ck > 1 {
+                // Multi-column CK: extract components from u16-prefixed
+                // encoding, then write each in BTI per-component format.
+                let components = split_u16_prefixed(&row.clustering, num_ck);
+                for (i, component) in components.iter().enumerate() {
+                    let type_name = &self.header.clustering_types[i];
+                    if crate::marshal::value_length_if_fixed(type_name).is_none() {
+                        push_unsigned_vint_to(&mut self.data_buf, component.len() as u64);
                     }
+                    self.data_buf.extend_from_slice(component);
                 }
             }
             // num_ck == 0: no clustering columns — header varint only, no data.
@@ -638,6 +625,24 @@ fn push_unsigned_vint_to(buf: &mut Vec<u8>, value: u64) {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Extract components from a u16-BE-length-prefixed byte sequence.
+///
+/// The CQL bridge encodes multi-column clustering keys as:
+///   `[u16 len][component bytes][u16 len][component bytes]...`
+/// This function splits them back into individual byte slices.
+fn split_u16_prefixed(bytes: &[u8], expected: usize) -> Vec<&[u8]> {
+    let mut components = Vec::with_capacity(expected);
+    let mut pos = 0;
+    while pos + 2 <= bytes.len() && components.len() < expected {
+        let len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+        pos += 2;
+        let end = (pos + len).min(bytes.len());
+        components.push(&bytes[pos..end]);
+        pos = end;
+    }
+    components
+}
 
 #[cfg(test)]
 mod tests {
@@ -1688,13 +1693,17 @@ mod tests {
 
         let timestamp = 1_000_100i64;
 
-        // Build clustering key: src_id (16 bytes) + edge_type bytes + dst_id (16 bytes)
+        // Build clustering key in the u16-prefixed format the CQL bridge produces
+        // for multi-column CK: [u16 len][component bytes] per component.
         let src_id = [0xAAu8; 16];
         let edge_type = b"RELATED_TO";
         let dst_id = [0xBBu8; 16];
         let mut ck = Vec::new();
+        ck.extend_from_slice(&(src_id.len() as u16).to_be_bytes());
         ck.extend_from_slice(&src_id);
+        ck.extend_from_slice(&(edge_type.len() as u16).to_be_bytes());
         ck.extend_from_slice(edge_type);
+        ck.extend_from_slice(&(dst_id.len() as u16).to_be_bytes());
         ck.extend_from_slice(&dst_id);
 
         let weight: f64 = 0.85;
