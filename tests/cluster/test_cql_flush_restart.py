@@ -157,28 +157,32 @@ def count_rows(session, table, pk_clause):
 
 def restart_cluster():
     """Stop and restart the cluster to force memtable flush."""
-    print("  Stopping cluster...")
-    subprocess.run(
+    print("INFO: stopping cluster")
+    r = subprocess.run(
         ["podman", "compose", "-f", COMPOSE_FILE, "stop"],
-        capture_output=True, timeout=60,
+        capture_output=True, text=True, timeout=60,
     )
+    if r.returncode != 0:
+        print(f"ERROR: stop failed: {r.stderr.strip()}")
     time.sleep(2)
-    print("  Starting cluster...")
-    subprocess.run(
+    print("INFO: starting cluster")
+    r = subprocess.run(
         ["podman", "compose", "-f", COMPOSE_FILE, "up", "-d"],
-        capture_output=True, timeout=60,
+        capture_output=True, text=True, timeout=60,
     )
-    # Wait for all nodes to be healthy
+    if r.returncode != 0:
+        print(f"ERROR: start failed: {r.stderr.strip()}")
     for attempt in range(30):
         try:
             for port in CQL_PORTS:
                 c, s = connect(port)
                 s.execute("SELECT now() FROM system.local")
                 c.shutdown()
-            print(f"  Cluster healthy after {attempt + 1} attempts")
+            print(f"INFO: cluster healthy after {attempt + 1} attempts")
             return
         except Exception:
             time.sleep(2)
+    print("ERROR: cluster did not become healthy after restart")
     raise RuntimeError("Cluster did not become healthy after restart")
 
 
@@ -224,69 +228,63 @@ def test_entity_store_survives_restart(session, port):
     cluster2.shutdown()
 
     if post != n:
-        print(f"  FAIL: lost {n - post} entities ({100*(n-post)/n:.0f}% loss)")
+        pct = 100 * (n - post) / n
+        print(f"ERROR: entity_store lost {n - post}/{n} entities ({pct:.0f}% loss)")
         return False
-    print("  PASS")
+    print("PASS: entity_store survived restart")
     return True
 
 
 def test_typed_edges_survives_restart(session, port):
-    """Test 2: typed_edges (3-column CK: uuid, text, uuid) survives restart.
-
-    Tests the multi-column CK serialization fix.
-    """
+    """Test 2: typed_edges (3-column CK: uuid, text, uuid) survives restart."""
     print("\n=== Test 2: typed_edges survives restart ===")
     n = 150
     pk = f"tenant_id = {TENANT} AND session_id = {SESSION_ID}"
 
     insert_edges(session, n)
     pre = count_rows(session, "typed_edges", pk)
-    print(f"  Pre-restart: {pre} edges")
-    assert pre == n, f"expected {n}, got {pre}"
+    print(f"INFO: pre-restart: {pre} edges")
+    assert pre == n, f"ASSERT FAILED: expected {n}, got {pre}"
 
     restart_cluster()
 
     cluster2, session2 = connect(port)
     session2.set_keyspace("agent_memory")
     post = count_rows(session2, "typed_edges", pk)
-    print(f"  Post-restart: {post} edges")
+    print(f"INFO: post-restart: {post} edges")
     cluster2.shutdown()
 
     if post != n:
-        print(f"  FAIL: lost {n - post} edges ({100*(n-post)/n:.0f}% loss)")
+        pct = 100 * (n - post) / n
+        print(f"ERROR: typed_edges lost {n - post}/{n} edges ({pct:.0f}% loss)")
         return False
-    print("  PASS")
+    print("PASS: typed_edges survived restart")
     return True
 
 
 def test_concurrent_writes_and_flush(session, port):
-    """Test 3: concurrent high-volume writes trigger auto-flush correctly.
-
-    With FLUSH_THRESHOLD_BYTES=8192, writes trigger multiple auto-flushes.
-    Tests that concurrent flush + write doesn't corrupt data.
-    """
+    """Test 3: concurrent high-volume writes trigger auto-flush correctly."""
     print("\n=== Test 3: concurrent writes + auto-flush ===")
     n = 500
     pk = f"tenant_id = {TENANT} AND session_id = {SESSION_ID}"
 
-    # Rapid-fire inserts — low flush threshold means flushes happen mid-write
     insert_entities(session, n, start=10000)
     pre = count_rows(session, "entity_store", pk)
-    # pre includes entities from test 1 if they survived
-    print(f"  Pre-restart: {pre} total entities")
+    print(f"INFO: pre-restart: {pre} total entities")
 
     restart_cluster()
 
     cluster2, session2 = connect(port)
     session2.set_keyspace("agent_memory")
     post = count_rows(session2, "entity_store", pk)
-    print(f"  Post-restart: {post} total entities")
+    print(f"INFO: post-restart: {post} total entities")
     cluster2.shutdown()
 
     if post != pre:
-        print(f"  FAIL: lost {pre - post} entities ({100*(pre-post)/pre:.0f}% loss)")
+        pct = 100 * (pre - post) / max(pre, 1)
+        print(f"ERROR: concurrent writes lost {pre - post}/{pre} entities ({pct:.0f}% loss)")
         return False
-    print("  PASS")
+    print("PASS: concurrent writes survived restart")
     return True
 
 
@@ -308,15 +306,15 @@ def test_multi_node_consistency(port):
         except Exception as e:
             counts[p] = f"ERROR: {e}"
 
-    print(f"  Entity counts: {counts}")
+    print(f"INFO: entity counts per node: {counts}")
     values = [v for v in counts.values() if isinstance(v, int)]
     if len(values) < 3:
-        print("  FAIL: could not connect to all nodes")
+        print("ERROR: could not connect to all nodes")
         return False
     if len(set(values)) != 1:
-        print(f"  FAIL: inconsistent counts across nodes: {counts}")
+        print(f"ERROR: inconsistent counts across nodes: {counts}")
         return False
-    print("  PASS")
+    print("PASS: multi-node consistency")
     return True
 
 
@@ -327,12 +325,15 @@ def test_corruption_errors():
     for port in CQL_PORTS:
         n = check_node_corruption(port)
         name = {30042: "node1", 30043: "node2", 30044: "node3"}[port]
-        print(f"  {name}: {n} corruption errors")
+        if n > 0:
+            print(f"ERROR: {name}: {n} corruption errors")
+        else:
+            print(f"INFO: {name}: 0 corruption errors")
         total += n
     if total > 0:
-        print(f"  FAIL: {total} total corruption errors")
+        print(f"ERROR: {total} total corruption errors across cluster")
         return False
-    print("  PASS")
+    print("PASS: zero corruption errors")
     return True
 
 
