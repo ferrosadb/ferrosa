@@ -9,10 +9,37 @@ updated: 2026-04-06
 source: ferrosa-memory DIKW pipeline test
 source-location: "ferrosa-memory/scripts/test-dikw-pipeline.sh"
 related: "specs/verified/bug-large-write-causes-data-loss-in-partition.md"
-branch: "fix/compaction-data-loss @ 689e404"
+branch: "fix/compaction-data-loss @ e9703f8"
 ---
 
 # SSTable corruption persists after 689e404 — data lost on restart
+
+## Implementation Notes
+
+### Root Cause (confirmed via CQL integration test)
+
+`build_row()` in `ferrosa-cql/src/bridge.rs` constructed `Row.cells` in INSERT-statement column order (e.g., `entity_name` before `confidence`), but the SSTable reader reads cells in column-index order from the bitmap. When columns are listed in non-schema order AND have different value sizes (float=4 bytes vs text=10+ bytes), the reader misinterprets cell boundaries, causing parse drift that corrupts every subsequent row and partition.
+
+**Why entity_store was affected but typed_edges wasn't:** entity_store has 5+ regular columns with mixed types. The INSERT statements list columns out of schema order. typed_edges has fewer columns and happened to list them in order.
+
+### Fix (e9703f8)
+
+One line in `bridge.rs:build_row()`: `cells.sort_by_key(|(idx, _)| *idx);`
+
+### Test
+
+`build_row_sorts_cells_by_column_index` — passes cells `[(3, text), (0, float), (1, text)]`, asserts output is sorted `[0, 1, 3]`.
+
+### All fixes in this branch
+
+| Commit | Fix |
+|--------|-----|
+| `692a96b` | coordinate_range_read: propagate errors, 120s timeout |
+| `c948aae` | Multi-column CK per-component BTI serialization |
+| `7c70c42` | Manifest save_with_retry carries pending removals |
+| `689e404` | Strip CQL bridge u16 CK prefixes before BTI write |
+| `543c80b` | Handle SIGTERM for graceful shutdown flush |
+| `e9703f8` | **Sort cells by column index in build_row** |
 
 ## Description
 
