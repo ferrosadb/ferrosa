@@ -1,5 +1,5 @@
 ---
-implemented-by: claude-code
+implemented-by: ""
 updated: 2026-04-06
 ---
 

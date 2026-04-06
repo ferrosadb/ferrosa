@@ -313,22 +313,46 @@ impl SSTableWriter {
         // Cassandra 5.x ClusteringPrefix format:
         //   header varint (0 = all non-null/non-empty) + per-component value bytes.
         //   Fixed-length types: raw bytes only. Variable-length: varint(len) + bytes.
+        //
+        // The row.clustering Vec<u8> is a flat concatenation of all component
+        // bytes. We split it back into per-component slices using the type
+        // information from the serialization header — fixed-length types
+        // consume a known number of bytes, variable-length types consume
+        // whatever remains after all fixed-length components are accounted for.
         if !is_static {
             push_unsigned_vint_to(&mut self.data_buf, 0); // header: all non-null, non-empty
 
             let num_ck = self.header.clustering_types.len();
-            if num_ck == 1 {
-                // Single clustering column: write value directly (fixed-length)
-                // or with a length prefix (variable-length).
-                let type_name = &self.header.clustering_types[0];
-                if crate::marshal::value_length_if_fixed(type_name).is_none() {
-                    push_unsigned_vint_to(&mut self.data_buf, row.clustering.len() as u64);
+            if num_ck > 0 {
+                // Split flat clustering bytes into per-component slices.
+                // Fixed-length types consume a known number of bytes;
+                // variable-length types get whatever remains after all
+                // subsequent fixed-length components are subtracted.
+                let ck = &row.clustering;
+                let mut offset = 0usize;
+
+                for (i, type_name) in self.header.clustering_types.iter().enumerate() {
+                    match crate::marshal::value_length_if_fixed(type_name) {
+                        Some(fixed_len) => {
+                            let end = (offset + fixed_len).min(ck.len());
+                            self.data_buf.extend_from_slice(&ck[offset..end]);
+                            offset = end;
+                        }
+                        None => {
+                            // Sum fixed bytes for all components AFTER this one.
+                            let subsequent_fixed: usize = self.header.clustering_types[i + 1..]
+                                .iter()
+                                .map(|t| crate::marshal::value_length_if_fixed(t).unwrap_or(0))
+                                .sum();
+                            let available = ck.len().saturating_sub(offset);
+                            let component_len = available.saturating_sub(subsequent_fixed);
+                            let end = offset + component_len;
+                            push_unsigned_vint_to(&mut self.data_buf, component_len as u64);
+                            self.data_buf.extend_from_slice(&ck[offset..end]);
+                            offset = end;
+                        }
+                    }
                 }
-                self.data_buf.extend_from_slice(&row.clustering);
-            } else if num_ck > 1 {
-                // Multi-column: treat as single variable-length blob (simplified)
-                push_unsigned_vint_to(&mut self.data_buf, row.clustering.len() as u64);
-                self.data_buf.extend_from_slice(&row.clustering);
             }
             // num_ck == 0: no clustering columns — header varint only, no data.
         }
@@ -1624,5 +1648,87 @@ mod tests {
         // This MUST panic — writing a row with deletion ts < header min
         // would produce a corrupt SSTable (varint underflow)
         writer.add_partition(&partition).unwrap();
+    }
+
+    /// Multi-column clustering key roundtrip (typed_edges schema: uuid, text, uuid).
+    ///
+    /// This is the P0 data loss regression test. The SSTableWriter serializes
+    /// multi-column clustering keys as a single varint-prefixed blob, but the
+    /// DataReader reads per-component with type-aware length handling. The
+    /// format mismatch causes parse drift for every row after the first field,
+    /// corrupting all subsequent data in the SSTable.
+    #[test]
+    fn multi_column_clustering_key_roundtrip() {
+        // Header matching typed_edges: (uuid, text, uuid) clustering
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                org.apache.cassandra.db.marshal.UUIDType,\
+                org.apache.cassandra.db.marshal.UUIDType)"
+                .into(),
+            clustering_types: vec![
+                "org.apache.cassandra.db.marshal.UUIDType".into(), // src_id
+                "org.apache.cassandra.db.marshal.UTF8Type".into(), // edge_type
+                "org.apache.cassandra.db.marshal.UUIDType".into(), // dst_id
+            ],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"weight".to_vec(),
+                "org.apache.cassandra.db.marshal.DoubleType".into(),
+            )],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let timestamp = 1_000_100i64;
+
+        // Build clustering key: src_id (16 bytes) + edge_type bytes + dst_id (16 bytes)
+        let src_id = [0xAAu8; 16];
+        let edge_type = b"RELATED_TO";
+        let dst_id = [0xBBu8; 16];
+        let mut ck = Vec::new();
+        ck.extend_from_slice(&src_id);
+        ck.extend_from_slice(edge_type);
+        ck.extend_from_slice(&dst_id);
+
+        let weight: f64 = 0.85;
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::new(vec![0x11; 16])),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: ck.clone(),
+                cells: vec![(0, CellValue::live(weight.to_be_bytes().to_vec(), timestamp))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        };
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        // Read back via sequential DataReader (same path as read_all_partitions)
+        let mut reader = DataReader::new(&output.data, &header, 0);
+        let read_back = reader
+            .read_partition()
+            .expect("read should not error on data we just wrote")
+            .expect("partition should be present");
+
+        assert_eq!(read_back.rows.len(), 1, "should have 1 row");
+        let row = &read_back.rows[0];
+
+        // Verify the cell value survived
+        assert_eq!(
+            row.cells[0].1.value.as_deref().unwrap(),
+            weight.to_be_bytes(),
+            "cell value must survive roundtrip for multi-column clustering key"
+        );
     }
 }
