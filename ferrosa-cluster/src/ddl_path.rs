@@ -458,12 +458,21 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
             _ => return None,
         };
 
+        // Try decoding as raw DdlOperation first (cluster-mode forward path).
+        // Fall back to DdlEnvelope (pair-mode replication path) which wraps
+        // the operation in {"op": ..., "schema_version": ...}. Both formats
+        // use the same PairDdlForward message type.
         let op = match DdlOperation::from_bytes(&body) {
             Ok(op) => op,
-            Err(e) => {
-                tracing::error!("ClusterDdlForwardHandler: failed to decode op: {e}");
-                return None;
-            }
+            Err(_) => match crate::pair::ddl::DdlEnvelope::from_bytes(&body) {
+                Ok(envelope) => envelope.op,
+                Err(e) => {
+                    tracing::error!(
+                        "ClusterDdlForwardHandler: failed to decode as DdlOperation or DdlEnvelope: {e}"
+                    );
+                    return None;
+                }
+            },
         };
 
         match execute_via_raft(&self.raft, op).await {

@@ -923,6 +923,8 @@ async fn route_select_user_table(
     ks: &str,
     s: &SelectStatement,
 ) -> Result<BytesMut, CqlError> {
+    validate_keyspace_exists(&state.schema, ks)?;
+
     // Permission check (M8)
     state.schema.check_permission(
         ctx.auth,
@@ -1753,6 +1755,7 @@ async fn route_insert(
     s: InsertStatement,
 ) -> Result<BytesMut, CqlError> {
     let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
+    validate_keyspace_exists(&state.schema, ks)?;
 
     // Permission check (M8)
     state.schema.check_permission(
@@ -3948,6 +3951,23 @@ fn resolve_keyspace<'a>(
         .as_deref()
         .or(current.as_deref())
         .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))
+}
+
+/// Check that a user keyspace exists in the local schema. Returns a clear
+/// error immediately instead of timing out when the schema hasn't propagated
+/// yet (e.g., during cluster formation).
+fn validate_keyspace_exists(schema: &ferrosa_schema::Schema, ks: &str) -> Result<(), CqlError> {
+    if ferrosa_schema::is_system_keyspace(ks) {
+        return Ok(());
+    }
+    let snap = schema.snapshot();
+    if snap.keyspaces.contains_key(ks) {
+        Ok(())
+    } else {
+        Err(CqlError::Invalid(format!(
+            "keyspace '{ks}' not found — schema may still be propagating. Retry in a few seconds."
+        )))
+    }
 }
 
 /// Look up the replication strategy for a keyspace from the schema.
