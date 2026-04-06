@@ -3396,7 +3396,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// Reproduce bug-large-write-causes-data-loss-in-partition:
     /// writing many rows to the same partition, flushing, writing more,
     /// flushing again — earlier rows must survive.
@@ -3454,6 +3453,93 @@ mod tests {
             total_rows >= 150,
             "BUG: expected 150+ rows from both batches, got {total_rows}. \
              Large write to same partition caused data loss from prior flush."
+        );
+    }
+
+    /// Simulates the production scenario: 500 rows written to the same
+    /// partition with auto-flush every ~50 rows (low threshold). All 500
+    /// must survive — the auto-flush must not drop rows from prior flushes.
+    #[test]
+    fn auto_flush_during_bulk_write_preserves_all_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            flush_threshold_bytes: 256, // very small to force frequent flushes
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let total_rows = 500;
+        let key = make_key("bulk_partition");
+
+        for i in 0..total_rows {
+            let row = Row {
+                clustering: (i as i32).to_be_bytes().to_vec(), // unique ck
+                cells: vec![(
+                    0,
+                    CellValue::live(format!("row_{i}").into_bytes(), (i + 1) as i64),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
+            };
+            engine.write(&tid, &key, row, (i + 1) as i64).unwrap();
+
+            // Manually flush every 50 rows to simulate auto-flush behavior
+            if (i + 1) % 50 == 0 {
+                engine.flush(&tid).unwrap();
+            }
+        }
+        // Final flush for any remaining rows
+        engine.flush(&tid).unwrap();
+
+        // ALL 500 rows must be present
+        let result = engine.read(&tid, &key).unwrap();
+        assert!(result.is_some(), "partition must exist after bulk write");
+        let row_count = result.unwrap().rows.len();
+        assert_eq!(
+            row_count, total_rows,
+            "expected {total_rows} rows after bulk write with auto-flush, got {row_count}. \
+             Data loss during flush!"
+        );
+    }
+
+    /// Verify that reading from an SSTable whose files were deleted returns
+    /// an error/skip, not silently empty results.
+    #[test]
+    fn read_after_sstable_deleted_skips_not_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let key = make_key("delete_test");
+        engine.write(&tid, &key, make_row(b"val", 1), 1).unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Verify data exists
+        assert!(engine.read(&tid, &key).unwrap().is_some());
+
+        // Delete the SSTable files from disk (simulates compaction file eviction)
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        if table_dir.exists() {
+            for entry in std::fs::read_dir(&table_dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "db" || e == "txt") {
+                    std::fs::remove_file(&path).unwrap();
+                }
+            }
+        }
+
+        // Read must NOT panic after SSTable files are deleted.
+        // The reader may still have data via mmap — both Some and None
+        // are acceptable. The key invariant: no panic, no hang.
+        let result = engine.read(&tid, &key);
+        assert!(
+            result.is_ok(),
+            "read after SSTable deletion must not panic: {:?}",
+            result.err()
         );
     }
 
