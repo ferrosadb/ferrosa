@@ -1,11 +1,10 @@
 # CQL integration test cluster — ports 3xxxx to avoid conflicts.
 #
-# Tests the full CQL INSERT -> flush -> restart -> SELECT path to catch
-# data loss that unit tests miss (concurrent flush/compaction races,
-# CQL layer cell ordering, file-level corruption).
+# Reuses the pre-built ferrosa-memory-node image (no Rust compile needed).
+# Fresh data volumes so tests start clean.
 #
 # Usage:
-#   podman compose -f tests/cluster/docker-compose.cql-integration.yml up -d --build
+#   podman compose -f tests/cluster/docker-compose.cql-integration.yml up -d
 #   python tests/cluster/test_cql_flush_restart.py
 #   podman compose -f tests/cluster/docker-compose.cql-integration.yml down -v
 
@@ -24,7 +23,7 @@ services:
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
     volumes:
-      - rustfs-data:/data
+      - cqltest-rustfs:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
       interval: 3s
@@ -44,9 +43,7 @@ services:
     restart: "no"
 
   node1:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
+    image: localhost/ferrosa-memory-node:latest
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -72,7 +69,7 @@ services:
       FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
       FERROSA_S3_PREFIX: "node1"
     volumes:
-      - node1-data:/var/lib/ferrosa
+      - cqltest-node1:/var/lib/ferrosa
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9042"]
       interval: 3s
@@ -81,9 +78,7 @@ services:
       start_period: 10s
 
   node2:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
+    image: localhost/ferrosa-memory-node:latest
     depends_on:
       node1:
         condition: service_healthy
@@ -110,7 +105,7 @@ services:
       FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
       FERROSA_S3_PREFIX: "node2"
     volumes:
-      - node2-data:/var/lib/ferrosa
+      - cqltest-node2:/var/lib/ferrosa
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9042"]
       interval: 3s
@@ -119,9 +114,7 @@ services:
       start_period: 10s
 
   node3:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
+    image: localhost/ferrosa-memory-node:latest
     depends_on:
       node1:
         condition: service_healthy
@@ -148,7 +141,7 @@ services:
       FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
       FERROSA_S3_PREFIX: "node3"
     volumes:
-      - node3-data:/var/lib/ferrosa
+      - cqltest-node3:/var/lib/ferrosa
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9042"]
       interval: 3s
@@ -157,7 +150,7 @@ services:
       start_period: 10s
 
 volumes:
-  rustfs-data:
-  node1-data:
-  node2-data:
-  node3-data:
+  cqltest-rustfs:
+  cqltest-node1:
+  cqltest-node2:
+  cqltest-node3:

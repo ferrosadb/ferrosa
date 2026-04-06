@@ -26,15 +26,14 @@ from cassandra.cluster import Cluster
 from cassandra.query import SimpleStatement, ConsistencyLevel
 
 CQL_PORTS = [
-    int(os.environ.get("CQL_PORT_1", "19042")),
-    int(os.environ.get("CQL_PORT_2", "19043")),
-    int(os.environ.get("CQL_PORT_3", "19044")),
+    int(os.environ.get("CQL_PORT_1", "30042")),
+    int(os.environ.get("CQL_PORT_2", "30043")),
+    int(os.environ.get("CQL_PORT_3", "30044")),
 ]
 CQL_HOST = os.environ.get("CQL_HOST", "127.0.0.1")
-# Default to ferrosa-memory cluster compose; override with CQL_COMPOSE_FILE env
 COMPOSE_FILE = os.environ.get(
     "CQL_COMPOSE_FILE",
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "ferrosa-memory", "docker-compose.yml"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker-compose.cql-integration.yml"),
 )
 TENANT = uuid.UUID("9a5f8fbf-d842-4d30-8ea5-1aa931e618a8")
 SESSION_ID = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -157,34 +156,43 @@ def count_rows(session, table, pk_clause):
     return result.one()[0]
 
 
+NODE_CONTAINERS = os.environ.get(
+    "NODE_CONTAINERS", "cluster_node1_1,cluster_node2_1,cluster_node3_1"
+).split(",")
+
+
 def restart_cluster():
-    """Stop and restart the cluster to force memtable flush."""
-    print("INFO: stopping cluster")
+    """Stop and restart the cluster to force memtable flush.
+
+    Uses direct `podman stop/start` instead of compose (which can hang
+    waiting for the compose provider).
+    """
+    print("INFO: stopping nodes")
     r = subprocess.run(
-        ["podman", "compose", "-f", COMPOSE_FILE, "stop"],
+        ["podman", "stop"] + NODE_CONTAINERS,
         capture_output=True, text=True, timeout=60,
     )
     if r.returncode != 0:
         print(f"ERROR: stop failed: {r.stderr.strip()}")
     time.sleep(2)
-    print("INFO: starting cluster")
+    print("INFO: starting nodes")
     r = subprocess.run(
-        ["podman", "compose", "-f", COMPOSE_FILE, "up", "-d"],
+        ["podman", "start"] + NODE_CONTAINERS,
         capture_output=True, text=True, timeout=60,
     )
     if r.returncode != 0:
         print(f"ERROR: start failed: {r.stderr.strip()}")
-    for attempt in range(30):
+    for attempt in range(45):
         try:
             for port in CQL_PORTS:
                 c, s = connect(port)
                 s.execute("SELECT now() FROM system.local")
                 c.shutdown()
-            print(f"INFO: cluster healthy after {attempt + 1} attempts")
+            print(f"INFO: cluster healthy after {(attempt + 1) * 3}s")
             return
         except Exception:
-            time.sleep(2)
-    print("ERROR: cluster did not become healthy after restart")
+            time.sleep(3)
+    print("ERROR: cluster did not become healthy after 135s")
     raise RuntimeError("Cluster did not become healthy after restart")
 
 
