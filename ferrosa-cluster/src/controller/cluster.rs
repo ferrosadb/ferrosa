@@ -97,12 +97,14 @@ impl ModeController {
 
         // Determine whether this node is the seed (responsible for calling
         // raft.initialize()). The seed is the node with the highest UUID among
-        // all cluster members — deterministic and independent of pair context
-        // which may have been cleared or never set (e.g., if the node joined
-        // directly from standalone mode in tests).
-        let was_seed = peers
-            .iter()
-            .all(|(peer_uuid, _)| self.local_host_id > *peer_uuid);
+        // ALL cluster members (self + all peers). We must include self in the
+        // comparison to handle the case where the ClusterInvite's peer list
+        // does not include the initiator — without this, a node that only sees
+        // a subset of peers can incorrectly believe it is the seed (RC-3 race).
+        let mut all_member_uuids: Vec<uuid::Uuid> = peers.iter().map(|(id, _)| *id).collect();
+        all_member_uuids.push(self.local_host_id);
+        let max_uuid = all_member_uuids.iter().max().copied().unwrap_or_default();
+        let was_seed = self.local_host_id == max_uuid;
 
         // Flush all memtables to SSTables before the write path switches to the
         // ClusterCoordinator. Data written in standalone/pair mode lives only in
@@ -1045,7 +1047,7 @@ impl ClusterInviteHandler {
 
 #[async_trait::async_trait]
 impl RpcHandler for ClusterInviteHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
         let (initiator, peers) = match msg {
             Message::ClusterInvite { initiator, peers } => (initiator, peers),
             _ => return None,
@@ -1139,11 +1141,22 @@ impl RpcHandler for ClusterInviteHandler {
         if let Some(ctrl) = self.controller.upgrade() {
             let mode = ctrl.mode();
             if mode == DeploymentMode::Pair || mode == DeploymentMode::Standalone {
-                let all_peers: Vec<(Uuid, std::net::SocketAddr)> = peers
+                // Include the initiator in the peer list so that all nodes
+                // have a complete view of cluster membership. Without this,
+                // a node receiving the invite would only see a subset of
+                // peers and might incorrectly determine the seed (RC-3 race).
+                let mut all_peers: Vec<(Uuid, std::net::SocketAddr)> = peers
                     .iter()
                     .filter(|(id, _)| *id != self.local_host_id)
                     .cloned()
                     .collect();
+                // Add the initiator if not already in the list. Use the
+                // sender's address from the RPC handler (from.1).
+                if initiator != self.local_host_id
+                    && !all_peers.iter().any(|(id, _)| *id == initiator)
+                {
+                    all_peers.push((initiator, from.1));
+                }
                 if all_peers.len() >= 2 {
                     tracing::info!(
                         peer_count = all_peers.len(),
