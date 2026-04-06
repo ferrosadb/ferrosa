@@ -435,6 +435,24 @@ impl FlushTarget for FileFlushTarget {
             Ok::<(), ferrosa_common::Error>(())
         })?;
 
+        // Verify tmp files were written completely before renaming.
+        // This catches the truncation bug: if the file on disk is shorter
+        // than the in-memory buffer, something overwrote or truncated it.
+        {
+            let expected_data_size = output.data.len() as u64;
+            let actual_data_size = std::fs::metadata(tmp(&data_path))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if actual_data_size != expected_data_size {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "FLUSH CORRUPTION: Data.db.tmp gen={gen} expected {expected_data_size} bytes, \
+                     got {actual_data_size} on disk. Buffer was {expected_data_size} bytes. \
+                     Path: {:?}",
+                    tmp(&data_path)
+                )));
+            }
+        }
+
         // All tmp files written successfully — atomically rename to final names.
         // rename() is atomic on POSIX (same filesystem).
         std::fs::rename(tmp(&data_path), &data_path)?;
@@ -445,6 +463,22 @@ impl FlushTarget for FileFlushTarget {
         std::fs::rename(&toc_tmp, &toc_path)?;
         if has_compression_info {
             std::fs::rename(tmp(&compression_info_path), &compression_info_path)?;
+        }
+
+        // Verify the renamed Data.db file is the correct size.
+        // If it differs from the tmp file we just checked, something else
+        // wrote a file with the same name in between (gen collision).
+        {
+            let expected = output.data.len() as u64;
+            let actual = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+            if actual != expected {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "FLUSH COLLISION: Data.db gen={gen} was {expected} bytes after rename, \
+                     now {actual} bytes. Another flush/compaction wrote the same file. \
+                     Path: {:?}",
+                    data_path
+                )));
+            }
         }
 
         // FileReadAt::open returns ferrosa_common::Result — use ? directly
