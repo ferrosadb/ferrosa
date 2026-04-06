@@ -55,6 +55,11 @@ pub struct Manifest {
     pub sstables: HashMap<String, Vec<ManifestEntry>>,
     /// ISO 8601 timestamp of the last compaction.
     pub last_compacted_at: Option<String>,
+    /// Removals accumulated via [`remove_sstables`] — re-applied on CAS
+    /// retry in [`save_with_retry`] so compaction deletions are never lost.
+    /// Not serialized (transient state only).
+    #[serde(skip)]
+    pub(crate) pending_removals: Vec<(String, Vec<String>)>,
 }
 
 /// Metadata for a single SSTable in the manifest.
@@ -75,6 +80,7 @@ impl Manifest {
             format_version: 1,
             sstables: HashMap::new(),
             last_compacted_at: None,
+            pending_removals: Vec::new(),
         }
     }
 
@@ -166,7 +172,8 @@ impl Manifest {
         store: &dyn ObjectStore,
         prefix: &str,
     ) -> ferrosa_common::Result<()> {
-        self.save_with_retry_and_removals(store, prefix, &[]).await
+        self.save_with_retry_and_removals(store, prefix, &self.pending_removals)
+            .await
     }
 
     /// Save the manifest with CAS retry, applying both additions and removals.
@@ -250,6 +257,11 @@ impl Manifest {
     pub fn remove_sstables(&mut self, table_id: &str, ids: &[String]) {
         if let Some(entries) = self.sstables.get_mut(table_id) {
             entries.retain(|e| !ids.contains(&e.id));
+        }
+        // Track removal so save_with_retry can re-apply it on CAS conflict.
+        if !ids.is_empty() {
+            self.pending_removals
+                .push((table_id.to_string(), ids.to_vec()));
         }
     }
 
@@ -549,14 +561,14 @@ mod tests {
         });
     }
 
-    /// RED TEST: proves that save_with_retry (without removals) loses
-    /// compaction deletions. This test MUST FAIL to demonstrate the bug.
+    /// Regression test: save_with_retry must preserve compaction removals.
     ///
-    /// The bug: save_with_retry calls merge_into which starts from the
-    /// latest S3 manifest (which still has old entries) and only adds new
-    /// entries from self. Removals applied to self are lost.
+    /// Previously, save_with_retry passed empty removals to
+    /// save_with_retry_and_removals, so entries removed via
+    /// remove_sstables() reappeared after CAS merge. Now removals
+    /// are tracked in pending_removals and forwarded automatically.
     #[tokio::test]
-    async fn save_with_retry_loses_compaction_removals() {
+    async fn save_with_retry_preserves_compaction_removals() {
         let store = InMemory::new();
 
         // Initial manifest: 3 SSTables
@@ -571,21 +583,28 @@ mod tests {
         manifest.remove_sstables("ks.t", &["sst1".to_string(), "sst2".to_string()]);
         manifest.add_sstable("ks.t", sample_entry("sst4"));
 
-        // Save using the OLD API (no removals parameter) — this is how
-        // the engine currently calls it for compaction
+        // save_with_retry now carries pending_removals automatically
         manifest.save_with_retry(&store, "test").await.unwrap();
 
-        // Verify: sst1 and sst2 should NOT be in the manifest
+        // Verify: sst1 and sst2 must NOT be in the manifest
         let (final_manifest, _) = Manifest::load(&store, "test").await.unwrap();
         let ids: Vec<&str> = final_manifest.sstables["ks.t"]
             .iter()
             .map(|e| e.id.as_str())
             .collect();
 
-        // This FAILS — proving the bug: removals are lost through save_with_retry
         assert!(
             !ids.contains(&"sst1"),
-            "BUG: sst1 was removed but reappeared through save_with_retry merge; got: {ids:?}"
+            "sst1 was removed but reappeared; got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"sst2"),
+            "sst2 was removed but reappeared; got: {ids:?}"
+        );
+        assert!(ids.contains(&"sst3"), "sst3 should survive; got: {ids:?}");
+        assert!(
+            ids.contains(&"sst4"),
+            "sst4 (compaction output) should be present; got: {ids:?}"
         );
     }
 
