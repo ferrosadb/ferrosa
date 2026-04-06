@@ -1489,6 +1489,419 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // node_state_to_str — all variant coverage
+    // =========================================================================
+
+    #[test]
+    fn node_state_to_str_joining() {
+        assert_eq!(node_state_to_str(NodeState::Joining), "Joining");
+    }
+
+    #[test]
+    fn node_state_to_str_normal() {
+        assert_eq!(node_state_to_str(NodeState::Normal), "Normal");
+    }
+
+    #[test]
+    fn node_state_to_str_leaving() {
+        assert_eq!(node_state_to_str(NodeState::Leaving), "Leaving");
+    }
+
+    #[test]
+    fn node_state_to_str_decommissioned() {
+        assert_eq!(
+            node_state_to_str(NodeState::Decommissioned),
+            "Decommissioned"
+        );
+    }
+
+    // =========================================================================
+    // virtual_table_to_json — edge cases for short/malformed byte arrays
+    // =========================================================================
+
+    #[test]
+    fn virtual_table_to_json_int_short_bytes_returns_null() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "count".to_string(),
+                data_type: DataType::Int,
+            }],
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(vec![0, 1], 1)], // only 2 bytes, need 4
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert_eq!(
+            rows[0]["count"],
+            Value::Null,
+            "Int with < 4 bytes must produce null"
+        );
+    }
+
+    #[test]
+    fn virtual_table_to_json_bigint_short_bytes_returns_null() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "total".to_string(),
+                data_type: DataType::BigInt,
+            }],
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(vec![0, 1, 2, 3], 1)], // only 4 bytes, need 8
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert_eq!(
+            rows[0]["total"],
+            Value::Null,
+            "BigInt with < 8 bytes must produce null"
+        );
+    }
+
+    #[test]
+    fn virtual_table_to_json_double_short_bytes_returns_null() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "ratio".to_string(),
+                data_type: DataType::Double,
+            }],
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(vec![0, 1, 2], 1)], // only 3 bytes, need 8
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert_eq!(
+            rows[0]["ratio"],
+            Value::Null,
+            "Double with < 8 bytes must produce null"
+        );
+    }
+
+    #[test]
+    fn virtual_table_to_json_double_nan_returns_null() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "ratio".to_string(),
+                data_type: DataType::Double,
+            }],
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(f64::NAN.to_be_bytes().to_vec(), 1)],
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert_eq!(
+            rows[0]["ratio"],
+            Value::Null,
+            "NaN double must produce null (JSON has no NaN)"
+        );
+    }
+
+    #[test]
+    fn virtual_table_to_json_double_infinity_returns_null() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "ratio".to_string(),
+                data_type: DataType::Double,
+            }],
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(f64::INFINITY.to_be_bytes().to_vec(), 1)],
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert_eq!(
+            rows[0]["ratio"],
+            Value::Null,
+            "Infinity double must produce null (JSON has no Infinity)"
+        );
+    }
+
+    #[test]
+    fn virtual_table_to_json_timestamp_column() {
+        let registry = VirtualTableRegistry::new();
+        let ts: i64 = 1_700_000_000_000; // millis since epoch
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "created_at".to_string(),
+                data_type: DataType::Timestamp,
+            }],
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(ts.to_be_bytes().to_vec(), 1)],
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert_eq!(
+            rows[0]["created_at"], ts,
+            "Timestamp must be serialized as i64"
+        );
+    }
+
+    #[test]
+    fn virtual_table_to_json_timestamp_short_bytes_returns_null() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "created_at".to_string(),
+                data_type: DataType::Timestamp,
+            }],
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(vec![0, 1, 2, 3], 1)], // only 4 bytes, need 8
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert_eq!(
+            rows[0]["created_at"],
+            Value::Null,
+            "Timestamp with < 8 bytes must produce null"
+        );
+    }
+
+    #[test]
+    fn virtual_table_to_json_boolean_false() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "active".to_string(),
+                data_type: DataType::Boolean,
+            }],
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(vec![0], 1)],
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert_eq!(rows[0]["active"], false, "byte 0 must deserialize as false");
+    }
+
+    #[test]
+    fn virtual_table_to_json_boolean_empty_bytes_is_false() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "active".to_string(),
+                data_type: DataType::Boolean,
+            }],
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(vec![], 1)],
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert_eq!(
+            rows[0]["active"], false,
+            "empty bytes must deserialize as false"
+        );
+    }
+
+    #[test]
+    fn virtual_table_to_json_uuid_column_shows_binary() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Uuid,
+            }],
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(vec![0u8; 16], 1)],
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        // Uuid falls through to the `_` match arm, which renders as "<binary>".
+        assert_eq!(rows[0]["id"], "<binary>");
+    }
+
+    #[test]
+    fn virtual_table_to_json_fewer_cells_than_columns() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![
+                VirtualColumnDef {
+                    name: "host".to_string(),
+                    data_type: DataType::Text,
+                },
+                VirtualColumnDef {
+                    name: "port".to_string(),
+                    data_type: DataType::Int,
+                },
+            ],
+            // Only one cell, but two columns defined.
+            rows: vec![VirtualRow {
+                cells: vec![CellValue::live(b"localhost".to_vec(), 1)],
+            }],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["host"], "localhost");
+        // "port" column is missing from cells — should not appear in the output.
+        assert!(
+            rows[0].get("port").is_none() || rows[0]["port"].is_null(),
+            "missing cell should produce no key or null"
+        );
+    }
+
+    #[test]
+    fn virtual_table_to_json_multiple_rows() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "name".to_string(),
+                data_type: DataType::Text,
+            }],
+            rows: vec![
+                VirtualRow {
+                    cells: vec![CellValue::live(b"alice".to_vec(), 1)],
+                },
+                VirtualRow {
+                    cells: vec![CellValue::live(b"bob".to_vec(), 2)],
+                },
+                VirtualRow {
+                    cells: vec![CellValue::live(b"carol".to_vec(), 3)],
+                },
+            ],
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["name"], "alice");
+        assert_eq!(rows[1]["name"], "bob");
+        assert_eq!(rows[2]["name"], "carol");
+    }
+
+    #[test]
+    fn virtual_table_to_json_empty_rows() {
+        let registry = VirtualTableRegistry::new();
+        let table = StubTable {
+            cols: vec![VirtualColumnDef {
+                name: "name".to_string(),
+                data_type: DataType::Text,
+            }],
+            rows: vec![], // no rows
+        };
+        registry.register(Arc::new(table));
+
+        let result = virtual_table_to_json(&registry, "test_table");
+        let rows = result.as_array().unwrap();
+        assert!(rows.is_empty(), "empty rows must produce empty JSON array");
+    }
+
+    // =========================================================================
+    // list_tables — edge cases
+    // =========================================================================
+
+    #[tokio::test]
+    async fn bt001_api_tables_empty_registry_returns_200_empty_array() {
+        let state = make_state();
+        // Default state has empty registry.
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/tables")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names = parsed.as_array().expect("must return array");
+        assert!(
+            names.is_empty(),
+            "empty registry must return empty array, got: {names:?}"
+        );
+    }
+
+    // =========================================================================
+    // Cluster status endpoint — field presence
+    // =========================================================================
+
+    #[tokio::test]
+    async fn api_cluster_status_mode_field_is_string() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/api/cluster/status")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mode = parsed["mode"].as_str().expect("mode must be a string");
+        assert!(!mode.is_empty(), "mode must be a non-empty string");
+    }
+
+    // =========================================================================
+    // Add-node with valid UUID — should succeed (no Raft, local approval only)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn api_add_node_valid_uuid_returns_200() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let host_id = uuid::Uuid::new_v4();
+        let body_str = format!(r#"{{"host_id": "{}"}}"#, host_id);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/cluster/add-node")
+            .header("content-type", "application/json")
+            .body(Body::from(body_str))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "valid UUID should be approved locally"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "approved");
+        assert_eq!(parsed["host_id"], host_id.to_string());
+    }
+
     /// BT-003b: GET /metrics with empty registry returns 200 + text/plain
     /// (possibly empty body, but no error).
     #[tokio::test]

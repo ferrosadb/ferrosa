@@ -209,4 +209,98 @@ mod tests {
             assert!(p.fan_factor >= 2, "fan_factor must be >= 2");
         }
     }
+
+    /// Helper: returns all built-in profiles for exhaustive property checks.
+    fn all_profiles() -> Vec<LoadProfile> {
+        vec![
+            LoadProfile::read_heavy(),
+            LoadProfile::balanced(),
+            LoadProfile::write_heavy(),
+            LoadProfile::delete_update_heavy(),
+            LoadProfile::compaction_stress(),
+        ]
+    }
+
+    #[test]
+    fn compaction_stress_profile_valid() {
+        let p = LoadProfile::compaction_stress();
+        let ratio_sum = p.read_ratio + p.write_ratio;
+        assert!(
+            (ratio_sum - 1.0).abs() < f64::EPSILON,
+            "compaction_stress ratios must sum to 1.0, got {ratio_sum}"
+        );
+        assert!(p.fan_factor > 0, "compaction_stress fan_factor must be > 0");
+        assert!(
+            p.key_space_size > 0,
+            "compaction_stress key_space_size must be > 0"
+        );
+        assert_eq!(p.name, "compaction_stress");
+        assert_eq!(p.read_ratio, 0.2);
+        assert_eq!(p.write_ratio, 0.8);
+        assert!(
+            p.update_ratio + p.delete_ratio <= p.write_ratio + f64::EPSILON,
+            "update + delete cannot exceed write ratio"
+        );
+    }
+
+    #[test]
+    fn custom_profile_with_duration() {
+        let mut p = LoadProfile::balanced();
+        p.name = "custom_30s".into();
+        p.duration = Duration::from_secs(30);
+        p.num_writers = 2;
+        p.num_readers = 10;
+
+        assert_eq!(p.name, "custom_30s");
+        assert_eq!(p.duration, Duration::from_secs(30));
+        assert_eq!(p.num_writers, 2);
+        assert_eq!(p.num_readers, 10);
+        // Ratios unchanged from balanced base.
+        assert_eq!(p.read_ratio, 0.5);
+        assert_eq!(p.write_ratio, 0.5);
+    }
+
+    #[test]
+    fn all_profiles_have_nonzero_writers() {
+        for p in all_profiles() {
+            assert!(
+                p.num_writers > 0,
+                "profile '{}' must have num_writers > 0",
+                p.name
+            );
+        }
+    }
+
+    #[test]
+    fn all_profiles_have_positive_value_range() {
+        for p in all_profiles() {
+            let (lo, hi) = p.value_size_range;
+            assert!(
+                lo > 0,
+                "profile '{}' value_size_range.0 must be > 0, got {lo}",
+                p.name
+            );
+            assert!(
+                hi > 0,
+                "profile '{}' value_size_range.1 must be > 0, got {hi}",
+                p.name
+            );
+            assert!(
+                lo <= hi,
+                "profile '{}' value_size_range.0 ({lo}) must be <= value_size_range.1 ({hi})",
+                p.name
+            );
+        }
+    }
+
+    #[test]
+    fn all_profiles_flush_threshold_positive() {
+        for p in all_profiles() {
+            assert!(
+                p.flush_threshold_bytes > 0,
+                "profile '{}' must have flush_threshold_bytes > 0",
+                p.name
+            );
+        }
+    }
 }

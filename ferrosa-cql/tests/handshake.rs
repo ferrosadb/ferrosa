@@ -116,7 +116,7 @@ fn encode_startup_frame() -> BytesMut {
     body.put_slice(val);
 
     let header = FrameHeader {
-        version: VERSION_REQUEST,
+        version: 0x04, // v4 — raw TCP tests don't implement v5 framing
         flags: 0,
         stream_id: 0,
         opcode: Opcode::Startup,
@@ -137,7 +137,7 @@ fn encode_auth_response(username: &str, password: &str) -> BytesMut {
     body.put_slice(sasl_bytes);
 
     let header = FrameHeader {
-        version: VERSION_REQUEST,
+        version: 0x04, // v4 — raw TCP tests don't implement v5 framing
         flags: 0,
         stream_id: 0,
         opcode: Opcode::AuthResponse,
@@ -184,7 +184,7 @@ async fn read_frame(stream: &mut TcpStream) -> RawFrame {
 
 async fn send_raw_frame(stream: &mut TcpStream, opcode: Opcode, body: &[u8]) {
     let header = FrameHeader {
-        version: VERSION_REQUEST,
+        version: 0x04,
         flags: 0,
         stream_id: 0,
         opcode,
@@ -196,6 +196,103 @@ async fn send_raw_frame(stream: &mut TcpStream, opcode: Opcode, body: &[u8]) {
     stream.write_all(&buf).await.unwrap();
 }
 
+// ── v5 framing helpers ──────────────────────────────────────────────────
+
+fn encode_startup_frame_v5() -> BytesMut {
+    let mut body = BytesMut::new();
+    body.put_u16(1);
+    let key = b"CQL_VERSION";
+    body.put_u16(key.len() as u16);
+    body.put_slice(key);
+    let val = b"3.0.0";
+    body.put_u16(val.len() as u16);
+    body.put_slice(val);
+
+    let header = FrameHeader {
+        version: 0x05, // v5
+        flags: 0,
+        stream_id: 0,
+        opcode: Opcode::Startup,
+        length: body.len() as u32,
+    };
+    let mut buf = BytesMut::new();
+    header.encode(&mut buf);
+    buf.extend_from_slice(&body);
+    buf
+}
+
+/// Read a v5 framed response: 6-byte LE header + CRC24 + payload + CRC32.
+/// Extracts the 9-byte envelope from inside the frame.
+async fn read_v5_frame(stream: &mut TcpStream) -> RawFrame {
+    // Read 6-byte frame header.
+    let mut frame_hdr = [0u8; 6];
+    timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut frame_hdr))
+        .await
+        .expect("timed out waiting for v5 frame header")
+        .unwrap();
+
+    let h = u32::from_le_bytes([frame_hdr[0], frame_hdr[1], frame_hdr[2], 0]);
+    let payload_len = (h & 0x1FFFF) as usize;
+
+    // Read payload + 4-byte CRC32.
+    let mut payload_and_crc = vec![0u8; payload_len + 4];
+    timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut payload_and_crc))
+        .await
+        .expect("timed out waiting for v5 frame payload")
+        .unwrap();
+
+    // Extract the 9-byte envelope from the payload.
+    let envelope = &payload_and_crc[..payload_len];
+    assert!(
+        envelope.len() >= HEADER_SIZE,
+        "v5 frame payload too short for envelope"
+    );
+    let header = FrameHeader::decode(&envelope[..HEADER_SIZE]).unwrap();
+    let body = envelope[HEADER_SIZE..].to_vec();
+    let opcode = header.opcode;
+    RawFrame {
+        header,
+        opcode,
+        body,
+    }
+}
+
+/// Send a v5 framed message.
+async fn send_v5_frame(stream: &mut TcpStream, opcode: Opcode, body: &[u8]) {
+    let header = FrameHeader {
+        version: 0x05,
+        flags: 0,
+        stream_id: 0,
+        opcode,
+        length: body.len() as u32,
+    };
+    let mut envelope = BytesMut::new();
+    header.encode(&mut envelope);
+    envelope.extend_from_slice(body);
+
+    let payload_len = envelope.len();
+
+    // Build 3-byte LE header: payload_length(17 bits) | isSelfContained(1 bit)
+    let header_bits: u32 = (payload_len as u32) | (1 << 17);
+    let h_bytes = header_bits.to_le_bytes();
+
+    // CRC24 of header bytes.
+    let crc24 = ferrosa_cql::frame::crc24_public(&h_bytes[..3]);
+    let crc24_bytes = crc24.to_le_bytes();
+
+    // CRC32 of payload.
+    let crc32 = ferrosa_cql::frame::crc32_public(&envelope);
+    let crc32_bytes = crc32.to_le_bytes();
+
+    let mut buf = BytesMut::new();
+    buf.put_slice(&h_bytes[..3]);
+    buf.put_slice(&crc24_bytes[..3]);
+    buf.put_slice(&envelope);
+    buf.put_slice(&crc32_bytes[..4]);
+
+    stream.write_all(&buf).await.unwrap();
+}
+
 #[allow(dead_code)]
 async fn send_raw_frame_with_stream(
     stream: &mut TcpStream,
@@ -204,7 +301,7 @@ async fn send_raw_frame_with_stream(
     stream_id: i16,
 ) {
     let header = FrameHeader {
-        version: VERSION_REQUEST,
+        version: 0x04, // v4 — raw TCP tests don't implement v5 framing
         flags: 0,
         stream_id,
         opcode,
@@ -666,7 +763,7 @@ async fn stream_id_preserved() {
     body.put_slice(val);
 
     let header = FrameHeader {
-        version: VERSION_REQUEST,
+        version: 0x04, // v4 — raw TCP tests don't implement v5 framing
         flags: 0,
         stream_id: 42,
         opcode: Opcode::Startup,
@@ -1491,4 +1588,74 @@ async fn query_with_bind_values_allow_filtering() {
         "ALLOW FILTERING with bind value category='tech' should return 2 rows, \
          got {filtered_count}"
     );
+}
+
+// ── CQL v5 framing tests ────────────────────────────────────────────────
+
+/// Test that a v5 STARTUP handshake succeeds, and subsequent queries
+/// work over v5 framing (6-byte LE header + CRC24/CRC32).
+#[tokio::test]
+async fn v5_startup_and_query_over_framed_transport() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // Send v5 STARTUP (unframed — same 9-byte envelope as v4).
+    let startup = encode_startup_frame_v5();
+    stream.write_all(&startup).await.unwrap();
+
+    // Read READY response (unframed — server hasn't switched yet).
+    let ready = read_frame(&mut stream).await;
+    assert_eq!(
+        ready.opcode,
+        Opcode::Ready,
+        "expected READY after v5 STARTUP"
+    );
+    assert_eq!(
+        ready.header.version, 0x85,
+        "v5 response version should be 0x85"
+    );
+
+    // After READY, both sides switch to v5 framing.
+    // Send a query in v5 frame format.
+    let query = b"SELECT key FROM system.local";
+    let mut body = BytesMut::new();
+    // Query body: [long string][consistency(u16)][flags(u8)]
+    body.put_i32(query.len() as i32);
+    body.put_slice(query);
+    body.put_u16(0x0001); // CL ONE
+    body.put_u8(0x00); // no flags
+    send_v5_frame(&mut stream, Opcode::Query, &body).await;
+
+    // Read result in v5 frame format.
+    let result = read_v5_frame(&mut stream).await;
+    assert_eq!(
+        result.opcode,
+        Opcode::Result,
+        "expected RESULT for SELECT query over v5 framing"
+    );
+}
+
+/// Test that v4 connections still work alongside v5.
+#[tokio::test]
+async fn v4_and_v5_coexist_on_same_server() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+
+    // v4 connection
+    let mut v4 = TcpStream::connect(addr).await.unwrap();
+    send_startup(&mut v4).await;
+    let ready4 = read_frame(&mut v4).await;
+    assert_eq!(ready4.opcode, Opcode::Ready);
+    assert_eq!(ready4.header.version, 0x84, "v4 response should be 0x84");
+
+    // v5 connection
+    let mut v5 = TcpStream::connect(addr).await.unwrap();
+    v5.write_all(&encode_startup_frame_v5()).await.unwrap();
+    let ready5 = read_frame(&mut v5).await;
+    assert_eq!(ready5.opcode, Opcode::Ready);
+    assert_eq!(ready5.header.version, 0x85, "v5 response should be 0x85");
 }

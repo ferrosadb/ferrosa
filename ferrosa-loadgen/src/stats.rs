@@ -67,6 +67,7 @@ pub struct LoadStats {
     pub writes_per_sec: f64,
     pub reads_per_sec: f64,
     pub bytes_written: u64,
+    pub bytes_read: u64,
     pub compaction_tasks_completed: u64,
     pub s3_uploads: u64,
     pub s3_deletes: u64,
@@ -111,6 +112,25 @@ impl fmt::Display for LoadStats {
             "Bytes written:      {:>12}  ({:.1} MB)",
             self.bytes_written,
             self.bytes_written as f64 / (1024.0 * 1024.0)
+        )?;
+        writeln!(
+            f,
+            "Bytes read:         {:>12}  ({:.1} MB)",
+            self.bytes_read,
+            self.bytes_read as f64 / (1024.0 * 1024.0)
+        )?;
+        let secs = self.elapsed.as_secs_f64().max(0.001);
+        writeln!(
+            f,
+            "Write throughput:   {:>12}  ({:.1} MB/s)",
+            "",
+            self.bytes_written as f64 / secs / (1024.0 * 1024.0)
+        )?;
+        writeln!(
+            f,
+            "Read throughput:    {:>12}  ({:.1} MB/s)",
+            "",
+            self.bytes_read as f64 / secs / (1024.0 * 1024.0)
         )?;
         writeln!(f, "Total updates:      {:>12}", self.total_updates)?;
         writeln!(f, "Total deletes:      {:>12}", self.total_deletes)?;
@@ -280,6 +300,7 @@ const MAX_ERROR_SAMPLES: usize = 10;
 pub struct FinalizeContext<'a> {
     pub profile_name: &'a str,
     pub bytes_written: u64,
+    pub bytes_read: u64,
     pub compaction_tasks: u64,
     pub s3_uploads: u64,
     pub s3_deletes: u64,
@@ -417,6 +438,7 @@ impl StatsCollector {
         let FinalizeContext {
             profile_name,
             bytes_written,
+            bytes_read,
             compaction_tasks,
             s3_uploads,
             s3_deletes,
@@ -448,6 +470,7 @@ impl StatsCollector {
             writes_per_sec: total_writes as f64 / secs,
             reads_per_sec: total_reads as f64 / secs,
             bytes_written,
+            bytes_read,
             compaction_tasks_completed: compaction_tasks,
             s3_uploads,
             s3_deletes,
@@ -483,6 +506,7 @@ mod tests {
         FinalizeContext {
             profile_name: name,
             bytes_written: 0,
+            bytes_read: 0,
             compaction_tasks: 0,
             s3_uploads: 0,
             s3_deletes: 0,
@@ -588,5 +612,70 @@ mod tests {
         assert_eq!(stats.snapshots.len(), 1);
         assert_eq!(stats.snapshots[0].s3_uploads, 2);
         assert_eq!(stats.snapshots[0].bytes_reclaimed, 1000);
+    }
+
+    #[test]
+    fn stats_display_includes_bytes_read() {
+        let sc = StatsCollector::new();
+        let stats = sc.finalize(FinalizeContext {
+            bytes_read: 5000,
+            ..test_ctx("bytes_read_test")
+        });
+        let output = format!("{stats}");
+        assert!(
+            output.contains("Bytes read:"),
+            "output should contain 'Bytes read:' line, got:\n{output}"
+        );
+        assert!(
+            output.contains("5000"),
+            "output should contain '5000', got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn stats_display_includes_throughput_mbs() {
+        let sc = StatsCollector::new();
+        let stats = sc.finalize(FinalizeContext {
+            bytes_written: 10 * 1024 * 1024,
+            bytes_read: 20 * 1024 * 1024,
+            ..test_ctx("throughput_test")
+        });
+        let output = format!("{stats}");
+        assert!(
+            output.contains("Write throughput:"),
+            "output should contain 'Write throughput:', got:\n{output}"
+        );
+        assert!(
+            output.contains("Read throughput:"),
+            "output should contain 'Read throughput:', got:\n{output}"
+        );
+        assert!(
+            output.contains("MB/s"),
+            "output should contain 'MB/s', got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn stats_display_zero_bytes_read() {
+        let sc = StatsCollector::new();
+        let stats = sc.finalize(FinalizeContext {
+            bytes_read: 0,
+            ..test_ctx("zero_bytes_read_test")
+        });
+        let output = format!("{stats}");
+        assert!(
+            output.contains("Bytes read:"),
+            "output should contain 'Bytes read:' line, got:\n{output}"
+        );
+        // The "Bytes read:" line should show 0 bytes and 0.0 MB.
+        // Find the specific line to verify the value is 0.
+        let bytes_read_line = output
+            .lines()
+            .find(|l| l.contains("Bytes read:"))
+            .expect("should have a 'Bytes read:' line");
+        assert!(
+            bytes_read_line.contains("0"),
+            "Bytes read line should contain '0', got: {bytes_read_line}"
+        );
     }
 }

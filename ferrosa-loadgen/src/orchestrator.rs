@@ -80,6 +80,7 @@ fn run_load_test_inner(
     let stats = StatsCollector::new();
     let stop = AtomicBool::new(false);
     let bytes_written = AtomicU64::new(0);
+    let bytes_read = AtomicU64::new(0);
     let mut resource_mon = ResourceMonitor::new(4);
     let mut abort_reason: Option<String> = None;
     let mut throughput_history: Vec<u64> = Vec::new();
@@ -111,6 +112,7 @@ fn run_load_test_inner(
             let sc = &stats;
             let st = &stop;
             let bw = &bytes_written;
+            let br = &bytes_read;
             let key_space = profile.key_space_size;
             let value_range = profile.value_size_range;
             let read_ratio = profile.read_ratio;
@@ -176,6 +178,9 @@ fn run_load_test_inner(
                                         .and_then(|p| p.rows.into_iter().next())
                                         .and_then(|r| r.cells.into_iter().next())
                                         .and_then(|(_, c)| c.value);
+                                    if let Some(ref v) = got {
+                                        br.fetch_add(v.len() as u64, Ordering::Relaxed);
+                                    }
                                     gt.record_read(&key_str, got.as_deref());
                                     sc.record_read(latency);
                                 }
@@ -338,9 +343,11 @@ fn run_load_test_inner(
 
     let resource_summary = resource_mon.summary();
 
+    let total_bytes_read = bytes_read.load(Ordering::Relaxed);
     stats.finalize(FinalizeContext {
         profile_name: &profile.name,
         bytes_written: total_bytes,
+        bytes_read: total_bytes_read,
         compaction_tasks: 0,
         s3_uploads,
         s3_deletes,

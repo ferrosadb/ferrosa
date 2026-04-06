@@ -135,6 +135,14 @@ impl FrameHeader {
     }
 
     /// Decode a header from the first 9 bytes of `buf`.
+    ///
+    /// CQL v4 and below use a 9-byte fixed header:
+    ///   version(1) + flags(1) + stream(2) + opcode(1) + length(4)
+    ///
+    /// CQL v5 changed the envelope format (different framing structure).
+    /// If we detect a v5 request, we return a `ProtocolVersionMismatch`
+    /// error so the connection handler can reply with an ERROR frame
+    /// using v4, causing the driver to fall back.
     pub fn decode(buf: &[u8]) -> std::result::Result<Self, CqlError> {
         if buf.len() < HEADER_SIZE {
             return Err(CqlError::Protocol(format!(
@@ -142,6 +150,7 @@ impl FrameHeader {
                 buf.len()
             )));
         }
+
         let mut cursor = &buf[..HEADER_SIZE];
         let version = cursor.get_u8();
         let flags = cursor.get_u8();
@@ -165,10 +174,28 @@ pub struct CqlFrame {
     pub body: Bytes,
 }
 
-/// Tokio codec for CQL v5 frame encoding/decoding.
+/// CQL v5 frame header size (uncompressed): 3 bytes header + 3 bytes CRC24.
+pub const V5_FRAME_HEADER_SIZE: usize = 6;
+/// CQL v5 CRC32 trailer size.
+pub const V5_CRC32_SIZE: usize = 4;
+/// Maximum payload in a single v5 frame: 2^17 - 1 = 131,071 bytes.
+pub const V5_MAX_PAYLOAD: usize = (1 << 17) - 1;
+
+/// Tokio codec for CQL frame encoding/decoding.
+///
+/// Supports both v4 (unframed 9-byte envelope headers) and v5 (framed
+/// with 6-byte LE headers + CRC24/CRC32 integrity checks). The codec
+/// starts in unframed mode and switches to v5 framed mode after the
+/// STARTUP/READY handshake completes on a v5 connection.
 pub struct CqlCodec {
     max_frame_size: u32,
     compression: Option<Compression>,
+    /// When true, incoming/outgoing data uses v5 frame format (6-byte LE
+    /// header + CRC24 + payload + CRC32). Set by the connection handler
+    /// after STARTUP succeeds on a v5 connection.
+    v5_framed: bool,
+    /// Buffer for reassembling segmented v5 messages (isSelfContained=0).
+    v5_segment_buf: BytesMut,
 }
 
 impl CqlCodec {
@@ -176,6 +203,8 @@ impl CqlCodec {
         Self {
             max_frame_size,
             compression: None,
+            v5_framed: false,
+            v5_segment_buf: BytesMut::new(),
         }
     }
 
@@ -187,16 +216,26 @@ impl CqlCodec {
     pub fn set_compression(&mut self, compression: Compression) {
         self.compression = Some(compression);
     }
+
+    /// Switch to v5 framed mode. Called by the connection handler after
+    /// the STARTUP/READY exchange completes on a v5 connection.
+    pub fn enable_v5_framing(&mut self) {
+        self.v5_framed = true;
+    }
+
+    /// Whether v5 framing is active.
+    pub fn is_v5_framed(&self) -> bool {
+        self.v5_framed
+    }
 }
 
-impl Decoder for CqlCodec {
-    type Item = CqlFrame;
-    type Error = CqlError;
-
-    fn decode(
+impl CqlCodec {
+    /// Decode a v4-style unframed envelope (9-byte BE header + body).
+    /// Also used for v5 pre-STARTUP messages.
+    fn decode_v4_envelope(
         &mut self,
         src: &mut BytesMut,
-    ) -> std::result::Result<Option<Self::Item>, Self::Error> {
+    ) -> std::result::Result<Option<CqlFrame>, CqlError> {
         if src.len() < HEADER_SIZE {
             return Ok(None);
         }
@@ -229,18 +268,145 @@ impl Decoder for CqlCodec {
             body_bytes
         };
 
-        // Return header with original flags (compression flag indicates wire state,
-        // but the body we return is already decompressed).
         Ok(Some(CqlFrame { header, body }))
     }
 
-    /// Override default `decode_eof` to silently discard partial frames.
+    /// Decode a v5 framed message.
     ///
-    /// Healthcheck probes (e.g. `echo > /dev/tcp/host/9042`) leave a few
-    /// stray bytes in the buffer when the connection closes.  The default
-    /// tokio_util implementation returns `Err("bytes remaining on stream")`
-    /// for any non-empty buffer on EOF, which floods logs.  Instead, we
-    /// attempt one normal decode and accept `None` (incomplete) as clean EOF.
+    /// v5 frame format (uncompressed):
+    ///   Bytes 0-2: payload_length(17 bits) | isSelfContained(1 bit) | padding(6 bits) — LE
+    ///   Bytes 3-5: CRC24 of bytes 0-2 — LE
+    ///   Bytes 6..6+payload_length: payload (one or more 9-byte envelopes)
+    ///   Last 4 bytes: CRC32 of payload — LE
+    fn decode_v5_frame(
+        &mut self,
+        src: &mut BytesMut,
+    ) -> std::result::Result<Option<CqlFrame>, CqlError> {
+        if src.len() < V5_FRAME_HEADER_SIZE {
+            return Ok(None);
+        }
+
+        // Parse 3-byte header (little-endian).
+        let h0 = src[0] as u32;
+        let h1 = src[1] as u32;
+        let h2 = src[2] as u32;
+        let header_bits = h0 | (h1 << 8) | (h2 << 16);
+        let payload_len = (header_bits & 0x1FFFF) as usize; // bits 0-16
+        let is_self_contained = (header_bits >> 17) & 1 == 1; // bit 17
+
+        // Verify CRC24 of the 3 header bytes.
+        let expected_crc24 = src[3] as u32 | ((src[4] as u32) << 8) | ((src[5] as u32) << 16);
+        let actual_crc24 = crc24(&src[..3]);
+        if expected_crc24 != actual_crc24 {
+            return Err(CqlError::Protocol(format!(
+                "v5 frame header CRC24 mismatch: expected 0x{expected_crc24:06X}, \
+                 got 0x{actual_crc24:06X}"
+            )));
+        }
+
+        let total = V5_FRAME_HEADER_SIZE + payload_len + V5_CRC32_SIZE;
+        if src.len() < total {
+            src.reserve(total - src.len());
+            return Ok(None);
+        }
+
+        // Verify CRC32 of the payload.
+        let payload_start = V5_FRAME_HEADER_SIZE;
+        let payload_end = payload_start + payload_len;
+        let crc32_start = payload_end;
+        let expected_crc32 = u32::from_le_bytes([
+            src[crc32_start],
+            src[crc32_start + 1],
+            src[crc32_start + 2],
+            src[crc32_start + 3],
+        ]);
+        let actual_crc32 = crc32_castagnoli(&src[payload_start..payload_end]);
+        if expected_crc32 != actual_crc32 {
+            return Err(CqlError::Protocol(format!(
+                "v5 frame payload CRC32 mismatch: expected 0x{expected_crc32:08X}, \
+                 got 0x{actual_crc32:08X}"
+            )));
+        }
+
+        // Extract payload.
+        src.advance(V5_FRAME_HEADER_SIZE);
+        let payload = src.split_to(payload_len);
+        src.advance(V5_CRC32_SIZE); // skip CRC32
+
+        if !is_self_contained {
+            // Segmented message — accumulate and wait for final segment.
+            self.v5_segment_buf.extend_from_slice(&payload);
+            return Ok(None);
+        }
+
+        // Complete message — combine with any buffered segments.
+        let envelope_data = if self.v5_segment_buf.is_empty() {
+            payload.freeze()
+        } else {
+            self.v5_segment_buf.extend_from_slice(&payload);
+            self.v5_segment_buf.split().freeze()
+        };
+
+        // The payload contains a standard 9-byte envelope header + body.
+        if envelope_data.len() < HEADER_SIZE {
+            return Err(CqlError::Protocol(
+                "v5 frame payload too short for envelope header".into(),
+            ));
+        }
+        let header = FrameHeader::decode(&envelope_data[..HEADER_SIZE])?;
+        let body = envelope_data.slice(HEADER_SIZE..);
+
+        // Decompress if needed.
+        let body = if header.flags & COMPRESSION_FLAG != 0 {
+            match self.compression {
+                Some(Compression::Lz4) => Bytes::from(decompress_lz4(&body)?),
+                Some(Compression::Snappy) => Bytes::from(decompress_snappy(&body)?),
+                None => {
+                    return Err(CqlError::Protocol(
+                        "received compressed frame but no compression negotiated".into(),
+                    ));
+                }
+            }
+        } else {
+            body
+        };
+
+        Ok(Some(CqlFrame { header, body }))
+    }
+}
+
+impl Decoder for CqlCodec {
+    type Item = CqlFrame;
+    type Error = CqlError;
+
+    fn decode(
+        &mut self,
+        src: &mut BytesMut,
+    ) -> std::result::Result<Option<Self::Item>, Self::Error> {
+        // Reject unsupported request protocol versions.
+        // Valid request versions: 0x03 (v3), 0x04 (v4), 0x05 (v5).
+        // Only explicitly reject 0x06/0x07 (future versions we don't support).
+        // Garbage bytes (healthcheck probes, etc.) fall through to the header
+        // parser which will reject them via unknown opcode.
+        if src.len() >= HEADER_SIZE && !self.v5_framed {
+            let version_byte = src[0];
+            if version_byte == 0x06 || version_byte == 0x07 {
+                src.clear();
+                return Err(CqlError::ProtocolVersionMismatch {
+                    requested: version_byte,
+                    supported: 0x05,
+                });
+            }
+        }
+
+        if self.v5_framed {
+            self.decode_v5_frame(src)
+        } else {
+            self.decode_v4_envelope(src)
+        }
+    }
+
+    /// Override default `decode_eof` to silently discard partial frames.
     fn decode_eof(
         &mut self,
         buf: &mut BytesMut,
@@ -248,7 +414,6 @@ impl Decoder for CqlCodec {
         match self.decode(buf)? {
             Some(frame) => Ok(Some(frame)),
             None => {
-                // Discard any trailing bytes — they're an incomplete frame.
                 buf.clear();
                 Ok(None)
             }
@@ -271,7 +436,6 @@ impl Encoder<CqlFrame> for CqlCodec {
                 Compression::Lz4 => compress_lz4(&item.body),
                 Compression::Snappy => compress_snappy(&item.body),
             };
-            // Only use compression if it actually reduces size.
             if compressed.len() < item.body.len() {
                 (compressed, header.flags | COMPRESSION_FLAG)
             } else {
@@ -283,9 +447,16 @@ impl Encoder<CqlFrame> for CqlCodec {
 
         header.length = body.len() as u32;
         header.flags = flags;
-        dst.reserve(HEADER_SIZE + body.len());
-        header.encode(dst);
-        dst.put_slice(&body);
+
+        if self.v5_framed {
+            // v5: wrap envelope in a frame with CRC24/CRC32.
+            encode_v5_frame(&header, &body, dst);
+        } else {
+            // v4 / pre-STARTUP: raw 9-byte envelope header + body.
+            dst.reserve(HEADER_SIZE + body.len());
+            header.encode(dst);
+            dst.put_slice(&body);
+        }
         Ok(())
     }
 }
@@ -334,6 +505,87 @@ fn decompress_snappy(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
             format!("Snappy decompression failed: {e}"),
         )
     })
+}
+
+// ── CQL v5 CRC functions ────────────────────────────────────────────────
+
+/// CRC24 used by CQL v5 frame headers (polynomial 0x875060).
+///
+/// Cassandra uses the CRC-24 variant defined in the native protocol v5 spec.
+/// The polynomial is 0x875060, initial value 0x875060, no final XOR.
+/// Public CRC24 for test use.
+pub fn crc24_public(data: &[u8]) -> u32 {
+    crc24(data)
+}
+
+/// Public CRC32 for test use.
+pub fn crc32_public(data: &[u8]) -> u32 {
+    crc32_castagnoli(data)
+}
+
+fn crc24(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0x87_5060;
+    for &byte in data {
+        crc ^= (byte as u32) << 16;
+        for _ in 0..8 {
+            crc <<= 1;
+            if crc & 0x100_0000 != 0 {
+                crc ^= 0x87_5060;
+            }
+        }
+    }
+    crc & 0xFF_FFFF
+}
+
+/// CRC32-C (Castagnoli) used by CQL v5 frame payload checksums.
+fn crc32_castagnoli(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0x82F6_3B78; // Castagnoli polynomial (reflected)
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// Encode a v5 frame around an envelope (header + body).
+///
+/// Produces: [3-byte LE header][3-byte CRC24][payload][4-byte CRC32]
+/// where payload = 9-byte envelope header + envelope body.
+pub fn encode_v5_frame(envelope_header: &FrameHeader, body: &[u8], dst: &mut BytesMut) {
+    // Build the envelope (9-byte header + body) as the frame payload.
+    let payload_len = HEADER_SIZE + body.len();
+    assert!(payload_len <= V5_MAX_PAYLOAD, "v5 frame payload too large");
+
+    // 3-byte header: payload_length(17 bits) | isSelfContained(1 bit) | padding(6 bits)
+    let header_bits: u32 = (payload_len as u32) | (1 << 17); // isSelfContained=1
+    let h_bytes = header_bits.to_le_bytes(); // [b0, b1, b2, _]
+
+    // CRC24 of the 3 header bytes.
+    let crc24_val = crc24(&h_bytes[..3]);
+    let crc24_bytes = crc24_val.to_le_bytes();
+
+    // Reserve space for header(6) + payload + CRC32(4)
+    dst.reserve(V5_FRAME_HEADER_SIZE + payload_len + V5_CRC32_SIZE);
+
+    // Write frame header (3 bytes) + CRC24 (3 bytes)
+    dst.put_slice(&h_bytes[..3]);
+    dst.put_slice(&crc24_bytes[..3]);
+
+    // Write envelope (9-byte header + body) = payload
+    let payload_start = dst.len();
+    envelope_header.encode(dst);
+    dst.put_slice(body);
+    let payload_end = dst.len();
+
+    // CRC32 of the payload
+    let crc32_val = crc32_castagnoli(&dst[payload_start..payload_end]);
+    dst.put_u32_le(crc32_val);
 }
 
 #[cfg(test)]
@@ -422,7 +674,7 @@ mod tests {
         let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
         let mut buf = BytesMut::new();
         let header = FrameHeader {
-            version: VERSION_REQUEST,
+            version: 0x04, // v4 request — v5 uses different envelope
             flags: 0,
             stream_id: 1,
             opcode: Opcode::Startup,
@@ -438,7 +690,7 @@ mod tests {
     #[test]
     fn codec_decode_incomplete_header() {
         let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
-        let mut buf = BytesMut::from(&[0x05, 0x00, 0x00][..]);
+        let mut buf = BytesMut::from(&[0x04, 0x00, 0x00][..]);
         assert!(codec.decode(&mut buf).unwrap().is_none());
     }
 
@@ -447,7 +699,7 @@ mod tests {
         let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
         let mut buf = BytesMut::new();
         let header = FrameHeader {
-            version: VERSION_REQUEST,
+            version: 0x04,
             flags: 0,
             stream_id: 0,
             opcode: Opcode::Query,
@@ -463,7 +715,7 @@ mod tests {
         let mut codec = CqlCodec::new(1024);
         let mut buf = BytesMut::new();
         let header = FrameHeader {
-            version: VERSION_REQUEST,
+            version: 0x04,
             flags: 0,
             stream_id: 0,
             opcode: Opcode::Query,
@@ -781,13 +1033,50 @@ mod tests {
     }
 
     #[test]
+    fn codec_accepts_v5_startup_envelope() {
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        // v5 STARTUP uses the same 9-byte envelope format as v4 (pre-framing).
+        let mut buf = BytesMut::new();
+        let header = FrameHeader {
+            version: 0x05,
+            flags: 0,
+            stream_id: 0,
+            opcode: Opcode::Startup,
+            length: 0,
+        };
+        header.encode(&mut buf);
+        let result = codec.decode(&mut buf).unwrap();
+        assert!(result.is_some(), "v5 STARTUP should be accepted");
+        assert_eq!(result.unwrap().header.version, 0x05);
+    }
+
+    #[test]
+    fn codec_rejects_v6_request() {
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        let mut buf = BytesMut::from(&[0x06, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00][..]);
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err(), "v6 frames should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CqlError::ProtocolVersionMismatch {
+                    requested: 6,
+                    supported: 5
+                }
+            ),
+            "should be ProtocolVersionMismatch, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_decoder_rejects_compressed_frame_without_negotiation() {
         // Manually encode a frame with the COMPRESSION_FLAG set but no
         // compression configured on the decoder.
         let body = compress_lz4(b"test data");
         let mut buf = BytesMut::new();
         let header = FrameHeader {
-            version: VERSION_REQUEST,
+            version: 0x04,
             flags: COMPRESSION_FLAG,
             stream_id: 1,
             opcode: Opcode::Query,

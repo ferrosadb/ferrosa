@@ -8,12 +8,20 @@
 //! on the batchlog replicas will detect the stale entry and replay the
 //! mutations.
 
+use std::sync::Arc;
+
+use futures::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use ferrosa_storage::batchlog::BatchlogEntry;
 use ferrosa_storage::Mutation;
 
 use super::ClusterCoordinator;
+
+/// Maximum concurrent mutations within a single batch. Lower than the global
+/// write semaphore (128) to prevent one large batch from consuming all capacity.
+const BATCH_CONCURRENCY: usize = 32;
 
 impl ClusterCoordinator {
     /// Coordinate a logged batch across the cluster.
@@ -45,21 +53,37 @@ impl ClusterCoordinator {
         // Phase 1: Write to batchlog.
         self.write_batchlog(&entry).await?;
 
-        // Phase 2: Fan out mutations.
-        let mut result = Ok(());
+        // Phase 2: Fan out mutations with bounded concurrency. Using
+        // FuturesUnordered + Semaphore instead of sequential await prevents
+        // a large batch from blocking the coordinator for the full serial
+        // duration, while the semaphore cap prevents one batch from consuming
+        // all write capacity.
+        let sem = Arc::new(Semaphore::new(BATCH_CONCURRENCY));
+        let mut futs = FuturesUnordered::new();
+
         for m in &mutations {
             let table_id = ferrosa_storage::TableId::new(&m.keyspace, &m.table);
             for row in &m.rows {
-                if let Err(e) = self
-                    .coordinate_write(&table_id, &m.key, row.clone(), m.timestamp)
-                    .await
-                {
-                    result = Err(e);
-                    break;
-                }
+                let permit = sem.clone().acquire_owned().await.map_err(|_| {
+                    crate::error::ClusterError::Internal("batch semaphore closed".to_string())
+                })?;
+                let key = m.key.clone();
+                let row = row.clone();
+                let ts = m.timestamp;
+                let tid = table_id.clone();
+                futs.push(async move {
+                    let result = self.coordinate_write(&tid, &key, row, ts).await;
+                    drop(permit);
+                    result
+                });
             }
-            if result.is_err() {
-                break;
+        }
+
+        let mut result = Ok(());
+        while let Some(res) = futs.next().await {
+            if let Err(e) = res {
+                result = Err(e);
+                // Don't break — let in-flight futures complete to avoid cancel-safety issues.
             }
         }
 
@@ -149,8 +173,6 @@ impl ClusterCoordinator {
 // ---------------------------------------------------------------------------
 // RPC Handlers for batchlog messages
 // ---------------------------------------------------------------------------
-
-use std::sync::Arc;
 
 use bytes::Bytes;
 

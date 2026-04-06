@@ -81,6 +81,13 @@ impl CqlClient {
             )));
         }
 
+        // The server enables v5 framing after READY when the client sends
+        // VERSION_REQUEST (0x05). The client must also switch to v5 framed
+        // mode so subsequent messages are wrapped in CRC-protected frames.
+        if ready {
+            framed.codec_mut().enable_v5_framing();
+        }
+
         Ok(Self {
             framed,
             stream_counter: 1,
@@ -94,15 +101,25 @@ impl CqlClient {
     }
 
     /// Execute a CQL query and return the result.
+    /// Execute a query at CL ONE (default for most operations).
     pub async fn query(&mut self, cql: &str) -> Result<QueryResult, CqlError> {
+        self.query_with_cl(cql, 1).await // 1 = ONE
+    }
+
+    /// Execute a query at CL QUORUM.
+    pub async fn query_quorum(&mut self, cql: &str) -> Result<QueryResult, CqlError> {
+        self.query_with_cl(cql, 4).await // 4 = QUORUM
+    }
+
+    /// Execute a query with an explicit consistency level (CQL wire u16).
+    async fn query_with_cl(&mut self, cql: &str, cl: u16) -> Result<QueryResult, CqlError> {
         let stream_id = self.next_stream_id();
 
         // Build QUERY frame body: long-string query + minimal parameters.
         let mut body = BytesMut::new();
         body.put_i32(cql.len() as i32);
         body.put_slice(cql.as_bytes());
-        // Query parameters: consistency ONE, no flags.
-        body.put_u16(1); // consistency: ONE
+        body.put_u16(cl); // consistency level
         body.put_u8(0); // flags: none
 
         let frame = CqlFrame {

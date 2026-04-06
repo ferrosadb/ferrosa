@@ -63,6 +63,16 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         rf: usize,
     ) -> crate::error::Result<()> {
+        // Acquire a write permit — limits concurrent in-flight writes to prevent
+        // tokio runtime saturation that would starve Raft heartbeat processing.
+        let _permit = self.write_semaphore.acquire().await.map_err(|_| {
+            crate::error::ClusterError::Unavailable {
+                consistency: cl.to_string(),
+                required: 0,
+                alive: 0,
+            }
+        })?;
+
         let ring = self.ring.load();
         let replicas = ring.replicas(key.token.0, rf);
         let required = cl.block_for(rf);
@@ -222,6 +232,15 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
     ) -> crate::error::Result<()> {
+        // Acquire a write permit — see coordinate_write_with for rationale.
+        let _permit = self.write_semaphore.acquire().await.map_err(|_| {
+            crate::error::ClusterError::Unavailable {
+                consistency: cl.to_string(),
+                required: 0,
+                alive: 0,
+            }
+        })?;
+
         let ring = self.ring.load();
         let replicas = ring.replicas_for_strategy(key.token.0, strategy);
 

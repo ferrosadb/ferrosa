@@ -51,10 +51,12 @@ graph TD
 ```
 
 **Dual export architecture:**
+
 - **Always:** Self-hosted `FerrosaTelemetryLayer` writes to ferrosa via CQL. No external deps. UI in `ferrosa-dbaas`.
 - **Optional (enterprise):** When `FERROSA_OTEL_ENDPOINT` is set, an additional `tracing-opentelemetry` layer exports spans via OTLP gRPC to the customer's existing observability stack (Jaeger, Datadog, Grafana Tempo, etc.). Both layers run concurrently — self-hosted telemetry is always available, OTLP is additive.
 
 **Crate additions:**
+
 - Custom `tracing::Layer` (`FerrosaTelemetryLayer`) — batches spans, writes via `CqlClient`
 - `tracing-opentelemetry` + `opentelemetry` + `opentelemetry-otlp` + `opentelemetry_sdk` — behind `otel` feature flag, only compiled when enterprise OTLP export is needed
 
@@ -96,6 +98,7 @@ CREATE TABLE system_observability.slow_queries (
 ```
 
 **Configuration (env vars):**
+
 - `FERROSA_TELEMETRY_ENDPOINT` — CQL endpoint for telemetry writes (default: `127.0.0.1:9042` — self)
 - `FERROSA_TELEMETRY_SAMPLE_RATE` — sampling ratio 0.0-1.0 (default: 1.0 in dev, 0.01 in prod)
 - `FERROSA_TELEMETRY_ENABLED` — master switch (default: true)
@@ -288,13 +291,13 @@ graph LR
     PH["partition_hotspots<br/>hot partition detection"]
     FS["full_scan_reasons<br/>missing index identification"]
     TA["table_access_summary<br/>read/write ratio"]
-    
+
     QF --> Advisor["ferrosa-dbaas<br/>Optimization Advisor"]
     CA --> Advisor
     PH --> Advisor
     FS --> Advisor
     TA --> Advisor
-    
+
     Advisor --> IDX["CREATE INDEX<br/>recommendations"]
     Advisor --> MV["Materialized View<br/>/ query alias candidates"]
     Advisor --> CS["Compaction Strategy<br/>recommendations"]
@@ -346,6 +349,7 @@ captures for N seconds, removes the layer, and returns an SVG flame chart.
 - Only one profile at a time (mutex-guarded)
 
 **Crate additions:**
+
 - `tracing-flame` — folded stack capture (only used during profiling window)
 - `inferno` — flamegraph SVG rendering
 
@@ -377,6 +381,7 @@ Per CMU-PDL-14-102 Section 4, use hybrid fixed-width metadata:
 3. **Across nodes (CQL):** Extract trace flag from CQL v5 custom payload (driver-initiated tracing)
 
 The internode propagation requires a wire format change:
+
 - Add `trace_context: [u8; 32]` to the codec frame (REQUIRED, not optional)
 - Layout: 16-byte trace_id + 8-byte span_id + 8-byte flags
 - All-zero = no active trace (equivalent to unsampled)

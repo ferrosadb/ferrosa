@@ -147,6 +147,123 @@ async fn get_billing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use ferrosa_cluster::ModeController;
+    use ferrosa_common::CellValue;
+    use ferrosa_net::rpc::HandlerRegistry;
+    use ferrosa_schema::{
+        RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow, VirtualTable,
+    };
+    use ferrosa_storage::commitlog::CommitLogConfig;
+    use ferrosa_storage::compaction::CompactionConfig;
+    use ferrosa_storage::{StorageEngine, StorageEngineConfig};
+    use tower::ServiceExt;
+
+    use crate::web::{build_router, WebAppState};
+
+    // -----------------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------------
+
+    /// Named stub virtual table for registering with a specific table name.
+    struct NamedStubTable {
+        table_name: &'static str,
+        rows: Vec<VirtualRow>,
+    }
+
+    impl NamedStubTable {
+        fn empty(table_name: &'static str) -> Self {
+            Self {
+                table_name,
+                rows: vec![],
+            }
+        }
+
+        fn with_rows(table_name: &'static str, rows: Vec<VirtualRow>) -> Self {
+            Self { table_name, rows }
+        }
+    }
+
+    impl VirtualTable for NamedStubTable {
+        fn name(&self) -> &str {
+            self.table_name
+        }
+        fn keyspace(&self) -> &str {
+            "system_observability"
+        }
+        fn columns(&self) -> &[VirtualColumnDef] {
+            &[]
+        }
+        fn primary_key_columns(&self) -> &[usize] {
+            &[]
+        }
+        fn read(&self, _: Option<&RowPredicate>) -> Vec<VirtualRow> {
+            self.rows.clone()
+        }
+        fn subscription_mode(&self) -> SubscriptionMode {
+            SubscriptionMode::Pollable
+        }
+    }
+
+    /// Build a minimal `WebAppState` with a given virtual table registry.
+    fn make_state_with_registry(registry: Arc<VirtualTableRegistry>) -> WebAppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                log_dir: dir.path().join("commitlog"),
+                checkpoint_dir: dir.path().join("commitlog"),
+                archive: None,
+                ..CommitLogConfig::default()
+            },
+            compaction: CompactionConfig::from_env(dir.path().join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            flush_threshold_bytes: 4096,
+            flush_max_age_secs: 5,
+            data_dir: dir.path().to_path_buf(),
+        };
+        let storage = Arc::new(StorageEngine::new(storage_config, None).expect("storage engine"));
+        let rpc_registry = Arc::new(HandlerRegistry::new());
+        let schema = Arc::new(
+            ferrosa_schema::Schema::new(ferrosa_schema::SchemaConfig {
+                hasher: ferrosa_schema::PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+                auth_method: ferrosa_schema::AuthMethod::Password,
+                rate_limit: ferrosa_schema::RateLimitConfig::default(),
+                audit_sink: Box::new(ferrosa_schema::TestAuditSink::new()),
+                secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+                mode: ferrosa_schema::DeploymentMode::Development,
+            })
+            .expect("test schema"),
+        );
+        let host_id = uuid::Uuid::new_v4();
+        let (mc, _handles) = ModeController::new(
+            Arc::new(ferrosa_cluster::ClusterConfig::default()),
+            Arc::new(ferrosa_net::config::NetConfig::default()),
+            host_id,
+            storage.clone(),
+            schema.clone(),
+            rpc_registry,
+        );
+        WebAppState {
+            registry,
+            mode_controller: mc,
+            schema,
+            storage,
+            host_id,
+            auth_disabled: true,
+            debug: None,
+        }
+    }
+
+    fn make_state() -> WebAppState {
+        make_state_with_registry(Arc::new(VirtualTableRegistry::new()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry-level tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn cql_stats_returns_empty_when_no_tables_registered() {
@@ -155,5 +272,453 @@ mod tests {
         assert!(registry
             .get("system_observability", "active_queries")
             .is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Route-level tests — GET /api/observability/cql
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_cql_stats_returns_200_with_empty_registry() {
+        let state = make_state();
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/cql")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // With no tables registered, the result should be an empty object.
+        assert!(parsed.is_object(), "response should be a JSON object");
+    }
+
+    #[tokio::test]
+    async fn get_cql_stats_includes_active_queries_when_registered() {
+        let registry = Arc::new(VirtualTableRegistry::new());
+        // Register active_queries with a row containing 5+ cells.
+        let query_id_bytes = 42i64.to_be_bytes().to_vec();
+        let row = VirtualRow {
+            cells: vec![
+                CellValue::live(query_id_bytes, 1),              // query_id
+                CellValue::live(b"192.168.1.1".to_vec(), 1),     // client_address
+                CellValue::live(b"admin".to_vec(), 1),           // username
+                CellValue::live(b"SELECT * FROM t".to_vec(), 1), // query_text
+                CellValue::live(b"my_keyspace".to_vec(), 1),     // keyspace
+            ],
+        };
+        registry.register(Arc::new(NamedStubTable::with_rows(
+            "active_queries",
+            vec![row],
+        )));
+
+        let state = make_state_with_registry(registry);
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/cql")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let queries = parsed["active_queries"]
+            .as_array()
+            .expect("active_queries array");
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0]["query_id"], 42);
+        assert_eq!(queries[0]["client_address"], "192.168.1.1");
+        assert_eq!(queries[0]["username"], "admin");
+        assert_eq!(queries[0]["query_text"], "SELECT * FROM t");
+        assert_eq!(queries[0]["keyspace"], "my_keyspace");
+    }
+
+    #[tokio::test]
+    async fn get_cql_stats_includes_connection_count() {
+        let registry = Arc::new(VirtualTableRegistry::new());
+        // Register connections table with 3 rows.
+        let rows = vec![
+            VirtualRow { cells: vec![] },
+            VirtualRow { cells: vec![] },
+            VirtualRow { cells: vec![] },
+        ];
+        registry.register(Arc::new(NamedStubTable::with_rows("connections", rows)));
+
+        let state = make_state_with_registry(registry);
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/cql")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["connection_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn get_cql_stats_endpoint_is_routable() {
+        let state = make_state();
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/cql")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GET /api/observability/cql must not return 404"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Route-level tests — GET /api/observability/alerts
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_alerts_returns_200_with_empty_registry() {
+        let state = make_state();
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/alerts")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let alerts = parsed["alerts"].as_array().expect("alerts array");
+        assert!(
+            alerts.is_empty(),
+            "alerts should be empty with no registry data"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_alerts_includes_alert_data_when_registered() {
+        let registry = Arc::new(VirtualTableRegistry::new());
+        let row = VirtualRow {
+            cells: vec![
+                CellValue::live(b"HighLatency".to_vec(), 1), // name
+                CellValue::live(b"warning".to_vec(), 1),     // severity
+                CellValue::live(b"p99 > 500ms".to_vec(), 1), // message
+                CellValue::live(b"2026-04-03T10:00:00Z".to_vec(), 1), // triggered_at
+            ],
+        };
+        registry.register(Arc::new(NamedStubTable::with_rows("alerts", vec![row])));
+
+        let state = make_state_with_registry(registry);
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/alerts")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let alerts = parsed["alerts"].as_array().expect("alerts array");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0]["name"], "HighLatency");
+        assert_eq!(alerts[0]["severity"], "warning");
+        assert_eq!(alerts[0]["message"], "p99 > 500ms");
+        assert_eq!(alerts[0]["triggered_at"], "2026-04-03T10:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn get_alerts_endpoint_is_routable() {
+        let state = make_state();
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/alerts")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GET /api/observability/alerts must not return 404"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Route-level tests — GET /api/observability/query_fingerprints
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_query_fingerprints_returns_200_with_empty_registry() {
+        let state = make_state();
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/query_fingerprints")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["fingerprints"], 0);
+    }
+
+    #[tokio::test]
+    async fn get_query_fingerprints_counts_rows() {
+        let registry = Arc::new(VirtualTableRegistry::new());
+        let rows = vec![VirtualRow { cells: vec![] }, VirtualRow { cells: vec![] }];
+        registry.register(Arc::new(NamedStubTable::with_rows(
+            "query_fingerprints",
+            rows,
+        )));
+
+        let state = make_state_with_registry(registry);
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/query_fingerprints")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["fingerprints"], 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Route-level tests — GET /api/observability/table_access
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_table_access_returns_200_with_empty_registry() {
+        let state = make_state();
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/table_access")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["tables"], 0);
+    }
+
+    #[tokio::test]
+    async fn get_table_access_counts_rows() {
+        let registry = Arc::new(VirtualTableRegistry::new());
+        let rows = vec![VirtualRow { cells: vec![] }];
+        registry.register(Arc::new(NamedStubTable::with_rows(
+            "table_access_summary",
+            rows,
+        )));
+
+        let state = make_state_with_registry(registry);
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/table_access")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["tables"], 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Route-level tests — GET /api/observability/full_scan_reasons
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_full_scan_reasons_returns_200_with_empty_registry() {
+        let state = make_state();
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/full_scan_reasons")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["full_scans"], 0);
+    }
+
+    #[tokio::test]
+    async fn get_full_scan_reasons_counts_rows() {
+        let registry = Arc::new(VirtualTableRegistry::new());
+        let rows = vec![
+            VirtualRow { cells: vec![] },
+            VirtualRow { cells: vec![] },
+            VirtualRow { cells: vec![] },
+            VirtualRow { cells: vec![] },
+        ];
+        registry.register(Arc::new(NamedStubTable::with_rows(
+            "full_scan_reasons",
+            rows,
+        )));
+
+        let state = make_state_with_registry(registry);
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/full_scan_reasons")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["full_scans"], 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Route-level tests — GET /api/observability/billing
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_billing_returns_200_with_empty_registry() {
+        let state = make_state();
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/billing")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["meters"], 0);
+    }
+
+    #[tokio::test]
+    async fn get_billing_counts_rows() {
+        let registry = Arc::new(VirtualTableRegistry::new());
+        let rows = vec![VirtualRow { cells: vec![] }, VirtualRow { cells: vec![] }];
+        registry.register(Arc::new(NamedStubTable::with_rows("billing_meters", rows)));
+
+        let state = make_state_with_registry(registry);
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/billing")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["meters"], 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // All observability endpoints are routable (regression gate)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn all_observability_endpoints_are_routable() {
+        let endpoints = vec![
+            "/api/observability/cql",
+            "/api/observability/alerts",
+            "/api/observability/query_fingerprints",
+            "/api/observability/table_access",
+            "/api/observability/full_scan_reasons",
+            "/api/observability/billing",
+        ];
+
+        for uri in endpoints {
+            let state = make_state();
+            let router = build_router(state);
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "GET {uri} must not return 404"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Response format validation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn all_observability_endpoints_return_valid_json() {
+        let endpoints = vec![
+            "/api/observability/cql",
+            "/api/observability/alerts",
+            "/api/observability/query_fingerprints",
+            "/api/observability/table_access",
+            "/api/observability/full_scan_reasons",
+            "/api/observability/billing",
+        ];
+
+        for uri in endpoints {
+            let state = make_state();
+            let router = build_router(state);
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&body);
+            assert!(
+                parsed.is_ok(),
+                "GET {uri} must return valid JSON, got: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_cql_stats_with_active_queries_no_connections_omits_connection_count() {
+        let registry = Arc::new(VirtualTableRegistry::new());
+        // Register only active_queries, no connections table.
+        registry.register(Arc::new(NamedStubTable::empty("active_queries")));
+
+        let state = make_state_with_registry(registry);
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/observability/cql")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // active_queries should be present (empty array), connection_count absent.
+        assert!(parsed["active_queries"].is_array());
+        assert!(
+            parsed.get("connection_count").is_none(),
+            "connection_count should not be present when connections table is unregistered"
+        );
     }
 }

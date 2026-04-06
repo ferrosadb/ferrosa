@@ -830,4 +830,274 @@ mod tests {
         let parts: Vec<&str> = s.split('T').collect();
         assert_eq!(parts.len(), 2);
     }
+
+    // ---- Additional format_iso8601 / is_leap_year tests ----------------------
+
+    #[test]
+    fn format_iso8601_leap_year_feb_29() {
+        // 2024-02-29 00:00:00 UTC = day 60 of 2024 (leap year).
+        // Days from epoch to 2024-01-01: 19723 days.
+        // 2024-02-29 = 19723 + 59 = 19782 days * 86400 = 1709164800.
+        let s = format_iso8601(1_709_164_800);
+        assert!(s.starts_with("2024-02-29"), "expected 2024-02-29, got {s}");
+        assert!(s.ends_with('Z'));
+    }
+
+    #[test]
+    fn format_iso8601_end_of_year() {
+        // 2023-12-31 23:59:59 UTC = 1704067199 seconds.
+        let s = format_iso8601(1_704_067_199);
+        assert!(s.starts_with("2023-12-31"), "expected 2023-12-31, got {s}");
+        assert!(s.ends_with("23:59:59Z"), "expected time 23:59:59Z, got {s}");
+    }
+
+    #[test]
+    fn format_iso8601_start_of_2000() {
+        // 2000-01-01 00:00:00 UTC = 946684800.
+        let s = format_iso8601(946_684_800);
+        assert_eq!(s, "2000-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn is_leap_year_divisible_by_400() {
+        assert!(is_leap_year(2000), "2000 is a leap year (divisible by 400)");
+    }
+
+    #[test]
+    fn is_leap_year_divisible_by_100_not_400() {
+        assert!(
+            !is_leap_year(1900),
+            "1900 is NOT a leap year (div by 100 but not 400)"
+        );
+    }
+
+    #[test]
+    fn is_leap_year_standard_leap() {
+        assert!(is_leap_year(2024), "2024 is a leap year");
+    }
+
+    #[test]
+    fn is_leap_year_non_leap() {
+        assert!(!is_leap_year(2023), "2023 is not a leap year");
+    }
+
+    // ---- POST /api/restore/preflight missing body ----------------------------
+
+    #[tokio::test]
+    async fn restore_preflight_rejects_missing_body() {
+        let state = make_state_no_s3();
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/restore/preflight")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // Missing required `snapshot` field — axum returns 422 before handler runs.
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // ---- Verify 503 response bodies contain error key ------------------------
+
+    #[tokio::test]
+    async fn create_snapshot_503_body_has_error() {
+        let state = make_state_no_s3();
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/snapshots")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"test-snap"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"], "S3 not configured");
+    }
+
+    #[tokio::test]
+    async fn delete_snapshot_503_body_has_error() {
+        let state = make_state_no_s3();
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/snapshots/my-snap")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"], "S3 not configured");
+    }
+
+    #[tokio::test]
+    async fn restore_preflight_503_body_has_error() {
+        let state = make_state_no_s3();
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/restore/preflight")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"snapshot":"snap1"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"], "S3 not configured");
+    }
+
+    #[tokio::test]
+    async fn trigger_restore_503_body_has_error() {
+        let state = make_state_no_s3();
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/restore")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"snapshot":"snap1"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"], "S3 not configured");
+    }
+
+    // ---- archive_status body field verification ------------------------------
+
+    #[tokio::test]
+    async fn archive_status_no_s3_has_all_fields() {
+        let state = make_state_no_s3();
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/api/archive_status")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["unarchived_segments"], 0);
+        assert_eq!(parsed["oldest_unarchived_age_secs"], 0);
+        assert_eq!(parsed["last_archive_success"], "");
+        assert_eq!(parsed["archive_errors_total"], 0);
+        assert_eq!(parsed["s3_configured"], false);
+    }
+
+    // ---- Missing content-type ------------------------------------------------
+
+    #[tokio::test]
+    async fn create_snapshot_rejects_no_content_type() {
+        let state = make_state_no_s3();
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/snapshots")
+            // No content-type header.
+            .body(Body::from(r#"{"name":"test-snap"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // axum rejects when content-type is missing for Json extractor (415).
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn trigger_restore_rejects_no_content_type() {
+        let state = make_state_no_s3();
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/restore")
+            // No content-type header.
+            .body(Body::from(r#"{"snapshot":"snap1"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn restore_preflight_rejects_no_content_type() {
+        let state = make_state_no_s3();
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/restore/preflight")
+            // No content-type header.
+            .body(Body::from(r#"{"snapshot":"snap1"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // ---- ttl_hours_to_expires_at additional coverage --------------------------
+
+    #[test]
+    fn ttl_positive_generates_future_timestamp() {
+        let result = ttl_hours_to_expires_at(Some(1)).unwrap();
+        // The result should represent a time at least 1 hour from now.
+        // Since we can't pin SystemTime, just validate format.
+        assert!(result.ends_with('Z'));
+        assert!(result.contains('T'));
+        // Year should be >= 2024 (test won't be run before that).
+        let year: u32 = result[..4].parse().expect("first 4 chars are year");
+        assert!(
+            year >= 2024,
+            "expiry year should be current or future: {result}"
+        );
+    }
+
+    #[test]
+    fn ttl_large_value_does_not_panic() {
+        // 8760 hours = ~1 year. Should not overflow.
+        let result = ttl_hours_to_expires_at(Some(8760));
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.ends_with('Z'));
+    }
+
+    // ---- Malformed JSON body -------------------------------------------------
+
+    #[tokio::test]
+    async fn create_snapshot_rejects_malformed_json() {
+        let state = make_state_no_s3();
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/snapshots")
+            .header("content-type", "application/json")
+            .body(Body::from("not json at all"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // axum returns 400 Bad Request for unparsable JSON.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trigger_restore_rejects_malformed_json() {
+        let state = make_state_no_s3();
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/restore")
+            .header("content-type", "application/json")
+            .body(Body::from("{invalid"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // axum returns 400 Bad Request for unparsable JSON.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }
