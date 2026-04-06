@@ -2675,19 +2675,23 @@ impl StorageEngine {
             Err(_) => crate::manifest::Manifest::new(),
         };
 
-        let tables = self.tables.read();
-        for (table_id, _state) in tables.iter() {
-            let table_dir = self
-                .config
-                .data_dir
-                .join("sstables")
-                .join(table_id.to_string());
+        // Collect table info under the lock, then drop it before async work.
+        let table_dirs: Vec<(String, std::path::PathBuf)> = {
+            let tables = self.tables.read();
+            tables
+                .keys()
+                .map(|tid| {
+                    let dir = self.config.data_dir.join("sstables").join(tid.to_string());
+                    (tid.to_string(), dir)
+                })
+                .collect()
+        };
+
+        for (table_id_str, table_dir) in &table_dirs {
             if !table_dir.exists() {
                 continue;
             }
-
-            // Scan for Data.db files to find all generation numbers.
-            let generations: Vec<u64> = std::fs::read_dir(&table_dir)
+            let generations: Vec<u64> = std::fs::read_dir(table_dir)
                 .into_iter()
                 .flatten()
                 .filter_map(|e| e.ok())
@@ -2701,27 +2705,20 @@ impl StorageEngine {
                 })
                 .collect();
 
-            let table_id_str = table_id.to_string();
-
             for gen in generations {
                 let gen_str = gen.to_string();
                 let hex = crate::upload::manager::hex_prefix_for(&gen_str);
-
-                // Check if this generation is already in the manifest.
                 if manifest
                     .sstables
-                    .get(&table_id_str)
+                    .get(table_id_str.as_str())
                     .is_some_and(|entries| entries.iter().any(|e| e.id == gen_str))
                 {
                     continue;
                 }
-
-                // Add manifest entry.
                 let data_path = table_dir.join(format!("{gen}-Data.db"));
                 let size = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
-
                 manifest.add_sstable(
-                    &table_id_str,
+                    table_id_str,
                     crate::manifest::ManifestEntry {
                         id: gen_str.clone(),
                         size,
@@ -2731,8 +2728,6 @@ impl StorageEngine {
                         max_timestamp: i64::MAX,
                     },
                 );
-
-                // Upload actual SSTable component files to S3 so restore can download them.
                 let components = [
                     "Data.db",
                     "Partitions.db",
@@ -2756,18 +2751,18 @@ impl StorageEngine {
                 }
             }
         }
-        drop(tables);
 
         manifest
             .save_with_retry(store.as_ref(), prefix)
             .await
             .unwrap();
 
-        // Also update the schema snapshot in S3.
-        let tables_guard = self.tables.read();
-        let schemas: Vec<&TableSchema> = tables_guard.values().map(|s| &s.schema).collect();
-        let schema_json = serde_json::to_vec_pretty(&schemas).unwrap_or_default();
-        drop(tables_guard);
+        // Schema snapshot — collect under lock, drop before await.
+        let schema_json = {
+            let tables = self.tables.read();
+            let schemas: Vec<&TableSchema> = tables.values().map(|s| &s.schema).collect();
+            serde_json::to_vec_pretty(&schemas).unwrap_or_default()
+        };
         crate::manifest::save_schema_snapshot(store.as_ref(), prefix, &schema_json)
             .await
             .unwrap();
