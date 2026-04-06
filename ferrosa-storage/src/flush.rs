@@ -328,16 +328,46 @@ impl FileFlushTarget {
     /// Create a file flush target that starts after the highest existing generation.
     ///
     /// Scans the directory for existing SSTable files (`{gen}-Data.db`) and
-    /// starts the generation counter at `max_gen + 1`. Used by the compaction
-    /// executor to avoid overwriting SSTables from prior flushes.
+    /// starts the generation counter at `max(max_gen, node_offset)` where
+    /// `node_offset` is derived from `FERROSA_HOST_ID` to prevent generation
+    /// collisions across nodes. Without this, two fresh nodes both start at
+    /// gen=1 and their SSTables collide in the S3 manifest.
     pub fn new_starting_at(base_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&base_dir)?;
         Self::cleanup_stale_tmp_files(&base_dir);
         let max_gen = Self::scan_max_generation(&base_dir);
+        let node_offset = Self::node_generation_offset();
         Ok(Self {
             base_dir,
-            generation: AtomicU64::new(max_gen),
+            generation: AtomicU64::new(max_gen.max(node_offset)),
         })
+    }
+
+    /// Compute a per-node generation offset from `FERROSA_HOST_ID`.
+    ///
+    /// Hashes the full host UUID to produce a well-distributed 40-bit offset
+    /// in range [0, 1 trillion). This gives each node a unique ~1M-generation
+    /// window. With typical flush rates (< 1000/day), a node would need to
+    /// run for years to exhaust its window.
+    ///
+    /// Using a hash instead of a prefix of the UUID ensures uniform
+    /// distribution even for UUIDs with common prefixes.
+    ///
+    /// Nodes with no host_id (tests, single-node) get offset 0.
+    pub(crate) fn node_generation_offset() -> u64 {
+        std::env::var("FERROSA_HOST_ID")
+            .ok()
+            .map(|s| {
+                // Simple FNV-1a hash of the UUID string, masked to 40 bits.
+                // 40 bits = ~1 trillion possible offsets.
+                let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+                for byte in s.bytes() {
+                    hash ^= byte as u64;
+                    hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+                }
+                hash & 0xFF_FFFF_FFFF // 40-bit mask → max ~1.1 trillion
+            })
+            .unwrap_or(0)
     }
 
     /// Scan a directory for the highest SSTable generation number.
@@ -843,6 +873,59 @@ mod tests {
             gen_a, gen_b,
             "Two flush targets on the same directory produced the same generation {gen_a}. \
              This causes file overwrites and truncated SSTables during concurrent compaction."
+        );
+    }
+
+    /// Verify that node_generation_offset produces different values for
+    /// different FERROSA_HOST_ID values. This is the fix for multi-node
+    /// gen collision: each node starts at a different offset.
+    #[test]
+    fn node_generation_offset_differs_per_host_id() {
+        // Compute offsets by temporarily setting the env var.
+        // We can't set env in parallel tests, so compute manually.
+        let hash = |s: &str| -> u64 {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for byte in s.bytes() {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h & 0xFF_FFFF_FFFF
+        };
+
+        let offset_a = hash("11111111-1111-1111-1111-111111111111");
+        let offset_b = hash("22222222-2222-2222-2222-222222222222");
+        let offset_c = hash("a7b3c9d2-e4f5-4a1b-8c6d-2e3f4a5b6c7d"); // realistic UUID
+
+        assert_ne!(
+            offset_a, offset_b,
+            "Different host IDs must produce different offsets"
+        );
+        assert_ne!(offset_a, offset_c);
+        assert_ne!(offset_b, offset_c);
+
+        // All offsets should be > 0 (non-trivial)
+        assert!(offset_a > 0, "offset_a should be non-zero");
+        assert!(offset_b > 0, "offset_b should be non-zero");
+        assert!(offset_c > 0, "offset_c should be non-zero");
+
+        // Offsets should be well-distributed (40-bit range)
+        assert!(offset_a > 1_000_000, "offset should be in the millions+");
+        assert!(offset_b > 1_000_000);
+    }
+
+    /// Verify that new_starting_at uses the node offset on an empty directory.
+    #[test]
+    fn new_starting_at_uses_node_offset_on_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let offset = FileFlushTarget::node_generation_offset();
+        let target = FileFlushTarget::new_starting_at(dir.path().to_path_buf()).unwrap();
+
+        // On an empty directory, the starting gen should be the node offset
+        // (or 0 if no FERROSA_HOST_ID is set in tests)
+        assert_eq!(
+            target.generation(),
+            offset,
+            "starting generation should equal node offset on empty dir"
         );
     }
 }
