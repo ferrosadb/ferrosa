@@ -3397,6 +3397,67 @@ mod tests {
     }
 
     #[test]
+    /// Reproduce bug-large-write-causes-data-loss-in-partition:
+    /// writing many rows to the same partition, flushing, writing more,
+    /// flushing again — earlier rows must survive.
+    #[test]
+    fn large_write_same_partition_preserves_prior_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            flush_threshold_bytes: 512, // small to force flushes
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        // Helper: build a row with a UNIQUE clustering key.
+        fn make_row_ck(ck: i32, value: &[u8], timestamp: i64) -> Row {
+            Row {
+                clustering: ck.to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(value.to_vec(), timestamp))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }
+        }
+
+        // Batch 1: write 50 rows with unique clustering keys and flush.
+        for i in 0..50 {
+            let key = make_key("pk1"); // same partition key for all
+            let row = make_row_ck(i, format!("batch1_{i}").as_bytes(), (i + 1) as i64);
+            engine.write(&tid, &key, row, (i + 1) as i64).unwrap();
+        }
+        engine.flush(&tid).unwrap();
+
+        // Verify batch 1 data exists.
+        let result = engine.read(&tid, &make_key("pk1")).unwrap();
+        assert!(result.is_some(), "batch 1 data must exist after flush");
+        let batch1_count = result.unwrap().rows.len();
+        assert!(
+            batch1_count >= 50,
+            "batch 1 should have 50 rows, got {batch1_count}"
+        );
+
+        // Batch 2: write 100 MORE rows with different clustering keys.
+        for i in 50..150 {
+            let key = make_key("pk1");
+            let row = make_row_ck(i, format!("batch2_{i}").as_bytes(), (i + 1) as i64);
+            engine.write(&tid, &key, row, (i + 1) as i64).unwrap();
+        }
+        engine.flush(&tid).unwrap();
+
+        // CRITICAL: ALL rows from both batches must survive.
+        let result = engine.read(&tid, &make_key("pk1")).unwrap();
+        assert!(result.is_some(), "data must exist after second flush");
+        let total_rows = result.unwrap().rows.len();
+        assert!(
+            total_rows >= 150,
+            "BUG: expected 150+ rows from both batches, got {total_rows}. \
+             Large write to same partition caused data loss from prior flush."
+        );
+    }
+
+    #[test]
     fn write_flush_read() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig::test_config(dir.path());
