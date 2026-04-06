@@ -761,7 +761,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("graph engine disabled (set FERROSA_GRAPH_ENABLED=true to enable)");
     }
 
-    // 11. Background: connect to seeds with exponential backoff
+    // 11. SPARQL endpoint (check FERROSA_SPARQL_ENABLED)
+    let sparql_enabled = std::env::var("FERROSA_SPARQL_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    if sparql_enabled {
+        let sparql_bind: std::net::SocketAddr = std::env::var("FERROSA_SPARQL_BIND")
+            .unwrap_or_else(|_| "0.0.0.0:8080".into())
+            .parse()
+            .expect("invalid FERROSA_SPARQL_BIND");
+
+        let sparql_engine = std::sync::Arc::new(ferrosa_sparql::engine::SparqlEngine::new(
+            storage.clone(),
+            ferrosa_sparql::engine::SparqlConfig::default(),
+        ));
+
+        let sparql_state = ferrosa_sparql::http::AppState {
+            engine: sparql_engine,
+            schema: schema.clone(),
+            auth_disabled,
+        };
+
+        let sparql_config = ferrosa_sparql::http::SparqlHttpConfig {
+            bind_addr: sparql_bind,
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                ferrosa_sparql::http::start_sparql_http(&sparql_config, sparql_state).await
+            {
+                tracing::error!(%e, "SPARQL HTTP server failed");
+            }
+        });
+
+        tracing::info!(%sparql_bind, "SPARQL server starting");
+    } else {
+        tracing::info!("SPARQL server disabled (set FERROSA_SPARQL_ENABLED=true to enable)");
+    }
+
+    // 12. Background: connect to seeds with exponential backoff
     // Seeds can be hostnames (e.g., "node2:7000") which SocketAddr can't parse.
     // Resolve via DNS in the background task.
     let seed_strs: Vec<String> = std::env::var("FERROSA_SEED")

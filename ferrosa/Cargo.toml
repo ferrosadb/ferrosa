@@ -16,6 +16,7 @@ ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-cql = { path = "../ferrosa-cql" }
 ferrosa-graph = { path = "../ferrosa-graph" }
+ferrosa-sparql = { path = "../ferrosa-sparql" }
 ferrosa-net = { path = "../ferrosa-net" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-storage = { path = "../ferrosa-storage" }
