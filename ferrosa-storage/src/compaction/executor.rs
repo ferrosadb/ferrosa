@@ -125,38 +125,87 @@ impl CompactionExecutor {
             let gen = &input.id;
             let dir = &input.path;
 
-            let data = FileReadAt::open(dir.join(format!("{gen}-Data.db")))
-                .map_err(|e| format!("open data: {e}"))?;
-            let partitions_file = FileReadAt::open(dir.join(format!("{gen}-Partitions.db")))
-                .map_err(|e| format!("open partitions: {e}"))?;
-            let rows = FileReadAt::open(dir.join(format!("{gen}-Rows.db")))
-                .map_err(|e| format!("open rows: {e}"))?;
-            let filter = std::fs::read(dir.join(format!("{gen}-Filter.db")))
-                .map_err(|e| format!("read filter: {e}"))?;
-            let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db")))
-                .map_err(|e| format!("read statistics: {e}"))?;
+            // Validate SSTable before reading. Corrupt/truncated files from
+            // unclean shutdown are skipped instead of failing the task.
+            let data_path = dir.join(format!("{gen}-Data.db"));
+            match std::fs::metadata(&data_path) {
+                Ok(meta) if meta.len() == 0 => {
+                    eprintln!("[compaction] skipping corrupt SSTable {gen}: Data.db empty");
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[compaction] skipping SSTable {gen}: Data.db missing: {e}");
+                    continue;
+                }
+                Ok(_) => {}
+            }
+
+            let data = match FileReadAt::open(&data_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[compaction] skipping SSTable {gen}: {e}");
+                    continue;
+                }
+            };
+            let partitions_file = match FileReadAt::open(dir.join(format!("{gen}-Partitions.db"))) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[compaction] skipping SSTable {gen}: {e}");
+                    continue;
+                }
+            };
+            let rows = match FileReadAt::open(dir.join(format!("{gen}-Rows.db"))) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[compaction] skipping SSTable {gen}: {e}");
+                    continue;
+                }
+            };
+            let filter = match std::fs::read(dir.join(format!("{gen}-Filter.db"))) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[compaction] skipping SSTable {gen}: {e}");
+                    continue;
+                }
+            };
+            let statistics = match std::fs::read(dir.join(format!("{gen}-Statistics.db"))) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[compaction] skipping SSTable {gen}: {e}");
+                    continue;
+                }
+            };
             let compression_info =
                 std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
 
-            let reader = SSTableReader::open(SSTableComponents {
+            let reader = match SSTableReader::open(SSTableComponents {
                 data,
                 partitions: partitions_file,
                 rows,
                 filter,
                 compression_info,
                 statistics,
-            })
-            .map_err(|e| format!("open sstable: {e}"))?;
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[compaction] skipping corrupt SSTable {gen}: {e}");
+                    continue;
+                }
+            };
 
-            let partitions = reader
-                .read_all_partitions()
-                .map_err(|e| format!("read partitions: {e}"))?;
-
-            for p in partitions {
-                all_partitions
-                    .entry(p.key.key.as_bytes().to_vec())
-                    .or_default()
-                    .push(p);
+            match reader.read_all_partitions() {
+                Ok(partitions) => {
+                    for p in partitions {
+                        all_partitions
+                            .entry(p.key.key.as_bytes().to_vec())
+                            .or_default()
+                            .push(p);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[compaction] skipping corrupt SSTable {gen}: {e}");
+                    continue;
+                }
             }
         }
 
