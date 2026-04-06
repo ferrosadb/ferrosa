@@ -1,6 +1,6 @@
 # Component Architecture
 
-> Last updated: 2026-04-02
+> Last updated: 2026-04-05
 > Status: Approved
 
 ## Overview
@@ -20,6 +20,7 @@ graph BT
     Schema[ferrosa-schema<br/>DDL, system keyspaces]
     CQL[ferrosa-cql<br/>CQL protocol v5]
     Graph[ferrosa-graph<br/>Graph query engine]
+    SPARQL[ferrosa-sparql<br/>SPARQL 1.1 endpoint]
     Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
     Ctl[ferrosa-ctl<br/>CLI admin + TUI]
     Bin[ferrosa<br/>Binary]
@@ -39,6 +40,8 @@ graph BT
     CQL --> Index
     Graph --> Common
     Graph --> Schema
+    SPARQL --> Storage
+    SPARQL --> Schema
     Graph --> SST
     Graph --> Storage
     Cluster --> Common
@@ -236,6 +239,27 @@ graph BT
 - **Security mitigations**: T2 (HTTP auth), T3 (per-hop auth), T4 (timeout + fan-out limits), T5 (reconciliation), T6 (extension validation in schema), T7 (system table protection), T8 (error sanitization), T9 (observer backpressure), T10 (audit events), T11 (TLS)
 - **Recent fixes**: Property resolution via schema metadata (not hardcoded), Cypher double-quoted string literals, path assignment syntax (`p = (a)-[r]->(b)`), `COLLECT(DISTINCT ...)` aggregation, `NOT` pattern support in WHERE clauses, `variable_tables` for DELETE operations, tokio runtime check to avoid nested runtime panics.
 - **Design**: Data stored in normal CQL tables with `graph.*` extensions, accessed via system-managed adjacency index per keyspace
+
+### ferrosa-sparql
+
+- **Purpose**: SPARQL 1.1 Query and Update endpoint with RDF*/SPARQL-star support
+- **Location**: `ferrosa-sparql/`
+- **Dependencies**: `ferrosa-common`, `ferrosa-storage`, `ferrosa-schema`, `ferrosa-index`, `ferrosa-sstable`, `spargebra` (with `sparql-12`), `sparesults`, `oxrdf`, `axum`, `tower-http`, `tokio`, `tracing`, `serde_json`
+- **Status**: Sprint 1 complete — parser, planner, executor, HTTP endpoint, FILTER evaluation, property path BFS, content negotiation, SPARQL UPDATE
+- **Modules**:
+  - `engine.rs` — `SparqlEngine`: parse → plan → execute, auto-registers `rdf_triples` table
+  - `planner.rs` — SPARQL algebra → `TripleOp` (SubjectLookup, PredicateScan, ObjectScan, FullScan, PropertyPath)
+  - `executor.rs` — Nested-loop join on binding sets, BFS property path dispatch, ORDER BY, DISTINCT
+  - `filter.rs` — SPARQL FILTER expression evaluator (Equal, Greater, Less, And, Or, Not, Bound, arithmetic)
+  - `property_path.rs` — BFS traversal for `+`, `*`, `?` operators with cycle detection
+  - `results.rs` — SPARQL JSON Results, Turtle, N-Triples serialization with content negotiation
+  - `update.rs` — INSERT DATA (write to storage), DELETE DATA (tombstone write)
+  - `rdf_star.rs` — RDF* annotation types and edge_annotations join stub
+  - `triple_store.rs` — RDF triple ↔ CQL row translation, `rdf_triples` table schema
+  - `http.rs` — Axum routes (POST/GET `/sparql`, POST `/sparql/update`, GET `/sparql/health`), Accept header parsing
+  - `namespace.rs` — Standard RDF prefix management (rdf, rdfs, owl, foaf, dc, prov, schema)
+- **Port**: 8080 (configurable via `FERROSA_SPARQL_BIND`), enabled via `FERROSA_SPARQL_ENABLED=true`
+- **Tests**: 77 unit tests covering parser, planner, executor, filter, results, property paths, RDF*, update
 
 ### ferrosa-ctl
 
