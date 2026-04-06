@@ -797,4 +797,52 @@ mod tests {
             "no .tmp files should remain after successful flush, found: {tmp_files:?}"
         );
     }
+
+    /// RED TEST (known bug): Two FileFlushTarget instances on the SAME
+    /// directory produce colliding generation numbers. This is why
+    /// compaction tasks MUST use per-table output directories.
+    #[test]
+    #[should_panic(expected = "same generation")]
+    fn concurrent_flush_targets_same_dir_collide_generations() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create two flush targets on the same directory simultaneously
+        let target_a = FileFlushTarget::new_starting_at(dir.path().to_path_buf()).unwrap();
+        let target_b = FileFlushTarget::new_starting_at(dir.path().to_path_buf()).unwrap();
+
+        // Both write SSTables
+        let schema = test_schema();
+        let partitions_a = vec![make_partition("ka", b"val_a", 1000)];
+        let partitions_b = vec![make_partition("kb", b"val_b", 2000)];
+
+        let header_a = build_serialization_header(&schema, &partitions_a);
+        let header_b = build_serialization_header(&schema, &partitions_b);
+
+        let opts = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+
+        let mut writer_a = SSTableWriter::new(opts.clone(), header_a);
+        writer_a.add_partition(&partitions_a[0]).unwrap();
+        let output_a = writer_a.finish().unwrap();
+
+        let mut writer_b = SSTableWriter::new(opts, header_b);
+        writer_b.add_partition(&partitions_b[0]).unwrap();
+        let output_b = writer_b.finish().unwrap();
+
+        let _reader_a = target_a.flush(output_a).unwrap();
+        let gen_a = target_a.generation();
+
+        let _reader_b = target_b.flush(output_b).unwrap();
+        let gen_b = target_b.generation();
+
+        // Generations MUST be different — if they're the same, one SSTable
+        // overwrites the other in the shared directory
+        assert_ne!(
+            gen_a, gen_b,
+            "Two flush targets on the same directory produced the same generation {gen_a}. \
+             This causes file overwrites and truncated SSTables during concurrent compaction."
+        );
+    }
 }

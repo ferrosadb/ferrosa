@@ -146,9 +146,13 @@ impl CompactionStrategy for SizeTieredStrategy {
                 let count = bucket.len().min(self.config.max_threshold);
                 let inputs: Vec<SSTableMetadata> =
                     bucket.into_iter().take(count).cloned().collect();
+                // Use per-table subdirectory to prevent generation collisions
+                // between concurrent compactions of different tables. Without
+                // this, two tasks scanning the same shared directory both get
+                // the same max_gen and overwrite each other's output.
                 tasks.push(CompactionTask {
                     inputs,
-                    output_dir: self.config.output_dir.clone(),
+                    output_dir: self.config.output_dir.join(table_id.to_string()),
                     schema: schema.clone(),
                     table_id: table_id.clone(),
                 });

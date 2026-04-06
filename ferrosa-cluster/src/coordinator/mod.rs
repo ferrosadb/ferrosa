@@ -121,9 +121,9 @@ impl RpcHandler for MutationForwardHandler {
         let mutation = decode_mutation(&body).ok()?;
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
         for row in &mutation.rows {
-            if let Err(e) = self
-                .storage
-                .write(&table_id, &mutation.key, row.clone(), mutation.timestamp)
+            if let Err(e) =
+                self.storage
+                    .write(&table_id, &mutation.key, row.clone(), mutation.timestamp)
             {
                 // CRITICAL: Do NOT return MutationAck when the write fails.
                 // Returning ACK here would make the coordinator count this as a

@@ -2184,7 +2184,7 @@ impl StorageEngine {
             if metadata.len() >= 2 {
                 let task = crate::compaction::metadata::CompactionTask {
                     inputs: metadata,
-                    output_dir: self.config.compaction.output_dir.clone(),
+                    output_dir: self.config.compaction.output_dir.join(table_id.to_string()),
                     schema: state.schema.clone(),
                     table_id: table_id.clone(),
                 };
