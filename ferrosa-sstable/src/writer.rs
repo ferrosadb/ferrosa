@@ -313,22 +313,33 @@ impl SSTableWriter {
         // Cassandra 5.x ClusteringPrefix format:
         //   header varint (0 = all non-null/non-empty) + per-component value bytes.
         //   Fixed-length types: raw bytes only. Variable-length: varint(len) + bytes.
+        //
+        // For single-column CK, row.clustering is raw component bytes.
+        // For multi-column CK, the CQL bridge encodes as u16-prefixed
+        // per-component: [u16 len][bytes][u16 len][bytes]...
+        // We must extract each component and write it in BTI format.
         if !is_static {
             push_unsigned_vint_to(&mut self.data_buf, 0); // header: all non-null, non-empty
 
             let num_ck = self.header.clustering_types.len();
             if num_ck == 1 {
-                // Single clustering column: write value directly (fixed-length)
-                // or with a length prefix (variable-length).
+                // Single CK column: raw bytes (no u16 prefix).
                 let type_name = &self.header.clustering_types[0];
                 if crate::marshal::value_length_if_fixed(type_name).is_none() {
                     push_unsigned_vint_to(&mut self.data_buf, row.clustering.len() as u64);
                 }
                 self.data_buf.extend_from_slice(&row.clustering);
             } else if num_ck > 1 {
-                // Multi-column: treat as single variable-length blob (simplified)
-                push_unsigned_vint_to(&mut self.data_buf, row.clustering.len() as u64);
-                self.data_buf.extend_from_slice(&row.clustering);
+                // Multi-column CK: extract components from u16-prefixed
+                // encoding, then write each in BTI per-component format.
+                let components = split_u16_prefixed(&row.clustering, num_ck);
+                for (i, component) in components.iter().enumerate() {
+                    let type_name = &self.header.clustering_types[i];
+                    if crate::marshal::value_length_if_fixed(type_name).is_none() {
+                        push_unsigned_vint_to(&mut self.data_buf, component.len() as u64);
+                    }
+                    self.data_buf.extend_from_slice(component);
+                }
             }
             // num_ck == 0: no clustering columns — header varint only, no data.
         }
@@ -353,6 +364,13 @@ impl SSTableWriter {
 
         // Row-level deletion (unsigned varint deltas)
         if flags & HAS_DELETION != 0 {
+            assert!(
+                row.deletion.marked_for_delete_at >= self.header.min_timestamp,
+                "SSTable writer: row deletion timestamp {} < header min_timestamp {} — \
+                 delta would underflow and corrupt the SSTable",
+                row.deletion.marked_for_delete_at,
+                self.header.min_timestamp
+            );
             let ts_delta = (row.deletion.marked_for_delete_at - self.header.min_timestamp) as u64;
             push_unsigned_vint_to(&mut row_body, ts_delta);
             let ldt_delta = (row.deletion.local_deletion_time as i64
@@ -552,11 +570,13 @@ fn serialize_cell(
     if !use_row_timestamp {
         // Safety: if cell.timestamp < header.min_timestamp, the cast to u64
         // wraps to a huge value, producing a corrupt varint that will be
-        // misread as a garbage length later. Assert to catch this at write time.
-        debug_assert!(
+        // misread as a garbage length later. This MUST be a hard assert
+        // (not debug_assert) — release builds must catch this corruption
+        // at write time, not produce silently corrupt SSTables.
+        assert!(
             cell.timestamp >= header.min_timestamp,
             "SSTable writer: cell timestamp {} < header min_timestamp {} — \
-             delta would underflow",
+             delta would underflow and corrupt the SSTable",
             cell.timestamp,
             header.min_timestamp
         );
@@ -605,6 +625,24 @@ fn push_unsigned_vint_to(buf: &mut Vec<u8>, value: u64) {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Extract components from a u16-BE-length-prefixed byte sequence.
+///
+/// The CQL bridge encodes multi-column clustering keys as:
+///   `[u16 len][component bytes][u16 len][component bytes]...`
+/// This function splits them back into individual byte slices.
+fn split_u16_prefixed(bytes: &[u8], expected: usize) -> Vec<&[u8]> {
+    let mut components = Vec::with_capacity(expected);
+    let mut pos = 0;
+    while pos + 2 <= bytes.len() && components.len() < expected {
+        let len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+        pos += 2;
+        let end = (pos + len).min(bytes.len());
+        components.push(&bytes[pos..end]);
+        pos = end;
+    }
+    components
+}
 
 #[cfg(test)]
 mod tests {
@@ -1566,6 +1604,140 @@ mod tests {
             last_key, write_last,
             "key bounds last={:?} should match token-sorted last={:?}",
             last_key, write_last
+        );
+    }
+
+    /// RED TEST: A partition with a row whose deletion timestamp is lower
+    /// than the header's min_timestamp must be caught during writing.
+    ///
+    /// This simulates what happens during compaction when merge produces a
+    /// row with an old deletion timestamp. Without the fix, the delta
+    /// underflows to a huge u64, producing a corrupt varint that misaligns
+    /// the reader — the root cause of post-compaction data loss.
+    #[test]
+    #[should_panic(expected = "delta would underflow")]
+    fn row_deletion_timestamp_below_header_min_panics() {
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000, // header min is 1M
+            min_local_deletion_time: 100,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        };
+
+        // Row with deletion timestamp 500 < header min 1_000_000
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::from(b"pk1".as_slice())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![0x00, 0x00, 0x00, 0x01],
+                cells: vec![(0, CellValue::live(b"val".to_vec(), 1_000_000))],
+                deletion: DeletionTime::new(500, 100), // OLD deletion timestamp!
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000_000),
+            }],
+        };
+
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+        let mut writer = SSTableWriter::new(options, header);
+        // This MUST panic — writing a row with deletion ts < header min
+        // would produce a corrupt SSTable (varint underflow)
+        writer.add_partition(&partition).unwrap();
+    }
+
+    /// Multi-column clustering key roundtrip (typed_edges schema: uuid, text, uuid).
+    ///
+    /// This is the P0 data loss regression test. The SSTableWriter serializes
+    /// multi-column clustering keys as a single varint-prefixed blob, but the
+    /// DataReader reads per-component with type-aware length handling. The
+    /// format mismatch causes parse drift for every row after the first field,
+    /// corrupting all subsequent data in the SSTable.
+    #[test]
+    fn multi_column_clustering_key_roundtrip() {
+        // Header matching typed_edges: (uuid, text, uuid) clustering
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                org.apache.cassandra.db.marshal.UUIDType,\
+                org.apache.cassandra.db.marshal.UUIDType)"
+                .into(),
+            clustering_types: vec![
+                "org.apache.cassandra.db.marshal.UUIDType".into(), // src_id
+                "org.apache.cassandra.db.marshal.UTF8Type".into(), // edge_type
+                "org.apache.cassandra.db.marshal.UUIDType".into(), // dst_id
+            ],
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"weight".to_vec(),
+                "org.apache.cassandra.db.marshal.DoubleType".into(),
+            )],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let timestamp = 1_000_100i64;
+
+        // Build clustering key in the u16-prefixed format the CQL bridge produces
+        // for multi-column CK: [u16 len][component bytes] per component.
+        let src_id = [0xAAu8; 16];
+        let edge_type = b"RELATED_TO";
+        let dst_id = [0xBBu8; 16];
+        let mut ck = Vec::new();
+        ck.extend_from_slice(&(src_id.len() as u16).to_be_bytes());
+        ck.extend_from_slice(&src_id);
+        ck.extend_from_slice(&(edge_type.len() as u16).to_be_bytes());
+        ck.extend_from_slice(edge_type);
+        ck.extend_from_slice(&(dst_id.len() as u16).to_be_bytes());
+        ck.extend_from_slice(&dst_id);
+
+        let weight: f64 = 0.85;
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::new(vec![0x11; 16])),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: ck.clone(),
+                cells: vec![(0, CellValue::live(weight.to_be_bytes().to_vec(), timestamp))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        };
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        // Read back via sequential DataReader (same path as read_all_partitions)
+        let mut reader = DataReader::new(&output.data, &header, 0);
+        let read_back = reader
+            .read_partition()
+            .expect("read should not error on data we just wrote")
+            .expect("partition should be present");
+
+        assert_eq!(read_back.rows.len(), 1, "should have 1 row");
+        let row = &read_back.rows[0];
+
+        // Verify the cell value survived
+        assert_eq!(
+            row.cells[0].1.value.as_deref().unwrap(),
+            weight.to_be_bytes(),
+            "cell value must survive roundtrip for multi-column clustering key"
         );
     }
 }

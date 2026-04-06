@@ -122,7 +122,9 @@ impl DdlPath {
                 // Still return an error to the client so they know to retry
                 // (the DDL will be applied automatically but the client can't
                 // observe the result until formation completes).
-                let _ = queue.send(op);
+                if let Err(e) = queue.send(op) {
+                    eprintln!("[ddl] failed to enqueue DDL operation: {e}");
+                }
                 Err(ClusterError::Internal(
                     "DDL unavailable: cluster formation in progress, will be applied after leader election — retry shortly".into(),
                 ))

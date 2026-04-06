@@ -226,10 +226,14 @@ impl FerrosStateMachine {
                     .entry(ks.name.clone())
                     .or_insert_with(|| ks.clone());
                 if let Some(schema) = &self.schema {
-                    let _ = schema.create_keyspace_internal(ks);
+                    if let Err(e) = schema.create_keyspace_internal(ks) {
+                        tracing::error!(%e, "Raft apply: create_keyspace_internal failed — schema diverged from Raft state");
+                    }
                 }
                 if let Some(writer) = &self.system_writer {
-                    let _ = writer.apply(SystemTableMutation::KeyspaceCreated(ks_clone));
+                    if let Err(e) = writer.apply(SystemTableMutation::KeyspaceCreated(ks_clone)) {
+                        tracing::error!(%e, "Raft apply: system table write failed for CreateKeyspace");
+                    }
                 }
             }
             RaftOp::DropKeyspace(name) => {
@@ -254,16 +258,23 @@ impl FerrosStateMachine {
                     .index_state_map
                     .retain(|(ks, _, _), _| ks != &name);
                 if let Some(schema) = &self.schema {
-                    let _ = schema.drop_keyspace_internal(&name);
+                    if let Err(e) = schema.drop_keyspace_internal(&name) {
+                        tracing::error!(%e, "Raft apply: drop_keyspace_internal failed — schema diverged from Raft state");
+                    }
                 }
                 if let Some(engine) = &self.engine {
                     for (ks, tbl) in dropped_tables {
                         let tid = TableId::new(&ks, &tbl);
-                        let _ = engine.unregister_table(&tid);
+                        if let Err(e) = engine.unregister_table(&tid) {
+                            tracing::error!(%e, "Raft apply: unregister_table failed");
+                        }
                     }
                 }
                 if let Some(writer) = &self.system_writer {
-                    let _ = writer.apply(SystemTableMutation::KeyspaceDropped(name.clone()));
+                    if let Err(e) = writer.apply(SystemTableMutation::KeyspaceDropped(name.clone()))
+                    {
+                        tracing::error!(%e, "Raft apply: system table write failed");
+                    }
                 }
             }
             RaftOp::AlterKeyspace { name, updates } => {
@@ -276,11 +287,17 @@ impl FerrosStateMachine {
                     }
                 }
                 if let Some(schema) = &self.schema {
-                    let _ = schema.alter_keyspace_internal(&name, updates);
+                    if let Err(e) = schema.alter_keyspace_internal(&name, updates) {
+                        tracing::error!(%e, "Raft apply: alter_keyspace_internal failed");
+                    }
                 }
                 if let Some(writer) = &self.system_writer {
                     if let Some(ks) = self.state.keyspaces.get(&name) {
-                        let _ = writer.apply(SystemTableMutation::KeyspaceCreated(ks.clone()));
+                        if let Err(e) =
+                            writer.apply(SystemTableMutation::KeyspaceCreated(ks.clone()))
+                        {
+                            tracing::error!(%e, "Raft apply: system table write failed for AlterKeyspace");
+                        }
                     }
                 }
             }
@@ -293,13 +310,19 @@ impl FerrosStateMachine {
                     .entry(key)
                     .or_insert_with(|| *table.clone());
                 if let Some(schema) = &self.schema {
-                    let _ = schema.create_table_internal(*table.clone());
+                    if let Err(e) = schema.create_table_internal(*table.clone()) {
+                        tracing::error!(%e, "Raft apply: create_table_internal failed — schema diverged");
+                    }
                 }
                 if let Some(engine) = &self.engine {
-                    let _ = engine.register_table(table.to_storage_schema());
+                    if let Err(e) = engine.register_table(table.to_storage_schema()) {
+                        tracing::error!(%e, "Raft apply: register_table failed — writes to this table will silently fail");
+                    }
                 }
                 if let Some(writer) = &self.system_writer {
-                    let _ = writer.apply(SystemTableMutation::TableCreated(table.clone()));
+                    if let Err(e) = writer.apply(SystemTableMutation::TableCreated(table.clone())) {
+                        tracing::error!(%e, "Raft apply: system table write failed for CreateTable");
+                    }
                 }
             }
             RaftOp::DropTable { keyspace, table } => {
@@ -312,17 +335,23 @@ impl FerrosStateMachine {
                     .index_state_map
                     .retain(|(ks, tbl, _), _| !(ks == &keyspace && tbl == &table));
                 if let Some(schema) = &self.schema {
-                    let _ = schema.drop_table_internal(&keyspace, &table);
+                    if let Err(e) = schema.drop_table_internal(&keyspace, &table) {
+                        tracing::error!(%e, "Raft apply: drop_table_internal failed");
+                    }
                 }
                 if let Some(engine) = &self.engine {
                     let tid = TableId::new(&keyspace, &table);
-                    let _ = engine.unregister_table(&tid);
+                    if let Err(e) = engine.unregister_table(&tid) {
+                        tracing::error!(%e, "Raft apply: unregister_table failed — stale table data may remain");
+                    }
                 }
                 if let Some(writer) = &self.system_writer {
-                    let _ = writer.apply(SystemTableMutation::TableDropped {
+                    if let Err(e) = writer.apply(SystemTableMutation::TableDropped {
                         keyspace: keyspace.clone(),
                         table: table.clone(),
-                    });
+                    }) {
+                        tracing::error!(%e, "Raft apply: system table write failed for DropTable");
+                    }
                 }
             }
             RaftOp::AlterTable {
@@ -351,7 +380,9 @@ impl FerrosStateMachine {
                     }
                 }
                 if let Some(schema) = &self.schema {
-                    let _ = schema.alter_table_internal(&keyspace, &table, *updates);
+                    if let Err(e) = schema.alter_table_internal(&keyspace, &table, *updates) {
+                        tracing::error!(%e, "Raft apply: schema.alter_table_internal failed");
+                    }
                 }
             }
 
@@ -385,7 +416,9 @@ impl FerrosStateMachine {
                     }
                 }
                 if let Some(schema) = &self.schema {
-                    let _ = schema.create_index_internal(index);
+                    if let Err(e) = schema.create_index_internal(index) {
+                        tracing::error!(%e, "Raft apply: schema.create_index_internal failed");
+                    }
                 }
             }
             RaftOp::DropIndex {
@@ -403,7 +436,9 @@ impl FerrosStateMachine {
                     index.clone(),
                 ));
                 if let Some(schema) = &self.schema {
-                    let _ = schema.drop_index_internal(&keyspace, &table, &index);
+                    if let Err(e) = schema.drop_index_internal(&keyspace, &table, &index) {
+                        tracing::error!(%e, "Raft apply: schema.drop_index_internal failed");
+                    }
                 }
             }
             RaftOp::IndexStatus {
@@ -426,13 +461,17 @@ impl FerrosStateMachine {
                 let key = (udt.keyspace.clone(), udt.name.clone());
                 self.state.types.entry(key).or_insert_with(|| udt.clone());
                 if let Some(schema) = &self.schema {
-                    let _ = schema.create_type_internal(&udt);
+                    if let Err(e) = schema.create_type_internal(&udt) {
+                        tracing::error!(%e, "Raft apply: schema.create_type_internal failed");
+                    }
                 }
             }
             RaftOp::DropType { keyspace, name } => {
                 self.state.types.remove(&(keyspace.clone(), name.clone()));
                 if let Some(schema) = &self.schema {
-                    let _ = schema.drop_type_internal(&keyspace, &name);
+                    if let Err(e) = schema.drop_type_internal(&keyspace, &name) {
+                        tracing::error!(%e, "Raft apply: schema.drop_type_internal failed");
+                    }
                 }
             }
 
@@ -448,7 +487,9 @@ impl FerrosStateMachine {
                     .entry(key)
                     .or_insert_with(|| func.clone());
                 if let Some(schema) = &self.schema {
-                    let _ = schema.create_function_internal(&func);
+                    if let Err(e) = schema.create_function_internal(&func) {
+                        tracing::error!(%e, "Raft apply: schema.create_function_internal failed");
+                    }
                 }
             }
             RaftOp::DropFunction {
@@ -459,7 +500,9 @@ impl FerrosStateMachine {
                 let key = (keyspace.clone(), name.clone(), arg_types.clone());
                 self.state.functions.remove(&key);
                 if let Some(schema) = &self.schema {
-                    let _ = schema.drop_function_internal(&keyspace, &name, &arg_types);
+                    if let Err(e) = schema.drop_function_internal(&keyspace, &name, &arg_types) {
+                        tracing::error!(%e, "Raft apply: schema.drop_function_internal failed");
+                    }
                 }
             }
 
@@ -475,7 +518,9 @@ impl FerrosStateMachine {
                     .entry(key)
                     .or_insert_with(|| agg.clone());
                 if let Some(schema) = &self.schema {
-                    let _ = schema.create_aggregate_internal(&agg);
+                    if let Err(e) = schema.create_aggregate_internal(&agg) {
+                        tracing::error!(%e, "Raft apply: schema.create_aggregate_internal failed");
+                    }
                 }
             }
             RaftOp::DropAggregate {
@@ -486,7 +531,9 @@ impl FerrosStateMachine {
                 let key = (keyspace.clone(), name.clone(), arg_types.clone());
                 self.state.aggregates.remove(&key);
                 if let Some(schema) = &self.schema {
-                    let _ = schema.drop_aggregate_internal(&keyspace, &name, &arg_types);
+                    if let Err(e) = schema.drop_aggregate_internal(&keyspace, &name, &arg_types) {
+                        tracing::error!(%e, "Raft apply: schema.drop_aggregate_internal failed");
+                    }
                 }
             }
 
@@ -497,10 +544,14 @@ impl FerrosStateMachine {
                     .entry(role.name.clone())
                     .or_insert_with(|| role.clone());
                 if let Some(writer) = &self.system_writer {
-                    let _ = writer.apply(SystemTableMutation::RoleCreated(role.clone()));
+                    if let Err(e) = writer.apply(SystemTableMutation::RoleCreated(role.clone())) {
+                        tracing::error!(%e, "Raft apply: system table write failed");
+                    }
                 }
                 if let Some(schema) = &self.schema {
-                    let _ = schema.create_role_internal(role);
+                    if let Err(e) = schema.create_role_internal(role) {
+                        tracing::error!(%e, "Raft apply: schema.create_role_internal failed");
+                    }
                 }
             }
             RaftOp::AlterRole { name, updates } => {
@@ -520,21 +571,30 @@ impl FerrosStateMachine {
                 }
                 if let Some(writer) = &self.system_writer {
                     if let Some(role) = self.state.roles.get(&name) {
-                        let _ = writer.apply(SystemTableMutation::RoleCreated(role.clone()));
+                        if let Err(e) = writer.apply(SystemTableMutation::RoleCreated(role.clone()))
+                        {
+                            tracing::error!(%e, "Raft apply: system table write failed");
+                        }
                     }
                 }
                 if let Some(schema) = &self.schema {
-                    let _ = schema.alter_role_internal(&name, updates);
+                    if let Err(e) = schema.alter_role_internal(&name, updates) {
+                        tracing::error!(%e, "Raft apply: schema.alter_role_internal failed");
+                    }
                 }
             }
             RaftOp::DropRole(name) => {
                 self.state.roles.remove(&name);
                 self.state.grants.remove(&name);
                 if let Some(schema) = &self.schema {
-                    let _ = schema.drop_role_internal(&name);
+                    if let Err(e) = schema.drop_role_internal(&name) {
+                        tracing::error!(%e, "Raft apply: schema.drop_role_internal failed");
+                    }
                 }
                 if let Some(writer) = &self.system_writer {
-                    let _ = writer.apply(SystemTableMutation::RoleDropped(name.clone()));
+                    if let Err(e) = writer.apply(SystemTableMutation::RoleDropped(name.clone())) {
+                        tracing::error!(%e, "Raft apply: system table write failed");
+                    }
                 }
             }
             RaftOp::Grant(entry) => {
@@ -547,10 +607,14 @@ impl FerrosStateMachine {
                     grants.push(entry.clone());
                 }
                 if let Some(writer) = &self.system_writer {
-                    let _ = writer.apply(SystemTableMutation::GrantUpdated(entry.clone()));
+                    if let Err(e) = writer.apply(SystemTableMutation::GrantUpdated(entry.clone())) {
+                        tracing::error!(%e, "Raft apply: system table write failed");
+                    }
                 }
                 if let Some(schema) = &self.schema {
-                    let _ = schema.grant_internal(entry);
+                    if let Err(e) = schema.grant_internal(entry) {
+                        tracing::error!(%e, "Raft apply: schema.grant_internal failed");
+                    }
                 }
             }
             RaftOp::Revoke {
@@ -568,14 +632,18 @@ impl FerrosStateMachine {
                     }
                 }
                 if let Some(writer) = &self.system_writer {
-                    let _ = writer.apply(SystemTableMutation::PermissionRevoked {
+                    if let Err(e) = writer.apply(SystemTableMutation::PermissionRevoked {
                         role: role.clone(),
                         resource: resource.clone(),
                         permission,
-                    });
+                    }) {
+                        tracing::error!(%e, "Raft apply: system table write failed for PermissionRevoked");
+                    }
                 }
                 if let Some(schema) = &self.schema {
-                    let _ = schema.revoke_internal(&role, &resource, &permission);
+                    if let Err(e) = schema.revoke_internal(&role, &resource, &permission) {
+                        tracing::error!(%e, "Raft apply: schema.revoke_internal failed");
+                    }
                 }
             }
 
@@ -831,13 +899,17 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
             };
-            let _ = schema.apply_snapshot(snap);
+            if let Err(e) = schema.apply_snapshot(snap) {
+                tracing::error!(%e, "Raft snapshot: apply_snapshot to schema failed");
+            }
         }
 
         // Re-register all tables with engine if present.
         if let Some(engine) = &self.engine {
             for table in self.state.tables.values() {
-                let _ = engine.register_table(table.to_storage_schema());
+                if let Err(e) = engine.register_table(table.to_storage_schema()) {
+                    tracing::error!(%e, "Raft snapshot: register_table failed");
+                }
             }
         }
 

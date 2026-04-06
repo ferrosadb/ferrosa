@@ -1,0 +1,156 @@
+# CQL integration test cluster — ports 3xxxx to avoid conflicts.
+#
+# Reuses the pre-built ferrosa-memory-node image (no Rust compile needed).
+# Fresh data volumes so tests start clean.
+#
+# Usage:
+#   podman compose -f tests/cluster/docker-compose.cql-integration.yml up -d
+#   python tests/cluster/test_cql_flush_restart.py
+#   podman compose -f tests/cluster/docker-compose.cql-integration.yml down -v
+
+services:
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    ports:
+      - "30000:9000"
+      - "30001:9001"
+    environment:
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+    volumes:
+      - cqltest-rustfs:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  rustfs-init:
+    image: minio/mc
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+             mc mb local/ferrosa-cql-test --ignore-existing &&
+             echo 'bucket ferrosa-cql-test ready'"
+    restart: "no"
+
+  node1:
+    image: localhost/ferrosa-memory-node:latest
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "30042:9042"
+      - "30090:9090"
+    environment:
+      FERROSA_HOST_ID: "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node1:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:30042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-cql-test"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_FLUSH_THRESHOLD_BYTES: "8192"
+      FERROSA_COMPACTION_MIN_THRESHOLD: "2"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-cql-test"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      FERROSA_S3_PREFIX: "node1"
+    volumes:
+      - cqltest-node1:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9042"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  node2:
+    image: localhost/ferrosa-memory-node:latest
+    depends_on:
+      node1:
+        condition: service_healthy
+    ports:
+      - "30043:9042"
+      - "30091:9090"
+    environment:
+      FERROSA_HOST_ID: "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node2:7000"
+      FERROSA_SEED: "node1:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:30043"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-cql-test"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_FLUSH_THRESHOLD_BYTES: "8192"
+      FERROSA_COMPACTION_MIN_THRESHOLD: "2"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-cql-test"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      FERROSA_S3_PREFIX: "node2"
+    volumes:
+      - cqltest-node2:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9042"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  node3:
+    image: localhost/ferrosa-memory-node:latest
+    depends_on:
+      node1:
+        condition: service_healthy
+    ports:
+      - "30044:9042"
+      - "30092:9090"
+    environment:
+      FERROSA_HOST_ID: "c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node3:7000"
+      FERROSA_SEED: "node1:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:30044"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-cql-test"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_FLUSH_THRESHOLD_BYTES: "8192"
+      FERROSA_COMPACTION_MIN_THRESHOLD: "2"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-cql-test"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      FERROSA_S3_PREFIX: "node3"
+    volumes:
+      - cqltest-node3:/var/lib/ferrosa
+    healthcheck:
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9042"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+volumes:
+  cqltest-rustfs:
+  cqltest-node1:
+  cqltest-node2:
+  cqltest-node3:

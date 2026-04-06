@@ -1,14 +1,12 @@
 name: Cluster Data Loss Test
 
 on:
+  # Only run on main merges and manual dispatch — NOT on every PR push.
+  # This workflow builds Docker images + runs a 3-node cluster test,
+  # consuming ~15 min of CI per run. Running on every push to a PR
+  # burned 1300+ minutes in one day.
   push:
     branches: [main]
-    paths:
-      - 'ferrosa-storage/**'
-      - 'ferrosa-cluster/**'
-      - 'ferrosa-cql/**'
-      - 'ferrosa-sstable/**'
-  pull_request:
     paths:
       - 'ferrosa-storage/**'
       - 'ferrosa-cluster/**'

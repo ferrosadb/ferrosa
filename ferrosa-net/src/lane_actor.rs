@@ -137,12 +137,16 @@ impl LaneHandle {
 
     /// Attempt to swap in a new RPC client (best-effort, non-blocking).
     pub(crate) fn try_swap_client(&self, client: RpcClient) {
-        let _ = self.tx.try_send(LaneCommand::SwapClient(client));
+        if let Err(e) = self.tx.try_send(LaneCommand::SwapClient(client)) {
+            eprintln!("[net] lane command send failed: {e}");
+        }
     }
 
     /// Mark the lane as permanently failed.
     pub(crate) fn mark_failed(&self) {
-        let _ = self.tx.try_send(LaneCommand::MarkFailed);
+        if let Err(e) = self.tx.try_send(LaneCommand::MarkFailed) {
+            eprintln!("[net] lane command send failed: {e}");
+        }
     }
 
     /// Query the current lane status.

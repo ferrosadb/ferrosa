@@ -169,6 +169,11 @@ impl<R: ReadAt> SSTableReader<R> {
         self.compression_info.as_ref()
     }
 
+    /// Returns the length of the Data.db file (or buffer) in bytes.
+    pub fn data_file_length(&self) -> Result<u64> {
+        self.data.len()
+    }
+
     /// Returns the approximate total size of this SSTable in bytes.
     ///
     /// Sums the sizes of the data file and the partition index. For

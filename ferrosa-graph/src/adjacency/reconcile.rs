@@ -201,6 +201,7 @@ pub fn reconcile_once(
 
                 // Verify the edge exists in the edge table.
                 let source_key = DecoratedKey::new(PartitionKey::new(source_id));
+                // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
                 let edge_exists = match storage.read(&edge_tid, &source_key) {
                     Ok(Some(p)) => p.rows.iter().any(|r| r.clustering == target_id),
                     _ => false,
@@ -243,6 +244,7 @@ fn adjacency_entry_exists(
     edge_label: &str,
     neighbor_id: &[u8],
 ) -> bool {
+    // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
     let partition = match storage.read(adj_table_id, vertex_key) {
         Ok(Some(p)) => p,
         _ => return false,

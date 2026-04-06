@@ -491,6 +491,82 @@ impl StorageEngine {
         Ok((engine, pending_mutations))
     }
 
+    /// Replays pending S3 uploads that were interrupted by a crash.
+    ///
+    /// Reads the pending-uploads.log and re-submits upload tasks for each
+    /// entry. The upload is idempotent (S3 PUT overwrites). Call this after
+    /// the engine is opened and tables are registered.
+    pub async fn replay_pending_uploads(&self) {
+        let pending_log_path = self.config.data_dir.join("pending-uploads.log");
+        let pending_log = match crate::upload::PendingUploadsLog::open(&pending_log_path) {
+            Ok(log) => log,
+            Err(_) => return, // No log file — nothing to replay
+        };
+
+        let entries = match pending_log.pending_entries() {
+            Ok(e) if e.is_empty() => return,
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("failed to read pending-uploads.log: {e}");
+                return;
+            }
+        };
+
+        let Some(upload_mgr) = self.upload_manager.as_ref() else {
+            tracing::warn!(
+                "pending-uploads.log has {} entries but no upload manager configured — \
+                 these SSTables may not be in S3",
+                entries.len()
+            );
+            return;
+        };
+
+        tracing::info!(
+            count = entries.len(),
+            "replaying pending S3 uploads from crash recovery"
+        );
+
+        for (table_id_str, sstable_id) in &entries {
+            // Find the SSTable files on disk
+            let table_dir = self.config.data_dir.join("sstables").join(table_id_str);
+            let files = Self::collect_sstable_files(&table_dir, sstable_id.parse().unwrap_or(0));
+            if files.is_empty() {
+                // Also check compaction output directory
+                let compaction_dir = self.config.compaction.output_dir.join(table_id_str);
+                let files2 =
+                    Self::collect_sstable_files(&compaction_dir, sstable_id.parse().unwrap_or(0));
+                if files2.is_empty() {
+                    tracing::warn!(
+                        table = table_id_str,
+                        sstable = sstable_id,
+                        "pending upload: SSTable files not found on disk — cannot replay"
+                    );
+                    continue;
+                }
+                let task = crate::upload::UploadTask::SSTable {
+                    table_id: table_id_str.clone(),
+                    sstable_id: sstable_id.clone(),
+                    files: files2,
+                    on_complete: None,
+                };
+                if let Err(e) = upload_mgr.submit(task).await {
+                    tracing::error!(sstable = sstable_id, "pending upload replay failed: {e}");
+                }
+                continue;
+            }
+
+            let task = crate::upload::UploadTask::SSTable {
+                table_id: table_id_str.clone(),
+                sstable_id: sstable_id.clone(),
+                files,
+                on_complete: None,
+            };
+            if let Err(e) = upload_mgr.submit(task).await {
+                tracing::error!(sstable = sstable_id, "pending upload replay failed: {e}");
+            }
+        }
+    }
+
     /// Replays a set of pending mutations into their respective table memtables.
     ///
     /// This is called after [`open`](Self::open) and after all table schemas
@@ -1791,6 +1867,7 @@ impl StorageEngine {
                     if let Ok(gen_num) = gen.parse::<u64>() {
                         state.store.advance_gen_past(gen_num);
                     }
+                    let pre_swap_count = state.store.sstable_count();
                     if let Err(e) = state.store.swap_compacted_sstables(
                         &input_id_paths,
                         output_id,
@@ -1801,6 +1878,13 @@ impl StorageEngine {
                         eprintln!("[compaction] swap failed: {e}");
                         continue;
                     }
+                    let post_swap_count = state.store.sstable_count();
+                    eprintln!(
+                        "[compaction] swap complete for {table_id}: \
+                         SSTables {pre_swap_count} → {post_swap_count}, \
+                         removed {} inputs, added 1 output",
+                        input_id_paths.len()
+                    );
 
                     // Eager index build: submit high-priority rebuild for compacted output.
                     // Same as flush — keeps MemtableIndex bounded in steady state.
@@ -2014,7 +2098,14 @@ impl StorageEngine {
                             max_timestamp: result.output.max_timestamp,
                         },
                     );
-                    if let Err(e) = manifest.save_with_retry(store.as_ref(), &prefix).await {
+                    // Pass removals explicitly so CAS retry re-applies them
+                    // after merging with the latest manifest. Without this,
+                    // merge_into re-introduces the entries we removed.
+                    let removals = vec![(table_id_str.clone(), input_ids.clone())];
+                    if let Err(e) = manifest
+                        .save_with_retry_and_removals(store.as_ref(), &prefix, &removals)
+                        .await
+                    {
                         eprintln!("[compaction] manifest save failed for {sstable_id}: {e}");
                     } else {
                         eprintln!(
@@ -2160,6 +2251,34 @@ impl StorageEngine {
     }
 
     /// Checks if compaction should be triggered after a flush.
+    /// Force compaction for all tables, ignoring the STCS threshold.
+    ///
+    /// Useful for testing and debugging compaction issues. Submits a compaction
+    /// task for every table that has at least 2 SSTables, regardless of size
+    /// bucketing or min_threshold.
+    pub fn force_compact_all(&self) {
+        let tables = self.tables.read();
+        for (table_id, state) in tables.iter() {
+            let metadata = self.collect_sstable_metadata(table_id, state);
+            eprintln!(
+                "[force-compact] table {}: {} SSTables",
+                table_id,
+                metadata.len()
+            );
+            if metadata.len() >= 2 {
+                let task = crate::compaction::metadata::CompactionTask {
+                    inputs: metadata,
+                    output_dir: self.config.compaction.output_dir.join(table_id.to_string()),
+                    schema: state.schema.clone(),
+                    table_id: table_id.clone(),
+                };
+                if let Err(e) = self.compaction_executor.submit(task) {
+                    eprintln!("[force-compact] submit failed for {table_id}: {e}");
+                }
+            }
+        }
+    }
+
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) {
         let metadata = self.collect_sstable_metadata(table_id, state);
         let strategy = self.strategy_for_table(state);
@@ -2480,26 +2599,48 @@ impl StorageEngine {
 
                 let total_size: u64 = files.iter().map(|(_, data)| data.len() as u64).sum();
 
+                // Wait for S3 upload confirmation before adding to manifest.
+                // Previously, manifest was updated immediately after submit
+                // (fire-and-forget), causing phantom entries if upload failed.
+                let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
                 let task = crate::upload::UploadTask::SSTable {
                     table_id: table_id_str.clone(),
                     sstable_id: gen_str.clone(),
                     files,
-                    on_complete: None,
+                    on_complete: Some(tx),
                 };
                 upload_mgr.submit(task).await?;
 
-                manifest.add_sstable(
-                    table_id_str,
-                    crate::manifest::ManifestEntry {
-                        id: gen_str,
-                        size: total_size,
-                        min_token: i64::MIN,
-                        max_token: i64::MAX,
-                        min_timestamp: 0,
-                        max_timestamp: 0,
-                    },
-                );
-                uploaded += 1;
+                match rx.await {
+                    Ok(Ok(())) => {
+                        manifest.add_sstable(
+                            table_id_str,
+                            crate::manifest::ManifestEntry {
+                                id: gen_str,
+                                size: total_size,
+                                min_token: i64::MIN,
+                                max_token: i64::MAX,
+                                min_timestamp: 0,
+                                max_timestamp: 0,
+                            },
+                        );
+                        uploaded += 1;
+                    }
+                    Ok(Err(msg)) => {
+                        tracing::error!(
+                            table = table_id_str,
+                            sstable = gen_str,
+                            "S3 upload failed — NOT adding to manifest: {msg}"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            table = table_id_str,
+                            sstable = gen_str,
+                            "S3 upload worker dropped channel — NOT adding to manifest"
+                        );
+                    }
+                }
             }
         }
 
@@ -3843,6 +3984,242 @@ mod tests {
                 &actual[..actual.len().min(40)]
             );
         }
+    }
+
+    /// Flush → drop engine → re-open from disk → read back.
+    ///
+    /// Simulates a node restart. The second engine instance loads SSTables
+    /// from disk via `load_existing_sstables_and_sidecars`, exactly like
+    /// production startup. If the SSTable files are corrupt (wrong header,
+    /// generation collision, serialization mismatch), this test catches it.
+    ///
+    /// Uses entity_store schema (CompositeType PK, UUID CK, multiple columns)
+    /// to match the production table that showed 98% data loss on restart.
+    #[test]
+    fn flush_restart_roundtrip_entity_store_schema() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let schema = TableSchema {
+            keyspace: "agent_memory".to_string(),
+            table: "entity_store".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                org.apache.cassandra.db.marshal.UUIDType,\
+                org.apache.cassandra.db.marshal.UUIDType)"
+                .to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "entity_id".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "entity_name".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "entity_type".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+        let tid = TableId::new("agent_memory", "entity_store");
+
+        // Phase 1: Write data and flush
+        let total_rows = 200usize;
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+
+            // Composite PK: [u16 len][uuid bytes][0x00][u16 len][uuid bytes][0x00]
+            let tenant_uuid = [0x11u8; 16];
+            let session_uuid = [0x22u8; 16];
+            let mut pk_bytes = Vec::new();
+            pk_bytes.extend_from_slice(&(16u16).to_be_bytes());
+            pk_bytes.extend_from_slice(&tenant_uuid);
+            pk_bytes.push(0x00);
+            pk_bytes.extend_from_slice(&(16u16).to_be_bytes());
+            pk_bytes.extend_from_slice(&session_uuid);
+            pk_bytes.push(0x00);
+            let pk = DecoratedKey::new(PartitionKey::new(pk_bytes));
+
+            for i in 0..total_rows {
+                let mut entity_uuid = [0u8; 16];
+                entity_uuid[14] = (i >> 8) as u8;
+                entity_uuid[15] = i as u8;
+
+                let row = Row {
+                    clustering: entity_uuid.to_vec(),
+                    cells: vec![
+                        (
+                            0,
+                            CellValue::live(format!("entity_{i}").into_bytes(), (i + 1) as i64),
+                        ),
+                        (1, CellValue::live(b"concept".to_vec(), (i + 1) as i64)),
+                    ],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
+                };
+                engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+            }
+            engine.flush(&tid).unwrap();
+
+            // Verify pre-drop: data is readable
+            let pre = engine.read(&tid, &pk).unwrap().unwrap();
+            assert_eq!(
+                pre.rows.len(),
+                total_rows,
+                "pre-restart: all rows must be present"
+            );
+        }
+        // Engine dropped here — simulates process exit
+
+        // Phase 2: Re-open from same directory (simulates restart)
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema).unwrap();
+
+            let tenant_uuid = [0x11u8; 16];
+            let session_uuid = [0x22u8; 16];
+            let mut pk_bytes = Vec::new();
+            pk_bytes.extend_from_slice(&(16u16).to_be_bytes());
+            pk_bytes.extend_from_slice(&tenant_uuid);
+            pk_bytes.push(0x00);
+            pk_bytes.extend_from_slice(&(16u16).to_be_bytes());
+            pk_bytes.extend_from_slice(&session_uuid);
+            pk_bytes.push(0x00);
+            let pk = DecoratedKey::new(PartitionKey::new(pk_bytes));
+
+            let result = engine.read(&tid, &pk);
+            assert!(
+                result.is_ok(),
+                "post-restart read should not error: {:?}",
+                result.err()
+            );
+            let partition = result.unwrap().expect("partition must exist after restart");
+            assert_eq!(
+                partition.rows.len(),
+                total_rows,
+                "post-restart: SSTable lost rows — data corruption on restart"
+            );
+        }
+    }
+
+    /// Multiple flushes → drop engine → re-open from disk → read back.
+    ///
+    /// Simulates the production scenario: many writes triggering multiple
+    /// auto-flushes, resulting in multiple SSTables per table. On restart,
+    /// all SSTables must be loaded and merged correctly.
+    #[test]
+    fn multi_flush_restart_roundtrip_preserves_all_data() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let schema = TableSchema {
+            keyspace: "agent_memory".to_string(),
+            table: "entity_store".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                org.apache.cassandra.db.marshal.UUIDType,\
+                org.apache.cassandra.db.marshal.UUIDType)"
+                .to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "entity_id".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "entity_name".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "entity_type".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+        let tid = TableId::new("agent_memory", "entity_store");
+        let total_rows = 500usize;
+        let flushes = 5;
+        let rows_per_flush = total_rows / flushes;
+
+        // Phase 1: Write in batches with explicit flushes
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+
+            let pk = make_entity_store_pk([0x11; 16], [0x22; 16]);
+
+            for batch in 0..flushes {
+                for i in 0..rows_per_flush {
+                    let idx = batch * rows_per_flush + i;
+                    let mut entity_uuid = [0u8; 16];
+                    entity_uuid[12..16].copy_from_slice(&(idx as u32).to_be_bytes());
+
+                    let row = Row {
+                        clustering: entity_uuid.to_vec(),
+                        cells: vec![
+                            (
+                                0,
+                                CellValue::live(
+                                    format!("entity_{idx}").into_bytes(),
+                                    (idx + 1) as i64,
+                                ),
+                            ),
+                            (1, CellValue::live(b"concept".to_vec(), (idx + 1) as i64)),
+                        ],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp((idx + 1) as i64),
+                    };
+                    engine.write(&tid, &pk, row, (idx + 1) as i64).unwrap();
+                }
+                engine.flush(&tid).unwrap();
+            }
+
+            assert!(
+                engine.sstable_count(&tid) >= flushes,
+                "should have {} SSTables, got {}",
+                flushes,
+                engine.sstable_count(&tid)
+            );
+        }
+
+        // Phase 2: Re-open and verify all data survived
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema).unwrap();
+
+            let pk = make_entity_store_pk([0x11; 16], [0x22; 16]);
+            let partition = engine
+                .read(&tid, &pk)
+                .expect("read should not error")
+                .expect("partition must exist after restart");
+
+            assert_eq!(
+                partition.rows.len(),
+                total_rows,
+                "post-restart: expected {total_rows} rows, got {} — \
+                 data lost across {} SSTables",
+                partition.rows.len(),
+                flushes,
+            );
+        }
+    }
+
+    /// Helper: build CompositeType PK for entity_store.
+    fn make_entity_store_pk(tenant: [u8; 16], session: [u8; 16]) -> DecoratedKey {
+        let mut pk = Vec::new();
+        pk.extend_from_slice(&(16u16).to_be_bytes());
+        pk.extend_from_slice(&tenant);
+        pk.push(0x00);
+        pk.extend_from_slice(&(16u16).to_be_bytes());
+        pk.extend_from_slice(&session);
+        pk.push(0x00);
+        DecoratedKey::new(PartitionKey::new(pk))
     }
 
     /// SSTable compaction roundtrip: 4 flushes → STCS compaction → verify all rows.

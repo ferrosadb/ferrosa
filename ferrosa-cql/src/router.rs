@@ -1028,7 +1028,13 @@ async fn route_select_user_table(
         for raw_pk in matching_pks {
             let decorated =
                 ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(raw_pk));
-            if let Some(partition) = state.engine.read(&table_id, &decorated)? {
+            if let Some(partition) = state
+                .write_path
+                .load()
+                .read(&table_id, &decorated)
+                .await
+                .map_err(|e| CqlError::ServerError(format!("{e}")))?
+            {
                 let mut prows = bridge::partition_to_rows(
                     &partition,
                     &all_col_names,
@@ -1156,7 +1162,7 @@ async fn route_select_user_table(
                 // values that can't be coerced to the PK column type) but
                 // the planner still sees Eq predicates on all PK columns.
                 // Fall through to a full scan rather than panicking.
-                let partitions = state.write_path.load().range_read(&table_id).await;
+                let partitions = state.write_path.load().range_read(&table_id).await?;
                 let mut all_rows = Vec::new();
                 for partition in &partitions {
                     let mut prows = bridge::partition_to_rows(
@@ -1228,7 +1234,7 @@ async fn route_select_user_table(
                 // may not be wired yet (Sprint I-3). Fall back to full scan so
                 // queries still return correct results.
                 let partitions = if partitions.is_empty() {
-                    state.write_path.load().range_read(&table_id).await
+                    state.write_path.load().range_read(&table_id).await?
                 } else {
                     partitions
                 };
@@ -1289,7 +1295,7 @@ async fn route_select_user_table(
                         .read_by_index(&table_id, first_idx_name, &index_key)?;
 
                 let partitions = if partitions.is_empty() {
-                    state.write_path.load().range_read(&table_id).await
+                    state.write_path.load().range_read(&table_id).await?
                 } else {
                     partitions
                 };
@@ -1349,7 +1355,7 @@ async fn route_select_user_table(
 
                 // Use a large scan window — LIMIT is applied *after* filtering,
                 // not before, to avoid cutting off matching rows (FRSA-BUG-003).
-                let partitions = state.write_path.load().range_read(&table_id).await;
+                let partitions = state.write_path.load().range_read(&table_id).await?;
                 let mut all_rows = Vec::new();
                 for partition in &partitions {
                     let mut prows = bridge::partition_to_rows(
@@ -1820,7 +1826,13 @@ async fn route_insert(
 
     // BUG-0016: IF NOT EXISTS — check whether the row already exists before writing.
     if s.if_not_exists {
-        let existing_row = if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+        let existing_row = if let Some(partition) = state
+            .write_path
+            .load()
+            .read(&table_id, &decorated_key)
+            .await
+            .map_err(|e| CqlError::ServerError(format!("{e}")))?
+        {
             let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
             let all_col_types: Vec<CqlType> = table_meta
                 .columns
@@ -2021,7 +2033,13 @@ async fn route_update(
             .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
             .collect();
 
-        if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+        if let Some(partition) = state
+            .write_path
+            .load()
+            .read(&table_id, &decorated_key)
+            .await
+            .map_err(|e| CqlError::ServerError(format!("{e}")))?
+        {
             let rows = bridge::partition_to_rows(
                 &partition,
                 &all_col_names,

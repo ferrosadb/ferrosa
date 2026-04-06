@@ -203,9 +203,10 @@ impl AccordStateMachine {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        // Ignore capacity errors in the state machine (ConflictIndex is
-        // bounded but we don't want to fail the protocol message).
-        let _ = self.conflict_index.register(key, entry);
+        // Don't fail the protocol message on capacity errors, but log them.
+        if let Err(e) = self.conflict_index.register(key, entry) {
+            eprintln!("[accord] conflict_index register failed: {e}");
+        }
 
         // Create or update TxnState.
         let state = self
@@ -321,7 +322,10 @@ impl AccordStateMachine {
 
         // Persist commit.
         let data = format!("Committed:{}:{}", txn_id.0.time, t.time);
-        let _ = self.sync_writer.write_and_sync(data.as_bytes());
+        let sync_result = self.sync_writer.write_and_sync(data.as_bytes());
+        if !sync_result.is_ok() {
+            eprintln!("[accord] sync_writer failed during commit — state may not be durable");
+        }
 
         // Track committed transaction.
         self.committed_txns.insert(txn_id);

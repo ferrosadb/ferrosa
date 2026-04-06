@@ -311,6 +311,10 @@ fn fetch_triples(
     let partitions = match op {
         TripleOp::SubjectLookup { graph, subject, .. } => {
             let key = triple_store::partition_key(graph, subject);
+            // TODO: route through coordinator for cluster mode — storage.read()
+            // only checks LOCAL storage, returning empty when RF=1 and this node
+            // doesn't own the token. Requires threading WritePath into the SPARQL
+            // executor (see ferrosa-cluster P0 cluster-read bug).
             match storage.read(&table_id, &key)? {
                 Some(p) => vec![p],
                 None => vec![],

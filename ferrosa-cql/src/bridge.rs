@@ -858,7 +858,11 @@ pub fn build_row(
 ) -> Row {
     let clustering = encode_clustering(clustering_values);
 
-    let cells: Vec<(u16, CellValue)> = column_values
+    // Cells MUST be sorted by column index. The SSTable writer serializes
+    // cells in Vec order, but the reader reads them in column-index order
+    // (from the bitmap). If cells are out of order, the reader misinterprets
+    // cell data → parse drift → SSTable corruption → 100% data loss.
+    let mut cells: Vec<(u16, CellValue)> = column_values
         .iter()
         .map(|(idx, val)| {
             let encoded = encode_value(val);
@@ -878,6 +882,7 @@ pub fn build_row(
             (*idx, cell)
         })
         .collect();
+    cells.sort_by_key(|(idx, _)| *idx);
 
     let primary_key_liveness = match ttl {
         Some(ttl_secs) => {
@@ -932,8 +937,9 @@ pub fn build_delete_row(
             primary_key_liveness: LivenessInfo::NONE,
         }
     } else {
-        // Column-level deletion: tombstone each specified column
-        let cells: Vec<(u16, CellValue)> = delete_columns
+        // Column-level deletion: tombstone each specified column.
+        // Must be sorted by column index — same requirement as build_row.
+        let mut cells: Vec<(u16, CellValue)> = delete_columns
             .iter()
             .map(|&idx| {
                 // CellValue.local_deletion_time is i32, DeletionTime.local_deletion_time is u32
@@ -941,6 +947,7 @@ pub fn build_delete_row(
                 (idx, CellValue::tombstone(timestamp, ldt))
             })
             .collect();
+        cells.sort_by_key(|(idx, _)| *idx);
 
         Row {
             clustering,
@@ -1889,6 +1896,31 @@ mod tests {
             buf
         };
         assert_eq!(row.clustering, expected);
+    }
+
+    /// Cells passed out of column-index order must be sorted in the output.
+    ///
+    /// The SSTable writer serializes cells in Vec order, but the reader
+    /// reads in column-index order (from the bitmap). Without sorting,
+    /// different-sized values cause parse drift → 100% data loss on
+    /// restart. This is the P0 entity_store corruption root cause.
+    #[test]
+    fn build_row_sorts_cells_by_column_index() {
+        // Pass cells out of order: col 3, col 0, col 1
+        let row = build_row(
+            &[
+                (3, CqlValue::Text("big_value_here".into())),
+                (0, CqlValue::Float(0.95f32.to_bits())),
+                (1, CqlValue::Text("concept".into())),
+            ],
+            &[],
+            5000,
+            None,
+        );
+        // After fix: cells must be sorted by index
+        assert_eq!(row.cells[0].0, 0, "first cell must be col 0");
+        assert_eq!(row.cells[1].0, 1, "second cell must be col 1");
+        assert_eq!(row.cells[2].0, 3, "third cell must be col 3");
     }
 
     // --- build_delete_row tests ---

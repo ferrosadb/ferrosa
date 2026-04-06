@@ -145,9 +145,14 @@ pub fn build_serialization_header(
         }
     }
 
-    // If no real timestamps were found, use sentinel value
+    // If no real timestamps were found, use safe defaults.
+    // Both must be reset symmetrically — a stale NO_TIMESTAMP min with a
+    // real max would cause delta-encoding underflow in the SSTable writer.
     if max_timestamp == i64::MIN {
         max_timestamp = i64::MAX;
+    }
+    if min_timestamp == NO_TIMESTAMP {
+        min_timestamp = 0;
     }
 
     SerializationHeader {
@@ -194,6 +199,12 @@ pub trait FlushTarget {
     /// Advance the generation counter to at least `min_gen + 1`.
     /// Prevents future flush file names from colliding with compaction output.
     fn advance_generation(&self, _min_gen: u64) {}
+
+    /// Returns the base directory where SSTable files are written.
+    /// Used by the store to register the SSTable with its actual path.
+    fn base_dir(&self) -> &std::path::Path {
+        std::path::Path::new("")
+    }
 
     /// Write per-index sidecar files alongside the flushed SSTable.
     ///
@@ -323,16 +334,46 @@ impl FileFlushTarget {
     /// Create a file flush target that starts after the highest existing generation.
     ///
     /// Scans the directory for existing SSTable files (`{gen}-Data.db`) and
-    /// starts the generation counter at `max_gen + 1`. Used by the compaction
-    /// executor to avoid overwriting SSTables from prior flushes.
+    /// starts the generation counter at `max(max_gen, node_offset)` where
+    /// `node_offset` is derived from `FERROSA_HOST_ID` to prevent generation
+    /// collisions across nodes. Without this, two fresh nodes both start at
+    /// gen=1 and their SSTables collide in the S3 manifest.
     pub fn new_starting_at(base_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&base_dir)?;
         Self::cleanup_stale_tmp_files(&base_dir);
         let max_gen = Self::scan_max_generation(&base_dir);
+        let node_offset = Self::node_generation_offset();
         Ok(Self {
             base_dir,
-            generation: AtomicU64::new(max_gen),
+            generation: AtomicU64::new(max_gen.max(node_offset)),
         })
+    }
+
+    /// Compute a per-node generation offset from `FERROSA_HOST_ID`.
+    ///
+    /// Hashes the full host UUID to produce a well-distributed 40-bit offset
+    /// in range [0, 1 trillion). This gives each node a unique ~1M-generation
+    /// window. With typical flush rates (< 1000/day), a node would need to
+    /// run for years to exhaust its window.
+    ///
+    /// Using a hash instead of a prefix of the UUID ensures uniform
+    /// distribution even for UUIDs with common prefixes.
+    ///
+    /// Nodes with no host_id (tests, single-node) get offset 0.
+    pub(crate) fn node_generation_offset() -> u64 {
+        std::env::var("FERROSA_HOST_ID")
+            .ok()
+            .map(|s| {
+                // Simple FNV-1a hash of the UUID string, masked to 40 bits.
+                // 40 bits = ~1 trillion possible offsets.
+                let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+                for byte in s.bytes() {
+                    hash ^= byte as u64;
+                    hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+                }
+                hash & 0xFF_FFFF_FFFF // 40-bit mask → max ~1.1 trillion
+            })
+            .unwrap_or(0)
     }
 
     /// Scan a directory for the highest SSTable generation number.
@@ -358,8 +399,26 @@ impl FlushTarget for FileFlushTarget {
     type Reader = FileReadAt;
 
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<FileReadAt>> {
-        let gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        // Use a timestamp-based generation to guarantee global uniqueness.
+        // The sequential counter can collide between the table's flush target
+        // and the compaction executor's flush target (different instances with
+        // overlapping gen ranges). A microsecond timestamp ensures uniqueness
+        // across all flush targets on this node. The fetch_max + add ensures
+        // monotonicity even if two flushes happen in the same microsecond.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        // Ensure gen is at least ts and strictly greater than the previous gen.
+        self.generation.fetch_max(ts, Ordering::SeqCst);
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let base = &self.base_dir;
+        let data_size = output.data.len();
+        eprintln!(
+            "[flush] gen={gen} data_size={data_size} partitions_size={} dir={:?}",
+            output.partitions.len(),
+            base,
+        );
 
         let data_path = base.join(format!("{gen}-Data.db"));
         let partitions_path = base.join(format!("{gen}-Partitions.db"));
@@ -400,6 +459,24 @@ impl FlushTarget for FileFlushTarget {
             Ok::<(), ferrosa_common::Error>(())
         })?;
 
+        // Verify tmp files were written completely before renaming.
+        // This catches the truncation bug: if the file on disk is shorter
+        // than the in-memory buffer, something overwrote or truncated it.
+        {
+            let expected_data_size = output.data.len() as u64;
+            let actual_data_size = std::fs::metadata(tmp(&data_path))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if actual_data_size != expected_data_size {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "FLUSH CORRUPTION: Data.db.tmp gen={gen} expected {expected_data_size} bytes, \
+                     got {actual_data_size} on disk. Buffer was {expected_data_size} bytes. \
+                     Path: {:?}",
+                    tmp(&data_path)
+                )));
+            }
+        }
+
         // All tmp files written successfully — atomically rename to final names.
         // rename() is atomic on POSIX (same filesystem).
         std::fs::rename(tmp(&data_path), &data_path)?;
@@ -411,6 +488,28 @@ impl FlushTarget for FileFlushTarget {
         if has_compression_info {
             std::fs::rename(tmp(&compression_info_path), &compression_info_path)?;
         }
+
+        // Verify the renamed Data.db file is the correct size.
+        // If it differs from the tmp file we just checked, something else
+        // wrote a file with the same name in between (gen collision).
+        {
+            let expected = output.data.len() as u64;
+            let actual = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+            if actual != expected {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "FLUSH COLLISION: Data.db gen={gen} was {expected} bytes after rename, \
+                     now {actual} bytes. Another flush/compaction wrote the same file. \
+                     Path: {:?}",
+                    data_path
+                )));
+            }
+        }
+
+        eprintln!(
+            "[flush] gen={gen} VERIFIED: Data.db={} bytes on disk, path={:?}",
+            std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0),
+            data_path,
+        );
 
         // FileReadAt::open returns ferrosa_common::Result — use ? directly
         let data = FileReadAt::open(&data_path)?;
@@ -440,6 +539,10 @@ impl FlushTarget for FileFlushTarget {
 
     fn advance_generation(&self, min_gen: u64) {
         self.generation.fetch_max(min_gen + 1, Ordering::SeqCst);
+    }
+
+    fn base_dir(&self) -> &std::path::Path {
+        &self.base_dir
     }
 
     /// Write per-index sidecar files as `{gen}-{index_name}.sidecar`.
@@ -676,14 +779,18 @@ mod tests {
         let _reader = target.flush(output).unwrap();
 
         // Verify component files were created
-        assert!(dir.path().join("1-Data.db").exists());
-        assert!(dir.path().join("1-Partitions.db").exists());
-        assert!(dir.path().join("1-Rows.db").exists());
-        assert!(dir.path().join("1-Filter.db").exists());
-        assert!(dir.path().join("1-Statistics.db").exists());
-        assert!(dir.path().join("1-TOC.txt").exists());
+        let gen = target.generation();
+        assert!(dir.path().join(format!("{gen}-Data.db")).exists());
+        assert!(dir.path().join(format!("{gen}-Partitions.db")).exists());
+        assert!(dir.path().join(format!("{gen}-Rows.db")).exists());
+        assert!(dir.path().join(format!("{gen}-Filter.db")).exists());
+        assert!(dir.path().join(format!("{gen}-Statistics.db")).exists());
+        assert!(dir.path().join(format!("{gen}-TOC.txt")).exists());
         // No compression, so CompressionInfo.db should not exist
-        assert!(!dir.path().join("1-CompressionInfo.db").exists());
+        assert!(!dir
+            .path()
+            .join(format!("{gen}-CompressionInfo.db"))
+            .exists());
     }
 
     #[test]
@@ -692,7 +799,6 @@ mod tests {
         let schema = test_schema();
 
         let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
-        assert_eq!(target.generation(), 0);
 
         // First flush
         let mut partitions = vec![make_partition("k1", b"v1", 5000)];
@@ -708,7 +814,8 @@ mod tests {
         }
         let output = writer.finish().unwrap();
         let _reader1 = target.flush(output).unwrap();
-        assert_eq!(target.generation(), 1);
+        let gen1 = target.generation();
+        assert!(gen1 > 0, "generation must be positive after first flush");
 
         // Second flush
         let mut partitions2 = vec![make_partition("k2", b"v2", 6000)];
@@ -720,11 +827,12 @@ mod tests {
         }
         let output2 = writer2.finish().unwrap();
         let _reader2 = target.flush(output2).unwrap();
-        assert_eq!(target.generation(), 2);
+        let gen2 = target.generation();
+        assert!(gen2 > gen1, "generation must increase: {gen1} → {gen2}");
 
         // Verify both generations have files
-        assert!(dir.path().join("1-Data.db").exists());
-        assert!(dir.path().join("2-Data.db").exists());
+        assert!(dir.path().join(format!("{gen1}-Data.db")).exists());
+        assert!(dir.path().join(format!("{gen2}-Data.db")).exists());
     }
 
     #[test]
@@ -778,8 +886,9 @@ mod tests {
         let _reader = target.flush(output).unwrap();
 
         // Final files exist
-        assert!(dir.path().join("1-Data.db").exists());
-        assert!(dir.path().join("1-Partitions.db").exists());
+        let gen = target.generation();
+        assert!(dir.path().join(format!("{gen}-Data.db")).exists());
+        assert!(dir.path().join(format!("{gen}-Partitions.db")).exists());
 
         // No .tmp files remain
         let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
@@ -790,6 +899,106 @@ mod tests {
         assert!(
             tmp_files.is_empty(),
             "no .tmp files should remain after successful flush, found: {tmp_files:?}"
+        );
+    }
+
+    /// RED TEST (known bug): Two FileFlushTarget instances on the SAME
+    /// Two FileFlushTarget instances on the same directory must produce
+    /// DIFFERENT generation numbers. Timestamp-based gens guarantee this.
+    #[test]
+    fn concurrent_flush_targets_same_dir_no_collision() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create two flush targets on the same directory simultaneously
+        let target_a = FileFlushTarget::new_starting_at(dir.path().to_path_buf()).unwrap();
+        let target_b = FileFlushTarget::new_starting_at(dir.path().to_path_buf()).unwrap();
+
+        // Both write SSTables
+        let schema = test_schema();
+        let partitions_a = vec![make_partition("ka", b"val_a", 1000)];
+        let partitions_b = vec![make_partition("kb", b"val_b", 2000)];
+
+        let header_a = build_serialization_header(&schema, &partitions_a);
+        let header_b = build_serialization_header(&schema, &partitions_b);
+
+        let opts = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+
+        let mut writer_a = SSTableWriter::new(opts.clone(), header_a);
+        writer_a.add_partition(&partitions_a[0]).unwrap();
+        let output_a = writer_a.finish().unwrap();
+
+        let mut writer_b = SSTableWriter::new(opts, header_b);
+        writer_b.add_partition(&partitions_b[0]).unwrap();
+        let output_b = writer_b.finish().unwrap();
+
+        let _reader_a = target_a.flush(output_a).unwrap();
+        let gen_a = target_a.generation();
+
+        let _reader_b = target_b.flush(output_b).unwrap();
+        let gen_b = target_b.generation();
+
+        // Generations MUST be different — if they're the same, one SSTable
+        // overwrites the other in the shared directory
+        assert_ne!(
+            gen_a, gen_b,
+            "Two flush targets on the same directory produced the same generation {gen_a}. \
+             This causes file overwrites and truncated SSTables during concurrent compaction."
+        );
+    }
+
+    /// Verify that node_generation_offset produces different values for
+    /// different FERROSA_HOST_ID values. This is the fix for multi-node
+    /// gen collision: each node starts at a different offset.
+    #[test]
+    fn node_generation_offset_differs_per_host_id() {
+        // Compute offsets by temporarily setting the env var.
+        // We can't set env in parallel tests, so compute manually.
+        let hash = |s: &str| -> u64 {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for byte in s.bytes() {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h & 0xFF_FFFF_FFFF
+        };
+
+        let offset_a = hash("11111111-1111-1111-1111-111111111111");
+        let offset_b = hash("22222222-2222-2222-2222-222222222222");
+        let offset_c = hash("a7b3c9d2-e4f5-4a1b-8c6d-2e3f4a5b6c7d"); // realistic UUID
+
+        assert_ne!(
+            offset_a, offset_b,
+            "Different host IDs must produce different offsets"
+        );
+        assert_ne!(offset_a, offset_c);
+        assert_ne!(offset_b, offset_c);
+
+        // All offsets should be > 0 (non-trivial)
+        assert!(offset_a > 0, "offset_a should be non-zero");
+        assert!(offset_b > 0, "offset_b should be non-zero");
+        assert!(offset_c > 0, "offset_c should be non-zero");
+
+        // Offsets should be well-distributed (40-bit range)
+        assert!(offset_a > 1_000_000, "offset should be in the millions+");
+        assert!(offset_b > 1_000_000);
+    }
+
+    /// Verify that new_starting_at uses the node offset on an empty directory.
+    #[test]
+    fn new_starting_at_uses_node_offset_on_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let offset = FileFlushTarget::node_generation_offset();
+        let target = FileFlushTarget::new_starting_at(dir.path().to_path_buf()).unwrap();
+
+        // On an empty directory, the starting gen should be the node offset
+        // (or 0 if no FERROSA_HOST_ID is set in tests)
+        assert_eq!(
+            target.generation(),
+            offset,
+            "starting generation should equal node offset on empty dir"
         );
     }
 }

@@ -60,7 +60,19 @@ impl Default for DebugState {
 
 /// Build debug routes. Must be mounted under `/api/debug`.
 pub fn debug_routes() -> Router<WebAppState> {
-    Router::new().route("/flamechart", get(flamechart_handler))
+    Router::new()
+        .route("/flamechart", get(flamechart_handler))
+        .route("/force-compact", axum::routing::post(force_compact_handler))
+}
+
+/// Force compaction for all tables. Useful for debugging compaction issues.
+/// POST /api/debug/force-compact
+async fn force_compact_handler(State(state): State<WebAppState>) -> impl IntoResponse {
+    state.storage.force_compact_all();
+    // Give compaction a moment to start, then poll results
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    state.storage.poll_compactions().await;
+    (StatusCode::OK, "compaction triggered and polled\n")
 }
 
 /// Check the admin auth token from the `Authorization: Bearer <token>` header.

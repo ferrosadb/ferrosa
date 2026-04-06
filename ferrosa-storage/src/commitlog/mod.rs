@@ -159,7 +159,9 @@ impl CommitLog {
 
         // Clean up old segment files before creating new CommitLog.
         for (_, path) in &segment_files {
-            let _ = fs::remove_file(path);
+            if let Err(e) = fs::remove_file(path) {
+                eprintln!("[commitlog] failed to remove segment file: {e}");
+            }
         }
 
         let commit_log = Self::new(config)?;
@@ -291,7 +293,9 @@ impl CommitLog {
             for seg_id in &segments_to_delete {
                 if let Some(idx) = closed.iter().position(|s| s.id == *seg_id) {
                     let segment = closed.remove(idx);
-                    let _ = fs::remove_file(segment.path());
+                    if let Err(e) = fs::remove_file(segment.path()) {
+                        eprintln!("[commitlog] failed to remove segment file: {e}");
+                    }
                 }
                 archived.remove(seg_id);
             }
@@ -350,7 +354,9 @@ impl CommitLog {
             for seg_id in &segments_to_delete {
                 if let Some(idx) = closed.iter().position(|s| s.id == *seg_id) {
                     let segment = closed.remove(idx);
-                    let _ = fs::remove_file(segment.path());
+                    if let Err(e) = fs::remove_file(segment.path()) {
+                        eprintln!("[commitlog] failed to remove segment file: {e}");
+                    }
                 }
                 archived.remove(seg_id);
             }

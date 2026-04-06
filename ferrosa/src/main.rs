@@ -71,7 +71,9 @@ fn load_or_generate_host_id_with(data_dir: &Path, env_override: Option<String>) 
     // Check explicit override (from FERROSA_HOST_ID env var or test parameter).
     if let Some(id_str) = env_override {
         if let Ok(id) = Uuid::parse_str(&id_str) {
-            let _ = std::fs::write(&path, id.to_string());
+            if let Err(e) = std::fs::write(&path, id.to_string()) {
+                eprintln!("[startup] failed to persist host_id: {e}");
+            }
             tracing::info!(%id, "using host_id from override");
             return id;
         }
@@ -79,7 +81,9 @@ fn load_or_generate_host_id_with(data_dir: &Path, env_override: Option<String>) 
 
     // Generate new host_id and persist.
     let id = Uuid::new_v4();
-    let _ = std::fs::write(&path, id.to_string());
+    if let Err(e) = std::fs::write(&path, id.to_string()) {
+        eprintln!("[startup] failed to persist host_id: {e}");
+    }
     tracing::info!(%id, "generated new host_id");
     id
 }
@@ -348,6 +352,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("S3 CAS probe failed (non-fatal): {e}");
     }
     let storage = Arc::new(storage);
+
+    // Replay any pending S3 uploads that were interrupted by a crash.
+    storage.replay_pending_uploads().await;
 
     // 4. Create Schema
     let schema_config = ferrosa_schema::SchemaConfig {
@@ -964,8 +971,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 13. Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
+    // 13. Wait for shutdown signal (SIGINT or SIGTERM)
+    //
+    // Docker/Podman sends SIGTERM on `stop`. Without this, the process
+    // only handles Ctrl-C (SIGINT) and gets killed after the stop timeout
+    // WITHOUT flushing memtables — causing 100% data loss on restart.
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
 
     // 14. Graceful shutdown: flush memtables, sync to S3, stop compaction
     tracing::info!("shutdown signal received, draining...");

@@ -74,7 +74,9 @@ impl SyncStrategy for BatchSync {
         // Intentionally ignoring the error here — the caller (CommitLog)
         // will handle flush failures at a higher level. In a production
         // system we'd propagate, but the trait signature returns `()`.
-        let _ = segment.flush_to_disk();
+        if let Err(e) = segment.flush_to_disk() {
+            eprintln!("[commitlog] flush_to_disk failed — data may not be durable: {e}");
+        }
         // No sync marker needed: BatchSync flushes every entry individually,
         // so every entry is already durable. Markers are only useful for
         // PeriodicSync/GroupSync where batches of entries are flushed together.
@@ -154,7 +156,9 @@ impl SyncStrategy for PeriodicSync {
                         break;
                     }
 
-                    let _ = flush_callback();
+                    if let Err(e) = flush_callback() {
+                        eprintln!("[commitlog] periodic flush_callback failed — data may not be durable: {e}");
+                    }
                 }
             })
             .expect("failed to spawn periodic sync thread");
@@ -180,7 +184,9 @@ impl SyncStrategy for PeriodicSync {
         }
 
         // Final flush to ensure all pending data is on disk.
-        let _ = (self.flush_callback)();
+        if let Err(e) = (self.flush_callback)() {
+            eprintln!("[commitlog] shutdown flush_callback failed — data may not be durable: {e}");
+        }
     }
 }
 
@@ -316,7 +322,9 @@ impl SyncStrategy for GroupSync {
                     // Flush pending writes.
                     let pending = state.pending.swap(0, Ordering::AcqRel);
                     if pending > 0 {
-                        let _ = flush_callback();
+                        if let Err(e) = flush_callback() {
+                            eprintln!("[commitlog] group flush_callback failed — data may not be durable: {e}");
+                        }
                     }
 
                     // Advance generation and wake all waiting writers.
@@ -348,7 +356,9 @@ impl SyncStrategy for GroupSync {
         }
 
         // Final flush to ensure all pending data is on disk.
-        let _ = (self.flush_callback)();
+        if let Err(e) = (self.flush_callback)() {
+            eprintln!("[commitlog] shutdown flush_callback failed — data may not be durable: {e}");
+        }
 
         // Wake any writers still waiting.
         self.state.generation.fetch_add(1, Ordering::AcqRel);

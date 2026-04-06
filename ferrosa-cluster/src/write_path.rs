@@ -134,26 +134,58 @@ impl WritePath {
         }
     }
 
+    /// Read a single partition by key, routing to the correct replica.
+    ///
+    /// - `Direct` / `Pair`: reads from local storage (single-node).
+    /// - `Cluster`: routes through ClusterCoordinator to the correct replica.
+    /// - `Unavailable`: returns None.
+    pub async fn read(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+    ) -> ferrosa_common::Result<Option<Partition>> {
+        match self {
+            Self::Direct(engine) => engine.read(table_id, key),
+            Self::Pair(coordinator) => coordinator.local_storage().read(table_id, key),
+            Self::Cluster(coordinator) => match coordinator.coordinate_read(table_id, key).await {
+                Ok(Some(rows)) => Ok(Some(Partition {
+                    key: key.clone(),
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    static_row: None,
+                    rows,
+                })),
+                Ok(None) => Ok(None),
+                Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "coordinate_read: {e}"
+                ))),
+            },
+            Self::Unavailable => Ok(None),
+        }
+    }
+
     /// Scatter a full-table range read to all nodes that hold data for
     /// `table_id` and return the deduplicated union of all partitions.
     ///
     /// - `Direct` / `Pair`: reads from local storage only (single-node case).
     /// - `Cluster`: fans out to every ring node and merges results.
-    /// - `Unavailable`: returns an empty vec (degraded mode).
-    pub async fn range_read(&self, table_id: &TableId) -> Vec<Partition> {
+    /// - `Unavailable`: returns error (degraded mode).
+    ///
+    /// Errors are propagated — callers MUST handle them. Silently returning
+    /// empty results on failure causes data loss (see BUG: large-write-causes-
+    /// data-loss-in-partition).
+    pub async fn range_read(&self, table_id: &TableId) -> crate::error::Result<Vec<Partition>> {
         match self {
             Self::Direct(engine) => engine
                 .read_range(table_id, None, None, 1_000_000)
-                .unwrap_or_default(),
+                .map_err(crate::error::ClusterError::Storage),
             Self::Pair(coordinator) => coordinator
                 .local_storage()
                 .read_range(table_id, None, None, 1_000_000)
-                .unwrap_or_default(),
-            Self::Cluster(coordinator) => coordinator
-                .coordinate_range_read(table_id)
-                .await
-                .unwrap_or_default(),
-            Self::Unavailable => vec![],
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Cluster(coordinator) => coordinator.coordinate_range_read(table_id).await,
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "range read unavailable: write path is in degraded mode".into(),
+            )),
         }
     }
 
