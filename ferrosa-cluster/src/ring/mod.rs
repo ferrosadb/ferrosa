@@ -780,3 +780,86 @@ mod tests {
         }
     }
 }
+
+/// After the fix: all nodes Normal → replicas() returns the correct owner.
+#[test]
+fn replicas_all_normal_routes_to_correct_owner() {
+    use crate::raft::{NodeInfo, NodeState};
+
+    let mut ring = TokenRing::new();
+    for (id, addr) in [(1, "n1"), (2, "n2"), (3, "n3")] {
+        ring.add_node(
+            id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: format!("{addr}:7000"),
+                data_center: "dc1".into(),
+                rack: "r1".into(),
+                state: NodeState::Normal, // all Normal after fix
+                cql_broadcast: None,
+            },
+        );
+    }
+    ring.assign_tokens(1, &[0, 100, 200]);
+    ring.assign_tokens(2, &[50, 150, 250]);
+    ring.assign_tokens(3, &[75, 175, 275]);
+
+    // Token 60: clockwise walk finds 75 (node3) first → node3 owns (50,75]
+    let replicas = ring.replicas(60, 1);
+    assert_eq!(replicas.len(), 1);
+    assert_eq!(replicas[0], 3, "token 60 → node3 (owns (50,75])");
+
+    // Token 30: clockwise finds 50 (node2) → node2 owns (0,50]
+    let replicas = ring.replicas(30, 1);
+    assert_eq!(replicas[0], 2, "token 30 → node2");
+}
+
+/// Documents the P0 data scatter bug: when peers are Joining,
+/// replicas() skips them and returns the only Normal node — causing
+/// every coordinator to write locally instead of forwarding to the
+/// correct owner.
+#[test]
+fn replicas_joining_peers_misroutes_to_only_normal_node() {
+    use crate::raft::{NodeInfo, NodeState};
+
+    let mut ring = TokenRing::new();
+    ring.add_node(
+        1,
+        NodeInfo {
+            host_id: uuid::Uuid::new_v4(),
+            addr: "n1:7000".into(),
+            data_center: "dc1".into(),
+            rack: "r1".into(),
+            state: NodeState::Normal, // only this node is Normal
+            cql_broadcast: None,
+        },
+    );
+    for id in [2, 3] {
+        ring.add_node(
+            id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: format!("n{id}:7000"),
+                data_center: "dc1".into(),
+                rack: "r1".into(),
+                state: NodeState::Joining, // peers are Joining
+                cql_broadcast: None,
+            },
+        );
+    }
+    ring.assign_tokens(1, &[0, 100, 200]);
+    ring.assign_tokens(2, &[50, 150, 250]);
+    ring.assign_tokens(3, &[75, 175, 275]);
+
+    // Token 60 should go to node2, but node2 is Joining → skipped.
+    // replicas() falls through to node1 (only Normal node).
+    let replicas = ring.replicas(60, 1);
+    assert_eq!(replicas.len(), 1);
+    // This documents the BUG — node 1 is returned instead of node 2.
+    // On each node's ring, only SELF is Normal, so every node thinks
+    // it owns every token → writes scatter.
+    assert_eq!(
+        replicas[0], 1,
+        "with Joining peers, replicas() misroutes to the only Normal node"
+    );
+}

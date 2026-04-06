@@ -550,6 +550,16 @@ fn serialize_cell(
 
     // Timestamp (unsigned varint delta, if not using row timestamp)
     if !use_row_timestamp {
+        // Safety: if cell.timestamp < header.min_timestamp, the cast to u64
+        // wraps to a huge value, producing a corrupt varint that will be
+        // misread as a garbage length later. Assert to catch this at write time.
+        debug_assert!(
+            cell.timestamp >= header.min_timestamp,
+            "SSTable writer: cell timestamp {} < header min_timestamp {} — \
+             delta would underflow",
+            cell.timestamp,
+            header.min_timestamp
+        );
         let ts_delta = (cell.timestamp - header.min_timestamp) as u64;
         push_unsigned_vint_to(buf, ts_delta);
     }
@@ -570,6 +580,15 @@ fn serialize_cell(
     // Value (absent if HAS_EMPTY_VALUE)
     if !has_empty_value {
         if let Some(ref value) = cell.value {
+            // Safety assertion: catch corrupt cell values at write time.
+            // The max CQL value size is 256 MiB. Anything larger is a bug.
+            const MAX_CELL_VALUE: usize = 256 * 1024 * 1024;
+            assert!(
+                value.len() <= MAX_CELL_VALUE,
+                "SSTable writer: cell value length {} exceeds maximum {MAX_CELL_VALUE} — \
+                 this is a bug in the write path, not user data",
+                value.len()
+            );
             push_unsigned_vint_to(buf, value.len() as u64);
             buf.extend_from_slice(value);
         }

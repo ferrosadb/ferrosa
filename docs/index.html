@@ -1298,6 +1298,7 @@
     <div class="code-tabs">
       <button class="code-tab active" onclick="showTab('cql')">CQL</button>
       <button class="code-tab" onclick="showTab('cypher')">Cypher</button>
+      <button class="code-tab" onclick="showTab('sparql')">SPARQL</button>
       <button class="code-tab" onclick="showTab('indexes')">Indexes</button>
       <button class="code-tab" onclick="showTab('python')">Python Driver</button>
       <button class="code-tab" onclick="showTab('observe')">Observability</button>
@@ -1345,6 +1346,38 @@
 <span class="kw">MATCH</span> (a:<span class="type">Person</span>)-[:<span class="type">FOLLOWS</span>*<span class="num">2</span>]->(c:<span class="type">Person</span>)
 <span class="kw">WHERE</span> a.name <span class="op">=</span> <span class="str">'Alice'</span>
 <span class="kw">RETURN DISTINCT</span> c.name;</pre>
+
+    <pre class="code-block" id="tab-sparql"><span class="cm"># SPARQL 1.1 — semantic queries on the same data</span>
+<span class="cm"># W3C standard for RDF, knowledge graphs, and provenance</span>
+
+<span class="kw">PREFIX</span> foaf: &lt;<span class="str">http://xmlns.com/foaf/0.1/</span>&gt;
+
+<span class="cm"># Find all people and who they know</span>
+<span class="kw">SELECT</span> ?person ?friend
+<span class="kw">WHERE</span> {
+  ?person foaf:name ?name .
+  ?person foaf:knows ?friend .
+}
+<span class="kw">ORDER BY</span> ?name <span class="kw">LIMIT</span> <span class="num">20</span>
+
+<span class="cm"># Property paths — transitive closure (who can Alice reach?)</span>
+<span class="kw">SELECT DISTINCT</span> ?reachable
+<span class="kw">WHERE</span> {
+  &lt;<span class="str">http://example.org/alice</span>&gt; foaf:knows+ ?reachable .
+}
+
+<span class="cm"># RDF* annotations — provenance on edges</span>
+<span class="kw">SELECT</span> ?who ?confidence
+<span class="kw">WHERE</span> {
+  &lt;&lt; ?s foaf:knows ?o &gt;&gt; &lt;<span class="str">http://example.org/confidence</span>&gt; ?confidence .
+  <span class="kw">FILTER</span>(?confidence &gt; <span class="num">0.8</span>)
+}
+
+<span class="cm"># INSERT DATA — write triples via SPARQL Update</span>
+<span class="kw">INSERT DATA</span> {
+  &lt;<span class="str">http://example.org/bob</span>&gt; foaf:name <span class="str">"Bob"</span> .
+  &lt;<span class="str">http://example.org/bob</span>&gt; foaf:knows &lt;<span class="str">http://example.org/alice</span>&gt; .
+}</pre>
 
     <pre class="code-block" id="tab-indexes"><span class="cm">-- B-tree index for sorted range queries</span>
 <span class="kw">CREATE INDEX</span> idx_email <span class="kw">ON</span> <span class="type">social.users</span> (email) <span class="kw">USING</span> <span class="str">'btree'</span>;
@@ -1610,14 +1643,6 @@ user = session.execute(stmt, [user_id])
           <td>Cloud tier</td>
           <td>Full (AWS)</td>
           <td>Full (AWS)</td>
-        </tr>
-        <tr>
-          <td>Source Available</td>
-          <td class="ferrosa-col">Coming Soon</td>
-          <td><span class="check">✓</span></td>
-          <td>Partial</td>
-          <td><span class="cross">✗</span></td>
-          <td><span class="cross">✗</span></td>
         </tr>
       </tbody>
     </table>

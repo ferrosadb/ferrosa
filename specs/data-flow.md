@@ -1,11 +1,19 @@
 # Data Flow
 
-> Last updated: 2026-04-02
+> Last updated: 2026-04-05
 > Status: Approved
 
 ## Overview
 
 Ferrosa uses a write-behind async S3 storage model. Writes go to local ephemeral storage first, then are asynchronously uploaded to S3. Reads check memtable, local cache, then fall back to S3 on cache miss. Transactional writes (LWT, BEGIN TRANSACTION) route through the Accord consensus protocol for serializable isolation before reaching the storage engine.
+
+Five protocol endpoints share the same storage engine:
+
+- **CQL** (port 9042) — CQL native protocol v4/v5 with CRC integrity (v5)
+- **Bolt** (port 7687) — Neo4j driver compatibility for Cypher
+- **Graph HTTP** (port 7474) — Cypher queries via HTTP/JSON
+- **SPARQL** (port 8080) — SPARQL 1.1 Query/Update with RDF* and content negotiation
+- **Web console** (port 9090) — Observability dashboard and metrics
 
 ## Write Path
 

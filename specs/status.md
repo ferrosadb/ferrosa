@@ -1,14 +1,14 @@
 # Ferrosa Development Status
 
-> Last updated: 2026-04-02
+> Last updated: 2026-04-05
 > Status: Living document
 
 ## Overview
 
-Ferrosa is a **distributed CQL-compatible database** with graph query support,
+Ferrosa is an **AI native database** with CQL, Cypher, and SPARQL query support,
 built-in observability, Accord consensus transactions, and S3-backed storage.
 
-**Completed milestones (2026-04-03):**
+**Completed milestones (2026-04-05):**
 
 - **Observability (O1-O6)** — Self-hosted telemetry: FerrosaTelemetryLayer with direct StorageEngine writes (no feedback loop), 25+ tracing spans across CQL/coordinator/Accord/storage/network, slow query detection with parameterized text, query fingerprint tracker (top 10k), billing metering per client, alert evaluator, table access summary, full scan reasons, internode trace context propagation (32-byte header), on-demand flame chart endpoint, 13 virtual tables in `system_observability.*`, `otel` feature flag for enterprise export.
 - **S4 close all hazards** — DDL queued during Forming (not rejected), ClusterInviteHandler spawns tracked, transition guard on disconnect, RangeReadHandler truncation flag, capped unbounded collections, PairClusterState peer cache, SSTable-based streaming, BootstrapComplete RPC barrier.
@@ -23,10 +23,17 @@ built-in observability, Accord consensus transactions, and S3-backed storage.
 - **Secondary + vector indexes** — BTree, Hash, Composite, Phonetic, Filtered, Vector (HNSW, IVFFlat), FullText — 11 index types with query planner integration
 - **PITR** — S3-native: commit log archiving, snapshot management, point-in-time restoration, CLI tooling
 - **Graph engine** — Complete: eval, aggregations, var-length paths, SUBSCRIBE, Bolt v5
+- **CQL protocol v5 wire format** — Full v5 support: 6-byte LE frame headers with CRC24/CRC32 integrity checks, message segmentation, `ProtocolVersionMismatch` for v6+ rejection, v4 backward compatible. 26 handshake tests (v4 + v5).
+- **SPARQL 1.1 endpoint** — New `ferrosa-sparql` crate: SPARQL parser (spargebra with SPARQL 1.2/RDF*), planner, executor, FILTER evaluation, property path BFS with cycle detection, content negotiation (JSON/Turtle/N-Triples), SPARQL UPDATE (INSERT/DELETE DATA), 77 tests. Port 8080.
+- **Raft starvation fix** — Dedicated OS thread for Raft lane, write backpressure semaphore(128), parallel batch processing, election timeout increase, lane capacity 64→256.
+- **Cluster formation race fix** — Deterministic seed election via max(all member UUIDs), Raft lane readiness check, early raft instance publication, initiator included in ClusterInvite peer list.
+- **Compaction corruption resilience** — Skip corrupt/truncated SSTables with warning instead of failing entire task.
+- **DDL forward fix** — `ClusterDdlForwardHandler` accepts both `DdlOperation` and `DdlEnvelope` formats, fixing schema propagation on fresh clusters.
+- **CQL readiness** — Immediate "keyspace not found" error instead of silent timeout for unpropagated keyspaces.
 
 | Metric | Value |
 |--------|-------|
-| Crates | 13 (12 core + ferrosa-jepsen) |
+| Crates | 14 (13 core + ferrosa-jepsen) |
 | Source files | ~378 |
 | Source LOC | ~258,000+ |
 | Test functions | ~3,499+ |

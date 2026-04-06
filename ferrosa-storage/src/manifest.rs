@@ -167,8 +167,17 @@ impl Manifest {
         prefix: &str,
     ) -> ferrosa_common::Result<()> {
         for attempt in 0..MAX_CAS_RETRIES {
-            let (_, version) = Self::load(store, prefix).await?;
-            match self.save(store, prefix, version).await {
+            // Re-load the LATEST manifest from S3 and MERGE our entries
+            // into it. This ensures that entries added by other nodes
+            // since we loaded our copy are preserved.
+            //
+            // BUG FIX: Previously, this re-loaded only the version (etag)
+            // but saved `self` (the caller's stale snapshot). If another
+            // node had added entries in the meantime, those entries were
+            // silently overwritten — causing data loss.
+            let (latest, version) = Self::load(store, prefix).await?;
+            let merged = self.merge_into(&latest);
+            match merged.save(store, prefix, version).await {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < MAX_CAS_RETRIES - 1 => {
                     eprintln!(
@@ -190,6 +199,30 @@ impl Manifest {
             .entry(table_id.to_string())
             .or_default()
             .push(entry);
+    }
+
+    /// Merge this manifest's entries into `base`, producing a new manifest
+    /// that contains the union of both. Entries with the same `(table_id, id)`
+    /// are deduplicated (self's version wins).
+    ///
+    /// Used by `save_with_retry` to preserve entries added by other nodes
+    /// between our load and save.
+    pub fn merge_into(&self, base: &Manifest) -> Manifest {
+        let mut merged = base.clone();
+        for (table_id, entries) in &self.sstables {
+            let existing = merged.sstables.entry(table_id.clone()).or_default();
+            let existing_ids: std::collections::HashSet<String> =
+                existing.iter().map(|e| e.id.clone()).collect();
+            for entry in entries {
+                if !existing_ids.contains(&entry.id) {
+                    existing.push(entry.clone());
+                }
+            }
+        }
+        if self.last_compacted_at > merged.last_compacted_at {
+            merged.last_compacted_at = self.last_compacted_at.clone();
+        }
+        merged
     }
 
     /// Removes SSTable entries by ID (after compaction replaces them).
