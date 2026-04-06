@@ -200,6 +200,12 @@ pub trait FlushTarget {
     /// Prevents future flush file names from colliding with compaction output.
     fn advance_generation(&self, _min_gen: u64) {}
 
+    /// Returns the base directory where SSTable files are written.
+    /// Used by the store to register the SSTable with its actual path.
+    fn base_dir(&self) -> &std::path::Path {
+        std::path::Path::new("")
+    }
+
     /// Write per-index sidecar files alongside the flushed SSTable.
     ///
     /// Called after [`FlushTarget::flush`] with the same generation number. For each
@@ -393,8 +399,26 @@ impl FlushTarget for FileFlushTarget {
     type Reader = FileReadAt;
 
     fn flush(&self, output: SSTableOutput) -> Result<SSTableReader<FileReadAt>> {
-        let gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        // Use a timestamp-based generation to guarantee global uniqueness.
+        // The sequential counter can collide between the table's flush target
+        // and the compaction executor's flush target (different instances with
+        // overlapping gen ranges). A microsecond timestamp ensures uniqueness
+        // across all flush targets on this node. The fetch_max + add ensures
+        // monotonicity even if two flushes happen in the same microsecond.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        // Ensure gen is at least ts and strictly greater than the previous gen.
+        self.generation.fetch_max(ts, Ordering::SeqCst);
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let base = &self.base_dir;
+        let data_size = output.data.len();
+        eprintln!(
+            "[flush] gen={gen} data_size={data_size} partitions_size={} dir={:?}",
+            output.partitions.len(),
+            base,
+        );
 
         let data_path = base.join(format!("{gen}-Data.db"));
         let partitions_path = base.join(format!("{gen}-Partitions.db"));
@@ -481,6 +505,12 @@ impl FlushTarget for FileFlushTarget {
             }
         }
 
+        eprintln!(
+            "[flush] gen={gen} VERIFIED: Data.db={} bytes on disk, path={:?}",
+            std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0),
+            data_path,
+        );
+
         // FileReadAt::open returns ferrosa_common::Result — use ? directly
         let data = FileReadAt::open(&data_path)?;
         let partitions = FileReadAt::open(&partitions_path)?;
@@ -509,6 +539,10 @@ impl FlushTarget for FileFlushTarget {
 
     fn advance_generation(&self, min_gen: u64) {
         self.generation.fetch_max(min_gen + 1, Ordering::SeqCst);
+    }
+
+    fn base_dir(&self) -> &std::path::Path {
+        &self.base_dir
     }
 
     /// Write per-index sidecar files as `{gen}-{index_name}.sidecar`.
@@ -745,14 +779,18 @@ mod tests {
         let _reader = target.flush(output).unwrap();
 
         // Verify component files were created
-        assert!(dir.path().join("1-Data.db").exists());
-        assert!(dir.path().join("1-Partitions.db").exists());
-        assert!(dir.path().join("1-Rows.db").exists());
-        assert!(dir.path().join("1-Filter.db").exists());
-        assert!(dir.path().join("1-Statistics.db").exists());
-        assert!(dir.path().join("1-TOC.txt").exists());
+        let gen = target.generation();
+        assert!(dir.path().join(format!("{gen}-Data.db")).exists());
+        assert!(dir.path().join(format!("{gen}-Partitions.db")).exists());
+        assert!(dir.path().join(format!("{gen}-Rows.db")).exists());
+        assert!(dir.path().join(format!("{gen}-Filter.db")).exists());
+        assert!(dir.path().join(format!("{gen}-Statistics.db")).exists());
+        assert!(dir.path().join(format!("{gen}-TOC.txt")).exists());
         // No compression, so CompressionInfo.db should not exist
-        assert!(!dir.path().join("1-CompressionInfo.db").exists());
+        assert!(!dir
+            .path()
+            .join(format!("{gen}-CompressionInfo.db"))
+            .exists());
     }
 
     #[test]
@@ -761,7 +799,6 @@ mod tests {
         let schema = test_schema();
 
         let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
-        assert_eq!(target.generation(), 0);
 
         // First flush
         let mut partitions = vec![make_partition("k1", b"v1", 5000)];
@@ -777,7 +814,8 @@ mod tests {
         }
         let output = writer.finish().unwrap();
         let _reader1 = target.flush(output).unwrap();
-        assert_eq!(target.generation(), 1);
+        let gen1 = target.generation();
+        assert!(gen1 > 0, "generation must be positive after first flush");
 
         // Second flush
         let mut partitions2 = vec![make_partition("k2", b"v2", 6000)];
@@ -789,11 +827,12 @@ mod tests {
         }
         let output2 = writer2.finish().unwrap();
         let _reader2 = target.flush(output2).unwrap();
-        assert_eq!(target.generation(), 2);
+        let gen2 = target.generation();
+        assert!(gen2 > gen1, "generation must increase: {gen1} → {gen2}");
 
         // Verify both generations have files
-        assert!(dir.path().join("1-Data.db").exists());
-        assert!(dir.path().join("2-Data.db").exists());
+        assert!(dir.path().join(format!("{gen1}-Data.db")).exists());
+        assert!(dir.path().join(format!("{gen2}-Data.db")).exists());
     }
 
     #[test]
@@ -847,8 +886,9 @@ mod tests {
         let _reader = target.flush(output).unwrap();
 
         // Final files exist
-        assert!(dir.path().join("1-Data.db").exists());
-        assert!(dir.path().join("1-Partitions.db").exists());
+        let gen = target.generation();
+        assert!(dir.path().join(format!("{gen}-Data.db")).exists());
+        assert!(dir.path().join(format!("{gen}-Partitions.db")).exists());
 
         // No .tmp files remain
         let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
@@ -863,11 +903,10 @@ mod tests {
     }
 
     /// RED TEST (known bug): Two FileFlushTarget instances on the SAME
-    /// directory produce colliding generation numbers. This is why
-    /// compaction tasks MUST use per-table output directories.
+    /// Two FileFlushTarget instances on the same directory must produce
+    /// DIFFERENT generation numbers. Timestamp-based gens guarantee this.
     #[test]
-    #[should_panic(expected = "same generation")]
-    fn concurrent_flush_targets_same_dir_collide_generations() {
+    fn concurrent_flush_targets_same_dir_no_collision() {
         let dir = tempfile::tempdir().unwrap();
 
         // Create two flush targets on the same directory simultaneously

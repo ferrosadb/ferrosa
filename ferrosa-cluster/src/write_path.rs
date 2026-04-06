@@ -134,6 +134,35 @@ impl WritePath {
         }
     }
 
+    /// Read a single partition by key, routing to the correct replica.
+    ///
+    /// - `Direct` / `Pair`: reads from local storage (single-node).
+    /// - `Cluster`: routes through ClusterCoordinator to the correct replica.
+    /// - `Unavailable`: returns None.
+    pub async fn read(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+    ) -> ferrosa_common::Result<Option<Partition>> {
+        match self {
+            Self::Direct(engine) => engine.read(table_id, key),
+            Self::Pair(coordinator) => coordinator.local_storage().read(table_id, key),
+            Self::Cluster(coordinator) => match coordinator.coordinate_read(table_id, key).await {
+                Ok(Some(rows)) => Ok(Some(Partition {
+                    key: key.clone(),
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    static_row: None,
+                    rows,
+                })),
+                Ok(None) => Ok(None),
+                Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "coordinate_read: {e}"
+                ))),
+            },
+            Self::Unavailable => Ok(None),
+        }
+    }
+
     /// Scatter a full-table range read to all nodes that hold data for
     /// `table_id` and return the deduplicated union of all partitions.
     ///

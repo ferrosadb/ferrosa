@@ -19,6 +19,7 @@ pub mod batchlog;
 pub mod cache;
 pub mod commitlog;
 pub mod compaction;
+pub mod data_store;
 pub mod engine;
 pub mod flush;
 pub mod index;
@@ -45,6 +46,7 @@ pub use commitlog::{
 pub use compaction::{
     CompactionConfig, CompactionExecutor, CompactionStrategy, SizeTieredStrategy,
 };
+pub use data_store::{DataStore, LocalDataStore};
 pub use engine::{StorageEngine, StorageEngineConfig};
 pub use flush::{FileFlushTarget, FlushTarget, InMemoryFlushTarget};
 pub use manifest::{load_schema_snapshot, save_schema_snapshot, Manifest};

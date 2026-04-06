@@ -259,6 +259,7 @@ fn execute_expand(
         let mut next_keys = Vec::new();
         for vertex_key in &current_keys {
             // Read adjacency entries for this vertex.
+            // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
             let adj_partition = storage.read(&adj_table_id, vertex_key)?;
             if let Some(partition) = adj_partition {
                 stats.edges_read += partition.rows.len();
@@ -268,6 +269,7 @@ fn execute_expand(
                 let edge_partition = if !hop.prop_filters.is_empty() {
                     if let Some(ref et) = hop.edge_table {
                         let edge_tid = TableId::new(&et.keyspace, &et.table);
+                        // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
                         storage.read(&edge_tid, vertex_key)?
                     } else {
                         None
@@ -322,6 +324,7 @@ fn execute_expand(
         }
 
         // Read the full partition from storage for property projection.
+        // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
         let partition = storage.read(&anchor_table_id_for_proj, key)?;
 
         let hex_id = hex::encode(key.key.as_bytes());

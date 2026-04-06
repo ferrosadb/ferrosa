@@ -222,6 +222,13 @@ pub struct ReadRequestPayload {
     pub key: Vec<u8>,
     /// If true, return only the CRC32 digest, not the full partition data.
     pub digest_only: bool,
+    /// Maximum number of rows to return per response page.
+    /// 0 means unlimited (backwards-compatible default).
+    #[serde(default)]
+    pub page_size: u32,
+    /// Opaque page state from a previous response. Empty = start from beginning.
+    #[serde(default)]
+    pub page_state: Vec<u8>,
 }
 
 /// Payload for a remote read response.
@@ -236,6 +243,13 @@ pub struct ReadResponsePayload {
     pub timestamp: i64,
     /// CRC32 digest of the serialized partition.  `None` if not found.
     pub digest: Option<u32>,
+    /// If true, more pages are available. Send another ReadRequest with
+    /// `page_state` set to `next_page_state` to get the next chunk.
+    #[serde(default)]
+    pub has_more: bool,
+    /// Opaque state for fetching the next page.
+    #[serde(default)]
+    pub next_page_state: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -600,8 +614,11 @@ impl RpcHandler for ReadRequestHandler {
         let table_id = TableId::new(&req.keyspace, &req.table);
         let key = DecoratedKey::new(PartitionKey::new(req.key));
 
+        // MUST use read_local — this handler is the RECEIVING end of a
+        // remote ReadRequest. Using read() would route through the coordinator
+        // which sends another ReadRequest → infinite recursion → stack overflow.
         let payload = match self.storage.read(&table_id, &key) {
-            Ok(Some(partition)) => {
+            Ok(Some(mut partition)) => {
                 let ts = newest_timestamp(&partition);
                 let digest = match compute_partition_digest(&partition) {
                     Ok(d) => Some(d),
@@ -610,6 +627,32 @@ impl RpcHandler for ReadRequestHandler {
                         None
                     }
                 };
+
+                // Paging: if page_size > 0, return only a page of rows.
+                let page_size = req.page_size as usize;
+                let page_offset: usize = if req.page_state.len() >= 8 {
+                    u64::from_le_bytes(req.page_state[..8].try_into().unwrap_or([0; 8])) as usize
+                } else {
+                    0
+                };
+
+                let (has_more, next_page_state) = if page_size > 0
+                    && !req.digest_only
+                    && partition.rows.len() > page_offset + page_size
+                {
+                    // Truncate to this page
+                    let end = (page_offset + page_size).min(partition.rows.len());
+                    partition.rows = partition.rows[page_offset..end].to_vec();
+                    let next_offset = end as u64;
+                    (true, next_offset.to_le_bytes().to_vec())
+                } else if page_size > 0 && !req.digest_only && page_offset > 0 {
+                    // Last page: slice from offset to end
+                    partition.rows = partition.rows[page_offset..].to_vec();
+                    (false, vec![])
+                } else {
+                    (false, vec![])
+                };
+
                 let wire_partition = if req.digest_only {
                     None
                 } else {
@@ -620,6 +663,8 @@ impl RpcHandler for ReadRequestHandler {
                     partition: wire_partition,
                     timestamp: ts,
                     digest,
+                    has_more,
+                    next_page_state,
                 }
             }
             Ok(None) => ReadResponsePayload {
@@ -627,6 +672,8 @@ impl RpcHandler for ReadRequestHandler {
                 partition: None,
                 timestamp: i64::MIN,
                 digest: None,
+                has_more: false,
+                next_page_state: vec![],
             },
             Err(e) => {
                 tracing::warn!("ReadRequestHandler: storage read failed: {e}");
@@ -829,6 +876,8 @@ mod tests {
             table: "tbl".to_string(),
             key: b"the_key".to_vec(),
             digest_only: false,
+            page_size: 0,
+            page_state: vec![],
         };
         let bytes = bincode::serialize(&req).expect("serialize");
         let decoded: ReadRequestPayload = bincode::deserialize(&bytes).expect("deserialize");
@@ -846,6 +895,8 @@ mod tests {
             partition: Some(partition_to_wire(partition)),
             timestamp: 42,
             digest: Some(0xDEAD_BEEF),
+            has_more: false,
+            next_page_state: vec![],
         };
         let bytes = bincode::serialize(&resp).expect("serialize");
         let decoded: ReadResponsePayload = bincode::deserialize(&bytes).expect("deserialize");
@@ -965,6 +1016,8 @@ mod tests {
             table: "test_tbl".to_string(),
             key: key_bytes.to_vec(),
             digest_only: false,
+            page_size: 0,
+            page_state: vec![],
         };
         let req_bytes = bincode::serialize(&req).unwrap();
         let msg = Message::ReadRequest(Bytes::from(req_bytes));
@@ -995,6 +1048,8 @@ mod tests {
             table: "test_tbl".to_string(),
             key: b"nonexistent".to_vec(),
             digest_only: false,
+            page_size: 0,
+            page_state: vec![],
         };
         let req_bytes = bincode::serialize(&req).unwrap();
         let msg = Message::ReadRequest(Bytes::from(req_bytes));
@@ -1036,6 +1091,8 @@ mod tests {
             table: "test_tbl".to_string(),
             key: key_bytes.to_vec(),
             digest_only: true,
+            page_size: 0,
+            page_state: vec![],
         };
         let req_bytes = bincode::serialize(&req).unwrap();
         let msg = Message::ReadRequest(Bytes::from(req_bytes));

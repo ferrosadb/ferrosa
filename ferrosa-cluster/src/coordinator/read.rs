@@ -149,6 +149,8 @@ impl ClusterCoordinator {
             table: table_id.table.clone(),
             key: key.key.as_bytes().to_vec(),
             digest_only: false,
+            page_size: 0,
+            page_state: vec![],
         };
         let body = encode_read_request(&payload);
         match self
@@ -260,6 +262,8 @@ impl ClusterCoordinator {
                             table: table_name,
                             key: key_bytes,
                             digest_only: false,
+                            page_size: 0,
+                            page_state: vec![],
                         };
                         let body = encode_read_request(&payload);
                         match full_host_id {
@@ -332,6 +336,8 @@ impl ClusterCoordinator {
                             table: table_name,
                             key: key_bytes,
                             digest_only: true,
+                            page_size: 0,
+                            page_state: vec![],
                         };
                         let body = encode_read_request(&payload);
                         match host_id {
@@ -597,39 +603,60 @@ impl ClusterCoordinator {
                 }
             }
 
-            // Remote replica.
+            // Remote replica — use paged reads to avoid Data lane timeout
+            // on large partitions (e.g., 70K rows / 209MB).
             let host_id = match ring.get_node(target).map(|n| n.host_id) {
                 Some(hid) => hid,
                 None => continue,
             };
 
-            let payload = ReadRequestPayload {
-                keyspace: table_id.keyspace.clone(),
-                table: table_id.table.clone(),
-                key: key.key.as_bytes().to_vec(),
-                digest_only: false,
-            };
-            let body = encode_read_request(&payload);
-            match self
-                .peer_manager
-                .send(host_id, Message::ReadRequest(body), Lane::Data)
-                .await
-            {
-                Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
-                    Some(resp) if resp.found => {
-                        let partition = resp.partition.map(partition_from_wire);
-                        if let Some(p) = partition {
-                            if !p.rows.is_empty() {
-                                return Ok(Some(p.rows));
+            /// Max rows per page for remote partition reads. Keeps each
+            /// response well under the Data lane timeout (10s) and frame
+            /// size limit (256MB). 5000 rows × ~3KB each ≈ 15MB per page.
+            const READ_PAGE_SIZE: u32 = 5000;
+
+            let mut all_rows: Vec<Row> = Vec::new();
+            let mut page_state: Vec<u8> = vec![];
+            let mut found_partition = false;
+
+            loop {
+                let payload = ReadRequestPayload {
+                    keyspace: table_id.keyspace.clone(),
+                    table: table_id.table.clone(),
+                    key: key.key.as_bytes().to_vec(),
+                    digest_only: false,
+                    page_size: READ_PAGE_SIZE,
+                    page_state: page_state.clone(),
+                };
+                let body = encode_read_request(&payload);
+                match self
+                    .peer_manager
+                    .send(host_id, Message::ReadRequest(body), Lane::Data)
+                    .await
+                {
+                    Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
+                        Some(resp) if resp.found => {
+                            found_partition = true;
+                            if let Some(p) = resp.partition.map(partition_from_wire) {
+                                all_rows.extend(p.rows);
                             }
+                            if resp.has_more && !resp.next_page_state.is_empty() {
+                                page_state = resp.next_page_state;
+                                continue; // fetch next page
+                            }
+                            break; // no more pages
                         }
-                        // found=true but no rows — try next replica
+                        _ => break, // not found or decode failure
+                    },
+                    _ => {
+                        tracing::debug!(target, "read_one_replica: remote send failed");
+                        break;
                     }
-                    _ => {} // not found or decode failure — try next
-                },
-                _ => {
-                    tracing::debug!(target, "read_one_replica: remote send failed, trying next");
                 }
+            }
+
+            if found_partition && !all_rows.is_empty() {
+                return Ok(Some(all_rows));
             }
         }
 

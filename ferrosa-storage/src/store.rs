@@ -320,6 +320,21 @@ impl<F: FlushTarget> TableStore<F> {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    // Detailed diagnostic for truncated SSTable investigation.
+                    // Uses eprintln! to bypass tracing level filters.
+                    let id_info = guard
+                        .sstable_ids
+                        .get(i)
+                        .map(|(id, path)| format!("id={id} path={path:?}"))
+                        .unwrap_or_else(|| format!("index={i}"));
+                    let data_len = sstable.data_file_length().unwrap_or(0);
+                    eprintln!(
+                        "[READ ERROR] SSTable {id_info}: error={e}, \
+                         data_file_len={data_len}, sstable_count={}, \
+                         key={:?}",
+                        guard.sstables.len(),
+                        key.key.as_bytes(),
+                    );
                     tracing::warn!(
                         error = %e,
                         sstable_index = i,
@@ -546,7 +561,9 @@ impl<F: FlushTarget> TableStore<F> {
                 if !flushed_keys.contains(&p.key) {
                     // Late write — replay to the current active memtable.
                     for row in &p.rows {
-                        let _ = current_view.active.put(&p.key, row.clone(), &self.schema);
+                        if let Err(e) = current_view.active.put(&p.key, row.clone(), &self.schema) {
+                            eprintln!("[flush] late-writer replay put failed: {e}");
+                        }
                     }
                 }
             }
@@ -563,7 +580,12 @@ impl<F: FlushTarget> TableStore<F> {
         let mut new_sstables = vec![new_reader];
         new_sstables.extend(current_view.sstables.iter().cloned());
 
-        let mut new_ids = vec![(format!("{gen}"), std::path::PathBuf::new())];
+        // Use the actual base directory from the flush target, not empty PathBuf.
+        // An empty path causes ID collisions with compaction output:
+        // swap_compacted_sstables matches by ID only, so a flush SSTable with
+        // the same gen as a compaction input gets incorrectly removed during swap.
+        let flush_dir = self.flush_target.base_dir().to_path_buf();
+        let mut new_ids = vec![(format!("{gen}"), flush_dir)];
         new_ids.extend(current_view.sstable_ids.iter().cloned());
 
         let mut new_sidecars = vec![Arc::new(sidecar_map)];

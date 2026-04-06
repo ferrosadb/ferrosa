@@ -1867,6 +1867,7 @@ impl StorageEngine {
                     if let Ok(gen_num) = gen.parse::<u64>() {
                         state.store.advance_gen_past(gen_num);
                     }
+                    let pre_swap_count = state.store.sstable_count();
                     if let Err(e) = state.store.swap_compacted_sstables(
                         &input_id_paths,
                         output_id,
@@ -1877,6 +1878,13 @@ impl StorageEngine {
                         eprintln!("[compaction] swap failed: {e}");
                         continue;
                     }
+                    let post_swap_count = state.store.sstable_count();
+                    eprintln!(
+                        "[compaction] swap complete for {table_id}: \
+                         SSTables {pre_swap_count} → {post_swap_count}, \
+                         removed {} inputs, added 1 output",
+                        input_id_paths.len()
+                    );
 
                     // Eager index build: submit high-priority rebuild for compacted output.
                     // Same as flush — keeps MemtableIndex bounded in steady state.

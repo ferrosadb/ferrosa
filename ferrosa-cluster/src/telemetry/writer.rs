@@ -149,9 +149,10 @@ impl TelemetryWriter {
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
             };
 
-            // Errors are intentionally swallowed — telemetry must not crash
-            // the node. In production, a metric counter would track failures.
-            let _ = self.engine.write_observability(table_id, &key, row, ts);
+            // Telemetry must not crash the node, but log failures.
+            if let Err(e) = self.engine.write_observability(table_id, &key, row, ts) {
+                eprintln!("[telemetry] write_observability failed: {e}");
+            }
         }
     }
 }

@@ -118,6 +118,7 @@ pub fn execute_var_length(
 
         for vertex_key in &frontier {
             // Read adjacency entries for this vertex.
+            // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
             let adj_partition = storage.read(&adj_table_id, vertex_key)?;
             if let Some(partition) = adj_partition {
                 stats.edges_read += partition.rows.len();
@@ -189,6 +190,7 @@ pub fn execute_var_length(
             break;
         }
 
+        // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
         let partition = storage.read(&proj_table_id, key)?;
         let hex_id = hex::encode(key.key.as_bytes());
 

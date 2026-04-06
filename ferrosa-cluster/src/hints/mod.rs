@@ -371,7 +371,9 @@ impl HintStore {
             }
         }
         // Try to remove the peer directory itself (only succeeds if empty).
-        let _ = fs::remove_dir(&pdir);
+        if let Err(e) = fs::remove_dir(&pdir) {
+            eprintln!("[hints] failed to remove peer hint dir: {e}");
+        }
 
         // Clear in-memory state.
         let mut peers = self.peers.lock().unwrap();

@@ -140,6 +140,10 @@ impl CompactionExecutor {
             let dir = &input.path;
 
             let data_path = dir.join(format!("{gen}-Data.db"));
+            let data_file_size = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+            eprintln!(
+                "[compaction] reading input SSTable {gen}: Data.db={data_file_size} bytes, path={data_path:?}"
+            );
             match std::fs::metadata(&data_path) {
                 Ok(meta) if meta.len() == 0 => {
                     return Err(format!(

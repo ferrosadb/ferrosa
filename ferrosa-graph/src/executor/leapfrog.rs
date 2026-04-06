@@ -42,6 +42,7 @@ impl AdjacencyIterator {
         vertex_key: &DecoratedKey,
         edge_label: Option<&str>,
     ) -> Self {
+        // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
         let partition = storage.read(adj_table_id, vertex_key).ok().flatten();
         let mut neighbors = Vec::new();
         if let Some(p) = partition {
@@ -319,6 +320,7 @@ fn enumerate_bindings(
                 // For leapfrog, we need the set of source vertices that
                 // have an edge TO dst. We read dst's IN-adjacency.
                 let dst_key = DecoratedKey::new(PartitionKey::new(dst_bytes.clone()));
+                // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
                 let partition = storage.read(adj_table_id, &dst_key).ok().flatten();
                 let mut neighbors = Vec::new();
                 if let Some(p) = partition {
@@ -429,6 +431,7 @@ fn verify_all_relations(
 
         // Check that src has an OUT edge to dst with the given label.
         let src_key = DecoratedKey::new(PartitionKey::new(src_bytes.clone()));
+        // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
         let partition = storage.read(adj_table_id, &src_key).ok().flatten();
         let found = if let Some(p) = partition {
             stats.edges_read += 1;
@@ -468,6 +471,7 @@ fn project_bindings(
         if let Some(table) = plan.var_tables.get(var) {
             let table_id = TableId::new(&table.keyspace, &table.table);
             let dk = DecoratedKey::new(PartitionKey::new(key_bytes.clone()));
+            // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
             let partition = storage.read(&table_id, &dk)?;
             stats.vertices_read += 1;
 

@@ -1028,7 +1028,13 @@ async fn route_select_user_table(
         for raw_pk in matching_pks {
             let decorated =
                 ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(raw_pk));
-            if let Some(partition) = state.engine.read(&table_id, &decorated)? {
+            if let Some(partition) = state
+                .write_path
+                .load()
+                .read(&table_id, &decorated)
+                .await
+                .map_err(|e| CqlError::ServerError(format!("{e}")))?
+            {
                 let mut prows = bridge::partition_to_rows(
                     &partition,
                     &all_col_names,
@@ -1820,7 +1826,13 @@ async fn route_insert(
 
     // BUG-0016: IF NOT EXISTS — check whether the row already exists before writing.
     if s.if_not_exists {
-        let existing_row = if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+        let existing_row = if let Some(partition) = state
+            .write_path
+            .load()
+            .read(&table_id, &decorated_key)
+            .await
+            .map_err(|e| CqlError::ServerError(format!("{e}")))?
+        {
             let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
             let all_col_types: Vec<CqlType> = table_meta
                 .columns
@@ -2021,7 +2033,13 @@ async fn route_update(
             .filter_map(|(name, _)| table_meta.columns.get_index_of(name))
             .collect();
 
-        if let Some(partition) = state.engine.read(&table_id, &decorated_key)? {
+        if let Some(partition) = state
+            .write_path
+            .load()
+            .read(&table_id, &decorated_key)
+            .await
+            .map_err(|e| CqlError::ServerError(format!("{e}")))?
+        {
             let rows = bridge::partition_to_rows(
                 &partition,
                 &all_col_names,
