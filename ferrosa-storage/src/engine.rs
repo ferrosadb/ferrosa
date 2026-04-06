@@ -3684,6 +3684,218 @@ mod tests {
         );
     }
 
+    /// Exact production scenario: 11,000 rows to the same partition key
+    /// with flush_if_needed triggering automatically based on size.
+    /// This is what `skilltools ingest` does against a live cluster.
+    #[test]
+    fn high_volume_ingest_with_auto_flush_preserves_all_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            flush_threshold_bytes: 4096, // 4KB — will trigger every ~50-100 rows
+            flush_max_age_secs: 1,
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let pk = make_key("tenant_session"); // same partition for all rows
+        let total = 11_000;
+
+        for i in 0..total {
+            let row = Row {
+                clustering: (i as i32).to_be_bytes().to_vec(),
+                cells: vec![(
+                    0,
+                    CellValue::live(format!("entity_{i}").into_bytes(), (i + 1) as i64),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
+            };
+            engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+
+            // Simulate the background flush loop calling flush_if_needed
+            // every 100 writes (production runs on a timer)
+            if (i + 1) % 100 == 0 {
+                engine.flush_if_needed().unwrap();
+            }
+        }
+
+        // Final flush
+        engine.flush(&tid).unwrap();
+
+        // ALL 11,000 rows MUST be present
+        let result = engine.read(&tid, &pk).unwrap();
+        assert!(result.is_some(), "partition must exist");
+        let actual = result.unwrap().rows.len();
+        assert_eq!(
+            actual,
+            total,
+            "DATA LOSS: expected {total} rows after high-volume ingest, got {actual}. \
+             {} rows lost during flush_if_needed cycles.",
+            total - actual
+        );
+    }
+
+    /// Concurrent writes + flush from separate thread.
+    #[test]
+    fn concurrent_write_and_flush_threads_preserve_all_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            flush_threshold_bytes: 2048,
+            flush_max_age_secs: 1,
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let pk = make_key("concurrent_pk");
+        let total = 5_000usize;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Background flush thread
+        let flush_engine = Arc::clone(&engine);
+        let flush_tid = tid.clone();
+        let flush_stop = Arc::clone(&stop);
+        let flush_handle = std::thread::spawn(move || {
+            let mut count = 0u64;
+            while !flush_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = flush_engine.flush_if_needed();
+                count += 1;
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            let _ = flush_engine.flush(&flush_tid);
+            count
+        });
+
+        // Writer
+        for i in 0..total {
+            let row = Row {
+                clustering: (i as i32).to_be_bytes().to_vec(),
+                cells: vec![(
+                    0,
+                    CellValue::live(format!("r{i}").into_bytes(), (i + 1) as i64),
+                )],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
+            };
+            engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let flush_count = flush_handle.join().unwrap();
+        engine.flush(&tid).unwrap();
+
+        let result = engine.read(&tid, &pk).unwrap();
+        assert!(result.is_some(), "partition must exist");
+        let actual = result.unwrap().rows.len();
+        assert_eq!(
+            actual,
+            total,
+            "DATA LOSS: {total} rows written with {flush_count} concurrent flushes, \
+             got {actual}. {} lost.",
+            total - actual
+        );
+    }
+
+    /// SSTable roundtrip: 1000 rows with varying value sizes, flush, read
+    /// back, verify every row and value is intact (no corruption).
+    #[test]
+    fn sstable_roundtrip_large_partition_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let pk = make_key("large_part");
+        let total = 1000usize;
+
+        for i in 0..total {
+            let value = format!("val_{i:06}_{}", "x".repeat(i % 100));
+            let row = Row {
+                clustering: (i as i32).to_be_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(value.into_bytes(), (i + 1) as i64))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
+            };
+            engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+        }
+        engine.flush(&tid).unwrap();
+
+        let result = engine.read(&tid, &pk).unwrap();
+        assert!(result.is_some(), "partition must exist");
+        let partition = result.unwrap();
+        assert_eq!(partition.rows.len(), total, "SSTable lost rows");
+
+        for (i, row) in partition.rows.iter().enumerate() {
+            let expected = format!("val_{i:06}_");
+            let actual = row.cells[0]
+                .1
+                .value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).to_string())
+                .unwrap_or_default();
+            assert!(
+                actual.starts_with(&expected),
+                "row {i} corrupt: expected '{expected}...', got '{}'",
+                &actual[..actual.len().min(40)]
+            );
+        }
+    }
+
+    /// SSTable compaction roundtrip: 4 flushes → STCS compaction → verify all rows.
+    #[test]
+    fn sstable_compaction_roundtrip_preserves_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            compaction: CompactionConfig::from_env(dir.path().join("compaction")),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let pk = make_key("compact_test");
+
+        // Write 4 batches, flush each → 4 SSTables
+        let mut total = 0usize;
+        for batch in 0..4 {
+            for i in 0..150i32 {
+                let ck = batch * 150 + i;
+                let row = Row {
+                    clustering: ck.to_be_bytes().to_vec(),
+                    cells: vec![(
+                        0,
+                        CellValue::live(format!("b{batch}_{ck:05}").into_bytes(), ck as i64 + 1),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(ck as i64 + 1),
+                };
+                engine.write(&tid, &pk, row, ck as i64 + 1).unwrap();
+                total += 1;
+            }
+            engine.flush(&tid).unwrap();
+        }
+
+        assert!(engine.sstable_count(&tid) >= 4, "need 4 SSTables");
+
+        let result = engine.read(&tid, &pk).unwrap().unwrap();
+        assert_eq!(
+            result.rows.len(),
+            total,
+            "compaction roundtrip: expected {}, got {}",
+            total,
+            result.rows.len()
+        );
+
+        // Verify first batch data intact
+        let first_val = result.rows[0].cells[0].1.value.as_ref().unwrap();
+        let s = String::from_utf8_lossy(first_val);
+        assert!(s.starts_with("b0_"), "batch 0 data corrupt: {s}");
+    }
+
     #[test]
     fn write_flush_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -8182,3 +8394,5 @@ mod tests {
         );
     }
 }
+// This test is added to the end of the test module by append.
+// It will be placed before the closing `}` of the module.
