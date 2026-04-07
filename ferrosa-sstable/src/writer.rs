@@ -1739,5 +1739,12 @@ mod tests {
             weight.to_be_bytes(),
             "cell value must survive roundtrip for multi-column clustering key"
         );
+
+        // Verify clustering key bytes survive roundtrip.
+        // The reader must produce the same u16-prefixed format the writer consumed.
+        assert_eq!(
+            row.clustering, ck,
+            "multi-column CK bytes must roundtrip through write→read"
+        );
     }
 }

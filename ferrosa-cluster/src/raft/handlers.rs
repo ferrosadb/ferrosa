@@ -752,7 +752,10 @@ impl RpcHandler for RangeReadHandler {
             Ok(ps) => ps,
             Err(e) => {
                 tracing::warn!("RangeReadHandler: read_range failed: {e}");
-                return None;
+                // Return empty response instead of None — a None response
+                // means NO response at all, causing the coordinator to wait
+                // for the full 120s timeout and hang the client.
+                vec![]
             }
         };
 
@@ -763,12 +766,18 @@ impl RpcHandler for RangeReadHandler {
             truncated,
         };
 
-        let resp_bytes = bincode::serialize(&payload)
-            .map_err(|e| {
+        let resp_bytes = match bincode::serialize(&payload) {
+            Ok(b) => b,
+            Err(e) => {
                 tracing::warn!("RangeReadHandler: failed to serialize response: {e}");
-                e
-            })
-            .ok()?;
+                // Serialize an empty response instead of dropping the message.
+                bincode::serialize(&RangeReadResponsePayload {
+                    partitions: vec![],
+                    truncated: false,
+                })
+                .unwrap_or_default()
+            }
+        };
 
         Some(Message::RangeReadResponse(Bytes::from(resp_bytes)))
     }
