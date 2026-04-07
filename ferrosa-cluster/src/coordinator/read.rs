@@ -742,11 +742,13 @@ impl ClusterCoordinator {
     /// coordinator deduplicates partitions that appear on multiple nodes
     /// (e.g. due to replication or token overlap) by merging replicas with
     /// the same partition key using last-write-wins cell semantics.
-    /// Range-read timeout for remote nodes. Full-table scans can return
-    /// large payloads (hundreds of MB for wide partitions), so we use a
-    /// much longer timeout than the default Data lane (10s). This is
-    /// analogous to Cassandra's `range_request_timeout`.
-    const RANGE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    /// Range-read timeout for remote nodes.
+    ///
+    /// Must be shorter than the CQL client timeout (typically 10s) so the
+    /// coordinator returns a result (even partial/error) before the client
+    /// gives up. A 120s timeout caused SELECT to hang on startup when
+    /// remote nodes hadn't established connections yet.
+    const RANGE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub async fn coordinate_range_read(
         &self,
@@ -774,6 +776,7 @@ impl ClusterCoordinator {
         let storage = self.storage.clone();
         let peer_manager = self.peer_manager.clone();
         let table_id_clone = table_id.clone();
+        let total_nodes = nodes.len();
 
         let mut futs: FuturesUnordered<_> = nodes
             .into_iter()
@@ -861,14 +864,26 @@ impl ClusterCoordinator {
             }
         }
 
-        if let Some(err) = first_error {
-            tracing::error!(
+        if let Some(ref err) = first_error {
+            if all_partitions.is_empty() {
+                // ALL nodes failed — return error (no data at all).
+                tracing::error!(
+                    failed_nodes,
+                    "coordinate_range_read: all nodes failed, returning error"
+                );
+                return Err(first_error.unwrap());
+            }
+            // Some nodes failed but we have partial data (e.g., local node
+            // succeeded, remote nodes not yet connected during startup).
+            // Return what we have — better than hanging the client.
+            tracing::warn!(
                 failed_nodes,
                 partitions_received = all_partitions.len(),
-                "coordinate_range_read: incomplete — {failed_nodes} node(s) failed, \
-                 returning error instead of partial data"
+                %err,
+                "coordinate_range_read: {failed_nodes} node(s) failed, \
+                 returning partial results from {remaining} node(s)",
+                remaining = total_nodes - failed_nodes,
             );
-            return Err(err);
         }
 
         // Deduplicate: group by token, merge replicas with the same partition key.
@@ -1931,12 +1946,12 @@ mod tests {
     // BUG: coordinate_range_read silent data loss
     // -----------------------------------------------------------------------
 
-    /// When remote nodes are unreachable, coordinate_range_read must return
-    /// an error — NOT silently return partial results. Returning only local
-    /// data as Ok(partial) is indistinguishable from success and causes
-    /// silent data loss (the P0 bug: 15K entities → 2K after compaction).
+    /// When remote nodes are unreachable, coordinate_range_read returns
+    /// partial results (local data) with a warning — NOT hang for 120s.
+    /// Previously this returned Err, but that caused startup hangs when
+    /// the CQL client timed out waiting for all nodes to connect.
     #[tokio::test]
-    async fn coordinate_range_read_errors_when_remote_nodes_unreachable() {
+    async fn coordinate_range_read_returns_partial_when_remote_nodes_unreachable() {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
         register_test_table(&storage);
@@ -1985,14 +2000,18 @@ mod tests {
             .unwrap();
 
         // coordinate_range_read fans out to all 3 nodes.
-        // Remote nodes have no pools → sends fail.
-        // Must return Err, NOT Ok(partial_data).
+        // Remote nodes have no pools → sends fail after 5s timeout.
+        // Returns Ok(local_data) with a warning — NOT Err or 120s hang.
         let result = coordinator.coordinate_range_read(&table_id).await;
         assert!(
-            result.is_err(),
-            "range read with unreachable nodes must return error, not partial data; \
-             got {} partitions — this is silent data loss!",
-            result.as_ref().map(|v| v.len()).unwrap_or(0)
+            result.is_ok(),
+            "range read should return partial results when remotes fail: {:?}",
+            result.err()
+        );
+        let partitions = result.unwrap();
+        assert!(
+            !partitions.is_empty(),
+            "should return local data even when remote nodes are unreachable"
         );
     }
 
