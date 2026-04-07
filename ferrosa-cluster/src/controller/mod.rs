@@ -256,6 +256,20 @@ impl ModeController {
             }
         };
 
+        // Register read handlers early so they respond before cluster formation.
+        // Without this, RangeReadRequest from a coordinator that formed faster
+        // gets silently dropped → 120s timeout → client hang on empty tables.
+        {
+            use crate::raft::handlers::{RangeReadHandler, ReadRequestHandler};
+            let range_read_handler = Arc::new(RangeReadHandler::new(storage.clone()));
+            registry.register(
+                ferrosa_net::codec::MsgType::RangeReadRequest,
+                range_read_handler,
+            );
+            let read_handler = Arc::new(ReadRequestHandler::new(storage.clone()));
+            registry.register(ferrosa_net::codec::MsgType::ReadRequest, read_handler);
+        }
+
         let controller = Arc::new(Self {
             mode: Arc::new(ArcSwap::from_pointee(DeploymentMode::Standalone)),
             write_path: write_path.clone(),
