@@ -1,7 +1,7 @@
 """Reproduce P0 data loss on 3-node cluster during high-volume ingest.
 
 This test creates a table, inserts canary rows, then performs a large
-bulk insert (simulating skilltools ingest), and verifies all canary rows
+bulk insert (simulating frg ingest), and verifies all canary rows
 survive. The production bug causes ~97% of canary rows to disappear
 during or after the large write.
 
@@ -97,7 +97,7 @@ class TestDataLossReproduction:
         print(f"\nAfter canaries: {canary_count} entities")
         assert canary_count >= 100, f"canaries not all inserted: {canary_count}"
 
-        # Step 2: Large bulk insert — 5000 entities (simulates skilltools ingest)
+        # Step 2: Large bulk insert — 5000 entities (simulates frg ingest)
         for i in range(5000):
             eid = uuid.uuid5(uuid.NAMESPACE_DNS, f"entity_{i}")
             session.execute(

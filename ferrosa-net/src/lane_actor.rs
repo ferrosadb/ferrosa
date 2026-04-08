@@ -260,6 +260,11 @@ pub(crate) fn spawn_raft_lane_actor(
                 .enable_all()
                 .build()
                 .expect("raft lane runtime");
+
+            // The Raft RpcClient was created on the Raft runtime (via
+            // ConnectionPool::connect's raft_runtime parameter), so its
+            // write/read IO loops are already on the correct runtime.
+            // No reconnection needed.
             rt.block_on(lane_actor_loop(lane, initial_state, rx, ctx));
         })
         .expect("spawn raft lane thread");

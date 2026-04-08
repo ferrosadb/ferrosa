@@ -157,22 +157,40 @@ impl Manifest {
         Ok(())
     }
 
+    /// Save the manifest unconditionally (no CAS). Used when the object
+    /// store does not support conditional PUT. Last-writer-wins — safe for
+    /// single-node prefixes and dev environments.
+    pub async fn save_unconditional(
+        &self,
+        store: &dyn ObjectStore,
+        prefix: &str,
+    ) -> ferrosa_common::Result<()> {
+        let path = Self::manifest_path(prefix);
+        let data = serde_json::to_vec_pretty(self).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("failed to serialize manifest: {e}"))
+        })?;
+        store
+            .put(&path, PutPayload::from(Bytes::from(data)))
+            .await
+            .map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to save manifest (unconditional): {e}"
+                ))
+            })?;
+        Ok(())
+    }
+
     /// Saves the manifest with automatic CAS retry and exponential backoff.
     ///
-    /// Re-loads the latest manifest version on each attempt and uses
-    /// conditional put (etag-based CAS). On conflict, retries with
-    /// exponential backoff up to [`MAX_CAS_RETRIES`] times.
-    ///
-    /// The object store **must** support conditional puts. If it does not,
-    /// callers must detect this at startup (via [`probe_conditional_put_support`])
-    /// and refuse to start — passing a non-CAS store here is a configuration
-    /// error that cannot be silently recovered.
+    /// When `cas` is true, uses etag-based conditional PUT with retry on
+    /// conflict. When `cas` is false, falls back to unconditional PUT
+    /// (last-writer-wins) for stores that don't support CAS (e.g. RustFS).
     pub async fn save_with_retry(
         &self,
         store: &dyn ObjectStore,
         prefix: &str,
     ) -> ferrosa_common::Result<()> {
-        self.save_with_retry_and_removals(store, prefix, &self.pending_removals)
+        self.save_with_retry_inner(store, prefix, &self.pending_removals, true)
             .await
     }
 
@@ -188,14 +206,51 @@ impl Manifest {
         prefix: &str,
         removals: &[(String, Vec<String>)],
     ) -> ferrosa_common::Result<()> {
+        self.save_with_retry_inner(store, prefix, removals, true)
+            .await
+    }
+
+    /// Save without CAS — for object stores that don't support conditional PUT.
+    /// Loads latest, merges, saves unconditionally (last-writer-wins).
+    pub async fn save_without_cas(
+        &self,
+        store: &dyn ObjectStore,
+        prefix: &str,
+    ) -> ferrosa_common::Result<()> {
+        self.save_with_retry_inner(store, prefix, &self.pending_removals, false)
+            .await
+    }
+
+    /// Save without CAS, with removals.
+    pub async fn save_without_cas_and_removals(
+        &self,
+        store: &dyn ObjectStore,
+        prefix: &str,
+        removals: &[(String, Vec<String>)],
+    ) -> ferrosa_common::Result<()> {
+        self.save_with_retry_inner(store, prefix, removals, false)
+            .await
+    }
+
+    /// Internal: save with optional CAS.
+    async fn save_with_retry_inner(
+        &self,
+        store: &dyn ObjectStore,
+        prefix: &str,
+        removals: &[(String, Vec<String>)],
+        cas: bool,
+    ) -> ferrosa_common::Result<()> {
+        if !cas {
+            // No CAS: load latest, merge, unconditional put.
+            let (mut latest, _version) = Self::load(store, prefix).await?;
+            for (table_id, ids) in removals {
+                latest.remove_sstables(table_id, ids);
+            }
+            let merged = self.merge_into(&latest);
+            return merged.save_unconditional(store, prefix).await;
+        }
+
         for attempt in 0..MAX_CAS_RETRIES {
-            // Re-load the LATEST manifest from S3, apply removals to it
-            // FIRST (so old entries are gone), then merge in our new entries.
-            //
-            // Order matters: if compaction output reuses an input's ID
-            // (gen collision), removing after merge would delete the new
-            // entry. Removing from latest first ensures the old entry is
-            // gone before self's replacement is merged in.
             let (mut latest, version) = Self::load(store, prefix).await?;
             for (table_id, ids) in removals {
                 latest.remove_sstables(table_id, ids);

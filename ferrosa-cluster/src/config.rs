@@ -67,7 +67,7 @@ impl Default for ClusterConfig {
             default_cl: ConsistencyLevel::Quorum,
             hinted_handoff_dir: PathBuf::from("data/hints"),
             hinted_handoff_max_mb: 1024,
-            auto_join: false,
+            auto_join: true,
             raft_data_dir: None,
             node_role: NodeRole::Both,
             formation_timeout_secs: None,
@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(config.num_tokens, 256);
         assert_eq!(config.default_cl, ConsistencyLevel::Quorum);
         assert_eq!(config.hinted_handoff_max_mb, 1024);
-        assert!(!config.auto_join);
+        assert!(config.auto_join);
     }
 
     #[test]

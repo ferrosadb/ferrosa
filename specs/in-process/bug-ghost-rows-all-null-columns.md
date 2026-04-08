@@ -29,7 +29,7 @@ The partition key columns (`tenant_id`, `session_id`) are present (row is querya
 
 ## Evidence
 
-9 ghost rows in `typed_edges`, at least 1 in `entity_store`, observed after `skilltools ingest` + `run_consolidation` on a fresh cluster. The ingest tool does not INSERT null values.
+9 ghost rows in `typed_edges`, at least 1 in `entity_store`, observed after `frg ingest` + `run_consolidation` on a fresh cluster. The ingest tool does not INSERT null values.
 
 ## Likely Cause
 
@@ -44,7 +44,7 @@ Related to the DROP TABLE data retention bug. Ferrosa's tombstone/compaction sys
 # Fresh cluster
 podman compose up -d
 # Ingest data
-skilltools ingest --cql localhost:19042 .
+frg ingest --cql localhost:19042 .
 # Check for ghosts
 SELECT * FROM typed_edges WHERE tenant_id = ? AND session_id = ? LIMIT 5;
 # First rows often have all-null columns

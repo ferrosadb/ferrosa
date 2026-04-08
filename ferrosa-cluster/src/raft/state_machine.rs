@@ -232,7 +232,7 @@ impl FerrosStateMachine {
                 }
                 if let Some(writer) = &self.system_writer {
                     if let Err(e) = writer.apply(SystemTableMutation::KeyspaceCreated(ks_clone)) {
-                        tracing::error!(%e, "Raft apply: system table write failed for CreateKeyspace");
+                        tracing::warn!(%e, "Raft apply: system table write skipped for CreateKeyspace (expected during log replay)");
                     }
                 }
             }
@@ -321,7 +321,10 @@ impl FerrosStateMachine {
                 }
                 if let Some(writer) = &self.system_writer {
                     if let Err(e) = writer.apply(SystemTableMutation::TableCreated(table.clone())) {
-                        tracing::error!(%e, "Raft apply: system table write failed for CreateTable");
+                        // Warn, not error: during Raft log replay on startup,
+                        // system_schema tables may not be registered yet.  The
+                        // schema bootstrap populates them once loading completes.
+                        tracing::warn!(%e, "Raft apply: system table write skipped for CreateTable (expected during log replay)");
                     }
                 }
             }

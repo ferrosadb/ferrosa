@@ -31,6 +31,7 @@ use std::sync::Arc;
 /// Maximum tracked connected peers before eviction (prevents unbounded growth).
 pub(super) const MAX_CONNECTED_PEERS: usize = 1000;
 /// Maximum pending join requests before eviction.
+#[allow(dead_code)] // Used in tests; retained for future eviction logic.
 pub(super) const MAX_PENDING_JOINS: usize = 100;
 /// Maximum seen invite initiators before eviction.
 #[allow(dead_code)]
@@ -204,6 +205,10 @@ pub struct ModeController {
     >,
     /// Contention metrics for the transition guard.
     pub contention_metrics: Arc<ContentionMetrics>,
+    /// Dedicated Raft runtime for openraft tasks.
+    pub(super) raft_runtime: std::sync::OnceLock<Arc<tokio::runtime::Runtime>>,
+    /// Dedicated Data runtime for internode IO.
+    pub(super) data_runtime: std::sync::OnceLock<Arc<tokio::runtime::Runtime>>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -256,20 +261,6 @@ impl ModeController {
             }
         };
 
-        // Register read handlers early so they respond before cluster formation.
-        // Without this, RangeReadRequest from a coordinator that formed faster
-        // gets silently dropped → 120s timeout → client hang on empty tables.
-        {
-            use crate::raft::handlers::{RangeReadHandler, ReadRequestHandler};
-            let range_read_handler = Arc::new(RangeReadHandler::new(storage.clone()));
-            registry.register(
-                ferrosa_net::codec::MsgType::RangeReadRequest,
-                range_read_handler,
-            );
-            let read_handler = Arc::new(ReadRequestHandler::new(storage.clone()));
-            registry.register(ferrosa_net::codec::MsgType::ReadRequest, read_handler);
-        }
-
         let controller = Arc::new(Self {
             mode: Arc::new(ArcSwap::from_pointee(DeploymentMode::Standalone)),
             write_path: write_path.clone(),
@@ -300,6 +291,8 @@ impl ModeController {
             committed_cluster_size: AtomicUsize::new(0),
             ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
+            raft_runtime: std::sync::OnceLock::new(),
+            data_runtime: std::sync::OnceLock::new(),
         });
 
         let handles = ModeControllerHandles {
@@ -355,6 +348,8 @@ impl ModeController {
             committed_cluster_size: AtomicUsize::new(0),
             ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
+            raft_runtime: std::sync::OnceLock::new(),
+            data_runtime: std::sync::OnceLock::new(),
         })
     }
 
@@ -410,6 +405,8 @@ impl ModeController {
             committed_cluster_size: AtomicUsize::new(0),
             ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
+            raft_runtime: std::sync::OnceLock::new(),
+            data_runtime: std::sync::OnceLock::new(),
         })
     }
 
@@ -433,6 +430,16 @@ impl ModeController {
             .register(MsgType::ClusterInvite, invite_handler);
 
         self.peer_manager.store(Arc::new(Some(pm)));
+    }
+
+    /// Set a dedicated runtime for Raft consensus tasks.
+    pub fn set_raft_runtime(&self, rt: Arc<tokio::runtime::Runtime>) {
+        let _ = self.raft_runtime.set(rt);
+    }
+
+    /// Set a dedicated runtime for internode data IO.
+    pub fn set_data_runtime(&self, rt: Arc<tokio::runtime::Runtime>) {
+        let _ = self.data_runtime.set(rt);
     }
 
     /// Get current deployment mode.

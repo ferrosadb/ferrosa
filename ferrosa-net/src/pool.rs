@@ -59,12 +59,40 @@ impl PriorityPool {
     /// `docker compose up --force-recreate`) to be reconnected automatically.
     ///
     /// Builds TLS connector once and shares it across all 3 connections.
+    /// Create RpcClient on a specific runtime (or the caller's if None).
+    async fn connect_client_on(
+        config: Arc<NetConfig>,
+        local_host_id: Uuid,
+        peer_addr: SocketAddr,
+        tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
+        runtime: Option<&tokio::runtime::Runtime>,
+    ) -> Result<RpcClient> {
+        if let Some(rt) = runtime {
+            let cfg = config;
+            let tls = tls_connector;
+            rt.spawn(async move {
+                RpcClient::connect_with_tls(cfg, local_host_id, peer_addr, tls.as_deref()).await
+            })
+            .await
+            .map_err(|e| NetError::Protocol(format!("runtime join error: {e}")))?
+        } else {
+            RpcClient::connect_with_tls(config, local_host_id, peer_addr, tls_connector.as_deref())
+                .await
+        }
+    }
+
+    /// Connect to a peer, creating one TCP connection per lane.
+    ///
+    /// Each client's IO loops are spawned on the provided runtime (or the
+    /// caller's runtime if None). This keeps the main runtime free for
+    /// supervision only.
     pub async fn connect(
         config: Arc<NetConfig>,
         local_host_id: Uuid,
         peer_host: &str,
+        raft_runtime: Option<&tokio::runtime::Runtime>,
+        data_runtime: Option<&tokio::runtime::Runtime>,
     ) -> Result<Self> {
-        // Resolve once for the initial connection.
         let peer_addr: SocketAddr = tokio::net::lookup_host(peer_host)
             .await
             .map_err(NetError::Io)?
@@ -73,25 +101,28 @@ impl PriorityPool {
 
         let tls_connector = crate::tls::build_tls_connector(&config)?.map(Arc::new);
 
-        let raft_client = RpcClient::connect_with_tls(
+        let raft_client = Self::connect_client_on(
             Arc::clone(&config),
             local_host_id,
             peer_addr,
-            tls_connector.as_deref(),
+            tls_connector.clone(),
+            raft_runtime,
         )
         .await?;
-        let data_client = RpcClient::connect_with_tls(
+        let data_client = Self::connect_client_on(
             Arc::clone(&config),
             local_host_id,
             peer_addr,
-            tls_connector.as_deref(),
+            tls_connector.clone(),
+            data_runtime,
         )
         .await?;
-        let bulk_client = RpcClient::connect_with_tls(
+        let bulk_client = Self::connect_client_on(
             Arc::clone(&config),
             local_host_id,
             peer_addr,
-            tls_connector.as_deref(),
+            tls_connector.clone(),
+            data_runtime,
         )
         .await?;
 
@@ -281,9 +312,15 @@ mod tests {
         ));
         let addr = server.start_and_get_addr().await.unwrap();
 
-        let pool = PriorityPool::connect(Arc::new(config), uuid::Uuid::new_v4(), &addr.to_string())
-            .await
-            .unwrap();
+        let pool = PriorityPool::connect(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            &addr.to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         for lane in [Lane::Raft, Lane::Data, Lane::Bulk] {
             let resp = pool
@@ -317,9 +354,15 @@ mod tests {
         ));
         let addr = server.start_and_get_addr().await.unwrap();
 
-        let pool = PriorityPool::connect(Arc::new(config), uuid::Uuid::new_v4(), &addr.to_string())
-            .await
-            .unwrap();
+        let pool = PriorityPool::connect(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            &addr.to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Send (request/response) on each lane.
         for lane in [Lane::Raft, Lane::Data, Lane::Bulk] {

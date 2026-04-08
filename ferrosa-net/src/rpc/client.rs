@@ -1,11 +1,11 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use bytes::BytesMut;
+use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::Framed;
 
 use crate::codec::{Frame, FrameHeader, InternodeCodec, Lane, FLAG_FIRE_AND_FORGET};
@@ -37,6 +37,7 @@ impl Default for BandwidthMetrics {
     }
 }
 
+#[derive(Clone)]
 pub struct RpcClient {
     #[allow(dead_code)] // used in future phases (reconnection, pool management)
     config: Arc<NetConfig>,
@@ -44,7 +45,7 @@ pub struct RpcClient {
     peer_host_id: uuid::Uuid,
     /// CQL broadcast address the peer advertised during handshake.
     peer_cql_broadcast: Option<String>,
-    pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Message>>>>,
+    pending: Arc<DashMap<u32, oneshot::Sender<Message>>>,
     tx: mpsc::Sender<Frame>,
     next_stream_id: Arc<AtomicU32>,
     /// Signals `false` when the TCP connection drops.
@@ -129,8 +130,7 @@ impl RpcClient {
         .await
         .map_err(|_| NetError::Timeout("handshake".into()))??;
 
-        let pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Message>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<DashMap<u32, oneshot::Sender<Message>>> = Arc::new(DashMap::new());
         let (tx, mut rx) = mpsc::channel::<Frame>(256);
 
         let (alive_tx, _alive_rx_init) = watch::channel(true);
@@ -153,13 +153,12 @@ impl RpcClient {
             while let Some(Ok(frame)) = stream.next().await {
                 let stream_id = frame.header.stream_id;
                 if let Ok(msg) = Message::decode(frame.header.msg_type, &mut frame.body.clone()) {
-                    let mut map = pending_clone.lock().await;
-                    if let Some(sender) = map.remove(&stream_id) {
+                    // Lock-free: DashMap::remove is a single atomic operation.
+                    if let Some((_, sender)) = pending_clone.remove(&stream_id) {
                         let _ = sender.send(msg);
                     }
                 }
             }
-            // Stream ended (EOF) or errored — notify subscribers.
             let _ = alive_tx_clone.send(false);
         });
 
@@ -199,7 +198,8 @@ impl RpcClient {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let (resp_tx, resp_rx) = oneshot::channel();
 
-        self.pending.lock().await.insert(stream_id, resp_tx);
+        // Lock-free: DashMap::insert is a single atomic operation.
+        self.pending.insert(stream_id, resp_tx);
 
         let mut body = BytesMut::new();
         msg.encode(&mut body)?;

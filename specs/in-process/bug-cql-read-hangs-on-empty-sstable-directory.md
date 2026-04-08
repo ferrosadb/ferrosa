@@ -25,7 +25,7 @@ podman compose up -d
 # Wait for healthy
 
 # Ingest data (creates entity_types/edge_types directories but no data)
-skilltools ingest --cql localhost:19042 /path/to/repo
+frg ingest --cql localhost:19042 /path/to/repo
 
 # Restart cluster
 podman compose stop && podman compose up -d

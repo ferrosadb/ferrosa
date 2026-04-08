@@ -7,14 +7,14 @@ verified-by: ""
 created: 2026-04-05
 updated: 2026-04-05
 source: manual
-source-location: "tools/skilltools/specs/bug-ingest-dangling-edge-references.md"
+source-location: "tools/forge/specs/bug-ingest-dangling-edge-references.md"
 ---
 
 # Entity store loses entities from prior ingests
 
 ## Description
 
-When multiple codebases are ingested sequentially via `skilltools ingest --cql`, entities from earlier ingests are lost. Only the last codebase's entities survive. All ingests use the same `(tenant_id, session_id)` partition, with unique `entity_id` clustering keys, so Cassandra upsert semantics should not cause overwrites.
+When multiple codebases are ingested sequentially via `frg ingest --cql`, entities from earlier ingests are lost. Only the last codebase's entities survive. All ingests use the same `(tenant_id, session_id)` partition, with unique `entity_id` clustering keys, so Cassandra upsert semantics should not cause overwrites.
 
 ## Evidence
 
@@ -53,8 +53,8 @@ All entities from all ingests should persist. The `entity_store` partition shoul
 ```bash
 # Step 1: Insert 100 test entities via direct CQL — all persist
 # Step 2: Insert 500 more via direct CQL — all persist (total 634)
-# Step 3: skilltools ingest ferrosa-memory (2,873 entities) — all prior data survives (total 3,847)
-# Step 4: skilltools ingest ferrosa (11,579 entities) — PRIOR DATA LOST
+# Step 3: frg ingest ferrosa-memory (2,873 entities) — all prior data survives (total 3,847)
+# Step 4: frg ingest ferrosa (11,579 entities) — PRIOR DATA LOST
 
 # Results after step 4:
 #   Total entities: 2,210 (was 3,191 before step 4)
@@ -105,7 +105,7 @@ This rules out post-compaction manifest issues. The loss occurs during concurren
 
 ## Diagnostic Logging Request
 
-We need debug-level logging added to the following hot paths to capture the exact moment data disappears. The reproduction is reliable: run `skilltools ingest --cql localhost:19042 /path/to/ferrosa` (~11K entities) while prior data exists in the same partition.
+We need debug-level logging added to the following hot paths to capture the exact moment data disappears. The reproduction is reliable: run `frg ingest --cql localhost:19042 /path/to/ferrosa` (~11K entities) while prior data exists in the same partition.
 
 ### 1. Memtable flush path
 Log BEFORE and AFTER each memtable flush:
@@ -173,10 +173,10 @@ podman compose up -d
 python3 -c "..." # (see reproduction steps above)
 
 # Step 2: Small ingest (canaries survive this)
-skilltools ingest --cql localhost:19042 /path/to/ferrosa-memory
+frg ingest --cql localhost:19042 /path/to/ferrosa-memory
 
 # Step 3: Large ingest (canaries lost during this)
-skilltools ingest --cql localhost:19042 /path/to/ferrosa
+frg ingest --cql localhost:19042 /path/to/ferrosa
 
 # Step 4: Check logs
 podman logs ferrosa-memory_node1_1 2>&1 | grep "CANARY"

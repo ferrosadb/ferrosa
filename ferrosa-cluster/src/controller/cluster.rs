@@ -124,14 +124,18 @@ impl ModeController {
         let net_cfg = self.net_config.clone();
         let local_id = self.local_host_id;
         let internode_port = self.net_config.bind_addr.port();
+        let raft_rt_for_connect = self.raft_runtime.get().cloned();
+        let data_rt_for_connect = self.data_runtime.get().cloned();
         for (peer_uuid, peer_addr) in &peers {
             if !peer_manager.has_peer(*peer_uuid) {
                 let pm = peer_manager.clone();
                 let cfg = net_cfg.clone();
                 let uuid = *peer_uuid;
                 let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
+                let raft_rt = raft_rt_for_connect.clone();
+                let data_rt = data_rt_for_connect.clone();
                 self.spawn_tracked(async move {
-                    match PriorityPool::connect(cfg, local_id, &reverse_addr.to_string()).await {
+                    match PriorityPool::connect(cfg, local_id, &reverse_addr.to_string(), raft_rt.as_deref(), data_rt.as_deref()).await {
                         Ok(pool) => {
                             pm.add_peer((uuid, reverse_addr), pool).await;
                             tracing::info!(%uuid, %reverse_addr, "cluster: reverse connection established");
@@ -357,6 +361,7 @@ impl ModeController {
         let raft_election_max_ms = self.config.raft_election_timeout_max_ms;
         let schema_for_replay = self.schema.clone();
         let ddl_queue_rx = self.ddl_queue_rx.clone();
+        let raft_runtime: Option<Arc<tokio::runtime::Runtime>> = self.raft_runtime.get().cloned();
 
         // Register Raft RPC handlers BEFORE spawning the init task.
         // Handlers use LazyRaft to wait for the instance to be ready.
@@ -440,9 +445,12 @@ impl ModeController {
             let raft_config = match (openraft::Config {
                 cluster_name,
                 heartbeat_interval: raft_heartbeat_ms,
+                // Data replication gets 10x the heartbeat timeout so followers
+                // have time for sled disk writes without blocking heartbeats.
+                replication_lag_timeout: raft_heartbeat_ms * 10,
                 election_timeout_min: raft_election_min_ms,
                 election_timeout_max: raft_election_max_ms,
-                max_payload_entries: 100,
+                max_payload_entries: 5,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
                 ..Default::default()
             })
@@ -490,20 +498,49 @@ impl ModeController {
             // The key invariant: only the seed calls initialize(), so only the
             // seed starts elections. Non-seeds are passive responders.
 
-            // Create the Raft instance
-            let raft = match FerrosRaft::new(
-                local_node_id,
-                raft_config,
-                network_factory,
-                log_store,
-                state_machine,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(fatal) => {
-                    tracing::error!(%fatal, "raft initialization failed (Fatal), DDL remains on direct path");
-                    return;
+            // Create the Raft instance on the dedicated Raft runtime so openraft's
+            // internal tasks (replication, election) run there. This keeps
+            // reply_rx.await off the busy main runtime, eliminating 100ms+
+            // scheduling delays on heartbeat round-trips.
+            let raft = if let Some(raft_rt) = raft_runtime.as_ref() {
+                match raft_rt
+                    .spawn(async move {
+                        FerrosRaft::new(
+                            local_node_id,
+                            raft_config,
+                            network_factory,
+                            log_store,
+                            state_machine,
+                        )
+                        .await
+                    })
+                    .await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(fatal)) => {
+                        tracing::error!(%fatal, "raft initialization failed (Fatal)");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "raft runtime join error");
+                        return;
+                    }
+                }
+            } else {
+                match FerrosRaft::new(
+                    local_node_id,
+                    raft_config,
+                    network_factory,
+                    log_store,
+                    state_machine,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(fatal) => {
+                        tracing::error!(%fatal, "raft initialization failed (Fatal)");
+                        return;
+                    }
                 }
             };
 
@@ -1100,7 +1137,7 @@ impl RpcHandler for ClusterInviteHandler {
             let addr = reverse_addr;
 
             connect_tasks.spawn(async move {
-                match PriorityPool::connect(cfg, local_id, &addr.to_string()).await {
+                match PriorityPool::connect(cfg, local_id, &addr.to_string(), None, None).await {
                     Ok(pool) => {
                         pm.add_peer((uuid, addr), pool).await;
                         tracing::info!(

@@ -16,6 +16,7 @@
 //! 13. Wait for shutdown signal
 //! 14. Graceful shutdown with timeout
 
+mod runtime;
 mod web;
 
 use std::path::Path;
@@ -460,6 +461,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mutation_fwd_handler,
     );
 
+    // 5b. Create subsystem runtimes (Raft gets its own so heartbeats
+    // 5b. Dedicated Raft runtime — heartbeats can't be starved by CQL/S3 work.
+    let runtimes = runtime::RuntimeManager::new();
+
     let (mode_controller, handles) = ferrosa_cluster::ModeController::new(
         cluster_config,
         net_config.clone(),
@@ -476,6 +481,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mode_controller.clone(),
     ));
     mode_controller.set_peer_manager(peer_manager.clone());
+    mode_controller.set_raft_runtime(runtimes.raft.clone());
+    mode_controller.set_data_runtime(runtimes.data.clone());
 
     // 6b. Start heartbeat loop for peer failure detection
     let heartbeat_pm = peer_manager.clone();
@@ -486,7 +493,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 7. Start internode RPC server with inbound peer callback
     let rpc_server = Arc::new(
         ferrosa_net::rpc::server::RpcServer::new((*net_config).clone(), host_id, registry)
-            .with_inbound_callback(mode_controller.clone()),
+            .with_inbound_callback(mode_controller.clone())
+            .with_data_runtime(runtimes.data.clone()),
     );
     let internode_addr = rpc_server.start_and_get_addr().await?;
     tracing::info!(%internode_addr, %host_id, "internode server listening");
@@ -835,6 +843,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         net_cfg.clone(),
                         host_id,
                         seed.as_str(),
+                        None,
+                        None,
                     )
                     .await
                     {
@@ -900,16 +910,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // After flush, sync new SSTables to S3.
+                    // Run on a dedicated thread so HTTP uploads don't starve
+                    // the main tokio runtime (which handles Raft RPCs).
                     if has_s3 {
-                        match maintenance_engine.sync_sstables_to_s3().await {
-                            Ok(n) if n > 0 => {
-                                tracing::info!(count = n, "synced SSTables to S3");
-                            }
-                            Err(e) => {
-                                tracing::warn!(%e, "S3 SSTable sync failed");
-                            }
-                            _ => {}
-                        }
+                        let engine = maintenance_engine.clone();
+                        let _ = std::thread::Builder::new()
+                            .name("s3-sync".into())
+                            .spawn(move || {
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .expect("s3-sync runtime");
+                                rt.block_on(async {
+                                    match engine.sync_sstables_to_s3().await {
+                                        Ok(n) if n > 0 => {
+                                            tracing::info!(count = n, "synced SSTables to S3");
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(%e, "S3 SSTable sync failed");
+                                        }
+                                        _ => {}
+                                    }
+                                });
+                            });
                     }
 
                     // Commit log GC: discard segments with no remaining dirty tables.
@@ -950,18 +973,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Always persist schema locally for restart recovery.
                         persist_schema_locally(Path::new(&maintenance_data_dir), &maintenance_schema);
 
-                        // Sync to S3 if configured.
+                        // Sync to S3 if configured — on a dedicated thread.
                         if has_s3 {
-                            match maintenance_engine.sync_sstables_to_s3().await {
-                                Ok(n) if n > 0 => {
-                                    tracing::info!(count = n, "pre-schema-persist S3 sync");
-                                }
-                                Err(e) => {
-                                    tracing::warn!(%e, "pre-schema-persist S3 sync failed");
-                                }
-                                _ => {}
-                            }
-                            persist_schema_to_s3(&maintenance_engine, &maintenance_schema).await;
+                            let engine = maintenance_engine.clone();
+                            let schema_ref = maintenance_schema.clone();
+                            let _ = std::thread::Builder::new()
+                                .name("s3-schema-sync".into())
+                                .spawn(move || {
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .expect("s3-schema-sync runtime");
+                                    rt.block_on(async {
+                                        match engine.sync_sstables_to_s3().await {
+                                            Ok(n) if n > 0 => {
+                                                tracing::info!(count = n, "pre-schema-persist S3 sync");
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(%e, "pre-schema-persist S3 sync failed");
+                                            }
+                                            _ => {}
+                                        }
+                                        persist_schema_to_s3(&engine, &schema_ref).await;
+                                    });
+                                });
                         }
 
                         last_schema_version = snap.version;

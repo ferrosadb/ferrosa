@@ -19,6 +19,9 @@ members = [
     "ferrosa-sparql",
 ]
 
+[patch.crates-io]
+openraft = { git = "https://github.com/ferrosadb/openraft.git", branch = "fix/separate-replication-timeout" }
+
 [workspace.package]
 version = "1.0.0-beta.4"
 edition = "2021"

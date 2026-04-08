@@ -428,35 +428,45 @@ impl RpcHandler for RaftAppendHandler {
     async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
         let bytes = match msg {
             Message::RaftAppendEntries(b) => b,
-            _ => return None,
+            other => {
+                tracing::error!(msg_type = ?other.msg_type(), "RaftAppendHandler: unexpected message type");
+                return None;
+            }
         };
 
-        let raft = self.raft.get().await?;
+        let raft = match self.raft.get().await {
+            Some(r) => r,
+            None => {
+                tracing::error!(
+                    "RaftAppendHandler: Raft instance not ready (LazyRaft returned None)"
+                );
+                return None;
+            }
+        };
 
-        let req: AppendEntriesRequest<FerrosRaftConfig> = bincode::deserialize(&bytes)
-            .map_err(|e| {
-                tracing::warn!("RaftAppendHandler: failed to deserialize request: {e}");
-                e
-            })
-            .ok()?;
+        let req: AppendEntriesRequest<FerrosRaftConfig> = match bincode::deserialize(&bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("RaftAppendHandler: deserialize failed: {e}");
+                return None;
+            }
+        };
 
-        let resp = raft
-            .append_entries(req)
-            .await
-            .map_err(|e| {
-                tracing::warn!("RaftAppendHandler: append_entries failed: {e}");
-                e
-            })
-            .ok()?;
+        let resp = match raft.append_entries(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("RaftAppendHandler: append_entries failed: {e}");
+                return None;
+            }
+        };
 
-        let resp_bytes = bincode::serialize(&resp)
-            .map_err(|e| {
-                tracing::warn!("RaftAppendHandler: failed to serialize response: {e}");
-                e
-            })
-            .ok()?;
-
-        Some(Message::RaftAppendResponse(Bytes::from(resp_bytes)))
+        match bincode::serialize(&resp) {
+            Ok(bytes) => Some(Message::RaftAppendResponse(Bytes::from(bytes))),
+            Err(e) => {
+                tracing::error!("RaftAppendHandler: serialize response failed: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -483,35 +493,45 @@ impl RpcHandler for RaftVoteHandler {
     async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
         let bytes = match msg {
             Message::RaftVote(b) => b,
-            _ => return None,
+            other => {
+                tracing::error!(msg_type = ?other.msg_type(), "RaftVoteHandler: unexpected message type");
+                return None;
+            }
         };
 
-        let raft = self.raft.get().await?;
+        let raft = match self.raft.get().await {
+            Some(r) => r,
+            None => {
+                tracing::error!(
+                    "RaftVoteHandler: Raft instance not ready (LazyRaft returned None)"
+                );
+                return None;
+            }
+        };
 
-        let req: VoteRequest<u64> = bincode::deserialize(&bytes)
-            .map_err(|e| {
-                tracing::warn!("RaftVoteHandler: failed to deserialize request: {e}");
-                e
-            })
-            .ok()?;
+        let req: VoteRequest<u64> = match bincode::deserialize(&bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("RaftVoteHandler: deserialize failed: {e}");
+                return None;
+            }
+        };
 
-        let resp: VoteResponse<u64> = raft
-            .vote(req)
-            .await
-            .map_err(|e| {
-                tracing::warn!("RaftVoteHandler: vote failed: {e}");
-                e
-            })
-            .ok()?;
+        let resp: VoteResponse<u64> = match raft.vote(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("RaftVoteHandler: vote failed: {e}");
+                return None;
+            }
+        };
 
-        let resp_bytes = bincode::serialize(&resp)
-            .map_err(|e| {
-                tracing::warn!("RaftVoteHandler: failed to serialize response: {e}");
-                e
-            })
-            .ok()?;
-
-        Some(Message::RaftVoteResponse(Bytes::from(resp_bytes)))
+        match bincode::serialize(&resp) {
+            Ok(bytes) => Some(Message::RaftVoteResponse(Bytes::from(bytes))),
+            Err(e) => {
+                tracing::error!("RaftVoteHandler: serialize response failed: {e}");
+                None
+            }
+        }
     }
 }
 

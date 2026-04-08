@@ -32,6 +32,8 @@ pub struct RpcServer {
     inbound_callback: Option<Arc<dyn InboundPeerCallback>>,
     /// Aggregate bandwidth counters across all inbound connections.
     pub bandwidth: Arc<super::client::BandwidthMetrics>,
+    /// Dedicated runtime for non-Raft connections (data, bulk, bootstrap).
+    data_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl RpcServer {
@@ -51,7 +53,14 @@ impl RpcServer {
             bound_addr_rx,
             inbound_callback: None,
             bandwidth: Arc::new(super::client::BandwidthMetrics::new()),
+            data_runtime: None,
         }
+    }
+
+    /// Set a dedicated runtime for non-Raft connections (data, bulk, bootstrap).
+    pub fn with_data_runtime(mut self, rt: Arc<tokio::runtime::Runtime>) -> Self {
+        self.data_runtime = Some(rt);
+        self
     }
 
     /// Set a callback for inbound peer connections. Called after handshake succeeds.
@@ -92,13 +101,43 @@ impl RpcServer {
     ) -> crate::error::Result<std::net::SocketAddr> {
         // Build TLS acceptor if configured (must happen before spawning)
         let tls_acceptor = crate::tls::build_tls_acceptor(&self.config)?;
-        let listener = TcpListener::bind(self.config.bind_addr).await?;
-        let addr = listener.local_addr()?;
-        let _ = self.bound_addr.send(Some(addr));
-        tracing::info!(%addr, "internode server listening");
+
+        // Create the TCP listener on the Data runtime (if available) so ALL
+        // connection handlers and their frame readers run there — not on the
+        // main runtime where they'd compete with CQL/bootstrap work.
+        let bind_addr = self.config.bind_addr;
         let server = self.clone();
-        tokio::spawn(async move { server.accept_loop(listener, tls_acceptor).await });
-        Ok(addr)
+
+        if let Some(ref data_rt) = self.data_runtime {
+            let bound_addr_tx = self.bound_addr.clone();
+            data_rt.spawn(async move {
+                match TcpListener::bind(bind_addr).await {
+                    Ok(listener) => {
+                        let addr = listener.local_addr().unwrap();
+                        let _ = bound_addr_tx.send(Some(addr));
+                        tracing::info!(%addr, "internode server listening (data runtime)");
+                        server.accept_loop(listener, tls_acceptor).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "failed to bind internode server");
+                    }
+                }
+            });
+            // Wait for the bind to complete
+            let mut rx = self.bound_addr_rx.clone();
+            rx.changed()
+                .await
+                .map_err(|_| NetError::Protocol("bound_addr channel closed".into()))?;
+            let addr = *rx.borrow_and_update();
+            Ok(addr.unwrap())
+        } else {
+            let listener = TcpListener::bind(bind_addr).await?;
+            let addr = listener.local_addr()?;
+            let _ = self.bound_addr.send(Some(addr));
+            tracing::info!(%addr, "internode server listening");
+            tokio::spawn(async move { server.accept_loop(listener, tls_acceptor).await });
+            Ok(addr)
+        }
     }
 
     async fn accept_loop(
@@ -196,7 +235,7 @@ impl RpcServer {
         peer_addr: std::net::SocketAddr,
     ) -> crate::error::Result<()>
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let mut framed = Framed::new(stream, InternodeCodec::new(self.config.max_frame_body_size));
 
@@ -216,39 +255,93 @@ impl RpcServer {
             cb.on_inbound_peer(peer_id, peer_cql_broadcast);
         }
 
-        // Message dispatch loop
-        while let Some(frame_result) = framed.next().await {
-            let frame = frame_result?;
+        // Concurrent frame handling: split read/write, dispatch handlers
+        // to the Data runtime so they don't block frame reading.
+        let (mut sink, mut stream) = framed.split();
+        let registry = self.registry.clone();
+        let bandwidth = self.bandwidth.clone();
+
+        // Frame reading stays on the main runtime (tokio I/O handles can't
+        // move between runtimes). Handlers are dispatched to dedicated runtimes.
+        let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<Frame>(64);
+
+        let bw_write = bandwidth.clone();
+        let write_task = tokio::spawn(async move {
+            while let Some(frame) = resp_rx.recv().await {
+                bw_write.bytes_sent.fetch_add(
+                    frame.body.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if sink.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        while let Some(frame_result) = stream.next().await {
+            let frame = match frame_result {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(?peer_id, %e, "frame read error");
+                    break;
+                }
+            };
             let msg_type = frame.header.msg_type;
             let stream_id = frame.header.stream_id;
-            // Track inbound bytes.
-            self.bandwidth.bytes_received.fetch_add(
+            let lane = frame.header.lane;
+            bandwidth.bytes_received.fetch_add(
                 frame.body.len() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            let msg = Message::decode(msg_type, &mut frame.body.clone())?;
+            let msg = match Message::decode(msg_type, &mut frame.body.clone()) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(?peer_id, %e, "message decode error");
+                    continue;
+                }
+            };
 
-            if let Some(response) = self.registry.dispatch(peer_id, msg_type, msg).await {
-                let mut body = bytes::BytesMut::new();
-                response.encode(&mut body)?;
-                let body_len = u32::try_from(body.len())
-                    .map_err(|_| NetError::Protocol("response body exceeds u32::MAX".into()))?;
-                // Track outbound bytes.
-                self.bandwidth
-                    .bytes_sent
-                    .fetch_add(body_len as u64, std::sync::atomic::Ordering::Relaxed);
-                let resp_frame = Frame {
-                    header: FrameHeader::new(
-                        response.msg_type(),
-                        frame.header.lane,
-                        stream_id,
-                        body_len,
-                    ),
-                    body: body.freeze(),
-                };
-                framed.send(resp_frame).await?;
+            // Dispatch handlers to the appropriate runtime.
+            // Raft handlers → Raft runtime (isolated from data-path load).
+            // Data/Bulk handlers → Data runtime (isolated from main runtime).
+            // Fallback → main runtime.
+            let registry = registry.clone();
+            let resp_tx = resp_tx.clone();
+            let handler = async move {
+                if let Some(response) = registry.dispatch(peer_id, msg_type, msg).await {
+                    let mut body = bytes::BytesMut::new();
+                    if response.encode(&mut body).is_ok() {
+                        if let Ok(body_len) = u32::try_from(body.len()) {
+                            let _ = resp_tx
+                                .send(Frame {
+                                    header: FrameHeader::new(
+                                        response.msg_type(),
+                                        lane,
+                                        stream_id,
+                                        body_len,
+                                    ),
+                                    body: body.freeze(),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            };
+
+            // ALL handlers run on the Data runtime (or main runtime fallback).
+            // Do NOT dispatch Raft handlers to the Raft runtime — the follower's
+            // raft_runtime is saturated with its own election attempts when
+            // heartbeats are delayed. The handler just calls raft.append_entries()
+            // which enqueues to openraft's internal channel — fast, no heavy work.
+            if let Some(ref data_rt) = self.data_runtime {
+                data_rt.spawn(handler);
+            } else {
+                tokio::spawn(handler);
             }
         }
+
+        drop(resp_tx);
+        let _ = write_task.await;
 
         tracing::info!(?peer_id, "peer disconnected");
         Ok(())
