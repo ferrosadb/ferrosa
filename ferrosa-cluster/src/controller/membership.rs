@@ -238,21 +238,15 @@ impl ModeController {
     /// or `auto_join`), and spawns an async task to propose `JoinNode` +
     /// `AssignTokens` via Raft.
     pub(super) fn trigger_cluster_join(&self, host_id: Uuid, addr: std::net::SocketAddr) {
-        // De-duplicate: skip if already pending.
+        // De-duplicate: skip if already a member (Raft AddLearner is idempotent
+        // but we avoid unnecessary Raft round-trips).
         {
-            let mut pending = self.pending_joins.lock();
+            let pending = self.pending_joins.lock();
             if pending.contains(&host_id) {
-                tracing::info!(peer = %host_id, "peer already pending join, skipping");
-                return;
+                tracing::debug!(peer = %host_id, "peer join already in progress");
+                // Don't skip — previous attempt may have failed because Raft
+                // wasn't ready. Allow retry.
             }
-            if pending.len() >= super::MAX_PENDING_JOINS {
-                tracing::warn!(
-                    cap = super::MAX_PENDING_JOINS,
-                    "pending_joins at capacity — evicting oldest entry"
-                );
-                pending.remove(0);
-            }
-            pending.push(host_id);
         }
 
         // Capture state needed by the spawned task.
@@ -276,7 +270,7 @@ impl ModeController {
                 None => {
                     tracing::warn!(
                         peer = %host_id,
-                        "raft not initialized yet, cannot admit peer"
+                        "raft not initialized yet, cannot admit peer — will retry on next connect"
                     );
                     return;
                 }
