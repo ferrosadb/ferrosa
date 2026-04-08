@@ -3853,7 +3853,7 @@ mod tests {
 
     /// Exact production scenario: 11,000 rows to the same partition key
     /// with flush_if_needed triggering automatically based on size.
-    /// This is what `skilltools ingest` does against a live cluster.
+    /// This is what `frg ingest` does against a live cluster.
     #[test]
     fn high_volume_ingest_with_auto_flush_preserves_all_rows() {
         let dir = tempfile::tempdir().unwrap();

@@ -160,7 +160,7 @@ impl TestClusterNode {
     /// Establish an outbound connection to another node.
     async fn connect_to(&self, other: &TestClusterNode) {
         let net_config = Arc::new(test_net_config());
-        let pool = PriorityPool::connect(net_config, self.host_id, &other.bound_addr.to_string())
+        let pool = PriorityPool::connect(net_config, self.host_id, &other.bound_addr.to_string(), None, None)
             .await
             .expect("failed to connect to peer");
 

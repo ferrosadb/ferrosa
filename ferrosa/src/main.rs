@@ -481,6 +481,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mode_controller.clone(),
     ));
     mode_controller.set_peer_manager(peer_manager.clone());
+    mode_controller.set_raft_runtime(runtimes.raft.clone());
+    mode_controller.set_data_runtime(runtimes.data.clone());
 
     // 6b. Start heartbeat loop for peer failure detection
     let heartbeat_pm = peer_manager.clone();
@@ -492,7 +494,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rpc_server = Arc::new(
         ferrosa_net::rpc::server::RpcServer::new((*net_config).clone(), host_id, registry)
             .with_inbound_callback(mode_controller.clone())
-            .with_raft_runtime(runtimes.raft.clone()),
+            .with_raft_runtime(runtimes.raft.clone())
+            .with_data_runtime(runtimes.data.clone()),
     );
     let internode_addr = rpc_server.start_and_get_addr().await?;
     tracing::info!(%internode_addr, %host_id, "internode server listening");
@@ -841,6 +844,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         net_cfg.clone(),
                         host_id,
                         seed.as_str(),
+                        None,
+                        None,
                     )
                     .await
                     {

@@ -13,8 +13,10 @@ use std::time::Duration;
 /// subsystem components.
 pub struct RuntimeManager {
     /// Raft consensus: openraft tasks, Raft lane IO, vote/heartbeat handlers.
+    /// Must NEVER run bootstrap streaming, S3 sync, or data-path handlers.
     pub raft: Arc<tokio::runtime::Runtime>,
-    // Phase 2+: cql, data, s3, index, aux runtimes will be added here.
+    /// Internode data path: read/write forwarding, bootstrap streaming, repair.
+    pub data: Arc<tokio::runtime::Runtime>,
 }
 
 impl RuntimeManager {
@@ -22,20 +24,30 @@ impl RuntimeManager {
     pub fn new() -> Self {
         let raft = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
+                .worker_threads(8)
                 .thread_name("raft-rt")
                 .enable_all()
                 .build()
                 .expect("raft runtime"),
         );
 
-        Self { raft }
+        let data = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(8)
+                .thread_name("data-rt")
+                .enable_all()
+                .build()
+                .expect("data runtime"),
+        );
+
+        Self { raft, data }
     }
 
     /// Graceful shutdown in reverse dependency order.
     pub fn shutdown_all(self, timeout: Duration) {
-        // Raft is the last to shut down — it must commit any in-flight entries.
-        // Try to unwrap the Arc; if other references exist, just drop our handle.
+        if let Ok(rt) = Arc::try_unwrap(self.data) {
+            rt.shutdown_timeout(timeout);
+        }
         if let Ok(rt) = Arc::try_unwrap(self.raft) {
             rt.shutdown_timeout(timeout);
         }

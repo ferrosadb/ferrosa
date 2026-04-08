@@ -192,6 +192,8 @@ impl PairNode {
             self.net_config.clone(),
             self.local_host_id,
             &peer_addr.to_string(),
+            None,
+            None,
         )
         .await
         {
@@ -227,6 +229,8 @@ impl PairNode {
             self.net_config.clone(),
             self.local_host_id,
             &peer_addr.to_string(),
+            None,
+            None,
         )
         .await
         .map_err(crate::error::ClusterError::Net)?;

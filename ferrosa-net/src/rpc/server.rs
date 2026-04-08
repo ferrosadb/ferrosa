@@ -32,9 +32,10 @@ pub struct RpcServer {
     inbound_callback: Option<Arc<dyn InboundPeerCallback>>,
     /// Aggregate bandwidth counters across all inbound connections.
     pub bandwidth: Arc<super::client::BandwidthMetrics>,
-    /// Optional dedicated runtime for Raft RPC handling. When set, inbound
-    /// Raft messages are dispatched on this runtime instead of the main one.
+    /// Dedicated runtime for Raft connections (frame reading + handler dispatch).
     raft_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    /// Dedicated runtime for non-Raft connections (data, bulk, bootstrap).
+    data_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl RpcServer {
@@ -55,12 +56,19 @@ impl RpcServer {
             inbound_callback: None,
             bandwidth: Arc::new(super::client::BandwidthMetrics::new()),
             raft_runtime: None,
+            data_runtime: None,
         }
     }
 
-    /// Set a dedicated runtime for inbound Raft RPC dispatch.
+    /// Set a dedicated runtime for Raft connections.
     pub fn with_raft_runtime(mut self, rt: Arc<tokio::runtime::Runtime>) -> Self {
         self.raft_runtime = Some(rt);
+        self
+    }
+
+    /// Set a dedicated runtime for non-Raft connections (data, bulk, bootstrap).
+    pub fn with_data_runtime(mut self, rt: Arc<tokio::runtime::Runtime>) -> Self {
+        self.data_runtime = Some(rt);
         self
     }
 
@@ -226,30 +234,29 @@ impl RpcServer {
             cb.on_inbound_peer(peer_id, peer_cql_broadcast);
         }
 
-        // Split the framed connection so reads and writes are independent.
-        // Handlers are spawned concurrently — no head-of-line blocking.
+        // Concurrent frame handling: split read/write, dispatch handlers
+        // to the Data runtime so they don't block frame reading.
         let (mut sink, mut stream) = framed.split();
+        let registry = self.registry.clone();
+        let bandwidth = self.bandwidth.clone();
 
-        // Channel for handler tasks to send responses back to the writer.
+        // Frame reading stays on the main runtime (tokio I/O handles can't
+        // move between runtimes). Handlers are dispatched to dedicated runtimes.
         let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<Frame>(64);
 
-        // Writer task: drains the response channel and writes to TCP.
-        let bandwidth_write = self.bandwidth.clone();
+        let bw_write = bandwidth.clone();
         let write_task = tokio::spawn(async move {
             while let Some(frame) = resp_rx.recv().await {
-                bandwidth_write
-                    .bytes_sent
-                    .fetch_add(frame.body.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                bw_write.bytes_sent.fetch_add(
+                    frame.body.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if sink.send(frame).await.is_err() {
                     break;
                 }
             }
         });
 
-        // Reader loop: reads frames and spawns handlers concurrently.
-        let registry = self.registry.clone();
-        let bandwidth_read = self.bandwidth.clone();
-        let raft_runtime = self.raft_runtime.clone();
         while let Some(frame_result) = stream.next().await {
             let frame = match frame_result {
                 Ok(f) => f,
@@ -261,7 +268,7 @@ impl RpcServer {
             let msg_type = frame.header.msg_type;
             let stream_id = frame.header.stream_id;
             let lane = frame.header.lane;
-            bandwidth_read.bytes_received.fetch_add(
+            bandwidth.bytes_received.fetch_add(
                 frame.body.len() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
@@ -273,43 +280,45 @@ impl RpcServer {
                 }
             };
 
-            // Spawn handler concurrently — response goes through the channel.
+            // Dispatch handlers to the appropriate runtime.
+            // Raft handlers → Raft runtime (isolated from data-path load).
+            // Data/Bulk handlers → Data runtime (isolated from main runtime).
+            // Fallback → main runtime.
             let registry = registry.clone();
             let resp_tx = resp_tx.clone();
-            let dispatch_fn = move || async move {
-                let response = registry.dispatch(peer_id, msg_type, msg).await;
-                if let Some(response) = response {
+            let handler = async move {
+                if let Some(response) = registry.dispatch(peer_id, msg_type, msg).await {
                     let mut body = bytes::BytesMut::new();
                     if response.encode(&mut body).is_ok() {
                         if let Ok(body_len) = u32::try_from(body.len()) {
-                            let resp_frame = Frame {
-                                header: FrameHeader::new(
-                                    response.msg_type(),
-                                    lane,
-                                    stream_id,
-                                    body_len,
-                                ),
-                                body: body.freeze(),
-                            };
-                            let _ = resp_tx.send(resp_frame).await;
+                            let _ = resp_tx
+                                .send(Frame {
+                                    header: FrameHeader::new(
+                                        response.msg_type(),
+                                        lane,
+                                        stream_id,
+                                        body_len,
+                                    ),
+                                    body: body.freeze(),
+                                })
+                                .await;
                         }
                     }
                 }
             };
 
-            // Route Raft handlers to the dedicated runtime if available.
-            if msg_type.is_raft() {
-                if let Some(ref raft_rt) = raft_runtime {
-                    raft_rt.spawn(dispatch_fn());
-                } else {
-                    tokio::spawn(dispatch_fn());
-                }
+            // ALL handlers run on the Data runtime (or main runtime fallback).
+            // Do NOT dispatch Raft handlers to the Raft runtime — the follower's
+            // raft_runtime is saturated with its own election attempts when
+            // heartbeats are delayed. The handler just calls raft.append_entries()
+            // which enqueues to openraft's internal channel — fast, no heavy work.
+            if let Some(ref data_rt) = self.data_runtime {
+                data_rt.spawn(handler);
             } else {
-                tokio::spawn(dispatch_fn());
+                tokio::spawn(handler);
             }
         }
 
-        // Reader done — drop the sender so the writer exits.
         drop(resp_tx);
         let _ = write_task.await;
 

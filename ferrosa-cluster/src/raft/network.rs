@@ -179,7 +179,16 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         rpc: AppendEntriesRequest<FerrosRaftConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static OK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static FAIL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let call_num = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let is_heartbeat = rpc.entries.is_empty();
+        let hard_ttl = _option.hard_ttl();
+        let soft_ttl = _option.soft_ttl();
+        let t0 = std::time::Instant::now();
         let payload = encode(&rpc)?;
+        let t_encode = t0.elapsed();
         let response = self
             .peer_manager
             .send(
@@ -189,9 +198,31 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
             )
             .await
             .map_err(|e| {
-                tracing::debug!(target = %self.target_host_id, %e, "AppendEntries send failed");
+                let f = FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let elapsed = t0.elapsed();
+                if f < 10 || f % 100 == 0 {
+                    tracing::warn!(
+                        target = %self.target_host_id, %e, ?elapsed, ?t_encode,
+                        ?hard_ttl, ?soft_ttl,
+                        is_heartbeat, call_num, ok = OK_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                        fail = f + 1,
+                        thread = ?std::thread::current().name(),
+                        "AppendEntries FAILED"
+                    );
+                }
                 net_error_to_unreachable(e)
             })?;
+        let ok = OK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let elapsed = t0.elapsed();
+        if ok < 30 || ok % 50 == 0 || elapsed > std::time::Duration::from_millis(50) {
+            tracing::info!(
+                target = %self.target_host_id, ?elapsed, ?t_encode,
+                ?hard_ttl,
+                is_heartbeat, call_num, ok = ok + 1,
+                thread = ?std::thread::current().name(),
+                "AppendEntries OK"
+            );
+        }
 
         match response {
             Message::RaftAppendResponse(bytes) => decode(&bytes),

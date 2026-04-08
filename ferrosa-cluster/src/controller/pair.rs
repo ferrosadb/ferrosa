@@ -141,7 +141,7 @@ impl ModeController {
             self.spawn_tracked(async move {
                 // Retry connecting to peer's RPC server with backoff.
                 for attempt in 0..10 {
-                    match PriorityPool::connect(net_cfg.clone(), local_id, &reverse_addr.to_string()).await {
+                    match PriorityPool::connect(net_cfg.clone(), local_id, &reverse_addr.to_string(), None, None).await {
                         Ok(pool) => {
                             pm.add_peer((peer_host_id, reverse_addr), pool).await;
                             tracing::info!(%peer_host_id, %reverse_addr, attempt, "reverse connection established");

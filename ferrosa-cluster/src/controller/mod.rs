@@ -204,6 +204,10 @@ pub struct ModeController {
     >,
     /// Contention metrics for the transition guard.
     pub contention_metrics: Arc<ContentionMetrics>,
+    /// Dedicated Raft runtime for openraft tasks.
+    pub(super) raft_runtime: std::sync::OnceLock<Arc<tokio::runtime::Runtime>>,
+    /// Dedicated Data runtime for internode IO.
+    pub(super) data_runtime: std::sync::OnceLock<Arc<tokio::runtime::Runtime>>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -286,7 +290,9 @@ impl ModeController {
             committed_cluster_size: AtomicUsize::new(0),
             ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
-        });
+            raft_runtime: std::sync::OnceLock::new(),
+            data_runtime: std::sync::OnceLock::new(),
+});
 
         let handles = ModeControllerHandles {
             write_path,
@@ -341,7 +347,9 @@ impl ModeController {
             committed_cluster_size: AtomicUsize::new(0),
             ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
-        })
+            raft_runtime: std::sync::OnceLock::new(),
+            data_runtime: std::sync::OnceLock::new(),
+})
     }
 
     /// Create a pair-secondary `ModeController` for unit tests.
@@ -396,7 +404,9 @@ impl ModeController {
             committed_cluster_size: AtomicUsize::new(0),
             ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
-        })
+            raft_runtime: std::sync::OnceLock::new(),
+            data_runtime: std::sync::OnceLock::new(),
+})
     }
 
     /// Set the peer manager reference. Must be called after PeerManager is created.
@@ -419,6 +429,16 @@ impl ModeController {
             .register(MsgType::ClusterInvite, invite_handler);
 
         self.peer_manager.store(Arc::new(Some(pm)));
+    }
+
+    /// Set a dedicated runtime for Raft consensus tasks.
+    pub fn set_raft_runtime(&self, rt: Arc<tokio::runtime::Runtime>) {
+        let _ = self.raft_runtime.set(rt);
+    }
+
+    /// Set a dedicated runtime for internode data IO.
+    pub fn set_data_runtime(&self, rt: Arc<tokio::runtime::Runtime>) {
+        let _ = self.data_runtime.set(rt);
     }
 
     /// Get current deployment mode.

@@ -263,10 +263,10 @@ pub(crate) fn spawn_raft_lane_actor(
                 .build()
                 .expect("raft lane runtime");
 
-            // Use the original client (IO on main runtime) for now.
-            // Reconnection was adding latency. With the concurrent server
-            // handler and separate replication timeout, the main runtime has
-            // enough capacity for heartbeat IO.
+            // The Raft RpcClient was created on the Raft runtime (via
+            // ConnectionPool::connect's raft_runtime parameter), so its
+            // write/read IO loops are already on the correct runtime.
+            // No reconnection needed.
             rt.block_on(lane_actor_loop(lane, initial_state, rx, ctx));
         })
         .expect("spawn raft lane thread");
@@ -306,17 +306,31 @@ async fn lane_actor_loop(
                     match &state {
                         LaneState::Connected(client) => {
                             let client = client.clone();
-                            tokio::spawn(async move {
+                            let handle = tokio::spawn(async move {
+                                let t0 = std::time::Instant::now();
                                 let result =
                                     tokio::time::timeout(timeout, client.send(msg, lane)).await;
+                                let elapsed = t0.elapsed();
                                 let result = match result {
                                     Ok(Ok(response)) => Ok(response),
-                                    Ok(Err(e)) => Err(e),
-                                    Err(_elapsed) => Err(NetError::Timeout(format!(
-                                        "{lane:?} lane send timeout"
-                                    ))),
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(?elapsed, %e, "raft concurrent send error");
+                                        Err(e)
+                                    }
+                                    Err(_elapsed) => {
+                                        tracing::warn!(?elapsed, "raft concurrent send TIMEOUT");
+                                        Err(NetError::Timeout(format!(
+                                            "{lane:?} lane send timeout"
+                                        )))
+                                    }
                                 };
                                 let _ = reply.send(result);
+                            });
+                            // Don't silently swallow panics from spawned tasks.
+                            tokio::spawn(async move {
+                                if let Err(e) = handle.await {
+                                    tracing::error!("raft concurrent send task PANICKED: {e}");
+                                }
                             });
                         }
                         LaneState::Reconnecting { .. } => {
