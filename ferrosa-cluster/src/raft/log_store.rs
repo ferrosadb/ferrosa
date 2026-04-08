@@ -176,16 +176,16 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
         let meta = self.meta.clone();
         let bytes =
             bincode::serialize(vote).map_err(|e| StorageIOError::write_vote(to_any_error(e)))?;
-        #[allow(clippy::result_large_err)] // StorageIOError size dictated by openraft
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
             meta.insert(META_VOTE, bytes)
-                .map_err(|e| StorageIOError::write_vote(to_any_error(e)))?;
+                .map_err(|e| Box::new(StorageIOError::write_vote(to_any_error(e))))?;
             meta.flush()
-                .map_err(|e| StorageIOError::write_vote(to_any_error(e)))?;
-            Ok::<(), StorageIOError<u64>>(())
+                .map_err(|e| Box::new(StorageIOError::write_vote(to_any_error(e))))?;
+            Ok(())
         })
         .await
-        .map_err(|e| StorageIOError::write_vote(to_any_error(e)))??;
+        .map_err(|e| StorageIOError::write_vote(to_any_error(e)))?
+        .map_err(|e| *e)?;
         Ok(())
     }
 
@@ -224,13 +224,14 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
         // Run sled disk IO on a blocking thread so the async Raft runtime
         // stays responsive for heartbeat processing.
         let log = self.log.clone();
-        #[allow(clippy::result_large_err)] // StorageIOError size dictated by openraft
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
             log.apply_batch(batch)
-                .map_err(|e| StorageIOError::write_logs(to_any_error(e)))
+                .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
+            Ok(())
         })
         .await
-        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))??;
+        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
+        .map_err(|e| *e)?;
 
         callback.log_io_completed(Ok(()));
 
@@ -240,8 +241,7 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let log = self.log.clone();
         let start = Self::index_key(log_id.index);
-        #[allow(clippy::result_large_err)] // StorageIOError size dictated by openraft
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> Result<(), Box<StorageIOError<u64>>> {
             let keys_to_remove: Vec<sled::IVec> = log
                 .range(start..)
                 .filter_map(|r| r.ok().map(|(k, _v)| k))
@@ -251,10 +251,12 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
                 batch.remove(key);
             }
             log.apply_batch(batch)
-                .map_err(|e| StorageIOError::write_logs(to_any_error(e)))
+                .map_err(|e| Box::new(StorageIOError::write_logs(to_any_error(e))))?;
+            Ok(())
         })
         .await
-        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))??;
+        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?
+        .map_err(|e| *e)?;
         Ok(())
     }
 
