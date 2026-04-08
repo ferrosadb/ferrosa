@@ -1,6 +1,6 @@
 //! Object store configuration from environment variables.
 
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::ObjectStore;
 
 /// S3-compatible object store configuration.
@@ -80,7 +80,8 @@ impl ObjectStoreConfig {
             .with_endpoint(&self.endpoint)
             .with_bucket_name(&self.bucket)
             .with_region(&self.region)
-            .with_allow_http(self.allow_http);
+            .with_allow_http(self.allow_http)
+            .with_conditional_put(S3ConditionalPut::ETagMatch);
 
         if let Some(ref key_id) = self.access_key_id {
             builder = builder.with_access_key_id(key_id);

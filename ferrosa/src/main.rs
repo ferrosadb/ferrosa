@@ -900,16 +900,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // After flush, sync new SSTables to S3.
+                    // Run on a dedicated thread so HTTP uploads don't starve
+                    // the main tokio runtime (which handles Raft RPCs).
                     if has_s3 {
-                        match maintenance_engine.sync_sstables_to_s3().await {
-                            Ok(n) if n > 0 => {
-                                tracing::info!(count = n, "synced SSTables to S3");
-                            }
-                            Err(e) => {
-                                tracing::warn!(%e, "S3 SSTable sync failed");
-                            }
-                            _ => {}
-                        }
+                        let engine = maintenance_engine.clone();
+                        let _ = std::thread::Builder::new()
+                            .name("s3-sync".into())
+                            .spawn(move || {
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .expect("s3-sync runtime");
+                                rt.block_on(async {
+                                    match engine.sync_sstables_to_s3().await {
+                                        Ok(n) if n > 0 => {
+                                            tracing::info!(count = n, "synced SSTables to S3");
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(%e, "S3 SSTable sync failed");
+                                        }
+                                        _ => {}
+                                    }
+                                });
+                            });
                     }
 
                     // Commit log GC: discard segments with no remaining dirty tables.
@@ -950,18 +963,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Always persist schema locally for restart recovery.
                         persist_schema_locally(Path::new(&maintenance_data_dir), &maintenance_schema);
 
-                        // Sync to S3 if configured.
+                        // Sync to S3 if configured — on a dedicated thread.
                         if has_s3 {
-                            match maintenance_engine.sync_sstables_to_s3().await {
-                                Ok(n) if n > 0 => {
-                                    tracing::info!(count = n, "pre-schema-persist S3 sync");
-                                }
-                                Err(e) => {
-                                    tracing::warn!(%e, "pre-schema-persist S3 sync failed");
-                                }
-                                _ => {}
-                            }
-                            persist_schema_to_s3(&maintenance_engine, &maintenance_schema).await;
+                            let engine = maintenance_engine.clone();
+                            let schema_ref = maintenance_schema.clone();
+                            let _ = std::thread::Builder::new()
+                                .name("s3-schema-sync".into())
+                                .spawn(move || {
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .expect("s3-schema-sync runtime");
+                                    rt.block_on(async {
+                                        match engine.sync_sstables_to_s3().await {
+                                            Ok(n) if n > 0 => {
+                                                tracing::info!(count = n, "pre-schema-persist S3 sync");
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(%e, "pre-schema-persist S3 sync failed");
+                                            }
+                                            _ => {}
+                                        }
+                                        persist_schema_to_s3(&engine, &schema_ref).await;
+                                    });
+                                });
                         }
 
                         last_schema_version = snap.version;

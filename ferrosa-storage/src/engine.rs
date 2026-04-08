@@ -152,6 +152,10 @@ pub struct StorageEngine {
     pub compaction_metrics: Arc<crate::metrics::CompactionMetrics>,
     /// NVMe pin/unpin operation metrics (pinned tables, bytes, evictions).
     pub pin_metrics: Arc<crate::metrics::PinMetrics>,
+    /// Whether the configured object store supports conditional PUT (CAS).
+    /// Set by `probe_s3_cas()` at startup.  When `false`, manifest saves
+    /// fall back to unconditional PUT (last-writer-wins).
+    pub(crate) s3_cas_supported: std::sync::atomic::AtomicBool,
     /// Injected object store used in tests to bypass `ObjectStoreConfig::build_object_store()`.
     /// When `Some`, `resolve_store_and_prefix()` returns this store instead of building one.
     #[cfg(test)]
@@ -264,6 +268,7 @@ impl StorageEngine {
             archiver_handle: None,
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
+            s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             #[cfg(test)]
             upload_store_override: None,
         };
@@ -275,21 +280,28 @@ impl StorageEngine {
     /// Probe the configured object store for conditional put support.
     ///
     /// Call this once after construction when an S3 store is configured.
-    /// Returns an error if the store does not support etag-based conditional
-    /// writes — the engine must not start against a non-CAS store because
-    /// concurrent manifest updates would silently overwrite each other.
+    /// Stores the result in `s3_cas_supported`. When CAS is not available,
+    /// manifest saves fall back to unconditional PUT (last-writer-wins),
+    /// which is safe for single-node prefixes and dev environments.
     pub async fn probe_s3_cas(&self) -> ferrosa_common::Result<()> {
         if let Ok((_, store)) = self.object_store_and_config() {
             let supported = crate::manifest::probe_conditional_put_support(store.as_ref()).await;
+            self.s3_cas_supported
+                .store(supported, std::sync::atomic::Ordering::Relaxed);
             if !supported {
-                return Err(ferrosa_common::Error::InvalidData(
-                    "object store must support conditional PUT (CAS) for manifest safety; \
-                     configure an S3-compatible store or disable object storage"
-                        .to_string(),
-                ));
+                tracing::warn!(
+                    "S3 object store does not support conditional PUT (CAS) — \
+                     manifest saves will use unconditional PUT (last-writer-wins)"
+                );
             }
         }
         Ok(())
+    }
+
+    /// Whether the configured S3 store supports CAS (conditional PUT).
+    pub fn cas_supported(&self) -> bool {
+        self.s3_cas_supported
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Creates a storage engine with an explicit archive object store.
@@ -410,6 +422,7 @@ impl StorageEngine {
             archiver_handle,
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
+            s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             #[cfg(test)]
             upload_store_override: None,
         })
@@ -484,6 +497,7 @@ impl StorageEngine {
             archiver_handle: None,
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
+            s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             #[cfg(test)]
             upload_store_override: None,
         };
@@ -2102,9 +2116,16 @@ impl StorageEngine {
                     // after merging with the latest manifest. Without this,
                     // merge_into re-introduces the entries we removed.
                     let removals = vec![(table_id_str.clone(), input_ids.clone())];
-                    if let Err(e) = manifest
-                        .save_with_retry_and_removals(store.as_ref(), &prefix, &removals)
-                        .await
+                    let save_result = if self.cas_supported() {
+                        manifest
+                            .save_with_retry_and_removals(store.as_ref(), &prefix, &removals)
+                            .await
+                    } else {
+                        manifest
+                            .save_without_cas_and_removals(store.as_ref(), &prefix, &removals)
+                            .await
+                    };
+                    if let Err(e) = save_result
                     {
                         eprintln!("[compaction] manifest save failed for {sstable_id}: {e}");
                     } else {
@@ -2645,8 +2666,12 @@ impl StorageEngine {
         }
 
         if uploaded > 0 {
-            // Save updated manifest.
-            manifest.save_with_retry(store.as_ref(), &prefix).await?;
+            // Save updated manifest — use CAS if supported, unconditional otherwise.
+            if self.cas_supported() {
+                manifest.save_with_retry(store.as_ref(), &prefix).await?;
+            } else {
+                manifest.save_without_cas(store.as_ref(), &prefix).await?;
+            }
             eprintln!("[s3-sync] uploaded {uploaded} SSTables, manifest saved");
         }
 
@@ -2841,6 +2866,7 @@ impl StorageEngine {
             archiver_handle: None,
             compaction_metrics: Arc::new(crate::metrics::CompactionMetrics::new()),
             pin_metrics: Arc::new(crate::metrics::PinMetrics::new()),
+            s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             upload_store_override: Some((store, prefix)),
         })
     }
