@@ -138,10 +138,12 @@ impl ModeController {
             let local_id = self.local_host_id;
             let internode_port = self.net_config.bind_addr.port();
             let reverse_addr = SocketAddr::new(peer_addr.ip(), internode_port);
+            let raft_rt = self.raft_runtime.get().cloned();
+            let data_rt = self.data_runtime.get().cloned();
             self.spawn_tracked(async move {
                 // Retry connecting to peer's RPC server with backoff.
                 for attempt in 0..10 {
-                    match PriorityPool::connect(net_cfg.clone(), local_id, &reverse_addr.to_string(), None, None).await {
+                    match PriorityPool::connect(net_cfg.clone(), local_id, &reverse_addr.to_string(), raft_rt.as_deref(), data_rt.as_deref()).await {
                         Ok(pool) => {
                             pm.add_peer((peer_host_id, reverse_addr), pool).await;
                             tracing::info!(%peer_host_id, %reverse_addr, attempt, "reverse connection established");

@@ -139,20 +139,12 @@ impl RpcClient {
         let (mut sink, mut stream) = framed.split();
 
         // Write loop
-        let write_peer = peer_addr;
         tokio::spawn(async move {
-            let mut count = 0u64;
             while let Some(frame) = rx.recv().await {
-                count += 1;
-                if count <= 5 || count % 100 == 0 {
-                    tracing::info!(%write_peer, count, msg_type = ?frame.header.msg_type, "write loop: sending frame");
-                }
                 if sink.send(frame).await.is_err() {
-                    tracing::warn!(%write_peer, count, "write loop: sink error, exiting");
                     break;
                 }
             }
-            tracing::info!(%write_peer, count, "write loop: channel closed, exiting");
         });
 
         // Read loop — signals `alive_tx` false when the stream ends or errors.

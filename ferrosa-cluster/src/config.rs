@@ -67,7 +67,7 @@ impl Default for ClusterConfig {
             default_cl: ConsistencyLevel::Quorum,
             hinted_handoff_dir: PathBuf::from("data/hints"),
             hinted_handoff_max_mb: 1024,
-            auto_join: false,
+            auto_join: true,
             raft_data_dir: None,
             node_role: NodeRole::Both,
             formation_timeout_secs: None,

@@ -32,8 +32,6 @@ pub struct RpcServer {
     inbound_callback: Option<Arc<dyn InboundPeerCallback>>,
     /// Aggregate bandwidth counters across all inbound connections.
     pub bandwidth: Arc<super::client::BandwidthMetrics>,
-    /// Dedicated runtime for Raft connections (frame reading + handler dispatch).
-    raft_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Dedicated runtime for non-Raft connections (data, bulk, bootstrap).
     data_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
@@ -55,15 +53,8 @@ impl RpcServer {
             bound_addr_rx,
             inbound_callback: None,
             bandwidth: Arc::new(super::client::BandwidthMetrics::new()),
-            raft_runtime: None,
             data_runtime: None,
         }
-    }
-
-    /// Set a dedicated runtime for Raft connections.
-    pub fn with_raft_runtime(mut self, rt: Arc<tokio::runtime::Runtime>) -> Self {
-        self.raft_runtime = Some(rt);
-        self
     }
 
     /// Set a dedicated runtime for non-Raft connections (data, bulk, bootstrap).

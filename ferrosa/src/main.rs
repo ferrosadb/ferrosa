@@ -494,7 +494,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rpc_server = Arc::new(
         ferrosa_net::rpc::server::RpcServer::new((*net_config).clone(), host_id, registry)
             .with_inbound_callback(mode_controller.clone())
-            .with_raft_runtime(runtimes.raft.clone())
             .with_data_runtime(runtimes.data.clone()),
     );
     let internode_addr = rpc_server.start_and_get_addr().await?;
