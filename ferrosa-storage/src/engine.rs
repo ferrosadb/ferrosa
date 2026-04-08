@@ -2125,8 +2125,7 @@ impl StorageEngine {
                             .save_without_cas_and_removals(store.as_ref(), &prefix, &removals)
                             .await
                     };
-                    if let Err(e) = save_result
-                    {
+                    if let Err(e) = save_result {
                         eprintln!("[compaction] manifest save failed for {sstable_id}: {e}");
                     } else {
                         eprintln!(

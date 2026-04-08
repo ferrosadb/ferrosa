@@ -361,8 +361,7 @@ impl ModeController {
         let raft_election_max_ms = self.config.raft_election_timeout_max_ms;
         let schema_for_replay = self.schema.clone();
         let ddl_queue_rx = self.ddl_queue_rx.clone();
-        let raft_runtime: Option<Arc<tokio::runtime::Runtime>> =
-            self.raft_runtime.get().cloned();
+        let raft_runtime: Option<Arc<tokio::runtime::Runtime>> = self.raft_runtime.get().cloned();
 
         // Register Raft RPC handlers BEFORE spawning the init task.
         // Handlers use LazyRaft to wait for the instance to be ready.

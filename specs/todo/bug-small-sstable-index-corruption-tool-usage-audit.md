@@ -57,7 +57,7 @@ The `wanted 97 bytes, got 34` error matches the 97-byte tool_usage_log SSTable e
 ## Reproduction
 
 1. Start fresh 3-node cluster from `e9703f8`
-2. Ingest ferrosa-memory and ferrosa via `skilltools ingest`
+2. Ingest ferrosa-memory and ferrosa via `frg ingest`
 3. Stop and restart cluster (`podman compose stop && podman compose up -d`)
 4. Check logs: `podman logs ferrosa-memory_node1_1 2>&1 | grep 'skipping corrupted'`
 

@@ -130,8 +130,7 @@ impl RpcClient {
         .await
         .map_err(|_| NetError::Timeout("handshake".into()))??;
 
-        let pending: Arc<DashMap<u32, oneshot::Sender<Message>>> =
-            Arc::new(DashMap::new());
+        let pending: Arc<DashMap<u32, oneshot::Sender<Message>>> = Arc::new(DashMap::new());
         let (tx, mut rx) = mpsc::channel::<Frame>(256);
 
         let (alive_tx, _alive_rx_init) = watch::channel(true);

@@ -125,9 +125,9 @@ impl RpcServer {
             });
             // Wait for the bind to complete
             let mut rx = self.bound_addr_rx.clone();
-            rx.changed().await.map_err(|_| {
-                NetError::Protocol("bound_addr channel closed".into())
-            })?;
+            rx.changed()
+                .await
+                .map_err(|_| NetError::Protocol("bound_addr channel closed".into()))?;
             let addr = *rx.borrow_and_update();
             Ok(addr.unwrap())
         } else {

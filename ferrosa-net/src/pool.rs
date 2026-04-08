@@ -102,17 +102,29 @@ impl PriorityPool {
         let tls_connector = crate::tls::build_tls_connector(&config)?.map(Arc::new);
 
         let raft_client = Self::connect_client_on(
-            Arc::clone(&config), local_host_id, peer_addr,
-            tls_connector.clone(), raft_runtime,
-        ).await?;
+            Arc::clone(&config),
+            local_host_id,
+            peer_addr,
+            tls_connector.clone(),
+            raft_runtime,
+        )
+        .await?;
         let data_client = Self::connect_client_on(
-            Arc::clone(&config), local_host_id, peer_addr,
-            tls_connector.clone(), data_runtime,
-        ).await?;
+            Arc::clone(&config),
+            local_host_id,
+            peer_addr,
+            tls_connector.clone(),
+            data_runtime,
+        )
+        .await?;
         let bulk_client = Self::connect_client_on(
-            Arc::clone(&config), local_host_id, peer_addr,
-            tls_connector.clone(), data_runtime,
-        ).await?;
+            Arc::clone(&config),
+            local_host_id,
+            peer_addr,
+            tls_connector.clone(),
+            data_runtime,
+        )
+        .await?;
 
         let peer_host_id = raft_client.peer_host_id();
         let peer_cql_broadcast = raft_client.peer_cql_broadcast().map(String::from);
@@ -300,9 +312,15 @@ mod tests {
         ));
         let addr = server.start_and_get_addr().await.unwrap();
 
-        let pool = PriorityPool::connect(Arc::new(config), uuid::Uuid::new_v4(), &addr.to_string(), None, None)
-            .await
-            .unwrap();
+        let pool = PriorityPool::connect(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            &addr.to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         for lane in [Lane::Raft, Lane::Data, Lane::Bulk] {
             let resp = pool
@@ -336,9 +354,15 @@ mod tests {
         ));
         let addr = server.start_and_get_addr().await.unwrap();
 
-        let pool = PriorityPool::connect(Arc::new(config), uuid::Uuid::new_v4(), &addr.to_string(), None, None)
-            .await
-            .unwrap();
+        let pool = PriorityPool::connect(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            &addr.to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Send (request/response) on each lane.
         for lane in [Lane::Raft, Lane::Data, Lane::Bulk] {

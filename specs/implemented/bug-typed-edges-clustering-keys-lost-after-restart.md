@@ -35,7 +35,7 @@ SELECT ... LIMIT 3 → src_id=None, edge_type=None, dst_id=None
 
 ## Evidence
 
-68,134 typed_edges created by `skilltools ingest`. All have NULL clustering keys after restart:
+68,134 typed_edges created by `frg ingest`. All have NULL clustering keys after restart:
 
 ```python
 {'tenant_id': '9a5f8fbf-...', 'session_id': '00000000-...', 

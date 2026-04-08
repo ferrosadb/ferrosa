@@ -118,12 +118,16 @@ impl PeerManager {
         // (heartbeat loop, peer additions) and blocks all other sends.
         let pool = {
             let peers = self.peers.read().await;
-            let state = peers
-                .get(&host_id)
-                .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
+            let state = peers.get(&host_id).ok_or_else(|| {
+                crate::error::NetError::Protocol(format!("unknown peer: {host_id}"))
+            })?;
             match &state.pool {
                 Some(pool) => Arc::clone(pool),
-                None => return Err(crate::error::NetError::Protocol("no connection pool".into())),
+                None => {
+                    return Err(crate::error::NetError::Protocol(
+                        "no connection pool".into(),
+                    ))
+                }
             }
         };
         pool.send(msg, lane).await
@@ -145,12 +149,16 @@ impl PeerManager {
     ) -> crate::error::Result<Message> {
         let pool = {
             let peers = self.peers.read().await;
-            let state = peers
-                .get(&host_id)
-                .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
+            let state = peers.get(&host_id).ok_or_else(|| {
+                crate::error::NetError::Protocol(format!("unknown peer: {host_id}"))
+            })?;
             match &state.pool {
                 Some(pool) => Arc::clone(pool),
-                None => return Err(crate::error::NetError::Protocol("no connection pool".into())),
+                None => {
+                    return Err(crate::error::NetError::Protocol(
+                        "no connection pool".into(),
+                    ))
+                }
             }
         };
         pool.send_with_timeout(msg, lane, timeout).await
@@ -168,12 +176,16 @@ impl PeerManager {
     ) -> crate::error::Result<()> {
         let pool = {
             let peers = self.peers.read().await;
-            let state = peers
-                .get(&host_id)
-                .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
+            let state = peers.get(&host_id).ok_or_else(|| {
+                crate::error::NetError::Protocol(format!("unknown peer: {host_id}"))
+            })?;
             match &state.pool {
                 Some(pool) => Arc::clone(pool),
-                None => return Err(crate::error::NetError::Protocol("no connection pool".into())),
+                None => {
+                    return Err(crate::error::NetError::Protocol(
+                        "no connection pool".into(),
+                    ))
+                }
             }
         };
         pool.fire(msg, lane).await

@@ -437,7 +437,9 @@ impl RpcHandler for RaftAppendHandler {
         let raft = match self.raft.get().await {
             Some(r) => r,
             None => {
-                tracing::error!("RaftAppendHandler: Raft instance not ready (LazyRaft returned None)");
+                tracing::error!(
+                    "RaftAppendHandler: Raft instance not ready (LazyRaft returned None)"
+                );
                 return None;
             }
         };
@@ -500,7 +502,9 @@ impl RpcHandler for RaftVoteHandler {
         let raft = match self.raft.get().await {
             Some(r) => r,
             None => {
-                tracing::error!("RaftVoteHandler: Raft instance not ready (LazyRaft returned None)");
+                tracing::error!(
+                    "RaftVoteHandler: Raft instance not ready (LazyRaft returned None)"
+                );
                 return None;
             }
         };
