@@ -16,6 +16,7 @@
 //! 13. Wait for shutdown signal
 //! 14. Graceful shutdown with timeout
 
+mod runtime;
 mod web;
 
 use std::path::Path;
@@ -460,6 +461,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mutation_fwd_handler,
     );
 
+    // 5b. Create subsystem runtimes (Raft gets its own so heartbeats
+    //     can't be starved by CQL/S3/bootstrap work on the main runtime).
+    let runtimes = runtime::RuntimeManager::new();
+
     let (mode_controller, handles) = ferrosa_cluster::ModeController::new(
         cluster_config,
         net_config.clone(),
@@ -468,6 +473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         schema.clone(),
         registry.clone(),
     );
+    mode_controller.set_raft_runtime(runtimes.raft.clone());
 
     // 6. Create PeerManager — ModeController is the PeerEventListener
     let peer_manager = Arc::new(ferrosa_net::peer::PeerManager::new(
