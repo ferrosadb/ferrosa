@@ -186,7 +186,7 @@ def restart_cluster():
         try:
             for port in CQL_PORTS:
                 c, s = connect(port)
-                s.execute("SELECT now() FROM system.local")
+                s.execute("SELECT key FROM system.local")
                 c.shutdown()
             print(f"INFO: cluster healthy after {(attempt + 1) * 3}s")
             return
