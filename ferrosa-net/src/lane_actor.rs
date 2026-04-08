@@ -241,8 +241,10 @@ pub(crate) fn spawn_lane_actor(
 /// tokio runtime. Used for the Raft lane to guarantee heartbeat processing cannot
 /// be starved by data-path saturation on the shared runtime.
 ///
-/// The actor loop logic is identical to [`spawn_lane_actor`]; only the execution
-/// context differs.
+/// The pre-connected `RpcClient` has its read/write IO loops spawned on the
+/// caller's runtime (the main tokio runtime). We must reconnect inside this
+/// dedicated thread so those IO tasks run here — otherwise the main runtime's
+/// load can starve the write loop and zero bytes reach the wire.
 pub(crate) fn spawn_raft_lane_actor(
     lane: Lane,
     initial_state: LaneState,
@@ -256,11 +258,48 @@ pub(crate) fn spawn_raft_lane_actor(
     std::thread::Builder::new()
         .name(format!("raft-lane-{peer_label}"))
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name(format!("raft-io-{}", &peer_label))
                 .enable_all()
                 .build()
                 .expect("raft lane runtime");
-            rt.block_on(lane_actor_loop(lane, initial_state, rx, ctx));
+
+            // Reconnect the RpcClient on THIS runtime so its read/write
+            // IO loops (tokio::spawn) target this thread, not the main
+            // runtime. Without this, the main runtime's S3/compaction
+            // load starves the write loop and no Raft frames reach TCP.
+            let state = match initial_state {
+                LaneState::Connected(old_client) => {
+                    let peer_addr = old_client.peer_addr();
+                    match rt.block_on(crate::rpc::client::RpcClient::connect_with_tls(
+                        ctx.config.clone(),
+                        ctx.local_host_id,
+                        peer_addr,
+                        ctx.tls_connector.as_deref(),
+                    )) {
+                        Ok(new_client) => {
+                            tracing::info!(
+                                %peer_addr,
+                                "Raft lane: reconnected on dedicated thread"
+                            );
+                            drop(old_client);
+                            LaneState::Connected(new_client)
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                %peer_addr,
+                                "Raft lane: reconnect FAILED: {e} — \
+                                 falling back to main-runtime IO (degraded)"
+                            );
+                            LaneState::Connected(old_client)
+                        }
+                    }
+                }
+                other => other,
+            };
+
+            rt.block_on(lane_actor_loop(lane, state, rx, ctx));
         })
         .expect("spawn raft lane thread");
 
