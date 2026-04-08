@@ -440,6 +440,9 @@ impl ModeController {
             let raft_config = match (openraft::Config {
                 cluster_name,
                 heartbeat_interval: raft_heartbeat_ms,
+                // Data replication gets 10x the heartbeat timeout so followers
+                // have time for sled disk writes without blocking heartbeats.
+                replication_lag_timeout: raft_heartbeat_ms * 10,
                 election_timeout_min: raft_election_min_ms,
                 election_timeout_max: raft_election_max_ms,
                 max_payload_entries: 5,

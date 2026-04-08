@@ -263,31 +263,10 @@ pub(crate) fn spawn_raft_lane_actor(
                 .build()
                 .expect("raft lane runtime");
 
-            // Re-establish the RPC connection on the dedicated Raft runtime so
-            // that the read/write loops are spawned here instead of on the
-            // shared data-path runtime (which caused head-of-line blocking).
-            let initial_state = if let LaneState::Connected(old_client) = initial_state {
-                let peer_addr = old_client.peer_addr();
-                match rt.block_on(RpcClient::connect_with_tls(
-                    ctx.config.clone(),
-                    ctx.local_host_id,
-                    peer_addr,
-                    ctx.tls_connector.as_deref(),
-                )) {
-                    Ok(new_client) => {
-                        tracing::info!(%peer_addr, "raft lane: reconnected on dedicated runtime");
-                        drop(old_client);
-                        LaneState::Connected(new_client)
-                    }
-                    Err(e) => {
-                        tracing::error!(%peer_addr, %e, "raft lane: failed to reconnect on dedicated runtime, using original client");
-                        LaneState::Connected(old_client)
-                    }
-                }
-            } else {
-                initial_state
-            };
-
+            // Use the original client (IO on main runtime) for now.
+            // Reconnection was adding latency. With the concurrent server
+            // handler and separate replication timeout, the main runtime has
+            // enough capacity for heartbeat IO.
             rt.block_on(lane_actor_loop(lane, initial_state, rx, ctx));
         })
         .expect("spawn raft lane thread");

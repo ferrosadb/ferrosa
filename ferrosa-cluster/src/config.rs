@@ -49,7 +49,7 @@ pub struct ClusterConfig {
     /// When set, overrides the internode address for native_address.
     /// Parsed from FERROSA_CQL_BROADCAST env var.
     pub cql_broadcast: Option<String>,
-    /// Raft heartbeat interval in milliseconds. Default: 300.
+    /// Raft heartbeat interval in milliseconds. Default: 500.
     pub raft_heartbeat_ms: u64,
     /// Raft minimum election timeout in milliseconds. Default: 1000.
     pub raft_election_timeout_min_ms: u64,
@@ -72,7 +72,7 @@ impl Default for ClusterConfig {
             node_role: NodeRole::Both,
             formation_timeout_secs: None,
             cql_broadcast: None,
-            raft_heartbeat_ms: 300,
+            raft_heartbeat_ms: 500,
             raft_election_timeout_min_ms: 3000,
             raft_election_timeout_max_ms: 6000,
         }
