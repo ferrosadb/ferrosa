@@ -256,9 +256,7 @@ pub(crate) fn spawn_raft_lane_actor(
     std::thread::Builder::new()
         .name(format!("raft-lane-{peer_label}"))
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name(format!("raft-io-{}", &peer_label))
+            let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("raft lane runtime");
@@ -293,8 +291,6 @@ async fn lane_actor_loop(
         });
     }
 
-    let concurrent_sends = lane == Lane::Raft;
-
     while let Some(cmd) = rx.recv().await {
         match cmd {
             LaneCommand::Send {
@@ -302,48 +298,8 @@ async fn lane_actor_loop(
                 timeout,
                 reply,
             } => {
-                if concurrent_sends {
-                    match &state {
-                        LaneState::Connected(client) => {
-                            let client = client.clone();
-                            let handle = tokio::spawn(async move {
-                                let t0 = std::time::Instant::now();
-                                let result =
-                                    tokio::time::timeout(timeout, client.send(msg, lane)).await;
-                                let elapsed = t0.elapsed();
-                                let result = match result {
-                                    Ok(Ok(response)) => Ok(response),
-                                    Ok(Err(e)) => {
-                                        tracing::warn!(?elapsed, %e, "raft concurrent send error");
-                                        Err(e)
-                                    }
-                                    Err(_elapsed) => {
-                                        tracing::warn!(?elapsed, "raft concurrent send TIMEOUT");
-                                        Err(NetError::Timeout(format!(
-                                            "{lane:?} lane send timeout"
-                                        )))
-                                    }
-                                };
-                                let _ = reply.send(result);
-                            });
-                            // Don't silently swallow panics from spawned tasks.
-                            tokio::spawn(async move {
-                                if let Err(e) = handle.await {
-                                    tracing::error!("raft concurrent send task PANICKED: {e}");
-                                }
-                            });
-                        }
-                        LaneState::Reconnecting { .. } => {
-                            let _ = reply.send(Err(NetError::Reconnecting));
-                        }
-                        LaneState::Failed => {
-                            let _ = reply.send(Err(NetError::LaneFailed));
-                        }
-                    }
-                } else {
-                    let result = handle_send(&mut state, &ctx, lane, msg, timeout).await;
-                    let _ = reply.send(result);
-                }
+                let result = handle_send(&mut state, &ctx, lane, msg, timeout).await;
+                let _ = reply.send(result);
             }
             LaneCommand::Fire {
                 msg,

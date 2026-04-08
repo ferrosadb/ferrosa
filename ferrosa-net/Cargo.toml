@@ -10,6 +10,7 @@ repository.workspace = true
 arc-swap = "1.7"
 async-trait = "0.1"
 bytes = "1"
+dashmap = "6"
 futures = "0.3"
 hmac = "0.12"
 lz4_flex = "0.11"

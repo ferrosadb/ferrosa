@@ -113,16 +113,20 @@ impl PeerManager {
         msg: Message,
         lane: Lane,
     ) -> crate::error::Result<Message> {
-        let peers = self.peers.read().await;
-        let state = peers
-            .get(&host_id)
-            .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
-        match &state.pool {
-            Some(pool) => pool.send(msg, lane).await,
-            None => Err(crate::error::NetError::Protocol(
-                "no connection pool".into(),
-            )),
-        }
+        // Clone the pool Arc and drop the read lock BEFORE the network
+        // round-trip. Holding the lock across .await starves writers
+        // (heartbeat loop, peer additions) and blocks all other sends.
+        let pool = {
+            let peers = self.peers.read().await;
+            let state = peers
+                .get(&host_id)
+                .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
+            match &state.pool {
+                Some(pool) => Arc::clone(pool),
+                None => return Err(crate::error::NetError::Protocol("no connection pool".into())),
+            }
+        };
+        pool.send(msg, lane).await
     }
 
     /// Send a message to a peer on the specified lane with a custom timeout.
@@ -139,16 +143,17 @@ impl PeerManager {
         lane: Lane,
         timeout: Duration,
     ) -> crate::error::Result<Message> {
-        let peers = self.peers.read().await;
-        let state = peers
-            .get(&host_id)
-            .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
-        match &state.pool {
-            Some(pool) => pool.send_with_timeout(msg, lane, timeout).await,
-            None => Err(crate::error::NetError::Protocol(
-                "no connection pool".into(),
-            )),
-        }
+        let pool = {
+            let peers = self.peers.read().await;
+            let state = peers
+                .get(&host_id)
+                .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
+            match &state.pool {
+                Some(pool) => Arc::clone(pool),
+                None => return Err(crate::error::NetError::Protocol("no connection pool".into())),
+            }
+        };
+        pool.send_with_timeout(msg, lane, timeout).await
     }
 
     /// Fire-and-forget a message to a peer on the specified lane.
@@ -161,16 +166,17 @@ impl PeerManager {
         msg: Message,
         lane: Lane,
     ) -> crate::error::Result<()> {
-        let peers = self.peers.read().await;
-        let state = peers
-            .get(&host_id)
-            .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
-        match &state.pool {
-            Some(pool) => pool.fire(msg, lane).await,
-            None => Err(crate::error::NetError::Protocol(
-                "no connection pool".into(),
-            )),
-        }
+        let pool = {
+            let peers = self.peers.read().await;
+            let state = peers
+                .get(&host_id)
+                .ok_or_else(|| crate::error::NetError::Protocol(format!("unknown peer: {host_id}")))?;
+            match &state.pool {
+                Some(pool) => Arc::clone(pool),
+                None => return Err(crate::error::NetError::Protocol("no connection pool".into())),
+            }
+        };
+        pool.fire(msg, lane).await
     }
 
     /// Heartbeat loop: sends Ping at configured interval, marks peers suspected
