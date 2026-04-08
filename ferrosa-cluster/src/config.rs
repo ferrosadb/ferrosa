@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(config.num_tokens, 256);
         assert_eq!(config.default_cl, ConsistencyLevel::Quorum);
         assert_eq!(config.hinted_handoff_max_mb, 1024);
-        assert!(!config.auto_join);
+        assert!(config.auto_join);
     }
 
     #[test]

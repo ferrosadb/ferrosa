@@ -31,6 +31,7 @@ use std::sync::Arc;
 /// Maximum tracked connected peers before eviction (prevents unbounded growth).
 pub(super) const MAX_CONNECTED_PEERS: usize = 1000;
 /// Maximum pending join requests before eviction.
+#[allow(dead_code)] // Used in tests; retained for future eviction logic.
 pub(super) const MAX_PENDING_JOINS: usize = 100;
 /// Maximum seen invite initiators before eviction.
 #[allow(dead_code)]
@@ -292,7 +293,7 @@ impl ModeController {
             contention_metrics: Arc::new(ContentionMetrics::new()),
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
-});
+        });
 
         let handles = ModeControllerHandles {
             write_path,
@@ -349,7 +350,7 @@ impl ModeController {
             contention_metrics: Arc::new(ContentionMetrics::new()),
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
-})
+        })
     }
 
     /// Create a pair-secondary `ModeController` for unit tests.
@@ -406,7 +407,7 @@ impl ModeController {
             contention_metrics: Arc::new(ContentionMetrics::new()),
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
-})
+        })
     }
 
     /// Set the peer manager reference. Must be called after PeerManager is created.

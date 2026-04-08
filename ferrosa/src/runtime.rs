@@ -44,6 +44,7 @@ impl RuntimeManager {
     }
 
     /// Graceful shutdown in reverse dependency order.
+    #[allow(dead_code)] // Will be called from shutdown path.
     pub fn shutdown_all(self, timeout: Duration) {
         if let Ok(rt) = Arc::try_unwrap(self.data) {
             rt.shutdown_timeout(timeout);
