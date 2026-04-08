@@ -188,13 +188,19 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
                 Lane::Raft,
             )
             .await
-            .map_err(net_error_to_unreachable)?;
+            .map_err(|e| {
+                tracing::debug!(target = %self.target_host_id, %e, "AppendEntries send failed");
+                net_error_to_unreachable(e)
+            })?;
 
         match response {
             Message::RaftAppendResponse(bytes) => decode(&bytes),
-            other => Err(RPCError::Network(NetworkError::new(&UnexpectedResponse(
-                format!("expected RaftAppendResponse, got {:?}", other.msg_type()),
-            )))),
+            other => {
+                tracing::error!(target = %self.target_host_id, msg_type = ?other.msg_type(), "AppendEntries got unexpected response type");
+                Err(RPCError::Network(NetworkError::new(&UnexpectedResponse(
+                    format!("expected RaftAppendResponse, got {:?}", other.msg_type()),
+                ))))
+            }
         }
     }
 
@@ -246,13 +252,19 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
             .peer_manager
             .send(self.target_host_id, Message::RaftVote(payload), Lane::Raft)
             .await
-            .map_err(net_error_to_unreachable)?;
+            .map_err(|e| {
+                tracing::debug!(target = %self.target_host_id, %e, "Vote send failed");
+                net_error_to_unreachable(e)
+            })?;
 
         match response {
             Message::RaftVoteResponse(bytes) => decode(&bytes),
-            other => Err(RPCError::Network(NetworkError::new(&UnexpectedResponse(
-                format!("expected RaftVoteResponse, got {:?}", other.msg_type()),
-            )))),
+            other => {
+                tracing::error!(target = %self.target_host_id, msg_type = ?other.msg_type(), "Vote got unexpected response type");
+                Err(RPCError::Network(NetworkError::new(&UnexpectedResponse(
+                    format!("expected RaftVoteResponse, got {:?}", other.msg_type()),
+                ))))
+            }
         }
     }
 }
