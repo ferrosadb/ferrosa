@@ -101,13 +101,43 @@ impl RpcServer {
     ) -> crate::error::Result<std::net::SocketAddr> {
         // Build TLS acceptor if configured (must happen before spawning)
         let tls_acceptor = crate::tls::build_tls_acceptor(&self.config)?;
-        let listener = TcpListener::bind(self.config.bind_addr).await?;
-        let addr = listener.local_addr()?;
-        let _ = self.bound_addr.send(Some(addr));
-        tracing::info!(%addr, "internode server listening");
+
+        // Create the TCP listener on the Data runtime (if available) so ALL
+        // connection handlers and their frame readers run there — not on the
+        // main runtime where they'd compete with CQL/bootstrap work.
+        let bind_addr = self.config.bind_addr;
         let server = self.clone();
-        tokio::spawn(async move { server.accept_loop(listener, tls_acceptor).await });
-        Ok(addr)
+
+        if let Some(ref data_rt) = self.data_runtime {
+            let bound_addr_tx = self.bound_addr.clone();
+            data_rt.spawn(async move {
+                match TcpListener::bind(bind_addr).await {
+                    Ok(listener) => {
+                        let addr = listener.local_addr().unwrap();
+                        let _ = bound_addr_tx.send(Some(addr));
+                        tracing::info!(%addr, "internode server listening (data runtime)");
+                        server.accept_loop(listener, tls_acceptor).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "failed to bind internode server");
+                    }
+                }
+            });
+            // Wait for the bind to complete
+            let mut rx = self.bound_addr_rx.clone();
+            rx.changed().await.map_err(|_| {
+                NetError::Protocol("bound_addr channel closed".into())
+            })?;
+            let addr = *rx.borrow_and_update();
+            Ok(addr.unwrap())
+        } else {
+            let listener = TcpListener::bind(bind_addr).await?;
+            let addr = listener.local_addr()?;
+            let _ = self.bound_addr.send(Some(addr));
+            tracing::info!(%addr, "internode server listening");
+            tokio::spawn(async move { server.accept_loop(listener, tls_acceptor).await });
+            Ok(addr)
+        }
     }
 
     async fn accept_loop(
