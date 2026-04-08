@@ -357,8 +357,6 @@ impl ModeController {
         let raft_election_max_ms = self.config.raft_election_timeout_max_ms;
         let schema_for_replay = self.schema.clone();
         let ddl_queue_rx = self.ddl_queue_rx.clone();
-        let raft_runtime: Option<Arc<tokio::runtime::Runtime>> =
-            self.raft_runtime.get().cloned();
 
         // Register Raft RPC handlers BEFORE spawning the init task.
         // Handlers use LazyRaft to wait for the instance to be ready.
@@ -444,7 +442,7 @@ impl ModeController {
                 heartbeat_interval: raft_heartbeat_ms,
                 election_timeout_min: raft_election_min_ms,
                 election_timeout_max: raft_election_max_ms,
-                max_payload_entries: 100,
+                max_payload_entries: 5,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
                 ..Default::default()
             })
@@ -492,48 +490,20 @@ impl ModeController {
             // The key invariant: only the seed calls initialize(), so only the
             // seed starts elections. Non-seeds are passive responders.
 
-            // Create the Raft instance on the dedicated Raft runtime (if available)
-            // so openraft's internal tasks (replication, election) spawn there
-            // instead of on the main runtime where they'd compete with CQL/S3/etc.
-            let raft = if let Some(raft_rt) = raft_runtime.as_ref() {
-                match raft_rt
-                    .spawn(async move {
-                        FerrosRaft::new(
-                            local_node_id,
-                            raft_config,
-                            network_factory,
-                            log_store,
-                            state_machine,
-                        )
-                        .await
-                    })
-                    .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(fatal)) => {
-                        tracing::error!(%fatal, "raft initialization failed (Fatal), DDL remains on direct path");
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::error!(%e, "raft runtime join error");
-                        return;
-                    }
-                }
-            } else {
-                match FerrosRaft::new(
-                    local_node_id,
-                    raft_config,
-                    network_factory,
-                    log_store,
-                    state_machine,
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(fatal) => {
-                        tracing::error!(%fatal, "raft initialization failed (Fatal), DDL remains on direct path");
-                        return;
-                    }
+            // Create the Raft instance
+            let raft = match FerrosRaft::new(
+                local_node_id,
+                raft_config,
+                network_factory,
+                log_store,
+                state_machine,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(fatal) => {
+                    tracing::error!(%fatal, "raft initialization failed (Fatal), DDL remains on direct path");
+                    return;
                 }
             };
 

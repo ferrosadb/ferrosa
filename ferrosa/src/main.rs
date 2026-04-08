@@ -462,7 +462,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 5b. Create subsystem runtimes (Raft gets its own so heartbeats
-    //     can't be starved by CQL/S3/bootstrap work on the main runtime).
+    // 5b. Dedicated Raft runtime — heartbeats can't be starved by CQL/S3 work.
     let runtimes = runtime::RuntimeManager::new();
 
     let (mode_controller, handles) = ferrosa_cluster::ModeController::new(
@@ -473,7 +473,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         schema.clone(),
         registry.clone(),
     );
-    mode_controller.set_raft_runtime(runtimes.raft.clone());
 
     // 6. Create PeerManager — ModeController is the PeerEventListener
     let peer_manager = Arc::new(ferrosa_net::peer::PeerManager::new(
@@ -492,7 +491,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 7. Start internode RPC server with inbound peer callback
     let rpc_server = Arc::new(
         ferrosa_net::rpc::server::RpcServer::new((*net_config).clone(), host_id, registry)
-            .with_inbound_callback(mode_controller.clone()),
+            .with_inbound_callback(mode_controller.clone())
+            .with_raft_runtime(runtimes.raft.clone()),
     );
     let internode_addr = rpc_server.start_and_get_addr().await?;
     tracing::info!(%internode_addr, %host_id, "internode server listening");

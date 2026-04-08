@@ -32,6 +32,9 @@ pub struct RpcServer {
     inbound_callback: Option<Arc<dyn InboundPeerCallback>>,
     /// Aggregate bandwidth counters across all inbound connections.
     pub bandwidth: Arc<super::client::BandwidthMetrics>,
+    /// Optional dedicated runtime for Raft RPC handling. When set, inbound
+    /// Raft messages are dispatched on this runtime instead of the main one.
+    raft_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl RpcServer {
@@ -51,7 +54,14 @@ impl RpcServer {
             bound_addr_rx,
             inbound_callback: None,
             bandwidth: Arc::new(super::client::BandwidthMetrics::new()),
+            raft_runtime: None,
         }
+    }
+
+    /// Set a dedicated runtime for inbound Raft RPC dispatch.
+    pub fn with_raft_runtime(mut self, rt: Arc<tokio::runtime::Runtime>) -> Self {
+        self.raft_runtime = Some(rt);
+        self
     }
 
     /// Set a callback for inbound peer connections. Called after handshake succeeds.
@@ -196,7 +206,7 @@ impl RpcServer {
         peer_addr: std::net::SocketAddr,
     ) -> crate::error::Result<()>
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let mut framed = Framed::new(stream, InternodeCodec::new(self.config.max_frame_body_size));
 
@@ -216,39 +226,92 @@ impl RpcServer {
             cb.on_inbound_peer(peer_id, peer_cql_broadcast);
         }
 
-        // Message dispatch loop
-        while let Some(frame_result) = framed.next().await {
-            let frame = frame_result?;
+        // Split the framed connection so reads and writes are independent.
+        // Handlers are spawned concurrently — no head-of-line blocking.
+        let (mut sink, mut stream) = framed.split();
+
+        // Channel for handler tasks to send responses back to the writer.
+        let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<Frame>(64);
+
+        // Writer task: drains the response channel and writes to TCP.
+        let bandwidth_write = self.bandwidth.clone();
+        let write_task = tokio::spawn(async move {
+            while let Some(frame) = resp_rx.recv().await {
+                bandwidth_write
+                    .bytes_sent
+                    .fetch_add(frame.body.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                if sink.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Reader loop: reads frames and spawns handlers concurrently.
+        let registry = self.registry.clone();
+        let bandwidth_read = self.bandwidth.clone();
+        let raft_runtime = self.raft_runtime.clone();
+        while let Some(frame_result) = stream.next().await {
+            let frame = match frame_result {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(?peer_id, %e, "frame read error");
+                    break;
+                }
+            };
             let msg_type = frame.header.msg_type;
             let stream_id = frame.header.stream_id;
-            // Track inbound bytes.
-            self.bandwidth.bytes_received.fetch_add(
+            let lane = frame.header.lane;
+            bandwidth_read.bytes_received.fetch_add(
                 frame.body.len() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            let msg = Message::decode(msg_type, &mut frame.body.clone())?;
+            let msg = match Message::decode(msg_type, &mut frame.body.clone()) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(?peer_id, %e, "message decode error");
+                    continue;
+                }
+            };
 
-            if let Some(response) = self.registry.dispatch(peer_id, msg_type, msg).await {
-                let mut body = bytes::BytesMut::new();
-                response.encode(&mut body)?;
-                let body_len = u32::try_from(body.len())
-                    .map_err(|_| NetError::Protocol("response body exceeds u32::MAX".into()))?;
-                // Track outbound bytes.
-                self.bandwidth
-                    .bytes_sent
-                    .fetch_add(body_len as u64, std::sync::atomic::Ordering::Relaxed);
-                let resp_frame = Frame {
-                    header: FrameHeader::new(
-                        response.msg_type(),
-                        frame.header.lane,
-                        stream_id,
-                        body_len,
-                    ),
-                    body: body.freeze(),
-                };
-                framed.send(resp_frame).await?;
+            // Spawn handler concurrently — response goes through the channel.
+            let registry = registry.clone();
+            let resp_tx = resp_tx.clone();
+            let dispatch_fn = move || async move {
+                let response = registry.dispatch(peer_id, msg_type, msg).await;
+                if let Some(response) = response {
+                    let mut body = bytes::BytesMut::new();
+                    if response.encode(&mut body).is_ok() {
+                        if let Ok(body_len) = u32::try_from(body.len()) {
+                            let resp_frame = Frame {
+                                header: FrameHeader::new(
+                                    response.msg_type(),
+                                    lane,
+                                    stream_id,
+                                    body_len,
+                                ),
+                                body: body.freeze(),
+                            };
+                            let _ = resp_tx.send(resp_frame).await;
+                        }
+                    }
+                }
+            };
+
+            // Route Raft handlers to the dedicated runtime if available.
+            if msg_type.is_raft() {
+                if let Some(ref raft_rt) = raft_runtime {
+                    raft_rt.spawn(dispatch_fn());
+                } else {
+                    tokio::spawn(dispatch_fn());
+                }
+            } else {
+                tokio::spawn(dispatch_fn());
             }
         }
+
+        // Reader done — drop the sender so the writer exits.
+        drop(resp_tx);
+        let _ = write_task.await;
 
         tracing::info!(?peer_id, "peer disconnected");
         Ok(())

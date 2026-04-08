@@ -173,11 +173,18 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
-        Self::save_meta(&self.meta, META_VOTE, vote)?;
-        self.meta
-            .flush_async()
-            .await
-            .map_err(|e| StorageIOError::write_vote(to_any_error(e)))?;
+        let meta = self.meta.clone();
+        let bytes =
+            bincode::serialize(vote).map_err(|e| StorageIOError::write_vote(to_any_error(e)))?;
+        tokio::task::spawn_blocking(move || {
+            meta.insert(META_VOTE, bytes)
+                .map_err(|e| StorageIOError::write_vote(to_any_error(e)))?;
+            meta.flush()
+                .map_err(|e| StorageIOError::write_vote(to_any_error(e)))?;
+            Ok::<(), StorageIOError<u64>>(())
+        })
+        .await
+        .map_err(|e| StorageIOError::write_vote(to_any_error(e)))??;
         Ok(())
     }
 
@@ -212,34 +219,39 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
             let val = Self::serialize_entry(&entry)?;
             batch.insert(&key, val);
         }
-        self.log
-            .apply_batch(batch)
-            .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?;
 
-        // sled persists on every tree operation by default;
-        // signal the caller that the data is durable.
+        // Run sled disk IO on a blocking thread so the async Raft runtime
+        // stays responsive for heartbeat processing.
+        let log = self.log.clone();
+        tokio::task::spawn_blocking(move || {
+            log.apply_batch(batch)
+                .map_err(|e| StorageIOError::write_logs(to_any_error(e)))
+        })
+        .await
+        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))??;
+
         callback.log_io_completed(Ok(()));
 
         Ok(())
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        // Remove all entries with index >= log_id.index (truncate is inclusive).
+        let log = self.log.clone();
         let start = Self::index_key(log_id.index);
-        let keys_to_remove: Vec<sled::IVec> = self
-            .log
-            .range(start..)
-            .filter_map(|r| r.ok().map(|(k, _v)| k))
-            .collect();
-
-        let mut batch = sled::Batch::default();
-        for key in keys_to_remove {
-            batch.remove(key);
-        }
-        self.log
-            .apply_batch(batch)
-            .map_err(|e| StorageIOError::write_logs(to_any_error(e)))?;
-
+        tokio::task::spawn_blocking(move || {
+            let keys_to_remove: Vec<sled::IVec> = log
+                .range(start..)
+                .filter_map(|r| r.ok().map(|(k, _v)| k))
+                .collect();
+            let mut batch = sled::Batch::default();
+            for key in keys_to_remove {
+                batch.remove(key);
+            }
+            log.apply_batch(batch)
+                .map_err(|e| StorageIOError::write_logs(to_any_error(e)))
+        })
+        .await
+        .map_err(|e| StorageIOError::write_logs(to_any_error(e)))??;
         Ok(())
     }
 

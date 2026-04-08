@@ -204,9 +204,6 @@ pub struct ModeController {
     >,
     /// Contention metrics for the transition guard.
     pub contention_metrics: Arc<ContentionMetrics>,
-    /// Dedicated runtime for Raft consensus tasks. When set, `FerrosRaft::new()`
-    /// and Raft RPC handler dispatch run here instead of the main runtime.
-    pub(super) raft_runtime: std::sync::OnceLock<Arc<tokio::runtime::Runtime>>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -259,20 +256,6 @@ impl ModeController {
             }
         };
 
-        // Register read handlers early so they respond before cluster formation.
-        // Without this, RangeReadRequest from a coordinator that formed faster
-        // gets silently dropped → 120s timeout → client hang on empty tables.
-        {
-            use crate::raft::handlers::{RangeReadHandler, ReadRequestHandler};
-            let range_read_handler = Arc::new(RangeReadHandler::new(storage.clone()));
-            registry.register(
-                ferrosa_net::codec::MsgType::RangeReadRequest,
-                range_read_handler,
-            );
-            let read_handler = Arc::new(ReadRequestHandler::new(storage.clone()));
-            registry.register(ferrosa_net::codec::MsgType::ReadRequest, read_handler);
-        }
-
         let controller = Arc::new(Self {
             mode: Arc::new(ArcSwap::from_pointee(DeploymentMode::Standalone)),
             write_path: write_path.clone(),
@@ -303,7 +286,6 @@ impl ModeController {
             committed_cluster_size: AtomicUsize::new(0),
             ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
-            raft_runtime: std::sync::OnceLock::new(),
         });
 
         let handles = ModeControllerHandles {
@@ -359,7 +341,6 @@ impl ModeController {
             committed_cluster_size: AtomicUsize::new(0),
             ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
-            raft_runtime: std::sync::OnceLock::new(),
         })
     }
 
@@ -415,7 +396,6 @@ impl ModeController {
             committed_cluster_size: AtomicUsize::new(0),
             ddl_queue_rx: Arc::new(parking_lot::Mutex::new(None)),
             contention_metrics: Arc::new(ContentionMetrics::new()),
-            raft_runtime: std::sync::OnceLock::new(),
         })
     }
 
@@ -444,15 +424,6 @@ impl ModeController {
     /// Get current deployment mode.
     pub fn mode(&self) -> DeploymentMode {
         **self.mode.load()
-    }
-
-    /// Set a dedicated runtime for Raft consensus tasks.
-    ///
-    /// When set, `FerrosRaft::new()` and openraft's internal tasks spawn on
-    /// this runtime instead of the caller's (main) runtime, ensuring Raft
-    /// heartbeats are never starved by other subsystem work.
-    pub fn set_raft_runtime(&self, rt: Arc<tokio::runtime::Runtime>) {
-        let _ = self.raft_runtime.set(rt);
     }
 
     /// Get current pair role, if in pair mode.

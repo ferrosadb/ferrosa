@@ -241,10 +241,8 @@ pub(crate) fn spawn_lane_actor(
 /// tokio runtime. Used for the Raft lane to guarantee heartbeat processing cannot
 /// be starved by data-path saturation on the shared runtime.
 ///
-/// The pre-connected `RpcClient` has its read/write IO loops spawned on the
-/// caller's runtime (the main tokio runtime). We must reconnect inside this
-/// dedicated thread so those IO tasks run here — otherwise the main runtime's
-/// load can starve the write loop and zero bytes reach the wire.
+/// The actor loop logic is identical to [`spawn_lane_actor`]; only the execution
+/// context differs.
 pub(crate) fn spawn_raft_lane_actor(
     lane: Lane,
     initial_state: LaneState,
@@ -265,41 +263,32 @@ pub(crate) fn spawn_raft_lane_actor(
                 .build()
                 .expect("raft lane runtime");
 
-            // Reconnect the RpcClient on THIS runtime so its read/write
-            // IO loops (tokio::spawn) target this thread, not the main
-            // runtime. Without this, the main runtime's S3/compaction
-            // load starves the write loop and no Raft frames reach TCP.
-            let state = match initial_state {
-                LaneState::Connected(old_client) => {
-                    let peer_addr = old_client.peer_addr();
-                    match rt.block_on(crate::rpc::client::RpcClient::connect_with_tls(
-                        ctx.config.clone(),
-                        ctx.local_host_id,
-                        peer_addr,
-                        ctx.tls_connector.as_deref(),
-                    )) {
-                        Ok(new_client) => {
-                            tracing::info!(
-                                %peer_addr,
-                                "Raft lane: reconnected on dedicated thread"
-                            );
-                            drop(old_client);
-                            LaneState::Connected(new_client)
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                %peer_addr,
-                                "Raft lane: reconnect FAILED: {e} — \
-                                 falling back to main-runtime IO (degraded)"
-                            );
-                            LaneState::Connected(old_client)
-                        }
+            // Re-establish the RPC connection on the dedicated Raft runtime so
+            // that the read/write loops are spawned here instead of on the
+            // shared data-path runtime (which caused head-of-line blocking).
+            let initial_state = if let LaneState::Connected(old_client) = initial_state {
+                let peer_addr = old_client.peer_addr();
+                match rt.block_on(RpcClient::connect_with_tls(
+                    ctx.config.clone(),
+                    ctx.local_host_id,
+                    peer_addr,
+                    ctx.tls_connector.as_deref(),
+                )) {
+                    Ok(new_client) => {
+                        tracing::info!(%peer_addr, "raft lane: reconnected on dedicated runtime");
+                        drop(old_client);
+                        LaneState::Connected(new_client)
+                    }
+                    Err(e) => {
+                        tracing::error!(%peer_addr, %e, "raft lane: failed to reconnect on dedicated runtime, using original client");
+                        LaneState::Connected(old_client)
                     }
                 }
-                other => other,
+            } else {
+                initial_state
             };
 
-            rt.block_on(lane_actor_loop(lane, state, rx, ctx));
+            rt.block_on(lane_actor_loop(lane, initial_state, rx, ctx));
         })
         .expect("spawn raft lane thread");
 
@@ -325,6 +314,8 @@ async fn lane_actor_loop(
         });
     }
 
+    let concurrent_sends = lane == Lane::Raft;
+
     while let Some(cmd) = rx.recv().await {
         match cmd {
             LaneCommand::Send {
@@ -332,8 +323,34 @@ async fn lane_actor_loop(
                 timeout,
                 reply,
             } => {
-                let result = handle_send(&mut state, &ctx, lane, msg, timeout).await;
-                let _ = reply.send(result);
+                if concurrent_sends {
+                    match &state {
+                        LaneState::Connected(client) => {
+                            let client = client.clone();
+                            tokio::spawn(async move {
+                                let result =
+                                    tokio::time::timeout(timeout, client.send(msg, lane)).await;
+                                let result = match result {
+                                    Ok(Ok(response)) => Ok(response),
+                                    Ok(Err(e)) => Err(e),
+                                    Err(_elapsed) => Err(NetError::Timeout(format!(
+                                        "{lane:?} lane send timeout"
+                                    ))),
+                                };
+                                let _ = reply.send(result);
+                            });
+                        }
+                        LaneState::Reconnecting { .. } => {
+                            let _ = reply.send(Err(NetError::Reconnecting));
+                        }
+                        LaneState::Failed => {
+                            let _ = reply.send(Err(NetError::LaneFailed));
+                        }
+                    }
+                } else {
+                    let result = handle_send(&mut state, &ctx, lane, msg, timeout).await;
+                    let _ = reply.send(result);
+                }
             }
             LaneCommand::Fire {
                 msg,

@@ -124,6 +124,20 @@ pub enum MsgType {
     BootstrapCompleteAck = 0x81,
 }
 
+impl MsgType {
+    /// Returns true for Raft consensus message types.
+    pub fn is_raft(self) -> bool {
+        matches!(
+            self,
+            Self::RaftAppendEntries
+                | Self::RaftAppendResponse
+                | Self::RaftVote
+                | Self::RaftVoteResponse
+                | Self::RaftInstallSnapshot
+        )
+    }
+}
+
 impl TryFrom<u8> for MsgType {
     type Error = NetError;
     fn try_from(value: u8) -> Result<Self> {
