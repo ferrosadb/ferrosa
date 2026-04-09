@@ -517,47 +517,10 @@ async fn verify_via_cql(
                         mismatched += 1;
                         if mismatched <= 5 {
                             eprintln!(
-                                "integrity: mismatch key '{key}': expected {} bytes (ts={}), got {} bytes",
+                                "integrity: mismatch key '{key}': expected {} bytes, got {} bytes",
                                 expected_val.len(),
-                                _ts,
                                 got.len()
                             );
-                            // Diagnostic: read from each node with WRITETIME to compare
-                            let ts_cql = format!(
-                                "SELECT val, writetime(val) FROM data WHERE pk = '{key}' AND ck = 1"
-                            );
-                            for node in nodes {
-                                if let Ok(mut nc) = CqlClient::connect(*node).await {
-                                    let _ = nc.query("USE load_test").await;
-                                    if let Ok(nr) = nc.query(&ts_cql).await {
-                                        if let Some(row) = nr.rows.first() {
-                                            let val_len = row
-                                                .columns
-                                                .first()
-                                                .and_then(|c| c.as_ref())
-                                                .map(|v| v.len());
-                                            let wt = row
-                                                .columns
-                                                .get(1)
-                                                .and_then(|c| c.as_ref())
-                                                .and_then(|v| {
-                                                    if v.len() == 8 {
-                                                        Some(i64::from_be_bytes(
-                                                            v[..8].try_into().unwrap(),
-                                                        ))
-                                                    } else {
-                                                        None
-                                                    }
-                                                });
-                                            eprintln!(
-                                                "  {node}: {} bytes, writetime={}",
-                                                val_len.map_or("NULL".into(), |l| l.to_string()),
-                                                wt.map_or("NULL".into(), |t| t.to_string())
-                                            );
-                                        }
-                                    }
-                                }
-                            }
                         }
                     }
                 } else {
