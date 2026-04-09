@@ -314,6 +314,73 @@ mod tests {
         assert!(gt.key_count() <= 100);
     }
 
+    /// Verify that the GT correctly tracks the highest-timestamp value
+    /// under concurrent writes from multiple threads (same pattern as loadgen).
+    #[test]
+    fn concurrent_lww_correctness() {
+        let gt = Arc::new(GroundTruth::new());
+        let num_writers = 8usize;
+        let key_space = 100usize;
+        let writes_per_worker = 10_000usize;
+
+        // Each worker writes to overlapping keys with its own timestamp range.
+        let handles: Vec<_> = (0..num_writers)
+            .map(|w| {
+                let gt = gt.clone();
+                std::thread::spawn(move || {
+                    for i in 0..writes_per_worker {
+                        let key_idx = (w * 31 + i * 7) % key_space;
+                        let key = format!("k{key_idx:06}");
+                        let ts = (w as i64) * 1_000_000_000 + (i as i64) + 1;
+                        let value = format!("w{w}_i{i}").into_bytes();
+                        gt.record_write(&key, &value, ts);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify: for each key, the GT should have the value from the
+        // writer with the highest timestamp. Since worker 7 has the highest
+        // base (7e9), and within a worker timestamps are monotonically
+        // increasing, the GT entry for each key should be from the LAST
+        // write by the HIGHEST-numbered worker that wrote to that key.
+        let snap = gt.snapshot();
+        for (key, (value, ts, _deleted)) in &snap {
+            let val_str = std::str::from_utf8(value).unwrap();
+            // Parse worker ID from value "wN_iM"
+            let worker_id: usize = val_str
+                .split('_')
+                .next()
+                .unwrap()
+                .trim_start_matches('w')
+                .parse()
+                .unwrap();
+
+            // The timestamp should be in this worker's range
+            let worker_base = (worker_id as i64) * 1_000_000_000;
+            assert!(
+                *ts > worker_base && *ts <= worker_base + writes_per_worker as i64,
+                "key {key}: ts={ts} not in worker {worker_id}'s range [{}, {}]",
+                worker_base + 1,
+                worker_base + writes_per_worker as i64
+            );
+
+            // No lower-numbered worker should have a higher timestamp
+            // (since worker N's max ts = N*1e9 + writes_per_worker)
+            for higher_w in (worker_id + 1)..num_writers {
+                let higher_base = (higher_w as i64) * 1_000_000_000;
+                assert!(
+                    *ts >= higher_base || *ts < (worker_id as i64) * 1_000_000_000,
+                    "key {key}: has ts={ts} from worker {worker_id}, but worker {higher_w} \
+                     (base={higher_base}) should have won"
+                );
+            }
+        }
+    }
+
     #[test]
     fn bytes_written_tracked() {
         let gt = GroundTruth::new();

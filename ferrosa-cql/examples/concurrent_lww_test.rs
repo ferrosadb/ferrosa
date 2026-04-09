@@ -34,8 +34,8 @@ async fn main() {
     drop(c);
 
     let num_writers = 8usize;
-    let key_space = 5_000usize;
-    let test_duration = Duration::from_secs(60);
+    let key_space = 50_000usize;
+    let test_duration = Duration::from_secs(120);
     let stop = Arc::new(AtomicBool::new(false));
 
     // Ground truth: key → (value, timestamp)
@@ -93,8 +93,8 @@ async fn main() {
         }));
     }
 
-    // Spawn reader workers (like the loadgen)
-    for reader_id in 0..8usize {
+    // Spawn reader workers (fewer than loadgen to avoid overloading)
+    for reader_id in 0..2usize {
         let node = nodes[reader_id % nodes.len()];
         let stop = Arc::clone(&stop);
         handles.push(tokio::spawn(async move {

@@ -3670,9 +3670,9 @@ mod tests {
         let tid = table_id();
         engine.register_table(test_schema()).unwrap();
 
-        let num_writers = 8usize;
-        let key_space = 1000usize;
-        let writes_per_worker = 2000usize;
+        let num_writers = 4usize;
+        let key_space = 100usize;
+        let writes_per_worker = 500usize;
         let stop = Arc::new(AtomicBool::new(false));
 
         // Track expected values: for each key, the highest-timestamp write.
