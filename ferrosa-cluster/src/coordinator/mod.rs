@@ -519,6 +519,107 @@ mod tests {
         assert!(result.is_some());
     }
 
+    #[test]
+    fn truncate_payload_encode_decode_roundtrip() {
+        let table_id = TableId::new("my_ks", "my_table");
+        let encoded = encode_truncate_payload(&table_id);
+        let decoded = decode_truncate_payload(&encoded).unwrap();
+        assert_eq!(decoded.keyspace, "my_ks");
+        assert_eq!(decoded.table, "my_table");
+    }
+
+    #[test]
+    fn truncate_payload_decode_rejects_truncated() {
+        assert!(decode_truncate_payload(&[]).is_none());
+        assert!(decode_truncate_payload(&[0, 5, b'h', b'e']).is_none());
+    }
+
+    #[tokio::test]
+    async fn truncate_forward_handler_clears_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        // Write some data first
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage
+            .write(&table_id, &test_key(), test_row(), 1000)
+            .unwrap();
+        assert!(storage.read(&table_id, &test_key()).unwrap().is_some());
+
+        // Send TruncateForward
+        let handler = TruncateForwardHandler::new(storage.clone());
+        let payload = encode_truncate_payload(&table_id);
+        let msg = Message::TruncateForward(payload);
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let response = handler.handle(peer_id, msg).await;
+
+        assert!(matches!(response, Some(Message::TruncateAck(_))));
+        assert!(
+            storage.read(&table_id, &test_key()).unwrap().is_none(),
+            "data should be cleared after truncate"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncate_forward_handler_no_ack_on_missing_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        // Do NOT register the table
+
+        let handler = TruncateForwardHandler::new(storage.clone());
+        let table_id = TableId::new("nonexistent_ks", "nonexistent_tbl");
+        let payload = encode_truncate_payload(&table_id);
+        let msg = Message::TruncateForward(payload);
+        let peer_id = (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap());
+        let response = handler.handle(peer_id, msg).await;
+
+        assert!(
+            response.is_none(),
+            "should not ACK truncate of missing table"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinate_truncate_clears_local_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            Arc::new(PeerManager::new(
+                Arc::new(ferrosa_net::config::NetConfig::default()),
+                Uuid::new_v4(),
+                Arc::new(NoopListener),
+            )),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        // Write data
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage
+            .write(&table_id, &test_key(), test_row(), 1000)
+            .unwrap();
+        assert!(storage.read(&table_id, &test_key()).unwrap().is_some());
+
+        // Truncate via coordinator (single-node cluster, no remotes)
+        coordinator.coordinate_truncate(&table_id).await.unwrap();
+
+        assert!(
+            storage.read(&table_id, &test_key()).unwrap().is_none(),
+            "local data should be cleared after coordinate_truncate"
+        );
+    }
+
     /// No-op listener for tests that don't care about peer events.
     struct NoopListener;
     impl ferrosa_net::peer::PeerEventListener for NoopListener {
