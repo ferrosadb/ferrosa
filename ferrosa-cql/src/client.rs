@@ -55,7 +55,7 @@ impl CqlClient {
         let frame = CqlFrame {
             header: FrameHeader {
                 version: VERSION_REQUEST,
-                flags: 0,
+                flags: 0x10, // USE_BETA: opt into v5 framing (CRC24/CRC32)
                 stream_id: 0,
                 opcode: Opcode::Startup,
                 length: body.len() as u32,

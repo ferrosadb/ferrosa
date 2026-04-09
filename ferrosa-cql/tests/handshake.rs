@@ -210,7 +210,7 @@ fn encode_startup_frame_v5() -> BytesMut {
 
     let header = FrameHeader {
         version: 0x05, // v5
-        flags: 0,
+        flags: 0x10,   // USE_BETA: opt into v5 framing
         stream_id: 0,
         opcode: Opcode::Startup,
         length: body.len() as u32,
