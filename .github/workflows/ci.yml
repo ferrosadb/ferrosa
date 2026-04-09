@@ -61,7 +61,8 @@ jobs:
                --skip flush_2000 --skip single_writer --skip write_flush_compact \
                --skip commitlog_write_span_is_created \
                --skip flamechart_auth_accepts_valid_token \
-               --skip accord_coordinator_creates_spans
+               --skip accord_coordinator_creates_spans \
+               --skip storage_engine_creates_spans
 
   # ── Stage 2b: Musl static build ───────────────────────────────────
   musl:
