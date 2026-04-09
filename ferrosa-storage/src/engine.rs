@@ -3652,6 +3652,144 @@ mod tests {
         );
     }
 
+    /// Concurrent writers + periodic flushes: reproduces the loadgen pattern.
+    /// 8 writer threads with different timestamp ranges write to 1000 keys.
+    /// A flush thread triggers flushes periodically. After all writers stop,
+    /// every key must have the value from the highest-timestamp write.
+    #[test]
+    fn concurrent_writers_with_flushes_preserve_lww() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            flush_threshold_bytes: 4096, // small to force frequent flushes
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let num_writers = 8usize;
+        let key_space = 1000usize;
+        let writes_per_worker = 2000usize;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Track expected values: for each key, the highest-timestamp write.
+        // Using a simple mutex-protected map (same pattern as loadgen GT).
+        type ExpectedMap = std::collections::HashMap<String, (Vec<u8>, i64)>;
+        let expected: Arc<std::sync::Mutex<ExpectedMap>> =
+            Arc::new(std::sync::Mutex::new(ExpectedMap::new()));
+
+        // Spawn writer threads.
+        let mut handles = Vec::new();
+        for worker_id in 0..num_writers {
+            let engine = Arc::clone(&engine);
+            let tid = tid.clone();
+            let expected = Arc::clone(&expected);
+            handles.push(std::thread::spawn(move || {
+                let mut ts = (worker_id as i64) * 1_000_000_000;
+                let mut rng_state = worker_id as u64;
+                for i in 0..writes_per_worker {
+                    let key_idx = (worker_id * 31 + i * 7) % key_space;
+                    let key_str = format!("k{key_idx:06}");
+                    ts += 1;
+                    // Deterministic "random" value based on worker + iteration
+                    rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let val_len = 10 + (rng_state % 50) as usize;
+                    let value: Vec<u8> = (0..val_len)
+                        .map(|j| ((rng_state >> (j % 8)) & 0xFF) as u8)
+                        .collect();
+
+                    let key = make_key(&key_str);
+                    let row = make_row(&value, ts);
+                    engine.write(&tid, &key, row, ts).unwrap();
+
+                    // Track in expected map (LWW by timestamp).
+                    let mut map = expected.lock().unwrap();
+                    let entry = map.entry(key_str).or_insert_with(|| (Vec::new(), 0));
+                    if ts >= entry.1 {
+                        entry.0 = value;
+                        entry.1 = ts;
+                    }
+                }
+            }));
+        }
+
+        // Spawn flush thread.
+        let flush_engine = Arc::clone(&engine);
+        let flush_tid = tid.clone();
+        let flush_stop = Arc::clone(&stop);
+        let flush_handle = std::thread::spawn(move || {
+            let mut flush_count = 0u32;
+            while !flush_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                if flush_engine.flush(&flush_tid).is_ok() {
+                    flush_count += 1;
+                }
+            }
+            flush_count
+        });
+
+        // Wait for all writers.
+        for h in handles {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let flush_count = flush_handle.join().unwrap();
+
+        // Final flush to push remaining memtable data to SSTables.
+        engine.flush(&tid).ok();
+
+        // Verify: every key must have the highest-timestamp value.
+        let map = expected.lock().unwrap();
+        let mut mismatches = 0u32;
+        let mut missing = 0u32;
+        for (key_str, (expected_val, expected_ts)) in map.iter() {
+            let key = make_key(key_str);
+            match engine.read(&tid, &key).unwrap() {
+                Some(partition) => {
+                    if let Some(row) = partition.rows.first() {
+                        if let Some((_, cell)) = row.cells.first() {
+                            if let Some(got) = cell.value.as_deref() {
+                                if got != expected_val.as_slice() {
+                                    mismatches += 1;
+                                    if mismatches <= 3 {
+                                        eprintln!(
+                                            "MISMATCH {key_str}: expected {} bytes (ts={expected_ts}), \
+                                             got {} bytes (cell_ts={})",
+                                            expected_val.len(),
+                                            got.len(),
+                                            cell.timestamp
+                                        );
+                                    }
+                                }
+                            } else {
+                                missing += 1;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    missing += 1;
+                }
+            }
+        }
+
+        eprintln!(
+            "concurrent_writers_with_flushes: {} keys, {} mismatches, {} missing, {} flushes",
+            map.len(),
+            mismatches,
+            missing,
+            flush_count
+        );
+        assert_eq!(
+            mismatches, 0,
+            "LWW violated under concurrent writes + flushes: {mismatches} mismatches"
+        );
+        assert_eq!(missing, 0, "missing keys: {missing}");
+    }
+
     /// Reproduce bug-large-write-causes-data-loss-in-partition:
     /// writing many rows to the same partition, flushing, writing more,
     /// flushing again — earlier rows must survive.

@@ -2450,4 +2450,359 @@ mod tests {
         let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         assert_eq!(cql_value_to_json(&CqlValue::Inet(ip)), "\"127.0.0.1\"");
     }
+
+    // ── Additional coverage tests ────────────────────────────────────
+
+    #[test]
+    fn term_int_to_varint() {
+        let val = term_to_cql_value(&Term::IntegerLiteral(42), &CqlType::Varint).unwrap();
+        assert_eq!(val, CqlValue::Varint(BigInt::from(42)));
+    }
+
+    #[test]
+    fn term_int_to_decimal() {
+        let val = term_to_cql_value(&Term::IntegerLiteral(42), &CqlType::Decimal).unwrap();
+        match val {
+            CqlValue::Decimal { scale, unscaled } => {
+                assert_eq!(scale, 0);
+                assert_eq!(unscaled, BigInt::from(42));
+            }
+            other => panic!("expected Decimal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn term_int_to_float() {
+        let val = term_to_cql_value(&Term::IntegerLiteral(42), &CqlType::Float).unwrap();
+        if let CqlValue::Float(bits) = val {
+            let f = f32::from_bits(bits);
+            assert!((f - 42.0f32).abs() < 1e-3);
+        } else {
+            panic!("expected Float");
+        }
+    }
+
+    #[test]
+    fn term_int_to_double() {
+        let val = term_to_cql_value(&Term::IntegerLiteral(42), &CqlType::Double).unwrap();
+        assert_eq!(val, CqlValue::Double(42.0f64.to_bits()));
+    }
+
+    #[test]
+    fn term_float_to_decimal() {
+        let val = term_to_cql_value(&Term::FloatLiteral(1.25), &CqlType::Decimal).unwrap();
+        match val {
+            CqlValue::Decimal { scale, unscaled } => {
+                assert_eq!(scale, 2);
+                assert_eq!(unscaled, BigInt::from(125));
+            }
+            other => panic!("expected Decimal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn term_float_type_mismatch() {
+        let result = term_to_cql_value(&Term::FloatLiteral(1.0), &CqlType::Int);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn term_int_type_mismatch() {
+        let result = term_to_cql_value(&Term::IntegerLiteral(42), &CqlType::Varchar);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn term_string_to_timestamp() {
+        let val = term_to_cql_value(
+            &Term::StringLiteral("2024-01-15".into()),
+            &CqlType::Timestamp,
+        )
+        .unwrap();
+        match val {
+            CqlValue::Timestamp(ms) => assert!(ms > 0, "timestamp should be positive"),
+            other => panic!("expected Timestamp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn term_string_to_date() {
+        let val =
+            term_to_cql_value(&Term::StringLiteral("2024-01-15".into()), &CqlType::Date).unwrap();
+        match val {
+            CqlValue::Date(encoded) => {
+                // Days since epoch + 2^31 offset. 2024-01-15 is day 19737.
+                let days = encoded as i64 - (1i64 << 31);
+                assert!(days > 0, "days since epoch should be positive, got {days}");
+            }
+            other => panic!("expected Date, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn term_string_to_time() {
+        let val =
+            term_to_cql_value(&Term::StringLiteral("10:30:00".into()), &CqlType::Time).unwrap();
+        match val {
+            CqlValue::Time(nanos) => {
+                assert!(nanos > 0, "nanoseconds should be positive");
+            }
+            other => panic!("expected Time, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn term_string_type_mismatch() {
+        let result = term_to_cql_value(&Term::StringLiteral("hello".into()), &CqlType::Int);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn term_bool_type_mismatch() {
+        let result = term_to_cql_value(&Term::BoolLiteral(true), &CqlType::Int);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn term_uuid_type_mismatch() {
+        let u = uuid::Uuid::new_v4();
+        let result = term_to_cql_value(&Term::UuidLiteral(u), &CqlType::Int);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn term_blob_to_uuid() {
+        let u = uuid::Uuid::new_v4();
+        let val =
+            term_to_cql_value(&Term::BlobLiteral(u.as_bytes().to_vec()), &CqlType::Uuid).unwrap();
+        assert_eq!(val, CqlValue::Uuid(u));
+    }
+
+    #[test]
+    fn term_blob_to_int() {
+        let val = term_to_cql_value(
+            &Term::BlobLiteral(42i32.to_be_bytes().to_vec()),
+            &CqlType::Int,
+        )
+        .unwrap();
+        assert_eq!(val, CqlValue::Int(42));
+    }
+
+    #[test]
+    fn term_blob_to_bigint() {
+        let val = term_to_cql_value(
+            &Term::BlobLiteral(123456789i64.to_be_bytes().to_vec()),
+            &CqlType::Bigint,
+        )
+        .unwrap();
+        assert_eq!(val, CqlValue::Bigint(123456789));
+    }
+
+    #[test]
+    fn term_blob_to_varchar() {
+        let val =
+            term_to_cql_value(&Term::BlobLiteral(b"hello".to_vec()), &CqlType::Varchar).unwrap();
+        assert_eq!(val, CqlValue::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn term_blob_to_boolean() {
+        let val = term_to_cql_value(&Term::BlobLiteral(vec![1]), &CqlType::Boolean).unwrap();
+        assert_eq!(val, CqlValue::Boolean(true));
+
+        let val = term_to_cql_value(&Term::BlobLiteral(vec![0]), &CqlType::Boolean).unwrap();
+        assert_eq!(val, CqlValue::Boolean(false));
+    }
+
+    #[test]
+    fn term_blob_to_float() {
+        let bits = 1.5f32.to_bits();
+        let val = term_to_cql_value(
+            &Term::BlobLiteral(bits.to_be_bytes().to_vec()),
+            &CqlType::Float,
+        )
+        .unwrap();
+        assert_eq!(val, CqlValue::Float(bits));
+    }
+
+    #[test]
+    fn term_blob_to_double() {
+        let bits = 2.5f64.to_bits();
+        let val = term_to_cql_value(
+            &Term::BlobLiteral(bits.to_be_bytes().to_vec()),
+            &CqlType::Double,
+        )
+        .unwrap();
+        assert_eq!(val, CqlValue::Double(bits));
+    }
+
+    #[test]
+    fn term_blob_type_mismatch() {
+        // Wrong size for int (needs 4 bytes)
+        let result = term_to_cql_value(&Term::BlobLiteral(vec![1, 2]), &CqlType::Int);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn term_list_type_mismatch() {
+        let term = Term::ListLiteral(vec![Term::IntegerLiteral(1)]);
+        let result = term_to_cql_value(&term, &CqlType::Int);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn term_set_type_mismatch() {
+        let term = Term::SetLiteral(vec![Term::IntegerLiteral(1)]);
+        let result = term_to_cql_value(&term, &CqlType::Int);
+        assert!(result.is_err());
+    }
+
+    // ── toJson coverage for remaining types ──────────────────────────
+
+    #[test]
+    fn tojson_smallint() {
+        assert_eq!(cql_value_to_json(&CqlValue::Smallint(42)), "42");
+    }
+
+    #[test]
+    fn tojson_tinyint() {
+        assert_eq!(cql_value_to_json(&CqlValue::Tinyint(7)), "7");
+    }
+
+    #[test]
+    fn tojson_timestamp() {
+        assert_eq!(
+            cql_value_to_json(&CqlValue::Timestamp(1710000000)),
+            "1710000000"
+        );
+    }
+
+    #[test]
+    fn tojson_counter() {
+        assert_eq!(cql_value_to_json(&CqlValue::Counter(99)), "99");
+    }
+
+    #[test]
+    fn tojson_blob() {
+        let json = cql_value_to_json(&CqlValue::Blob(vec![0xDE, 0xAD]));
+        assert_eq!(json, "\"0xdead\"");
+    }
+
+    #[test]
+    fn tojson_ascii() {
+        assert_eq!(cql_value_to_json(&CqlValue::Ascii("hi".into())), "\"hi\"");
+    }
+
+    #[test]
+    fn tojson_tuple() {
+        let tuple = CqlValue::Tuple(vec![
+            Some(CqlValue::Int(1)),
+            None,
+            Some(CqlValue::Text("a".into())),
+        ]);
+        let json = cql_value_to_json(&tuple);
+        assert!(json.starts_with('['));
+        assert!(json.contains("1"));
+        assert!(json.contains("null"));
+        assert!(json.contains("\"a\""));
+    }
+
+    // ── cql_type_display_name coverage ───────────────────────────────
+
+    #[test]
+    fn cql_type_display_name_simple() {
+        assert_eq!(cql_type_display_name(&CqlType::Int), "int");
+        assert_eq!(cql_type_display_name(&CqlType::Varchar), "text");
+    }
+
+    #[test]
+    fn cql_type_display_name_collection() {
+        assert_eq!(
+            cql_type_display_name(&CqlType::List(Box::new(CqlType::Int))),
+            "list<int>"
+        );
+        assert_eq!(
+            cql_type_display_name(&CqlType::Set(Box::new(CqlType::Varchar))),
+            "set<text>"
+        );
+        assert_eq!(
+            cql_type_display_name(&CqlType::Map(
+                Box::new(CqlType::Varchar),
+                Box::new(CqlType::Int)
+            )),
+            "map<text, int>"
+        );
+    }
+
+    #[test]
+    fn cql_type_display_name_tuple() {
+        assert_eq!(
+            cql_type_display_name(&CqlType::Tuple(vec![CqlType::Int, CqlType::Varchar])),
+            "tuple<int, text>"
+        );
+    }
+
+    // ── partition_to_rows_with_metadata coverage ─────────────────────
+
+    #[test]
+    fn partition_to_rows_with_metadata_basic() {
+        use ferrosa_sstable::types::Partition;
+
+        let pk_bytes = encode_value(&CqlValue::Int(42));
+        let dk = DecoratedKey::new(PartitionKey::new(pk_bytes));
+
+        let cell_bytes = encode_value(&CqlValue::Text("alice".into()));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(cell_bytes, 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+
+        let partition = Partition {
+            key: dk,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row],
+        };
+
+        let column_names = vec!["id".into(), "name".into()];
+        let column_types = vec![CqlType::Int, CqlType::Varchar];
+        let pk_columns = vec![0usize];
+        let ck_columns: Vec<usize> = vec![];
+
+        let (rows, metas) = partition_to_rows_with_metadata(
+            &partition,
+            &column_names,
+            &column_types,
+            &pk_columns,
+            &ck_columns,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(rows[0][0], Some(CqlValue::Int(42)));
+        assert_eq!(rows[0][1], Some(CqlValue::Text("alice".into())));
+        // Metadata should have timestamp for the data cell
+        assert_eq!(metas[0][1].timestamp, 1000);
+    }
+
+    // ── parse_cql_type_in_keyspace coverage ──────────────────────────
+
+    #[test]
+    fn parse_cql_type_in_keyspace_builtin() {
+        let schema = test_schema_with_keyspace("ks");
+        let result = parse_cql_type_in_keyspace("int", "ks", &schema).unwrap();
+        assert_eq!(result, CqlType::Int);
+    }
+
+    // ── build_delete_row partition-level ─────────────────────────────
+
+    #[test]
+    fn build_delete_row_no_clustering_is_partition_delete() {
+        let row = build_delete_row(&[], &[], 7000);
+        assert!(!row.deletion.is_live());
+        assert_eq!(row.deletion.marked_for_delete_at, 7000);
+        assert!(row.cells.is_empty());
+        assert!(row.clustering.is_empty());
+    }
 }

@@ -10668,4 +10668,821 @@ mod tests {
             result.err()
         );
     }
+
+    // ── DROP TABLE routing tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn drop_table_removes_from_schema() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Create keyspace + table
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE dtks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE dtks.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Verify table exists
+        let snap = state.schema.snapshot();
+        assert!(snap.tables.contains_key(&("dtks".into(), "t".into())));
+
+        // DROP TABLE
+        let stmt = crate::parser::parse("DROP TABLE dtks.t").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "DROP TABLE should succeed: {:?}",
+            result.err()
+        );
+        match &result.unwrap() {
+            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0005i32.to_be_bytes()),
+            _ => panic!("expected Result (schema change)"),
+        }
+
+        // Table must be gone
+        let snap = state.schema.snapshot();
+        assert!(!snap.tables.contains_key(&("dtks".into(), "t".into())));
+    }
+
+    #[tokio::test]
+    async fn drop_table_if_exists_nonexistent_succeeds() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Create keyspace only (no table)
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE dtks2 WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // DROP TABLE IF EXISTS on nonexistent table should succeed silently
+        let stmt = crate::parser::parse("DROP TABLE IF EXISTS dtks2.nope").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "DROP TABLE IF EXISTS should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_table_nonexistent_without_if_exists_errors() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE dtks3 WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("DROP TABLE dtks3.nope").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(result.is_err(), "DROP TABLE without IF EXISTS should fail");
+    }
+
+    // ── CREATE ROLE / ALTER ROLE / DROP ROLE routing tests ────────────
+
+    #[tokio::test]
+    async fn create_role_stores_in_schema() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE ROLE test_role WITH PASSWORD = 'secret' AND LOGIN = true AND SUPERUSER = false", // pragma: allowlist secret
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "CREATE ROLE should succeed: {:?}",
+            result.err()
+        );
+        match &result.unwrap() {
+            RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0001i32.to_be_bytes()),
+            _ => panic!("expected Result (void)"),
+        }
+
+        // Verify role exists in schema
+        let snap = state.schema.snapshot();
+        assert!(
+            snap.roles.contains_key("test_role"),
+            "role should be in schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn alter_role_updates_login() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Create role first
+        let stmt =
+            crate::parser::parse("CREATE ROLE ar_role WITH PASSWORD = 'pass' AND LOGIN = false")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // ALTER ROLE via direct AST (parser doesn't support ALTER ROLE yet)
+        let stmt = Statement::AlterRole(AlterRoleStatement {
+            name: "ar_role".into(),
+            password: None,
+            superuser: None,
+            login: Some(true),
+        });
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALTER ROLE should succeed: {:?}",
+            result.err()
+        );
+
+        let snap = state.schema.snapshot();
+        let role = snap.roles.get("ar_role").unwrap();
+        assert!(role.can_login, "role should have login enabled after alter");
+    }
+
+    #[tokio::test]
+    async fn drop_role_removes_from_schema() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Create + drop role
+        let stmt =
+            crate::parser::parse("CREATE ROLE dr_role WITH PASSWORD = 'pass' AND LOGIN = true")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let snap = state.schema.snapshot();
+        assert!(snap.roles.contains_key("dr_role"));
+
+        let stmt = crate::parser::parse("DROP ROLE dr_role").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "DROP ROLE should succeed: {:?}",
+            result.err()
+        );
+
+        let snap = state.schema.snapshot();
+        assert!(!snap.roles.contains_key("dr_role"), "role should be gone");
+    }
+
+    // ── DROP INDEX routing tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn drop_index_removes_from_schema() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Setup keyspace + table + index
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE diks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE diks.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE INDEX idx_v ON diks.t (v)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Verify index exists
+        let snap = state.schema.snapshot();
+        assert!(
+            snap.indexes
+                .keys()
+                .any(|(ks, _t, n)| ks == "diks" && n == "idx_v"),
+            "index should exist in schema"
+        );
+
+        // DROP INDEX
+        let stmt = crate::parser::parse("DROP INDEX diks.idx_v").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "DROP INDEX should succeed: {:?}",
+            result.err()
+        );
+
+        // Index must be gone
+        let snap = state.schema.snapshot();
+        assert!(
+            !snap
+                .indexes
+                .keys()
+                .any(|(ks, _t, n)| ks == "diks" && n == "idx_v"),
+            "index should be removed from schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_index_if_exists_nonexistent_succeeds() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE diks2 WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("DROP INDEX IF EXISTS diks2.no_such_idx").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "DROP INDEX IF EXISTS should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_index_nonexistent_without_if_exists_errors() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE diks3 WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("DROP INDEX diks3.nonexistent_idx").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_err(),
+            "DROP INDEX without IF EXISTS on missing index should fail"
+        );
+    }
+
+    // ── GRANT / REVOKE on table resources ────────────────────────────
+
+    #[tokio::test]
+    async fn grant_select_on_table() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Setup keyspace + table + role
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE grks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE grks.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE ROLE gr_user WITH PASSWORD = 'pass' AND LOGIN = true")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // GRANT SELECT ON TABLE
+        let stmt = crate::parser::parse("GRANT SELECT ON grks.t TO gr_user").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "GRANT SELECT ON TABLE should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_select_on_table() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        // Setup keyspace + table + role + grant
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE rvks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE rvks.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE ROLE rv_user WITH PASSWORD = 'pass' AND LOGIN = true")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("GRANT SELECT ON rvks.t TO rv_user").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // REVOKE SELECT ON TABLE
+        let stmt = crate::parser::parse("REVOKE SELECT ON rvks.t FROM rv_user").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "REVOKE SELECT ON TABLE should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_all_on_keyspace() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE gaks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE ROLE ga_user WITH PASSWORD = 'pass' AND LOGIN = true")
+                .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("GRANT ALL ON KEYSPACE gaks TO ga_user").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "GRANT ALL ON KEYSPACE should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // ── ALTER TABLE with extensions ──────────────────────────────────
+
+    #[tokio::test]
+    async fn alter_table_with_extensions() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE ateks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE ateks.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // ALTER TABLE with extensions
+        let stmt = Statement::AlterTable(AlterTableStatement {
+            keyspace: Some("ateks".into()),
+            table: "t".into(),
+            add_columns: vec![],
+            drop_columns: vec![],
+            extensions: Some(vec![("vertex_label".into(), "Person".into())]),
+            table_options: vec![],
+        });
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALTER TABLE with extensions should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // ── CREATE INDEX with auto-generated name ────────────────────────
+
+    #[tokio::test]
+    async fn create_index_auto_name() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE cian WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE cian.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // CREATE INDEX without explicit name — should auto-generate name
+        let stmt = crate::parser::parse("CREATE INDEX ON cian.t (v)").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "CREATE INDEX (auto-name) should succeed: {:?}",
+            result.err()
+        );
+
+        // Verify the auto-generated index name follows the pattern table_column_idx
+        let snap = state.schema.snapshot();
+        assert!(
+            snap.indexes
+                .keys()
+                .any(|(ks, _t, n)| ks == "cian" && n == "t_v_idx"),
+            "auto-generated index name should be 't_v_idx'"
+        );
+    }
+
+    // ── resolve_index_type coverage for remaining variants ───────────
+
+    #[test]
+    fn resolve_index_type_filtered() {
+        let result = resolve_index_type(Some("filtered"), &["col".into()], &HashMap::new());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), IndexType::Filtered);
+    }
+
+    #[test]
+    fn resolve_index_type_vector() {
+        let result = resolve_index_type(Some("vector"), &["embedding".into()], &HashMap::new());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), IndexType::Vector);
+    }
+
+    // ── parse_permissions coverage for remaining variants ────────────
+
+    #[test]
+    fn parse_permissions_modify() {
+        let perms = parse_permissions(&["MODIFY".into()]).unwrap();
+        assert_eq!(perms.len(), 1);
+        assert!(perms.contains(&Permission::Modify));
+    }
+
+    #[test]
+    fn parse_permissions_multiple() {
+        let perms = parse_permissions(&["SELECT".into(), "MODIFY".into(), "ALTER".into()]).unwrap();
+        assert_eq!(perms.len(), 3);
+        assert!(perms.contains(&Permission::Select));
+        assert!(perms.contains(&Permission::Modify));
+        assert!(perms.contains(&Permission::Alter));
+    }
+
+    #[test]
+    fn parse_permissions_describe() {
+        let perms = parse_permissions(&["DESCRIBE".into()]).unwrap();
+        assert!(perms.contains(&Permission::Describe));
+    }
+
+    #[test]
+    fn parse_permissions_execute() {
+        let perms = parse_permissions(&["EXECUTE".into()]).unwrap();
+        assert!(perms.contains(&Permission::Execute));
+    }
+
+    #[test]
+    fn parse_permissions_authorize() {
+        let perms = parse_permissions(&["AUTHORIZE".into()]).unwrap();
+        assert!(perms.contains(&Permission::Authorize));
+    }
+
+    #[test]
+    fn parse_permissions_create() {
+        let perms = parse_permissions(&["CREATE".into()]).unwrap();
+        assert!(perms.contains(&Permission::Create));
+    }
+
+    #[test]
+    fn parse_permissions_drop() {
+        let perms = parse_permissions(&["DROP".into()]).unwrap();
+        assert!(perms.contains(&Permission::Drop));
+    }
+
+    // ── ast_resource_to_schema coverage ──────────────────────────────
+
+    #[test]
+    fn ast_resource_all_keyspaces() {
+        let r = ast_resource_to_schema(&GrantResource::AllKeyspaces, &None).unwrap();
+        assert!(matches!(r, Resource::AllKeyspaces));
+    }
+
+    #[test]
+    fn ast_resource_keyspace() {
+        let r = ast_resource_to_schema(&GrantResource::Keyspace("ks".into()), &None).unwrap();
+        assert!(matches!(r, Resource::Keyspace(ref k) if k == "ks"));
+    }
+
+    #[test]
+    fn ast_resource_table_with_keyspace() {
+        let r = ast_resource_to_schema(
+            &GrantResource::Table(Some("ks".into()), "tbl".into()),
+            &None,
+        )
+        .unwrap();
+        assert!(matches!(r, Resource::Table(ref k, ref t) if k == "ks" && t == "tbl"));
+    }
+
+    #[test]
+    fn ast_resource_table_uses_session_keyspace() {
+        let r = ast_resource_to_schema(
+            &GrantResource::Table(None, "tbl".into()),
+            &Some("session_ks".into()),
+        )
+        .unwrap();
+        assert!(matches!(r, Resource::Table(ref k, ref t) if k == "session_ks" && t == "tbl"));
+    }
+
+    #[test]
+    fn ast_resource_table_no_keyspace_errors() {
+        let r = ast_resource_to_schema(&GrantResource::Table(None, "tbl".into()), &None);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn ast_resource_all_roles() {
+        let r = ast_resource_to_schema(&GrantResource::AllRoles, &None).unwrap();
+        assert!(matches!(r, Resource::AllRoles));
+    }
+
+    #[test]
+    fn ast_resource_role() {
+        let r = ast_resource_to_schema(&GrantResource::Role("admin".into()), &None).unwrap();
+        assert!(matches!(r, Resource::Role(ref n) if n == "admin"));
+    }
+
+    #[test]
+    fn ast_resource_function_with_keyspace() {
+        let r = ast_resource_to_schema(
+            &GrantResource::Function {
+                keyspace: Some("ks".into()),
+                name: "myfunc".into(),
+                arg_types: vec![],
+            },
+            &None,
+        )
+        .unwrap();
+        assert!(matches!(r, Resource::Function(ref k, ref n, _) if k == "ks" && n == "myfunc"));
+    }
+
+    #[test]
+    fn ast_resource_function_no_keyspace_errors() {
+        let r = ast_resource_to_schema(
+            &GrantResource::Function {
+                keyspace: None,
+                name: "myfunc".into(),
+                arg_types: vec![],
+            },
+            &None,
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn ast_resource_all_functions_with_keyspace() {
+        let r = ast_resource_to_schema(
+            &GrantResource::AllFunctions {
+                keyspace: Some("ks".into()),
+            },
+            &None,
+        )
+        .unwrap();
+        assert!(matches!(r, Resource::AllFunctions(ref k) if k == "ks"));
+    }
+
+    #[test]
+    fn ast_resource_all_functions_no_keyspace_errors() {
+        let r = ast_resource_to_schema(&GrantResource::AllFunctions { keyspace: None }, &None);
+        assert!(r.is_err());
+    }
+
+    // ── Truncate with data verification ──────────────────────────────
+
+    #[tokio::test]
+    async fn truncate_clears_inserted_rows() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE trks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE trks.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Insert some rows
+        let stmt = crate::parser::parse("INSERT INTO trks.t (k, v) VALUES (1, 'hello')").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("INSERT INTO trks.t (k, v) VALUES (2, 'world')").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Truncate
+        let stmt = crate::parser::parse("TRUNCATE trks.t").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "TRUNCATE should succeed: {:?}",
+            result.err()
+        );
+
+        // SELECT should return 0 rows
+        let stmt = crate::parser::parse("SELECT * FROM trks.t WHERE k = 1").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        let count = match &result {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(count, 0, "table should be empty after TRUNCATE");
+    }
+
+    // ── CREATE INDEX with session keyspace ───────────────────────────
+
+    #[tokio::test]
+    async fn create_index_uses_session_keyspace() {
+        let (state, _dir) = setup();
+        let ctx_no_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE sks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx_no_ks, stmt).await.unwrap();
+
+        let stmt = crate::parser::parse("CREATE TABLE sks.t (k int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx_no_ks, stmt).await.unwrap();
+
+        // Use session keyspace
+        let ctx_ks = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &Some("sks".into()),
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse("CREATE INDEX idx_sk ON t (v)").unwrap();
+        let result = route(&state, &ctx_ks, stmt).await;
+        assert!(
+            result.is_ok(),
+            "CREATE INDEX with session keyspace should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // ── Drop keyspace routing ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn drop_keyspace_removes_from_schema() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE dkks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let snap = state.schema.snapshot();
+        assert!(snap.keyspaces.contains_key("dkks"));
+
+        let stmt = crate::parser::parse("DROP KEYSPACE dkks").unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "DROP KEYSPACE should succeed: {:?}",
+            result.err()
+        );
+
+        let snap = state.schema.snapshot();
+        assert!(!snap.keyspaces.contains_key("dkks"));
+    }
+
+    // ── ALTER KEYSPACE routing ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn alter_keyspace_changes_durable_writes() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE akks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        ).unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // ALTER KEYSPACE via direct AST (parser doesn't support ALTER KEYSPACE yet)
+        let stmt = Statement::AlterKeyspace(AlterKeyspaceStatement {
+            name: "akks".into(),
+            replication: Some(vec![
+                ("class".into(), "SimpleStrategy".into()),
+                ("replication_factor".into(), "1".into()),
+            ]),
+            durable_writes: Some(false),
+        });
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "ALTER KEYSPACE should succeed: {:?}",
+            result.err()
+        );
+    }
 }

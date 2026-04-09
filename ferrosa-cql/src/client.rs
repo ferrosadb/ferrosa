@@ -541,4 +541,175 @@ mod tests {
         skip_type_option(&mut cursor).unwrap();
         assert!(cursor.is_empty());
     }
+
+    #[test]
+    fn skip_type_option_set() {
+        // set<int>
+        let mut buf = BytesMut::new();
+        buf.put_u16(0x0022); // set
+        buf.put_u16(0x0009); // int
+        let mut cursor = &buf[..];
+        skip_type_option(&mut cursor).unwrap();
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn skip_type_option_tuple() {
+        // tuple<int, varchar>
+        let mut buf = BytesMut::new();
+        buf.put_u16(0x0031); // tuple
+        buf.put_u16(2); // 2 elements
+        buf.put_u16(0x0009); // int
+        buf.put_u16(0x000D); // varchar
+        let mut cursor = &buf[..];
+        skip_type_option(&mut cursor).unwrap();
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn skip_type_option_custom() {
+        // custom type with class name
+        let mut buf = BytesMut::new();
+        buf.put_u16(0x0000); // custom
+        let class = b"org.apache.cassandra.db.marshal.VectorType";
+        buf.put_u16(class.len() as u16);
+        buf.put_slice(class);
+        let mut cursor = &buf[..];
+        skip_type_option(&mut cursor).unwrap();
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn skip_type_option_udt() {
+        // UDT with 1 field
+        let mut buf = BytesMut::new();
+        buf.put_u16(0x0030); // UDT
+                             // keyspace
+        let ks = b"test_ks";
+        buf.put_u16(ks.len() as u16);
+        buf.put_slice(ks);
+        // name
+        let name = b"address";
+        buf.put_u16(name.len() as u16);
+        buf.put_slice(name);
+        // 1 field
+        buf.put_u16(1);
+        // field name
+        let field = b"street";
+        buf.put_u16(field.len() as u16);
+        buf.put_slice(field);
+        // field type: varchar
+        buf.put_u16(0x000D);
+
+        let mut cursor = &buf[..];
+        skip_type_option(&mut cursor).unwrap();
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn skip_type_option_simple() {
+        // simple type (e.g. int = 0x0009)
+        let mut buf = BytesMut::new();
+        buf.put_u16(0x0009); // int
+        let mut cursor = &buf[..];
+        skip_type_option(&mut cursor).unwrap();
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn skip_type_option_truncated_returns_error() {
+        let buf = [0u8; 1]; // too short for type id
+        let mut cursor = &buf[..];
+        let result = skip_type_option(&mut cursor);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_error_invalid_utf8() {
+        let mut body = BytesMut::new();
+        body.put_i32(0x2000); // error code
+        let bad_utf8 = [0xFF, 0xFE];
+        body.put_u16(bad_utf8.len() as u16);
+        body.put_slice(&bad_utf8);
+        let result = parse_error(&body).unwrap();
+        // unwrap_or("invalid utf8") is the fallback for invalid UTF-8
+        assert_eq!(result, "invalid utf8");
+    }
+
+    #[test]
+    fn parse_result_rows_kind() {
+        // Build a minimal ROWS result
+        let mut body = BytesMut::new();
+        body.put_i32(2); // ROWS kind
+        body.put_i32(0x0001); // flags: global table spec
+        body.put_i32(1); // 1 column
+        let ks = b"ks";
+        body.put_u16(ks.len() as u16);
+        body.put_slice(ks);
+        let tbl = b"t";
+        body.put_u16(tbl.len() as u16);
+        body.put_slice(tbl);
+        let col = b"id";
+        body.put_u16(col.len() as u16);
+        body.put_slice(col);
+        body.put_u16(0x0009); // int type
+        body.put_i32(0); // 0 rows
+
+        let result = parse_result(&body).unwrap();
+        assert_eq!(result.column_names, vec!["id"]);
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn parse_result_prepared_kind() {
+        let mut body = BytesMut::new();
+        body.put_i32(4); // PREPARED kind
+        let result = parse_result(&body).unwrap();
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn parse_rows_truncated_metadata() {
+        // Too short for metadata
+        let buf = [0u8; 2];
+        let result = parse_rows(&buf).unwrap();
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn parse_rows_truncated_row_count() {
+        let mut buf = BytesMut::new();
+        buf.put_i32(0x0001); // flags
+        buf.put_i32(1); // 1 column
+        let ks = b"ks";
+        buf.put_u16(ks.len() as u16);
+        buf.put_slice(ks);
+        let tbl = b"t";
+        buf.put_u16(tbl.len() as u16);
+        buf.put_slice(tbl);
+        let col = b"c";
+        buf.put_u16(col.len() as u16);
+        buf.put_slice(col);
+        buf.put_u16(0x0009); // int
+                             // No row count bytes — truncated
+
+        let result = parse_rows(&buf).unwrap();
+        assert_eq!(result.column_names, vec!["c"]);
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn read_short_string_truncated() {
+        let buf = [0u8; 1]; // too short
+        let mut cursor = &buf[..];
+        assert!(read_short_string(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn read_short_string_body_truncated() {
+        let mut buf = BytesMut::new();
+        buf.put_u16(10); // claims 10 bytes but none follow
+        let mut cursor = &buf[..];
+        assert!(read_short_string(&mut cursor).is_err());
+    }
 }

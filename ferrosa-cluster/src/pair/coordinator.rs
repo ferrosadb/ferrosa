@@ -541,4 +541,93 @@ mod tests {
             "error should be ReplicationFailed or Net, got: {err}"
         );
     }
+
+    // -- encode/decode mutation round-trip edge cases ---------------------
+
+    #[test]
+    fn encode_decode_mutation_preserves_key() {
+        let mutation = test_mutation();
+        let encoded = encode_mutation(&mutation);
+        let decoded = decode_mutation(&encoded).unwrap();
+
+        assert_eq!(decoded.key.token.0, mutation.key.token.0);
+        assert_eq!(decoded.key.key.as_bytes(), mutation.key.key.as_bytes());
+    }
+
+    #[test]
+    fn decode_mutation_garbage_returns_error() {
+        let result = decode_mutation(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(result.is_err(), "garbage bytes should fail to decode");
+        assert!(
+            matches!(result.unwrap_err(), ClusterError::Internal(_)),
+            "error should be ClusterError::Internal"
+        );
+    }
+
+    // -- encode/decode batch round-trip -----------------------------------
+
+    #[test]
+    fn encode_decode_batch_roundtrip() {
+        let mutations = vec![test_mutation(), test_mutation()];
+        let batch_id = Uuid::new_v4();
+        let encoded = encode_batch(batch_id, &mutations).unwrap();
+        let (decoded_id, decoded_mutations) = decode_batch(&encoded).unwrap();
+
+        assert_eq!(decoded_id, batch_id);
+        assert_eq!(decoded_mutations.len(), 2);
+        assert_eq!(decoded_mutations[0].keyspace, "test_ks");
+        assert_eq!(decoded_mutations[1].table, "test_tbl");
+    }
+
+    #[test]
+    fn encode_decode_batch_empty() {
+        let batch_id = Uuid::new_v4();
+        let encoded = encode_batch(batch_id, &[]).unwrap();
+        let (decoded_id, decoded_mutations) = decode_batch(&encoded).unwrap();
+
+        assert_eq!(decoded_id, batch_id);
+        assert!(decoded_mutations.is_empty());
+    }
+
+    #[test]
+    fn decode_batch_too_short_returns_error() {
+        let result = decode_batch(&[0u8; 10]);
+        assert!(result.is_err(), "payload shorter than 20 bytes should fail");
+    }
+
+    #[test]
+    fn decode_batch_truncated_at_length_prefix() {
+        // Valid header but truncated at mutation length prefix
+        let batch_id = Uuid::new_v4();
+        let mut buf = vec![0u8; 20];
+        buf[0..16].copy_from_slice(batch_id.as_bytes());
+        buf[16..20].copy_from_slice(&1u32.to_be_bytes()); // claims 1 mutation
+                                                          // But no mutation data follows
+
+        let result = decode_batch(&buf);
+        assert!(result.is_err(), "truncated batch should fail");
+    }
+
+    #[test]
+    fn decode_batch_truncated_at_mutation_body() {
+        let batch_id = Uuid::new_v4();
+        let mut buf = vec![0u8; 24];
+        buf[0..16].copy_from_slice(batch_id.as_bytes());
+        buf[16..20].copy_from_slice(&1u32.to_be_bytes()); // 1 mutation
+        buf[20..24].copy_from_slice(&1000u32.to_be_bytes()); // claims 1000 bytes but only 0 follow
+
+        let result = decode_batch(&buf);
+        assert!(result.is_err(), "truncated mutation body should fail");
+    }
+
+    // -- role accessor tests ---------------------------------------------
+
+    #[tokio::test]
+    async fn coordinator_role_and_peer_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (coordinator, peer_id) = primary_coordinator_with_unreachable_peer(dir.path()).await;
+
+        assert_eq!(coordinator.role(), PairRole::Primary);
+        assert_eq!(coordinator.peer_host_id(), peer_id);
+    }
 }

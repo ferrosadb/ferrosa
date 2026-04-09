@@ -438,4 +438,177 @@ mod tests {
             .unwrap();
         assert_eq!(vote, None);
     }
+
+    // -- get_log_state with entries present --------------------------------
+
+    #[tokio::test]
+    async fn get_log_state_returns_last_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+
+        // Insert entries 1..=3 directly.
+        {
+            let mut batch = sled::Batch::default();
+            for idx in 1u64..=3 {
+                let entry = blank_entry(2, idx);
+                let key = SledLogStore::index_key(idx);
+                let val = SledLogStore::serialize_entry(&entry).unwrap();
+                batch.insert(&key, val);
+            }
+            store.log.apply_batch(batch).unwrap();
+        }
+
+        let state =
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::get_log_state(
+                &mut store,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.last_purged_log_id, None);
+        assert!(state.last_log_id.is_some());
+        assert_eq!(state.last_log_id.unwrap().index, 3);
+    }
+
+    // -- save_committed / read_committed round-trip -----------------------
+
+    #[tokio::test]
+    async fn committed_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+
+        // Initially no committed value.
+        let initial =
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::read_committed(
+                &mut store,
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial, None);
+
+        // Save a committed log id.
+        let committed = Some(LogId::new(CommittedLeaderId::new(3, 0), 7));
+        <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::save_committed(
+            &mut store, committed,
+        )
+        .await
+        .unwrap();
+
+        // Read back.
+        let read_back =
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::read_committed(
+                &mut store,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_back, committed);
+    }
+
+    // -- truncate removes entries from given index onward ------------------
+
+    #[tokio::test]
+    async fn truncate_removes_tail_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+
+        // Insert entries 1..=5.
+        {
+            let mut batch = sled::Batch::default();
+            for idx in 1u64..=5 {
+                let entry = blank_entry(1, idx);
+                let key = SledLogStore::index_key(idx);
+                let val = SledLogStore::serialize_entry(&entry).unwrap();
+                batch.insert(&key, val);
+            }
+            store.log.apply_batch(batch).unwrap();
+        }
+
+        // Truncate from index 3 onward (3, 4, 5 removed).
+        let truncate_id = LogId::new(CommittedLeaderId::new(1, 0), 3);
+        <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::truncate(
+            &mut store,
+            truncate_id,
+        )
+        .await
+        .unwrap();
+
+        // Only entries 1 and 2 should remain.
+        let remaining = store.try_get_log_entries(1u64..6u64).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].log_id.index, 1);
+        assert_eq!(remaining[1].log_id.index, 2);
+    }
+
+    // -- get_log_reader returns independent reader -------------------------
+
+    #[tokio::test]
+    async fn get_log_reader_returns_reader_with_same_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+
+        // Insert an entry
+        {
+            let mut batch = sled::Batch::default();
+            let entry = blank_entry(1, 1);
+            let key = SledLogStore::index_key(1);
+            let val = SledLogStore::serialize_entry(&entry).unwrap();
+            batch.insert(&key, val);
+            store.log.apply_batch(batch).unwrap();
+        }
+
+        let mut reader =
+            <SledLogStore as openraft::storage::RaftLogStorage<FerrosRaftConfig>>::get_log_reader(
+                &mut store,
+            )
+            .await;
+
+        let entries = reader.try_get_log_entries(1u64..2u64).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].log_id.index, 1);
+    }
+
+    // -- range queries with various bounds --------------------------------
+
+    #[tokio::test]
+    async fn try_get_log_entries_empty_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+
+        // Insert entries 1..=3
+        {
+            let mut batch = sled::Batch::default();
+            for idx in 1u64..=3 {
+                let entry = blank_entry(1, idx);
+                let key = SledLogStore::index_key(idx);
+                let val = SledLogStore::serialize_entry(&entry).unwrap();
+                batch.insert(&key, val);
+            }
+            store.log.apply_batch(batch).unwrap();
+        }
+
+        // Range that doesn't match any entries
+        let entries = store.try_get_log_entries(10u64..20u64).await.unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_get_log_entries_single_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+
+        {
+            let mut batch = sled::Batch::default();
+            for idx in 1u64..=5 {
+                let entry = blank_entry(1, idx);
+                let key = SledLogStore::index_key(idx);
+                let val = SledLogStore::serialize_entry(&entry).unwrap();
+                batch.insert(&key, val);
+            }
+            store.log.apply_batch(batch).unwrap();
+        }
+
+        // Get exactly one entry
+        let entries = store.try_get_log_entries(3u64..4u64).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].log_id.index, 3);
+    }
 }
