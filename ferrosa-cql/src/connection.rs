@@ -303,15 +303,15 @@ pub async fn handle_connection<S>(
                                 );
                                 framed.codec_mut().set_compression(compression);
                             }
-                            // CQL v5 framing (CRC24/CRC32 envelopes) is disabled for
-                            // server-side connections. Third-party drivers (cqlsh,
-                            // cdrs-tokio, Python cassandra-driver) negotiate v5 but
-                            // don't all implement the v5 framing layer, causing
-                            // CRC24 mismatches. V5 protocol semantics (metadata IDs,
-                            // new types) work fine over v4 framing.
-                            //
-                            // The built-in CqlClient enables v5 framing on its side
-                            // only when the server does — since we don't, it won't.
+                            // CQL v5 switches to framed mode (CRC24/CRC32) after
+                            // READY. If the client doesn't implement v5 framing
+                            // (e.g., Python cassandra-driver), the first decode
+                            // will fail with a CRC mismatch and the error handler
+                            // above will fall back to v4 unframed mode.
+                            if client_protocol_version >= 0x05 {
+                                debug!("enabling v5 framing for {peer}");
+                                framed.codec_mut().enable_v5_framing();
+                            }
                         }
                     }
                     HandleResult::StartSubscription {
