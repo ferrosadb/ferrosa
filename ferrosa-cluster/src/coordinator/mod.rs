@@ -4,6 +4,7 @@
 pub mod batch;
 pub mod metrics;
 pub mod read;
+pub mod truncate;
 pub mod write;
 
 use std::sync::Arc;
@@ -147,6 +148,77 @@ impl RpcHandler for MutationForwardHandler {
         }
         Some(Message::MutationAck(Bytes::new()))
     }
+}
+
+// ---------------------------------------------------------------------------
+// TruncateForwardHandler — receives TruncateForward RPCs from coordinators
+// ---------------------------------------------------------------------------
+
+/// RPC handler that receives `TruncateForward` messages from coordinators
+/// and truncates the specified table on local storage.
+pub struct TruncateForwardHandler {
+    storage: Arc<StorageEngine>,
+}
+
+impl TruncateForwardHandler {
+    pub fn new(storage: Arc<StorageEngine>) -> Self {
+        Self { storage }
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for TruncateForwardHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let body = match msg {
+            Message::TruncateForward(b) => b,
+            _ => return None,
+        };
+        let table_id = match decode_truncate_payload(&body) {
+            Some(t) => t,
+            None => {
+                tracing::warn!("TruncateForward: failed to decode payload");
+                return None;
+            }
+        };
+        if let Err(e) = self.storage.truncate(&table_id) {
+            tracing::warn!(%e, table = %table_id, "TruncateForward failed — not sending ACK");
+            return None;
+        }
+        Some(Message::TruncateAck(Bytes::new()))
+    }
+}
+
+/// Encode a truncate payload: `[u16 ks_len][ks_bytes][u16 table_len][table_bytes]`
+pub fn encode_truncate_payload(table_id: &TableId) -> Bytes {
+    let size = 2 + table_id.keyspace.len() + 2 + table_id.table.len();
+    let mut buf = Vec::with_capacity(size);
+    buf.extend_from_slice(&(table_id.keyspace.len() as u16).to_be_bytes());
+    buf.extend_from_slice(table_id.keyspace.as_bytes());
+    buf.extend_from_slice(&(table_id.table.len() as u16).to_be_bytes());
+    buf.extend_from_slice(table_id.table.as_bytes());
+    Bytes::from(buf)
+}
+
+/// Decode a truncate payload back to a `TableId`.
+fn decode_truncate_payload(body: &[u8]) -> Option<TableId> {
+    if body.len() < 4 {
+        return None;
+    }
+    let mut cursor = body;
+    let ks_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    cursor = &cursor[2..];
+    if cursor.len() < ks_len + 2 {
+        return None;
+    }
+    let keyspace = std::str::from_utf8(&cursor[..ks_len]).ok()?.to_string();
+    cursor = &cursor[ks_len..];
+    let tbl_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    cursor = &cursor[2..];
+    if cursor.len() < tbl_len {
+        return None;
+    }
+    let table = std::str::from_utf8(&cursor[..tbl_len]).ok()?.to_string();
+    Some(TableId::new(&keyspace, &table))
 }
 
 // ---------------------------------------------------------------------------

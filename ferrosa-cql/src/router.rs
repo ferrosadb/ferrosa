@@ -275,7 +275,7 @@ pub async fn route(
             let body = result::encode_set_keyspace(&u.keyspace);
             Ok(RouteResult::SetKeyspace(u.keyspace, body))
         }
-        Statement::Truncate(t) => route_truncate(state, ctx, t).map(RouteResult::Result),
+        Statement::Truncate(t) => route_truncate(state, ctx, t).await.map(RouteResult::Result),
         Statement::CreateIndex(ci) => route_create_index(state, ctx, ci)
             .await
             .map(RouteResult::Result),
@@ -3876,7 +3876,7 @@ async fn route_revoke(
 
 // ── TRUNCATE ─────────────────────────────────────────────────────────────
 
-fn route_truncate(
+async fn route_truncate(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     s: TruncateStatement,
@@ -3890,11 +3890,13 @@ fn route_truncate(
         &Resource::Table(ks.to_string(), s.table.clone()),
     )?;
 
-    // Truncate the table's data in the storage engine.
+    // Truncate the table's data across all cluster nodes.
     let table_id = ferrosa_storage::TableId::new(ks, &s.table);
     state
-        .engine
+        .write_path
+        .load()
         .truncate(&table_id)
+        .await
         .map_err(|e| CqlError::ServerError(format!("truncate failed: {e}")))?;
 
     Ok(result::encode_void())

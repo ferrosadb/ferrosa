@@ -461,6 +461,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mutation_fwd_handler,
     );
 
+    // Register TruncateForwardHandler for cluster mode TRUNCATE propagation
+    let truncate_fwd_handler = Arc::new(ferrosa_cluster::TruncateForwardHandler::new(
+        storage.clone(),
+    ));
+    registry.register(
+        ferrosa_net::codec::MsgType::TruncateForward,
+        truncate_fwd_handler,
+    );
+
     // 5b. Create subsystem runtimes (Raft gets its own so heartbeats
     // 5b. Dedicated Raft runtime — heartbeats can't be starved by CQL/S3 work.
     let runtimes = runtime::RuntimeManager::new();

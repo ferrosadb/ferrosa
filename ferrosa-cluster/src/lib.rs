@@ -26,7 +26,9 @@ pub use controller::{ClusterStateHolder, ModeController, ModeControllerHandles};
 pub use coordinator::batch::{
     BatchlogDeleteHandler, BatchlogReplayHandler, BatchlogReplayTask, BatchlogWriteHandler,
 };
-pub use coordinator::{ClusterCoordinator, MutationForwardHandler, RepairWriteHandler};
+pub use coordinator::{
+    ClusterCoordinator, MutationForwardHandler, RepairWriteHandler, TruncateForwardHandler,
+};
 pub use ddl_path::DdlPath;
 pub use error::{ClusterError, Result};
 pub use mode::DeploymentMode;

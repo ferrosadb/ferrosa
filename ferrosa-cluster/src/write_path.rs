@@ -189,6 +189,22 @@ impl WritePath {
         }
     }
 
+    /// Truncate a table. In standalone/pair mode this truncates local storage.
+    /// In cluster mode the coordinator fans out to all nodes.
+    pub async fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        match self {
+            Self::Direct(engine) => engine.truncate(table_id),
+            Self::Pair(coordinator) => coordinator.local_storage().truncate(table_id),
+            Self::Cluster(coordinator) => coordinator
+                .coordinate_truncate(table_id)
+                .await
+                .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster truncate: {e}"))),
+            Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, truncate rejected until operator promotes".into(),
+            )),
+        }
+    }
+
     /// Write a row. In standalone mode this goes directly to storage.
     /// In pair mode this goes through the PairCoordinator which handles
     /// replication (primary) or forwarding (secondary).
