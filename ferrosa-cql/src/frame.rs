@@ -509,10 +509,12 @@ fn decompress_snappy(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 
 // ── CQL v5 CRC functions ────────────────────────────────────────────────
 
-/// CRC24 used by CQL v5 frame headers (polynomial 0x875060).
+/// CRC24 used by CQL v5 frame headers.
 ///
-/// Cassandra uses the CRC-24 variant defined in the native protocol v5 spec.
-/// The polynomial is 0x875060, initial value 0x875060, no final XOR.
+/// Matches Cassandra's `org.apache.cassandra.utils.Crc.crc24()`:
+/// - Initial value: `CRC24_INIT = 0x875060`
+/// - Polynomial:    `CRC24_POLY = 0x1974F0B`
+///
 /// Public CRC24 for test use.
 pub fn crc24_public(data: &[u8]) -> u32 {
     crc24(data)
@@ -523,14 +525,19 @@ pub fn crc32_public(data: &[u8]) -> u32 {
     crc32_castagnoli(data)
 }
 
+/// CRC24 initial value (matches Cassandra `CRC24_INIT`).
+const CRC24_INIT: u32 = 0x87_5060;
+/// CRC24 polynomial (matches Cassandra `CRC24_POLY`).
+const CRC24_POLY: u32 = 0x197_4F0B;
+
 fn crc24(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0x87_5060;
+    let mut crc: u32 = CRC24_INIT;
     for &byte in data {
         crc ^= (byte as u32) << 16;
         for _ in 0..8 {
             crc <<= 1;
             if crc & 0x100_0000 != 0 {
-                crc ^= 0x87_5060;
+                crc ^= CRC24_POLY;
             }
         }
     }
