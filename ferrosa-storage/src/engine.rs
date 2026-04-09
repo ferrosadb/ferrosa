@@ -9041,6 +9041,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tracing)]
     fn storage_engine_creates_spans() {
         use std::sync::atomic::AtomicU64;
 
