@@ -3562,6 +3562,96 @@ mod tests {
         );
     }
 
+    /// LWW must work across the flush boundary: a newer value in an SSTable
+    /// must beat an older value in the memtable.
+    #[test]
+    fn lww_survives_flush_newer_in_sstable_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let key = make_key("lww_flush");
+
+        // Write value A at high timestamp, then flush to SSTable.
+        engine
+            .write(
+                &tid,
+                &key,
+                make_row(b"NEWER_VALUE", 7_000_000_000),
+                7_000_000_000,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Write value B at lower timestamp to the new (empty) memtable.
+        engine
+            .write(
+                &tid,
+                &key,
+                make_row(b"OLDER_VALUE", 3_000_000_000),
+                3_000_000_000,
+            )
+            .unwrap();
+
+        // Read should return NEWER_VALUE (ts=7e9 > ts=3e9).
+        let result = engine.read(&tid, &key).unwrap().unwrap();
+        let cell_value = result.rows[0].cells[0].1.value.as_deref().unwrap();
+        assert_eq!(
+            cell_value,
+            b"NEWER_VALUE",
+            "LWW failed across flush boundary: SSTable value (ts=7e9) should beat \
+             memtable value (ts=3e9), but got {:?}",
+            std::str::from_utf8(cell_value).unwrap_or("(not utf8)")
+        );
+    }
+
+    /// Same as above but with multiple flush cycles.
+    #[test]
+    fn lww_survives_multiple_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let key = make_key("lww_multi");
+
+        // Flush 1: write at ts=5e9
+        engine
+            .write(&tid, &key, make_row(b"V5", 5_000_000_000), 5_000_000_000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Flush 2: write at ts=7e9 (HIGHEST — should win)
+        engine
+            .write(&tid, &key, make_row(b"V7", 7_000_000_000), 7_000_000_000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Flush 3: write at ts=3e9
+        engine
+            .write(&tid, &key, make_row(b"V3", 3_000_000_000), 3_000_000_000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Memtable: write at ts=1e9
+        engine
+            .write(&tid, &key, make_row(b"V1", 1_000_000_000), 1_000_000_000)
+            .unwrap();
+
+        // Read should return V7 (highest timestamp across all sources).
+        let result = engine.read(&tid, &key).unwrap().unwrap();
+        let cell_value = result.rows[0].cells[0].1.value.as_deref().unwrap();
+        assert_eq!(
+            cell_value,
+            b"V7",
+            "LWW across 3 SSTables + memtable: expected V7 (ts=7e9), got {:?}",
+            std::str::from_utf8(cell_value).unwrap_or("(not utf8)")
+        );
+    }
+
     /// Reproduce bug-large-write-causes-data-loss-in-partition:
     /// writing many rows to the same partition, flushing, writing more,
     /// flushing again — earlier rows must survive.
