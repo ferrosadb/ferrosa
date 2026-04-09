@@ -247,7 +247,7 @@ async fn run_cluster_load_test_async(
                 if is_reader {
                     let cql = format!("SELECT val FROM data WHERE pk = '{key_str}' AND ck = 1");
                     let t0 = Instant::now();
-                    match client.query(&cql).await {
+                    match client.query_quorum(&cql).await {
                         Ok(result) => {
                             sc.record_read(t0.elapsed());
                             if let Some(Some(v)) = result
@@ -271,7 +271,7 @@ async fn run_cluster_load_test_async(
                          USING TIMESTAMP {local_ts}"
                     );
                     let t0 = Instant::now();
-                    match client.query(&cql).await {
+                    match client.query_quorum(&cql).await {
                         Ok(_) => {
                             sc.record_write(t0.elapsed());
                             bw.fetch_add(val_len as u64, Ordering::Relaxed);
@@ -517,10 +517,47 @@ async fn verify_via_cql(
                         mismatched += 1;
                         if mismatched <= 5 {
                             eprintln!(
-                                "integrity: mismatch key '{key}': expected {} bytes, got {} bytes",
+                                "integrity: mismatch key '{key}': expected {} bytes (ts={}), got {} bytes",
                                 expected_val.len(),
+                                _ts,
                                 got.len()
                             );
+                            // Diagnostic: read from each node with WRITETIME to compare
+                            let ts_cql = format!(
+                                "SELECT val, writetime(val) FROM data WHERE pk = '{key}' AND ck = 1"
+                            );
+                            for node in nodes {
+                                if let Ok(mut nc) = CqlClient::connect(*node).await {
+                                    let _ = nc.query("USE load_test").await;
+                                    if let Ok(nr) = nc.query(&ts_cql).await {
+                                        if let Some(row) = nr.rows.first() {
+                                            let val_len = row
+                                                .columns
+                                                .first()
+                                                .and_then(|c| c.as_ref())
+                                                .map(|v| v.len());
+                                            let wt = row
+                                                .columns
+                                                .get(1)
+                                                .and_then(|c| c.as_ref())
+                                                .and_then(|v| {
+                                                    if v.len() == 8 {
+                                                        Some(i64::from_be_bytes(
+                                                            v[..8].try_into().unwrap(),
+                                                        ))
+                                                    } else {
+                                                        None
+                                                    }
+                                                });
+                                            eprintln!(
+                                                "  {node}: {} bytes, writetime={}",
+                                                val_len.map_or("NULL".into(), |l| l.to_string()),
+                                                wt.map_or("NULL".into(), |t| t.to_string())
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 } else {
