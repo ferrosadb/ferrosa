@@ -29,26 +29,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Ferrosa Docker image
-        run: docker compose build --no-cache node1
-
-      - name: Start 3-node cluster
-        run: docker compose up -d node1
-
       - name: Install cqlsh
         run: pip install cqlsh
+
+      - name: Clean Docker state
+        run: |
+          docker compose down -v --remove-orphans 2>/dev/null || true
+          docker system prune -af 2>/dev/null || true
+
+      - name: Build and start Ferrosa
+        run: docker compose up -d --build --force-recreate node1
 
       - name: Wait for CQL port
         run: |
           echo "Waiting for Ferrosa CQL port (9042)..."
-          for i in $(seq 1 120); do
+          for i in $(seq 1 180); do
             if cqlsh 127.0.0.1 9042 -e "SELECT cluster_name FROM system.local;" >/dev/null 2>&1; then
               echo "Ferrosa ready after ${i}s"
               break
             fi
-            if [ "$i" -eq 120 ]; then
-              echo "::error::Ferrosa did not become ready within 120s"
-              docker compose logs node1 | tail -50
+            if [ "$i" -eq 180 ]; then
+              echo "::error::Ferrosa did not become ready within 180s"
+              docker compose logs node1 | tail -80
               exit 1
             fi
             sleep 1
