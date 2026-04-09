@@ -53,7 +53,12 @@ async fn main() {
             let mut client = CqlClient::connect(node).await.expect("connect");
             client.query("USE lww_test").await.expect("USE");
 
-            let mut ts = (worker_id as i64) * 1_000_000_000;
+            // Use epoch millis as base to ensure unique timestamps across runs
+            let epoch_base = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            let mut ts = epoch_base + (worker_id as i64) * 1_000_000_000;
             let mut write_count = 0u64;
 
             while !stop.load(Ordering::Relaxed) {
@@ -61,11 +66,11 @@ async fn main() {
                 let key_str = format!("k{key_idx:06}");
                 ts += 1;
 
-                // Large deterministic value (1024-4096 bytes like the loadgen)
+                // Value encodes the timestamp as first 8 bytes (BE) for debugging
                 let val_len = 1024 + ((ts as usize * 31) % 3072);
-                let value: Vec<u8> = (0..val_len)
-                    .map(|i| ((ts as u8).wrapping_add(i as u8)).wrapping_mul(37))
-                    .collect();
+                let mut value = Vec::with_capacity(val_len);
+                value.extend_from_slice(&ts.to_be_bytes()); // first 8 bytes = timestamp
+                value.resize(val_len, (ts & 0xFF) as u8); // pad with ts-derived byte
                 let val_hex: String = value.iter().map(|b| format!("{b:02x}")).collect();
 
                 let cql = format!(
@@ -148,11 +153,29 @@ async fn main() {
                     if got != expected_val.as_slice() {
                         mismatches += 1;
                         if mismatches <= 5 {
-                            let got_str = std::str::from_utf8(got).unwrap_or("(binary)");
-                            let exp_str = std::str::from_utf8(expected_val).unwrap_or("(binary)");
+                            // Decode the timestamp from the stored value's first 8 bytes
+                            let got_ts = if got.len() >= 8 {
+                                i64::from_be_bytes(got[..8].try_into().unwrap())
+                            } else {
+                                -1
+                            };
+                            let exp_ts_from_val = if expected_val.len() >= 8 {
+                                i64::from_be_bytes(expected_val[..8].try_into().unwrap())
+                            } else {
+                                -1
+                            };
                             eprintln!(
-                                "MISMATCH {key}: expected '{exp_str}' (ts={expected_ts}), \
-                                 got '{got_str}'"
+                                "MISMATCH {key}: GT expects ts={expected_ts} (val_ts={exp_ts_from_val}, {} bytes), \
+                                 storage has val_ts={got_ts} ({} bytes) — stored ts is {}",
+                                expected_val.len(),
+                                got.len(),
+                                if got_ts > *expected_ts {
+                                    "HIGHER (LWW correct, GT wrong)"
+                                } else if got_ts < *expected_ts {
+                                    "LOWER (LWW violated!)"
+                                } else {
+                                    "EQUAL (same ts, different value?!)"
+                                }
                             );
                         }
                     }

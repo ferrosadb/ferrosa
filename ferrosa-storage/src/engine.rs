@@ -1491,7 +1491,105 @@ impl StorageEngine {
             let _ = std::fs::create_dir_all(&table_dir);
         }
 
+        // Delete S3 objects + manifest entry for this table synchronously
+        // so stale data doesn't reappear on bootstrap from S3.
+        self.truncate_s3(table_id);
+
         Ok(())
+    }
+
+    /// Delete S3 objects and manifest entry for a truncated table.
+    ///
+    /// Runs synchronously on a dedicated thread with its own tokio runtime
+    /// so this can be called from non-async contexts. Blocks until all
+    /// S3 deletions complete — this ensures stale data doesn't reappear
+    /// when other nodes bootstrap from S3 after a TRUNCATE.
+    fn truncate_s3(&self, table_id: &TableId) {
+        let Some((store, prefix)) = self.resolve_store_and_prefix() else {
+            return;
+        };
+        let table_id_str = table_id.to_string();
+        let manifest_path = self
+            .config
+            .object_store
+            .as_ref()
+            .map(|c| format!("{}/manifest.json", c.prefix));
+
+        // Run S3 operations on a blocking thread with its own runtime.
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("truncate S3 runtime");
+            rt.block_on(async {
+                // 1. Delete all SSTable objects for this table (recursive).
+                // S3 objects are stored under: {prefix}/{table_id}/{sstable_id}/...
+                // We also need to check subdirectories, so use list_with_delimiter
+                // at the table level to find SSTable dirs, then delete each.
+                let table_path = object_store::path::Path::from(format!("{prefix}/{table_id_str}"));
+                match store.list_with_delimiter(Some(&table_path)).await {
+                    Ok(result) => {
+                        let mut deleted = 0u64;
+                        // Delete objects at the table level
+                        for obj in &result.objects {
+                            let _ = store.delete(&obj.location).await;
+                            deleted += 1;
+                        }
+                        // Delete objects in SSTable subdirectories
+                        for subdir in &result.common_prefixes {
+                            if let Ok(sub_result) = store.list_with_delimiter(Some(subdir)).await {
+                                for obj in &sub_result.objects {
+                                    let _ = store.delete(&obj.location).await;
+                                    deleted += 1;
+                                }
+                            }
+                        }
+                        if deleted > 0 {
+                            tracing::info!(
+                                table = %table_id_str,
+                                deleted,
+                                "TRUNCATE: deleted S3 objects"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            table = %table_id_str,
+                            %e,
+                            "TRUNCATE: S3 list failed"
+                        );
+                    }
+                }
+
+                // 2. Remove this table from the S3 manifest.
+                if let Some(mpath) = manifest_path {
+                    let path = object_store::path::Path::from(mpath);
+                    if let Ok(data) = store.get(&path).await {
+                        if let Ok(bytes) = data.bytes().await {
+                            if let Ok(mut manifest) =
+                                serde_json::from_slice::<crate::manifest::Manifest>(&bytes)
+                            {
+                                if manifest.sstables.remove(&table_id_str).is_some() {
+                                    if let Ok(updated) = serde_json::to_vec_pretty(&manifest) {
+                                        let _ = store
+                                            .put(&path, object_store::PutPayload::from(updated))
+                                            .await;
+                                        tracing::info!(
+                                            table = %table_id_str,
+                                            "TRUNCATE: removed table from S3 manifest"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        // Wait for S3 cleanup to complete before returning.
+        if let Err(e) = handle.join() {
+            tracing::warn!("TRUNCATE: S3 cleanup thread panicked: {:?}", e);
+        }
     }
 
     /// Replay mutations from a given commit log position forward.
