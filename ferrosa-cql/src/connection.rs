@@ -151,6 +151,18 @@ pub async fn handle_connection<S>(
                         break;
                     }
                     Ok(Some(Err(e))) => {
+                        // If v5 framing is active and we get a CRC mismatch,
+                        // the client negotiated v5 but doesn't implement v5
+                        // framing (e.g., Python cassandra-driver). Fall back
+                        // to v4 unframed mode and retry the decode.
+                        if framed.codec().is_v5_framed() {
+                            warn!(
+                                "v5 frame decode failed from {peer}, \
+                                 falling back to v4 unframed: {e}"
+                            );
+                            framed.codec_mut().disable_v5_framing();
+                            continue;
+                        }
                         warn!("frame decode error from {peer}: {e}");
                         break;
                     }
@@ -291,11 +303,15 @@ pub async fn handle_connection<S>(
                                 );
                                 framed.codec_mut().set_compression(compression);
                             }
-                            // CQL v5 switches to framed mode (CRC24/CRC32) after READY.
-                            if client_protocol_version >= 0x05 {
-                                debug!("enabling v5 framing for {peer}");
-                                framed.codec_mut().enable_v5_framing();
-                            }
+                            // CQL v5 framing (CRC24/CRC32 envelopes) is disabled for
+                            // server-side connections. Third-party drivers (cqlsh,
+                            // cdrs-tokio, Python cassandra-driver) negotiate v5 but
+                            // don't all implement the v5 framing layer, causing
+                            // CRC24 mismatches. V5 protocol semantics (metadata IDs,
+                            // new types) work fine over v4 framing.
+                            //
+                            // The built-in CqlClient enables v5 framing on its side
+                            // only when the server does — since we don't, it won't.
                         }
                     }
                     HandleResult::StartSubscription {

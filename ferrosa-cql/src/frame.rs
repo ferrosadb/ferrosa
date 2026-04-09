@@ -223,6 +223,16 @@ impl CqlCodec {
         self.v5_framed = true;
     }
 
+    /// Disable v5 framing, reverting to v4 unframed mode.
+    ///
+    /// Used when a client negotiates v5 but doesn't implement v5 framing
+    /// (e.g., Python cassandra-driver sends v5 STARTUP but continues with
+    /// v4-style envelopes). The server detects the CRC mismatch and falls
+    /// back gracefully.
+    pub fn disable_v5_framing(&mut self) {
+        self.v5_framed = false;
+    }
+
     /// Whether v5 framing is active.
     pub fn is_v5_framed(&self) -> bool {
         self.v5_framed
