@@ -10,6 +10,8 @@ on:
     branches: [main]
     paths:
       - 'examples/**'
+      - 'ferrosa-cql/**'
+      - 'Dockerfile'
       - '.github/workflows/test-examples.yml'
   schedule:
     # Nightly at 03:00 UTC
