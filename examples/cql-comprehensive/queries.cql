@@ -151,6 +151,14 @@ SELECT * FROM all_types WHERE col_boolean = true ALLOW FILTERING;
 SELECT val, TTL(val) FROM ttl_test WHERE id = 1;
 
 -- ============================================================
+-- Built-in functions: now(), toTimestamp(), toDate()
+-- Standard CQL health check functions that all drivers rely on.
+-- ============================================================
+SELECT now() FROM system.local;
+SELECT toTimestamp(now()) FROM system.local;
+SELECT toDate(now()) FROM system.local;
+
+-- ============================================================
 -- Cleanup: DROP TYPE, DROP TABLE, DROP INDEX, DROP KEYSPACE
 -- ============================================================
 DROP INDEX IF EXISTS cql_compat.all_types_col_text_idx;
