@@ -247,7 +247,7 @@ async fn run_cluster_load_test_async(
                 if is_reader {
                     let cql = format!("SELECT val FROM data WHERE pk = '{key_str}' AND ck = 1");
                     let t0 = Instant::now();
-                    match client.query(&cql).await {
+                    match client.query_quorum(&cql).await {
                         Ok(result) => {
                             sc.record_read(t0.elapsed());
                             if let Some(Some(v)) = result
@@ -271,11 +271,20 @@ async fn run_cluster_load_test_async(
                          USING TIMESTAMP {local_ts}"
                     );
                     let t0 = Instant::now();
-                    match client.query(&cql).await {
+                    match client.query_quorum(&cql).await {
                         Ok(_) => {
                             sc.record_write(t0.elapsed());
                             bw.fetch_add(val_len as u64, Ordering::Relaxed);
                             gt.record_write(&key_str, &value, local_ts);
+
+                            // Trace key k00000000 to debug integrity mismatches
+                            if key_str == "k00000000" {
+                                let first4 = &val_hex[..8.min(val_hex.len())];
+                                eprintln!(
+                                    "TRACE k00000000: worker={worker_id} ts={local_ts} \
+                                     val_len={val_len} hex_prefix={first4}"
+                                );
+                            }
                         }
                         Err(e) => {
                             sc.record_write_error();
@@ -498,7 +507,21 @@ async fn verify_via_cql(
         }
         checked += 1;
 
-        let (expected_val, _ts, is_deleted) = &snapshot[*key];
+        let (expected_val, expected_ts, is_deleted) = &snapshot[*key];
+
+        // Trace key k00000000
+        if key.as_str() == "k00000000" {
+            let first4: String = expected_val
+                .iter()
+                .take(4)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            eprintln!(
+                "VERIFY k00000000: gt_ts={expected_ts} gt_len={} gt_hex_prefix={first4}",
+                expected_val.len()
+            );
+        }
+
         let cql = format!("SELECT val FROM data WHERE pk = '{key}' AND ck = 1");
         match client.query_quorum(&cql).await {
             Ok(result) => {

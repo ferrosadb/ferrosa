@@ -1491,7 +1491,105 @@ impl StorageEngine {
             let _ = std::fs::create_dir_all(&table_dir);
         }
 
+        // Delete S3 objects + manifest entry for this table synchronously
+        // so stale data doesn't reappear on bootstrap from S3.
+        self.truncate_s3(table_id);
+
         Ok(())
+    }
+
+    /// Delete S3 objects and manifest entry for a truncated table.
+    ///
+    /// Runs synchronously on a dedicated thread with its own tokio runtime
+    /// so this can be called from non-async contexts. Blocks until all
+    /// S3 deletions complete — this ensures stale data doesn't reappear
+    /// when other nodes bootstrap from S3 after a TRUNCATE.
+    fn truncate_s3(&self, table_id: &TableId) {
+        let Some((store, prefix)) = self.resolve_store_and_prefix() else {
+            return;
+        };
+        let table_id_str = table_id.to_string();
+        let manifest_path = self
+            .config
+            .object_store
+            .as_ref()
+            .map(|c| format!("{}/manifest.json", c.prefix));
+
+        // Run S3 operations on a blocking thread with its own runtime.
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("truncate S3 runtime");
+            rt.block_on(async {
+                // 1. Delete all SSTable objects for this table (recursive).
+                // S3 objects are stored under: {prefix}/{table_id}/{sstable_id}/...
+                // We also need to check subdirectories, so use list_with_delimiter
+                // at the table level to find SSTable dirs, then delete each.
+                let table_path = object_store::path::Path::from(format!("{prefix}/{table_id_str}"));
+                match store.list_with_delimiter(Some(&table_path)).await {
+                    Ok(result) => {
+                        let mut deleted = 0u64;
+                        // Delete objects at the table level
+                        for obj in &result.objects {
+                            let _ = store.delete(&obj.location).await;
+                            deleted += 1;
+                        }
+                        // Delete objects in SSTable subdirectories
+                        for subdir in &result.common_prefixes {
+                            if let Ok(sub_result) = store.list_with_delimiter(Some(subdir)).await {
+                                for obj in &sub_result.objects {
+                                    let _ = store.delete(&obj.location).await;
+                                    deleted += 1;
+                                }
+                            }
+                        }
+                        if deleted > 0 {
+                            tracing::info!(
+                                table = %table_id_str,
+                                deleted,
+                                "TRUNCATE: deleted S3 objects"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            table = %table_id_str,
+                            %e,
+                            "TRUNCATE: S3 list failed"
+                        );
+                    }
+                }
+
+                // 2. Remove this table from the S3 manifest.
+                if let Some(mpath) = manifest_path {
+                    let path = object_store::path::Path::from(mpath);
+                    if let Ok(data) = store.get(&path).await {
+                        if let Ok(bytes) = data.bytes().await {
+                            if let Ok(mut manifest) =
+                                serde_json::from_slice::<crate::manifest::Manifest>(&bytes)
+                            {
+                                if manifest.sstables.remove(&table_id_str).is_some() {
+                                    if let Ok(updated) = serde_json::to_vec_pretty(&manifest) {
+                                        let _ = store
+                                            .put(&path, object_store::PutPayload::from(updated))
+                                            .await;
+                                        tracing::info!(
+                                            table = %table_id_str,
+                                            "TRUNCATE: removed table from S3 manifest"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        // Wait for S3 cleanup to complete before returning.
+        if let Err(e) = handle.join() {
+            tracing::warn!("TRUNCATE: S3 cleanup thread panicked: {:?}", e);
+        }
     }
 
     /// Replay mutations from a given commit log position forward.
@@ -3560,6 +3658,234 @@ mod tests {
             "data must be gone after TRUNCATE — got {:?}",
             result
         );
+    }
+
+    /// LWW must work across the flush boundary: a newer value in an SSTable
+    /// must beat an older value in the memtable.
+    #[test]
+    fn lww_survives_flush_newer_in_sstable_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let key = make_key("lww_flush");
+
+        // Write value A at high timestamp, then flush to SSTable.
+        engine
+            .write(
+                &tid,
+                &key,
+                make_row(b"NEWER_VALUE", 7_000_000_000),
+                7_000_000_000,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Write value B at lower timestamp to the new (empty) memtable.
+        engine
+            .write(
+                &tid,
+                &key,
+                make_row(b"OLDER_VALUE", 3_000_000_000),
+                3_000_000_000,
+            )
+            .unwrap();
+
+        // Read should return NEWER_VALUE (ts=7e9 > ts=3e9).
+        let result = engine.read(&tid, &key).unwrap().unwrap();
+        let cell_value = result.rows[0].cells[0].1.value.as_deref().unwrap();
+        assert_eq!(
+            cell_value,
+            b"NEWER_VALUE",
+            "LWW failed across flush boundary: SSTable value (ts=7e9) should beat \
+             memtable value (ts=3e9), but got {:?}",
+            std::str::from_utf8(cell_value).unwrap_or("(not utf8)")
+        );
+    }
+
+    /// Same as above but with multiple flush cycles.
+    #[test]
+    fn lww_survives_multiple_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let key = make_key("lww_multi");
+
+        // Flush 1: write at ts=5e9
+        engine
+            .write(&tid, &key, make_row(b"V5", 5_000_000_000), 5_000_000_000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Flush 2: write at ts=7e9 (HIGHEST — should win)
+        engine
+            .write(&tid, &key, make_row(b"V7", 7_000_000_000), 7_000_000_000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Flush 3: write at ts=3e9
+        engine
+            .write(&tid, &key, make_row(b"V3", 3_000_000_000), 3_000_000_000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Memtable: write at ts=1e9
+        engine
+            .write(&tid, &key, make_row(b"V1", 1_000_000_000), 1_000_000_000)
+            .unwrap();
+
+        // Read should return V7 (highest timestamp across all sources).
+        let result = engine.read(&tid, &key).unwrap().unwrap();
+        let cell_value = result.rows[0].cells[0].1.value.as_deref().unwrap();
+        assert_eq!(
+            cell_value,
+            b"V7",
+            "LWW across 3 SSTables + memtable: expected V7 (ts=7e9), got {:?}",
+            std::str::from_utf8(cell_value).unwrap_or("(not utf8)")
+        );
+    }
+
+    /// Concurrent writers + periodic flushes: reproduces the loadgen pattern.
+    /// 8 writer threads with different timestamp ranges write to 1000 keys.
+    /// A flush thread triggers flushes periodically. After all writers stop,
+    /// every key must have the value from the highest-timestamp write.
+    #[test]
+    fn concurrent_writers_with_flushes_preserve_lww() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            flush_threshold_bytes: 4096, // small to force frequent flushes
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        let num_writers = 4usize;
+        let key_space = 100usize;
+        let writes_per_worker = 500usize;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Track expected values: for each key, the highest-timestamp write.
+        // Using a simple mutex-protected map (same pattern as loadgen GT).
+        type ExpectedMap = std::collections::HashMap<String, (Vec<u8>, i64)>;
+        let expected: Arc<std::sync::Mutex<ExpectedMap>> =
+            Arc::new(std::sync::Mutex::new(ExpectedMap::new()));
+
+        // Spawn writer threads.
+        let mut handles = Vec::new();
+        for worker_id in 0..num_writers {
+            let engine = Arc::clone(&engine);
+            let tid = tid.clone();
+            let expected = Arc::clone(&expected);
+            handles.push(std::thread::spawn(move || {
+                let mut ts = (worker_id as i64) * 1_000_000_000;
+                let mut rng_state = worker_id as u64;
+                for i in 0..writes_per_worker {
+                    let key_idx = (worker_id * 31 + i * 7) % key_space;
+                    let key_str = format!("k{key_idx:06}");
+                    ts += 1;
+                    // Deterministic "random" value based on worker + iteration
+                    rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let val_len = 10 + (rng_state % 50) as usize;
+                    let value: Vec<u8> = (0..val_len)
+                        .map(|j| ((rng_state >> (j % 8)) & 0xFF) as u8)
+                        .collect();
+
+                    let key = make_key(&key_str);
+                    let row = make_row(&value, ts);
+                    engine.write(&tid, &key, row, ts).unwrap();
+
+                    // Track in expected map (LWW by timestamp).
+                    let mut map = expected.lock().unwrap();
+                    let entry = map.entry(key_str).or_insert_with(|| (Vec::new(), 0));
+                    if ts >= entry.1 {
+                        entry.0 = value;
+                        entry.1 = ts;
+                    }
+                }
+            }));
+        }
+
+        // Spawn flush thread.
+        let flush_engine = Arc::clone(&engine);
+        let flush_tid = tid.clone();
+        let flush_stop = Arc::clone(&stop);
+        let flush_handle = std::thread::spawn(move || {
+            let mut flush_count = 0u32;
+            while !flush_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                if flush_engine.flush(&flush_tid).is_ok() {
+                    flush_count += 1;
+                }
+            }
+            flush_count
+        });
+
+        // Wait for all writers.
+        for h in handles {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let flush_count = flush_handle.join().unwrap();
+
+        // Final flush to push remaining memtable data to SSTables.
+        engine.flush(&tid).ok();
+
+        // Verify: every key must have the highest-timestamp value.
+        let map = expected.lock().unwrap();
+        let mut mismatches = 0u32;
+        let mut missing = 0u32;
+        for (key_str, (expected_val, expected_ts)) in map.iter() {
+            let key = make_key(key_str);
+            match engine.read(&tid, &key).unwrap() {
+                Some(partition) => {
+                    if let Some(row) = partition.rows.first() {
+                        if let Some((_, cell)) = row.cells.first() {
+                            if let Some(got) = cell.value.as_deref() {
+                                if got != expected_val.as_slice() {
+                                    mismatches += 1;
+                                    if mismatches <= 3 {
+                                        eprintln!(
+                                            "MISMATCH {key_str}: expected {} bytes (ts={expected_ts}), \
+                                             got {} bytes (cell_ts={})",
+                                            expected_val.len(),
+                                            got.len(),
+                                            cell.timestamp
+                                        );
+                                    }
+                                }
+                            } else {
+                                missing += 1;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    missing += 1;
+                }
+            }
+        }
+
+        eprintln!(
+            "concurrent_writers_with_flushes: {} keys, {} mismatches, {} missing, {} flushes",
+            map.len(),
+            mismatches,
+            missing,
+            flush_count
+        );
+        assert_eq!(
+            mismatches, 0,
+            "LWW violated under concurrent writes + flushes: {mismatches} mismatches"
+        );
+        assert_eq!(missing, 0, "missing keys: {missing}");
     }
 
     /// Reproduce bug-large-write-causes-data-loss-in-partition:
@@ -8715,6 +9041,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tracing)]
     fn storage_engine_creates_spans() {
         use std::sync::atomic::AtomicU64;
 

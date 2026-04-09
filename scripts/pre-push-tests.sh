@@ -76,8 +76,7 @@ else
     set +e
     COV_OUTPUT=$(cargo llvm-cov $CARGO_ARGS --lib --summary-only \
       --ignore-filename-regex '(^|/)main\.rs$' \
-      -- --skip cassandra_reads_compacted --skip compaction_end_to_end \
-         --skip accord_coordinator_creates_spans 2>&1)
+      -- --skip cassandra_reads_compacted --skip compaction_end_to_end 2>&1)
     COV_RC=$?
     set -e
     echo "$COV_OUTPUT"
@@ -98,8 +97,7 @@ else
   else
     echo "=== Running cargo test$CARGO_ARGS ==="
     echo "(install cargo-llvm-cov for coverage: cargo install cargo-llvm-cov)"
-    cargo test $CARGO_ARGS --lib -- --skip cassandra_reads_compacted --skip compaction_end_to_end \
-      --skip accord_coordinator_creates_spans
+    cargo test $CARGO_ARGS --lib -- --skip cassandra_reads_compacted --skip compaction_end_to_end
   fi
 fi
 

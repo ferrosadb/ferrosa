@@ -79,6 +79,8 @@ pub enum MsgType {
     RepairWrite = 0x24,
     RangeReadRequest = 0x25,
     RangeReadResponse = 0x26,
+    TruncateForward = 0x27,
+    TruncateAck = 0x28,
     // Streaming (row-based)
     StreamStart = 0x30,
     StreamChunk = 0x31,
@@ -160,6 +162,8 @@ impl TryFrom<u8> for MsgType {
             0x24 => Ok(Self::RepairWrite),
             0x25 => Ok(Self::RangeReadRequest),
             0x26 => Ok(Self::RangeReadResponse),
+            0x27 => Ok(Self::TruncateForward),
+            0x28 => Ok(Self::TruncateAck),
             0x30 => Ok(Self::StreamStart),
             0x31 => Ok(Self::StreamChunk),
             0x32 => Ok(Self::StreamEnd),

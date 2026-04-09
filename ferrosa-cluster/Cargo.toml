@@ -30,5 +30,6 @@ uuid = { version = "1", features = ["v4"] }
 ferrosa-index = { path = "../ferrosa-index" }
 indexmap = "2"
 proptest = "1"
+serial_test = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

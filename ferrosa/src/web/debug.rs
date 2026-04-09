@@ -277,6 +277,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn flamechart_auth_accepts_valid_token() {
         // Safety: test-only env var manipulation.
         unsafe {
@@ -297,6 +298,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(env)]
     fn flamechart_auth_rejects_wrong_token() {
         unsafe {
             std::env::set_var("FERROSA_DEBUG_AUTH_TOKEN", "correct-token");

@@ -910,4 +910,296 @@ mod tests {
             "error must be ClusterError::Internal"
         );
     }
+
+    // -- apply_direct tests for remaining DDL operation variants -----------
+
+    #[tokio::test]
+    async fn direct_drop_keyspace_removes_from_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let engine = test_storage(dir.path());
+
+        let ddl = DdlPath::Direct {
+            schema: schema.clone(),
+            engine: engine.clone(),
+        };
+
+        // Create then drop.
+        ddl.execute(DdlOperation::CreateKeyspace(simple_keyspace("drop_ks")))
+            .await
+            .unwrap();
+        assert!(schema.snapshot().keyspaces.contains_key("drop_ks"));
+
+        ddl.execute(DdlOperation::DropKeyspace("drop_ks".into()))
+            .await
+            .unwrap();
+        assert!(!schema.snapshot().keyspaces.contains_key("drop_ks"));
+    }
+
+    #[tokio::test]
+    async fn direct_drop_table_removes_from_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let engine = test_storage(dir.path());
+
+        let ddl = DdlPath::Direct {
+            schema: schema.clone(),
+            engine: engine.clone(),
+        };
+
+        ddl.execute(DdlOperation::CreateKeyspace(simple_keyspace("dtks")))
+            .await
+            .unwrap();
+        let table = simple_table("dtks", "tbl");
+        ddl.execute(DdlOperation::CreateTable(Box::new(table)))
+            .await
+            .unwrap();
+        assert!(schema
+            .snapshot()
+            .tables
+            .contains_key(&("dtks".into(), "tbl".into())));
+
+        ddl.execute(DdlOperation::DropTable {
+            keyspace: "dtks".into(),
+            table: "tbl".into(),
+        })
+        .await
+        .unwrap();
+        assert!(!schema
+            .snapshot()
+            .tables
+            .contains_key(&("dtks".into(), "tbl".into())));
+    }
+
+    #[tokio::test]
+    async fn direct_alter_keyspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let engine = test_storage(dir.path());
+
+        let ddl = DdlPath::Direct {
+            schema: schema.clone(),
+            engine,
+        };
+
+        ddl.execute(DdlOperation::CreateKeyspace(simple_keyspace("alks")))
+            .await
+            .unwrap();
+
+        let updates = ferrosa_schema::KeyspaceUpdates {
+            durable_writes: Some(false),
+            replication: None,
+        };
+        ddl.execute(DdlOperation::AlterKeyspace {
+            name: "alks".into(),
+            updates,
+        })
+        .await
+        .unwrap();
+
+        let snap = schema.snapshot();
+        let ks = snap.keyspaces.get("alks").unwrap();
+        assert!(
+            !ks.durable_writes,
+            "durable_writes should be false after alter"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_create_and_drop_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let engine = test_storage(dir.path());
+
+        let ddl = DdlPath::Direct {
+            schema: schema.clone(),
+            engine,
+        };
+
+        let role = ferrosa_schema::RoleMetadata {
+            name: "test_role".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: HashSet::new(),
+        };
+        ddl.execute(DdlOperation::CreateRole(role)).await.unwrap();
+        assert!(schema.snapshot().roles.contains_key("test_role"));
+
+        ddl.execute(DdlOperation::DropRole("test_role".into()))
+            .await
+            .unwrap();
+        assert!(!schema.snapshot().roles.contains_key("test_role"));
+    }
+
+    #[tokio::test]
+    async fn direct_alter_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let engine = test_storage(dir.path());
+
+        let ddl = DdlPath::Direct {
+            schema: schema.clone(),
+            engine,
+        };
+
+        let role = ferrosa_schema::RoleMetadata {
+            name: "ar_role".to_string(),
+            is_superuser: false,
+            can_login: false,
+            salted_hash: None,
+            member_of: HashSet::new(),
+        };
+        ddl.execute(DdlOperation::CreateRole(role)).await.unwrap();
+
+        let updates = ferrosa_schema::RoleUpdates {
+            is_superuser: None,
+            can_login: Some(true),
+            password: None,
+            member_of: None,
+        };
+        ddl.execute(DdlOperation::AlterRole {
+            name: "ar_role".into(),
+            updates,
+        })
+        .await
+        .unwrap();
+
+        let snap = schema.snapshot();
+        let role = snap.roles.get("ar_role").unwrap();
+        assert!(role.can_login, "role should have login enabled after alter");
+    }
+
+    // -- ddl_op_to_raft_command for remaining variants --------------------
+
+    #[test]
+    fn ddl_op_to_raft_command_alter_keyspace() {
+        let updates = ferrosa_schema::KeyspaceUpdates {
+            durable_writes: Some(false),
+            replication: None,
+        };
+        let op = DdlOperation::AlterKeyspace {
+            name: "ks".into(),
+            updates,
+        };
+        let cmd = ddl_op_to_raft_command(op);
+        assert!(matches!(cmd.op, RaftOp::AlterKeyspace { ref name, .. } if name == "ks"));
+    }
+
+    #[test]
+    fn ddl_op_to_raft_command_alter_table() {
+        let updates = Box::new(ferrosa_schema::TableUpdates {
+            params: None,
+            add_columns: vec![],
+            drop_columns: vec![],
+            extensions: None,
+        });
+        let op = DdlOperation::AlterTable {
+            keyspace: "ks".into(),
+            table: "tbl".into(),
+            updates,
+        };
+        let cmd = ddl_op_to_raft_command(op);
+        assert!(matches!(
+            cmd.op,
+            RaftOp::AlterTable { ref keyspace, ref table, .. }
+            if keyspace == "ks" && table == "tbl"
+        ));
+    }
+
+    #[test]
+    fn ddl_op_to_raft_command_create_role() {
+        let role = ferrosa_schema::RoleMetadata {
+            name: "role1".to_string(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: HashSet::new(),
+        };
+        let op = DdlOperation::CreateRole(role);
+        let cmd = ddl_op_to_raft_command(op);
+        assert!(matches!(cmd.op, RaftOp::CreateRole(ref r) if r.name == "role1"));
+    }
+
+    #[test]
+    fn ddl_op_to_raft_command_drop_role() {
+        let op = DdlOperation::DropRole("role1".into());
+        let cmd = ddl_op_to_raft_command(op);
+        assert!(matches!(cmd.op, RaftOp::DropRole(ref n) if n == "role1"));
+    }
+
+    #[test]
+    fn ddl_op_to_raft_command_create_index() {
+        let idx = ferrosa_schema::IndexMetadata {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            name: "idx1".to_string(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: vec!["col".to_string()],
+            filter_predicate: None,
+            options: HashMap::new(),
+        };
+        let op = DdlOperation::CreateIndex(idx);
+        let cmd = ddl_op_to_raft_command(op);
+        assert!(matches!(cmd.op, RaftOp::CreateIndex(ref i) if i.name == "idx1"));
+    }
+
+    #[test]
+    fn ddl_op_to_raft_command_drop_index() {
+        let op = DdlOperation::DropIndex {
+            keyspace: "ks".into(),
+            table: "tbl".into(),
+            index: "idx1".into(),
+        };
+        let cmd = ddl_op_to_raft_command(op);
+        assert!(matches!(
+            cmd.op,
+            RaftOp::DropIndex { ref keyspace, ref table, ref index }
+            if keyspace == "ks" && table == "tbl" && index == "idx1"
+        ));
+    }
+
+    #[test]
+    fn ddl_op_to_raft_command_grant() {
+        use ferrosa_schema::{GrantEntry, Permission, Resource};
+        let entry = GrantEntry {
+            role: "user1".to_string(),
+            resource: Resource::AllKeyspaces,
+            permissions: std::iter::once(Permission::Select).collect(),
+        };
+        let op = DdlOperation::Grant(entry);
+        let cmd = ddl_op_to_raft_command(op);
+        assert!(matches!(cmd.op, RaftOp::Grant(ref e) if e.role == "user1"));
+    }
+
+    #[test]
+    fn ddl_op_to_raft_command_revoke() {
+        use ferrosa_schema::{Permission, Resource};
+        let op = DdlOperation::Revoke {
+            role: "user1".to_string(),
+            resource: Resource::AllKeyspaces,
+            permission: Permission::Select,
+        };
+        let cmd = ddl_op_to_raft_command(op);
+        assert!(matches!(
+            cmd.op,
+            RaftOp::Revoke { ref role, .. } if role == "user1"
+        ));
+    }
+
+    #[test]
+    fn ddl_op_to_raft_command_alter_role() {
+        let updates = ferrosa_schema::RoleUpdates {
+            is_superuser: Some(true),
+            can_login: None,
+            password: None,
+            member_of: None,
+        };
+        let op = DdlOperation::AlterRole {
+            name: "r1".into(),
+            updates,
+        };
+        let cmd = ddl_op_to_raft_command(op);
+        assert!(matches!(cmd.op, RaftOp::AlterRole { ref name, .. } if name == "r1"));
+    }
 }

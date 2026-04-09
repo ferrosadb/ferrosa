@@ -114,6 +114,7 @@ pub async fn handle_connection<S>(
     let mut subscription_state = SubscriptionState::new(8);
     let mut pending_compression: Option<Compression> = None;
     let mut client_protocol_version: u8 = 4; // default; updated from STARTUP frame
+    let mut client_use_beta: bool = false; // USE_BETA flag (0x10) in STARTUP
 
     // Channel for subscription tasks to push streaming frames.
     let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<crate::subscribe::SubscriptionPush>(64);
@@ -215,9 +216,11 @@ pub async fn handle_connection<S>(
                     None
                 };
 
-                // Track the client's protocol version from the first frame.
+                // Track the client's protocol version and USE_BETA flag
+                // from the STARTUP frame.
                 if matches!(phase, ConnectionPhase::AwaitingStartup) {
                     client_protocol_version = maybe_frame.header.version;
+                    client_use_beta = maybe_frame.header.flags & 0x10 != 0;
                 }
                 let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);
                 let was_ready = matches!(phase, ConnectionPhase::Ready);
@@ -291,9 +294,14 @@ pub async fn handle_connection<S>(
                                 );
                                 framed.codec_mut().set_compression(compression);
                             }
-                            // CQL v5 switches to framed mode (CRC24/CRC32) after READY.
-                            if client_protocol_version >= 0x05 {
-                                debug!("enabling v5 framing for {peer}");
+                            // CQL v5 framing (CRC24/CRC32 envelopes) is only
+                            // enabled when the client sets USE_BETA (0x10) in
+                            // the STARTUP flags, matching Cassandra's behavior.
+                            // Clients that negotiate v5 without USE_BETA (e.g.,
+                            // Python cassandra-driver) use v5 semantics over
+                            // v4 unframed transport.
+                            if client_protocol_version >= 0x05 && client_use_beta {
+                                debug!("enabling v5 framing for {peer} (USE_BETA set)");
                                 framed.codec_mut().enable_v5_framing();
                             }
                         }

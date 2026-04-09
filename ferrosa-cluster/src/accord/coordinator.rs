@@ -997,6 +997,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tracing)]
     fn accord_coordinator_creates_spans() {
         use std::sync::atomic::AtomicU64;
         use std::sync::Arc;

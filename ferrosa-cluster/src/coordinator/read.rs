@@ -2051,4 +2051,179 @@ mod tests {
             "should return the one written partition"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: empty ring range read
+    // -----------------------------------------------------------------------
+
+    /// Range read on an empty ring returns an error (no nodes at all).
+    #[tokio::test]
+    async fn coordinate_range_read_empty_ring_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+
+        let coordinator = make_coordinator(
+            TokenRing::new(),
+            noop_peer_manager(),
+            1u64,
+            storage,
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let result = coordinator.coordinate_range_read(&table_id).await;
+        // Empty ring means no nodes to contact at all, should return Ok([])
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional coverage: CL=ALL with 1 node
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn coordinate_read_cl_all_single_node_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::All,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        storage
+            .write(&table_id, &key, test_row(1000), 1000)
+            .unwrap();
+
+        let result = coordinator.coordinate_read(&table_id, &key).await;
+        assert!(result.is_ok(), "CL=ALL with 1 node should succeed");
+        assert!(result.unwrap().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // NTS: LOCAL_ONE CL
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn coordinate_read_nts_local_one_succeeds_with_single_dc_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut local_info = make_node("10.0.0.1:7000");
+        local_info.data_center = "dc1".to_string();
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local_info);
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::LocalOne,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        storage
+            .write(&table_id, &key, test_row(1000), 1000)
+            .unwrap();
+
+        let dc_rf = std::collections::HashMap::from([("dc1".to_string(), 1usize)]);
+        let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology { dc_rf };
+
+        let result = coordinator
+            .coordinate_read_nts(&table_id, &key, ConsistencyLevel::LocalOne, &strategy)
+            .await;
+        assert!(
+            result.is_ok(),
+            "LOCAL_ONE should succeed: {:?}",
+            result.err()
+        );
+        assert!(result.unwrap().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // NTS: regular CL with NetworkTopology strategy
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn coordinate_read_nts_quorum_with_nts_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut local_info = make_node("10.0.0.1:7000");
+        local_info.data_center = "dc1".to_string();
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local_info);
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(ring)),
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        storage
+            .write(&table_id, &key, test_row(1000), 1000)
+            .unwrap();
+
+        // Use CL=ONE (non-LOCAL) with NTS strategy -- takes the regular path
+        let dc_rf = std::collections::HashMap::from([("dc1".to_string(), 1usize)]);
+        let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology { dc_rf };
+
+        let result = coordinator
+            .coordinate_read_nts(&table_id, &key, ConsistencyLevel::One, &strategy)
+            .await;
+        assert!(
+            result.is_ok(),
+            "CL=ONE with NTS should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // select_index_ready_replicas: all-ready
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn select_index_ready_replicas_all_ready() {
+        let mut index_state_map: BTreeMap<
+            (String, String, String),
+            BTreeMap<u64, IndexNodeStatus>,
+        > = BTreeMap::new();
+        let mut node_statuses = BTreeMap::new();
+        node_statuses.insert(1u64, IndexNodeStatus::Ready);
+        node_statuses.insert(2u64, IndexNodeStatus::Ready);
+        index_state_map.insert(("ks".into(), "tbl".into(), "idx".into()), node_statuses);
+
+        let replicas = vec![1u64, 2];
+        let result = select_index_ready_replicas(&replicas, "ks", "tbl", "idx", &index_state_map);
+        assert_eq!(result, vec![1, 2], "all ready means same order");
+    }
 }

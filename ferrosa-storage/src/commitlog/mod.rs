@@ -1041,6 +1041,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tracing)]
     fn commitlog_write_span_is_created() {
         // Verify that the commitlog.write and commitlog.sync spans are
         // created during append by using a tracing subscriber that records
