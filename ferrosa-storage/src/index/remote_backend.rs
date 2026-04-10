@@ -5,7 +5,7 @@
 //! includes per-endpoint circuit breakers and a [`LocalBackend`] fallback.
 //!
 //! [`IndexBackendConfig`] is the engine-level enum that controls which
-//! backend the [`IndexBuildScheduler`] uses (or disables it entirely).
+//! backend the [`super::IndexBuildScheduler`] uses (or disables it entirely).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
