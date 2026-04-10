@@ -17,6 +17,7 @@ members = [
     "ferrosa-jepsen",
     "ferrosa-loadgen",
     "ferrosa-sparql",
+    "ferrosa-index-builder",
 ]
 
 [patch.crates-io]

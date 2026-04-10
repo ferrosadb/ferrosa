@@ -173,6 +173,7 @@ fn main() {
         flush_threshold_bytes: profile.flush_threshold_bytes,
         flush_max_age_secs: 30,
         data_dir: args.data_dir.clone(),
+        index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
     };
 
     if !args.tui {

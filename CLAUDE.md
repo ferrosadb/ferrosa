@@ -1,124 +1,103 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code working in this repository.
 
 ## Project Overview
 
-Ferrosa is a Rust reimplementation of Apache Cassandra with S3-backed storage. The repository has two tracks:
+Ferrosa is a Rust reimplementation of Apache Cassandra with S3-backed storage. All 13 core crates are complete. Current work focuses on correctness sprints, cluster formation, UCS compaction, and the remote index builder.
 
-- **Rust workspace** (primary): Independent crates that compose into a distributed database
-- **Cassandra submodule** (`cassandra/`): Apache Cassandra 5.1 source as a behavioral reference/oracle for Track 1 analysis
-
-See `superpowers/specs/2026-03-11-ferrosa-architecture-design.md` for the full architecture spec.
-
-## Rust Workspace (Track 2 — Primary)
-
-Cargo workspace with these crates (in build order):
+## Workspace
 
 | Crate | Purpose |
 |-------|---------|
-| `ferrosa-common` | Shared types: Token, PartitionKey, DecoratedKey, CellValue |
+| `ferrosa` | Main binary: CQL 9042, graph HTTP 7474, Bolt 7687, web 9090, Prometheus |
+| `ferrosa-common` | Shared types: Token, PartitionKey, DecoratedKey, CellValue, Accord HLC/TxnId |
 | `ferrosa-sstable` | Read Cassandra Big+BTI SSTables, write BTI format |
-| `ferrosa-storage` | Memtable, commit log, compaction, S3 write-behind, cache |
-| `ferrosa-schema` | Table/keyspace definitions, system keyspaces, schema evolution |
-| `ferrosa-cql` | CQL native protocol v5, query parsing/execution |
-| `ferrosa-net` | Custom internode protocol, TLS, connection management |
-| `ferrosa-cluster` | Raft metadata, tunable CL, routing, repair, hinted handoff |
-| `ferrosa` | Binary — composes all crates into the running database |
+| `ferrosa-storage` | Memtable, commit log, compaction, S3 write-behind, cache, NVMe pinning, index pipeline |
+| `ferrosa-schema` | Table/keyspace definitions, system keyspaces, DDL, auth, audit, UDT, virtual tables |
+| `ferrosa-cql` | CQL native protocol v5, query parsing/execution, LWT, transactions, pagination |
+| `ferrosa-index` | BTree, Hash, Composite, Phonetic, Filtered, Vector HNSW/IVFFlat, FullText |
+| `ferrosa-net` | Custom internode protocol, TLS, connection management, graceful drain |
+| `ferrosa-cluster` | Raft metadata (openraft), tunable CL, routing, repair, hinted handoff, Accord |
+| `ferrosa-graph` | Property graph: eval, aggregations, var-length paths, SUBSCRIBE, Bolt v5, HTTP |
+| `ferrosa-udf` | User-defined functions: parser, Wasmtime compilation, DDL replication |
+| `ferrosa-worker` | Background task management |
+| `ferrosa-sparql` | SPARQL 1.1 query endpoint |
+| `ferrosa-ctl` | CLI + TUI: cluster management, snapshot/restore |
+| `ferrosa-jepsen` | Distributed testing framework (Firecracker-based) |
+| `ferrosa-loadgen` | Load testing: UCS compaction stress, integrity checks |
+| `ferrosa-index-builder` | Standalone index builder: offloads secondary index construction from engine |
 
 ```bash
-# Build
-cargo build
-
-# Test
-cargo test                           # All crates
-cargo test -p ferrosa-sstable        # Single crate
-
-# Lint
-cargo clippy --all-targets
-cargo fmt --check
+cargo build                          # Build all
+cargo test                           # Test all
+cargo test -p ferrosa-storage        # Single crate
+cargo clippy --all-targets           # Lint (warnings are errors in CI)
+cargo fmt --check                    # Format check
 ```
 
-## Cassandra Submodule (Track 1 — Analysis Reference)
+## Directory Layout
 
-The `cassandra/` directory is a git submodule of Apache Cassandra (`git@github.com:apache/cassandra.git`). It exists for:
-
-- DSM (Dependency Structure Matrix) analysis
-- Behavioral characterization
-- SSTable format reverse engineering
-- CQL protocol documentation
-
-Commands run from `cassandra/`:
-
-```bash
-cd cassandra
-ant build                    # Compile
-ant test                     # Unit tests
-ant testsome -Dtest.name=MyTest  # Single test
-ant check                    # Code checks
-```
-
-### Cassandra Architecture Reference
-
-Source under `cassandra/src/java/org/apache/cassandra/`:
-
-| Package | Purpose |
-|---------|---------|
-| `cql3/` | CQL query language |
-| `db/` | Storage engine, memtable, compaction |
-| `io/sstable/` | SSTable formats (Big + BTI) |
-| `gms/` | Gossip protocol |
-| `service/` | StorageService, StorageProxy |
-| `service/accord/` | Accord consensus (5.x) |
-| `tcm/` | Cluster metadata service |
-| `db/commitlog/` | Commit log |
-| `cache/` | Row, key, chunk caches |
-| `repair/` | Anti-entropy repair |
-
-### Checkstyle Rules (Cassandra)
-
-- **Clock**: Use `Clock.Global`, not `System.currentTimeMillis()`
-- **Executors**: Use `ExecutorFactory.Global`, not `java.util.concurrent.Executors`
-- Suppress with: `// checkstyle: permit this import`
-
-## Directory Layout Rules
-
-- **`docs/`** — PUBLIC marketing site served via GitHub Pages (ferrosadb.com). Contains only HTML, CSS, SVG, and `CNAME`. **NEVER put internal specs, plans, rustdoc output, or non-public content here.** Changes to `docs/` trigger the Pages deployment workflow.
-- **`superpowers/`** — Internal specs (`superpowers/specs/`) and implementation plans (`superpowers/plans/`). Not publicly served.
-- **`specs/`** — Architecture specs, threat models, status docs. Not publicly served.
-- **`.github/workflows/docs.yml`** — Deploys `docs/` to GitHub Pages. Must ONLY deploy from `docs/`. Never deploy rustdoc (`target/doc/`) or any generated content to Pages.
-
-## Test Policy — Non-Negotiable Rules for All Agents
-
-These rules apply to every agent working in this repository. They cannot be overridden by task instructions.
-
-- **No `#[ignore]`** — Never add `#[ignore]` to a test. There are zero legitimately ignored tests in this codebase.
-- **No silent returns** — Never write `if condition { return; }` in a test body to make a test appear to pass when it didn't run. A test that returns early shows as `ok` but ran nothing. This is forbidden.
-- **Panic on missing infrastructure** — If a test requires infrastructure (Firecracker, Podman/Docker, cluster nodes), it must `panic!` with a clear message explaining what to set up. Example:
-  ```rust
-  if std::env::var("FERROSA_TEST_FIRECRACKER").is_err() {
-      panic!("FERROSA_TEST_FIRECRACKER not set — run scripts/lima-fc-setup.sh first");
-  }
-  ```
-- **Infrastructure env vars**:
-  - `FERROSA_TEST_FIRECRACKER=1` — Firecracker VMs, SSH, cluster provisioning tests
-  - `FERROSA_TEST_CLUSTER_NODES=<addr>` — pre-provisioned cluster
-  - `FERROSA_TEST_CONTAINERS=1` — Docker/Podman compose cluster (MinIO + Cassandra compat tests)
-- **Container runtime** — Use `container_runtime()` helper (auto-detects `docker` or `podman`) not hardcoded `"docker"`. macOS uses Podman Desktop.
-- **Goal: `cargo test` with full infrastructure = zero failures, zero ignored.** Without infrastructure, tests fail loudly with setup instructions.
+- **`docs/`** — PUBLIC marketing site (ferrosadb.com) via GitHub Pages. HTML/CSS/SVG only. **Never put specs, rustdoc, or internal content here.**
+- **`specs/`** — Architecture specs, threat models, active project plans. See [specs/README.md](specs/README.md).
+- **`specs/todo/`** — Work items awaiting implementation (bugs + features).
+- **`specs/in-process/`** — Active work items.
+- **`specs/archive/`** — Completed plans, fixed bugs, historical analysis.
+- **`specs/decisions/`** — Architecture Decision Records (ADRs).
+- **`cassandra/`** — Git submodule of Apache Cassandra 5.1 (behavioral reference only).
 
 ## Key Design Decisions
 
 - **Storage**: Write-behind async S3 — local ephemeral disk as cache, S3 as durable store
 - **SSTable**: Read Big+BTI, write BTI, future native format behind feature flag
 - **Protocol**: CQL client compatible, own internode protocol (not Cassandra wire compat)
-- **Consensus**: Raft for metadata (openraft), Accord for strict-serializable transactions (all writes routed through Accord)
-- **Transactions**: See [specs/accord-project-plan.md](specs/accord-project-plan.md) for the Accord implementation plan (7 sprints, 4 phases)
+- **Consensus**: Raft for metadata (openraft), Accord for strict-serializable transactions
+- **Index Build**: Configurable via `FERROSA_INDEX_BACKEND` — `local` (in-process), `remote` (HTTP to ferrosa-index-builder), `off` (external builder only)
 - **Partitioner**: Murmur3Partitioner (Cassandra compatible)
 - **Target**: AWS-first, flag any lock-in for S3-compatible portability
 
-## Current Sprint Focus
+## Current Focus
 
-See [specs/project-plan-next-sprints.md](specs/project-plan-next-sprints.md) for the active sprint plan: 4 sprints covering P0/P1 hazard fixes, NTS read path, correctness gaps (read fallback, hints, streaming), formation robustness, anti-entropy repair, and Jepsen/driver validation. Start here before taking on new work.
+See [specs/project-plan-next-sprints.md](specs/project-plan-next-sprints.md) for the active sprint plan (S1-S4).
 
-Previous: [specs/project-plan-correctness-sprints.md](specs/project-plan-correctness-sprints.md) (C1-C7 complete, C4/C8 remaining — folded into S4).
+Active work areas:
+- **Cluster formation**: state machine, formation protocol ([specs/cluster-formation-architecture.md](specs/cluster-formation-architecture.md))
+- **UCS compaction**: unified compaction strategy ([specs/ucs-compaction-architecture.md](specs/ucs-compaction-architecture.md))
+- **Remote index builder**: standalone binary, engine backend modes ([specs/remote-index-build-backend.md](specs/remote-index-build-backend.md))
+- **Correctness**: 5 bugs in [specs/in-process/](specs/in-process/), C4/C8 sprints remaining
+
+## Development Process
+
+### Use `/tdd` for all implementation work
+
+Every new feature and bug fix must follow the `/tdd` skill (red-green-refactor). Write the failing test first, make it pass, then refactor. No code lands without a test that exercises it.
+
+### Use Rust skills and knowledge
+
+Always apply Rust idioms and best practices. Use the language's type system to prevent bugs at compile time. Prefer `Result` over panics, ownership over reference counting, iterators over manual loops, and exhaustive matches over wildcards.
+
+### Hygiene checklist (every change)
+
+1. `cargo fmt` — format before anything else
+2. `cargo clippy --all-targets` — zero warnings, no suppressions without justification
+3. `cargo test -p <crate>` — affected crate tests pass
+4. `cargo build --all-targets` — full workspace compiles clean
+5. Feature branch — never commit to main directly
+
+### CI must pass before pushing
+
+Agents MUST verify that all CI checks will pass locally before pushing to a remote branch or creating a PR. This means running `cargo fmt --check`, `cargo clippy --all-targets`, and `cargo test` across the full workspace — not just the crate you touched. A CI failure that could have been caught locally is a wasted round-trip. Do not push and hope.
+
+## Test Policy
+
+Non-negotiable rules for all agents:
+
+- **No `#[ignore]`** — Zero legitimately ignored tests in this codebase.
+- **No silent returns** — Never `if condition { return; }` in a test body.
+- **Panic on missing infrastructure** — Tests requiring Firecracker/Docker/cluster must `panic!` with setup instructions.
+- **Infrastructure env vars**:
+  - `FERROSA_TEST_FIRECRACKER=1` — Firecracker VMs
+  - `FERROSA_TEST_CLUSTER_NODES=<addr>` — pre-provisioned cluster
+  - `FERROSA_TEST_CONTAINERS=1` — Docker/Podman compose (MinIO + Cassandra compat)
+- **Container runtime** — Use `container_runtime()` helper, not hardcoded `"docker"`.
+- **Goal**: `cargo test` with full infrastructure = zero failures, zero ignored.
