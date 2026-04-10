@@ -81,6 +81,10 @@ pub struct IndexBuildResult {
         HashMap<String, Vec<(ferrosa_index::IndexKey, ferrosa_index::RowPosition)>>,
     /// How long the build took.
     pub build_duration: std::time::Duration,
+    /// If true, sidecar files were already written to S3 by the backend
+    /// (e.g. `RemoteBackend`). The scheduler should skip local
+    /// `SidecarWriter::write()`.
+    pub sidecar_written_to_s3: bool,
 }
 
 /// Default backend that builds indexes in-process from local SSTable files.
@@ -170,6 +174,7 @@ impl IndexBuildBackend for LocalBackend {
             sstable_id: job.sstable_id.clone(),
             sidecar_entries,
             build_duration: start.elapsed(),
+            sidecar_written_to_s3: false,
         })
     }
 }
@@ -207,6 +212,7 @@ impl IndexBuildScheduler {
                     sstable_id: job.sstable_id.clone(),
                     sidecar_entries: HashMap::new(),
                     build_duration: std::time::Duration::from_millis(0),
+                    sidecar_written_to_s3: false,
                 })
             }
         }
@@ -463,18 +469,21 @@ impl IndexBuildScheduler {
                     let (keyspace, table) = &job.table;
                     match backend.build(&job) {
                         Ok(result) => {
-                            // Write sidecar files.
-                            for (index_name, entries) in &result.sidecar_entries {
-                                if entries.is_empty() {
-                                    continue;
-                                }
-                                let path = data_dir
-                                    .join(format!("{}-{}.sidecar", job.sstable_id, index_name));
-                                if let Err(e) = SidecarWriter::write(&path, entries) {
-                                    eprintln!(
-                                        "[index-build] failed to write sidecar {}: {e}",
-                                        path.display()
-                                    );
+                            // Write sidecar files locally unless the backend
+                            // already wrote them to S3 (e.g. RemoteBackend).
+                            if !result.sidecar_written_to_s3 {
+                                for (index_name, entries) in &result.sidecar_entries {
+                                    if entries.is_empty() {
+                                        continue;
+                                    }
+                                    let path = data_dir
+                                        .join(format!("{}-{}.sidecar", job.sstable_id, index_name));
+                                    if let Err(e) = SidecarWriter::write(&path, entries) {
+                                        eprintln!(
+                                            "[index-build] failed to write sidecar {}: {e}",
+                                            path.display()
+                                        );
+                                    }
                                 }
                             }
                             tracker.mark_indexed(keyspace, table, &job.index_name, &job.sstable_id);
@@ -606,6 +615,7 @@ mod tests {
             sstable_id: "sst-001".to_string(),
             sidecar_entries,
             build_duration: Duration::from_millis(42),
+            sidecar_written_to_s3: false,
         };
 
         assert_eq!(result.sstable_id, "sst-001");
@@ -624,6 +634,7 @@ mod tests {
                     sstable_id: "mock".to_string(),
                     sidecar_entries: std::collections::HashMap::new(),
                     build_duration: Duration::from_millis(0),
+                    sidecar_written_to_s3: false,
                 })
             }
         }
@@ -811,6 +822,7 @@ mod tests {
                     sstable_id: job.sstable_id.clone(),
                     sidecar_entries: std::collections::HashMap::new(),
                     build_duration: Duration::from_millis(1),
+                    sidecar_written_to_s3: false,
                 })
             }
         }
@@ -900,6 +912,7 @@ mod tests {
                     sstable_id: job.sstable_id.clone(),
                     sidecar_entries: HashMap::new(),
                     build_duration: Duration::from_millis(200),
+                    sidecar_written_to_s3: false,
                 })
             }
         }
@@ -943,6 +956,7 @@ mod tests {
                     sstable_id: job.sstable_id.clone(),
                     sidecar_entries: HashMap::new(),
                     build_duration: Duration::from_secs(30),
+                    sidecar_written_to_s3: false,
                 })
             }
         }
@@ -1000,6 +1014,7 @@ mod tests {
                     sstable_id: job.sstable_id.clone(),
                     sidecar_entries,
                     build_duration: Duration::from_millis(1),
+                    sidecar_written_to_s3: false,
                 })
             }
         }

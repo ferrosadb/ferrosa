@@ -65,6 +65,11 @@ pub struct StorageEngineConfig {
     /// tables from data loss on restart. Default: 30 seconds.
     pub flush_max_age_secs: u64,
     pub data_dir: PathBuf,
+    /// Controls how secondary index builds are handled.
+    /// - `Local`: in-process (default)
+    /// - `Remote`: delegate to external `ferrosa-index-builder`
+    /// - `Off`: disable index building entirely
+    pub index_backend: crate::index::IndexBackendConfig,
 }
 
 impl StorageEngineConfig {
@@ -107,6 +112,7 @@ impl StorageEngineConfig {
             flush_threshold_bytes,
             flush_max_age_secs,
             data_dir,
+            index_backend: crate::index::IndexBackendConfig::from_env(),
         })
     }
 
@@ -121,8 +127,76 @@ impl StorageEngineConfig {
             flush_threshold_bytes: 4096,        // 4 KB — triggers flush quickly in tests
             flush_max_age_secs: 5,              // 5s — fast age-based flush in tests
             data_dir: dir.to_path_buf(),
+            index_backend: crate::index::IndexBackendConfig::Local,
         }
     }
+}
+
+/// Build the index scheduler and tracker based on the engine configuration.
+///
+/// Returns `(Option<IndexBuildScheduler>, Arc<IndexStateTracker>)`.
+/// When `index_backend` is `Off`, the scheduler is `None` and no worker
+/// threads are spawned.
+fn build_index_scheduler(
+    config: &StorageEngineConfig,
+) -> (
+    Option<crate::index::IndexBuildScheduler>,
+    Arc<crate::index::IndexStateTracker>,
+) {
+    let tracker = Arc::new(crate::index::IndexStateTracker::new());
+
+    let scheduler = match &config.index_backend {
+        crate::index::IndexBackendConfig::Off => None,
+        crate::index::IndexBackendConfig::Local => {
+            let backend = Arc::new(crate::index::LocalBackend::new(config.data_dir.clone()));
+            Some(
+                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
+                    2,
+                    Arc::clone(&tracker),
+                    backend,
+                    config.data_dir.clone(),
+                ),
+            )
+        }
+        crate::index::IndexBackendConfig::Remote {
+            endpoints,
+            timeout,
+            max_retries,
+            circuit_breaker_threshold,
+            circuit_breaker_recovery,
+        } => {
+            let s3_resolver = config
+                .object_store
+                .as_ref()
+                .map(crate::index::S3PathResolver::from_object_store_config)
+                .unwrap_or_else(|| crate::index::S3PathResolver {
+                    bucket: String::new(),
+                    endpoint: String::new(),
+                    prefix: String::new(),
+                });
+
+            let local_fallback = crate::index::LocalBackend::new(config.data_dir.clone());
+            let backend = Arc::new(crate::index::RemoteBackend::new(
+                endpoints.clone(),
+                s3_resolver,
+                *timeout,
+                *max_retries,
+                *circuit_breaker_threshold,
+                *circuit_breaker_recovery,
+                local_fallback,
+            ));
+            Some(
+                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
+                    2,
+                    Arc::clone(&tracker),
+                    backend,
+                    config.data_dir.clone(),
+                ),
+            )
+        }
+    };
+
+    (scheduler, tracker)
 }
 
 /// Top-level storage engine.
@@ -237,18 +311,7 @@ impl StorageEngine {
         let local_cache =
             LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
 
-        let index_tracker = Arc::new(crate::index::IndexStateTracker::new());
-        let index_scheduler = {
-            let backend = Arc::new(crate::index::LocalBackend::new(config.data_dir.clone()));
-            Some(
-                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
-                    2,
-                    Arc::clone(&index_tracker),
-                    backend,
-                    config.data_dir.clone(),
-                ),
-            )
-        };
+        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
 
         let engine = Self {
             config,
@@ -391,18 +454,7 @@ impl StorageEngine {
             _ => None,
         };
 
-        let index_tracker = Arc::new(crate::index::IndexStateTracker::new());
-        let index_scheduler = {
-            let backend = Arc::new(crate::index::LocalBackend::new(config.data_dir.clone()));
-            Some(
-                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
-                    2,
-                    Arc::clone(&index_tracker),
-                    backend,
-                    config.data_dir.clone(),
-                ),
-            )
-        };
+        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
 
         Ok(Self {
             config,
@@ -466,18 +518,7 @@ impl StorageEngine {
         let local_cache =
             LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
 
-        let index_tracker = Arc::new(crate::index::IndexStateTracker::new());
-        let index_scheduler = {
-            let backend = Arc::new(crate::index::LocalBackend::new(config.data_dir.clone()));
-            Some(
-                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
-                    2,
-                    Arc::clone(&index_tracker),
-                    backend,
-                    config.data_dir.clone(),
-                ),
-            )
-        };
+        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
 
         let engine = Self {
             config,
@@ -2932,18 +2973,7 @@ impl StorageEngine {
         let local_cache =
             LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
 
-        let index_tracker = Arc::new(crate::index::IndexStateTracker::new());
-        let index_scheduler = {
-            let backend = Arc::new(crate::index::LocalBackend::new(config.data_dir.clone()));
-            Some(
-                crate::index::IndexBuildScheduler::with_backend_and_data_dir(
-                    2,
-                    Arc::clone(&index_tracker),
-                    backend,
-                    config.data_dir.clone(),
-                ),
-            )
-        };
+        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
 
         Ok(Self {
             config,

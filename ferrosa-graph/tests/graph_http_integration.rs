@@ -51,6 +51,7 @@ fn setup() -> (Arc<Schema>, Arc<StorageEngine>, TempDir) {
         flush_threshold_bytes: 4096,
         flush_max_age_secs: 5,
         data_dir: dir.path().to_path_buf(),
+        index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
     };
     let storage = Arc::new(StorageEngine::new(config, None).unwrap());
     let schema = Arc::new(

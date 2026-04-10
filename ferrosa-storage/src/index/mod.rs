@@ -6,11 +6,13 @@
 //! background worker threads following the same channel-based pattern as
 //! `CompactionExecutor`.
 
+pub mod remote_backend;
 pub mod scheduler;
 pub mod sidecar;
 pub mod tracker;
 pub mod virtual_table;
 
+pub use remote_backend::{IndexBackendConfig, RemoteBackend, S3PathResolver};
 pub use scheduler::{
     BuildPriority, IndexBuildBackend, IndexBuildJob, IndexBuildResult, IndexBuildScheduler,
     LocalBackend,

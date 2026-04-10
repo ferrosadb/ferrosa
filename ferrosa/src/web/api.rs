@@ -450,6 +450,7 @@ mod tests {
             flush_threshold_bytes: 4096,
             flush_max_age_secs: 5,
             data_dir: dir.path().to_path_buf(),
+            index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
         };
         let storage = Arc::new(StorageEngine::new(storage_config, None).expect("storage engine"));
         let registry = Arc::new(HandlerRegistry::new());
@@ -914,6 +915,7 @@ mod tests {
                 flush_threshold_bytes: 4096,
                 flush_max_age_secs: 5,
                 data_dir: dir.path().to_path_buf(),
+                index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
             };
             let storage = Arc::new(
                 ferrosa_storage::StorageEngine::new(storage_config, None).expect("storage engine"),

@@ -34,6 +34,7 @@ fn test_engine_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig 
         flush_threshold_bytes: profile.flush_threshold_bytes,
         flush_max_age_secs: 30,
         data_dir: dir.to_path_buf(),
+        index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
     }
 }
 
