@@ -384,10 +384,10 @@ impl CommitLog {
 
     /// Returns the total in-memory buffer bytes held by all closed segments.
     ///
-    /// After [`force_rotate()`](Self::force_rotate) calls
-    /// [`Segment::release_buffer()`], each closed segment holds 0 bytes of
-    /// buffer memory.  A non-zero value here indicates that the release path
-    /// is not running (regression detector).
+    /// After [`force_rotate()`](Self::force_rotate) releases each segment's
+    /// write buffer, every closed segment holds 0 bytes of buffer memory.
+    /// A non-zero value indicates that the release path is not running
+    /// (regression detector).
     pub fn closed_segments_total_bytes(&self) -> usize {
         self.closed_segments
             .lock()
