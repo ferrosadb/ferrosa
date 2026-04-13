@@ -452,6 +452,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(tracing)]
     async fn rpc_send_creates_net_rpc_span() {
         use std::sync::atomic::AtomicU64;
 
