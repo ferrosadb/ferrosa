@@ -382,6 +382,20 @@ impl CommitLog {
         self.closed_segments.lock().len()
     }
 
+    /// Returns the total in-memory buffer bytes held by all closed segments.
+    ///
+    /// After [`force_rotate()`](Self::force_rotate) calls
+    /// [`Segment::release_buffer()`], each closed segment holds 0 bytes of
+    /// buffer memory.  A non-zero value here indicates that the release path
+    /// is not running (regression detector).
+    pub fn closed_segments_total_bytes(&self) -> usize {
+        self.closed_segments
+            .lock()
+            .iter()
+            .map(|s| s.buffer_bytes())
+            .sum()
+    }
+
     /// Returns the set of segment IDs currently marked as archived.
     pub fn archived_segments(&self) -> HashSet<u64> {
         self.archived.lock().clone()
@@ -427,10 +441,12 @@ impl CommitLog {
         let old_segment = self.active.swap(new_segment);
 
         // Flush the old segment to disk before archiving, then release the
-        // file descriptor. The data is fully on disk; keeping the handle open
-        // while waiting for discard_completed() leaks FDs under heavy write load.
+        // file descriptor and the 32 MB write buffer.  The data is fully on
+        // disk; retaining the buffer while waiting for discard_completed() to
+        // run GC causes unbounded memory growth when GC stalls (OOM bug).
         old_segment.flush_to_disk()?;
         old_segment.close_file_handle();
+        old_segment.release_buffer();
 
         // Move old segment to closed list.
         let old_id = old_segment.id;
@@ -1110,6 +1126,57 @@ mod tests {
         );
 
         drop(_guard);
+        cl.shutdown().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Closed-segment buffer release tests (P0 OOM fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn closed_segments_total_bytes_zero_with_no_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config).unwrap();
+
+        // No rotation yet: no closed segments.
+        assert_eq!(
+            cl.closed_segments_total_bytes(),
+            0,
+            "no closed segments yet: total bytes must be 0"
+        );
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn closed_segment_buffers_released_after_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Small segment to force rotation quickly.
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+
+        let m = simple_mutation();
+        for _ in 0..10 {
+            let _ = cl.append(&m);
+        }
+
+        // At least one segment should have rotated out.
+        assert!(
+            cl.closed_segment_count() > 0,
+            "expected at least one closed segment after 10 appends into a 512-byte segment"
+        );
+
+        // After rotation, every closed segment must have released its buffer.
+        assert_eq!(
+            cl.closed_segments_total_bytes(),
+            0,
+            "closed segment buffers must be 0 after force_rotate releases them"
+        );
+
         cl.shutdown().unwrap();
     }
 }
