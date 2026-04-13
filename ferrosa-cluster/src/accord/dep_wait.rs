@@ -90,10 +90,12 @@ pub struct DepWaitGraph {
     waited_by: HashMap<TxnId, HashSet<TxnId>>,
     /// Registration timestamps for timeout tracking.
     wait_start: HashMap<TxnId, Instant>,
-    /// Set of transactions that have been applied (completed).
-    applied: HashSet<TxnId>,
-    /// Set of transactions that have been aborted (cycle-broken).
-    aborted: HashSet<TxnId>,
+    /// Applied transactions mapped to the time they were marked applied.
+    /// Entries are pruned by [`prune()`](Self::prune) to bound memory.
+    applied: HashMap<TxnId, Instant>,
+    /// Aborted transactions mapped to the time they were aborted.
+    /// Entries are pruned by [`prune()`](Self::prune) to bound memory.
+    aborted: HashMap<TxnId, Instant>,
     /// Configurable timeout duration.
     timeout: Duration,
 }
@@ -105,8 +107,8 @@ impl DepWaitGraph {
             waiting_on: HashMap::new(),
             waited_by: HashMap::new(),
             wait_start: HashMap::new(),
-            applied: HashSet::new(),
-            aborted: HashSet::new(),
+            applied: HashMap::new(),
+            aborted: HashMap::new(),
             timeout: DEP_WAIT_TIMEOUT,
         }
     }
@@ -117,8 +119,8 @@ impl DepWaitGraph {
             waiting_on: HashMap::new(),
             waited_by: HashMap::new(),
             wait_start: HashMap::new(),
-            applied: HashSet::new(),
-            aborted: HashSet::new(),
+            applied: HashMap::new(),
+            aborted: HashMap::new(),
             timeout,
         }
     }
@@ -132,7 +134,7 @@ impl DepWaitGraph {
     /// registering an edge.
     pub fn register_wait(&mut self, waiter: TxnId, dep: TxnId) -> Result<(), DepWaitError> {
         // If the dependency is already applied, nothing to wait for.
-        if self.applied.contains(&dep) {
+        if self.applied.contains_key(&dep) {
             return Ok(());
         }
 
@@ -182,7 +184,7 @@ impl DepWaitGraph {
 
         // Remove victim from the graph.
         self.remove_txn(victim);
-        self.aborted.insert(victim);
+        self.aborted.insert(victim, Instant::now());
 
         Ok(victim)
     }
@@ -192,7 +194,7 @@ impl DepWaitGraph {
     /// Returns the set of transactions that were waiting on this dep and
     /// are now unblocked (have no remaining dependencies).
     pub fn mark_applied(&mut self, txn_id: TxnId) -> Vec<TxnId> {
-        self.applied.insert(txn_id);
+        self.applied.insert(txn_id, Instant::now());
 
         let mut woken = Vec::new();
 
@@ -222,12 +224,40 @@ impl DepWaitGraph {
 
     /// Check if a transaction has been applied.
     pub fn is_applied(&self, txn_id: &TxnId) -> bool {
-        self.applied.contains(txn_id)
+        self.applied.contains_key(txn_id)
     }
 
     /// Check if a transaction has been aborted.
     pub fn is_aborted(&self, txn_id: &TxnId) -> bool {
-        self.aborted.contains(txn_id)
+        self.aborted.contains_key(txn_id)
+    }
+
+    /// Returns the number of entries in the applied set.
+    pub fn applied_count(&self) -> usize {
+        self.applied.len()
+    }
+
+    /// Returns the number of entries in the aborted set.
+    pub fn aborted_count(&self) -> usize {
+        self.aborted.len()
+    }
+
+    /// Evicts entries from `applied` and `aborted` that are older than `max_age`.
+    ///
+    /// Returns the total number of entries removed.
+    ///
+    /// Call this periodically from the maintenance loop (e.g., every 60 seconds
+    /// with `max_age = 10 * timeout`) to prevent the sets from growing
+    /// without bound under sustained write traffic.
+    pub fn prune(&mut self, max_age: Duration) -> usize {
+        let now = Instant::now();
+        let before = self.applied.len() + self.aborted.len();
+        self.applied
+            .retain(|_, inserted_at| now.duration_since(*inserted_at) < max_age);
+        self.aborted
+            .retain(|_, inserted_at| now.duration_since(*inserted_at) < max_age);
+        let after = self.applied.len() + self.aborted.len();
+        before - after
     }
 
     /// Check if a transaction is currently waiting.
@@ -265,7 +295,7 @@ impl DepWaitGraph {
             .unwrap_or(self.timeout);
 
         self.remove_txn(txn_id);
-        self.aborted.insert(txn_id);
+        self.aborted.insert(txn_id, Instant::now());
 
         DepWaitError::Timeout { txn_id, waited }
     }
@@ -572,6 +602,103 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test 6: dep_wait_already_applied
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Test: applied/aborted set size accessors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn applied_count_tracks_mark_applied() {
+        let mut graph = DepWaitGraph::new();
+        assert_eq!(graph.applied_count(), 0);
+        graph.mark_applied(txn(1));
+        graph.mark_applied(txn(2));
+        assert_eq!(graph.applied_count(), 2);
+    }
+
+    #[test]
+    fn aborted_count_tracks_break_cycle() {
+        let mut graph = DepWaitGraph::new();
+        assert_eq!(graph.aborted_count(), 0);
+
+        let a = txn(100);
+        let b = txn(200);
+        graph.register_wait(a, b).unwrap();
+        let result = graph.register_wait(b, a);
+        let cycle = match result.unwrap_err() {
+            DepWaitError::CycleDetected { cycle } => cycle,
+            other => panic!("expected CycleDetected, got {:?}", other),
+        };
+        graph.break_cycle(&cycle).unwrap();
+        assert_eq!(graph.aborted_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: prune evicts stale applied entries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prune_removes_old_applied_entries() {
+        let mut graph = DepWaitGraph::new();
+        graph.mark_applied(txn(1));
+        graph.mark_applied(txn(2));
+        assert_eq!(graph.applied_count(), 2);
+
+        // Zero duration: every entry is "older than max_age", so all are pruned.
+        let pruned = graph.prune(Duration::ZERO);
+        assert_eq!(pruned, 2);
+        assert_eq!(graph.applied_count(), 0);
+        assert!(!graph.is_applied(&txn(1)));
+        assert!(!graph.is_applied(&txn(2)));
+    }
+
+    #[test]
+    fn prune_keeps_recent_applied_entries() {
+        let mut graph = DepWaitGraph::new();
+        graph.mark_applied(txn(1));
+        graph.mark_applied(txn(2));
+
+        // Very long max_age: nothing is old enough to prune.
+        let pruned = graph.prune(Duration::from_secs(3600));
+        assert_eq!(pruned, 0);
+        assert_eq!(graph.applied_count(), 2);
+        assert!(graph.is_applied(&txn(1)));
+        assert!(graph.is_applied(&txn(2)));
+    }
+
+    #[test]
+    fn prune_removes_old_aborted_entries() {
+        let mut graph = DepWaitGraph::new();
+
+        let a = txn(100);
+        let b = txn(200);
+        graph.register_wait(a, b).unwrap();
+        let result = graph.register_wait(b, a);
+        let cycle = match result.unwrap_err() {
+            DepWaitError::CycleDetected { cycle } => cycle,
+            other => panic!("expected cycle, got {:?}", other),
+        };
+        graph.break_cycle(&cycle).unwrap();
+        assert_eq!(graph.aborted_count(), 1);
+
+        let pruned = graph.prune(Duration::ZERO);
+        assert!(pruned >= 1, "at least one aborted entry must be pruned");
+        assert_eq!(graph.aborted_count(), 0);
+    }
+
+    #[test]
+    fn applied_set_bounded_by_pruning() {
+        let mut graph = DepWaitGraph::new();
+
+        for i in 0..1000u64 {
+            graph.mark_applied(txn(i));
+        }
+        assert_eq!(graph.applied_count(), 1000);
+
+        let pruned = graph.prune(Duration::ZERO);
+        assert_eq!(pruned, 1000);
+        assert_eq!(graph.applied_count(), 0);
+    }
 
     #[test]
     fn dep_wait_already_applied() {

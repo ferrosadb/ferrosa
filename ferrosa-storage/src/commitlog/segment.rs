@@ -490,6 +490,40 @@ impl Segment {
     pub fn entry_total_size(mutation: &Mutation) -> usize {
         ENTRY_OVERHEAD + mutation.serialized_size()
     }
+
+    /// Returns the current heap size of the buffer in bytes.
+    ///
+    /// Returns the segment capacity before [`release_buffer()`](Self::release_buffer)
+    /// is called, and 0 after.  Used by [`CommitLog::closed_segments_total_bytes()`]
+    /// to confirm that closed segments are not holding memory.
+    pub fn buffer_bytes(&self) -> usize {
+        // SAFETY: We only read the Vec's length field — no slice access.
+        unsafe { &*self.buffer.get() }.len()
+    }
+
+    /// Drops the in-memory write buffer, retaining only segment metadata.
+    ///
+    /// Called by [`CommitLog::force_rotate()`] immediately after the segment
+    /// has been fsynced to disk and moved to `closed_segments`.  Replacing
+    /// the 32 MB buffer with an empty `Vec` caps closed-segment memory at
+    /// ~200 bytes of metadata per segment regardless of GC lag.
+    ///
+    /// # Precondition
+    ///
+    /// Must only be called after:
+    /// 1. [`flush_to_disk()`](Self::flush_to_disk) (all data is on disk), and
+    /// 2. The segment is no longer the active segment (no new writes possible).
+    ///
+    /// Writing to or re-flushing the segment after this call is safe — the
+    /// position has not advanced, so incremental flush finds nothing new to write.
+    pub fn release_buffer(&self) {
+        // SAFETY: The caller guarantees this segment is no longer active.
+        // No concurrent writers can reach it via ArcSwap after force_rotate()
+        // swaps in the new segment.  We replace the Vec, not a slice, so no
+        // concurrent read of a byte range is possible.
+        let buf = unsafe { &mut *self.buffer.get() };
+        *buf = Vec::new();
+    }
 }
 
 #[cfg(test)]
@@ -761,5 +795,63 @@ mod tests {
             segment.path().file_name().unwrap().to_str().unwrap(),
             "commitlog-42.log"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Buffer release tests (P0 OOM fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn release_buffer_frees_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::new(1, 4096, dir.path());
+
+        // Write an entry and flush so the segment has real data on disk.
+        let m = simple_mutation();
+        let total_size = Segment::entry_total_size(&m);
+        let offset = segment.allocate(total_size).unwrap();
+        segment.write_entry(offset, &m);
+        segment.flush_to_disk().unwrap();
+
+        // Buffer is live before release.
+        assert_eq!(segment.buffer_bytes(), 4096);
+
+        segment.release_buffer();
+
+        // Buffer is gone after release; only metadata remains.
+        assert_eq!(segment.buffer_bytes(), 0);
+    }
+
+    #[test]
+    fn release_buffer_preserves_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::new(42, 4096, dir.path());
+        let table = TableId::new("ks", "tbl");
+        let pos = CommitLogPosition {
+            segment_id: 42,
+            offset: 25,
+        };
+        segment.mark_table_dirty(&table, pos);
+
+        segment.release_buffer();
+
+        // Metadata fields survive the release.
+        assert_eq!(segment.id, 42);
+        assert_eq!(
+            segment.path().file_name().unwrap().to_str().unwrap(),
+            "commitlog-42.log"
+        );
+        let dirty = segment.dirty_tables.lock();
+        assert_eq!(
+            dirty[&table], pos,
+            "dirty_tables must survive release_buffer"
+        );
+    }
+
+    #[test]
+    fn buffer_bytes_returns_capacity_before_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::new(1, 8192, dir.path());
+        assert_eq!(segment.buffer_bytes(), 8192);
     }
 }

@@ -215,6 +215,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tracing)]
     fn layer_captures_span_on_close() {
         let config = TelemetryConfig {
             sample_rate: 1.0,
@@ -242,6 +243,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tracing)]
     fn layer_try_send_does_not_block() {
         let config = TelemetryConfig {
             sample_rate: 1.0,
@@ -262,6 +264,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tracing)]
     fn layer_drops_oldest_on_full() {
         let config = TelemetryConfig {
             sample_rate: 1.0,
@@ -295,6 +298,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tracing)]
     fn sample_rate_zero_captures_nothing() {
         let config = TelemetryConfig {
             sample_rate: 0.0,
@@ -318,6 +322,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tracing)]
     fn sample_rate_one_captures_all() {
         let config = TelemetryConfig {
             sample_rate: 1.0,
