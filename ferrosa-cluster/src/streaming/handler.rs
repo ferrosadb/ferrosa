@@ -3,11 +3,16 @@
 //! A single [`StreamHandler`] manages session state across the three-message
 //! protocol (Start → Chunk → End) for both row-based and SSTable file-based
 //! streaming. Sessions are tracked in a `DashMap` keyed by `session_id`.
+//!
+//! **Important:** `PeerManager::send()` awaits a response. Handlers MUST return
+//! `Some(Message)` — returning `None` causes the sender to block until the
+//! Bulk lane times out.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use dashmap::DashMap;
 
 use ferrosa_net::message::Message;
@@ -19,6 +24,11 @@ use super::{
     SstableStreamChunkPayload, SstableStreamEndPayload, SstableStreamStartPayload,
     StreamChunkPayload, StreamEndPayload, StreamStartPayload,
 };
+
+/// Empty ack payload — minimal response to unblock the sender.
+fn ack() -> Bytes {
+    Bytes::from_static(b"ok")
+}
 
 // ---------------------------------------------------------------------------
 // Row-based streaming handler
@@ -54,7 +64,7 @@ impl RpcHandler for StreamHandler {
                 let session_id = payload.session_id;
                 let session = StreamReceiver::begin(payload);
                 self.sessions.insert(session_id, session);
-                None // fire-and-forget
+                Some(Message::StreamStart(ack()))
             }
             Message::StreamChunk(b) => {
                 let payload: StreamChunkPayload = bincode::deserialize(&b)
@@ -72,7 +82,7 @@ impl RpcHandler for StreamHandler {
                         "StreamChunk: no session found (missed StreamStart?)"
                     );
                 }
-                None
+                Some(Message::StreamChunk(ack()))
             }
             Message::StreamEnd(b) => {
                 let payload: StreamEndPayload = bincode::deserialize(&b)
@@ -98,7 +108,7 @@ impl RpcHandler for StreamHandler {
                         "StreamEnd: no session found (missed StreamStart?)"
                     );
                 }
-                None
+                Some(Message::StreamEnd(ack()))
             }
             _ => None,
         }
@@ -141,7 +151,7 @@ impl RpcHandler for SstableStreamHandler {
                 ));
                 let session = SstableStreamReceiver::begin(payload, dest_dir);
                 self.sessions.insert(session_id, session);
-                None
+                Some(Message::SstableStreamStart(ack()))
             }
             Message::SstableStreamChunk(b) => {
                 let payload: SstableStreamChunkPayload = bincode::deserialize(&b)
@@ -161,7 +171,7 @@ impl RpcHandler for SstableStreamHandler {
                         "SstableStreamChunk: no session found (missed Start?)"
                     );
                 }
-                None
+                Some(Message::SstableStreamChunk(ack()))
             }
             Message::SstableStreamEnd(b) => {
                 let payload: SstableStreamEndPayload = bincode::deserialize(&b)
@@ -190,7 +200,7 @@ impl RpcHandler for SstableStreamHandler {
                         "SstableStreamEnd: no session found (missed Start?)"
                     );
                 }
-                None
+                Some(Message::SstableStreamEnd(ack()))
             }
             _ => None,
         }
