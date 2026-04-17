@@ -380,6 +380,8 @@ async fn execute_expand(
 
     // Apply DISTINCT.
     if return_clause.distinct {
+        // serde_json::Value doesn't impl Ord; use string repr for dedup.
+        rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         rows.dedup();
     }
 

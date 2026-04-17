@@ -220,6 +220,7 @@ pub async fn execute_var_length(
 
     // Apply DISTINCT.
     if return_clause.distinct {
+        rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         rows.dedup();
     }
 

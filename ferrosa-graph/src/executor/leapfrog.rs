@@ -238,6 +238,7 @@ pub async fn execute_wco_join(
 
     // Apply DISTINCT.
     if return_clause.distinct {
+        result_rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         result_rows.dedup();
     }
 
