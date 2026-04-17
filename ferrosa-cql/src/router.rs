@@ -4871,15 +4871,11 @@ fn apply_builtin_functions(
         if let SelectColumn::FunctionCall { name, args, .. } = sc {
             let fn_lower = name.to_lowercase();
             match fn_lower.as_str() {
-                "now" => {
-                    if proj_idx < proj_col_names.len() {
-                        ops.push((proj_idx, BuiltinOp::Now));
-                    }
+                "now" if proj_idx < proj_col_names.len() => {
+                    ops.push((proj_idx, BuiltinOp::Now));
                 }
-                "totimestamp" => {
-                    if proj_idx < proj_col_names.len() {
-                        ops.push((proj_idx, BuiltinOp::ToTimestamp));
-                    }
+                "totimestamp" if proj_idx < proj_col_names.len() => {
+                    ops.push((proj_idx, BuiltinOp::ToTimestamp));
                 }
                 "writetime" => {
                     if let Some(arg) = args.first() {

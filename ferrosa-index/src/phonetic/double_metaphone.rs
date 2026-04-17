@@ -87,10 +87,8 @@ impl DoubleMetaphoneEncoder {
                 'A' | 'E' | 'I' | 'O' | 'U' => {
                     // Vowels only kept at start (already handled above)
                 }
-                'B' => {
-                    if !(i == len - 1 && prev == 'M') {
-                        push_both('P');
-                    }
+                'B' if !(i == len - 1 && prev == 'M') => {
+                    push_both('P');
                 }
                 'C' => {
                     if next == 'H' {
@@ -139,16 +137,12 @@ impl DoubleMetaphoneEncoder {
                         push_both('K');
                     }
                 }
-                'H' => {
-                    if Self::is_vowel(next) && !Self::is_vowel(prev) {
-                        push_both('H');
-                    }
+                'H' if Self::is_vowel(next) && !Self::is_vowel(prev) => {
+                    push_both('H');
                 }
                 'J' => push_both('J'),
-                'K' => {
-                    if prev != 'C' {
-                        push_both('K');
-                    }
+                'K' if prev != 'C' => {
+                    push_both('K');
                 }
                 'L' => push_both('L'),
                 'M' => push_both('M'),
@@ -186,10 +180,8 @@ impl DoubleMetaphoneEncoder {
                     }
                 }
                 'V' => push_both('F'),
-                'W' | 'Y' => {
-                    if Self::is_vowel(next) {
-                        push_both(c);
-                    }
+                'W' | 'Y' if Self::is_vowel(next) => {
+                    push_both(c);
                 }
                 'X' => {
                     if primary.len() < Self::MAX_LEN {

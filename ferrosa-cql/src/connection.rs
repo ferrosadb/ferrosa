@@ -1487,11 +1487,9 @@ fn substitute_in_statement(stmt: &Statement, terms: &[Term], idx: &mut usize) ->
 /// Recurses into nested terms (lists, maps, sets, tuples).
 fn substitute_in_term(term: &mut Term, terms: &[Term], idx: &mut usize) {
     match term {
-        Term::BindMarker(_) => {
-            if *idx < terms.len() {
-                *term = terms[*idx].clone();
-                *idx += 1;
-            }
+        Term::BindMarker(_) if *idx < terms.len() => {
+            *term = terms[*idx].clone();
+            *idx += 1;
         }
         Term::InList(items)
         | Term::ListLiteral(items)

@@ -58,13 +58,9 @@ impl RegisterModel {
                     expected, value, ..
                 },
                 OpResult::Ok | OpResult::Applied(true),
-            ) => {
-                if self.value == Some(*expected) {
-                    self.value = Some(*value);
-                    true
-                } else {
-                    false
-                }
+            ) if self.value == Some(*expected) => {
+                self.value = Some(*value);
+                true
             }
 
             // CAS fails when model does NOT match expected.

@@ -205,7 +205,7 @@ impl FullTextIndexReader {
 
         // If exceeds cap, keep terms with highest doc frequency.
         if matching.len() > Self::MAX_WILDCARD_EXPANSION {
-            matching.sort_by(|a, b| b.1.cmp(&a.1));
+            matching.sort_by_key(|item| std::cmp::Reverse(item.1));
             matching.truncate(Self::MAX_WILDCARD_EXPANSION);
         }
 
