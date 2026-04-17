@@ -8,6 +8,7 @@ description = "Graph query engine for ferrosa — Cypher/GQL endpoint"
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
+ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 arc-swap = "1.7"
 hex = "0.4"

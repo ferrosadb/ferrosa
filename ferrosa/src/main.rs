@@ -692,6 +692,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register stub virtual tables for deferred observability features.
     ferrosa_cql::virtual_tables::register_all_stubs(schema.virtual_tables());
 
+    // Clone write_path before shared_state is moved into the CQL server.
+    let cluster_write_path = shared_state.write_path.clone();
     let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state);
     let cql_addr = cql_server.start_background().await?;
     tracing::info!(%cql_addr, "CQL server listening");
@@ -730,9 +732,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let http_config = graph_config.http.clone();
+        let graph_write_path = cluster_write_path.clone();
         let graph_engine = Arc::new(ferrosa_graph::engine::GraphEngine::new(
             schema.clone(),
             storage.clone(),
+            graph_write_path,
             graph_config.engine,
             graph_config.reconciliation_interval,
         ));
@@ -796,8 +800,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .parse()
             .expect("invalid FERROSA_SPARQL_BIND");
 
+        let sparql_write_path = std::sync::Arc::new(
+            ferrosa_cluster::write_path::WritePath::direct(storage.clone()),
+        );
         let sparql_engine = std::sync::Arc::new(ferrosa_sparql::engine::SparqlEngine::new(
             storage.clone(),
+            sparql_write_path.clone(),
             ferrosa_sparql::engine::SparqlConfig::default(),
         ));
 

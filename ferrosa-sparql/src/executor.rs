@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ferrosa_cluster::write_path::WritePath;
 use ferrosa_sstable::types::Row;
-use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::SparqlError;
 use crate::planner::{QueryPlan, TripleOp};
@@ -15,11 +15,11 @@ use crate::results::{Binding, SparqlJsonResults};
 use crate::triple_store;
 
 /// Execute a query plan and return SPARQL JSON results.
-pub fn execute(
+pub async fn execute(
     plan: &QueryPlan,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<SparqlJsonResults, SparqlError> {
-    let mut binding_sets = evaluate_triple_patterns(plan, storage)?;
+    let mut binding_sets = evaluate_triple_patterns(plan, write_path).await?;
 
     // Apply FILTER expressions to binding sets.
     if !plan.filters.is_empty() {
@@ -57,9 +57,9 @@ pub fn execute(
 }
 
 /// Evaluate all triple patterns via nested-loop join, returning binding sets.
-fn evaluate_triple_patterns(
+async fn evaluate_triple_patterns(
     plan: &QueryPlan,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
     let mut binding_sets: Vec<HashMap<String, Binding>> = vec![HashMap::new()];
 
@@ -70,8 +70,8 @@ fn evaluate_triple_patterns(
                 subject,
                 path,
                 object,
-            } => evaluate_path_op(graph, subject, path, object, &binding_sets, storage)?,
-            _ => evaluate_standard_op(tp, op, &binding_sets, storage)?,
+            } => evaluate_path_op(graph, subject, path, object, &binding_sets, write_path).await?,
+            _ => evaluate_standard_op(tp, op, &binding_sets, write_path).await?,
         };
         binding_sets = new_bindings;
     }
@@ -80,16 +80,17 @@ fn evaluate_triple_patterns(
 }
 
 /// Evaluate a property path op via BFS traversal.
-fn evaluate_path_op(
+async fn evaluate_path_op(
     graph: &str,
     subject: &spargebra::term::TermPattern,
     path: &spargebra::algebra::PropertyPathExpression,
     object: &spargebra::term::TermPattern,
     existing_bindings: &[HashMap<String, Binding>],
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
     let results =
-        crate::property_path::evaluate_property_path(subject, path, object, graph, storage)?;
+        crate::property_path::evaluate_property_path(subject, path, object, graph, write_path)
+            .await?;
     let path_bindings = crate::property_path::path_results_to_bindings(subject, object, &results);
 
     let mut new_bindings = Vec::new();
@@ -104,13 +105,13 @@ fn evaluate_path_op(
 }
 
 /// Evaluate a standard (non-path) triple pattern op.
-fn evaluate_standard_op(
+async fn evaluate_standard_op(
     tp: &spargebra::term::TriplePattern,
     op: &TripleOp,
     existing_bindings: &[HashMap<String, Binding>],
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    let rows = fetch_triples(op, storage)?;
+    let rows = fetch_triples(op, write_path).await?;
     let mut new_bindings = Vec::new();
     for existing in existing_bindings {
         for triple in &rows {
@@ -264,13 +265,15 @@ const OBJECT_INDEX_NAME: &str = "rdf_triples_object_idx";
 ///
 /// Falls back to a full range scan with post-fetch filtering if the index
 /// does not exist. Logs a warning on fallback and on truncation.
-fn fetch_by_object_index(
+async fn fetch_by_object_index(
     table_id: &ferrosa_storage::TableId,
     object: &str,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<Vec<ferrosa_sstable::types::Partition>, SparqlError> {
     let index_key = ferrosa_index::IndexKey(object.as_bytes().to_vec());
-    let indexed = storage.read_by_index(table_id, OBJECT_INDEX_NAME, &index_key)?;
+    let indexed = write_path
+        .index_read(table_id, OBJECT_INDEX_NAME, &index_key)
+        .await?;
     if !indexed.is_empty() {
         return Ok(indexed);
     }
@@ -280,7 +283,7 @@ fn fetch_by_object_index(
         object,
         "ObjectScan: no secondary index hit; falling back to full scan with filtering"
     );
-    let results = storage.read_range(table_id, None, None, SCAN_ROW_CAP)?;
+    let results = write_path.range_read(table_id).await?;
     if results.len() >= SCAN_ROW_CAP {
         tracing::warn!(
             cap = SCAN_ROW_CAP,
@@ -291,9 +294,9 @@ fn fetch_by_object_index(
 }
 
 /// Fetch triples from storage for a single triple pattern operation.
-fn fetch_triples(
+async fn fetch_triples(
     op: &TripleOp,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<Vec<FetchedTriple>, SparqlError> {
     // BUG-S2 fix: use the graph from the execution plan, not hardcoded "rdf".
     let graph = match op {
@@ -311,18 +314,16 @@ fn fetch_triples(
     let partitions = match op {
         TripleOp::SubjectLookup { graph, subject, .. } => {
             let key = triple_store::partition_key(graph, subject);
-            // TODO: route through coordinator for cluster mode — storage.read()
-            // only checks LOCAL storage, returning empty when RF=1 and this node
-            // doesn't own the token. Requires threading WritePath into the SPARQL
-            // executor (see ferrosa-cluster P0 cluster-read bug).
-            match storage.read(&table_id, &key)? {
+            match write_path.read(&table_id, &key).await? {
                 Some(p) => vec![p],
                 None => vec![],
             }
         }
-        TripleOp::ObjectScan { object, .. } => fetch_by_object_index(&table_id, object, storage)?,
+        TripleOp::ObjectScan { object, .. } => {
+            fetch_by_object_index(&table_id, object, write_path).await?
+        }
         TripleOp::PredicateScan { .. } | TripleOp::FullScan { .. } => {
-            let results = storage.read_range(&table_id, None, None, SCAN_ROW_CAP)?;
+            let results = write_path.range_read(&table_id).await?;
             if results.len() >= SCAN_ROW_CAP {
                 tracing::warn!(
                     cap = SCAN_ROW_CAP,

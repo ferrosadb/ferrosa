@@ -58,5 +58,11 @@ impl From<ferrosa_schema::SchemaError> for GraphError {
     }
 }
 
+impl From<ferrosa_cluster::error::ClusterError> for GraphError {
+    fn from(e: ferrosa_cluster::error::ClusterError) -> Self {
+        Self::Storage(ferrosa_common::Error::InvalidData(e.to_string()))
+    }
+}
+
 /// Result type alias for graph operations.
 pub type Result<T> = std::result::Result<T, GraphError>;

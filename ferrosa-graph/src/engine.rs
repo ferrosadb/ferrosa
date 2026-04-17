@@ -7,8 +7,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use serde::Serialize;
 
+use ferrosa_cluster::write_path::WritePath;
 use ferrosa_schema::auth::role::AuthContext;
 use ferrosa_schema::Schema;
 use ferrosa_storage::StorageEngine;
@@ -50,7 +52,10 @@ const DEFAULT_MAX_SUBSCRIPTIONS: usize = 8;
 /// Central coordinator for graph query processing.
 pub struct GraphEngine {
     schema: Arc<Schema>,
+    /// Retained to keep the `Arc<StorageEngine>` alive for observers and WritePath.
+    #[allow(dead_code)]
     storage: Arc<StorageEngine>,
+    write_path: Arc<ArcSwap<WritePath>>,
     config: GraphEngineConfig,
     reconciliation_handles: Vec<tokio::task::JoinHandle<()>>,
     reconciliation_cancel: CancellationToken,
@@ -87,6 +92,7 @@ impl GraphEngine {
     pub fn new(
         schema: Arc<Schema>,
         storage: Arc<StorageEngine>,
+        write_path: Arc<ArcSwap<WritePath>>,
         config: GraphEngineConfig,
         reconciliation_interval: std::time::Duration,
     ) -> Self {
@@ -113,7 +119,7 @@ impl GraphEngine {
             if tokio::runtime::Handle::try_current().is_ok() {
                 let handle = spawn_reconciliation(
                     Arc::clone(&schema),
-                    Arc::clone(&storage),
+                    Arc::new(WritePath::direct(Arc::clone(&storage))),
                     ks.clone(),
                     reconciliation_interval,
                     reconciliation_cancel.child_token(),
@@ -125,6 +131,7 @@ impl GraphEngine {
         Self {
             schema,
             storage,
+            write_path,
             config,
             reconciliation_handles,
             reconciliation_cancel,
@@ -133,19 +140,26 @@ impl GraphEngine {
     }
 
     /// Execute a Cypher query: parse -> validate -> plan -> execute.
-    pub fn execute(&self, query: &str, keyspace: &str, auth: &AuthContext) -> Result<GraphResult> {
+    pub async fn execute(
+        &self,
+        query: &str,
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<GraphResult> {
         let statement = parse(query)?;
         let snap = self.schema.snapshot();
         let logical = validate(&snap, auth, keyspace, statement)?;
         let physical = plan(logical)?;
+        let wp = self.write_path.load();
         execute(
             physical,
-            &self.storage,
+            &wp,
             keyspace,
             &self.config,
             Some(self.schema.virtual_tables()),
             Some(&self.schema),
         )
+        .await
     }
 
     /// Explain a query: parse -> validate -> plan (return plan description).
@@ -159,7 +173,7 @@ impl GraphEngine {
 
     /// Execute a subscribe query. Returns the initial snapshot, subscription ID,
     /// poll interval, and delta flag. The HTTP layer manages the actual SSE stream.
-    pub fn execute_subscribe(
+    pub async fn execute_subscribe(
         &self,
         query: &str,
         keyspace: &str,
@@ -195,14 +209,16 @@ impl GraphEngine {
         };
 
         // Execute the initial snapshot.
+        let wp = self.write_path.load();
         let result = execute(
             physical,
-            &self.storage,
+            &wp,
             keyspace,
             &self.config,
             Some(self.schema.virtual_tables()),
             Some(&self.schema),
-        )?;
+        )
+        .await?;
 
         Ok((result, interval, delta))
     }
@@ -506,9 +522,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Arc::new(test_storage_engine(tmp.path()));
 
+        let write_path = Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage)),
+        ));
         let engine = GraphEngine::new(
             schema,
             storage,
+            write_path,
             GraphEngineConfig::default(),
             std::time::Duration::from_secs(300),
         );

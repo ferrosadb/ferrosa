@@ -8,9 +8,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_schema::VirtualTableRegistry;
-use ferrosa_storage::{StorageEngine, TableId};
+use ferrosa_storage::TableId;
 
 use crate::adjacency::schema::adjacency_keyspace_name;
 use crate::error::{GraphError, Result};
@@ -28,8 +29,8 @@ use crate::planner::physical::{Anchor, Hop};
 /// of the given hop. Uses a visited set for cycle detection and a total
 /// vertex budget for DoS protection (threat T13, FMEA F3).
 #[allow(clippy::too_many_arguments)]
-pub fn execute_var_length(
-    storage: &StorageEngine,
+pub async fn execute_var_length(
+    write_path: &WritePath,
     keyspace: &str,
     anchor: &Anchor,
     hop: &Hop,
@@ -58,7 +59,7 @@ pub fn execute_var_length(
         // Fall back to storage (which will return empty for virtual tables).
         vec![]
     } else {
-        storage.read_range(&anchor_table_id, None, None, config.max_result_rows)?
+        write_path.range_read(&anchor_table_id).await?
     };
     stats.vertices_read += anchor_partitions.len();
     check_timeout(start, config.query_timeout)?;
@@ -118,8 +119,7 @@ pub fn execute_var_length(
 
         for vertex_key in &frontier {
             // Read adjacency entries for this vertex.
-            // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
-            let adj_partition = storage.read(&adj_table_id, vertex_key)?;
+            let adj_partition = write_path.read(&adj_table_id, vertex_key).await?;
             if let Some(partition) = adj_partition {
                 stats.edges_read += partition.rows.len();
 
@@ -190,8 +190,7 @@ pub fn execute_var_length(
             break;
         }
 
-        // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
-        let partition = storage.read(&proj_table_id, key)?;
+        let partition = write_path.read(&proj_table_id, key).await?;
         let hex_id = hex::encode(key.key.as_bytes());
 
         let row_json = if let Some(ref part) = partition {
@@ -247,8 +246,9 @@ mod tests {
     use ferrosa_common::PartitionKey;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
     use ferrosa_storage::{
-        CommitLogConfig, CompactionConfig, StorageEngineConfig, SyncStrategyConfig,
+        CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
     };
+    use std::sync::Arc;
     use std::time::Duration;
 
     use crate::adjacency::schema::adjacency_keyspace_name;
@@ -276,7 +276,7 @@ mod tests {
         }
     }
 
-    fn test_storage(dir: &std::path::Path) -> StorageEngine {
+    fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         let config = StorageEngineConfig {
             commit_log: CommitLogConfig {
                 segment_size: 4096,
@@ -294,7 +294,7 @@ mod tests {
             data_dir: dir.to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
         };
-        StorageEngine::new(config, None).unwrap()
+        Arc::new(StorageEngine::new(config, None).unwrap())
     }
 
     fn make_table_schema(keyspace: &str, table: &str) -> TableSchema {
@@ -313,7 +313,7 @@ mod tests {
     }
 
     /// Create storage and register the vertex table and adjacency table.
-    fn setup_storage(dir: &std::path::Path) -> StorageEngine {
+    fn setup_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         let storage = test_storage(dir);
         // Register vertex table.
         storage
@@ -405,8 +405,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn varpath_single_hop() {
+    #[tokio::test]
+    async fn varpath_single_hop() {
         // Graph: A -> B (only A is written to person_v; B is discovered via adjacency)
         let tmp = tempfile::tempdir().unwrap();
         let storage = setup_storage(tmp.path());
@@ -415,8 +415,9 @@ mod tests {
         write_vertex(&storage, "test_ks", "person_v", b"A");
         write_adjacency(&storage, "test_ks", b"A", "KNOWS", b"B");
 
+        let wp = WritePath::direct(storage);
         let result = execute_var_length(
-            &storage,
+            &wp,
             "test_ks",
             &make_anchor("a"),
             &make_hop("b"),
@@ -428,14 +429,15 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         // Should find exactly B reachable from A in 1 hop.
         assert_eq!(result.rows.len(), 1);
     }
 
-    #[test]
-    fn varpath_cycle_terminates() {
+    #[tokio::test]
+    async fn varpath_cycle_terminates() {
         // Graph: A -> B -> C -> A (cycle)
         // Only A is in the anchor table; B and C are discovered via BFS.
         let tmp = tempfile::tempdir().unwrap();
@@ -446,8 +448,9 @@ mod tests {
         write_adjacency(&storage, "test_ks", b"B", "KNOWS", b"C");
         write_adjacency(&storage, "test_ks", b"C", "KNOWS", b"A");
 
+        let wp = WritePath::direct(storage);
         let result = execute_var_length(
-            &storage,
+            &wp,
             "test_ks",
             &make_anchor("a"),
             &make_hop("b"),
@@ -459,6 +462,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
 
         // A->B at depth 1, B->C at depth 2, C->A at depth 3 is cycle (A visited).
@@ -466,8 +470,8 @@ mod tests {
         assert_eq!(result.rows.len(), 2);
     }
 
-    #[test]
-    fn varpath_budget_exceeded() {
+    #[tokio::test]
+    async fn varpath_budget_exceeded() {
         // Create a chain of vertices that exceeds the visited budget.
         // Only V0000 is in the anchor table; rest are discovered via BFS.
         let tmp = tempfile::tempdir().unwrap();
@@ -500,8 +504,9 @@ mod tests {
             filters: vec![],
         };
 
+        let wp = WritePath::direct(storage);
         let result = execute_var_length(
-            &storage,
+            &wp,
             "test_ks",
             &anchor,
             &make_hop("b"),
@@ -512,7 +517,8 @@ mod tests {
             Instant::now(),
             None,
             None,
-        );
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();

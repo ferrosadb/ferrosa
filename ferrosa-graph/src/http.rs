@@ -260,6 +260,7 @@ async fn handle_query(State(state): State<AppState>, req: Request<Body>) -> Resp
     match state
         .engine
         .execute(&query_req.query, &query_req.keyspace, &auth)
+        .await
     {
         Ok(result) => {
             tracing::info!(
@@ -409,22 +410,22 @@ async fn handle_subscribe(State(state): State<AppState>, req: Request<Body>) -> 
     );
 
     // Parse and execute initial snapshot, extracting interval and delta flag.
-    let (initial_result, interval, delta) =
-        match state
-            .engine
-            .execute_subscribe(&query_req.query, &query_req.keyspace, &auth)
-        {
-            Ok(r) => r,
-            Err(ref e) => {
-                tracing::info!(
-                    user = %auth.role,
-                    keyspace = %query_req.keyspace,
-                    error = %e,
-                    "graph subscribe failed"
-                );
-                return error_to_response(e);
-            }
-        };
+    let (initial_result, interval, delta) = match state
+        .engine
+        .execute_subscribe(&query_req.query, &query_req.keyspace, &auth)
+        .await
+    {
+        Ok(r) => r,
+        Err(ref e) => {
+            tracing::info!(
+                user = %auth.role,
+                keyspace = %query_req.keyspace,
+                error = %e,
+                "graph subscribe failed"
+            );
+            return error_to_response(e);
+        }
+    };
 
     // Build the SSE stream.
     let stream = make_subscribe_stream(
@@ -484,7 +485,7 @@ fn make_subscribe_stream(
             tokio::select! {
                 _ = ticker.tick() => {
                     // Re-execute the query.
-                    let result = engine.execute(&query, &keyspace, &auth);
+                    let result = engine.execute(&query, &keyspace, &auth).await;
                     match result {
                         Ok(current) => {
                             if delta {
@@ -816,9 +817,13 @@ mod tests {
         };
         let storage = Arc::new(ferrosa_storage::StorageEngine::new(storage_config, None).unwrap());
 
+        let write_path = Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage)),
+        ));
         let engine = Arc::new(crate::engine::GraphEngine::new(
             Arc::clone(&schema),
             storage,
+            write_path,
             crate::executor::expand::GraphEngineConfig::default(),
             std::time::Duration::from_secs(300),
         ));

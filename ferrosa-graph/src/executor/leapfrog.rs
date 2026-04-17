@@ -11,9 +11,10 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_schema::VirtualTableRegistry;
-use ferrosa_storage::{StorageEngine, TableId};
+use ferrosa_storage::TableId;
 
 use crate::adjacency::schema::adjacency_keyspace_name;
 use crate::error::{GraphError, Result};
@@ -36,14 +37,17 @@ struct AdjacencyIterator {
 
 impl AdjacencyIterator {
     /// Create from a vertex's adjacency partition, filtering by optional label.
-    fn from_partition(
-        storage: &StorageEngine,
+    async fn from_partition(
+        write_path: &WritePath,
         adj_table_id: &TableId,
         vertex_key: &DecoratedKey,
         edge_label: Option<&str>,
     ) -> Self {
-        // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
-        let partition = storage.read(adj_table_id, vertex_key).ok().flatten();
+        let partition = write_path
+            .read(adj_table_id, vertex_key)
+            .await
+            .ok()
+            .flatten();
         let mut neighbors = Vec::new();
         if let Some(p) = partition {
             for row in &p.rows {
@@ -156,8 +160,8 @@ fn leapfrog_join(iterators: &mut [AdjacencyIterator], max_results: usize) -> Vec
 ///    d. Check that the closing edge `(c)->(a)` is satisfied.
 /// 3. Collect matched bindings and project via return clause.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_wco_join(
-    storage: &StorageEngine,
+pub async fn execute_wco_join(
+    write_path: &WritePath,
     keyspace: &str,
     plan: &WcoJoinPlan,
     return_clause: &ReturnClause,
@@ -187,7 +191,7 @@ pub fn execute_wco_join(
         GraphError::Validation(format!("no resolved table for variable '{first_var}'"))
     })?;
     let first_table_id = TableId::new(&first_table.keyspace, &first_table.table);
-    let candidates = storage.read_range(&first_table_id, None, None, config.max_result_rows)?;
+    let candidates = write_path.range_read(&first_table_id).await?;
     stats.vertices_read += candidates.len();
     check_timeout(start, config.query_timeout)?;
 
@@ -209,8 +213,8 @@ pub fn execute_wco_join(
         let mut var_bindings: HashMap<String, Vec<u8>> = HashMap::new();
         var_bindings.insert(first_var.clone(), first_key_bytes);
 
-        enumerate_bindings(
-            storage,
+        Box::pin(enumerate_bindings(
+            write_path,
             &adj_table_id,
             plan,
             &plan.variables,
@@ -223,7 +227,8 @@ pub fn execute_wco_join(
             start,
             &mut stats,
             schema,
-        )?;
+        ))
+        .await?;
     }
 
     // Apply ORDER BY.
@@ -257,8 +262,8 @@ pub fn execute_wco_join(
 /// that connect the variable to already-bound variables, then intersects them
 /// via leapfrog_join to find valid bindings.
 #[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
-fn enumerate_bindings(
-    storage: &StorageEngine,
+async fn enumerate_bindings(
+    write_path: &WritePath,
     adj_table_id: &TableId,
     plan: &WcoJoinPlan,
     variables: &[String],
@@ -281,9 +286,11 @@ fn enumerate_bindings(
     // (some closing edges may connect two already-bound variables).
     if var_idx >= variables.len() {
         // Check that every relation is satisfied with current bindings.
-        if verify_all_relations(storage, adj_table_id, plan, var_bindings, stats)? {
+        if verify_all_relations(write_path, adj_table_id, plan, var_bindings, stats).await? {
             // Build a result row from the bindings.
-            let row = project_bindings(storage, plan, var_bindings, return_clause, stats, schema)?;
+            let row =
+                project_bindings(write_path, plan, var_bindings, return_clause, stats, schema)
+                    .await?;
             result_rows.push(row);
         }
         return Ok(());
@@ -299,11 +306,12 @@ fn enumerate_bindings(
             if let Some(src_bytes) = var_bindings.get(&rel.src_var) {
                 let src_key = DecoratedKey::new(PartitionKey::new(src_bytes.clone()));
                 let it = AdjacencyIterator::from_partition(
-                    storage,
+                    write_path,
                     adj_table_id,
                     &src_key,
                     rel.edge_label.as_deref(),
-                );
+                )
+                .await;
                 stats.edges_read += it.neighbors.len();
                 iterators.push(it);
             }
@@ -320,8 +328,7 @@ fn enumerate_bindings(
                 // For leapfrog, we need the set of source vertices that
                 // have an edge TO dst. We read dst's IN-adjacency.
                 let dst_key = DecoratedKey::new(PartitionKey::new(dst_bytes.clone()));
-                // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
-                let partition = storage.read(adj_table_id, &dst_key).ok().flatten();
+                let partition = write_path.read(adj_table_id, &dst_key).await.ok().flatten();
                 let mut neighbors = Vec::new();
                 if let Some(p) = partition {
                     for row in &p.rows {
@@ -348,7 +355,7 @@ fn enumerate_bindings(
         // Fall back to scanning all candidates for this variable.
         if let Some(table) = plan.var_tables.get(current_var) {
             let table_id = TableId::new(&table.keyspace, &table.table);
-            let candidates = storage.read_range(&table_id, None, None, config.max_result_rows)?;
+            let candidates = write_path.range_read(&table_id).await?;
             stats.vertices_read += candidates.len();
 
             for candidate in &candidates {
@@ -357,8 +364,8 @@ fn enumerate_bindings(
                 }
                 let key_bytes = candidate.key.key.as_bytes().to_vec();
                 var_bindings.insert(current_var.clone(), key_bytes);
-                enumerate_bindings(
-                    storage,
+                Box::pin(enumerate_bindings(
+                    write_path,
                     adj_table_id,
                     plan,
                     variables,
@@ -371,7 +378,8 @@ fn enumerate_bindings(
                     start,
                     stats,
                     schema,
-                )?;
+                ))
+                .await?;
             }
             var_bindings.remove(current_var);
         }
@@ -386,8 +394,8 @@ fn enumerate_bindings(
             break;
         }
         var_bindings.insert(current_var.clone(), binding.clone());
-        enumerate_bindings(
-            storage,
+        Box::pin(enumerate_bindings(
+            write_path,
             adj_table_id,
             plan,
             variables,
@@ -400,7 +408,8 @@ fn enumerate_bindings(
             start,
             stats,
             schema,
-        )?;
+        ))
+        .await?;
     }
     var_bindings.remove(current_var);
 
@@ -412,8 +421,8 @@ fn enumerate_bindings(
 /// This checks "closing" edges -- relations between two variables that were both
 /// already bound before the other was enumerated (e.g., the `(c)->(a)` edge
 /// in a triangle where `a` was the anchor and `c` was the last variable eliminated).
-fn verify_all_relations(
-    storage: &StorageEngine,
+async fn verify_all_relations(
+    write_path: &WritePath,
     adj_table_id: &TableId,
     plan: &WcoJoinPlan,
     var_bindings: &HashMap<String, Vec<u8>>,
@@ -431,8 +440,7 @@ fn verify_all_relations(
 
         // Check that src has an OUT edge to dst with the given label.
         let src_key = DecoratedKey::new(PartitionKey::new(src_bytes.clone()));
-        // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
-        let partition = storage.read(adj_table_id, &src_key).ok().flatten();
+        let partition = write_path.read(adj_table_id, &src_key).await.ok().flatten();
         let found = if let Some(p) = partition {
             stats.edges_read += 1;
             p.rows.iter().any(|row| {
@@ -455,8 +463,8 @@ fn verify_all_relations(
 }
 
 /// Project variable bindings into a result row according to the return clause.
-fn project_bindings(
-    storage: &StorageEngine,
+async fn project_bindings(
+    write_path: &WritePath,
     plan: &WcoJoinPlan,
     var_bindings: &HashMap<String, Vec<u8>>,
     return_clause: &ReturnClause,
@@ -471,8 +479,7 @@ fn project_bindings(
         if let Some(table) = plan.var_tables.get(var) {
             let table_id = TableId::new(&table.keyspace, &table.table);
             let dk = DecoratedKey::new(PartitionKey::new(key_bytes.clone()));
-            // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
-            let partition = storage.read(&table_id, &dk)?;
+            let partition = write_path.read(&table_id, &dk).await?;
             stats.vertices_read += 1;
 
             let col_names =
