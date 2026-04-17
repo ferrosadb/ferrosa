@@ -288,6 +288,36 @@ impl SSTableWriter {
             &self.header.regular_columns
         };
         let num_columns = column_defs.len();
+
+        // P0 correctness: every cell's col_idx must be in range for the header's
+        // column set, and col_idx values must be unique within a row. If either
+        // invariant is violated, the writer's bitmap (built from a HashSet) will
+        // under-count cells relative to the body bytes written, producing an
+        // SSTable where the reader's parse-position drifts row-over-row until
+        // it hits a byte with bit-0 set and terminates the partition early.
+        // That manifests on disk as "corrupted DeletionTime flags" warnings
+        // with silent data loss for every row after the first drift.
+        for (i, (idx, _)) in row.cells.iter().enumerate() {
+            assert!(
+                (*idx as usize) < num_columns,
+                "SSTable writer: cell col_idx {} is out of range (num_columns={}). \
+                 Serializing would produce a silently corrupt SSTable.",
+                idx,
+                num_columns
+            );
+            if i > 0 {
+                let prev = row.cells[i - 1].0;
+                assert!(
+                    *idx > prev,
+                    "SSTable writer: row.cells must be strictly sorted by col_idx \
+                     with no duplicates (found {} after {}). Duplicates would cause \
+                     the bitmap to under-count the body, producing a silently \
+                     corrupt SSTable.",
+                    idx,
+                    prev
+                );
+            }
+        }
         let all_present = row.cells.len() == num_columns
             && row
                 .cells
@@ -1746,5 +1776,360 @@ mod tests {
             row.clustering, ck,
             "multi-column CK bytes must roundtrip through write→read"
         );
+    }
+
+    /// P0 data-loss regression: if a row has a cell whose col_idx is
+    /// out-of-range relative to the header's regular_columns, the writer's
+    /// HashSet-based bitmap silently drops that cell from the bitmap but
+    /// still serializes the cell bytes to the body. Reader then under-reads
+    /// by one cell, and subsequent rows/partitions drift. This is the
+    /// suspected root cause of entity_store's 83% silent data-loss on
+    /// fresh clusters.
+    ///
+    /// Either the writer must reject out-of-range col_idx at write time
+    /// (fail loud), or serialize only the in-range cells.
+    #[test]
+    fn writer_rejects_cell_with_out_of_range_column_index() {
+        let header = test_header(); // single regular column `val` (idx 0)
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let timestamp = 1_000_042i64;
+        // Row with a legit cell (col 0) and a bogus out-of-range cell (col 99).
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![0x00, 0x00, 0x00, 0x01],
+                cells: vec![
+                    (0, CellValue::live(b"hello".to_vec(), timestamp)),
+                    (99, CellValue::live(b"garbage".to_vec(), timestamp)),
+                ],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            }],
+        };
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        // Must either return an error or panic — silent acceptance is the
+        // bug we're fixing.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.add_partition(&partition)
+        }));
+        match result {
+            Ok(Ok(())) => panic!(
+                "writer silently accepted cell with col_idx=99 when num_columns=1; \
+                 this produces a silently corrupt SSTable (the exact P0 we are chasing)"
+            ),
+            Ok(Err(_)) | Err(_) => {
+                // Either a Result error or a panic is acceptable — the point
+                // is the writer must NOT silently accept the corrupt input.
+            }
+        }
+    }
+
+    /// P0 alt hypothesis: duplicate col_idx in row.cells also produces a
+    /// bitmap that under-counts cells vs. body length. The HashSet-based
+    /// `present_set` dedupes duplicates, but the cell-serialization loop
+    /// writes every entry in `row.cells`.
+    #[test]
+    fn writer_rejects_duplicate_column_index_cells() {
+        // 7-column header matching entity_store shape
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.UUIDType".into()],
+            static_columns: vec![],
+            regular_columns: (0..7)
+                .map(|i| {
+                    (
+                        format!("col{i}").into_bytes(),
+                        "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                    )
+                })
+                .collect(),
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        let ts = 1_000_042i64;
+        // Duplicate col_idx=3 (empty + long value).
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: [0xAAu8; 16].to_vec(),
+                cells: vec![
+                    (0, CellValue::live(b"name".to_vec(), ts)),
+                    (1, CellValue::live(b"type".to_vec(), ts)),
+                    (3, CellValue::live(b"".to_vec(), ts)),
+                    (5, CellValue::live(vec![0x3f, 0x80, 0x00, 0x00], ts)),
+                    (6, CellValue::live(b"12345678".to_vec(), ts)),
+                    (3, CellValue::live(b"long context snippet".to_vec(), ts)),
+                ],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+        };
+
+        let mut writer = SSTableWriter::new(options, header.clone());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.add_partition(&partition)
+        }));
+        match result {
+            Ok(Ok(())) => panic!(
+                "writer silently accepted row.cells with duplicate col_idx=3; \
+                 body written has more cells than bitmap bits set → silent SSTable corruption"
+            ),
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+
+    /// P0 data-loss regression: parameterized round-trip for entity_store-shaped
+    /// partitions. Schema: PK=(uuid,uuid), CK=uuid, regular columns mix text
+    /// (variable-length) + vector<float,N> (large variable-length). Production
+    /// writes multiple entities per session, producing multi-row partitions.
+    ///
+    /// The hypothesis under test: the SSTable writer serializes row bodies
+    /// with sizes that drift against what the reader consumes, so the first
+    /// partition parses fine but later rows/partitions trip
+    /// `corrupted DeletionTime flags: 0xNN`.
+    ///
+    /// Cases vary:
+    ///   - rows per partition: 1, 2, 5
+    ///   - partitions per SSTable: 1, 3
+    ///   - cell value size per row: small (64B) and large (3072B ≈ 768-dim f32 vector)
+    #[test]
+    fn multi_row_partition_roundtrip_entity_store_shape() {
+        // entity_store shape: PK (tenant_id uuid, session_id uuid), CK entity_id uuid,
+        // regular columns: entity_name text, entity_type text, embedding (3072B blob)
+        let header = SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                org.apache.cassandra.db.marshal.UUIDType,\
+                org.apache.cassandra.db.marshal.UUIDType)"
+                .into(),
+            clustering_types: vec!["org.apache.cassandra.db.marshal.UUIDType".into()],
+            static_columns: vec![],
+            regular_columns: vec![
+                (
+                    b"entity_name".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"entity_type".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"embedding".to_vec(),
+                    "org.apache.cassandra.db.marshal.BytesType".into(),
+                ),
+            ],
+        };
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size: 65536,
+        };
+
+        // Composite PK encoding: [u16 len][bytes][0x00] per component.
+        fn make_composite_pk(part1: &[u8], part2: &[u8]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&(part1.len() as u16).to_be_bytes());
+            buf.extend_from_slice(part1);
+            buf.push(0x00);
+            buf.extend_from_slice(&(part2.len() as u16).to_be_bytes());
+            buf.extend_from_slice(part2);
+            buf.push(0x00);
+            buf
+        }
+
+        // Parameterize: (num_partitions, rows_per_partition, cell_size, present_cells_bitmask)
+        // bitmask: which of the 3 regular columns to include per row (1=col0, 2=col1, 4=col2)
+        //   0b111 = all 3 columns → HAS_ALL_COLUMNS path
+        //   0b101, 0b110, 0b011, 0b001 etc. = sparse → missing-column bitmap path
+        let cases: &[(usize, usize, usize, u8)] = &[
+            (1, 1, 64, 0b111),
+            (1, 2, 64, 0b111),
+            (1, 5, 64, 0b111),
+            (1, 1, 3072, 0b111),
+            (1, 2, 3072, 0b111),
+            (1, 5, 3072, 0b111),
+            (3, 1, 64, 0b111),
+            (3, 2, 64, 0b111),
+            (3, 5, 64, 0b111),
+            (3, 2, 3072, 0b111),
+            (3, 5, 3072, 0b111),
+            // Sparse cases (missing-column bitmap path)
+            (1, 2, 64, 0b101),
+            (1, 2, 64, 0b110),
+            (1, 2, 64, 0b011),
+            (1, 5, 64, 0b001),
+            (3, 3, 64, 0b101),
+            (3, 3, 3072, 0b101),
+            (3, 5, 3072, 0b011),
+        ];
+
+        for &(num_partitions, rows_per_partition, cell_size, mask) in cases {
+            let timestamp = 1_000_100i64;
+
+            // Build partitions in sorted-by-key order (required by SSTableWriter).
+            let mut partitions: Vec<Partition> = (0..num_partitions)
+                .map(|p_idx| {
+                    let tenant_id = [0x11u8; 16];
+                    let mut session_id = [0x22u8; 16];
+                    session_id[15] = p_idx as u8;
+                    let pk = make_composite_pk(&tenant_id, &session_id);
+
+                    let rows: Vec<Row> = (0..rows_per_partition)
+                        .map(|r_idx| {
+                            let mut entity_id = [0xAAu8; 16];
+                            entity_id[15] = r_idx as u8;
+
+                            // entity_name: short text
+                            let name = format!("entity_{:04}", r_idx).into_bytes();
+                            // entity_type: short text
+                            let etype = b"concept".to_vec();
+                            // embedding: deterministic blob of cell_size bytes
+                            let embedding: Vec<u8> = (0..cell_size)
+                                .map(|i| ((i + r_idx + p_idx) % 256) as u8)
+                                .collect();
+
+                            let mut cells: Vec<(u16, CellValue)> = Vec::new();
+                            if mask & 0b001 != 0 {
+                                cells.push((0, CellValue::live(name, timestamp)));
+                            }
+                            if mask & 0b010 != 0 {
+                                cells.push((1, CellValue::live(etype, timestamp)));
+                            }
+                            if mask & 0b100 != 0 {
+                                cells.push((2, CellValue::live(embedding, timestamp)));
+                            }
+
+                            Row {
+                                clustering: entity_id.to_vec(),
+                                cells,
+                                deletion: DeletionTime::LIVE,
+                                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+                            }
+                        })
+                        .collect();
+
+                    Partition {
+                        key: DecoratedKey::new(PartitionKey::new(pk)),
+                        deletion: DeletionTime::LIVE,
+                        static_row: None,
+                        rows,
+                    }
+                })
+                .collect();
+            partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+            // Snapshot expected content for comparison.
+            let expected = partitions.clone();
+
+            let mut writer = SSTableWriter::new(options.clone(), header.clone());
+            for p in &partitions {
+                writer.add_partition(p).unwrap();
+            }
+            let output = writer.finish().unwrap();
+
+            // Sequential read must recover every partition and every row
+            // byte-for-byte.
+            let mut reader = DataReader::new(&output.data, &header, 0);
+            let mut read_back = Vec::new();
+            while let Some(p) = reader.read_partition().unwrap_or_else(|e| {
+                panic!(
+                    "read_partition failed for case \
+                     (np={}, rpp={}, cs={}, mask=0b{:03b}): {}",
+                    num_partitions, rows_per_partition, cell_size, mask, e
+                )
+            }) {
+                read_back.push(p);
+            }
+
+            assert_eq!(
+                read_back.len(),
+                expected.len(),
+                "case (np={}, rpp={}, cs={}, mask=0b{:03b}): partition count mismatch",
+                num_partitions,
+                rows_per_partition,
+                cell_size,
+                mask
+            );
+
+            for (exp, got) in expected.iter().zip(read_back.iter()) {
+                assert_eq!(
+                    got.key.key.as_bytes(),
+                    exp.key.key.as_bytes(),
+                    "case (np={}, rpp={}, cs={}): partition key mismatch",
+                    num_partitions,
+                    rows_per_partition,
+                    cell_size
+                );
+                assert_eq!(
+                    got.rows.len(),
+                    exp.rows.len(),
+                    "case (np={}, rpp={}, cs={}): row count mismatch",
+                    num_partitions,
+                    rows_per_partition,
+                    cell_size
+                );
+                for (r_idx, (exp_row, got_row)) in
+                    exp.rows.iter().zip(got.rows.iter()).enumerate()
+                {
+                    assert_eq!(
+                        got_row.clustering, exp_row.clustering,
+                        "case (np={}, rpp={}, cs={}): row {} clustering mismatch",
+                        num_partitions, rows_per_partition, cell_size, r_idx
+                    );
+                    assert_eq!(
+                        got_row.cells.len(),
+                        exp_row.cells.len(),
+                        "case (np={}, rpp={}, cs={}): row {} cell count mismatch",
+                        num_partitions,
+                        rows_per_partition,
+                        cell_size,
+                        r_idx
+                    );
+                    for (c_idx, ((g_col, g_cell), (e_col, e_cell))) in got_row
+                        .cells
+                        .iter()
+                        .zip(exp_row.cells.iter())
+                        .enumerate()
+                    {
+                        assert_eq!(
+                            g_col, e_col,
+                            "case (np={}, rpp={}, cs={}): row {} cell {} column idx",
+                            num_partitions, rows_per_partition, cell_size, r_idx, c_idx
+                        );
+                        assert_eq!(
+                            g_cell.value.as_deref(),
+                            e_cell.value.as_deref(),
+                            "case (np={}, rpp={}, cs={}): row {} cell {} value",
+                            num_partitions,
+                            rows_per_partition,
+                            cell_size,
+                            r_idx,
+                            c_idx
+                        );
+                    }
+                }
+            }
+        }
     }
 }

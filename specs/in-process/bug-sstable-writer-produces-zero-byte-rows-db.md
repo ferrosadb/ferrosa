@@ -175,26 +175,60 @@ cell packing) puts later `read_partition_header` reads at the wrong
 offset. The "corrupted DeletionTime flags" byte is whatever happened to
 be at that drifted offset.
 
-## Narrowed hypotheses
+## Root cause (identified 2026-04-17)
 
-1. 0-byte Rows.db and Data.db drift share a root cause: the flush
-   codepath that emitted an empty Rows.db may also be miscomputing
-   row-body sizes in Data.db.
-2. Row-body size prefix is off by one (e.g., forgot to include an
-   extended_flags byte). Per-row drift compounds across rows.
-3. `split_u16_prefixed` multi-column CK encoding mismatches the reader
-   for text / variable-length components.
-4. `END_OF_PARTITION` marker collision — some row's flags byte happens
-   to equal the sentinel, terminating the partition early.
+**Schema drift between ALTER TABLE and the storage engine.** Flow:
 
-## Starter TDD plan
+1. `register_table_inner` (engine.rs:789) captures `state.schema` and
+   `TableStore.schema` at table-creation time.
+2. `ALTER TABLE ADD COLUMN` applies via `RaftOp::AlterTable`
+   (raft/state_machine.rs:405) which updates the cluster-level schema
+   (`schema.alter_table_internal`) but **does not** propagate to
+   `state.schema` or `TableStore.schema`. `register_table_inner` is a
+   no-op when the table exists (engine.rs:796-799), and there is no
+   other mutation path — `grep "state.schema ="` returns zero hits.
+3. The CQL bridge learns the new schema via `schema.alter_table_internal`
+   and emits writes with `col_idx` values for post-ALTER columns.
+4. Those writes land in the memtable untouched.
+5. At flush, `TableStore.flush` calls `build_serialization_header(
+   &self.schema, &partitions)` (store.rs:462) with the **stale**
+   pre-ALTER schema. Header's `regular_columns.len()` is too small
+   for the new cells.
+6. `SSTableWriter::serialize_row` built its missing-column bitmap
+   from a `HashSet<col_idx>` but then iterated all cells in order,
+   writing the body bytes for every cell — including those whose
+   `col_idx >= num_columns` that the bitmap could not represent. Body
+   size is correct; the bitmap is a subset of the body.
+7. The reader reads bitmap bits, consumes exactly that many cells,
+   and leaves the remainder of the body unparsed. Its position is
+   now inside real cell bytes. It interprets subsequent bytes as the
+   next row's flags byte, eventually hitting a byte with bit 0 set
+   and terminating the partition early — or drifting far enough to
+   misread a partition header and report "corrupted DeletionTime flags".
 
-1. Red: parameterized round-trip test — build a Partition with N live
-   rows (N = 0, 1, 2, many), variable CK component counts/types, write
-   via `SSTableWriter`, read via `read_all_partitions`, assert parity.
-2. Expect at least one parameter combination to fail with "corrupted
-   DeletionTime flags". That narrows the root cause.
-3. Green once the failing configuration is understood.
+Confirmed by `ferrosa-sstable/tests/p0_production_disk_replay.rs` on
+the on-disk files under `~/data/ferrosa-memory/node1/sstables/
+agent_memory.entity_store/` (the 8 `ALTER TABLE ADD` statements in
+`ferrosa-memory/ddl/020_rich_entity_schema.cql` line up exactly with
+the 7-vs-15 column gap observed in the on-disk bitmaps).
+
+## Fix in progress
+
+**Writer (landed):** fail loud when handed any row whose cells contain
+an out-of-range or duplicate `col_idx`. Replaces the silent-corruption
+path with an assert that fires at write time. See
+`ferrosa-sstable/src/writer.rs:293-321` and the two red regression tests
+(`writer_rejects_cell_with_out_of_range_column_index`,
+`writer_rejects_duplicate_column_index_cells`).
+
+**Upstream (to do):** wire `RaftOp::AlterTable` to update
+`TableStore.schema` (and `state.schema`). Requires making
+`TableStore.schema` interior-mutable (ArcSwap<Arc<TableSchema>> to match
+the `view` pattern) and exposing
+`StorageEngine::update_table_schema(table_id, new_schema)` called from
+the Raft apply path. Re-enable
+`engine::tests::read_survives_schema_evolution_across_sstables` once
+the upstream path is in place.
 
 ## Possibly Related
 
