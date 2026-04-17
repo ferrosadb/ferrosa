@@ -372,7 +372,7 @@ impl HintStore {
         }
         // Try to remove the peer directory itself (only succeeds if empty).
         if let Err(e) = fs::remove_dir(&pdir) {
-            eprintln!("[hints] failed to remove peer hint dir: {e}");
+            tracing::warn!(%e, "hints: failed to remove peer hint dir");
         }
 
         // Clear in-memory state.

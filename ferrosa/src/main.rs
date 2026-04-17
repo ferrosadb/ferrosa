@@ -73,7 +73,7 @@ fn load_or_generate_host_id_with(data_dir: &Path, env_override: Option<String>) 
     if let Some(id_str) = env_override {
         if let Ok(id) = Uuid::parse_str(&id_str) {
             if let Err(e) = std::fs::write(&path, id.to_string()) {
-                eprintln!("[startup] failed to persist host_id: {e}");
+                tracing::error!(%e, "startup: failed to persist host_id");
             }
             tracing::info!(%id, "using host_id from override");
             return id;
@@ -83,7 +83,7 @@ fn load_or_generate_host_id_with(data_dir: &Path, env_override: Option<String>) 
     // Generate new host_id and persist.
     let id = Uuid::new_v4();
     if let Err(e) = std::fs::write(&path, id.to_string()) {
-        eprintln!("[startup] failed to persist host_id: {e}");
+        tracing::error!(%e, "startup: failed to persist host_id");
     }
     tracing::info!(%id, "generated new host_id");
     id

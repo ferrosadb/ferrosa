@@ -123,7 +123,7 @@ impl DdlPath {
                 // (the DDL will be applied automatically but the client can't
                 // observe the result until formation completes).
                 if let Err(e) = queue.send(op) {
-                    eprintln!("[ddl] failed to enqueue DDL operation: {e}");
+                    tracing::error!(%e, "ddl: failed to enqueue DDL operation");
                 }
                 Err(ClusterError::Internal(
                     "DDL unavailable: cluster formation in progress, will be applied after leader election — retry shortly".into(),

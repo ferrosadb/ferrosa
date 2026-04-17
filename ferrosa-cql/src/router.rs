@@ -3614,10 +3614,11 @@ async fn route_create_index(
             if let Err(e) = state.engine.add_index(&table_id, &index_name, pos) {
                 // Log warning but don't fail — index is persisted in schema;
                 // it will be populated once the table is registered (e.g., on restart).
-                eprintln!(
-                    "[router] CREATE INDEX: failed to wire index '{index_name}' to \
-                     storage engine for table '{ks}.{}': {e}",
-                    s.table
+                tracing::warn!(
+                    %e,
+                    index_name,
+                    table = %format!("{ks}.{}", s.table),
+                    "router: CREATE INDEX failed to wire index to storage engine"
                 );
             }
         }

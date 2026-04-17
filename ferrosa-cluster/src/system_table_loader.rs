@@ -108,7 +108,7 @@ pub fn bootstrap_system_tables(
 
     // Step 4: Log divergences.
     for msg in &divergences {
-        eprintln!("[system-table-bootstrap] {msg}");
+        tracing::warn!("system-table-bootstrap: {msg}");
     }
 
     Ok(BootstrapReport {

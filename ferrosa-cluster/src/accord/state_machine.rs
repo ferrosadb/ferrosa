@@ -205,7 +205,7 @@ impl AccordStateMachine {
         };
         // Don't fail the protocol message on capacity errors, but log them.
         if let Err(e) = self.conflict_index.register(key, entry) {
-            eprintln!("[accord] conflict_index register failed: {e}");
+            tracing::error!(%e, "accord: conflict_index register failed");
         }
 
         // Create or update TxnState.
@@ -324,7 +324,7 @@ impl AccordStateMachine {
         let data = format!("Committed:{}:{}", txn_id.0.time, t.time);
         let sync_result = self.sync_writer.write_and_sync(data.as_bytes());
         if !sync_result.is_ok() {
-            eprintln!("[accord] sync_writer failed during commit — state may not be durable");
+            tracing::error!("accord: sync_writer failed during commit — state may not be durable");
         }
 
         // Track committed transaction.

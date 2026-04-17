@@ -56,7 +56,7 @@ impl CompactionExecutor {
                                 let _ = result_tx.send(CompactionResult { task, output });
                             }
                             Err(e) => {
-                                eprintln!("[compaction] task failed: {e}");
+                                tracing::error!(%e, "compaction: task failed");
                             }
                         },
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -117,10 +117,10 @@ impl CompactionExecutor {
         use ferrosa_sstable::WriteOptions;
         use std::collections::BTreeMap;
 
-        eprintln!(
-            "[compaction] starting task for {}: {} inputs",
-            task.table_id,
-            task.inputs.len()
+        tracing::info!(
+            table_id = %task.table_id,
+            inputs = task.inputs.len(),
+            "compaction: starting task"
         );
 
         // 1. Read all partitions from each input SSTable.
@@ -141,8 +141,11 @@ impl CompactionExecutor {
 
             let data_path = dir.join(format!("{gen}-Data.db"));
             let data_file_size = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
-            eprintln!(
-                "[compaction] reading input SSTable {gen}: Data.db={data_file_size} bytes, path={data_path:?}"
+            tracing::info!(
+                %gen,
+                data_file_size,
+                path = ?data_path,
+                "compaction: reading input SSTable"
             );
             match std::fs::metadata(&data_path) {
                 Ok(meta) if meta.len() == 0 => {
@@ -188,10 +191,11 @@ impl CompactionExecutor {
 
             let input_row_count: usize = partitions.iter().map(|p| p.rows.len()).sum();
             total_input_rows += input_row_count;
-            eprintln!(
-                "[compaction]   input SSTable {gen}: {} partitions, {} rows",
-                partitions.len(),
-                input_row_count
+            tracing::info!(
+                %gen,
+                partitions = partitions.len(),
+                rows = input_row_count,
+                "compaction: input SSTable stats"
             );
 
             for p in partitions {
@@ -202,10 +206,10 @@ impl CompactionExecutor {
             }
         }
 
-        eprintln!(
-            "[compaction] total input: {} unique partition keys, {} total rows across all inputs",
-            all_partitions.len(),
-            total_input_rows
+        tracing::info!(
+            unique_keys = all_partitions.len(),
+            total_input_rows,
+            "compaction: total input summary"
         );
 
         // 2. Merge partitions with the same key.
@@ -218,19 +222,18 @@ impl CompactionExecutor {
         merged.sort_by(|a, b| a.key.cmp(&b.key));
 
         let merged_row_count: usize = merged.iter().map(|p| p.rows.len()).sum();
-        eprintln!(
-            "[compaction] after merge: {} partitions, {} rows (input had {})",
-            merged.len(),
+        tracing::info!(
+            partitions = merged.len(),
             merged_row_count,
-            total_input_rows
+            total_input_rows,
+            "compaction: after merge"
         );
         if merged_row_count < total_input_rows {
-            eprintln!(
-                "[compaction] WARNING: merge reduced rows from {} to {} — \
-                 {} rows lost during merge (may be deletions or LWW overwrites)",
+            tracing::warn!(
                 total_input_rows,
                 merged_row_count,
-                total_input_rows - merged_row_count
+                lost = total_input_rows - merged_row_count,
+                "compaction: merge reduced rows (may be deletions or LWW overwrites)"
             );
         }
 
@@ -240,9 +243,10 @@ impl CompactionExecutor {
 
         // 4. Build serialization header and write output SSTable.
         let header = flush::build_serialization_header(&task.schema, &merged);
-        eprintln!(
-            "[compaction] header: min_ts={}, max_ts={}",
-            header.min_timestamp, header.max_timestamp
+        tracing::info!(
+            min_ts = header.min_timestamp,
+            max_ts = header.max_timestamp,
+            "compaction: serialization header"
         );
         let header_min_ts = header.min_timestamp;
         let header_max_ts = header.max_timestamp;
@@ -272,13 +276,12 @@ impl CompactionExecutor {
             .map_err(|e| format!("CORRUPTION: output SSTable readback failed: {e}"))?;
         let readback_row_count: usize = readback_partitions.iter().map(|p| p.rows.len()).sum();
         if readback_partitions.len() != merged.len() || readback_row_count != merged_row_count {
-            eprintln!(
-                "[compaction] CORRUPTION DETECTED: wrote {} partitions/{} rows, \
-                 readback got {} partitions/{} rows",
-                merged.len(),
-                merged_row_count,
-                readback_partitions.len(),
-                readback_row_count
+            tracing::error!(
+                written_partitions = merged.len(),
+                written_rows = merged_row_count,
+                readback_partitions = readback_partitions.len(),
+                readback_rows = readback_row_count,
+                "compaction: CORRUPTION DETECTED in output SSTable"
             );
             return Err(format!(
                 "compaction output SSTable is corrupt: expected {} partitions/{} rows, \
@@ -289,10 +292,10 @@ impl CompactionExecutor {
                 readback_row_count
             ));
         }
-        eprintln!(
-            "[compaction] output verified: {} partitions, {} rows (matches merge)",
-            readback_partitions.len(),
-            readback_row_count
+        tracing::info!(
+            partitions = readback_partitions.len(),
+            rows = readback_row_count,
+            "compaction: output verified (matches merge)"
         );
 
         let gen = flush_target.generation();
