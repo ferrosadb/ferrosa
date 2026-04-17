@@ -236,6 +236,24 @@ pub async fn route(
         _ => CqlOpcode::Other,
     };
 
+    // Check if this statement requires Accord consensus (LWT).
+    // Determined by serial_consistency being set in the request context.
+    {
+        use crate::accord_router::{route_decision, RouteDecision, RoutingMode};
+        let mode = match &**state.cluster_state.load() {
+            ferrosa_cluster::ClusterStateHolder::Standalone => RoutingMode::Standalone,
+            _ => RoutingMode::Cluster,
+        };
+        if route_decision(mode, &stmt, ctx.serial_consistency) == RouteDecision::Accord {
+            // TODO(S3): Execute through AccordCoordinator instead of WritePath.
+            // For now, fall through to the existing CL-based path and log.
+            tracing::info!(
+                ?opcode,
+                "LWT statement detected — Accord consensus required (falling through to CL path)"
+            );
+        }
+    }
+
     let result = match stmt {
         Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
         Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),

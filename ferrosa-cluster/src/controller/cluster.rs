@@ -441,6 +441,7 @@ impl ModeController {
         // The AccordHandler dispatches to a shared AccordStateMachine. Response
         // types (PreAcceptOK, AcceptOK, ReadOK, ApplyOK, RecoverOK) are sent
         // back by the coordinator, not received as RPC requests.
+        let accord_state_for_maintenance;
         {
             use crate::accord::handlers::{AccordHandler, AccordState};
             use crate::accord::state_machine::AccordStateMachine;
@@ -463,6 +464,7 @@ impl ModeController {
             let accord_state: AccordState = Arc::new(parking_lot::Mutex::new(
                 AccordStateMachine::new(uuid_to_node_id(self.local_host_id), sync_writer),
             ));
+            accord_state_for_maintenance = accord_state.clone();
 
             let accord_handler = Arc::new(AccordHandler::new(
                 accord_state,
@@ -541,6 +543,7 @@ impl ModeController {
         // DepWaitGraph entries, and logs memory usage for leak detection.
         {
             let storage = self.storage.clone();
+            let accord_state = accord_state_for_maintenance;
             self.spawn_tracked(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
@@ -555,11 +558,23 @@ impl ModeController {
                         );
                     }
 
+                    // Prune applied Accord transactions to prevent unbounded
+                    // memory growth in txn_states and committed_txns.
+                    let pruned = {
+                        let mut sm = accord_state.lock();
+                        sm.prune_applied()
+                    };
+                    if pruned > 0 {
+                        tracing::info!(pruned, "maintenance: pruned applied Accord transactions");
+                    }
+
                     // Log table-level memory stats.
                     let table_count = storage.table_count();
+                    let accord_txns = accord_state.lock().txn_count();
                     tracing::info!(
                         table_count,
                         closed_buf_bytes,
+                        accord_txns,
                         "maintenance: periodic memory check"
                     );
                 }
