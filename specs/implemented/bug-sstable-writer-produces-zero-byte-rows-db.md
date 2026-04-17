@@ -5,7 +5,7 @@ reported-by: ferrosa-memory codebase ingest (2026-04-17)
 implemented-by: ""
 verified-by: ""
 created: 2026-04-17
-updated: 2026-04-17
+updated: 2026-04-18
 ---
 
 # SSTable writer produces 0-byte `Rows.db` — reader then parses corrupt DeletionTime flags
@@ -212,23 +212,37 @@ agent_memory.entity_store/` (the 8 `ALTER TABLE ADD` statements in
 `ferrosa-memory/ddl/020_rich_entity_schema.cql` line up exactly with
 the 7-vs-15 column gap observed in the on-disk bitmaps).
 
-## Fix in progress
+## Implementation Notes
 
-**Writer (landed):** fail loud when handed any row whose cells contain
-an out-of-range or duplicate `col_idx`. Replaces the silent-corruption
-path with an assert that fires at write time. See
-`ferrosa-sstable/src/writer.rs:293-321` and the two red regression tests
-(`writer_rejects_cell_with_out_of_range_column_index`,
-`writer_rejects_duplicate_column_index_cells`).
+Two-layer fix:
 
-**Upstream (to do):** wire `RaftOp::AlterTable` to update
-`TableStore.schema` (and `state.schema`). Requires making
-`TableStore.schema` interior-mutable (ArcSwap<Arc<TableSchema>> to match
-the `view` pattern) and exposing
-`StorageEngine::update_table_schema(table_id, new_schema)` called from
-the Raft apply path. Re-enable
-`engine::tests::read_survives_schema_evolution_across_sstables` once
-the upstream path is in place.
+1. `ferrosa-sstable/src/writer.rs` — `serialize_row` asserts each cell's
+   `col_idx` is in range for the header and that cells are strictly
+   sorted by `col_idx`. Any violation is a hard fail at write time
+   instead of producing silently corrupt SSTables.
+2. `ferrosa-storage/src/store.rs` — `TableStore.schema` is now
+   `ArcSwap<TableSchema>`; new `update_schema` method atomically swaps
+   the schema. `ferrosa-storage/src/engine.rs` exposes
+   `StorageEngine::update_table_schema(tid, new_schema)` that updates
+   both `TableState.schema` and `TableStore.schema`.
+3. All `AlterTable` apply paths
+   (`ferrosa-cluster/src/raft/state_machine.rs`,
+   `ferrosa-cluster/src/ddl_path.rs`,
+   `ferrosa-cluster/src/pair/ddl.rs`) now call
+   `engine.update_table_schema` with the post-ALTER `to_storage_schema()`
+   so subsequent flushes build the correct `SerializationHeader`.
+
+Regression coverage:
+
+- `ferrosa-sstable/src/writer.rs`: `writer_rejects_cell_with_out_of_range_column_index`
+  and `writer_rejects_duplicate_column_index_cells`.
+- `ferrosa-sstable/tests/p0_production_disk_replay.rs`: diagnostic
+  replay of on-disk corrupt SSTables (ignored by default).
+- `ferrosa-storage/src/engine.rs::tests::read_survives_schema_evolution_across_sstables`:
+  re-enabled and green; exercises the post-ALTER path with explicit
+  `engine.update_table_schema`.
+- `ferrosa-cluster/src/ddl_path.rs::tests::direct_alter_table_propagates_schema_to_storage`:
+  end-to-end DDL→write→ALTER→write→flush→read.
 
 ## Possibly Related
 

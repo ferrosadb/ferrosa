@@ -73,7 +73,12 @@ struct StoreView<R: ReadAt + Send + Sync + 'static> {
 /// production). `F::Reader` must be `ReadAt + Send + Sync + 'static`
 /// so the resulting `SSTableReader` can be held inside the shared view.
 pub struct TableStore<F: FlushTarget> {
-    schema: TableSchema,
+    /// Current schema for this table. Wrapped in `ArcSwap` so `ALTER TABLE`
+    /// can atomically swap in a new schema without blocking reads, writes,
+    /// or in-flight flushes. Prior to this indirection, `ALTER TABLE ADD
+    /// COLUMN` left the schema stale and the flush path produced silently
+    /// corrupt SSTables (bug-sstable-writer-produces-zero-byte-rows-db.md).
+    schema: ArcSwap<TableSchema>,
     view: ArcSwap<StoreView<F::Reader>>,
     /// Serializes concurrent flushes. The read/write paths never touch this.
     flush_guard: Mutex<()>,
@@ -163,7 +168,7 @@ impl<F: FlushTarget> TableStore<F> {
             sidecar_indexes: Arc::new(vec![]),
         };
         Self {
-            schema,
+            schema: ArcSwap::from_pointee(schema),
             view: ArcSwap::from_pointee(initial_view),
             flush_guard: Mutex::new(()),
             flush_target,
@@ -234,7 +239,7 @@ impl<F: FlushTarget> TableStore<F> {
             sidecar_indexes: Arc::new(sidecars),
         };
         Self {
-            schema,
+            schema: ArcSwap::from_pointee(schema),
             view: ArcSwap::from_pointee(initial_view),
             flush_guard: Mutex::new(()),
             flush_target,
@@ -245,6 +250,22 @@ impl<F: FlushTarget> TableStore<F> {
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Atomically swap in a new schema. Called when `ALTER TABLE` mutates
+    /// the set of columns so that subsequent flushes build the
+    /// `SerializationHeader` with up-to-date `num_columns`, avoiding the
+    /// writer's out-of-range-col_idx panic
+    /// (see bug-sstable-writer-produces-zero-byte-rows-db.md).
+    pub fn update_schema(&self, new_schema: TableSchema) {
+        self.schema.store(Arc::new(new_schema));
+    }
+
+    /// Return a guard over the current schema. Holding the guard keeps the
+    /// schema `Arc` alive; `ALTER TABLE` can still swap in a new schema
+    /// concurrently.
+    pub fn schema(&self) -> arc_swap::Guard<Arc<TableSchema>> {
+        self.schema.load()
     }
 
     /// Write a row into the active memtable and update secondary indexes.
@@ -283,7 +304,8 @@ impl<F: FlushTarget> TableStore<F> {
         // write to the current active, not a stale one.
         let _wb = self.write_barrier.read();
         let current = self.view.load();
-        current.active.put(key, row, &self.schema)
+        let schema = self.schema.load();
+        current.active.put(key, row, &schema)
     }
 
     /// Read a partition by merging all sources: active memtable, flushing
@@ -459,7 +481,8 @@ impl<F: FlushTarget> TableStore<F> {
         let mut options = self.options.clone();
         options.compression = None;
 
-        let header = flush::build_serialization_header(&self.schema, &partitions);
+        let schema = self.schema.load();
+        let header = flush::build_serialization_header(&schema, &partitions);
         let mut writer = SSTableWriter::new(options, header);
         for p in &partitions {
             writer.add_partition(p)?;
@@ -547,6 +570,7 @@ impl<F: FlushTarget> TableStore<F> {
         let late_partitions = old_active.snapshot();
         if late_partitions.len() > partitions.len() {
             let current_view = self.view.load();
+            let schema = self.schema.load();
             // The original partitions were sorted by key. Build a set of flushed keys.
             let flushed_keys: std::collections::BTreeSet<_> =
                 partitions.iter().map(|p| &p.key).collect();
@@ -554,7 +578,7 @@ impl<F: FlushTarget> TableStore<F> {
                 if !flushed_keys.contains(&p.key) {
                     // Late write — replay to the current active memtable.
                     for row in &p.rows {
-                        if let Err(e) = current_view.active.put(&p.key, row.clone(), &self.schema) {
+                        if let Err(e) = current_view.active.put(&p.key, row.clone(), &schema) {
                             tracing::error!(%e, "flush: late-writer replay put failed");
                         }
                     }

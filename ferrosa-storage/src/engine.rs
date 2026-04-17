@@ -863,6 +863,30 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Updates the schema for a registered table after `ALTER TABLE`.
+    ///
+    /// Propagates the new schema both to `TableState.schema` (used by
+    /// compaction/snapshot paths) and `TableStore.schema` (used by the flush
+    /// path's `SerializationHeader`). Without this, `ALTER TABLE ADD COLUMN`
+    /// left the storage engine with a stale column list and the flush path
+    /// produced silently corrupt SSTables. See
+    /// `specs/in-process/bug-sstable-writer-produces-zero-byte-rows-db.md`.
+    ///
+    /// Returns `Err` if the table is not registered.
+    pub fn update_table_schema(
+        &self,
+        table_id: &TableId,
+        new_schema: TableSchema,
+    ) -> ferrosa_common::Result<()> {
+        let mut tables = self.tables.write();
+        let state = tables.get_mut(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state.schema = new_schema.clone();
+        state.store.update_schema(new_schema);
+        Ok(())
+    }
+
     /// Unregisters a table from the storage engine.
     ///
     /// Removes the `TableState` from the engine's table map AND deletes the
@@ -6851,10 +6875,6 @@ mod tests {
     /// FMEA #9: Write data, flush, ALTER TABLE ADD column, write more,
     /// flush again, read back — old SSTables should still be readable.
     #[test]
-    #[ignore = "P0 bug-sstable-writer-produces-zero-byte-rows-db: flush uses stale \
-                TableStore.schema after simulated ALTER TABLE ADD column. The writer \
-                now fails loud on out-of-range cells (ferrosa-sstable/src/writer.rs) — \
-                re-enable once ALTER TABLE propagates to storage-engine state.schema."]
     fn read_survives_schema_evolution_across_sstables() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig {
@@ -6876,7 +6896,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        engine.register_table(schema).unwrap();
+        engine.register_table(schema.clone()).unwrap();
         let tid = TableId::new("test_ks", "evolving");
 
         // Write row with 1 column, flush to SSTable
@@ -6890,7 +6910,21 @@ mod tests {
         engine.write(&tid, &key1, row1, 1000).unwrap();
         engine.flush_all().unwrap();
 
-        // "ALTER TABLE ADD" — write row with 2 columns (cell index 0 and 1)
+        // "ALTER TABLE ADD" — propagate the post-ALTER schema to the storage
+        // engine so flush builds the SerializationHeader with the correct
+        // num_columns. Without this, the writer's fail-loud assertion
+        // (ferrosa-sstable/src/writer.rs) catches the col_idx-out-of-range
+        // case and panics. Bug:
+        // specs/implemented/bug-sstable-writer-produces-zero-byte-rows-db.md.
+        let mut schema_v2 = schema;
+        schema_v2
+            .regular_columns
+            .push(ferrosa_common::ColumnDefinition {
+                name: "extra".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            });
+        engine.update_table_schema(&tid, schema_v2).unwrap();
+
         let key2 = DecoratedKey::new(PartitionKey::new(2i32.to_be_bytes().to_vec()));
         let row2 = Row {
             clustering: vec![],

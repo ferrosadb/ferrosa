@@ -199,6 +199,16 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &StorageEngine) -> R
             schema
                 .alter_table_internal(keyspace, table, *updates.clone())
                 .map_err(|e| ClusterError::Internal(format!("alter_table: {e}")))?;
+            // Propagate the post-ALTER column set to the storage engine so
+            // flush builds the SerializationHeader with the correct column
+            // list. See bug-sstable-writer-produces-zero-byte-rows-db.md.
+            let snap = schema.snapshot();
+            if let Some(tbl) = snap.tables.get(&(keyspace.clone(), table.clone())) {
+                let tid = ferrosa_storage::TableId::new(keyspace, table);
+                engine
+                    .update_table_schema(&tid, tbl.to_storage_schema())
+                    .map_err(ClusterError::Storage)?;
+            }
         }
         DdlOperation::CreateRole(role) => {
             schema
@@ -989,6 +999,111 @@ mod tests {
             .snapshot()
             .tables
             .contains_key(&("dtks".into(), "tbl".into())));
+    }
+
+    /// End-to-end P0 regression for
+    /// bug-sstable-writer-produces-zero-byte-rows-db.md: create a table, write
+    /// a row, ALTER TABLE ADD COLUMN, write a row that uses the new column,
+    /// flush, and read both rows back. Without the storage-engine schema
+    /// propagation the second write would either drift cell parsing (old bug)
+    /// or hit the writer's fail-loud assertion (new bug). Both must be fixed.
+    #[tokio::test]
+    async fn direct_alter_table_propagates_schema_to_storage() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_schema::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
+        use ferrosa_schema::metadata::table::TableUpdates;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let engine = test_storage(dir.path());
+
+        let ddl = DdlPath::Direct {
+            schema: schema.clone(),
+            engine: engine.clone(),
+        };
+
+        // Create keyspace + table with a single regular column.
+        ddl.execute(DdlOperation::CreateKeyspace(simple_keyspace("ks")))
+            .await
+            .unwrap();
+        let mut table = simple_table("ks", "evolving");
+        table.columns.insert(
+            "v".into(),
+            ColumnMetadata {
+                name: "v".into(),
+                kind: ColumnKind::Regular,
+                position: 1,
+                column_type: "text".into(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        ddl.execute(DdlOperation::CreateTable(Box::new(table)))
+            .await
+            .unwrap();
+
+        let tid = ferrosa_storage::TableId::new("ks", "evolving");
+
+        // Write a row with the single regular column and flush.
+        let key1 = DecoratedKey::new(PartitionKey::new(
+            uuid::Uuid::new_v4().as_bytes().to_vec(),
+        ));
+        let row1 = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"before".to_vec(), 1_000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1_000),
+        };
+        engine.write(&tid, &key1, row1, 1_000).unwrap();
+        engine.flush_all().unwrap();
+
+        // ALTER TABLE ADD extra text column.
+        ddl.execute(DdlOperation::AlterTable {
+            keyspace: "ks".into(),
+            table: "evolving".into(),
+            updates: Box::new(TableUpdates {
+                params: None,
+                add_columns: vec![ColumnMetadata {
+                    name: "extra".into(),
+                    kind: ColumnKind::Regular,
+                    position: 2,
+                    column_type: "text".into(),
+                    clustering_order: ClusteringOrder::None,
+                    mask: None,
+                }],
+                drop_columns: vec![],
+                extensions: None,
+            }),
+        })
+        .await
+        .unwrap();
+
+        // Write a row that includes the newly-added column. Pre-fix, flush would
+        // produce a silently corrupt SSTable (cell col_idx=1 with num_columns=1).
+        // Post-fix, the propagated schema gives num_columns=2 and flush succeeds.
+        let key2 = DecoratedKey::new(PartitionKey::new(
+            uuid::Uuid::new_v4().as_bytes().to_vec(),
+        ));
+        let row2 = Row {
+            clustering: vec![],
+            cells: vec![
+                (0, CellValue::live(b"after_v".to_vec(), 2_000)),
+                (1, CellValue::live(b"after_extra".to_vec(), 2_000)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(2_000),
+        };
+        engine.write(&tid, &key2, row2, 2_000).unwrap();
+        engine.flush_all().unwrap();
+
+        // Both rows must be readable.
+        let r1 = engine.read(&tid, &key1).unwrap();
+        assert!(r1.is_some(), "pre-ALTER row must survive");
+        let r2 = engine.read(&tid, &key2).unwrap();
+        assert!(r2.is_some(), "post-ALTER row must survive");
+        let r2_cells = &r2.unwrap().rows[0].cells;
+        assert_eq!(r2_cells.len(), 2, "post-ALTER row must have 2 cells");
     }
 
     #[tokio::test]

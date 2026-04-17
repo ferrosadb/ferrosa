@@ -407,29 +407,47 @@ impl FerrosStateMachine {
                 table,
                 updates,
             } => {
-                if let Some(tbl) = self
-                    .state
-                    .tables
-                    .get_mut(&(keyspace.clone(), table.clone()))
-                {
-                    if let Some(params) = &updates.params {
-                        tbl.params = params.clone();
-                    }
-                    for col in &updates.add_columns {
-                        tbl.columns.insert(col.name.clone(), col.clone());
-                    }
-                    for col_name in &updates.drop_columns {
-                        tbl.columns.shift_remove(col_name);
-                    }
-                    if let Some(extensions) = &updates.extensions {
-                        for (k, v) in extensions {
-                            tbl.extensions.insert(k.clone(), v.clone());
+                let new_storage_schema = {
+                    let tbl = self
+                        .state
+                        .tables
+                        .get_mut(&(keyspace.clone(), table.clone()));
+                    if let Some(tbl) = tbl {
+                        if let Some(params) = &updates.params {
+                            tbl.params = params.clone();
                         }
+                        for col in &updates.add_columns {
+                            tbl.columns.insert(col.name.clone(), col.clone());
+                        }
+                        for col_name in &updates.drop_columns {
+                            tbl.columns.shift_remove(col_name);
+                        }
+                        if let Some(extensions) = &updates.extensions {
+                            for (k, v) in extensions {
+                                tbl.extensions.insert(k.clone(), v.clone());
+                            }
+                        }
+                        Some(tbl.to_storage_schema())
+                    } else {
+                        None
                     }
-                }
+                };
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.alter_table_internal(&keyspace, &table, *updates) {
                         tracing::error!(%e, "Raft apply: schema.alter_table_internal failed");
+                    }
+                }
+                // Propagate the post-ALTER column set into the storage engine
+                // so subsequent flushes build the SSTable SerializationHeader
+                // with the correct num_columns. Without this, writes carrying
+                // newly-added column indices flush through a stale header
+                // whose regular_columns.len() is too small, and the writer's
+                // out-of-range-col_idx assertion would fire
+                // (bug-sstable-writer-produces-zero-byte-rows-db.md).
+                if let (Some(engine), Some(new_schema)) = (&self.engine, new_storage_schema) {
+                    let tid = TableId::new(&keyspace, &table);
+                    if let Err(e) = engine.update_table_schema(&tid, new_schema) {
+                        tracing::error!(%e, "Raft apply: update_table_schema failed — future flushes may be corrupt");
                     }
                 }
             }

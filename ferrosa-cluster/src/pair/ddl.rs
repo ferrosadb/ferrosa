@@ -252,6 +252,15 @@ impl DdlCoordinator {
                 self.schema
                     .alter_table_internal(keyspace, table, *updates.clone())
                     .map_err(|e| ClusterError::Internal(format!("alter_table: {e}")))?;
+                // Propagate the post-ALTER column set to the storage engine.
+                // See bug-sstable-writer-produces-zero-byte-rows-db.md.
+                let snap = self.schema.snapshot();
+                if let Some(tbl) = snap.tables.get(&(keyspace.clone(), table.clone())) {
+                    let tid = ferrosa_storage::TableId::new(keyspace, table);
+                    self.engine
+                        .update_table_schema(&tid, tbl.to_storage_schema())
+                        .map_err(ClusterError::Storage)?;
+                }
             }
             DdlOperation::CreateRole(role) => {
                 self.schema
