@@ -1,37 +1,72 @@
 //! Import data from a Cassandra SSTable into Ferrosa storage.
 //!
-//! Usage: `ferrosa-sstable-import <path-to-sstable-dir> <target-data-dir>`
+//! Usage: `ferrosa-sstable-import <sstable-dir> <generation-id> <target-data-dir> <keyspace> <table>`
+//!
+//! Copies SSTable component files into the Ferrosa data directory
+//! structure so the engine picks them up on next startup.
 
-use std::path::Path;
+use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: ferrosa-sstable-import <path-to-sstable-dir> <target-data-dir>");
+    if args.len() < 6 {
+        eprintln!(
+            "Usage: ferrosa-sstable-import <sstable-dir> <generation-id> \
+             <target-data-dir> <keyspace> <table>"
+        );
         eprintln!();
-        eprintln!("Reads Cassandra BTI-format SSTables and imports them into");
-        eprintln!("a Ferrosa data directory for migration.");
+        eprintln!("Copies SSTable component files into the Ferrosa data directory");
+        eprintln!("structure so the engine picks them up on next startup.");
         std::process::exit(1);
     }
 
-    let source = Path::new(&args[1]);
-    let target = Path::new(&args[2]);
+    let source_dir = PathBuf::from(&args[1]);
+    let gen = &args[2];
+    let target_dir = PathBuf::from(&args[3]);
+    let keyspace = &args[4];
+    let table = &args[5];
 
-    if !source.exists() {
-        eprintln!("Error: source not found: {}", source.display());
+    let data_path = source_dir.join(format!("{gen}-Data.db"));
+    if !data_path.exists() {
+        eprintln!("Error: Data.db not found: {}", data_path.display());
         std::process::exit(1);
     }
-    if !target.exists() {
-        eprintln!("Error: target directory not found: {}", target.display());
+
+    let table_dir = target_dir
+        .join("sstables")
+        .join(format!("{keyspace}.{table}"));
+    if let Err(e) = std::fs::create_dir_all(&table_dir) {
+        eprintln!("Error creating target dir: {e}");
         std::process::exit(1);
     }
 
-    // TODO: Discover SSTable components in source dir, read each table,
-    // write into Ferrosa storage format at target dir.
-    eprintln!(
-        "ferrosa-sstable-import: {} -> {}",
-        source.display(),
-        target.display()
-    );
-    eprintln!("SSTable import not yet wired — see ferrosa-sstable::reader + ferrosa-storage");
+    let extensions = [
+        "Data.db",
+        "Partitions.db",
+        "Rows.db",
+        "Filter.db",
+        "Statistics.db",
+        "CompressionInfo.db",
+        "TOC.txt",
+    ];
+
+    let mut copied = 0;
+    for ext in &extensions {
+        let src = source_dir.join(format!("{gen}-{ext}"));
+        if src.exists() {
+            let dst = table_dir.join(format!("{gen}-{ext}"));
+            match std::fs::copy(&src, &dst) {
+                Ok(bytes) => {
+                    println!("  {gen}-{ext} ({bytes} bytes)");
+                    copied += 1;
+                }
+                Err(e) => {
+                    eprintln!("  Error copying {gen}-{ext}: {e}");
+                }
+            }
+        }
+    }
+
+    println!("Imported {copied} files to {}/", table_dir.display());
+    println!("Restart ferrosa to load the imported SSTable.");
 }
