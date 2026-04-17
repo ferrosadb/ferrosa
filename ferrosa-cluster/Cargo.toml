@@ -9,7 +9,9 @@ async-trait = "0.1"
 bincode = "1"
 bytes = "1"
 crc32fast = "1"
+dashmap = "6"
 ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-index = { path = "../ferrosa-index" }
 ferrosa-net = { path = "../ferrosa-net" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
@@ -27,7 +29,6 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-ferrosa-index = { path = "../ferrosa-index" }
 indexmap = "2"
 proptest = "1"
 serial_test = "3"

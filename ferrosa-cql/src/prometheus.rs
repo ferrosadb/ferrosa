@@ -53,6 +53,29 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
     output.push_str("# TYPE ferrosa_up gauge\n");
     output.push_str(&format_metric("ferrosa_up", &[], 1.0));
 
+    // Process memory metrics — critical for diagnosing memory leaks.
+    // On Linux (containers), read from /proc/self/status.
+    if let Some((rss, vsize)) = read_process_memory() {
+        output.push_str(
+            "# HELP ferrosa_process_resident_memory_bytes Resident set size (RSS) in bytes.\n",
+        );
+        output.push_str("# TYPE ferrosa_process_resident_memory_bytes gauge\n");
+        output.push_str(&format_metric(
+            "ferrosa_process_resident_memory_bytes",
+            &[],
+            rss as f64,
+        ));
+        output.push_str(
+            "# HELP ferrosa_process_virtual_memory_bytes Virtual memory size in bytes.\n",
+        );
+        output.push_str("# TYPE ferrosa_process_virtual_memory_bytes gauge\n");
+        output.push_str(&format_metric(
+            "ferrosa_process_virtual_memory_bytes",
+            &[],
+            vsize as f64,
+        ));
+    }
+
     // Get all tables from system_observability keyspace
     let tables = registry.list("system_observability");
 
@@ -127,6 +150,43 @@ pub fn render_metrics(registry: &VirtualTableRegistry) -> String {
     }
 
     output
+}
+
+/// Read the current process's RSS and virtual memory size.
+///
+/// Returns `(rss_bytes, vsize_bytes)`. On Linux reads `/proc/self/status`;
+/// on macOS reads `/proc/{pid}/status`-equivalent via `ps`. Returns `None`
+/// on unsupported platforms or if the read fails.
+fn read_process_memory() -> Option<(u64, u64)> {
+    // Linux: /proc/self/status has VmRSS and VmSize in kB.
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        let mut rss_kb = 0u64;
+        let mut vsize_kb = 0u64;
+        for line in status.lines() {
+            if let Some(val) = line.strip_prefix("VmRSS:") {
+                rss_kb = val.trim().trim_end_matches(" kB").trim().parse().ok()?;
+            } else if let Some(val) = line.strip_prefix("VmSize:") {
+                vsize_kb = val.trim().trim_end_matches(" kB").trim().parse().ok()?;
+            }
+        }
+        return Some((rss_kb * 1024, vsize_kb * 1024));
+    }
+
+    // macOS fallback: use `ps` to read RSS (no libc dependency).
+    let pid = std::process::id();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=,vsz=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.len() >= 2 {
+        let rss_kb: u64 = parts[0].parse().ok()?;
+        let vsz_kb: u64 = parts[1].parse().ok()?;
+        return Some((rss_kb * 1024, vsz_kb * 1024));
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -229,6 +289,20 @@ mod tests {
         // Even with no virtual tables, baseline metrics are always emitted.
         assert!(output.contains("ferrosa_up"));
         assert!(output.contains("ferrosa_virtual_tables_registered"));
+    }
+
+    #[test]
+    fn render_metrics_includes_process_memory() {
+        let registry = VirtualTableRegistry::new();
+        let output = render_metrics(&registry);
+        assert!(
+            output.contains("ferrosa_process_resident_memory_bytes"),
+            "metrics must include RSS for memory leak diagnosis"
+        );
+        assert!(
+            output.contains("ferrosa_process_virtual_memory_bytes"),
+            "metrics must include vsize for memory leak diagnosis"
+        );
     }
 
     #[test]

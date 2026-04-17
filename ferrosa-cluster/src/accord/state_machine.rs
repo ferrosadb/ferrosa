@@ -412,6 +412,47 @@ impl AccordStateMachine {
     pub fn conflict_index(&self) -> &ConflictIndex {
         &self.conflict_index
     }
+
+    /// Remove transactions that have reached the Applied phase.
+    ///
+    /// Applied transactions are fully committed and their mutations have been
+    /// persisted. Retaining them in `txn_states` and `committed_txns`
+    /// indefinitely causes unbounded memory growth under sustained write load.
+    ///
+    /// Returns the number of entries removed.
+    pub fn prune_applied(&mut self) -> usize {
+        let before = self.txn_states.len() + self.committed_txns.len();
+
+        // Collect TxnIds that have reached Applied phase.
+        let applied_ids: Vec<TxnId> = self
+            .txn_states
+            .iter()
+            .filter(|(_, state)| state.phase == TxnPhase::Applied)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for id in &applied_ids {
+            self.txn_states.remove(id);
+            self.committed_txns.remove(id);
+            self.dep_waiters.remove(id);
+        }
+
+        // Also GC the conflict index for applied transactions.
+        self.conflict_index.gc_applied();
+
+        let after = self.txn_states.len() + self.committed_txns.len();
+        before - after
+    }
+
+    /// Number of transactions currently tracked.
+    pub fn txn_count(&self) -> usize {
+        self.txn_states.len()
+    }
+
+    /// Number of committed transactions tracked.
+    pub fn committed_count(&self) -> usize {
+        self.committed_txns.len()
+    }
 }
 
 // Helper extension for TxnPhase to expose rank for comparison.
@@ -1406,6 +1447,66 @@ mod tests {
         assert_eq!(
             notified[0], waiter_txn,
             "commit must wake waiting transactions"
+        );
+    }
+
+    #[test]
+    fn prune_applied_removes_completed_transactions() {
+        let (mut sm, _writer) = make_sm(1);
+        let tid = txn(1, 100);
+        let t0 = ts(100);
+
+        // Drive through full lifecycle: PreAccept -> Accept -> Commit -> Apply
+        sm.handle_preaccept(tid, t0, b"key", BallotNumber(0), 0);
+        sm.handle_accept(tid, t0, ts(101), vec![], BallotNumber(0));
+        sm.handle_commit(tid, t0, ts(101), vec![]);
+        sm.handle_apply(tid, b"result".to_vec());
+
+        assert_eq!(sm.txn_count(), 1, "transaction should be tracked");
+        assert_eq!(sm.committed_count(), 1, "committed set should have entry");
+
+        let pruned = sm.prune_applied();
+        assert!(pruned > 0, "should prune at least one entry");
+        assert_eq!(sm.txn_count(), 0, "txn_states should be empty after prune");
+        assert_eq!(
+            sm.committed_count(),
+            0,
+            "committed_txns should be empty after prune"
+        );
+    }
+
+    #[test]
+    fn prune_applied_preserves_in_flight_transactions() {
+        let (mut sm, _writer) = make_sm(1);
+        let applied = txn(1, 100);
+        let in_flight = txn(1, 200);
+        let t0 = ts(100);
+
+        // applied goes through full lifecycle.
+        sm.handle_preaccept(applied, t0, b"k1", BallotNumber(0), 0);
+        sm.handle_accept(applied, t0, ts(101), vec![], BallotNumber(0));
+        sm.handle_commit(applied, t0, ts(101), vec![]);
+        sm.handle_apply(applied, b"done".to_vec());
+
+        // in_flight is only preaccepted (still in consensus).
+        sm.handle_preaccept(in_flight, ts(200), b"k2", BallotNumber(0), 0);
+
+        assert_eq!(sm.txn_count(), 2);
+
+        sm.prune_applied();
+
+        assert_eq!(
+            sm.txn_count(),
+            1,
+            "only the applied transaction should be pruned"
+        );
+        assert!(
+            sm.get_state(&in_flight).is_some(),
+            "in-flight transaction must survive pruning"
+        );
+        assert!(
+            sm.get_state(&applied).is_none(),
+            "applied transaction must be pruned"
         );
     }
 }

@@ -272,6 +272,7 @@ pub async fn route(
         Statement::Grant(g) => route_grant(state, ctx, g).await.map(RouteResult::Result),
         Statement::Revoke(r) => route_revoke(state, ctx, r).await.map(RouteResult::Result),
         Statement::Use(u) => {
+            validate_keyspace_exists(&state.schema, &u.keyspace)?;
             let body = result::encode_set_keyspace(&u.keyspace);
             Ok(RouteResult::SetKeyspace(u.keyspace, body))
         }
@@ -606,7 +607,26 @@ async fn route_select(
             ];
             let map_type = CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Varchar));
             let all_col_types = vec![CqlType::Varchar, CqlType::Boolean, map_type];
-            let all_rows: Vec<Vec<Option<CqlValue>>> = ks_rows
+            // Apply WHERE equality filters.
+            let filtered: Vec<_> = ks_rows
+                .iter()
+                .filter(|k| {
+                    s.where_clauses.iter().all(|wc| {
+                        if wc.op != crate::ast::ComparisonOp::Eq {
+                            return true;
+                        }
+                        let val = match &wc.value {
+                            crate::ast::Term::StringLiteral(s) => s.as_str(),
+                            _ => return true,
+                        };
+                        match wc.column.as_str() {
+                            "keyspace_name" => k.keyspace_name == val,
+                            _ => true,
+                        }
+                    })
+                })
+                .collect();
+            let all_rows: Vec<Vec<Option<CqlValue>>> = filtered
                 .iter()
                 .map(|k| {
                     // Build the replication map as CqlValue::Map
@@ -638,7 +658,27 @@ async fn route_select(
             let table_rows = query_tables(&snap);
             let col_names = vec!["keyspace_name".into(), "table_name".into(), "id".into()];
             let col_types = vec![CqlType::Varchar, CqlType::Varchar, CqlType::Uuid];
-            let rows: Vec<Vec<Option<CqlValue>>> = table_rows
+            // Apply WHERE equality filters.
+            let filtered: Vec<_> = table_rows
+                .iter()
+                .filter(|t| {
+                    s.where_clauses.iter().all(|wc| {
+                        if wc.op != crate::ast::ComparisonOp::Eq {
+                            return true;
+                        }
+                        let val = match &wc.value {
+                            crate::ast::Term::StringLiteral(s) => s.as_str(),
+                            _ => return true,
+                        };
+                        match wc.column.as_str() {
+                            "keyspace_name" => t.keyspace_name == val,
+                            "table_name" => t.table_name == val,
+                            _ => true,
+                        }
+                    })
+                })
+                .collect();
+            let rows: Vec<Vec<Option<CqlValue>>> = filtered
                 .iter()
                 .map(|t| {
                     vec![
@@ -850,8 +890,29 @@ async fn route_select(
                 CqlType::Varchar,
                 CqlType::Varchar,
             ];
-            let rows: Vec<Vec<Option<CqlValue>>> = snap
+            // Apply WHERE equality filters.
+            let filtered: Vec<_> = snap
                 .indexes
+                .iter()
+                .filter(|((ks, tbl, name), _)| {
+                    s.where_clauses.iter().all(|wc| {
+                        if wc.op != crate::ast::ComparisonOp::Eq {
+                            return true;
+                        }
+                        let val = match &wc.value {
+                            crate::ast::Term::StringLiteral(s) => s.as_str(),
+                            _ => return true,
+                        };
+                        match wc.column.as_str() {
+                            "keyspace_name" => ks.as_str() == val,
+                            "table_name" => tbl.as_str() == val,
+                            "index_name" => name.as_str() == val,
+                            _ => true,
+                        }
+                    })
+                })
+                .collect();
+            let rows: Vec<Vec<Option<CqlValue>>> = filtered
                 .iter()
                 .map(|((ks, tbl, name), idx)| {
                     let kind = match idx.index_type {
@@ -1226,9 +1287,13 @@ async fn route_select_user_table(
                     &state.schema,
                 )?;
 
+                // Scatter-gather index read: in cluster mode this fans out
+                // to all ring nodes so results include rows on every node.
                 let partitions = state
-                    .engine
-                    .read_by_index(&table_id, index_name, &index_key)?;
+                    .write_path
+                    .load()
+                    .index_read(&table_id, index_name, &index_key)
+                    .await?;
 
                 // Fallback: if the index read returns empty, the memtable index
                 // may not be wired yet (Sprint I-3). Fall back to full scan so
@@ -1289,10 +1354,11 @@ async fn route_select_user_table(
                     &state.schema,
                 )?;
 
-                let partitions =
-                    state
-                        .engine
-                        .read_by_index(&table_id, first_idx_name, &index_key)?;
+                let partitions = state
+                    .write_path
+                    .load()
+                    .index_read(&table_id, first_idx_name, &index_key)
+                    .await?;
 
                 let partitions = if partitions.is_empty() {
                     state.write_path.load().range_read(&table_id).await?
@@ -6415,10 +6481,11 @@ mod tests {
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
         };
-        let stmt = crate::parser::parse("USE my_ks").unwrap();
+        // Use a system keyspace — always exists, no need to create it.
+        let stmt = crate::parser::parse("USE system").unwrap();
         match route(&state, &ctx, stmt).await.unwrap() {
             RouteResult::SetKeyspace(ks, body) => {
-                assert_eq!(ks, "my_ks");
+                assert_eq!(ks, "system");
                 assert_eq!(&body[0..4], &0x0003i32.to_be_bytes());
             }
             _ => panic!("expected SetKeyspace"),
@@ -11486,5 +11553,110 @@ mod tests {
             "ALTER KEYSPACE should succeed: {:?}",
             result.err()
         );
+    }
+
+    #[tokio::test]
+    async fn use_nonexistent_keyspace_returns_error() {
+        let (state, _dir) = setup();
+        let dev = dev_auth();
+        let stmt = crate::parser::parse("USE totally_bogus_ks").unwrap();
+        let result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+            },
+            stmt,
+        )
+        .await;
+        match result {
+            Err(e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("totally_bogus_ks"),
+                    "error should name the keyspace, got: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("USE against nonexistent keyspace must return an error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn system_schema_keyspaces_where_filters_rows() {
+        let (state, _dir) = setup();
+        let dev = dev_auth();
+
+        // Query system_schema.keyspaces WHERE keyspace_name = 'nonexistent_ks_xyz'
+        let stmt = crate::parser::parse(
+            "SELECT keyspace_name FROM system_schema.keyspaces \
+             WHERE keyspace_name = 'nonexistent_ks_xyz'",
+        )
+        .unwrap();
+        let result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+            },
+            stmt,
+        )
+        .await
+        .unwrap();
+
+        match &result {
+            RouteResult::Result(b) => {
+                let row_count = extract_row_count(b);
+                assert_eq!(
+                    row_count, 0,
+                    "WHERE keyspace_name='nonexistent_ks_xyz' should return 0 rows, got {row_count}"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn system_schema_tables_where_filters_rows() {
+        let (state, _dir) = setup();
+        let dev = dev_auth();
+
+        let stmt = crate::parser::parse(
+            "SELECT table_name FROM system_schema.tables \
+             WHERE keyspace_name = 'nonexistent_ks_xyz'",
+        )
+        .unwrap();
+        let result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+            },
+            stmt,
+        )
+        .await
+        .unwrap();
+
+        match &result {
+            RouteResult::Result(b) => {
+                let row_count = extract_row_count(b);
+                assert_eq!(
+                    row_count, 0,
+                    "WHERE keyspace_name='nonexistent_ks_xyz' on tables should return 0 rows, got {row_count}"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
     }
 }

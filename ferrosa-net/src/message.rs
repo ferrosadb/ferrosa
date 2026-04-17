@@ -167,6 +167,10 @@ pub enum Message {
     IndexBuildRequest(Bytes),
     IndexBuildComplete(Bytes),
 
+    // Secondary index scatter-gather
+    IndexReadRequest(Bytes),
+    IndexReadResponse(Bytes),
+
     // Accord consensus — opaque payloads, ferrosa-cluster interprets
     AccordPreAccept(Bytes),
     AccordPreAcceptOK(Bytes),
@@ -235,6 +239,8 @@ impl Message {
             Self::BatchlogReplay(_) => MsgType::BatchlogReplay,
             Self::IndexBuildRequest(_) => MsgType::IndexBuildRequest,
             Self::IndexBuildComplete(_) => MsgType::IndexBuildComplete,
+            Self::IndexReadRequest(_) => MsgType::IndexReadRequest,
+            Self::IndexReadResponse(_) => MsgType::IndexReadResponse,
             Self::AccordPreAccept(_) => MsgType::AccordPreAccept,
             Self::AccordPreAcceptOK(_) => MsgType::AccordPreAcceptOK,
             Self::AccordAccept(_) => MsgType::AccordAccept,
@@ -380,6 +386,8 @@ impl Message {
             | Self::BatchlogReplay(b)
             | Self::IndexBuildRequest(b)
             | Self::IndexBuildComplete(b)
+            | Self::IndexReadRequest(b)
+            | Self::IndexReadResponse(b)
             | Self::AccordPreAccept(b)
             | Self::AccordPreAcceptOK(b)
             | Self::AccordAccept(b)
@@ -575,6 +583,8 @@ impl Message {
             MsgType::IndexBuildComplete => {
                 Self::IndexBuildComplete(body.split_to(body.remaining()))
             }
+            MsgType::IndexReadRequest => Self::IndexReadRequest(body.split_to(body.remaining())),
+            MsgType::IndexReadResponse => Self::IndexReadResponse(body.split_to(body.remaining())),
             MsgType::AccordPreAccept => Self::AccordPreAccept(body.split_to(body.remaining())),
             MsgType::AccordPreAcceptOK => Self::AccordPreAcceptOK(body.split_to(body.remaining())),
             MsgType::AccordAccept => Self::AccordAccept(body.split_to(body.remaining())),

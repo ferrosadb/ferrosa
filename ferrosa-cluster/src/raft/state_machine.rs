@@ -147,6 +147,51 @@ impl FerrosStateMachine {
         }
     }
 
+    /// Recover `last_applied` from the log store's purge point.
+    ///
+    /// After an OOM kill, the in-memory `last_applied` is lost (reverts to
+    /// `None`), but the log store may have a `last_purged_log_id` — entries
+    /// can only be purged after they've been applied and snapshotted. If
+    /// `last_applied` is `None` and a purge point exists, set `last_applied`
+    /// to the purge point so openraft doesn't try to replay already-purged
+    /// entries (which would fail with "expected index [0, N), got [M, N)").
+    pub fn recover_from_purge_point(&mut self, purge_point: Option<LogId<u64>>) {
+        if self.last_applied.is_none() {
+            if let Some(purged) = purge_point {
+                tracing::warn!(
+                    ?purged,
+                    "state machine last_applied was None but log has purged entries; \
+                     recovering from purge point"
+                );
+                self.last_applied = Some(purged);
+            }
+        }
+    }
+
+    /// Recover `last_membership` from the log if it was lost.
+    ///
+    /// After an OOM kill, `last_membership` reverts to the default (empty).
+    /// Without a valid membership, no election can happen and the cluster
+    /// stays stuck as Learners. This scans the log for the latest Membership
+    /// entry and restores it.
+    pub fn recover_membership(&mut self, membership: Option<StoredMembership<u64, BasicNode>>) {
+        if self
+            .last_membership
+            .membership()
+            .get_joint_config()
+            .iter()
+            .all(|c| c.is_empty())
+        {
+            if let Some(m) = membership {
+                tracing::warn!(
+                    ?m,
+                    "state machine membership was empty; recovering from log"
+                );
+                self.last_membership = m;
+            }
+        }
+    }
+
     /// Create a new state machine wired to local `Schema` and `StorageEngine`
     /// for side-effect propagation.
     pub fn with_side_effects(schema: Arc<Schema>, engine: Arc<StorageEngine>) -> Self {
@@ -2435,5 +2480,113 @@ mod tests {
             &sm.state().index_state_map,
         );
         assert_eq!(selected[0], node1_id);
+    }
+
+    #[test]
+    fn recover_from_purge_point_sets_last_applied_when_none() {
+        use openraft::{CommittedLeaderId, LogId};
+
+        let mut sm = FerrosStateMachine::new();
+        assert!(sm.last_applied.is_none());
+
+        let purge_point = LogId::new(CommittedLeaderId::new(1, 42), 6);
+        sm.recover_from_purge_point(Some(purge_point));
+
+        assert_eq!(
+            sm.last_applied,
+            Some(purge_point),
+            "last_applied must be set to purge point when it was None"
+        );
+    }
+
+    #[test]
+    fn recover_from_purge_point_noop_when_already_applied() {
+        use openraft::{CommittedLeaderId, LogId};
+
+        let mut sm = FerrosStateMachine::new();
+        let existing = LogId::new(CommittedLeaderId::new(5, 42), 100);
+        sm.last_applied = Some(existing);
+
+        let purge_point = LogId::new(CommittedLeaderId::new(1, 42), 6);
+        sm.recover_from_purge_point(Some(purge_point));
+
+        assert_eq!(
+            sm.last_applied,
+            Some(existing),
+            "must not overwrite existing last_applied"
+        );
+    }
+
+    #[test]
+    fn recover_from_purge_point_noop_when_no_purge() {
+        let mut sm = FerrosStateMachine::new();
+        sm.recover_from_purge_point(None);
+        assert!(
+            sm.last_applied.is_none(),
+            "no purge point means no recovery needed"
+        );
+    }
+
+    #[test]
+    fn recover_membership_restores_from_log() {
+        use openraft::Membership;
+        use std::collections::BTreeSet;
+
+        let mut sm = FerrosStateMachine::new();
+
+        // Membership is empty (the OOM-kill state).
+        assert!(
+            sm.last_membership
+                .membership()
+                .get_joint_config()
+                .iter()
+                .all(|c| c.is_empty()),
+            "membership must start empty"
+        );
+
+        // Simulate finding a membership entry in the log.
+        let voters: BTreeSet<u64> = [1, 2, 3].into_iter().collect();
+        let membership = Membership::new(vec![voters], None);
+        let stored = StoredMembership::new(
+            Some(LogId::new(CommittedLeaderId::new(1, 1), 5)),
+            membership,
+        );
+
+        sm.recover_membership(Some(stored));
+
+        let configs = sm.last_membership.membership().get_joint_config();
+        assert_eq!(configs.len(), 1, "membership must be recovered from log");
+        assert!(configs[0].contains(&1), "node 1 must be a voter");
+        assert!(configs[0].contains(&3), "node 3 must be a voter");
+    }
+
+    #[test]
+    fn recover_membership_noop_when_already_set() {
+        use openraft::Membership;
+        use std::collections::BTreeSet;
+
+        let mut sm = FerrosStateMachine::new();
+
+        // Set an existing membership.
+        let voters: BTreeSet<u64> = [10, 20].into_iter().collect();
+        let existing = Membership::new(vec![voters], None);
+        sm.last_membership = StoredMembership::new(
+            Some(LogId::new(CommittedLeaderId::new(5, 10), 100)),
+            existing,
+        );
+
+        // Try to recover with different membership — should be a noop.
+        let new_voters: BTreeSet<u64> = [1, 2, 3].into_iter().collect();
+        let new_membership = Membership::new(vec![new_voters], None);
+        let stored = StoredMembership::new(
+            Some(LogId::new(CommittedLeaderId::new(1, 1), 5)),
+            new_membership,
+        );
+        sm.recover_membership(Some(stored));
+
+        assert!(
+            sm.last_membership.membership().get_joint_config()[0].contains(&10),
+            "existing membership must not be overwritten"
+        );
     }
 }

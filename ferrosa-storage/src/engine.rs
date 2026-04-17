@@ -1213,6 +1213,20 @@ impl StorageEngine {
         &self.config.data_dir
     }
 
+    /// Number of tables currently registered.
+    pub fn table_count(&self) -> usize {
+        self.tables.read().len()
+    }
+
+    /// Total buffer bytes held by closed commit log segments.
+    ///
+    /// After the P0 OOM fix, this should be 0 — closed segments release
+    /// their 32 MB write buffers after fsync. A non-zero value indicates
+    /// the release path is not running (regression detector).
+    pub fn closed_segment_buffer_bytes(&self) -> usize {
+        self.commit_log.closed_segments_total_bytes()
+    }
+
     /// Write directly to storage for observability tables.
     /// Same as `write()` but skips observer dispatch to prevent telemetry
     /// feedback loops (observability writes must not generate new spans).

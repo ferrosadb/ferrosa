@@ -97,6 +97,40 @@ impl SledLogStore {
         }
     }
 
+    /// Return the persisted `last_purged_log_id`, if any.
+    ///
+    /// Used during startup recovery: if the state machine's `last_applied` is
+    /// `None` (e.g., after an OOM kill lost the in-memory state), the purge
+    /// point serves as a safe baseline — entries can only be purged after
+    /// they've been applied and snapshotted.
+    pub fn last_purged_log_id(&self) -> Result<Option<LogId<u64>>, StorageIOError<u64>> {
+        Self::load_meta(&self.meta, META_LAST_PURGED)
+    }
+
+    /// Scan all log entries for the last `Membership` payload.
+    ///
+    /// Used during recovery when the state machine lost `last_membership`
+    /// (e.g., after OOM kill). Walks the entire log backwards and returns
+    /// the most recent membership entry, if any.
+    pub fn find_last_membership(
+        &self,
+    ) -> Result<Option<openraft::StoredMembership<u64, openraft::BasicNode>>, StorageIOError<u64>>
+    {
+        use openraft::EntryPayload;
+        // Iterate backwards (last entry first) through the log.
+        for item in self.log.iter().rev() {
+            let (_k, v) = item.map_err(|e| StorageIOError::read_logs(to_any_error(e)))?;
+            let entry = Self::deserialize_entry(&v)?;
+            if let EntryPayload::Membership(membership) = entry.payload {
+                return Ok(Some(openraft::StoredMembership::new(
+                    Some(entry.log_id),
+                    membership,
+                )));
+            }
+        }
+        Ok(None)
+    }
+
     /// Return the last entry currently present in the log tree.
     fn last_entry_log_id(&self) -> Result<Option<LogId<u64>>, StorageIOError<u64>> {
         let last = self
