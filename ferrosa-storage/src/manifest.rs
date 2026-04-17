@@ -260,10 +260,7 @@ impl Manifest {
             match merged.save(store, prefix, version).await {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < MAX_CAS_RETRIES - 1 => {
-                    eprintln!(
-                        "manifest CAS conflict on attempt {}, retrying: {e}",
-                        attempt + 1
-                    );
+                    tracing::warn!(attempt = attempt + 1, %e, "manifest CAS conflict, retrying");
                     let backoff = std::time::Duration::from_millis(10 * 2u64.pow(attempt));
                     tokio::time::sleep(backoff).await;
                 }
@@ -348,10 +345,7 @@ pub async fn save_schema_snapshot(
     snapshot_json: &[u8],
 ) -> ferrosa_common::Result<()> {
     let path = schema_path(prefix);
-    eprintln!(
-        "saving schema snapshot to S3 at {path} ({} bytes)",
-        snapshot_json.len()
-    );
+    tracing::info!(%path, bytes = snapshot_json.len(), "saving schema snapshot to S3");
     store
         .put(
             &path,
@@ -361,10 +355,7 @@ pub async fn save_schema_snapshot(
         .map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to save schema snapshot: {e}"))
         })?;
-    eprintln!(
-        "schema snapshot saved to S3 at {path} ({} bytes)",
-        snapshot_json.len()
-    );
+    tracing::info!(%path, bytes = snapshot_json.len(), "schema snapshot saved to S3");
     Ok(())
 }
 
@@ -374,20 +365,17 @@ pub async fn load_schema_snapshot(
     prefix: &str,
 ) -> ferrosa_common::Result<Option<Vec<u8>>> {
     let path = schema_path(prefix);
-    eprintln!("loading schema snapshot from S3 at {path}");
+    tracing::info!(%path, "loading schema snapshot from S3");
     match store.get(&path).await {
         Ok(result) => {
             let data = result.bytes().await.map_err(|e| {
                 ferrosa_common::Error::InvalidFormat(format!("failed to read schema snapshot: {e}"))
             })?;
-            eprintln!(
-                "schema snapshot loaded from S3 at {path} ({} bytes)",
-                data.len()
-            );
+            tracing::info!(%path, bytes = data.len(), "schema snapshot loaded from S3");
             Ok(Some(data.to_vec()))
         }
         Err(object_store::Error::NotFound { .. }) => {
-            eprintln!("schema snapshot not found in S3 at {path}");
+            tracing::info!(%path, "schema snapshot not found in S3");
             Ok(None)
         }
         Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(

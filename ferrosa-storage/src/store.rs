@@ -321,24 +321,19 @@ impl<F: FlushTarget> TableStore<F> {
                 Ok(None) => {}
                 Err(e) => {
                     // Detailed diagnostic for truncated SSTable investigation.
-                    // Uses eprintln! to bypass tracing level filters.
                     let id_info = guard
                         .sstable_ids
                         .get(i)
                         .map(|(id, path)| format!("id={id} path={path:?}"))
                         .unwrap_or_else(|| format!("index={i}"));
                     let data_len = sstable.data_file_length().unwrap_or(0);
-                    eprintln!(
-                        "[READ ERROR] SSTable {id_info}: error={e}, \
-                         data_file_len={data_len}, sstable_count={}, \
-                         key={:?}",
-                        guard.sstables.len(),
-                        key.key.as_bytes(),
-                    );
-                    tracing::warn!(
-                        error = %e,
-                        sstable_index = i,
-                        "skipping corrupt SSTable partition during read — data may be incomplete"
+                    tracing::error!(
+                        %e,
+                        %id_info,
+                        data_file_len = data_len,
+                        sstable_count = guard.sstables.len(),
+                        key = ?key.key.as_bytes(),
+                        "SSTable read error: skipping corrupt partition — data may be incomplete"
                     );
                     self.sstable_read_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -504,7 +499,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         // Persist sidecar files to disk (no-op for in-memory flush targets).
         if let Err(e) = self.flush_target.write_sidecars(gen, &raw_sidecar_entries) {
-            eprintln!("[store] sidecar persist failed for gen {gen}: {e}");
+            tracing::error!(%e, gen, "store: sidecar persist failed");
         }
 
         // Step 5c: Build FTI sidecar files for any full-text indexes.
@@ -536,13 +531,11 @@ impl<F: FlushTarget> TableStore<F> {
                         .flush_target
                         .write_fti_sidecar(gen, index_name, &fti_bytes)
                     {
-                        eprintln!(
-                            "[store] FTI sidecar write failed for {index_name} gen {gen}: {e}"
-                        );
+                        tracing::error!(%e, %index_name, gen, "store: FTI sidecar write failed");
                     }
                 }
                 Err(e) => {
-                    eprintln!("[store] FTI build failed for {index_name} gen {gen}: {e}");
+                    tracing::error!(%e, %index_name, gen, "store: FTI build failed");
                 }
             }
         }
@@ -562,7 +555,7 @@ impl<F: FlushTarget> TableStore<F> {
                     // Late write — replay to the current active memtable.
                     for row in &p.rows {
                         if let Err(e) = current_view.active.put(&p.key, row.clone(), &self.schema) {
-                            eprintln!("[flush] late-writer replay put failed: {e}");
+                            tracing::error!(%e, "flush: late-writer replay put failed");
                         }
                     }
                 }

@@ -436,15 +436,11 @@ impl StorageEngine {
                                     )
                                     .await
                                 {
-                                    eprintln!(
-                                        "[commitlog-archiver] manifest update failed for segment {segment_id}: {e}"
-                                    );
+                                    tracing::error!(%e, segment_id, "commitlog-archiver: manifest update failed");
                                 }
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "[commitlog-archiver] failed to archive segment {segment_id}: {e}"
-                                );
+                                tracing::error!(%e, segment_id, "commitlog-archiver: failed to archive segment");
                             }
                         }
                     }
@@ -653,7 +649,7 @@ impl StorageEngine {
                 for row in &mutation.rows {
                     // Use best-effort replay: log but don't fail on individual row errors.
                     if let Err(e) = state.store.write(&mutation.key, row.clone()) {
-                        eprintln!("[replay] failed to replay row for {table_id}: {e}");
+                        tracing::error!(%e, %table_id, "replay: failed to replay row");
                     }
                 }
             }
@@ -850,7 +846,20 @@ impl StorageEngine {
             first_unflushed_write_at: parking_lot::Mutex::new(None),
             last_commit_log_position: parking_lot::Mutex::new(None),
         };
-        self.tables.write().insert(table_id, state);
+        self.tables.write().insert(table_id.clone(), state);
+
+        // Trigger compaction check for tables loaded with existing SSTables.
+        // Without this, tables restored from S3 bootstrap can have thousands
+        // of tiny SSTables that never get compacted (each one holds an
+        // in-memory reader, bloating RSS). With 2,462 SSTables of 2KB each
+        // for a single table, reader overhead alone exceeded 1GB.
+        {
+            let tables = self.tables.read();
+            if let Some(state) = tables.get(&table_id) {
+                self.maybe_compact(&table_id, state);
+            }
+        }
+
         Ok(())
     }
 
@@ -984,7 +993,7 @@ impl StorageEngine {
                     column_position,
                 };
                 if let Err(e) = scheduler.submit(job) {
-                    eprintln!("[engine] failed to submit index backfill: {e}");
+                    tracing::error!(%e, "engine: failed to submit index backfill");
                 }
             }
         }
@@ -1054,10 +1063,7 @@ impl StorageEngine {
                     sidecars.push(Arc::new(Self::load_sidecars_for_generation(table_dir, gen)));
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[storage-engine] skipping corrupt SSTable gen {gen} in {}: {e}",
-                        table_dir.display()
-                    );
+                    tracing::warn!(%e, gen, dir = %table_dir.display(), "storage-engine: skipping corrupt SSTable");
                 }
             }
         }
@@ -1096,11 +1102,7 @@ impl StorageEngine {
                         sidecars.insert(index_name.to_string(), reader);
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[storage-engine] skipping corrupt sidecar {} in {}: {e}",
-                            name,
-                            table_dir.display()
-                        );
+                        tracing::warn!(%e, %name, dir = %table_dir.display(), "storage-engine: skipping corrupt sidecar");
                     }
                 }
             }
@@ -1161,7 +1163,7 @@ impl StorageEngine {
                 for dm in derived {
                     // Durability: go through commit log.
                     if let Err(e) = self.commit_log.append(&dm) {
-                        eprintln!("[observer] commit log append failed: {e}");
+                        tracing::error!(%e, "observer: commit log append failed");
                         continue;
                     }
                     let dtid = TableId::new(&dm.keyspace, &dm.table);
@@ -1211,6 +1213,20 @@ impl StorageEngine {
     /// Return the data directory path.
     pub fn data_dir(&self) -> &std::path::Path {
         &self.config.data_dir
+    }
+
+    /// Number of tables currently registered.
+    pub fn table_count(&self) -> usize {
+        self.tables.read().len()
+    }
+
+    /// Total buffer bytes held by closed commit log segments.
+    ///
+    /// After the P0 OOM fix, this should be 0 — closed segments release
+    /// their 32 MB write buffers after fsync. A non-zero value indicates
+    /// the release path is not running (regression detector).
+    pub fn closed_segment_buffer_bytes(&self) -> usize {
+        self.commit_log.closed_segments_total_bytes()
     }
 
     /// Write directly to storage for observability tables.
@@ -2002,7 +2018,7 @@ impl StorageEngine {
             let reader = match Self::open_sstable_from_dir(dir, gen) {
                 Ok(r) => Arc::new(r),
                 Err(e) => {
-                    eprintln!("[compaction] failed to open output SSTable: {e}");
+                    tracing::error!(%e, "compaction: failed to open output SSTable");
                     continue;
                 }
             };
@@ -2028,15 +2044,16 @@ impl StorageEngine {
                         reader,
                         std::collections::HashMap::new(),
                     ) {
-                        eprintln!("[compaction] swap failed: {e}");
+                        tracing::error!(%e, "compaction: swap failed");
                         continue;
                     }
                     let post_swap_count = state.store.sstable_count();
-                    eprintln!(
-                        "[compaction] swap complete for {table_id}: \
-                         SSTables {pre_swap_count} → {post_swap_count}, \
-                         removed {} inputs, added 1 output",
-                        input_id_paths.len()
+                    tracing::info!(
+                        %table_id,
+                        pre_swap_count,
+                        post_swap_count,
+                        removed = input_id_paths.len(),
+                        "compaction: swap complete"
                     );
 
                     // Eager index build: submit high-priority rebuild for compacted output.
@@ -2056,9 +2073,7 @@ impl StorageEngine {
                                 column_position: *col_pos,
                             };
                             if let Err(e) = scheduler.submit(job) {
-                                eprintln!(
-                                    "[compaction] failed to submit index rebuild for {index_name}: {e}"
-                                );
+                                tracing::error!(%e, %index_name, "compaction: failed to submit index rebuild");
                             }
                         }
                     }
@@ -2124,7 +2139,7 @@ impl StorageEngine {
             let gen_u64: u64 = match sstable_id.parse() {
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!("[compaction] output SSTable id {sstable_id} is not a u64: {e}");
+                    tracing::error!(%e, %sstable_id, "compaction: output SSTable id is not a u64");
                     continue;
                 }
             };
@@ -2134,9 +2149,7 @@ impl StorageEngine {
 
             let files = Self::collect_sstable_files(&output_dir, gen_u64);
             if files.is_empty() {
-                eprintln!(
-                    "[compaction] no files for output SSTable {sstable_id}, skipping S3 upload"
-                );
+                tracing::warn!(%sstable_id, "compaction: no files for output SSTable, skipping S3 upload");
                 continue;
             }
 
@@ -2147,9 +2160,7 @@ impl StorageEngine {
             let pending_log_result = crate::upload::PendingUploadsLog::open(&pending_log_path);
             if let Ok(ref pending_log) = pending_log_result {
                 if let Err(e) = pending_log.add_entry(&table_id_str, &sstable_id) {
-                    eprintln!(
-                        "[compaction] failed to write pending-log entry for {sstable_id}: {e}"
-                    );
+                    tracing::warn!(%e, %sstable_id, "compaction: failed to write pending-log entry");
                 }
             }
 
@@ -2162,7 +2173,7 @@ impl StorageEngine {
                 on_complete: Some(tx),
             };
             if let Err(e) = upload_mgr.submit(task).await {
-                eprintln!("[compaction] failed to submit upload task for {sstable_id}: {e}");
+                tracing::error!(%e, %sstable_id, "compaction: failed to submit upload task");
                 continue;
             }
 
@@ -2173,14 +2184,14 @@ impl StorageEngine {
                     self.compaction_metrics.inc_s3_uploads();
                 }
                 Ok(Err(msg)) => {
-                    eprintln!("[compaction] upload failed for {sstable_id}: {msg}");
+                    tracing::error!(%sstable_id, %msg, "compaction: upload failed");
                     if let Ok(ref pending_log) = pending_log_result {
                         let _ = pending_log.remove_entry(&sstable_id);
                     }
                     continue;
                 }
                 Err(_) => {
-                    eprintln!("[compaction] upload worker dropped channel for {sstable_id}");
+                    tracing::error!(%sstable_id, "compaction: upload worker dropped channel");
                     if let Ok(ref pending_log) = pending_log_result {
                         let _ = pending_log.remove_entry(&sstable_id);
                     }
@@ -2191,9 +2202,7 @@ impl StorageEngine {
             // Step 4: remove the pending-log entry now that S3 confirmed.
             if let Ok(ref pending_log) = pending_log_result {
                 if let Err(e) = pending_log.remove_entry(&sstable_id) {
-                    eprintln!(
-                        "[compaction] warning: failed to remove pending-log entry for {sstable_id}: {e}"
-                    );
+                    tracing::warn!(%e, %sstable_id, "compaction: failed to remove pending-log entry");
                     // Non-fatal: replay will re-upload (idempotent).
                 }
             }
@@ -2265,19 +2274,16 @@ impl StorageEngine {
                             .await
                     };
                     if let Err(e) = save_result {
-                        eprintln!("[compaction] manifest save failed for {sstable_id}: {e}");
+                        tracing::error!(%e, %sstable_id, "compaction: manifest save failed");
                     } else {
-                        eprintln!(
-                            "[compaction] manifest updated: output {sstable_id}, removed {} inputs",
-                            input_ids.len()
-                        );
+                        tracing::info!(%sstable_id, removed = input_ids.len(), "compaction: manifest updated");
                         // Record bytes freed by this compaction in the metrics gauge.
                         self.compaction_metrics
                             .add_bytes_reclaimed(input_bytes_total);
                     }
                 }
                 Err(e) => {
-                    eprintln!("[compaction] failed to load manifest for update: {e}");
+                    tracing::error!(%e, "compaction: failed to load manifest for update");
                 }
             }
 
@@ -2386,7 +2392,7 @@ impl StorageEngine {
         for table_id in &table_ids {
             // Best-effort flush; log but don't fail on individual table errors.
             if let Err(e) = self.flush(table_id) {
-                eprintln!("[storage-engine] flush failed for {table_id}: {e}");
+                tracing::error!(%e, %table_id, "storage-engine: flush failed");
             }
         }
 
@@ -2419,11 +2425,7 @@ impl StorageEngine {
         let tables = self.tables.read();
         for (table_id, state) in tables.iter() {
             let metadata = self.collect_sstable_metadata(table_id, state);
-            eprintln!(
-                "[force-compact] table {}: {} SSTables",
-                table_id,
-                metadata.len()
-            );
+            tracing::info!(%table_id, count = metadata.len(), "force-compact: table SSTables");
             if metadata.len() >= 2 {
                 let task = crate::compaction::metadata::CompactionTask {
                     inputs: metadata,
@@ -2432,7 +2434,7 @@ impl StorageEngine {
                     table_id: table_id.clone(),
                 };
                 if let Err(e) = self.compaction_executor.submit(task) {
-                    eprintln!("[force-compact] submit failed for {table_id}: {e}");
+                    tracing::error!(%e, %table_id, "force-compact: submit failed");
                 }
             }
         }
@@ -2444,7 +2446,7 @@ impl StorageEngine {
         let tasks = strategy.select(&metadata, &state.schema, table_id);
         for task in tasks {
             if let Err(e) = self.compaction_executor.submit(task) {
-                eprintln!("[storage-engine] compaction submit failed for {table_id}: {e}");
+                tracing::error!(%e, %table_id, "storage-engine: compaction submit failed");
             }
         }
     }
@@ -2810,7 +2812,7 @@ impl StorageEngine {
             } else {
                 manifest.save_without_cas(store.as_ref(), &prefix).await?;
             }
-            eprintln!("[s3-sync] uploaded {uploaded} SSTables, manifest saved");
+            tracing::info!(uploaded, "s3-sync: SSTables uploaded, manifest saved");
         }
 
         Ok(uploaded)
@@ -9071,44 +9073,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(tracing)]
     fn storage_engine_creates_spans() {
-        use std::sync::atomic::AtomicU64;
-
-        struct SpanCollector {
-            names: Arc<std::sync::Mutex<Vec<String>>>,
-            next_id: AtomicU64,
-        }
-
-        impl tracing::Subscriber for SpanCollector {
-            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                self.names
-                    .lock()
-                    .unwrap()
-                    .push(span.metadata().name().to_string());
-                let id = self
-                    .next_id
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
-                tracing::span::Id::from_u64(id)
-            }
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-            fn event(&self, _: &tracing::Event<'_>) {}
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
-        }
-
-        let shared_names: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-
-        let _guard = tracing::subscriber::set_default(SpanCollector {
-            names: Arc::clone(&shared_names),
-            next_id: AtomicU64::new(0),
-        });
+        crate::test_span_collector::ensure_installed();
+        crate::test_span_collector::drain_names();
 
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig::test_config(dir.path());
@@ -9140,16 +9107,14 @@ mod tests {
         engine.write(&table_id, &key, row, 1).unwrap();
         let _ = engine.read(&table_id, &key);
 
-        let recorded = shared_names.lock().unwrap();
+        let recorded = crate::test_span_collector::drain_names();
         assert!(
             recorded.iter().any(|n| n == "storage.write"),
-            "expected 'storage.write' span, got: {:?}",
-            *recorded
+            "expected 'storage.write' span, got: {recorded:?}",
         );
         assert!(
             recorded.iter().any(|n| n == "storage.read"),
-            "expected 'storage.read' span, got: {:?}",
-            *recorded
+            "expected 'storage.read' span, got: {recorded:?}",
         );
     }
 }

@@ -414,10 +414,12 @@ impl FlushTarget for FileFlushTarget {
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let base = &self.base_dir;
         let data_size = output.data.len();
-        eprintln!(
-            "[flush] gen={gen} data_size={data_size} partitions_size={} dir={:?}",
-            output.partitions.len(),
-            base,
+        tracing::info!(
+            gen,
+            data_size,
+            partitions_size = output.partitions.len(),
+            dir = %base.display(),
+            "flush: writing SSTable"
         );
 
         let data_path = base.join(format!("{gen}-Data.db"));
@@ -505,10 +507,11 @@ impl FlushTarget for FileFlushTarget {
             }
         }
 
-        eprintln!(
-            "[flush] gen={gen} VERIFIED: Data.db={} bytes on disk, path={:?}",
-            std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0),
-            data_path,
+        tracing::info!(
+            gen,
+            data_bytes = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0),
+            path = %data_path.display(),
+            "flush: Data.db verified on disk"
         );
 
         // FileReadAt::open returns ferrosa_common::Result — use ? directly
@@ -567,7 +570,7 @@ impl FlushTarget for FileFlushTarget {
                 .base_dir
                 .join(format!("{generation}-{index_name}.sidecar"));
             if let Err(e) = SidecarWriter::write(&path, entries) {
-                eprintln!("[flush] failed to write sidecar {}: {e}", path.display());
+                tracing::error!(%e, path = %path.display(), "flush: failed to write sidecar");
             }
         }
         Ok(())

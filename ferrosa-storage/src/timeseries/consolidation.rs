@@ -223,10 +223,8 @@ fn functions_need_median(functions: &[ConsolidationFn]) -> bool {
     for f in functions {
         match f {
             ConsolidationFn::Median => return true,
-            ConsolidationFn::Composite(inner) => {
-                if functions_need_median(inner) {
-                    return true;
-                }
+            ConsolidationFn::Composite(inner) if functions_need_median(inner) => {
+                return true;
             }
             _ => {}
         }

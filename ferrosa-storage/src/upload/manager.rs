@@ -283,9 +283,9 @@ fn is_transient(err: &object_store::Error) -> bool {
     )
 }
 
-/// Log helper — uses eprintln since we don't want a tracing dependency yet.
+/// Log helper for upload manager messages.
 fn tracing_or_eprintln(msg: String) {
-    eprintln!("[upload-manager] {msg}");
+    tracing::info!("{}", msg);
 }
 
 #[cfg(test)]

@@ -34,8 +34,8 @@ use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
 use crate::pair::coordinator::encode_mutation;
 use crate::raft::handlers::{
-    partition_from_wire, RangeReadRequestPayload, RangeReadResponsePayload, ReadRequestPayload,
-    ReadResponsePayload,
+    partition_from_wire, IndexReadRequestPayload, IndexReadResponsePayload,
+    RangeReadRequestPayload, RangeReadResponsePayload, ReadRequestPayload, ReadResponsePayload,
 };
 use crate::raft::IndexNodeStatus;
 
@@ -887,6 +887,159 @@ impl ClusterCoordinator {
         }
 
         // Deduplicate: group by token, merge replicas with the same partition key.
+        let mut by_token: BTreeMap<i64, Vec<ferrosa_sstable::types::Partition>> = BTreeMap::new();
+        for p in all_partitions {
+            by_token.entry(p.key.token.0).or_default().push(p);
+        }
+
+        let deduped: Vec<ferrosa_sstable::types::Partition> = by_token
+            .into_values()
+            .map(|group| {
+                if group.len() == 1 {
+                    group.into_iter().next().unwrap()
+                } else {
+                    ferrosa_storage::merge::merge_partitions(group)
+                }
+            })
+            .collect();
+
+        Ok(deduped)
+    }
+
+    /// Scatter-gather index read across all ring nodes.
+    ///
+    /// Each node runs `StorageEngine::read_by_index()` locally and returns
+    /// matching partitions. The coordinator merges and deduplicates results
+    /// so that all rows matching the indexed value are returned regardless
+    /// of which node they reside on.
+    pub async fn coordinate_index_read(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        index_key: &ferrosa_index::IndexKey,
+    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+        let ring = self.ring.load();
+        let node_ids = ring.node_ids();
+
+        let nodes: Vec<(u64, Option<uuid::Uuid>)> = node_ids
+            .iter()
+            .map(|&id| (id, ring.get_node(id).map(|n| n.host_id)))
+            .collect();
+        drop(ring);
+
+        let req_payload = IndexReadRequestPayload {
+            keyspace: table_id.keyspace.clone(),
+            table: table_id.table.clone(),
+            index_name: index_name.to_string(),
+            index_key: index_key.0.clone(),
+        };
+        let req_body = Bytes::from(bincode::serialize(&req_payload).unwrap_or_default());
+
+        let local_id = self.local_node_id;
+        let storage = self.storage.clone();
+        let peer_manager = self.peer_manager.clone();
+        let table_id_clone = table_id.clone();
+        let index_name_owned = index_name.to_string();
+        let index_key_clone = index_key.clone();
+        let total_nodes = nodes.len();
+
+        let mut futs: FuturesUnordered<_> = nodes
+            .into_iter()
+            .map(|(node_id, host_id)| {
+                let storage = storage.clone();
+                let peer_manager = peer_manager.clone();
+                let table_id = table_id_clone.clone();
+                let index_name = index_name_owned.clone();
+                let index_key = index_key_clone.clone();
+                let req_body = req_body.clone();
+
+                async move {
+                    if node_id == local_id {
+                        storage
+                            .read_by_index(&table_id, &index_name, &index_key)
+                            .map_err(ClusterError::Storage)
+                    } else {
+                        let hid = host_id.ok_or_else(|| {
+                            ClusterError::Internal(format!(
+                                "index read: node {node_id} has no host_id"
+                            ))
+                        })?;
+
+                        let resp = peer_manager
+                            .send_with_timeout(
+                                hid,
+                                Message::IndexReadRequest(req_body),
+                                Lane::Data,
+                                Self::RANGE_READ_TIMEOUT,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ClusterError::Internal(format!(
+                                    "index read from node {node_id} ({hid}): {e}"
+                                ))
+                            })?;
+
+                        match resp {
+                            Message::IndexReadResponse(b) => {
+                                let payload = bincode::deserialize::<IndexReadResponsePayload>(&b)
+                                    .map_err(|e| {
+                                        ClusterError::Internal(format!(
+                                            "index read: failed to decode response \
+                                                 from node {node_id} ({hid}): {e}"
+                                        ))
+                                    })?;
+                                Ok(payload
+                                    .partitions
+                                    .into_iter()
+                                    .map(partition_from_wire)
+                                    .collect())
+                            }
+                            other => Err(ClusterError::Internal(format!(
+                                "index read: unexpected response {:?} from node {node_id} ({hid})",
+                                other.msg_type()
+                            ))),
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        let mut all_partitions: Vec<ferrosa_sstable::types::Partition> = Vec::new();
+        let mut first_error: Option<ClusterError> = None;
+        let mut failed_nodes = 0usize;
+
+        while let Some(result) = futs.next().await {
+            match result {
+                Ok(batch) => all_partitions.extend(batch),
+                Err(e) => {
+                    tracing::error!("coordinate_index_read: {e}");
+                    failed_nodes += 1;
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        if let Some(ref err) = first_error {
+            if all_partitions.is_empty() {
+                tracing::error!(
+                    failed_nodes,
+                    "coordinate_index_read: all nodes failed, returning error"
+                );
+                return Err(first_error.unwrap());
+            }
+            tracing::warn!(
+                failed_nodes,
+                partitions_received = all_partitions.len(),
+                %err,
+                "coordinate_index_read: {failed_nodes} node(s) failed, \
+                 returning partial results from {remaining} node(s)",
+                remaining = total_nodes - failed_nodes,
+            );
+        }
+
+        // Deduplicate by token.
         let mut by_token: BTreeMap<i64, Vec<ferrosa_sstable::types::Partition>> = BTreeMap::new();
         for p in all_partitions {
             by_token.entry(p.key.token.0).or_default().push(p);

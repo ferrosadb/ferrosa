@@ -62,17 +62,13 @@ impl PhoneticEncoder for MetaphoneEncoder {
             }
 
             match c {
-                'A' | 'E' | 'I' | 'O' | 'U' => {
-                    // Vowels are only kept at the beginning
-                    if result.is_empty() {
-                        result.push(c);
-                    }
+                // Vowels are only kept at the beginning
+                'A' | 'E' | 'I' | 'O' | 'U' if result.is_empty() => {
+                    result.push(c);
                 }
-                'B' => {
-                    // B unless silent at end after M (e.g., "dumb")
-                    if !(i == len - 1 && prev == 'M') {
-                        result.push('B');
-                    }
+                // B unless silent at end after M (e.g., "dumb")
+                'B' if !(i == len - 1 && prev == 'M') => {
+                    result.push('B');
                 }
                 'C' => {
                     if next == 'I' && next2 == 'A' {
@@ -122,18 +118,14 @@ impl PhoneticEncoder for MetaphoneEncoder {
                         result.push('K');
                     }
                 }
-                'H' => {
-                    if Self::is_vowel(next) && !Self::is_vowel(prev) {
-                        result.push('H');
-                    }
+                'H' if Self::is_vowel(next) && !Self::is_vowel(prev) => {
+                    result.push('H');
                 }
                 'J' => {
                     result.push('J');
                 }
-                'K' => {
-                    if prev != 'C' {
-                        result.push('K');
-                    }
+                'K' if prev != 'C' => {
+                    result.push('K');
                 }
                 'L' => {
                     result.push('L');
@@ -188,10 +180,8 @@ impl PhoneticEncoder for MetaphoneEncoder {
                 'V' => {
                     result.push('F');
                 }
-                'W' | 'Y' => {
-                    if Self::is_vowel(next) {
-                        result.push(c);
-                    }
+                'W' | 'Y' if Self::is_vowel(next) => {
+                    result.push(c);
                 }
                 'X' => {
                     result.push('K');

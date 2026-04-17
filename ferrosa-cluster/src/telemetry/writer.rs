@@ -151,7 +151,7 @@ impl TelemetryWriter {
 
             // Telemetry must not crash the node, but log failures.
             if let Err(e) = self.engine.write_observability(table_id, &key, row, ts) {
-                eprintln!("[telemetry] write_observability failed: {e}");
+                tracing::error!(%e, "telemetry: write_observability failed");
             }
         }
     }

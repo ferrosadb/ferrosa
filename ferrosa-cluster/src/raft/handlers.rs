@@ -35,6 +35,7 @@ use openraft::raft::{
 use serde::{Deserialize, Serialize};
 
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
+use ferrosa_index::IndexKey;
 use ferrosa_net::message::Message;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
@@ -800,6 +801,85 @@ impl RpcHandler for RangeReadHandler {
         };
 
         Some(Message::RangeReadResponse(Bytes::from(resp_bytes)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index read handler
+// ---------------------------------------------------------------------------
+
+/// Payload for a remote index-read request (secondary index lookup on one node).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexReadRequestPayload {
+    pub keyspace: String,
+    pub table: String,
+    pub index_name: String,
+    pub index_key: Vec<u8>,
+}
+
+/// Payload for a remote index-read response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexReadResponsePayload {
+    pub partitions: Vec<PartitionWire>,
+}
+
+/// Handles inbound `IndexReadRequest` RPCs from remote coordinators.
+///
+/// Runs `read_by_index` on local storage and returns matching partitions.
+pub struct IndexReadHandler {
+    storage: Arc<StorageEngine>,
+}
+
+impl IndexReadHandler {
+    pub fn new(storage: Arc<StorageEngine>) -> Self {
+        Self { storage }
+    }
+}
+
+#[async_trait]
+impl RpcHandler for IndexReadHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let bytes = match msg {
+            Message::IndexReadRequest(b) => b,
+            _ => return None,
+        };
+
+        let req: IndexReadRequestPayload = bincode::deserialize(&bytes)
+            .map_err(|e| {
+                tracing::warn!("IndexReadHandler: failed to deserialize request: {e}");
+                e
+            })
+            .ok()?;
+
+        let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
+        let index_key = IndexKey(req.index_key);
+
+        let partitions = match self
+            .storage
+            .read_by_index(&table_id, &req.index_name, &index_key)
+        {
+            Ok(ps) => ps,
+            Err(e) => {
+                tracing::warn!("IndexReadHandler: read_by_index failed: {e}");
+                vec![]
+            }
+        };
+
+        let wire_partitions = partitions.into_iter().map(partition_to_wire).collect();
+        let payload = IndexReadResponsePayload {
+            partitions: wire_partitions,
+        };
+
+        let resp_bytes = match bincode::serialize(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("IndexReadHandler: failed to serialize response: {e}");
+                bincode::serialize(&IndexReadResponsePayload { partitions: vec![] })
+                    .unwrap_or_default()
+            }
+        };
+
+        Some(Message::IndexReadResponse(Bytes::from(resp_bytes)))
     }
 }
 

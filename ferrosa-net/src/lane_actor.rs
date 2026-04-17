@@ -138,14 +138,14 @@ impl LaneHandle {
     /// Attempt to swap in a new RPC client (best-effort, non-blocking).
     pub(crate) fn try_swap_client(&self, client: RpcClient) {
         if let Err(e) = self.tx.try_send(LaneCommand::SwapClient(client)) {
-            eprintln!("[net] lane command send failed: {e}");
+            tracing::error!(%e, "net: lane command send failed");
         }
     }
 
     /// Mark the lane as permanently failed.
     pub(crate) fn mark_failed(&self) {
         if let Err(e) = self.tx.try_send(LaneCommand::MarkFailed) {
-            eprintln!("[net] lane command send failed: {e}");
+            tracing::error!(%e, "net: lane command send failed");
         }
     }
 
@@ -319,8 +319,28 @@ async fn lane_actor_loop(
                 });
             }
             LaneCommand::MarkFailed => {
-                tracing::error!(?lane, "lane actor: marking lane as failed");
-                state = LaneState::Failed;
+                // Never permanently fail — always retry. A transient network
+                // issue (e.g., bootstrap streaming saturating the Bulk lane)
+                // should not permanently kill the Data lane. Schedule another
+                // reconnect attempt after a delay.
+                tracing::warn!(
+                    ?lane,
+                    "lane actor: reconnection exhausted, scheduling delayed retry"
+                );
+                state = LaneState::Reconnecting {
+                    attempt: 0,
+                    backoff: crate::reconnect::ExponentialBackoff::new(
+                        std::time::Duration::from_secs(5),
+                        std::time::Duration::from_secs(30),
+                    ),
+                };
+                // Spawn a new reconnect cycle after a brief delay to avoid
+                // tight-looping if the peer is truly down.
+                let retry_ctx = ctx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    retry_ctx.spawn_reconnect();
+                });
             }
             LaneCommand::QueryStatus { reply } => {
                 let report = match &state {
@@ -369,7 +389,18 @@ async fn handle_send(
             }
         }
         LaneState::Reconnecting { .. } => Err(NetError::Reconnecting),
-        LaneState::Failed => Err(NetError::LaneFailed),
+        LaneState::Failed => {
+            // Legacy state or startup-only — trigger reconnect to recover.
+            *state = LaneState::Reconnecting {
+                attempt: 0,
+                backoff: crate::reconnect::ExponentialBackoff::new(
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(30),
+                ),
+            };
+            ctx.spawn_reconnect();
+            Err(NetError::Reconnecting)
+        }
     }
 }
 
@@ -404,7 +435,17 @@ async fn handle_fire(
             }
         }
         LaneState::Reconnecting { .. } => Err(NetError::Reconnecting),
-        LaneState::Failed => Err(NetError::LaneFailed),
+        LaneState::Failed => {
+            *state = LaneState::Reconnecting {
+                attempt: 0,
+                backoff: crate::reconnect::ExponentialBackoff::new(
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(30),
+                ),
+            };
+            ctx.spawn_reconnect();
+            Err(NetError::Reconnecting)
+        }
     }
 }
 
@@ -436,7 +477,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_lane_actor_with_failed_state_returns_lane_failed() {
+    async fn failed_lane_auto_recovers_to_reconnecting() {
         let handle = spawn_lane_actor(Lane::Raft, LaneState::Failed, |h| ActorReconnectContext {
             lane: Lane::Raft,
             config: Arc::new(NetConfig::default()),
@@ -448,7 +489,7 @@ mod tests {
 
         assert_eq!(handle.lane(), Lane::Raft);
 
-        // Send should return LaneFailed for a Failed lane.
+        // Send on a Failed lane should trigger recovery to Reconnecting.
         let result = handle
             .send(
                 Message::Ping {
@@ -459,11 +500,11 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(result, Err(NetError::LaneFailed)),
-            "expected LaneFailed, got {result:?}"
+            matches!(result, Err(NetError::Reconnecting)),
+            "Failed lane should auto-recover to Reconnecting, got {result:?}"
         );
 
-        // Fire should also return LaneFailed.
+        // Fire should also see Reconnecting now.
         let result = handle
             .fire(
                 Message::Ping {
@@ -474,13 +515,13 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(result, Err(NetError::LaneFailed)),
-            "expected LaneFailed, got {result:?}"
+            matches!(result, Err(NetError::Reconnecting)),
+            "expected Reconnecting, got {result:?}"
         );
 
-        // Status should report Failed.
+        // Status should report Reconnecting (no permanent failure).
         let status = handle.query_status().await.unwrap();
-        assert_eq!(status, LaneStatusReport::Failed);
+        assert_eq!(status, LaneStatusReport::Reconnecting);
 
         handle.shutdown().await;
     }
@@ -553,28 +594,42 @@ mod tests {
         let status = handle.query_status().await.unwrap();
         assert_eq!(status, LaneStatusReport::Reconnecting);
 
-        // Mark failed.
+        // Mark failed — should transition to Reconnecting (never terminal).
         handle.mark_failed();
 
         // Give the actor a moment to process the command.
         tokio::task::yield_now().await;
 
         let status = handle.query_status().await.unwrap();
-        assert_eq!(status, LaneStatusReport::Failed);
+        assert_eq!(
+            status,
+            LaneStatusReport::Reconnecting,
+            "MarkFailed should reset to Reconnecting, not terminal Failed"
+        );
 
         handle.shutdown().await;
     }
 
     #[tokio::test]
     async fn shutdown_stops_actor() {
-        let handle = spawn_lane_actor(Lane::Raft, LaneState::Failed, |h| ActorReconnectContext {
-            lane: Lane::Raft,
-            config: Arc::new(NetConfig::default()),
-            local_host_id: Uuid::new_v4(),
-            peer_host: "127.0.0.1:9999".to_owned(),
-            tls_connector: None,
-            handle: h,
-        });
+        let handle = spawn_lane_actor(
+            Lane::Raft,
+            LaneState::Reconnecting {
+                attempt: 0,
+                backoff: ExponentialBackoff::new(
+                    Duration::from_millis(100),
+                    Duration::from_secs(10),
+                ),
+            },
+            |h| ActorReconnectContext {
+                lane: Lane::Raft,
+                config: Arc::new(NetConfig::default()),
+                local_host_id: Uuid::new_v4(),
+                peer_host: "127.0.0.1:9999".to_owned(),
+                tls_connector: None,
+                handle: h,
+            },
+        );
 
         handle.shutdown().await;
 

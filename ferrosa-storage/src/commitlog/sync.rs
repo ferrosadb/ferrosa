@@ -75,7 +75,7 @@ impl SyncStrategy for BatchSync {
         // will handle flush failures at a higher level. In a production
         // system we'd propagate, but the trait signature returns `()`.
         if let Err(e) = segment.flush_to_disk() {
-            eprintln!("[commitlog] flush_to_disk failed — data may not be durable: {e}");
+            tracing::error!(%e, "commitlog: flush_to_disk failed — data may not be durable");
         }
         // No sync marker needed: BatchSync flushes every entry individually,
         // so every entry is already durable. Markers are only useful for
@@ -157,7 +157,7 @@ impl SyncStrategy for PeriodicSync {
                     }
 
                     if let Err(e) = flush_callback() {
-                        eprintln!("[commitlog] periodic flush_callback failed — data may not be durable: {e}");
+                        tracing::error!(%e, "commitlog: periodic flush_callback failed — data may not be durable");
                     }
                 }
             })
@@ -185,7 +185,7 @@ impl SyncStrategy for PeriodicSync {
 
         // Final flush to ensure all pending data is on disk.
         if let Err(e) = (self.flush_callback)() {
-            eprintln!("[commitlog] shutdown flush_callback failed — data may not be durable: {e}");
+            tracing::error!(%e, "commitlog: shutdown flush_callback failed — data may not be durable");
         }
     }
 }
@@ -323,7 +323,7 @@ impl SyncStrategy for GroupSync {
                     let pending = state.pending.swap(0, Ordering::AcqRel);
                     if pending > 0 {
                         if let Err(e) = flush_callback() {
-                            eprintln!("[commitlog] group flush_callback failed — data may not be durable: {e}");
+                            tracing::error!(%e, "commitlog: group flush_callback failed — data may not be durable");
                         }
                     }
 
@@ -357,7 +357,7 @@ impl SyncStrategy for GroupSync {
 
         // Final flush to ensure all pending data is on disk.
         if let Err(e) = (self.flush_callback)() {
-            eprintln!("[commitlog] shutdown flush_callback failed — data may not be durable: {e}");
+            tracing::error!(%e, "commitlog: shutdown flush_callback failed — data may not be durable");
         }
 
         // Wake any writers still waiting.

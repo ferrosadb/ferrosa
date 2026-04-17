@@ -10,10 +10,12 @@
 //! The transport layer is network-agnostic at the unit-test level; integration
 //! with a live `PeerManager` is exercised in docker smoke tests.
 
+pub mod handler;
 pub mod receiver;
 pub mod sender;
 pub mod sstable_transfer;
 
+pub use handler::{SstableStreamHandler, StreamHandler};
 pub use receiver::{SstableStreamReceiver, SstableStreamResult, StreamReceiver, StreamResult};
 pub use sender::StreamSender;
 

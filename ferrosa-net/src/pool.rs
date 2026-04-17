@@ -445,12 +445,12 @@ mod tests {
             "expected Reconnecting, got {result:?}"
         );
 
-        // Mark the lane as failed.
+        // Mark the lane as failed — should auto-recover to Reconnecting.
         handle.mark_failed();
         // Give the actor a moment to process the command.
         tokio::task::yield_now().await;
 
-        // Next send should return LaneFailed.
+        // Next send should return Reconnecting (lanes never permanently fail).
         let result = handle
             .send(
                 Message::Ping {
@@ -461,8 +461,8 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(result, Err(NetError::LaneFailed)),
-            "expected LaneFailed, got {result:?}"
+            matches!(result, Err(NetError::Reconnecting)),
+            "expected Reconnecting after mark_failed (auto-recovery), got {result:?}"
         );
 
         handle.shutdown().await;

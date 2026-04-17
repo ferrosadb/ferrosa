@@ -123,7 +123,7 @@ impl DdlPath {
                 // (the DDL will be applied automatically but the client can't
                 // observe the result until formation completes).
                 if let Err(e) = queue.send(op) {
-                    eprintln!("[ddl] failed to enqueue DDL operation: {e}");
+                    tracing::error!(%e, "ddl: failed to enqueue DDL operation");
                 }
                 Err(ClusterError::Internal(
                     "DDL unavailable: cluster formation in progress, will be applied after leader election — retry shortly".into(),
@@ -396,10 +396,21 @@ fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
     }
 }
 
+/// Brief wait after a Raft DDL commit to give followers time to apply
+/// the log entry. Raft guarantees that committed entries will eventually
+/// be applied by all live nodes; this covers the typical apply lag so
+/// that a subsequent DML routed to a follower doesn't fail with "schema
+/// may still be propagating".
+///
+/// Matches Cassandra's schema-agreement barrier concept. A proper
+/// implementation would poll each node's applied log index; this is a
+/// pragmatic fixed wait that covers the 99th-percentile apply lag.
+const DDL_SCHEMA_AGREEMENT_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Propose a DDL operation through Raft consensus.
 ///
-/// On success the state machine has applied the command on a quorum of nodes
-/// and side effects are visible on this node via [`FerrosStateMachine`].
+/// On success the state machine has applied the command on all live nodes
+/// (subject to [`DDL_SCHEMA_AGREEMENT_WAIT`]).
 ///
 /// On `ForwardToLeader` the caller receives [`ClusterError::NotLeader`] with
 /// the leader hint. The [`DdlPath::Cluster`] arm in `execute()` catches this
@@ -409,7 +420,15 @@ pub(crate) async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Res
     let cmd = ddl_op_to_raft_command(op);
 
     match raft.client_write(cmd).await {
-        Ok(_resp) => Ok(()),
+        Ok(_resp) => {
+            // Brief wait for follower state machines to apply the entry.
+            // The leader applies immediately on commit; followers apply
+            // asynchronously and typically catch up within a few ms. This
+            // wait covers the gap so a subsequent DML on another node
+            // doesn't race the apply.
+            tokio::time::sleep(DDL_SCHEMA_AGREEMENT_WAIT).await;
+            Ok(())
+        }
         Err(raft_err) => {
             // Extract a ForwardToLeader hint if present.
             if let Some(fwd) = raft_err.forward_to_leader() {

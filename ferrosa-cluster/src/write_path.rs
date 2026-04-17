@@ -189,6 +189,37 @@ impl WritePath {
         }
     }
 
+    /// Read by secondary index, scattering to all nodes in cluster mode.
+    ///
+    /// - `Direct` / `Pair`: reads from local storage only.
+    /// - `Cluster`: fans out to every ring node, each runs a local
+    ///   `read_by_index`, and results are merged and deduplicated.
+    /// - `Unavailable`: returns error.
+    pub async fn index_read(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        index_key: &ferrosa_index::IndexKey,
+    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+        match self {
+            Self::Direct(engine) => engine
+                .read_by_index(table_id, index_name, index_key)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Pair(coordinator) => coordinator
+                .local_storage()
+                .read_by_index(table_id, index_name, index_key)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Cluster(coordinator) => {
+                coordinator
+                    .coordinate_index_read(table_id, index_name, index_key)
+                    .await
+            }
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "index read unavailable: write path is in degraded mode".into(),
+            )),
+        }
+    }
+
     /// Truncate a table. In standalone/pair mode this truncates local storage.
     /// In cluster mode the coordinator fans out to all nodes.
     pub async fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
@@ -259,13 +290,17 @@ mod tests {
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
 
     fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
-        use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngineConfig};
+        use ferrosa_storage::{
+            CommitLogConfig, CompactionConfig, StorageEngineConfig, SyncStrategyConfig,
+        };
         let config = StorageEngineConfig {
             commit_log: CommitLogConfig {
+                segment_size: 4096,
+                max_segment_age: std::time::Duration::from_secs(60),
+                sync_strategy: SyncStrategyConfig::Batch,
                 log_dir: dir.to_path_buf(),
                 checkpoint_dir: dir.to_path_buf(),
                 archive: None,
-                ..CommitLogConfig::default()
             },
             compaction: CompactionConfig::from_env(dir.join("compaction")),
             object_store: None,
@@ -330,5 +365,70 @@ mod tests {
         // Verify data was written
         let result = storage.read(&table_id, &key).unwrap();
         assert!(result.is_some(), "DirectWritePath should write to storage");
+    }
+
+    #[tokio::test]
+    async fn direct_index_read_returns_matching_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        let schema = TableSchema {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "label".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        storage
+            .register_table_with_indexes(schema, vec![("label_idx".to_string(), 0)])
+            .unwrap();
+
+        let table_id = TableId::new("ks", "tbl");
+
+        // Insert 4 rows all with the same indexed value.
+        for i in 0..4u8 {
+            let pk = format!("user{i}");
+            let key = DecoratedKey::new(PartitionKey::new(pk.into_bytes()));
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(b"shared".to_vec(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            };
+            storage.write(&table_id, &key, row, 1000).unwrap();
+        }
+
+        // Verify base data is readable.
+        let key0 = DecoratedKey::new(PartitionKey::new(b"user0".to_vec()));
+        let base = storage.read(&table_id, &key0).unwrap();
+        assert!(base.is_some(), "base partition should be readable for key0");
+
+        // Verify index read returns all rows.
+        let index_key = ferrosa_index::IndexKey(b"shared".to_vec());
+        let direct = storage
+            .read_by_index(&table_id, "label_idx", &index_key)
+            .unwrap();
+        assert_eq!(
+            direct.len(),
+            4,
+            "engine.read_by_index must return all 4 rows (direct check)"
+        );
+
+        let wp = WritePath::direct(storage);
+        let partitions = wp
+            .index_read(&table_id, "label_idx", &index_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            partitions.len(),
+            4,
+            "index_read must return all 4 rows with label='shared'"
+        );
     }
 }

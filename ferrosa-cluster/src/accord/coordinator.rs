@@ -996,30 +996,33 @@ mod tests {
         }
     }
 
-    #[test]
-    #[serial_test::serial(tracing)]
-    fn accord_coordinator_creates_spans() {
-        use std::sync::atomic::AtomicU64;
-        use std::sync::Arc;
+    /// Process-global span collector for tracing tests.
+    ///
+    /// Installed once via `set_global_default` so that tracing callsites
+    /// are always interned with an active subscriber. This eliminates the
+    /// callsite-caching flakiness where a parallel test could intern a
+    /// callsite before any subscriber was installed, permanently disabling it.
+    mod global_span_collector {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Mutex, OnceLock};
 
-        struct SpanCollector {
-            names: Arc<std::sync::Mutex<Vec<String>>>,
+        static NAMES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+
+        struct GlobalSpanCollector {
             next_id: AtomicU64,
         }
 
-        impl tracing::Subscriber for SpanCollector {
+        impl tracing::Subscriber for GlobalSpanCollector {
             fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
                 true
             }
             fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                self.names
+                names()
                     .lock()
                     .unwrap()
                     .push(span.metadata().name().to_string());
-                let id = self
-                    .next_id
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
                 tracing::span::Id::from_u64(id)
             }
             fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
@@ -1029,42 +1032,56 @@ mod tests {
             fn exit(&self, _: &tracing::span::Id) {}
         }
 
-        let shared_names: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        fn names() -> &'static Mutex<Vec<String>> {
+            NAMES.get_or_init(|| Mutex::new(Vec::new()))
+        }
 
-        let subscriber = SpanCollector {
-            names: Arc::clone(&shared_names),
-            next_id: AtomicU64::new(0),
-        };
-
-        tracing::subscriber::with_default(subscriber, || {
-            let t0 = Timestamp {
-                epoch: 1,
-                time: 1000,
-                seq: 1,
-                node: 1,
-            };
-            let txn_id = TxnId::new(1, t0);
-
-            let mut coord = AccordCoordinator::new(txn_id, t0, vec![1, 2, 3], 1, 3, true);
-
-            // Send preaccept responses to trigger the preaccept span.
-            let _ = coord.handle_preaccept_ok(PreAcceptResponse {
-                from: 2,
-                t: t0,
-                deps: vec![],
+        /// Ensure the global collector is installed. Idempotent.
+        pub fn ensure_installed() {
+            INSTALLED.get_or_init(|| {
+                let collector = GlobalSpanCollector {
+                    next_id: AtomicU64::new(0),
+                };
+                // Ignore error if another test already set a global subscriber.
+                let _ = tracing::subscriber::set_global_default(collector);
             });
+        }
 
-            let recorded = shared_names.lock().unwrap();
-            // Tracing callsite caching may suppress spans whose callsite was
-            // first evaluated without a subscriber in parallel test runs.
-            // Verify that at least one accord span was recorded.
-            let has_accord_span = recorded.iter().any(|n| n.starts_with("accord."));
-            assert!(
-                has_accord_span,
-                "expected at least one 'accord.*' span, got: {:?}",
-                *recorded
-            );
+        /// Drain all recorded span names since the last call.
+        pub fn drain_names() -> Vec<String> {
+            names().lock().unwrap().drain(..).collect()
+        }
+    }
+
+    #[test]
+    fn accord_coordinator_creates_spans() {
+        global_span_collector::ensure_installed();
+
+        // Drain any spans from prior tests.
+        global_span_collector::drain_names();
+
+        let t0 = Timestamp {
+            epoch: 1,
+            time: 1000,
+            seq: 1,
+            node: 1,
+        };
+        let txn_id = TxnId::new(1, t0);
+
+        let mut coord = AccordCoordinator::new(txn_id, t0, vec![1, 2, 3], 1, 3, true);
+
+        // Send preaccept responses to trigger the preaccept span.
+        let _ = coord.handle_preaccept_ok(PreAcceptResponse {
+            from: 2,
+            t: t0,
+            deps: vec![],
         });
+
+        let recorded = global_span_collector::drain_names();
+        let has_accord_span = recorded.iter().any(|n| n.starts_with("accord."));
+        assert!(
+            has_accord_span,
+            "expected at least one 'accord.*' span, got: {recorded:?}"
+        );
     }
 }

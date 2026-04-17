@@ -131,12 +131,12 @@ impl CommitLogArchiver {
             match self.store.put(path, data.clone().into()).await {
                 Ok(_) => return Ok(()),
                 Err(e) if attempt < max_retries => {
-                    eprintln!(
-                        "[commitlog-archiver] upload attempt {}/{} failed for {}: {}",
-                        attempt + 1,
-                        max_retries + 1,
-                        path,
-                        e
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_retries = max_retries + 1,
+                        %path,
+                        %e,
+                        "commitlog-archiver: upload attempt failed"
                     );
                     tokio::time::sleep(delay).await;
                     delay *= 2;

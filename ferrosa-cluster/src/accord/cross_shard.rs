@@ -279,6 +279,24 @@ impl CrossShardCoordinator {
             sm.register_dep_waiter(dep_txn, waiter_txn);
         }
     }
+
+    /// Prune applied transactions from all shards and the result cache.
+    ///
+    /// Returns the total number of entries removed across all shards.
+    /// Should be called periodically from a maintenance task to prevent
+    /// unbounded memory growth in `txn_states` and `committed_txns`.
+    pub fn prune_applied(&mut self) -> usize {
+        let mut total = 0;
+        for sm in self.shards.values_mut() {
+            total += sm.prune_applied();
+        }
+        // Clear the result cache — applied transactions are fully committed
+        // and their cached results aren't needed for idempotent retry.
+        let cache_size = self.result_cache.len();
+        self.result_cache.clear();
+        total += cache_size;
+        total
+    }
 }
 
 // ===========================================================================

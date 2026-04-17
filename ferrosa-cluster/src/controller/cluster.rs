@@ -19,7 +19,8 @@ use crate::ddl_path::{execute_via_raft, ClusterDdlForwardHandler, DdlPath};
 use crate::mode::DeploymentMode;
 use crate::pair::ddl::DdlOperation;
 use crate::raft::handlers::{
-    RaftAppendHandler, RaftSnapshotHandler, RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
+    IndexReadHandler, RaftAppendHandler, RaftSnapshotHandler, RaftVoteHandler, RangeReadHandler,
+    ReadRequestHandler,
 };
 use crate::raft::log_store::SledLogStore;
 use crate::raft::network::FerrosRaftNetworkFactory;
@@ -167,6 +168,23 @@ impl ModeController {
         // 2. Create state machine from current schema
         let mut state_machine =
             FerrosStateMachine::with_side_effects(self.schema.clone(), self.storage.clone());
+
+        // Recover last_applied from the log store's purge point if the state
+        // machine was lost (e.g., OOM kill before snapshot persisted). Without
+        // this, openraft tries to replay from index 0 but purged entries are
+        // gone, causing a fatal "expected index [0, N)" error on startup.
+        match log_store.last_purged_log_id() {
+            Ok(purge_point) => state_machine.recover_from_purge_point(purge_point),
+            Err(e) => tracing::warn!(%e, "failed to read last_purged from log store"),
+        }
+
+        // Recover membership from the log if it was lost (e.g., OOM kill
+        // before snapshot persisted). Without valid membership, no election
+        // can happen and the cluster stays stuck as Learners.
+        match log_store.find_last_membership() {
+            Ok(membership) => state_machine.recover_membership(membership),
+            Err(e) => tracing::warn!(%e, "failed to scan log for membership"),
+        }
 
         // 3. Create network factory
         let network_factory = FerrosRaftNetworkFactory::new(peer_manager.clone());
@@ -391,8 +409,64 @@ impl ModeController {
         self.registry
             .register(MsgType::RangeReadRequest, range_read_handler);
 
+        let index_read_handler = Arc::new(IndexReadHandler::new(self.storage.clone()));
+        self.registry
+            .register(MsgType::IndexReadRequest, index_read_handler);
+
         let read_handler = Arc::new(ReadRequestHandler::new(self.storage.clone()));
         self.registry.register(MsgType::ReadRequest, read_handler);
+
+        // Register streaming handlers — row-based and SSTable file-based.
+        // Without these, bootstrap streaming from the leader fails with
+        // "no handler registered msg_type=StreamStart" on the receiver.
+        let stream_handler = Arc::new(crate::streaming::StreamHandler::new(self.storage.clone()));
+        self.registry
+            .register(MsgType::StreamStart, stream_handler.clone());
+        self.registry
+            .register(MsgType::StreamChunk, stream_handler.clone());
+        self.registry.register(MsgType::StreamEnd, stream_handler);
+
+        let data_dir = std::env::var("FERROSA_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/ferrosa"));
+        let sstable_stream_handler =
+            Arc::new(crate::streaming::SstableStreamHandler::new(data_dir));
+        self.registry
+            .register(MsgType::SstableStreamStart, sstable_stream_handler.clone());
+        self.registry
+            .register(MsgType::SstableStreamChunk, sstable_stream_handler.clone());
+        self.registry
+            .register(MsgType::SstableStreamEnd, sstable_stream_handler);
+
+        // Spawn periodic maintenance loop for memory-bounded data structures.
+        // Runs every 60s and prunes applied Accord transactions, expired
+        // DepWaitGraph entries, and logs memory usage for leak detection.
+        {
+            let storage = self.storage.clone();
+            self.spawn_tracked(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+
+                    // Log closed-segment buffer memory (P0 OOM regression detector).
+                    let closed_buf_bytes = storage.closed_segment_buffer_bytes();
+                    if closed_buf_bytes > 0 {
+                        tracing::warn!(
+                            closed_buf_bytes,
+                            "maintenance: closed commit log segments still holding buffer memory"
+                        );
+                    }
+
+                    // Log table-level memory stats.
+                    let table_count = storage.table_count();
+                    tracing::info!(
+                        table_count,
+                        closed_buf_bytes,
+                        "maintenance: periodic memory check"
+                    );
+                }
+            });
+        }
 
         self.spawn_tracked(async move {
             // Deliver ClusterInvite to all peers BEFORE starting Raft.

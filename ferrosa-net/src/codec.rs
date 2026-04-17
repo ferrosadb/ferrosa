@@ -109,6 +109,9 @@ pub enum MsgType {
     // Index build coordination
     IndexBuildRequest = 0x60,
     IndexBuildComplete = 0x61,
+    // Secondary index scatter-gather
+    IndexReadRequest = 0x62,
+    IndexReadResponse = 0x63,
     // Accord consensus
     AccordPreAccept = 0x70,
     AccordPreAcceptOK = 0x71,
@@ -185,6 +188,8 @@ impl TryFrom<u8> for MsgType {
             0x52 => Ok(Self::BatchlogReplay),
             0x60 => Ok(Self::IndexBuildRequest),
             0x61 => Ok(Self::IndexBuildComplete),
+            0x62 => Ok(Self::IndexReadRequest),
+            0x63 => Ok(Self::IndexReadResponse),
             0x70 => Ok(Self::AccordPreAccept),
             0x71 => Ok(Self::AccordPreAcceptOK),
             0x72 => Ok(Self::AccordAccept),

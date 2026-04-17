@@ -479,10 +479,7 @@ impl IndexBuildScheduler {
                                     let path = data_dir
                                         .join(format!("{}-{}.sidecar", job.sstable_id, index_name));
                                     if let Err(e) = SidecarWriter::write(&path, entries) {
-                                        eprintln!(
-                                            "[index-build] failed to write sidecar {}: {e}",
-                                            path.display()
-                                        );
+                                        tracing::error!(%e, path = %path.display(), "index-build: failed to write sidecar");
                                     }
                                 }
                             }
