@@ -1057,46 +1057,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(tracing)]
     fn commitlog_write_span_is_created() {
-        // Verify that the commitlog.write and commitlog.sync spans are
-        // created during append by using a tracing subscriber that records
-        // span names.
-        use std::sync::atomic::AtomicU64;
-        use std::sync::{Arc, Mutex};
-
-        struct SpanCollector {
-            names: Arc<Mutex<Vec<String>>>,
-            next_id: AtomicU64,
-        }
-
-        impl tracing::Subscriber for SpanCollector {
-            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                self.names
-                    .lock()
-                    .unwrap()
-                    .push(span.metadata().name().to_string());
-                let id = self
-                    .next_id
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
-                tracing::span::Id::from_u64(id)
-            }
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-            fn event(&self, _: &tracing::Event<'_>) {}
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
-        }
-
-        let names = Arc::new(Mutex::new(Vec::<String>::new()));
-        let subscriber = SpanCollector {
-            names: Arc::clone(&names),
-            next_id: AtomicU64::new(0),
-        };
+        crate::test_span_collector::ensure_installed();
+        crate::test_span_collector::drain_names();
 
         let dir = tempfile::tempdir().unwrap();
         // Use Batch sync strategy so flush_to_disk (and its commitlog.sync
@@ -1109,23 +1072,19 @@ mod tests {
         };
         let cl = CommitLog::new(config).unwrap();
 
-        let _guard = tracing::subscriber::set_default(subscriber);
         let m = simple_mutation();
         cl.append(&m).unwrap();
 
-        let recorded = names.lock().unwrap();
+        let recorded = crate::test_span_collector::drain_names();
         assert!(
             recorded.iter().any(|n| n == "commitlog.write"),
-            "expected 'commitlog.write' span, got: {:?}",
-            *recorded
+            "expected 'commitlog.write' span, got: {recorded:?}",
         );
         assert!(
             recorded.iter().any(|n| n == "commitlog.sync"),
-            "expected 'commitlog.sync' span, got: {:?}",
-            *recorded
+            "expected 'commitlog.sync' span, got: {recorded:?}",
         );
 
-        drop(_guard);
         cl.shutdown().unwrap();
     }
 

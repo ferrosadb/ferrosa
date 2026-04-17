@@ -9085,44 +9085,9 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(tracing)]
     fn storage_engine_creates_spans() {
-        use std::sync::atomic::AtomicU64;
-
-        struct SpanCollector {
-            names: Arc<std::sync::Mutex<Vec<String>>>,
-            next_id: AtomicU64,
-        }
-
-        impl tracing::Subscriber for SpanCollector {
-            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                self.names
-                    .lock()
-                    .unwrap()
-                    .push(span.metadata().name().to_string());
-                let id = self
-                    .next_id
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
-                tracing::span::Id::from_u64(id)
-            }
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-            fn event(&self, _: &tracing::Event<'_>) {}
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
-        }
-
-        let shared_names: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-
-        let _guard = tracing::subscriber::set_default(SpanCollector {
-            names: Arc::clone(&shared_names),
-            next_id: AtomicU64::new(0),
-        });
+        crate::test_span_collector::ensure_installed();
+        crate::test_span_collector::drain_names();
 
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig::test_config(dir.path());
@@ -9154,16 +9119,14 @@ mod tests {
         engine.write(&table_id, &key, row, 1).unwrap();
         let _ = engine.read(&table_id, &key);
 
-        let recorded = shared_names.lock().unwrap();
+        let recorded = crate::test_span_collector::drain_names();
         assert!(
             recorded.iter().any(|n| n == "storage.write"),
-            "expected 'storage.write' span, got: {:?}",
-            *recorded
+            "expected 'storage.write' span, got: {recorded:?}",
         );
         assert!(
             recorded.iter().any(|n| n == "storage.read"),
-            "expected 'storage.read' span, got: {:?}",
-            *recorded
+            "expected 'storage.read' span, got: {recorded:?}",
         );
     }
 }
