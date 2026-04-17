@@ -14,7 +14,10 @@ use ferrosa_net::rpc::RpcHandler;
 use uuid::Uuid;
 
 use crate::consistency::ConsistencyLevel;
-use crate::coordinator::{ClusterCoordinator, RepairWriteHandler};
+use crate::coordinator::{
+    batch::{BatchlogDeleteHandler, BatchlogReplayHandler, BatchlogWriteHandler},
+    ClusterCoordinator, RepairWriteHandler, TruncateForwardHandler,
+};
 use crate::ddl_path::{execute_via_raft, ClusterDdlForwardHandler, DdlPath};
 use crate::mode::DeploymentMode;
 use crate::pair::ddl::DdlOperation;
@@ -416,6 +419,69 @@ impl ModeController {
         let read_handler = Arc::new(ReadRequestHandler::new(self.storage.clone()));
         self.registry.register(MsgType::ReadRequest, read_handler);
 
+        // Register batchlog handlers — without these, logged batch writes
+        // sent to remote nodes are silently dropped.
+        let batchlog_write = Arc::new(BatchlogWriteHandler::new(self.storage.clone()));
+        self.registry
+            .register(MsgType::BatchlogWrite, batchlog_write);
+        let batchlog_delete = Arc::new(BatchlogDeleteHandler::new(self.storage.clone()));
+        self.registry
+            .register(MsgType::BatchlogDelete, batchlog_delete);
+        let batchlog_replay = Arc::new(BatchlogReplayHandler::new(self.storage.clone()));
+        self.registry
+            .register(MsgType::BatchlogReplay, batchlog_replay);
+
+        // Register truncate handler — without this, TRUNCATE TABLE only
+        // clears the coordinator's local storage; remote replicas keep data.
+        let truncate_handler = Arc::new(TruncateForwardHandler::new(self.storage.clone()));
+        self.registry
+            .register(MsgType::TruncateForward, truncate_handler);
+
+        // Register Accord consensus handlers for all 6 inbound message types.
+        // The AccordHandler dispatches to a shared AccordStateMachine. Response
+        // types (PreAcceptOK, AcceptOK, ReadOK, ApplyOK, RecoverOK) are sent
+        // back by the coordinator, not received as RPC requests.
+        {
+            use crate::accord::handlers::{AccordHandler, AccordState};
+            use crate::accord::state_machine::AccordStateMachine;
+            use ferrosa_storage::accord::sync_writer::FileSyncWriter;
+
+            let accord_dir = std::env::var("FERROSA_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/ferrosa"))
+                .join("accord");
+            let accord_dir = match std::fs::create_dir_all(&accord_dir) {
+                Ok(()) => accord_dir,
+                Err(_) => {
+                    // Fallback to temp dir (e.g., in tests or containerless envs).
+                    let tmp = std::env::temp_dir().join("ferrosa-accord");
+                    let _ = std::fs::create_dir_all(&tmp);
+                    tmp
+                }
+            };
+            let sync_writer = Arc::new(FileSyncWriter::new(accord_dir));
+            let accord_state: AccordState = Arc::new(parking_lot::Mutex::new(
+                AccordStateMachine::new(uuid_to_node_id(self.local_host_id), sync_writer),
+            ));
+
+            let accord_handler = Arc::new(AccordHandler::new(
+                accord_state,
+                uuid_to_node_id(self.local_host_id),
+            ));
+            self.registry
+                .register(MsgType::AccordPreAccept, accord_handler.clone());
+            self.registry
+                .register(MsgType::AccordAccept, accord_handler.clone());
+            self.registry
+                .register(MsgType::AccordCommit, accord_handler.clone());
+            self.registry
+                .register(MsgType::AccordRead, accord_handler.clone());
+            self.registry
+                .register(MsgType::AccordApply, accord_handler.clone());
+            self.registry
+                .register(MsgType::AccordRecover, accord_handler);
+        }
+
         // Register streaming handlers — row-based and SSTable file-based.
         // Without these, bootstrap streaming from the leader fails with
         // "no handler registered msg_type=StreamStart" on the receiver.
@@ -437,6 +503,38 @@ impl ModeController {
             .register(MsgType::SstableStreamChunk, sstable_stream_handler.clone());
         self.registry
             .register(MsgType::SstableStreamEnd, sstable_stream_handler);
+
+        // Register BootstrapComplete handler — increments a shared counter
+        // so the leader's polling loop can track how many nodes have finished.
+        let bootstrap_complete_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let counter = bootstrap_complete_count.clone();
+            struct BootstrapCompleteHandler {
+                counter: Arc<std::sync::atomic::AtomicUsize>,
+            }
+            #[async_trait::async_trait]
+            impl RpcHandler for BootstrapCompleteHandler {
+                async fn handle(
+                    &self,
+                    _from: ferrosa_net::rpc::handler::PeerId,
+                    msg: Message,
+                ) -> Option<Message> {
+                    if let Message::BootstrapComplete { node_id } = msg {
+                        let prev = self
+                            .counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(
+                            count = prev + 1,
+                            %node_id,
+                            "received BootstrapComplete from peer"
+                        );
+                    }
+                    Some(Message::BootstrapCompleteAck)
+                }
+            }
+            let handler = Arc::new(BootstrapCompleteHandler { counter });
+            self.registry.register(MsgType::BootstrapComplete, handler);
+        }
 
         // Spawn periodic maintenance loop for memory-bounded data structures.
         // Runs every 60s and prunes applied Accord transactions, expired
@@ -468,6 +566,7 @@ impl ModeController {
             });
         }
 
+        let bootstrap_complete_counter = bootstrap_complete_count;
         self.spawn_tracked(async move {
             // Deliver ClusterInvite to all peers BEFORE starting Raft.
             // This ensures peers transition to cluster mode and register
@@ -1079,13 +1178,9 @@ impl ModeController {
                             // In a production system this would use a channel/notify,
                             // but polling is correct and simple.
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            // Check if we've received enough completions.
-                            // For now, count based on connected peers that have
-                            // finished streaming (tracked by Raft state or messages).
-                            // Simplification: wait for timeout since we can't easily
-                            // intercept BootstrapComplete in the Raft init task.
-                            // The timeout is much shorter than the old fixed delay.
-                            received_count = expected_count; // TODO: wire actual counting
+                            // Read the counter incremented by BootstrapCompleteHandler.
+                            received_count = bootstrap_complete_counter
+                                .load(std::sync::atomic::Ordering::Relaxed);
                         }
 
                         tracing::info!(
