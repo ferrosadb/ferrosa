@@ -1887,12 +1887,11 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             writer.add_partition(&partition)
         }));
-        match result {
-            Ok(Ok(())) => panic!(
+        if let Ok(Ok(())) = result {
+            panic!(
                 "writer silently accepted row.cells with duplicate col_idx=3; \
                  body written has more cells than bitmap bits set → silent SSTable corruption"
-            ),
-            Ok(Err(_)) | Err(_) => {}
+            );
         }
     }
 
@@ -2089,8 +2088,7 @@ mod tests {
                     rows_per_partition,
                     cell_size
                 );
-                for (r_idx, (exp_row, got_row)) in
-                    exp.rows.iter().zip(got.rows.iter()).enumerate()
+                for (r_idx, (exp_row, got_row)) in exp.rows.iter().zip(got.rows.iter()).enumerate()
                 {
                     assert_eq!(
                         got_row.clustering, exp_row.clustering,
@@ -2106,11 +2104,8 @@ mod tests {
                         cell_size,
                         r_idx
                     );
-                    for (c_idx, ((g_col, g_cell), (e_col, e_cell))) in got_row
-                        .cells
-                        .iter()
-                        .zip(exp_row.cells.iter())
-                        .enumerate()
+                    for (c_idx, ((g_col, g_cell), (e_col, e_cell))) in
+                        got_row.cells.iter().zip(exp_row.cells.iter()).enumerate()
                     {
                         assert_eq!(
                             g_col, e_col,
