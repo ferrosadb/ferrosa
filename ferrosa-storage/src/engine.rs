@@ -4620,11 +4620,7 @@ mod tests {
         let rows_db_files: Vec<_> = std::fs::read_dir(&table_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with("-Rows.db")
-            })
+            .filter(|e| e.file_name().to_string_lossy().ends_with("-Rows.db"))
             .collect();
         assert!(
             !rows_db_files.is_empty(),
@@ -4664,7 +4660,10 @@ mod tests {
             // And reading back the data must still work.
             let pk = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
             let p = engine.read(&tid, &pk).unwrap();
-            assert!(p.is_some(), "data must survive restart after zero-byte Rows.db");
+            assert!(
+                p.is_some(),
+                "data must survive restart after zero-byte Rows.db"
+            );
         }
     }
 
