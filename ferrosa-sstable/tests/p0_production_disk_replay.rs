@@ -114,9 +114,8 @@ fn replay_entity_store_sstable_from_node1() {
 #[test]
 #[ignore]
 fn replay_typed_edges_sstable_from_node1() {
-    let dir = PathBuf::from(
-        "/Users/bkearns/data/ferrosa-memory/node1/sstables/agent_memory.typed_edges",
-    );
+    let dir =
+        PathBuf::from("/Users/bkearns/data/ferrosa-memory/node1/sstables/agent_memory.typed_edges");
     if !dir.exists() {
         eprintln!("skip: {} missing", dir.display());
         return;

@@ -1046,9 +1046,7 @@ mod tests {
         let tid = ferrosa_storage::TableId::new("ks", "evolving");
 
         // Write a row with the single regular column and flush.
-        let key1 = DecoratedKey::new(PartitionKey::new(
-            uuid::Uuid::new_v4().as_bytes().to_vec(),
-        ));
+        let key1 = DecoratedKey::new(PartitionKey::new(uuid::Uuid::new_v4().as_bytes().to_vec()));
         let row1 = Row {
             clustering: vec![],
             cells: vec![(0, CellValue::live(b"before".to_vec(), 1_000))],
@@ -1082,9 +1080,7 @@ mod tests {
         // Write a row that includes the newly-added column. Pre-fix, flush would
         // produce a silently corrupt SSTable (cell col_idx=1 with num_columns=1).
         // Post-fix, the propagated schema gives num_columns=2 and flush succeeds.
-        let key2 = DecoratedKey::new(PartitionKey::new(
-            uuid::Uuid::new_v4().as_bytes().to_vec(),
-        ));
+        let key2 = DecoratedKey::new(PartitionKey::new(uuid::Uuid::new_v4().as_bytes().to_vec()));
         let row2 = Row {
             clustering: vec![],
             cells: vec![
