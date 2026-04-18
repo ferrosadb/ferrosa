@@ -79,3 +79,22 @@ The storage engine's read path likely opens the SSTable directory, finds no file
 3. Has an iterator that never terminates because there are no SSTables to iterate
 
 Tables with no SSTable directory at all (never created) would skip the SSTable read path entirely. The bug is specific to directories that exist but are empty.
+
+## Implementation Notes
+
+Resolved on PR #109. Verified 2026-04-18 against the live 3-node
+ferrosa-memory cluster running the PR #109 image:
+
+- `SELECT * FROM agent_memory.{entity_types, edge_types, audit_log,
+  tool_usage_log}` all return in < 0.05s with the correct result set —
+  including tables with only a subset of expected SSTables and tables
+  with zero matching rows.
+- Direct repro: `CREATE KEYSPACE + CREATE TABLE + SELECT * + SELECT …
+  WHERE k=1` against a brand-new table with no writes returns `0 rows`
+  in 0.01s. No hang.
+
+Most likely carried by the cluster-formation/schema-replay commits
+(`8d18faa`, `9bcd7ea`) which ensure new tables are registered on every
+node before the first read. The startup-compaction/load-existing-SSTable
+changes (`c6209a8`, `9441e48`) also closed the empty-dir case by
+treating missing SSTable sets as "empty result" rather than blocking.

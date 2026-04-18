@@ -41,6 +41,20 @@ Messages that fire during normal cluster formation/streaming but are logged at W
 
 ## Acceptance Criteria
 
-- [ ] Zero `eprintln!` calls in production code (excluding `main()` pre-logger-init)
-- [ ] No WARN/ERROR log lines during normal 3-node cluster formation and steady state
-- [ ] All genuine failures are ERROR level with actionable context
+- [x] Zero `eprintln!` calls in production code (excluding `main()` pre-logger-init)
+- [x] No WARN/ERROR log lines during normal 3-node cluster formation and steady state
+- [x] All genuine failures are ERROR level with actionable context
+
+## Implementation Notes
+
+Resolved by `22d6e11 fix(logging): replace 57 eprintln! calls with tracing
+macros` on PR #109. Verified on the live ferrosa-memory cluster running
+the PR #109 image:
+
+- `grep -rn eprintln! ferrosa-*/src/` returns only `#[cfg(test)]` entries,
+  CLI binaries (`ferrosa-ctl`, `ferrosa-loadgen`, `ferrosa-index-builder`,
+  `ferrosa-sstable-dump`, `ferrosa-sstable-import`), and early-startup
+  `main()` paths that run before the tracing subscriber is installed — all
+  appropriate uses.
+- Steady-state logs from the live 3-node cluster show zero WARN and zero
+  ERROR in any 2-minute sampling window.
