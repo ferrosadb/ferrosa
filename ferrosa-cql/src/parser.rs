@@ -176,11 +176,13 @@ impl<'input> Parser<'input> {
                     let n = i32::try_from(n).map_err(|_| {
                         CqlError::SyntaxError(format!("LIMIT value out of range: {n}"))
                     })?;
-                    Some(n)
+                    Some(crate::ast::Limit::Literal(n))
                 }
+                TokenKind::QuestionMark => Some(crate::ast::Limit::BindMarker),
+                TokenKind::NamedBind(name) => Some(crate::ast::Limit::NamedBindMarker(name)),
                 _ => {
                     return Err(CqlError::SyntaxError(format!(
-                        "expected integer after LIMIT, got {:?}",
+                        "expected integer or bind marker after LIMIT, got {:?}",
                         tok.kind
                     )))
                 }
@@ -2508,7 +2510,31 @@ mod tests {
         match stmt {
             Statement::Select(s) => {
                 assert_eq!(s.order_by, vec![("ts".into(), OrderDirection::Desc)]);
-                assert_eq!(s.limit, Some(10));
+                assert_eq!(s.limit, Some(crate::ast::Limit::Literal(10)));
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_select_with_parameterized_limit() {
+        // Positional bind marker
+        let stmt = parse("SELECT * FROM t WHERE pk = 1 LIMIT ?").unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.limit, Some(crate::ast::Limit::BindMarker));
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+
+        // Named bind marker
+        let stmt = parse("SELECT * FROM t WHERE pk = 1 LIMIT :page_size").unwrap();
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(
+                    s.limit,
+                    Some(crate::ast::Limit::NamedBindMarker("page_size".into()))
+                );
             }
             other => panic!("expected Select, got {:?}", other),
         }

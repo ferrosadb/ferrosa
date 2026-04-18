@@ -1137,11 +1137,12 @@ async fn route_select_user_table(
         }
 
         // Apply LIMIT if specified.
-        let fts_rows: Vec<Vec<Option<CqlValue>>> = if let Some(limit) = s.limit {
-            fts_rows.into_iter().take(limit as usize).collect()
-        } else {
-            fts_rows
-        };
+        let fts_rows: Vec<Vec<Option<CqlValue>>> =
+            if let Some(limit) = s.limit.as_ref().and_then(|l| l.as_literal()) {
+                fts_rows.into_iter().take(limit as usize).collect()
+            } else {
+                fts_rows
+            };
         // Project to selected columns.
         let selected_rows = select_columns(&fts_rows, &all_col_names, &col_names);
         let result = result::encode_rows(&col_names, &col_types, ks, &s.table, &selected_rows);
@@ -1677,7 +1678,8 @@ async fn route_select_user_table(
         apply_tojson_projections(&s.columns, &col_names, &all_col_names, &rows, selected_rows);
 
     // Apply LIMIT
-    let limited = if let Some(limit) = s.limit {
+    let limit_val = s.limit.as_ref().and_then(|l| l.as_literal());
+    let limited = if let Some(limit) = limit_val {
         &selected_rows[..std::cmp::min(selected_rows.len(), limit as usize)]
     } else {
         &selected_rows
@@ -1686,7 +1688,7 @@ async fn route_select_user_table(
     // Apply pagination: page_size interacts with LIMIT.
     // If both page_size and LIMIT are set, the effective limit is min(page_size, limit).
     // Pagination operates on the already-limited result set.
-    let effective_page_size = match (ctx.paging.page_size, s.limit) {
+    let effective_page_size = match (ctx.paging.page_size, limit_val) {
         (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
         (Some(ps), None) => Some(ps),
         (None, _) => None,
