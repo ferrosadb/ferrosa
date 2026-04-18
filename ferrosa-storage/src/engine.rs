@@ -1078,9 +1078,49 @@ impl StorageEngine {
 
         let mut sstables = Vec::new();
         let mut sidecars = Vec::new();
+        let mut quarantined_count = 0usize;
 
         for gen in generations {
             let gen_str = gen.to_string();
+
+            // Quarantine SSTables with zero-byte critical components.
+            // These are unrecoverable (produced by the pre-fix writer bug).
+            let critical_components = ["Data.db", "Partitions.db", "Rows.db"];
+            let mut quarantine = false;
+            for comp in &critical_components {
+                let path = table_dir.join(format!("{gen_str}-{comp}"));
+                match std::fs::metadata(&path) {
+                    Ok(meta) if meta.len() == 0 => {
+                        tracing::error!(
+                            gen,
+                            component = comp,
+                            dir = %table_dir.display(),
+                            "storage-engine: quarantining SSTable with zero-byte {comp}"
+                        );
+                        quarantine = true;
+                    }
+                    Err(_) => {
+                        // Missing component — will fail in open_sstable_from_dir.
+                    }
+                    _ => {}
+                }
+            }
+            if quarantine {
+                // Move to quarantine subdirectory.
+                let quarantine_dir = table_dir.join("quarantine");
+                let _ = std::fs::create_dir_all(&quarantine_dir);
+                for entry in std::fs::read_dir(table_dir).into_iter().flatten().flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with(&format!("{gen_str}-")) {
+                        let dest = quarantine_dir.join(&*name);
+                        let _ = std::fs::rename(entry.path(), dest);
+                    }
+                }
+                quarantined_count += 1;
+                continue;
+            }
+
             match Self::open_sstable_from_dir(table_dir, &gen_str) {
                 Ok(reader) => {
                     sstables.push(Arc::new(reader));
@@ -1090,6 +1130,18 @@ impl StorageEngine {
                     tracing::warn!(%e, gen, dir = %table_dir.display(), "storage-engine: skipping corrupt SSTable");
                 }
             }
+        }
+
+        if quarantined_count > 0 {
+            tracing::error!(
+                quarantined = quarantined_count,
+                loaded = sstables.len(),
+                dir = %table_dir.display(),
+                "storage-engine: quarantined {quarantined_count} corrupt SSTable(s) \
+                 with zero-byte component files — moved to {}/quarantine/. \
+                 Data in quarantined SSTables is unrecoverable.",
+                table_dir.display(),
+            );
         }
 
         (sstables, sidecars)

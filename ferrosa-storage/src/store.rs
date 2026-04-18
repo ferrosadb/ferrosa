@@ -657,11 +657,19 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // SSTables — read all partitions from each
-        for sstable in guard.sstables.iter() {
+        for (i, sstable) in guard.sstables.iter().enumerate() {
             match sstable.read_all_partitions() {
                 Ok(parts) => all_partitions.extend(parts),
                 Err(e) => {
-                    tracing::warn!("read_range: skipping corrupted SSTable: {e}");
+                    let id = guard
+                        .sstable_ids
+                        .get(i)
+                        .map(|(gen, dir)| format!("{}/{gen}", dir.display()))
+                        .unwrap_or_else(|| format!("index={i}"));
+                    tracing::warn!(
+                        sstable = %id,
+                        "read_range: skipping corrupted SSTable: {e}"
+                    );
                 }
             }
         }
