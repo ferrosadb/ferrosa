@@ -11674,4 +11674,36 @@ mod tests {
             _ => panic!("expected Result"),
         }
     }
+
+    #[tokio::test]
+    async fn select_now_from_system_local_returns_timeuuid() {
+        let (state, _dir) = setup();
+        let dev = dev_auth();
+        let stmt = crate::parser::parse("SELECT now() FROM system.local").unwrap();
+        let result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+            },
+            stmt,
+        )
+        .await
+        .unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes(), "must be a Rows result");
+                let row_count = extract_row_count(b);
+                assert_eq!(
+                    row_count, 1,
+                    "SELECT now() FROM system.local must return 1 row"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
 }
