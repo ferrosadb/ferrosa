@@ -1084,8 +1084,13 @@ impl StorageEngine {
             let gen_str = gen.to_string();
 
             // Quarantine SSTables with zero-byte critical components.
-            // These are unrecoverable (produced by the pre-fix writer bug).
-            let critical_components = ["Data.db", "Partitions.db", "Rows.db"];
+            // NOTE: Rows.db is intentionally excluded — the SSTable writer
+            // emits a zero-byte Rows.db for simple partitions that don't need
+            // a per-partition row index (ferrosa-sstable/src/writer.rs:212).
+            // A 0-byte Rows.db is the expected output, not corruption; the
+            // reader treats a missing/empty Rows.db as "no row index".
+            // Only Data.db and Partitions.db being zero-byte is unrecoverable.
+            let critical_components = ["Data.db", "Partitions.db"];
             let mut quarantine = false;
             for comp in &critical_components {
                 let path = table_dir.join(format!("{gen_str}-{comp}"));
@@ -4563,6 +4568,103 @@ mod tests {
                 total_rows,
                 "post-restart: SSTable lost rows — data corruption on restart"
             );
+        }
+    }
+
+    /// Regression: the startup quarantine must NOT treat zero-byte Rows.db
+    /// as corruption. `ferrosa-sstable/src/writer.rs:212` intentionally
+    /// emits an empty Rows.db for simple partitions (no per-partition row
+    /// index), and every SSTable the current writer produces therefore has
+    /// a zero-byte Rows.db. A previous version of the quarantine list
+    /// included Rows.db, which caused every legitimate SSTable to be moved
+    /// to `quarantine/` on restart, losing all persisted data on the
+    /// ferrosa-memory cluster (871 SSTables × 14k+ entities).
+    #[test]
+    fn startup_does_not_quarantine_zero_byte_rows_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "rows_db".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let tid = TableId::new("test_ks", "rows_db");
+
+        // Phase 1: write and flush so a real on-disk SSTable with the
+        // writer's default zero-byte Rows.db exists.
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+
+            let pk = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            };
+            engine.write(&tid, &pk, row, 1000).unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        // Confirm at least one Rows.db on disk is zero-byte — this is what
+        // the pre-fix quarantine treated as "corruption".
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let rows_db_files: Vec<_> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("-Rows.db")
+            })
+            .collect();
+        assert!(
+            !rows_db_files.is_empty(),
+            "flush must produce a Rows.db file"
+        );
+        let any_zero_byte_rows_db = rows_db_files
+            .iter()
+            .any(|e| e.metadata().map(|m| m.len() == 0).unwrap_or(false));
+        assert!(
+            any_zero_byte_rows_db,
+            "writer currently emits zero-byte Rows.db; this test guards the quarantine \
+             heuristic that treated them as corruption. If the writer changes to emit \
+             non-empty Rows.db, revisit the quarantine policy."
+        );
+
+        // Phase 2: reopen. The quarantine code must NOT move the SSTable
+        // because of the zero-byte Rows.db. A quarantine directory
+        // containing any SSTable components after reload is a regression.
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema).unwrap();
+
+            let quarantine_dir = table_dir.join("quarantine");
+            if quarantine_dir.exists() {
+                let count = std::fs::read_dir(&quarantine_dir)
+                    .map(|it| it.count())
+                    .unwrap_or(0);
+                assert_eq!(
+                    count, 0,
+                    "startup quarantined SSTable(s) with zero-byte Rows.db — \
+                     these are the writer's expected output, not corruption. \
+                     See ferrosa-sstable/src/writer.rs:212."
+                );
+            }
+
+            // And reading back the data must still work.
+            let pk = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+            let p = engine.read(&tid, &pk).unwrap();
+            assert!(p.is_some(), "data must survive restart after zero-byte Rows.db");
         }
     }
 
