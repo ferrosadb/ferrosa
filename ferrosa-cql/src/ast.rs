@@ -194,6 +194,28 @@ pub enum OrderDirection {
     Desc,
 }
 
+/// A LIMIT clause value — either a literal integer or a bind marker.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Limit {
+    /// Literal integer value: `LIMIT 10`
+    Literal(i32),
+    /// Positional bind marker: `LIMIT ?`
+    BindMarker,
+    /// Named bind marker: `LIMIT :name`
+    NamedBindMarker(String),
+}
+
+impl Limit {
+    /// Extract the literal value, or `None` for bind markers.
+    /// Bind marker values are resolved at prepared-statement execution time.
+    pub fn as_literal(&self) -> Option<i32> {
+        match self {
+            Self::Literal(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
     pub keyspace: Option<String>,
@@ -201,7 +223,7 @@ pub struct SelectStatement {
     pub columns: Vec<SelectColumn>,
     pub where_clauses: Vec<WhereClause>,
     pub order_by: Vec<(String, OrderDirection)>,
-    pub limit: Option<i32>,
+    pub limit: Option<Limit>,
     pub allow_filtering: bool,
     /// ANN (Approximate Nearest Neighbor) ordering: `ORDER BY col ANN OF <term>`.
     /// Stores the column name and the vector term for similarity search.

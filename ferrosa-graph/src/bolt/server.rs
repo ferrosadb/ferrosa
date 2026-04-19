@@ -243,7 +243,7 @@ async fn handle_connection(
         }
         // If it's not a LOGON, process it as a regular message.
         other => {
-            let reply = process_message(other, &engine, &schema, &mut state)?;
+            let reply = process_message(other, &engine, &schema, &mut state).await?;
             send_replies(&mut stream, &reply).await?;
         }
     }
@@ -287,7 +287,7 @@ async fn handle_connection(
                 break;
             }
             other => {
-                let replies = process_message(other, &engine, &schema, &mut state)?;
+                let replies = process_message(other, &engine, &schema, &mut state).await?;
                 send_replies(&mut stream, &replies).await?;
             }
         }
@@ -297,7 +297,7 @@ async fn handle_connection(
 }
 
 /// Process a single message and produce response messages.
-fn process_message(
+async fn process_message(
     msg: BoltMessage,
     engine: &Arc<GraphEngine>,
     _schema: &Arc<Schema>,
@@ -320,7 +320,7 @@ fn process_message(
                 .or_else(|| find_string_field(&params, "db"))
                 .unwrap_or_else(|| state.keyspace.clone());
 
-            match engine.execute(&query, &keyspace, &auth) {
+            match engine.execute(&query, &keyspace, &auth).await {
                 Ok(result) => {
                     let fields: Vec<PackValue> = result
                         .columns

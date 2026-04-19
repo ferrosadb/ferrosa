@@ -6,8 +6,11 @@
 
 use std::collections::BTreeMap;
 
+use ferrosa_net::peer::PeerManager;
+
 use crate::raft::Token;
 use crate::ring::TokenRing;
+use crate::streaming::{StreamConfig, StreamSender, StreamedMutation};
 
 /// A plan describing which tokens to move between nodes to achieve balance.
 #[derive(Debug, Clone)]
@@ -136,11 +139,15 @@ fn compute_max_skew(node_tokens: &BTreeMap<u64, Vec<Token>>, ideal: usize) -> f6
 /// Steps:
 /// 1. Compute the rebalance plan.
 /// 2. If empty, return immediately.
-/// 3. Stream data for reassigned ranges (TODO: full implementation).
+/// 3. Stream data for reassigned token ranges from source to target nodes.
 /// 4. Propose `AssignTokens` via Raft for each target node.
 pub async fn execute_rebalance(
     raft: &crate::raft::FerrosRaft,
     ring: &TokenRing,
+    storage: &ferrosa_storage::engine::StorageEngine,
+    schema: &ferrosa_schema::Schema,
+    peer_manager: &PeerManager,
+    local_node_id: u64,
 ) -> crate::error::Result<()> {
     let plan = compute_rebalance(ring);
     if plan.reassignments.is_empty() {
@@ -159,9 +166,138 @@ pub async fn execute_rebalance(
         by_target.entry(r.to_node).or_default().push(r.token);
     }
 
-    // TODO: Stream data for affected ranges from source to target nodes.
-    // For the MVP, S3-backed storage means data is globally accessible
-    // and only token ownership metadata needs to move.
+    // Stream data for reassigned token ranges from source to target nodes.
+    //
+    // Only stream from the local node: each node in the cluster runs
+    // execute_rebalance and streams the partitions it currently owns that
+    // are being reassigned to a different node.
+    let local_reassignments: Vec<&TokenReassignment> = plan
+        .reassignments
+        .iter()
+        .filter(|r| r.from_node == local_node_id)
+        .collect();
+
+    if !local_reassignments.is_empty() {
+        // Collect the set of tokens being moved away, grouped by target node.
+        let mut tokens_by_target: BTreeMap<u64, Vec<Token>> = BTreeMap::new();
+        for r in &local_reassignments {
+            tokens_by_target.entry(r.to_node).or_default().push(r.token);
+        }
+
+        let schema_snap = schema.snapshot();
+        let config = StreamConfig::default();
+        let mut session_counter = 0_u64;
+
+        for (ks, tbl) in schema_snap.tables.keys() {
+            if ks.starts_with("system") {
+                continue;
+            }
+
+            let table_id = ferrosa_storage::commitlog::TableId::new(ks, tbl);
+
+            // Read all partitions for this table from local storage.
+            // Cap to prevent OOM; anti-entropy repair covers the rest.
+            const REBALANCE_READ_LIMIT: usize = 100_000;
+            let partitions = match storage.read_range(&table_id, None, None, REBALANCE_READ_LIMIT) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(%e, ks, tbl, "rebalance: failed to read table");
+                    continue;
+                }
+            };
+
+            // Group partitions by target node based on which tokens are
+            // being reassigned. A partition belongs to a reassignment if
+            // the token ring currently maps it to the local node AND its
+            // token is in the set being moved to a target.
+            let mut mutations_by_target: BTreeMap<u64, Vec<StreamedMutation>> = BTreeMap::new();
+
+            for partition in &partitions {
+                let token = partition.key.token.0; // Token(i64) -> i64
+
+                // Check if this token is being reassigned to any target.
+                for (&target_node_id, target_tokens) in &tokens_by_target {
+                    if !target_tokens.contains(&token) {
+                        continue;
+                    }
+
+                    // Serialize rows via RowWire for full fidelity
+                    // (clustering keys, all cells, deletion, liveness).
+                    use crate::raft::handlers::RowWire;
+                    let wire_rows: Vec<RowWire> =
+                        partition.rows.iter().cloned().map(RowWire::from).collect();
+                    let row_bytes = match bincode::serialize(&wire_rows) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::error!(
+                                %e,
+                                partition_key = ?partition.key,
+                                "rebalance: failed to serialize rows, skipping partition"
+                            );
+                            continue;
+                        }
+                    };
+                    let ts = partition
+                        .rows
+                        .first()
+                        .and_then(|r| r.cells.first())
+                        .map(|(_, cv)| cv.timestamp)
+                        .unwrap_or(0);
+
+                    mutations_by_target
+                        .entry(target_node_id)
+                        .or_default()
+                        .push(StreamedMutation {
+                            keyspace: ks.clone(),
+                            table: tbl.clone(),
+                            key: partition.key.key.as_bytes().to_vec(),
+                            row: row_bytes,
+                            timestamp: ts,
+                        });
+                }
+            }
+
+            // Send accumulated mutations to each target node.
+            for (target_node_id, mutations) in mutations_by_target {
+                let target_uuid = ring
+                    .get_node(target_node_id)
+                    .map(|n| n.host_id)
+                    .unwrap_or_default();
+
+                session_counter += 1;
+                let count = mutations.len();
+
+                if let Err(e) = StreamSender::send_stream(
+                    mutations,
+                    peer_manager,
+                    target_uuid,
+                    session_counter,
+                    (i64::MIN, i64::MAX),
+                    local_node_id,
+                    &config,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        %e,
+                        target = target_node_id,
+                        "rebalance: streaming failed for {ks}.{tbl}"
+                    );
+                } else {
+                    tracing::info!(
+                        target = target_node_id,
+                        count,
+                        "rebalance: streamed {ks}.{tbl} to node {target_node_id}"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            tables_scanned = schema_snap.tables.len(),
+            "rebalance: data streaming complete"
+        );
+    }
 
     // Propose AssignTokens for each target node.
     for (node_id, tokens) in by_target {

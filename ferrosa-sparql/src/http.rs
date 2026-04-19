@@ -89,7 +89,7 @@ async fn handle_sparql_post(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    execute_and_respond(&state, &query_str, keyspace, accept)
+    execute_and_respond(&state, &query_str, keyspace, accept).await
 }
 
 /// GET /sparql?query=... — execute a SPARQL query via URL parameter.
@@ -114,7 +114,7 @@ async fn handle_sparql_get(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    execute_and_respond(&state, &params.query, &params.keyspace, accept)
+    execute_and_respond(&state, &params.query, &params.keyspace, accept).await
 }
 
 /// POST /sparql/update — execute a SPARQL UPDATE (INSERT DATA, DELETE DATA).
@@ -170,10 +170,15 @@ async fn handle_health(State(state): State<AppState>) -> Response {
 /// - `text/turtle` -> Turtle serialization
 /// - `application/n-triples` -> N-Triples serialization
 /// - Default -> `application/sparql-results+json`
-fn execute_and_respond(state: &AppState, query: &str, keyspace: &str, accept: &str) -> Response {
+async fn execute_and_respond(
+    state: &AppState,
+    query: &str,
+    keyspace: &str,
+    accept: &str,
+) -> Response {
     let format = crate::results::ResultFormat::from_accept(accept);
 
-    match state.engine.execute(query, keyspace) {
+    match state.engine.execute(query, keyspace).await {
         Ok(result) => match result.serialize(format) {
             Ok(bytes) => (
                 StatusCode::OK,

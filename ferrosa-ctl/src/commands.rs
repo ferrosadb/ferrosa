@@ -372,34 +372,48 @@ pub async fn snapshot_create(
     name: &str,
     ttl_hours: Option<u64>,
 ) -> Result<(), WebError> {
-    let node_url = format!("http://{}:{}", host, web_port);
-    println!("Creating snapshot '{name}'...");
-    println!("  TTL: {ttl_hours:?} hours");
-    println!("  Node: {node_url}");
-    // TODO: POST /api/snapshots
-    Ok(())
+    let url = format!("http://{host}:{web_port}/api/snapshots");
+    let mut body = serde_json::json!({ "name": name });
+    if let Some(ttl) = ttl_hours {
+        body["ttl_hours"] = serde_json::json!(ttl);
+    }
+    let resp = reqwest::Client::new().post(&url).json(&body).send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        println!("Snapshot '{name}' created: {text}");
+        Ok(())
+    } else {
+        Err(format!("POST {url}: {status} — {text}").into())
+    }
 }
 
 /// List snapshots on the target node.
-///
-/// Will issue `GET /api/snapshots` once the endpoint exists.
 pub async fn snapshot_list(host: &str, web_port: u16) -> Result<(), WebError> {
-    let node_url = format!("http://{}:{}", host, web_port);
-    println!("Listing snapshots...");
-    println!("  Node: {node_url}");
-    // TODO: GET /api/snapshots
-    Ok(())
+    let url = format!("http://{host}:{web_port}/api/snapshots");
+    let resp = reqwest::Client::new().get(&url).send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        println!("{text}");
+        Ok(())
+    } else {
+        Err(format!("GET {url}: {status} — {text}").into())
+    }
 }
 
 /// Delete a snapshot on the target node.
-///
-/// Will issue `DELETE /api/snapshots/{name}` once the endpoint exists.
 pub async fn snapshot_delete(host: &str, web_port: u16, name: &str) -> Result<(), WebError> {
-    let node_url = format!("http://{}:{}", host, web_port);
-    println!("Deleting snapshot '{name}'...");
-    println!("  Node: {node_url}");
-    // TODO: DELETE /api/snapshots/{name}
-    Ok(())
+    let url = format!("http://{host}:{web_port}/api/snapshots/{name}");
+    let resp = reqwest::Client::new().delete(&url).send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        println!("Snapshot '{name}' deleted.");
+        Ok(())
+    } else {
+        Err(format!("DELETE {url}: {status} — {text}").into())
+    }
 }
 
 /// Restore from a snapshot, optionally to a point in time.
@@ -412,13 +426,23 @@ pub async fn restore(
     point_in_time: Option<&str>,
     force: bool,
 ) -> Result<(), WebError> {
-    let node_url = format!("http://{}:{}", host, web_port);
-    println!("Restoring from snapshot '{snapshot_name}'...");
-    println!("  Point-in-time: {point_in_time:?}");
-    println!("  Force: {force}");
-    println!("  Node: {node_url}");
-    // TODO: POST /api/restore
-    Ok(())
+    let url = format!("http://{host}:{web_port}/api/restore");
+    let mut body = serde_json::json!({
+        "snapshot_name": snapshot_name,
+        "force": force,
+    });
+    if let Some(pit) = point_in_time {
+        body["point_in_time"] = serde_json::json!(pit);
+    }
+    let resp = reqwest::Client::new().post(&url).json(&body).send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        println!("Restore initiated: {text}");
+        Ok(())
+    } else {
+        Err(format!("POST {url}: {status} — {text}").into())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

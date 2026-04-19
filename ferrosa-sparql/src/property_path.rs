@@ -7,7 +7,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use ferrosa_storage::engine::StorageEngine;
+use ferrosa_cluster::write_path::WritePath;
 use spargebra::algebra::PropertyPathExpression;
 use spargebra::term::TermPattern;
 
@@ -21,29 +21,32 @@ pub type PathResult = Vec<(String, String)>;
 /// Evaluate a property path pattern against storage.
 ///
 /// Returns all `(subject, object)` pairs reachable via the path expression.
-pub fn evaluate_property_path(
+pub async fn evaluate_property_path(
     subject: &TermPattern,
     path: &PropertyPathExpression,
     object: &TermPattern,
     graph: &str,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<PathResult, SparqlError> {
     match path {
         PropertyPathExpression::NamedNode(predicate) => {
-            evaluate_single_hop(subject, predicate.as_str(), object, graph, storage)
+            evaluate_single_hop(subject, predicate.as_str(), object, graph, write_path).await
         }
         PropertyPathExpression::OneOrMore(inner) => {
-            evaluate_closure(subject, inner, object, graph, storage, false)
+            evaluate_closure(subject, inner, object, graph, write_path, false).await
         }
         PropertyPathExpression::ZeroOrMore(inner) => {
-            evaluate_closure(subject, inner, object, graph, storage, true)
+            evaluate_closure(subject, inner, object, graph, write_path, true).await
         }
         PropertyPathExpression::ZeroOrOne(inner) => {
-            evaluate_zero_or_one(subject, inner, object, graph, storage)
+            evaluate_zero_or_one(subject, inner, object, graph, write_path).await
         }
         PropertyPathExpression::Reverse(inner) => {
             // Swap subject and object, evaluate, then swap results back.
-            let results = evaluate_property_path(object, inner, subject, graph, storage)?;
+            let results = Box::pin(evaluate_property_path(
+                object, inner, subject, graph, write_path,
+            ))
+            .await?;
             Ok(results.into_iter().map(|(s, o)| (o, s)).collect())
         }
         _ => Err(SparqlError::Plan(format!(
@@ -53,14 +56,14 @@ pub fn evaluate_property_path(
 }
 
 /// Single-hop: fetch triples matching (subject, predicate, object).
-fn evaluate_single_hop(
+async fn evaluate_single_hop(
     subject: &TermPattern,
     predicate: &str,
     object: &TermPattern,
     graph: &str,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<PathResult, SparqlError> {
-    let triples = fetch_triples_for_predicate(graph, predicate, storage)?;
+    let triples = fetch_triples_for_predicate(graph, predicate, write_path).await?;
     filter_by_endpoints(subject, object, &triples)
 }
 
@@ -68,16 +71,16 @@ fn evaluate_single_hop(
 ///
 /// When `include_start` is true (ZeroOrMore), includes the start node
 /// paired with itself. When false (OneOrMore), requires at least one hop.
-fn evaluate_closure(
+async fn evaluate_closure(
     subject: &TermPattern,
     inner: &PropertyPathExpression,
     object: &TermPattern,
     graph: &str,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
     include_start: bool,
 ) -> Result<PathResult, SparqlError> {
     let predicate = extract_single_predicate(inner)?;
-    let adjacency = fetch_triples_for_predicate(graph, &predicate, storage)?;
+    let adjacency = fetch_triples_for_predicate(graph, &predicate, write_path).await?;
     let starts = collect_start_nodes(subject, &adjacency);
 
     let mut results = Vec::new();
@@ -90,15 +93,15 @@ fn evaluate_closure(
 }
 
 /// ZeroOrOne: return 0-hop (self) and 1-hop matches.
-fn evaluate_zero_or_one(
+async fn evaluate_zero_or_one(
     subject: &TermPattern,
     inner: &PropertyPathExpression,
     object: &TermPattern,
     graph: &str,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<PathResult, SparqlError> {
     let predicate = extract_single_predicate(inner)?;
-    let adjacency = fetch_triples_for_predicate(graph, &predicate, storage)?;
+    let adjacency = fetch_triples_for_predicate(graph, &predicate, write_path).await?;
     let starts = collect_start_nodes(subject, &adjacency);
 
     let mut results = Vec::new();
@@ -164,13 +167,13 @@ fn extract_single_predicate(path: &PropertyPathExpression) -> Result<String, Spa
 }
 
 /// Fetch all (subject, object) pairs for a given predicate from storage.
-fn fetch_triples_for_predicate(
+async fn fetch_triples_for_predicate(
     graph: &str,
     predicate: &str,
-    storage: &Arc<StorageEngine>,
+    write_path: &Arc<WritePath>,
 ) -> Result<Vec<(String, String)>, SparqlError> {
     let table_id = triple_store::triples_table_id(graph);
-    let partitions = storage.read_range(&table_id, None, None, 10_000)?;
+    let partitions = write_path.range_read(&table_id).await?;
 
     let mut pairs = Vec::new();
     for partition in &partitions {

@@ -863,6 +863,30 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Updates the schema for a registered table after `ALTER TABLE`.
+    ///
+    /// Propagates the new schema both to `TableState.schema` (used by
+    /// compaction/snapshot paths) and `TableStore.schema` (used by the flush
+    /// path's `SerializationHeader`). Without this, `ALTER TABLE ADD COLUMN`
+    /// left the storage engine with a stale column list and the flush path
+    /// produced silently corrupt SSTables. See
+    /// `specs/in-process/bug-sstable-writer-produces-zero-byte-rows-db.md`.
+    ///
+    /// Returns `Err` if the table is not registered.
+    pub fn update_table_schema(
+        &self,
+        table_id: &TableId,
+        new_schema: TableSchema,
+    ) -> ferrosa_common::Result<()> {
+        let mut tables = self.tables.write();
+        let state = tables.get_mut(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state.schema = new_schema.clone();
+        state.store.update_schema(new_schema);
+        Ok(())
+    }
+
     /// Unregisters a table from the storage engine.
     ///
     /// Removes the `TableState` from the engine's table map AND deletes the
@@ -1054,9 +1078,54 @@ impl StorageEngine {
 
         let mut sstables = Vec::new();
         let mut sidecars = Vec::new();
+        let mut quarantined_count = 0usize;
 
         for gen in generations {
             let gen_str = gen.to_string();
+
+            // Quarantine SSTables with zero-byte critical components.
+            // NOTE: Rows.db is intentionally excluded — the SSTable writer
+            // emits a zero-byte Rows.db for simple partitions that don't need
+            // a per-partition row index (ferrosa-sstable/src/writer.rs:212).
+            // A 0-byte Rows.db is the expected output, not corruption; the
+            // reader treats a missing/empty Rows.db as "no row index".
+            // Only Data.db and Partitions.db being zero-byte is unrecoverable.
+            let critical_components = ["Data.db", "Partitions.db"];
+            let mut quarantine = false;
+            for comp in &critical_components {
+                let path = table_dir.join(format!("{gen_str}-{comp}"));
+                match std::fs::metadata(&path) {
+                    Ok(meta) if meta.len() == 0 => {
+                        tracing::error!(
+                            gen,
+                            component = comp,
+                            dir = %table_dir.display(),
+                            "storage-engine: quarantining SSTable with zero-byte {comp}"
+                        );
+                        quarantine = true;
+                    }
+                    Err(_) => {
+                        // Missing component — will fail in open_sstable_from_dir.
+                    }
+                    _ => {}
+                }
+            }
+            if quarantine {
+                // Move to quarantine subdirectory.
+                let quarantine_dir = table_dir.join("quarantine");
+                let _ = std::fs::create_dir_all(&quarantine_dir);
+                for entry in std::fs::read_dir(table_dir).into_iter().flatten().flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with(&format!("{gen_str}-")) {
+                        let dest = quarantine_dir.join(&*name);
+                        let _ = std::fs::rename(entry.path(), dest);
+                    }
+                }
+                quarantined_count += 1;
+                continue;
+            }
+
             match Self::open_sstable_from_dir(table_dir, &gen_str) {
                 Ok(reader) => {
                     sstables.push(Arc::new(reader));
@@ -1066,6 +1135,18 @@ impl StorageEngine {
                     tracing::warn!(%e, gen, dir = %table_dir.display(), "storage-engine: skipping corrupt SSTable");
                 }
             }
+        }
+
+        if quarantined_count > 0 {
+            tracing::error!(
+                quarantined = quarantined_count,
+                loaded = sstables.len(),
+                dir = %table_dir.display(),
+                "storage-engine: quarantined {quarantined_count} corrupt SSTable(s) \
+                 with zero-byte component files — moved to {}/quarantine/. \
+                 Data in quarantined SSTables is unrecoverable.",
+                table_dir.display(),
+            );
         }
 
         (sstables, sidecars)
@@ -4490,6 +4571,102 @@ mod tests {
         }
     }
 
+    /// Regression: the startup quarantine must NOT treat zero-byte Rows.db
+    /// as corruption. `ferrosa-sstable/src/writer.rs:212` intentionally
+    /// emits an empty Rows.db for simple partitions (no per-partition row
+    /// index), and every SSTable the current writer produces therefore has
+    /// a zero-byte Rows.db. A previous version of the quarantine list
+    /// included Rows.db, which caused every legitimate SSTable to be moved
+    /// to `quarantine/` on restart, losing all persisted data on the
+    /// ferrosa-memory cluster (871 SSTables × 14k+ entities).
+    #[test]
+    fn startup_does_not_quarantine_zero_byte_rows_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "rows_db".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let tid = TableId::new("test_ks", "rows_db");
+
+        // Phase 1: write and flush so a real on-disk SSTable with the
+        // writer's default zero-byte Rows.db exists.
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+
+            let pk = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(b"hello".to_vec(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            };
+            engine.write(&tid, &pk, row, 1000).unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        // Confirm at least one Rows.db on disk is zero-byte — this is what
+        // the pre-fix quarantine treated as "corruption".
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let rows_db_files: Vec<_> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with("-Rows.db"))
+            .collect();
+        assert!(
+            !rows_db_files.is_empty(),
+            "flush must produce a Rows.db file"
+        );
+        let any_zero_byte_rows_db = rows_db_files
+            .iter()
+            .any(|e| e.metadata().map(|m| m.len() == 0).unwrap_or(false));
+        assert!(
+            any_zero_byte_rows_db,
+            "writer currently emits zero-byte Rows.db; this test guards the quarantine \
+             heuristic that treated them as corruption. If the writer changes to emit \
+             non-empty Rows.db, revisit the quarantine policy."
+        );
+
+        // Phase 2: reopen. The quarantine code must NOT move the SSTable
+        // because of the zero-byte Rows.db. A quarantine directory
+        // containing any SSTable components after reload is a regression.
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema).unwrap();
+
+            let quarantine_dir = table_dir.join("quarantine");
+            if quarantine_dir.exists() {
+                let count = std::fs::read_dir(&quarantine_dir)
+                    .map(|it| it.count())
+                    .unwrap_or(0);
+                assert_eq!(
+                    count, 0,
+                    "startup quarantined SSTable(s) with zero-byte Rows.db — \
+                     these are the writer's expected output, not corruption. \
+                     See ferrosa-sstable/src/writer.rs:212."
+                );
+            }
+
+            // And reading back the data must still work.
+            let pk = DecoratedKey::new(PartitionKey::new(1i32.to_be_bytes().to_vec()));
+            let p = engine.read(&tid, &pk).unwrap();
+            assert!(
+                p.is_some(),
+                "data must survive restart after zero-byte Rows.db"
+            );
+        }
+    }
+
     /// Multiple flushes → drop engine → re-open from disk → read back.
     ///
     /// Simulates the production scenario: many writes triggering multiple
@@ -6872,7 +7049,7 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        engine.register_table(schema).unwrap();
+        engine.register_table(schema.clone()).unwrap();
         let tid = TableId::new("test_ks", "evolving");
 
         // Write row with 1 column, flush to SSTable
@@ -6886,7 +7063,21 @@ mod tests {
         engine.write(&tid, &key1, row1, 1000).unwrap();
         engine.flush_all().unwrap();
 
-        // "ALTER TABLE ADD" — write row with 2 columns (cell index 0 and 1)
+        // "ALTER TABLE ADD" — propagate the post-ALTER schema to the storage
+        // engine so flush builds the SerializationHeader with the correct
+        // num_columns. Without this, the writer's fail-loud assertion
+        // (ferrosa-sstable/src/writer.rs) catches the col_idx-out-of-range
+        // case and panics. Bug:
+        // specs/implemented/bug-sstable-writer-produces-zero-byte-rows-db.md.
+        let mut schema_v2 = schema;
+        schema_v2
+            .regular_columns
+            .push(ferrosa_common::ColumnDefinition {
+                name: "extra".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            });
+        engine.update_table_schema(&tid, schema_v2).unwrap();
+
         let key2 = DecoratedKey::new(PartitionKey::new(2i32.to_be_bytes().to_vec()));
         let row2 = Row {
             clustering: vec![],

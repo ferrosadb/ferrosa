@@ -25,6 +25,7 @@ use bytes::BytesMut;
 use crate::ast::*;
 use crate::result;
 use crate::types::{CqlType, CqlValue};
+use ferrosa_cluster::consistency::ConsistencyLevel;
 
 // ---------------------------------------------------------------------------
 // Routing mode
@@ -54,22 +55,35 @@ pub enum RouteDecision {
 
 /// Determine routing for a DML statement based on deployment mode.
 ///
-/// In cluster mode, all DML (INSERT/UPDATE/DELETE/SELECT) routes through
-/// Accord for strict serializability. In standalone mode, Accord is bypassed.
-pub fn route_decision(mode: RoutingMode, stmt: &Statement) -> RouteDecision {
+/// In cluster mode, only LWT statements (INSERT IF NOT EXISTS,
+/// UPDATE/DELETE IF condition) route through Accord for linearizability.
+/// Regular DML uses tunable consistency via the WritePath coordinator.
+/// In standalone mode, everything is local.
+pub fn route_decision(
+    mode: RoutingMode,
+    stmt: &Statement,
+    serial_consistency: Option<ConsistencyLevel>,
+) -> RouteDecision {
     if mode == RoutingMode::Standalone {
         return RouteDecision::Local;
     }
 
-    match stmt {
-        Statement::Insert(_)
-        | Statement::Update(_)
-        | Statement::Delete(_)
-        | Statement::Select(_)
-        | Statement::Batch(_) => RouteDecision::Accord,
-        // DDL and other statements do not go through Accord.
-        _ => RouteDecision::Local,
+    // LWT: serial_consistency is set by the CQL protocol when the client
+    // uses IF NOT EXISTS / IF condition. This is the signal that Accord
+    // consensus is required for linearizability.
+    if serial_consistency.is_some() {
+        return match stmt {
+            Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::Select(_)
+            | Statement::Batch(_) => RouteDecision::Accord,
+            _ => RouteDecision::Local,
+        };
     }
+
+    // Regular DML: use WritePath (tunable CL, not Accord).
+    RouteDecision::Local
 }
 
 // ---------------------------------------------------------------------------
@@ -423,17 +437,29 @@ mod tests {
         });
 
         assert_eq!(
-            route_decision(RoutingMode::Cluster, &insert),
+            route_decision(
+                RoutingMode::Cluster,
+                &insert,
+                Some(ConsistencyLevel::Serial)
+            ),
             RouteDecision::Accord,
             "INSERT must route through Accord in cluster mode"
         );
         assert_eq!(
-            route_decision(RoutingMode::Cluster, &update),
+            route_decision(
+                RoutingMode::Cluster,
+                &update,
+                Some(ConsistencyLevel::Serial)
+            ),
             RouteDecision::Accord,
             "UPDATE must route through Accord in cluster mode"
         );
         assert_eq!(
-            route_decision(RoutingMode::Cluster, &delete),
+            route_decision(
+                RoutingMode::Cluster,
+                &delete,
+                Some(ConsistencyLevel::Serial)
+            ),
             RouteDecision::Accord,
             "DELETE must route through Accord in cluster mode"
         );
@@ -459,7 +485,11 @@ mod tests {
         });
 
         assert_eq!(
-            route_decision(RoutingMode::Cluster, &select),
+            route_decision(
+                RoutingMode::Cluster,
+                &select,
+                Some(ConsistencyLevel::Serial)
+            ),
             RouteDecision::Accord,
             "SELECT must use linearizable read path through Accord in cluster mode"
         );
@@ -489,12 +519,12 @@ mod tests {
         });
 
         assert_eq!(
-            route_decision(RoutingMode::Standalone, &insert),
+            route_decision(RoutingMode::Standalone, &insert, None),
             RouteDecision::Local,
             "INSERT must bypass Accord in standalone mode"
         );
         assert_eq!(
-            route_decision(RoutingMode::Standalone, &select),
+            route_decision(RoutingMode::Standalone, &select, None),
             RouteDecision::Local,
             "SELECT must bypass Accord in standalone mode"
         );
@@ -507,7 +537,7 @@ mod tests {
             durable_writes: None,
         });
         assert_eq!(
-            route_decision(RoutingMode::Cluster, &ddl),
+            route_decision(RoutingMode::Cluster, &ddl, Some(ConsistencyLevel::Serial)),
             RouteDecision::Local,
             "DDL must not route through Accord even in cluster mode"
         );
@@ -551,7 +581,7 @@ mod tests {
         });
 
         assert_eq!(
-            route_decision(RoutingMode::Cluster, &batch),
+            route_decision(RoutingMode::Cluster, &batch, Some(ConsistencyLevel::Serial)),
             RouteDecision::Accord,
             "BATCH must route through Accord in cluster mode"
         );

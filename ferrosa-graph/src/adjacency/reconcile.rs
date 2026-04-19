@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_schema::Schema;
 use ferrosa_sstable::types::DeletionTime;
-use ferrosa_storage::{StorageEngine, TableId};
+use ferrosa_storage::TableId;
 
 use crate::adjacency::observer::make_adjacency_mutation;
 use crate::adjacency::schema::{adjacency_keyspace_name, DIRECTION_IN, DIRECTION_OUT};
@@ -27,12 +28,14 @@ pub struct ReconcileMetrics {
 }
 
 /// Number of partitions to read per batch during reconciliation.
+/// Retained for future use when WritePath supports batched range reads.
+#[allow(dead_code)]
 const BATCH_LIMIT: usize = 1000;
 
 /// Run one reconciliation pass for a keyspace.
-pub fn reconcile_once(
+pub async fn reconcile_once(
     schema: &Schema,
-    storage: &StorageEngine,
+    write_path: &WritePath,
     keyspace: &str,
 ) -> ReconcileMetrics {
     let snap = schema.snapshot();
@@ -63,95 +66,84 @@ pub fn reconcile_once(
         let edge_label = edge_tid.table.clone();
         let edge_table_fqn = format!("{}.{}", edge_tid.keyspace, edge_tid.table);
 
-        // Scan edge table partitions in batches.
-        let mut last_key: Option<DecoratedKey> = None;
-        while let Ok(partitions) =
-            storage.read_range(edge_tid, last_key.as_ref(), None, BATCH_LIMIT)
-        {
-            if partitions.is_empty() {
-                break;
-            }
+        // Scan all edge table partitions.
+        let partitions = match write_path.range_read(edge_tid).await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
 
-            for partition in &partitions {
-                let source_id = partition.key.key.as_bytes().to_vec();
-                let source_key = partition.key.clone();
+        for partition in &partitions {
+            let source_id = partition.key.key.as_bytes().to_vec();
+            let source_key = partition.key.clone();
 
-                for row in &partition.rows {
-                    let target_id = row.clustering.clone();
-                    metrics.entries_checked += 1;
+            for row in &partition.rows {
+                let target_id = row.clustering.clone();
+                metrics.entries_checked += 1;
 
-                    // Check OUT adjacency: source -> target
-                    if !adjacency_entry_exists(
-                        storage,
-                        &adj_table_id,
-                        &source_key,
+                // Check OUT adjacency: source -> target
+                if !adjacency_entry_exists(
+                    write_path,
+                    &adj_table_id,
+                    &source_key,
+                    DIRECTION_OUT,
+                    &edge_label,
+                    &target_id,
+                )
+                .await
+                {
+                    // Repair: create OUT adjacency entry.
+                    let mutation = make_adjacency_mutation(
+                        &adj_ks,
+                        &source_id,
                         DIRECTION_OUT,
                         &edge_label,
                         &target_id,
-                    ) {
-                        // Repair: create OUT adjacency entry.
-                        let mutation = make_adjacency_mutation(
-                            &adj_ks,
-                            &source_id,
-                            DIRECTION_OUT,
-                            &edge_label,
-                            &target_id,
-                            &edge_table_fqn,
-                            now_micros(),
-                        );
-                        if write_mutation(storage, &mutation).is_ok() {
-                            metrics.entries_repaired += 1;
-                        }
+                        &edge_table_fqn,
+                        now_micros(),
+                    );
+                    if write_mutation(write_path, &mutation).await.is_ok() {
+                        metrics.entries_repaired += 1;
                     }
+                }
 
-                    // Check IN adjacency: target -> source
-                    let target_key = DecoratedKey::new(PartitionKey::new(target_id.clone()));
-                    if !adjacency_entry_exists(
-                        storage,
-                        &adj_table_id,
-                        &target_key,
+                // Check IN adjacency: target -> source
+                let target_key = DecoratedKey::new(PartitionKey::new(target_id.clone()));
+                if !adjacency_entry_exists(
+                    write_path,
+                    &adj_table_id,
+                    &target_key,
+                    DIRECTION_IN,
+                    &edge_label,
+                    &source_id,
+                )
+                .await
+                {
+                    // Repair: create IN adjacency entry.
+                    let mutation = make_adjacency_mutation(
+                        &adj_ks,
+                        &target_id,
                         DIRECTION_IN,
                         &edge_label,
                         &source_id,
-                    ) {
-                        // Repair: create IN adjacency entry.
-                        let mutation = make_adjacency_mutation(
-                            &adj_ks,
-                            &target_id,
-                            DIRECTION_IN,
-                            &edge_label,
-                            &source_id,
-                            &edge_table_fqn,
-                            now_micros(),
-                        );
-                        if write_mutation(storage, &mutation).is_ok() {
-                            metrics.entries_repaired += 1;
-                        }
+                        &edge_table_fqn,
+                        now_micros(),
+                    );
+                    if write_mutation(write_path, &mutation).await.is_ok() {
+                        metrics.entries_repaired += 1;
                     }
                 }
-            }
-
-            // Advance past the last partition we saw.
-            let batch_len = partitions.len();
-            last_key = partitions.last().map(|p| p.key.clone());
-
-            // If we got fewer than BATCH_LIMIT, we've exhausted the table.
-            if batch_len < BATCH_LIMIT {
-                break;
             }
         }
     }
 
     // Phase 2: Scan adjacency index for orphans.
     // For each adjacency entry, verify the source edge still exists.
-    let mut last_adj_key: Option<DecoratedKey> = None;
-    while let Ok(adj_partitions) =
-        storage.read_range(&adj_table_id, last_adj_key.as_ref(), None, BATCH_LIMIT)
-    {
-        if adj_partitions.is_empty() {
-            break;
-        }
+    let adj_partitions = write_path
+        .range_read(&adj_table_id)
+        .await
+        .unwrap_or_default();
 
+    {
         for partition in &adj_partitions {
             let vertex_id = partition.key.key.as_bytes().to_vec();
 
@@ -201,8 +193,7 @@ pub fn reconcile_once(
 
                 // Verify the edge exists in the edge table.
                 let source_key = DecoratedKey::new(PartitionKey::new(source_id));
-                // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
-                let edge_exists = match storage.read(&edge_tid, &source_key) {
+                let edge_exists = match write_path.read(&edge_tid, &source_key).await {
                     Ok(Some(p)) => p.rows.iter().any(|r| r.clustering == target_id),
                     _ => false,
                 };
@@ -210,12 +201,13 @@ pub fn reconcile_once(
                 if !edge_exists {
                     // Write a tombstone to remove this orphan adjacency entry.
                     if write_tombstone(
-                        storage,
+                        write_path,
                         &adj_table_id,
                         &partition.key,
                         &row.clustering,
                         &edge_label,
                     )
+                    .await
                     .is_ok()
                     {
                         metrics.orphans_removed += 1;
@@ -223,29 +215,21 @@ pub fn reconcile_once(
                 }
             }
         }
-
-        let batch_len = adj_partitions.len();
-        last_adj_key = adj_partitions.last().map(|p| p.key.clone());
-
-        if batch_len < BATCH_LIMIT {
-            break;
-        }
     }
 
     metrics
 }
 
 /// Check whether a specific adjacency entry exists for a vertex.
-fn adjacency_entry_exists(
-    storage: &StorageEngine,
+async fn adjacency_entry_exists(
+    write_path: &WritePath,
     adj_table_id: &TableId,
     vertex_key: &DecoratedKey,
     direction: u8,
     edge_label: &str,
     neighbor_id: &[u8],
 ) -> bool {
-    // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
-    let partition = match storage.read(adj_table_id, vertex_key) {
+    let partition = match write_path.read(adj_table_id, vertex_key).await {
         Ok(Some(p)) => p,
         _ => return false,
     };
@@ -281,21 +265,32 @@ fn extract_edge_label(clustering: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Write a mutation to the storage engine by decomposing it into individual row writes.
-fn write_mutation(
-    storage: &StorageEngine,
+/// Write a mutation by decomposing it into individual row writes via WritePath.
+async fn write_mutation(
+    write_path: &WritePath,
     mutation: &ferrosa_storage::Mutation,
 ) -> ferrosa_common::Result<()> {
     let table_id = TableId::new(&mutation.keyspace, &mutation.table);
     for row in &mutation.rows {
-        storage.write(&table_id, &mutation.key, row.clone(), mutation.timestamp)?;
+        write_path
+            .write(
+                &table_id,
+                &mutation.key,
+                row.clone(),
+                mutation.timestamp,
+                ferrosa_cluster::consistency::ConsistencyLevel::One,
+                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
+            .await?;
     }
     Ok(())
 }
 
 /// Write a tombstone row for an orphan adjacency entry.
-fn write_tombstone(
-    storage: &StorageEngine,
+async fn write_tombstone(
+    write_path: &WritePath,
     adj_table_id: &TableId,
     vertex_key: &DecoratedKey,
     clustering: &[u8],
@@ -313,7 +308,18 @@ fn write_tombstone(
         primary_key_liveness: LivenessInfo::NONE,
     };
 
-    storage.write(adj_table_id, vertex_key, tombstone_row, now_us)
+    write_path
+        .write(
+            adj_table_id,
+            vertex_key,
+            tombstone_row,
+            now_us,
+            ferrosa_cluster::consistency::ConsistencyLevel::One,
+            &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                replication_factor: 1,
+            },
+        )
+        .await
 }
 
 /// Returns the current time in microseconds since epoch.
@@ -327,7 +333,7 @@ fn now_micros() -> i64 {
 /// Spawn the background reconciliation loop.
 pub fn spawn_reconciliation(
     schema: Arc<Schema>,
-    storage: Arc<StorageEngine>,
+    write_path: Arc<WritePath>,
     keyspace: String,
     interval: Duration,
     cancel: CancellationToken,
@@ -337,7 +343,7 @@ pub fn spawn_reconciliation(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let metrics = reconcile_once(&schema, &storage, &keyspace);
+                    let metrics = reconcile_once(&schema, &write_path, &keyspace).await;
                     if metrics.entries_repaired > 0 || metrics.orphans_removed > 0 {
                         tracing::info!(
                             keyspace = %keyspace,
@@ -374,11 +380,11 @@ mod tests {
     };
     use ferrosa_sstable::types::{LivenessInfo, Row};
     use ferrosa_storage::{
-        CommitLogConfig, CompactionConfig, StorageEngineConfig, SyncStrategyConfig,
+        CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
     };
     use indexmap::IndexMap;
 
-    fn test_storage_engine(dir: &std::path::Path) -> StorageEngine {
+    fn test_storage_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
         let config = StorageEngineConfig {
             commit_log: CommitLogConfig {
                 segment_size: 4096,
@@ -396,7 +402,7 @@ mod tests {
             data_dir: dir.to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
         };
-        StorageEngine::new(config, None).unwrap()
+        Arc::new(StorageEngine::new(config, None).unwrap())
     }
 
     fn test_schema() -> Schema {
@@ -569,8 +575,8 @@ mod tests {
         assert_eq!(m.orphans_removed, 0);
     }
 
-    #[test]
-    fn reconcile_repairs_missing_adjacency_entries() {
+    #[tokio::test]
+    async fn reconcile_repairs_missing_adjacency_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = test_storage_engine(tmp.path());
         let schema = test_schema();
@@ -582,7 +588,8 @@ mod tests {
         write_edge(&storage, "social", "knows", b"alice", b"carol");
 
         // No adjacency entries exist yet. Reconciliation should repair them.
-        let metrics = reconcile_once(&schema, &storage, "social");
+        let wp = WritePath::direct(storage.clone());
+        let metrics = reconcile_once(&schema, &wp, "social").await;
 
         // 2 edge rows checked.
         assert_eq!(metrics.entries_checked, 2);
@@ -623,8 +630,8 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn reconcile_is_idempotent_when_entries_exist() {
+    #[tokio::test]
+    async fn reconcile_is_idempotent_when_entries_exist() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = test_storage_engine(tmp.path());
         let schema = test_schema();
@@ -634,18 +641,19 @@ mod tests {
         write_edge(&storage, "social", "knows", b"alice", b"bob");
 
         // First reconciliation creates the entries.
-        let m1 = reconcile_once(&schema, &storage, "social");
+        let wp = WritePath::direct(storage.clone());
+        let m1 = reconcile_once(&schema, &wp, "social").await;
         assert_eq!(m1.entries_repaired, 2); // OUT + IN
 
         // Second reconciliation should find everything in order.
-        let m2 = reconcile_once(&schema, &storage, "social");
+        let m2 = reconcile_once(&schema, &wp, "social").await;
         assert_eq!(m2.entries_checked, 1);
         assert_eq!(m2.entries_repaired, 0);
         assert_eq!(m2.orphans_removed, 0);
     }
 
-    #[test]
-    fn reconcile_removes_orphan_adjacency_entries() {
+    #[tokio::test]
+    async fn reconcile_removes_orphan_adjacency_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = test_storage_engine(tmp.path());
         let schema = test_schema();
@@ -683,25 +691,27 @@ mod tests {
         assert!(!before.unwrap().rows.is_empty());
 
         // Run reconciliation — should detect and remove the orphan.
-        let metrics = reconcile_once(&schema, &storage, "social");
+        let wp = WritePath::direct(storage.clone());
+        let metrics = reconcile_once(&schema, &wp, "social").await;
         assert_eq!(metrics.orphans_removed, 1);
     }
 
-    #[test]
-    fn reconcile_no_edge_tables_returns_zero_metrics() {
+    #[tokio::test]
+    async fn reconcile_no_edge_tables_returns_zero_metrics() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = test_storage_engine(tmp.path());
         let schema = test_schema();
 
         // No edge tables registered — should return zero metrics.
-        let metrics = reconcile_once(&schema, &storage, "nonexistent");
+        let wp = WritePath::direct(storage);
+        let metrics = reconcile_once(&schema, &wp, "nonexistent").await;
         assert_eq!(metrics.entries_checked, 0);
         assert_eq!(metrics.entries_repaired, 0);
         assert_eq!(metrics.orphans_removed, 0);
     }
 
-    #[test]
-    fn reconcile_partial_repair_only_missing_direction() {
+    #[tokio::test]
+    async fn reconcile_partial_repair_only_missing_direction() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = test_storage_engine(tmp.path());
         let schema = test_schema();
@@ -736,7 +746,8 @@ mod tests {
         }
 
         // Reconciliation should only repair the missing IN entry.
-        let metrics = reconcile_once(&schema, &storage, "social");
+        let wp = WritePath::direct(storage.clone());
+        let metrics = reconcile_once(&schema, &wp, "social").await;
         assert_eq!(metrics.entries_checked, 1);
         assert_eq!(metrics.entries_repaired, 1); // Only the IN entry was missing.
     }

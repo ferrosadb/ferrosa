@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use ferrosa_cluster::write_path::WritePath;
 use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::SparqlError;
@@ -75,6 +76,7 @@ impl Default for SparqlConfig {
 /// SPARQL query engine backed by ferrosa's StorageEngine.
 pub struct SparqlEngine {
     storage: Arc<StorageEngine>,
+    write_path: Arc<WritePath>,
     config: SparqlConfig,
 }
 
@@ -84,13 +86,21 @@ impl SparqlEngine {
     /// Registers the `rdf_triples` table schema for the default graph
     /// keyspace so that INSERT/DELETE/SELECT queries can execute without
     /// requiring external DDL.
-    pub fn new(storage: Arc<StorageEngine>, config: SparqlConfig) -> Self {
+    pub fn new(
+        storage: Arc<StorageEngine>,
+        write_path: Arc<WritePath>,
+        config: SparqlConfig,
+    ) -> Self {
         // Register the RDF triples table for the default keyspace.
         let schema = crate::triple_store::rdf_triples_schema(&config.default_graph);
         if let Err(e) = storage.register_table(schema) {
             tracing::warn!(%e, "failed to register rdf_triples table for default graph");
         }
-        Self { storage, config }
+        Self {
+            storage,
+            write_path,
+            config,
+        }
     }
 
     /// Ensure the rdf_triples table is registered for a given keyspace.
@@ -128,7 +138,11 @@ impl SparqlEngine {
     ///
     /// The `keyspace` parameter scopes the query to a specific tenant/keyspace.
     /// ASK queries return a boolean result; SELECT queries return binding sets.
-    pub fn execute(&self, query_str: &str, keyspace: &str) -> Result<SparqlResult, SparqlError> {
+    pub async fn execute(
+        &self,
+        query_str: &str,
+        keyspace: &str,
+    ) -> Result<SparqlResult, SparqlError> {
         // 1. Parse SPARQL → algebra.
         let query = spargebra::SparqlParser::new()
             .parse_query(query_str)
@@ -155,7 +169,7 @@ impl SparqlEngine {
         let plan = planner::plan_query(&query, graph)?;
 
         // 3. Execute plan against storage.
-        let results = crate::executor::execute(&plan, &self.storage)?;
+        let results = crate::executor::execute(&plan, &self.write_path).await?;
 
         // BUG-S6 fix: ASK queries return boolean result format.
         if plan.is_ask {

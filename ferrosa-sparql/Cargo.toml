@@ -18,6 +18,7 @@ oxrdf = { version = "0.3", features = ["rdf-12"] }
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-index = { path = "../ferrosa-index" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
+ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 

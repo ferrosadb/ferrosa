@@ -39,3 +39,9 @@ impl From<ferrosa_common::Error> for SparqlError {
         Self::Execution(e.to_string())
     }
 }
+
+impl From<ferrosa_cluster::error::ClusterError> for SparqlError {
+    fn from(e: ferrosa_cluster::error::ClusterError) -> Self {
+        Self::Execution(e.to_string())
+    }
+}

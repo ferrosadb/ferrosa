@@ -21,7 +21,9 @@ use std::time::SystemTime;
 /// Fields are laid out so that the derived `Ord` sorts by
 /// `epoch > time > seq > node`, which is the correct priority order for
 /// Accord's consistency guarantees.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[repr(C)]
 pub struct Timestamp {
     /// Electorate configuration epoch.
@@ -76,7 +78,9 @@ impl Timestamp {
 // ---------------------------------------------------------------------------
 
 /// Unique transaction identifier — a newtype over [`Timestamp`].
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct TxnId(pub Timestamp);
 
 impl TxnId {
@@ -91,20 +95,56 @@ impl TxnId {
 // ---------------------------------------------------------------------------
 
 /// A monotonically increasing ballot number used in the Paxos-like protocol.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct BallotNumber(pub u64);
 
 /// Ballot at which a value was actually **voted** (accepted).
 ///
 /// Intentionally **not** convertible to/from [`PromisedBallot`] — the only
 /// way to extract the inner [`BallotNumber`] is via `.0`.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct AcceptedBallot(pub BallotNumber);
 
 /// Highest ballot a replica has **promised** not to participate in lower ballots.
 ///
 /// Intentionally **not** convertible to/from [`AcceptedBallot`].
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct PromisedBallot(pub BallotNumber);
 
 // ---------------------------------------------------------------------------
@@ -314,7 +354,7 @@ impl Default for BallotGenerator {
 ///
 /// Phases advance forward only: `PreAccepted → Accepted → Committed → Applied`.
 /// Attempts to regress to an earlier phase are silently ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TxnPhase {
     PreAccepted,
     Accepted,
@@ -346,7 +386,7 @@ impl TxnPhase {
 /// Using a single variable is the EPaxos correctness bug documented by
 /// Sutra et al. (2019). The invariant `accepted_ballot <= max_ballot_seen`
 /// is checked after every mutation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TxnState {
     pub txn_id: TxnId,
     /// Coordinator's initial proposed timestamp.

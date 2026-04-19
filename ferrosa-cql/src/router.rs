@@ -236,6 +236,24 @@ pub async fn route(
         _ => CqlOpcode::Other,
     };
 
+    // Check if this statement requires Accord consensus (LWT).
+    // Determined by serial_consistency being set in the request context.
+    {
+        use crate::accord_router::{route_decision, RouteDecision, RoutingMode};
+        let mode = match &**state.cluster_state.load() {
+            ferrosa_cluster::ClusterStateHolder::Standalone => RoutingMode::Standalone,
+            _ => RoutingMode::Cluster,
+        };
+        if route_decision(mode, &stmt, ctx.serial_consistency) == RouteDecision::Accord {
+            // TODO(S3): Execute through AccordCoordinator instead of WritePath.
+            // For now, fall through to the existing CL-based path and log.
+            tracing::info!(
+                ?opcode,
+                "LWT statement detected — Accord consensus required (falling through to CL path)"
+            );
+        }
+    }
+
     let result = match stmt {
         Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
         Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
@@ -1119,11 +1137,12 @@ async fn route_select_user_table(
         }
 
         // Apply LIMIT if specified.
-        let fts_rows: Vec<Vec<Option<CqlValue>>> = if let Some(limit) = s.limit {
-            fts_rows.into_iter().take(limit as usize).collect()
-        } else {
-            fts_rows
-        };
+        let fts_rows: Vec<Vec<Option<CqlValue>>> =
+            if let Some(limit) = s.limit.as_ref().and_then(|l| l.as_literal()) {
+                fts_rows.into_iter().take(limit as usize).collect()
+            } else {
+                fts_rows
+            };
         // Project to selected columns.
         let selected_rows = select_columns(&fts_rows, &all_col_names, &col_names);
         let result = result::encode_rows(&col_names, &col_types, ks, &s.table, &selected_rows);
@@ -1659,7 +1678,8 @@ async fn route_select_user_table(
         apply_tojson_projections(&s.columns, &col_names, &all_col_names, &rows, selected_rows);
 
     // Apply LIMIT
-    let limited = if let Some(limit) = s.limit {
+    let limit_val = s.limit.as_ref().and_then(|l| l.as_literal());
+    let limited = if let Some(limit) = limit_val {
         &selected_rows[..std::cmp::min(selected_rows.len(), limit as usize)]
     } else {
         &selected_rows
@@ -1668,7 +1688,7 @@ async fn route_select_user_table(
     // Apply pagination: page_size interacts with LIMIT.
     // If both page_size and LIMIT are set, the effective limit is min(page_size, limit).
     // Pagination operates on the already-limited result set.
-    let effective_page_size = match (ctx.paging.page_size, s.limit) {
+    let effective_page_size = match (ctx.paging.page_size, limit_val) {
         (Some(ps), Some(lim)) => Some(std::cmp::min(ps, lim)),
         (Some(ps), None) => Some(ps),
         (None, _) => None,
@@ -11651,6 +11671,38 @@ mod tests {
                 assert_eq!(
                     row_count, 0,
                     "WHERE keyspace_name='nonexistent_ks_xyz' on tables should return 0 rows, got {row_count}"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn select_now_from_system_local_returns_timeuuid() {
+        let (state, _dir) = setup();
+        let dev = dev_auth();
+        let stmt = crate::parser::parse("SELECT now() FROM system.local").unwrap();
+        let result = route(
+            &state,
+            &RequestContext {
+                auth: &dev,
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams::default(),
+                client_address: String::new(),
+            },
+            stmt,
+        )
+        .await
+        .unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(&b[0..4], &0x0002i32.to_be_bytes(), "must be a Rows result");
+                let row_count = extract_row_count(b);
+                assert_eq!(
+                    row_count, 1,
+                    "SELECT now() FROM system.local must return 1 row"
                 );
             }
             _ => panic!("expected Result"),

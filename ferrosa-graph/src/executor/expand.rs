@@ -9,10 +9,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_schema::{Schema, VirtualTableRegistry};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
-use ferrosa_storage::{StorageEngine, TableId};
+use ferrosa_storage::TableId;
 
 use crate::adjacency::schema::adjacency_keyspace_name;
 use crate::error::{GraphError, Result};
@@ -62,9 +63,9 @@ impl Default for GraphEngineConfig {
 /// If `schema` is provided, column names from table metadata are used to
 /// map cell indices to property names (e.g., `name`, `age`) so that Cypher
 /// property lookups like `a.name` resolve correctly.
-pub fn execute(
+pub async fn execute(
     plan: PhysicalPlan,
-    storage: &StorageEngine,
+    write_path: &WritePath,
     keyspace: &str,
     config: &GraphEngineConfig,
     virtual_tables: Option<&VirtualTableRegistry>,
@@ -77,68 +78,90 @@ pub fn execute(
             anchor,
             hops,
             return_clause,
-        } => execute_expand(
-            storage,
-            keyspace,
-            &anchor,
-            &hops,
-            &return_clause,
-            config,
-            start,
-            virtual_tables,
-            schema,
-        ),
-        PhysicalPlan::CreateNodes { creates } => execute_create(storage, &creates, config, start),
+        } => {
+            execute_expand(
+                write_path,
+                keyspace,
+                &anchor,
+                &hops,
+                &return_clause,
+                config,
+                start,
+                virtual_tables,
+                schema,
+            )
+            .await
+        }
+        PhysicalPlan::CreateNodes { creates } => {
+            execute_create(write_path, &creates, config, start).await
+        }
         PhysicalPlan::SetProperties {
             expand,
             assignments,
-        } => execute_set(
-            storage,
-            *expand,
-            keyspace,
-            &assignments,
-            config,
-            virtual_tables,
-            start,
-            schema,
-        ),
+        } => {
+            execute_set(
+                write_path,
+                *expand,
+                keyspace,
+                &assignments,
+                config,
+                virtual_tables,
+                start,
+                schema,
+            )
+            .await
+        }
         PhysicalPlan::DeleteNodes {
             expand,
             variables,
             detach,
             variable_tables,
-        } => execute_delete(
-            storage,
-            *expand,
-            keyspace,
-            &variables,
-            detach,
-            config,
-            virtual_tables,
-            start,
-            schema,
-            &variable_tables,
-        ),
+        } => {
+            execute_delete(
+                write_path,
+                *expand,
+                keyspace,
+                &variables,
+                detach,
+                config,
+                virtual_tables,
+                start,
+                schema,
+                &variable_tables,
+            )
+            .await
+        }
         PhysicalPlan::Aggregate {
             inner,
             group_keys,
             projections,
             return_clause,
-        } => execute_aggregate(
-            storage,
-            keyspace,
-            *inner,
-            &group_keys,
-            &projections,
-            &return_clause,
-            config,
-            start,
-            virtual_tables,
-            schema,
-        ),
+        } => {
+            execute_aggregate(
+                write_path,
+                keyspace,
+                *inner,
+                &group_keys,
+                &projections,
+                &return_clause,
+                config,
+                start,
+                virtual_tables,
+                schema,
+            )
+            .await
+        }
         PhysicalPlan::Subscribe { inner, .. } => {
             // Execute the initial snapshot from the inner plan.
-            execute(*inner, storage, keyspace, config, virtual_tables, schema)
+            Box::pin(execute(
+                *inner,
+                write_path,
+                keyspace,
+                config,
+                virtual_tables,
+                schema,
+            ))
+            .await
         }
         PhysicalPlan::ExpandVarLength {
             anchor,
@@ -146,39 +169,45 @@ pub fn execute(
             min_hops,
             max_hops,
             return_clause,
-        } => super::varpath::execute_var_length(
-            storage,
-            keyspace,
-            &anchor,
-            &hop,
-            min_hops,
-            max_hops,
-            &return_clause,
-            config,
-            start,
-            virtual_tables,
-            schema,
-        ),
+        } => {
+            super::varpath::execute_var_length(
+                write_path,
+                keyspace,
+                &anchor,
+                &hop,
+                min_hops,
+                max_hops,
+                &return_clause,
+                config,
+                start,
+                virtual_tables,
+                schema,
+            )
+            .await
+        }
         PhysicalPlan::WcoJoin {
             plan,
             return_clause,
-        } => super::leapfrog::execute_wco_join(
-            storage,
-            keyspace,
-            &plan,
-            &return_clause,
-            config,
-            start,
-            virtual_tables,
-            schema,
-        ),
+        } => {
+            super::leapfrog::execute_wco_join(
+                write_path,
+                keyspace,
+                &plan,
+                &return_clause,
+                config,
+                start,
+                virtual_tables,
+                schema,
+            )
+            .await
+        }
     }
 }
 
 /// Execute an Expand plan.
 #[allow(clippy::too_many_arguments)]
-fn execute_expand(
-    storage: &StorageEngine,
+async fn execute_expand(
+    write_path: &WritePath,
     keyspace: &str,
     anchor: &Anchor,
     hops: &[Hop],
@@ -212,8 +241,7 @@ fn execute_expand(
 
     // Storage path: read all partitions from the anchor table.
     let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
-    let anchor_partitions =
-        storage.read_range(&anchor_table_id, None, None, config.max_result_rows)?;
+    let anchor_partitions = write_path.range_read(&anchor_table_id).await?;
     stats.vertices_read += anchor_partitions.len();
     check_timeout(start, config.query_timeout)?;
 
@@ -259,8 +287,7 @@ fn execute_expand(
         let mut next_keys = Vec::new();
         for vertex_key in &current_keys {
             // Read adjacency entries for this vertex.
-            // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
-            let adj_partition = storage.read(&adj_table_id, vertex_key)?;
+            let adj_partition = write_path.read(&adj_table_id, vertex_key).await?;
             if let Some(partition) = adj_partition {
                 stats.edges_read += partition.rows.len();
 
@@ -269,8 +296,7 @@ fn execute_expand(
                 let edge_partition = if !hop.prop_filters.is_empty() {
                     if let Some(ref et) = hop.edge_table {
                         let edge_tid = TableId::new(&et.keyspace, &et.table);
-                        // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
-                        storage.read(&edge_tid, vertex_key)?
+                        write_path.read(&edge_tid, vertex_key).await?
                     } else {
                         None
                     }
@@ -324,8 +350,7 @@ fn execute_expand(
         }
 
         // Read the full partition from storage for property projection.
-        // TODO: route through coordinator for cluster mode (P0 cluster-read bug)
-        let partition = storage.read(&anchor_table_id_for_proj, key)?;
+        let partition = write_path.read(&anchor_table_id_for_proj, key).await?;
 
         let hex_id = hex::encode(key.key.as_bytes());
 
@@ -355,6 +380,8 @@ fn execute_expand(
 
     // Apply DISTINCT.
     if return_clause.distinct {
+        // serde_json::Value doesn't impl Ord; use string repr for dedup.
+        rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
         rows.dedup();
     }
 
@@ -454,8 +481,8 @@ fn now_micros() -> i64 {
 
 /// Execute a CREATE plan: for each CreateOp, build a Row with cells from the
 /// properties and write it to storage.
-fn execute_create(
-    storage: &StorageEngine,
+async fn execute_create(
+    write_path: &WritePath,
     creates: &[CreateOp],
     _config: &GraphEngineConfig,
     start: Instant,
@@ -488,7 +515,18 @@ fn execute_create(
             primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
         };
 
-        storage.write(&table_id, &key, row, timestamp)?;
+        write_path
+            .write(
+                &table_id,
+                &key,
+                row,
+                timestamp,
+                ferrosa_cluster::consistency::ConsistencyLevel::One,
+                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
+            .await?;
         stats.vertices_written += 1;
     }
 
@@ -507,8 +545,8 @@ fn execute_create(
 /// Execute a SET plan: run the expand to find matching vertices, then write
 /// updated cells for each one.
 #[allow(clippy::too_many_arguments)]
-fn execute_set(
-    storage: &StorageEngine,
+async fn execute_set(
+    write_path: &WritePath,
     expand: PhysicalPlan,
     keyspace: &str,
     assignments: &[(String, String, Expr)],
@@ -518,7 +556,15 @@ fn execute_set(
     schema: Option<&Schema>,
 ) -> Result<GraphResult> {
     // Execute the inner expand to find matching vertices.
-    let expand_result = execute(expand, storage, keyspace, config, virtual_tables, schema)?;
+    let expand_result = Box::pin(execute(
+        expand,
+        write_path,
+        keyspace,
+        config,
+        virtual_tables,
+        schema,
+    ))
+    .await?;
     let mut stats = QueryStats::default();
     stats.vertices_read = expand_result.stats.vertices_read;
     stats.edges_read = expand_result.stats.edges_read;
@@ -569,7 +615,18 @@ fn execute_set(
                     primary_key_liveness: LivenessInfo::NONE,
                 };
 
-                storage.write(&table_id, &key, update_row, timestamp)?;
+                write_path
+                    .write(
+                        &table_id,
+                        &key,
+                        update_row,
+                        timestamp,
+                        ferrosa_cluster::consistency::ConsistencyLevel::One,
+                        &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                            replication_factor: 1,
+                        },
+                    )
+                    .await?;
                 stats.vertices_written += 1;
             }
         }
@@ -590,8 +647,8 @@ fn execute_set(
 /// Execute a DELETE plan: run the expand to find matching vertices, then write
 /// tombstones for each one.
 #[allow(clippy::too_many_arguments)]
-fn execute_delete(
-    storage: &StorageEngine,
+async fn execute_delete(
+    write_path: &WritePath,
     expand: PhysicalPlan,
     keyspace: &str,
     variables: &[String],
@@ -602,7 +659,15 @@ fn execute_delete(
     schema: Option<&Schema>,
     variable_tables: &HashMap<String, String>,
 ) -> Result<GraphResult> {
-    let expand_result = execute(expand, storage, keyspace, config, virtual_tables, schema)?;
+    let expand_result = Box::pin(execute(
+        expand,
+        write_path,
+        keyspace,
+        config,
+        virtual_tables,
+        schema,
+    ))
+    .await?;
     let mut stats = QueryStats::default();
     stats.vertices_read = expand_result.stats.vertices_read;
     stats.edges_read = expand_result.stats.edges_read;
@@ -654,7 +719,18 @@ fn execute_delete(
                     primary_key_liveness: LivenessInfo::NONE,
                 };
 
-                storage.write(&table_id, &key, tombstone_row, timestamp)?;
+                write_path
+                    .write(
+                        &table_id,
+                        &key,
+                        tombstone_row,
+                        timestamp,
+                        ferrosa_cluster::consistency::ConsistencyLevel::One,
+                        &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                            replication_factor: 1,
+                        },
+                    )
+                    .await?;
                 stats.vertices_deleted += 1;
             }
         }
@@ -679,8 +755,8 @@ fn execute_delete(
 /// 3. For each group, creates accumulators, feeds values, builds output rows.
 /// 4. Enforces max group count (FMEA F7).
 #[allow(clippy::too_many_arguments)]
-fn execute_aggregate(
-    storage: &StorageEngine,
+async fn execute_aggregate(
+    write_path: &WritePath,
     keyspace: &str,
     inner: PhysicalPlan,
     group_keys: &[usize],
@@ -692,7 +768,15 @@ fn execute_aggregate(
     schema: Option<&Schema>,
 ) -> Result<GraphResult> {
     // Step 1: Execute inner plan to get all rows.
-    let inner_result = execute(inner, storage, keyspace, config, virtual_tables, schema)?;
+    let inner_result = Box::pin(execute(
+        inner,
+        write_path,
+        keyspace,
+        config,
+        virtual_tables,
+        schema,
+    ))
+    .await?;
     check_timeout(start, config.query_timeout)?;
 
     let inner_columns = &inner_result.columns;
@@ -1231,8 +1315,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn execute_virtual_table_anchor_returns_rows() {
+    #[tokio::test]
+    async fn execute_virtual_table_anchor_returns_rows() {
         let registry = VirtualTableRegistry::new();
         let vtable = Arc::new(TestVirtualTable {
             table_name: "connections".to_string(),
@@ -1275,14 +1359,16 @@ mod tests {
         let storage = test_storage_engine(tmp.path());
 
         let config = GraphEngineConfig::default();
+        let wp = WritePath::direct(storage);
         let result = execute(
             plan,
-            &storage,
+            &wp,
             "system_observability",
             &config,
             Some(&registry),
             None,
         )
+        .await
         .unwrap();
 
         assert_eq!(result.columns, vec!["n.peer_address", "n.state"]);
@@ -1304,8 +1390,8 @@ mod tests {
         assert_eq!(result.stats.vertices_read, 2);
     }
 
-    #[test]
-    fn execute_virtual_table_missing_column_returns_null() {
+    #[tokio::test]
+    async fn execute_virtual_table_missing_column_returns_null() {
         let registry = VirtualTableRegistry::new();
         let vtable = Arc::new(TestVirtualTable {
             table_name: "connections".to_string(),
@@ -1331,14 +1417,16 @@ mod tests {
         let storage = test_storage_engine(tmp.path());
 
         let config = GraphEngineConfig::default();
+        let wp = WritePath::direct(storage);
         let result = execute(
             plan,
-            &storage,
+            &wp,
             "system_observability",
             &config,
             Some(&registry),
             None,
         )
+        .await
         .unwrap();
 
         assert_eq!(result.rows.len(), 1);
@@ -1349,8 +1437,8 @@ mod tests {
         assert_eq!(result.rows[0][1], serde_json::Value::Null);
     }
 
-    #[test]
-    fn execute_virtual_table_tombstone_returns_null() {
+    #[tokio::test]
+    async fn execute_virtual_table_tombstone_returns_null() {
         let registry = VirtualTableRegistry::new();
         let vtable = Arc::new(TestVirtualTable {
             table_name: "test_table".to_string(),
@@ -1371,22 +1459,24 @@ mod tests {
         let storage = test_storage_engine(tmp.path());
 
         let config = GraphEngineConfig::default();
+        let wp = WritePath::direct(storage);
         let result = execute(
             plan,
-            &storage,
+            &wp,
             "system_observability",
             &config,
             Some(&registry),
             None,
         )
+        .await
         .unwrap();
 
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], serde_json::Value::Null);
     }
 
-    #[test]
-    fn execute_virtual_table_empty_returns_no_rows() {
+    #[tokio::test]
+    async fn execute_virtual_table_empty_returns_no_rows() {
         let registry = VirtualTableRegistry::new();
         let vtable = Arc::new(TestVirtualTable {
             table_name: "empty_table".to_string(),
@@ -1405,22 +1495,24 @@ mod tests {
         let storage = test_storage_engine(tmp.path());
 
         let config = GraphEngineConfig::default();
+        let wp = WritePath::direct(storage);
         let result = execute(
             plan,
-            &storage,
+            &wp,
             "system_observability",
             &config,
             Some(&registry),
             None,
         )
+        .await
         .unwrap();
 
         assert!(result.rows.is_empty());
         assert_eq!(result.stats.vertices_read, 0);
     }
 
-    #[test]
-    fn execute_non_virtual_table_falls_through_to_storage() {
+    #[tokio::test]
+    async fn execute_non_virtual_table_falls_through_to_storage() {
         // When virtual tables registry exists but table is NOT registered,
         // execution should fall through to the normal storage path.
         let registry = VirtualTableRegistry::new();
@@ -1433,12 +1525,15 @@ mod tests {
 
         let config = GraphEngineConfig::default();
         // This should succeed (empty result from storage, not error).
-        let result = execute(plan, &storage, "social", &config, Some(&registry), None).unwrap();
+        let wp = WritePath::direct(storage);
+        let result = execute(plan, &wp, "social", &config, Some(&registry), None)
+            .await
+            .unwrap();
         assert!(result.rows.is_empty());
     }
 
-    #[test]
-    fn execute_without_virtual_registry_falls_through() {
+    #[tokio::test]
+    async fn execute_without_virtual_registry_falls_through() {
         // When no virtual table registry is provided, execute normally.
         let plan = virtual_anchor_plan("social", "person_v", &[("n", "name")]);
 
@@ -1446,12 +1541,15 @@ mod tests {
         let storage = test_storage_engine(tmp.path());
 
         let config = GraphEngineConfig::default();
-        let result = execute(plan, &storage, "social", &config, None, None).unwrap();
+        let wp = WritePath::direct(storage);
+        let result = execute(plan, &wp, "social", &config, None, None)
+            .await
+            .unwrap();
         assert!(result.rows.is_empty());
     }
 
-    #[test]
-    fn execute_virtual_table_respects_max_rows() {
+    #[tokio::test]
+    async fn execute_virtual_table_respects_max_rows() {
         let registry = VirtualTableRegistry::new();
         // Create a virtual table with many rows.
         let rows: Vec<VirtualRow> = (0..100)
@@ -1481,14 +1579,16 @@ mod tests {
             ..Default::default()
         };
 
+        let wp = WritePath::direct(storage);
         let result = execute(
             plan,
-            &storage,
+            &wp,
             "system_observability",
             &config,
             Some(&registry),
             None,
         )
+        .await
         .unwrap();
         assert_eq!(result.rows.len(), 5);
     }
@@ -1515,7 +1615,7 @@ mod tests {
     }
 
     /// Helper to create a StorageEngine for tests using a temp directory.
-    fn test_storage_engine(dir: &std::path::Path) -> ferrosa_storage::StorageEngine {
+    fn test_storage_engine(dir: &std::path::Path) -> Arc<ferrosa_storage::StorageEngine> {
         use ferrosa_storage::{
             CommitLogConfig, CompactionConfig, StorageEngineConfig, SyncStrategyConfig,
         };
@@ -1537,7 +1637,7 @@ mod tests {
             data_dir: dir.to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
         };
-        ferrosa_storage::StorageEngine::new(config, None).unwrap()
+        Arc::new(ferrosa_storage::StorageEngine::new(config, None).unwrap())
     }
 
     #[test]
@@ -1752,8 +1852,8 @@ mod tests {
         assert!(bytes.is_empty());
     }
 
-    #[test]
-    fn execute_aggregate_count() {
+    #[tokio::test]
+    async fn execute_aggregate_count() {
         // Test end-to-end aggregation: count over a virtual table.
         let registry = VirtualTableRegistry::new();
         let vtable = Arc::new(TestVirtualTable {
@@ -1836,7 +1936,10 @@ mod tests {
         let storage = test_storage_engine(tmp.path());
 
         let config = GraphEngineConfig::default();
-        let result = execute(agg_plan, &storage, "social", &config, Some(&registry), None).unwrap();
+        let wp = WritePath::direct(storage);
+        let result = execute(agg_plan, &wp, "social", &config, Some(&registry), None)
+            .await
+            .unwrap();
 
         assert_eq!(result.columns, vec!["count(*)"]);
         assert_eq!(result.rows.len(), 1);

@@ -304,7 +304,13 @@ async fn rebalance_handler(State(mc): State<Arc<ModeController>>) -> (StatusCode
         }
     };
 
-    match ferrosa_cluster::rebalance::execute_rebalance(&raft, &ring).await {
+    // TODO: wire storage, schema, peer_manager, and local_node_id into the
+    // rebalance handler. For now, return an error indicating the endpoint
+    // needs the full cluster context.
+    let _ = (&raft, &ring);
+    match Err::<(), _>(ferrosa_cluster::error::ClusterError::Internal(
+        "rebalance: not yet wired with storage/schema/peer_manager context".into(),
+    )) {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({ "status": "rebalance complete" })),

@@ -244,9 +244,13 @@ fn create_social_graph_schema(schema: &Schema) {
 }
 
 fn build_app(schema: Arc<Schema>, storage: Arc<StorageEngine>) -> axum::Router {
+    let write_path = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage)),
+    ));
     let engine = Arc::new(GraphEngine::new(
         Arc::clone(&schema),
         Arc::clone(&storage),
+        write_path,
         GraphEngineConfig::default(),
         std::time::Duration::from_secs(300),
     ));

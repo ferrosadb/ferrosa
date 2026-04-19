@@ -68,8 +68,10 @@ pub struct SSTableReader<R: ReadAt> {
     compression_info: Option<CompressionInfo>,
     header: SerializationHeader,
     data: R,
-    /// Decompressed Data.db contents (when compression is used).
-    decompressed_data: Option<Vec<u8>>,
+    /// Previously cached decompressed Data.db contents. Removed to prevent
+    /// unbounded memory growth — decompression now happens on demand in
+    /// read_all_partitions() and get_partition().
+    _decompressed_data: Option<Vec<u8>>,
     #[allow(dead_code)]
     rows: R,
 }
@@ -92,12 +94,11 @@ impl<R: ReadAt> SSTableReader<R> {
 
         let partition_index = PartitionIndex::open(components.partitions)?;
 
-        // Decompress Data.db if compression is configured
-        let decompressed_data = if let Some(ref ci) = compression_info {
-            Some(decompress_data(&components.data, ci)?)
-        } else {
-            None
-        };
+        // Decompression moved to read_all_partitions() — eager decompression
+        // caused unbounded memory growth (the entire Data.db decompressed as a
+        // Vec<u8> was held for the lifetime of the SSTableReader, causing ~1.4GB
+        // growth on a 28k-row scan). Now decompressed on demand and freed after.
+        let decompressed_data = None;
 
         Ok(SSTableReader {
             partition_index,
@@ -105,7 +106,7 @@ impl<R: ReadAt> SSTableReader<R> {
             compression_info,
             header,
             data: components.data,
-            decompressed_data,
+            _decompressed_data: decompressed_data,
             rows: components.rows,
         })
     }
@@ -140,8 +141,9 @@ impl<R: ReadAt> SSTableReader<R> {
         };
 
         // Step 3: read partition from Data.db (decompressed if applicable)
-        if let Some(ref decompressed) = self.decompressed_data {
-            let mut data_reader = DataReader::new(decompressed, &self.header, data_position);
+        if let Some(ref ci) = self.compression_info {
+            let decompressed = decompress_data(&self.data, ci)?;
+            let mut data_reader = DataReader::new(&decompressed, &self.header, data_position);
             data_reader.read_partition()
         } else {
             let mut data_reader = DataReader::new(&self.data, &self.header, data_position);
@@ -204,8 +206,13 @@ impl<R: ReadAt> SSTableReader<R> {
     /// multiple SSTables.
     pub fn read_all_partitions(&self) -> Result<Vec<crate::types::Partition>> {
         let mut partitions = Vec::new();
-        if let Some(ref dec) = self.decompressed_data {
-            let mut reader = crate::data::DataReader::new(dec, &self.header, 0);
+        if let Some(ref ci) = self.compression_info {
+            // Decompress on demand — the buffer is freed when this scope ends.
+            // Previously the decompressed buffer was cached in the SSTableReader,
+            // causing ~1.4GB growth on a 28k-row scan because every loaded
+            // SSTable held its entire decompressed Data.db in memory.
+            let decompressed = decompress_data(&self.data, ci)?;
+            let mut reader = crate::data::DataReader::new(&decompressed, &self.header, 0);
             while let Some(partition) = reader.read_partition()? {
                 partitions.push(partition);
             }

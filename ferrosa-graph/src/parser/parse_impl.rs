@@ -595,10 +595,10 @@ impl<'input> Parser<'input> {
                     next.kind,
                     TokenKind::DashBracket | TokenKind::ArrowLeft | TokenKind::Minus
                 ) {
-                    // TODO: Negative pattern expressions are consumed but
-                    // treated as `true` (no filtering). Implement proper
-                    // pattern-existence checks in the executor.
-                    let _ = inner; // discard parsed node expression
+                    // Negative pattern expressions (NOT (a)-[:REL]->(b)) are
+                    // not yet supported. Return an error instead of silently
+                    // returning all rows (which is incorrect).
+                    let _ = inner;
                     loop {
                         let tok = self.lexer.peek()?;
                         match &tok.kind {
@@ -609,7 +609,10 @@ impl<'input> Parser<'input> {
                             _ => break,
                         }
                     }
-                    return Ok(Expr::Literal(Literal::Bool(true)));
+                    return Err(ParseError {
+                        message: "negative pattern expressions (NOT (a)-[:REL]->(b)) are not yet supported".into(),
+                        span: crate::parser::error::Span { start: 0, end: 0 },
+                    });
                 }
 
                 return Ok(Expr::Not(Box::new(inner)));
@@ -1742,23 +1745,22 @@ mod tests {
 
     #[test]
     fn parse_not_pattern_in_where() {
-        let stmt = parse(
+        // Negative pattern expressions are not yet supported and should
+        // return an error instead of silently returning all rows.
+        let result = parse(
             "MATCH (a:Person), (b:Person) \
              WHERE NOT (a)-[:FOLLOWS]->(b) AND b.name <> 'Alice' \
              RETURN b.name",
-        )
-        .unwrap();
-        if let Statement::Match {
-            where_clause: Some(expr),
-            ..
-        } = stmt
-        {
-            // The negative pattern is replaced with `true`, so the WHERE
-            // becomes `AND(true, b.name <> 'Alice')`.
-            assert!(matches!(expr, Expr::And(_, _)));
-        } else {
-            panic!("expected Match with WHERE clause");
-        }
+        );
+        assert!(
+            result.is_err(),
+            "negative patterns should return an error, got: {result:?}"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("negative pattern"),
+            "error should mention negative patterns: {err_msg}"
+        );
     }
 
     #[test]

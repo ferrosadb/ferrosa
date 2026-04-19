@@ -14,6 +14,8 @@ pub mod durability;
 pub mod electorate;
 pub mod epoch;
 pub mod epoch_drain;
+/// RPC handlers for inbound Accord consensus messages.
+pub mod handlers;
 mod jepsen_bank;
 pub mod jepsen_nemesis;
 pub mod leaseholder;
