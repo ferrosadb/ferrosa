@@ -155,6 +155,10 @@ pub struct SharedState {
     pub mode_controller: Arc<ferrosa_cluster::ModeController>,
     /// CQL request metrics (per-opcode counters and error counter).
     pub cql_metrics: Arc<CqlMetrics>,
+    /// When `true`, permission failures are logged as warnings and allowed
+    /// through instead of returning 0x2100 Unauthorized.  Set from
+    /// `FERROSA_AUTH_WARN=true` to enable the soak observation period.
+    pub auth_warn: bool,
 }
 
 /// Per-request context: authentication, current keyspace, and consistency level.
@@ -6294,6 +6298,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: dir.path().to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
 
@@ -6345,6 +6352,7 @@ mod tests {
             event_sender: tokio::sync::broadcast::channel(64).0,
             mode_controller,
             cql_metrics: Arc::new(CqlMetrics::new()),
+            auth_warn: false,
         };
         (state, dir)
     }
@@ -10200,6 +10208,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: dir.path().to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
         };
         let engine = StorageEngine::new(engine_config, None).unwrap();
 

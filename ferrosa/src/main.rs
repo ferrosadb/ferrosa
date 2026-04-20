@@ -16,6 +16,10 @@
 //! 13. Wait for shutdown signal
 //! 14. Graceful shutdown with timeout
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod runtime;
 mod web;
 
@@ -320,6 +324,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Create StorageEngine — use open() on restart to replay commit log
     let storage_config = ferrosa_storage::StorageEngineConfig::from_env()?;
+    let storage_auth_warn = storage_config.auth_warn;
+    // Capture auth enablement before the config is consumed by `new`/`open`.
+    // Used below to gate the seed-role bootstrap and the 5-minute
+    // default-password reminder task. Falls through to false when the env
+    // var is unset; see Sprint A of
+    // specs/decisions/design-cql-role-auth-rollout.md.
+    let storage_auth_enabled = storage_config.auth_enabled;
     let rt = tokio::runtime::Handle::current();
     let has_commitlog_segments = storage_config.commit_log.log_dir.exists()
         && std::fs::read_dir(&storage_config.commit_log.log_dir)
@@ -358,6 +369,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     storage.replay_pending_uploads().await;
 
     // 4. Create Schema
+    //
+    // G-P0-1 fix (T-R1): Schema::new composites LogAuditSink with
+    // SystemTableAuditSink internally, so every audit event is both
+    // logged structurally and visible via
+    //   SELECT * FROM system_auth.audit_log
+    // in live clusters. No callsite change needed here.
     let schema_config = ferrosa_schema::SchemaConfig {
         hasher: ferrosa_schema::PasswordHasher::default(),
         password_policy: ferrosa_schema::PasswordPolicy::permissive(),
@@ -368,6 +385,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mode: ferrosa_schema::DeploymentMode::Development,
     };
     let schema = Arc::new(ferrosa_schema::Schema::new(schema_config)?);
+
+    // 4a. Seed default roles if auth is enabled.
+    //
+    // `ferrosa_schema::Schema::new` always creates the built-in `cassandra`
+    // superuser; the bootstrap helper creates three additional well-known
+    // roles (`ferrosa_admin` SUPERUSER, `graph_engine` and `app_reader`
+    // unprivileged LOGIN) so a fresh cluster with auth enabled is never
+    // locked out. All calls are idempotent — subsequent restarts are no-ops.
+    //
+    // A one-shot 5-minute task fires a loud WARN if `ferrosa_admin` is
+    // still using the default seed password. This mirrors Cassandra's
+    // default-credentials nag and gives the operator a single reminder
+    // window to rotate.
+    if storage_auth_enabled {
+        ferrosa_schema::auth::bootstrap::seed_default_roles(&schema)?;
+        let schema_for_warn = Arc::clone(&schema);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+            if ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema_for_warn) {
+                tracing::warn!(
+                    "ferrosa_admin is still using the default seed password \
+                     after 5 minutes — rotate it NOW. See \
+                     specs/decisions/design-cql-role-auth-rollout.md Sprint A."
+                );
+            }
+        });
+    } else {
+        tracing::info!(
+            "auth_enabled=false — skipping seed-role bootstrap. Set \
+             FERROSA_AUTH_ENABLED=true to enforce CQL role auth."
+        );
+    }
 
     // 4b. Restore schema from local disk or S3.
     //
@@ -620,6 +669,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_sender: tokio::sync::broadcast::channel(64).0,
         mode_controller: Arc::clone(&mode_controller),
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
+        auth_warn: storage_auth_warn,
     });
     let auth_disabled = cql_config.auth_disabled;
 

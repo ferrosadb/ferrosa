@@ -111,7 +111,21 @@ impl GraphEngine {
         let reconciliation_cancel = CancellationToken::new();
         for ks in &edge_keyspaces {
             let observer = Arc::new(AdjacencyIndexObserver::new(Arc::clone(&schema), ks.clone()));
-            storage.register_observer(observer);
+
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // Runtime available: register the observer with an engine-side drain task.
+                // The drain task applies derived adjacency mutations through the full write
+                // path (commit log + memtable) and catches observer panics loudly at ERROR.
+                storage.register_async_observer_with_drain(
+                    observer as Arc<dyn ferrosa_storage::WriteObserver>,
+                    Arc::clone(&storage),
+                );
+            } else {
+                // No runtime available (e.g., proptest sync context): fall back to
+                // register_observer which drops the receiver. Adjacency entries are not
+                // written in this context, but the engine does not panic.
+                storage.register_observer(observer);
+            }
 
             // spawn_reconciliation requires a tokio runtime. In test
             // contexts (e.g., proptest without #[tokio::test]), there may
@@ -320,7 +334,7 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             out.push('}');
             out
         }
-        PhysicalPlan::CreateNodes { creates } => {
+        PhysicalPlan::CreateNodes { creates, .. } => {
             let mut out = String::new();
             out.push_str("CreateNodes {\n");
             for (i, op) in creates.iter().enumerate() {
@@ -453,6 +467,33 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             out.push('}');
             out
         }
+        PhysicalPlan::MergeUpsert {
+            merges,
+            set_clause,
+            return_clause,
+        } => {
+            let mut out = String::new();
+            out.push_str("MergeUpsert {\n");
+            for (i, op) in merges.iter().enumerate() {
+                out.push_str(&format!(
+                    "  merge[{}]: {}.{} (var: {:?}, match_props: {})\n",
+                    i,
+                    op.table.keyspace,
+                    op.table.table,
+                    op.var,
+                    op.match_props.len()
+                ));
+            }
+            out.push_str(&format!(
+                "  set_clause: {} assignment(s)\n",
+                set_clause.len()
+            ));
+            if let Some(rc) = return_clause {
+                out.push_str(&format!("  return: {} item(s)\n", rc.items.len()));
+            }
+            out.push('}');
+            out
+        }
     }
 }
 
@@ -492,6 +533,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
         };
         StorageEngine::new(config, None).unwrap()
     }

@@ -234,6 +234,15 @@ impl Schema {
         self.inner.load_full()
     }
 
+    /// Returns a reference to the configured `PasswordHasher`.
+    ///
+    /// Exposed for bootstrap helpers (e.g. `ferrosa_schema::auth::bootstrap`)
+    /// that need to hash seed-role passwords without going through the full
+    /// role-creation DDL path.
+    pub fn password_hasher(&self) -> &PasswordHasher {
+        &self.hasher_config
+    }
+
     /// Bulk-load schema from a snapshot. Bypasses auth and audit.
     /// Used for pair mode catch-up. Idempotent — silently skips
     /// keyspaces/tables that already exist.

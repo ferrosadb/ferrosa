@@ -175,7 +175,10 @@ pub struct CommitLogConfig {
 
 impl CommitLogConfig {
     /// Create a config for testing with small segments and a temp directory.
-    #[cfg(test)]
+    ///
+    /// Not restricted to `#[cfg(test)]` so that integration-test helpers in
+    /// sibling crates (e.g. `ferrosa-cql/tests/`) can construct a full
+    /// `StorageEngineConfig::test_config` without duplicating every field.
     pub fn test_config(dir: &std::path::Path) -> Self {
         Self {
             segment_size: 4096, // 4 KB for fast rotation in tests

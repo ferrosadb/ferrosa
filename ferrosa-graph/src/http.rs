@@ -814,6 +814,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: tmp.path().to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
         };
         let storage = Arc::new(ferrosa_storage::StorageEngine::new(storage_config, None).unwrap());
 

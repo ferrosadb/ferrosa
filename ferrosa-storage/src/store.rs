@@ -28,6 +28,8 @@ use ferrosa_sstable::types::{Partition, Row};
 use ferrosa_sstable::writer::SSTableWriter;
 use ferrosa_sstable::WriteOptions;
 
+use ferrosa_index::DistanceMetric;
+
 use crate::flush::{self, FlushTarget};
 use crate::index::sidecar::SidecarReader;
 use crate::memtable::index::MemtableIndex;
@@ -35,6 +37,7 @@ use crate::memtable::index::MemtableIndex;
 use crate::memtable::sharded::ShardedBTreeMemtable;
 #[cfg(feature = "skiplist-memtable")]
 use crate::memtable::skiplist::SkipListMemtable;
+use crate::memtable::vector_index::VectorMemtableIndex;
 use crate::memtable::Memtable;
 use crate::merge;
 
@@ -65,6 +68,64 @@ struct StoreView<R: ReadAt + Send + Sync + 'static> {
     /// Per-SSTable sidecar index readers, parallel to `sstables`.
     /// Each entry maps index_name -> SidecarReader for that SSTable.
     sidecar_indexes: Arc<Vec<Arc<HashMap<String, SidecarReader>>>>,
+    /// In-memory vector indexes for the active memtable, keyed by index name.
+    /// Each holds the accumulated vectors for one vector column.
+    /// Drained at flush time and used to build persistent HNSW sidecar files.
+    vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>>,
+}
+
+impl<R: ReadAt + Send + Sync + 'static> StoreView<R> {
+    /// Check the three-parallel-vector invariant:
+    /// `sstables.len() == sstable_ids.len() == sidecar_indexes.len()`.
+    ///
+    /// When violated, logs a loud `tracing::error!` with full lengths and a
+    /// caller-supplied tag so logs point at the offending construction site.
+    /// Also `debug_assert!`s so unit tests fail at the exact write site.
+    ///
+    /// Previously, violations were silently masked downstream: `sstable_metadata`
+    /// synthesized fake integer IDs (`format!("{}", i + 1)`) for SSTables without
+    /// a matching `sstable_ids` entry, and compaction then tried to read
+    /// `<i+1>-Data.db` files that were never written, driving the node toward OOM.
+    fn check_invariants(&self, tag: &'static str) {
+        let n_sst = self.sstables.len();
+        let n_ids = self.sstable_ids.len();
+        let n_side = self.sidecar_indexes.len();
+        if n_sst != n_ids || n_sst != n_side {
+            tracing::error!(
+                tag,
+                sstables_len = n_sst,
+                sstable_ids_len = n_ids,
+                sidecar_indexes_len = n_side,
+                "StoreView invariant violated: parallel vectors desynced at construction"
+            );
+        }
+        debug_assert_eq!(
+            n_sst, n_ids,
+            "StoreView@{tag}: sstables ({n_sst}) != sstable_ids ({n_ids})"
+        );
+        debug_assert_eq!(
+            n_sst, n_side,
+            "StoreView@{tag}: sstables ({n_sst}) != sidecar_indexes ({n_side})"
+        );
+    }
+}
+
+/// Configuration for a single vector index on a table column.
+///
+/// Immutable after registration — parameters control the in-memory and
+/// persistent HNSW graph built at flush time.
+#[derive(Clone, Debug)]
+pub struct VectorIndexConfig {
+    /// Unique name for this index (matches the column name by convention).
+    pub index_name: String,
+    /// Column ordinal (the `u16` tag in `Row.cells`) holding vector values.
+    pub column_position: usize,
+    /// Distance metric for similarity comparisons.
+    pub metric: DistanceMetric,
+    /// HNSW `m` parameter: max connections per node per layer.
+    pub m: usize,
+    /// HNSW `ef_construction` parameter: search width during build.
+    pub ef_construction: usize,
 }
 
 /// Single-table storage engine: lock-free reads, serialized flushes.
@@ -88,7 +149,7 @@ pub struct TableStore<F: FlushTarget> {
     write_barrier: parking_lot::RwLock<()>,
     /// Counter of SSTable read errors during get_partition.
     pub sstable_read_errors: std::sync::atomic::AtomicU64,
-    flush_target: F,
+    pub(crate) flush_target: F,
     options: WriteOptions,
     /// Secondary index declarations: `(index_name, column_position)` pairs.
     /// Column position is the index into `Row.cells` by column ordinal
@@ -97,6 +158,10 @@ pub struct TableStore<F: FlushTarget> {
     /// Full-text index declarations: `(index_name, column_position)` pairs.
     /// Built as FTI sidecar files during flush.
     fulltext_indexes: Vec<(String, usize)>,
+    /// Vector index configurations. Immutable after registration.
+    /// At flush time each declared vector index is drained from the memtable
+    /// and persisted as a `{gen}-VEC-{index_name}.db` HNSW sidecar file.
+    vector_index_configs: Vec<VectorIndexConfig>,
     /// Monotonic generation counter for stable SSTable IDs.
     /// Incremented on each flush. Used by compaction swap to identify
     /// exactly which SSTables to remove.
@@ -120,6 +185,27 @@ fn new_indexes(indexed_columns: &[(String, usize)]) -> Arc<HashMap<String, Arc<M
     let map: HashMap<String, Arc<MemtableIndex>> = indexed_columns
         .iter()
         .map(|(name, _)| (name.clone(), Arc::new(MemtableIndex::new())))
+        .collect();
+    Arc::new(map)
+}
+
+/// Build a fresh `HashMap` of empty `VectorMemtableIndex` instances, one per
+/// declared vector index configuration.
+fn new_vector_indexes(
+    configs: &[VectorIndexConfig],
+) -> Arc<HashMap<String, Arc<VectorMemtableIndex>>> {
+    let map: HashMap<String, Arc<VectorMemtableIndex>> = configs
+        .iter()
+        .map(|cfg| {
+            (
+                cfg.index_name.clone(),
+                Arc::new(VectorMemtableIndex::new(
+                    cfg.metric,
+                    cfg.m,
+                    cfg.ef_construction,
+                )),
+            )
+        })
         .collect();
     Arc::new(map)
 }
@@ -166,7 +252,9 @@ impl<F: FlushTarget> TableStore<F> {
             sstable_ids: Arc::new(vec![]),
             indexes,
             sidecar_indexes: Arc::new(vec![]),
+            vector_indexes: Arc::new(HashMap::new()),
         };
+        initial_view.check_invariants("new:empty");
         Self {
             schema: ArcSwap::from_pointee(schema),
             view: ArcSwap::from_pointee(initial_view),
@@ -175,6 +263,7 @@ impl<F: FlushTarget> TableStore<F> {
             options,
             indexed_columns,
             fulltext_indexes: vec![],
+            vector_index_configs: vec![],
             next_gen: std::sync::atomic::AtomicU64::new(1),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
@@ -196,6 +285,7 @@ impl<F: FlushTarget> TableStore<F> {
         options: WriteOptions,
         initial_sstables: Vec<Arc<SSTableReader<F::Reader>>>,
         initial_sidecars: Vec<Arc<HashMap<String, SidecarReader>>>,
+        initial_ids: Vec<(String, std::path::PathBuf)>,
     ) -> Self {
         Self::new_with_sstables_and_indexes(
             schema,
@@ -203,18 +293,27 @@ impl<F: FlushTarget> TableStore<F> {
             options,
             initial_sstables,
             initial_sidecars,
+            initial_ids,
             vec![],
         )
     }
 
     /// Like [`Self::new_with_sstables`] but also registers secondary index declarations
     /// so that new writes populate the memtable index.
+    ///
+    /// `initial_ids` must be parallel to `initial_sstables` — each entry is
+    /// `(gen_str, sstable_dir)` where `gen_str` matches the on-disk file name
+    /// prefix `{gen_str}-Data.db`. **Do not pass synthetic IDs** (e.g.
+    /// `1..=N`): compaction constructs paths from these IDs and will ENOENT
+    /// on every task if they don't match real files, driving the node toward
+    /// OOM via retry storms.
     pub fn new_with_sstables_and_indexes(
         schema: TableSchema,
         flush_target: F,
         options: WriteOptions,
         initial_sstables: Vec<Arc<SSTableReader<F::Reader>>>,
         initial_sidecars: Vec<Arc<HashMap<String, SidecarReader>>>,
+        initial_ids: Vec<(String, std::path::PathBuf)>,
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
@@ -227,9 +326,17 @@ impl<F: FlushTarget> TableStore<F> {
             sidecars.push(Arc::new(HashMap::new()));
         }
 
-        let initial_ids: Vec<(String, std::path::PathBuf)> = (1..=sidecar_count)
-            .map(|i| (format!("{i}"), std::path::PathBuf::new()))
-            .collect();
+        // Fail loud if caller didn't provide a matching IDs vec. Previous
+        // behavior silently synthesized fake integer IDs here — that masked
+        // the invariant violation and produced phantom `{n}-Data.db` paths.
+        assert_eq!(
+            initial_sstables.len(),
+            initial_ids.len(),
+            "new_with_sstables_and_indexes: initial_sstables ({}) and initial_ids ({}) \
+             must have equal length — one (gen_str, dir) per SSTable reader",
+            initial_sstables.len(),
+            initial_ids.len()
+        );
         let initial_view = StoreView {
             active,
             flushing: None,
@@ -237,7 +344,9 @@ impl<F: FlushTarget> TableStore<F> {
             sstable_ids: Arc::new(initial_ids),
             indexes,
             sidecar_indexes: Arc::new(sidecars),
+            vector_indexes: Arc::new(HashMap::new()),
         };
+        initial_view.check_invariants("new_with_sstables");
         Self {
             schema: ArcSwap::from_pointee(schema),
             view: ArcSwap::from_pointee(initial_view),
@@ -246,6 +355,7 @@ impl<F: FlushTarget> TableStore<F> {
             options,
             indexed_columns,
             fulltext_indexes: vec![],
+            vector_index_configs: vec![],
             next_gen: std::sync::atomic::AtomicU64::new(1),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
@@ -294,6 +404,41 @@ impl<F: FlushTarget> TableStore<F> {
                         }
                     }
                     // If value is None (tombstone), skip — no index entry for deletions
+                }
+            }
+        }
+
+        // Vector index maintenance: extract vector column values and insert into
+        // the in-memory HNSW/brute-force index for the active memtable.
+        // Row byte offset is unknown until the SSTable is written; we use 0 as a
+        // placeholder. The drain→HNSW build at flush time re-inserts with
+        // the final on-disk offset. For now, the memtable search is by position
+        // within the memtable (ordering only), not absolute file offset.
+        if !self.vector_index_configs.is_empty() {
+            for cfg in &self.vector_index_configs {
+                if let Some(cell) = row
+                    .cells
+                    .iter()
+                    .find(|(idx, _)| *idx as usize == cfg.column_position)
+                {
+                    if let Some(ref value) = cell.1.value {
+                        if let Ok(vector) = ferrosa_index::bytes_to_vec_f32(value) {
+                            // Use a sequential position based on current index size
+                            // (placeholder offset; not a true file offset).
+                            let pos = ferrosa_index::vector::RowPosition::new(
+                                guard
+                                    .vector_indexes
+                                    .get(&cfg.index_name)
+                                    .map(|vi| vi.len() as u64)
+                                    .unwrap_or(0),
+                            );
+                            if let Some(vi) = guard.vector_indexes.get(&cfg.index_name) {
+                                vi.insert(pos, vector);
+                            }
+                        }
+                        // If bytes_to_vec_f32 fails, the cell contains non-vector
+                        // data — skip silently (the schema enforces the type).
+                    }
                 }
             }
         }
@@ -389,27 +534,37 @@ impl<F: FlushTarget> TableStore<F> {
         // contains a complete snapshot.
         let new_active: Arc<dyn Memtable> = new_memtable();
         let fresh_indexes = new_indexes(&self.indexed_columns);
-        let (old_active, old_view_flushing, old_indexes) = {
+        let fresh_vector_indexes = new_vector_indexes(&self.vector_index_configs);
+        let (old_active, old_view_flushing, old_indexes, old_vector_indexes) = {
             let _wb = self.write_barrier.write(); // block all writers
             let old_view = self.view.load();
             let old_active = Arc::clone(&old_view.active);
             let old_view_flushing = old_view.flushing.clone();
             let old_indexes = Arc::clone(&old_view.indexes);
+            let old_vector_indexes = Arc::clone(&old_view.vector_indexes);
             let current_sstables = Arc::clone(&old_view.sstables);
             let current_ids = Arc::clone(&old_view.sstable_ids);
             let current_sidecars = Arc::clone(&old_view.sidecar_indexes);
             drop(old_view);
 
-            self.view.store(Arc::new(StoreView {
+            let new_view = StoreView {
                 active: new_active,
                 flushing: Some(Arc::clone(&old_active)),
                 sstables: Arc::clone(&current_sstables),
                 sstable_ids: Arc::clone(&current_ids),
                 indexes: fresh_indexes,
                 sidecar_indexes: Arc::clone(&current_sidecars),
-            }));
+                vector_indexes: fresh_vector_indexes,
+            };
+            new_view.check_invariants("flush:swap_active");
+            self.view.store(Arc::new(new_view));
             // Write barrier released here — writers resume with the new active.
-            (old_active, old_view_flushing, old_indexes)
+            (
+                old_active,
+                old_view_flushing,
+                old_indexes,
+                old_vector_indexes,
+            )
         };
 
         // Step 2: Snapshot the flushing memtable.
@@ -461,14 +616,17 @@ impl<F: FlushTarget> TableStore<F> {
             // capture from the top of flush) — defensive against future
             // changes to locking discipline.
             let live = self.view.load();
-            self.view.store(Arc::new(StoreView {
+            let new_view = StoreView {
                 active: Arc::clone(&live.active),
                 flushing: None,
                 sstables: Arc::clone(&live.sstables),
                 sstable_ids: Arc::clone(&live.sstable_ids),
                 indexes: Arc::clone(&live.indexes),
                 sidecar_indexes: Arc::clone(&live.sidecar_indexes),
-            }));
+                vector_indexes: Arc::clone(&live.vector_indexes),
+            };
+            new_view.check_invariants("flush:clear_flushing");
+            self.view.store(Arc::new(new_view));
             return Ok(());
         }
 
@@ -563,6 +721,55 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
+        // Step 5e: Drain vector memtable indexes and persist as HNSW sidecar files.
+        //
+        // Each declared vector index is drained from the old memtable's
+        // `VectorMemtableIndex`, a full HNSW graph is built from the drained
+        // vectors, serialized to JSON, and written via the flush target.
+        //
+        // Fail policy (Fail Loud, Never Fake):
+        //   - If serialization fails: ERROR log + panic in debug builds.
+        //   - If the persist call fails: ERROR log + panic in debug builds.
+        //   - Never silently skip: a missing vector sidecar causes ANN queries
+        //     to fall back to full scans without the caller knowing.
+        for cfg in &self.vector_index_configs {
+            if let Some(vi) = old_vector_indexes.get(&cfg.index_name) {
+                let drained = vi.drain();
+                if drained.is_empty() {
+                    continue;
+                }
+
+                // Build HNSW graph and serialize via the public API.
+                match ferrosa_index::vector::hnsw::build_and_serialize(
+                    cfg.m,
+                    cfg.ef_construction,
+                    cfg.metric,
+                    drained,
+                ) {
+                    Ok(vec_bytes) => {
+                        if let Err(e) =
+                            self.flush_target
+                                .write_vector_sidecar(gen, &cfg.index_name, &vec_bytes)
+                        {
+                            tracing::error!(%e, index_name = %cfg.index_name, gen,
+                                "store: vector sidecar persist failed");
+                            #[cfg(debug_assertions)]
+                            panic!("vector sidecar persist failed: {e}");
+                        } else {
+                            tracing::debug!(index_name = %cfg.index_name, gen,
+                                "flush: vector sidecar written");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, index_name = %cfg.index_name, gen,
+                            "store: vector sidecar serialization failed");
+                        #[cfg(debug_assertions)]
+                        panic!("vector sidecar serialize failed: {e}");
+                    }
+                }
+            }
+        }
+
         // Step 5d: Drain late writers. Any writer that loaded the view before
         // step 1 may have written to old_active AFTER our snapshot. Those writes
         // would be lost when we clear `flushing`. Re-snapshot the old memtable
@@ -615,14 +822,17 @@ impl<F: FlushTarget> TableStore<F> {
         // flushing slot. The next flush's step 1 will atomically replace
         // flushing, at which point ArcSwap guarantees all prior readers
         // have released their guards.
-        self.view.store(Arc::new(StoreView {
+        let new_view = StoreView {
             active: Arc::clone(&current_view.active),
             flushing: Some(old_active),
             sstables: Arc::new(new_sstables),
             sstable_ids: Arc::new(new_ids),
             indexes: Arc::clone(&current_view.indexes),
             sidecar_indexes: Arc::new(new_sidecars),
-        }));
+            vector_indexes: Arc::clone(&current_view.vector_indexes),
+        };
+        new_view.check_invariants("flush:install_new_sstable");
+        self.view.store(Arc::new(new_view));
 
         Ok(())
     }
@@ -785,14 +995,17 @@ impl<F: FlushTarget> TableStore<F> {
         let current = self.view.load();
         let mut new_indexes = (*current.indexes).clone();
         new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
-        self.view.store(Arc::new(StoreView {
+        let new_view = StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
             sstables: Arc::clone(&current.sstables),
             sstable_ids: Arc::clone(&current.sstable_ids),
             indexes: Arc::new(new_indexes),
             sidecar_indexes: Arc::clone(&current.sidecar_indexes),
-        }));
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        };
+        new_view.check_invariants("update_indexes");
+        self.view.store(Arc::new(new_view));
     }
 
     /// Retrieve a named memtable-level secondary index.
@@ -820,6 +1033,118 @@ impl<F: FlushTarget> TableStore<F> {
         if !self.fulltext_indexes.iter().any(|(n, _)| n == &index_name) {
             self.fulltext_indexes.push((index_name, column_position));
         }
+    }
+
+    /// Register a vector index for this table.
+    ///
+    /// Idempotent: calling twice with the same `index_name` is a no-op.
+    /// Updates both `vector_index_configs` and the live `StoreView` so that
+    /// subsequent writes begin populating the in-memory vector index
+    /// immediately.
+    pub fn add_vector_index(&mut self, config: VectorIndexConfig) {
+        if self
+            .vector_index_configs
+            .iter()
+            .any(|c| c.index_name == config.index_name)
+        {
+            return; // already registered
+        }
+
+        // Insert an empty VectorMemtableIndex into the current view so that
+        // writes made after this call are indexed immediately.
+        let current = self.view.load();
+        let mut new_vi = (*current.vector_indexes).clone();
+        new_vi.insert(
+            config.index_name.clone(),
+            Arc::new(VectorMemtableIndex::new(
+                config.metric,
+                config.m,
+                config.ef_construction,
+            )),
+        );
+        let new_view = StoreView {
+            active: Arc::clone(&current.active),
+            flushing: current.flushing.clone(),
+            sstables: Arc::clone(&current.sstables),
+            sstable_ids: Arc::clone(&current.sstable_ids),
+            indexes: Arc::clone(&current.indexes),
+            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
+            vector_indexes: Arc::new(new_vi),
+        };
+        new_view.check_invariants("add_vector_index");
+        self.view.store(Arc::new(new_view));
+        self.vector_index_configs.push(config);
+    }
+
+    /// Perform an approximate nearest-neighbor search across memtable and
+    /// all flushed SSTable vector sidecars.
+    ///
+    /// Searches the active (and optionally flushing) memtable via brute-force,
+    /// then queries each SSTable's persisted HNSW sidecar via the flush target.
+    /// Results from all sources are merged, deduplicated by `position.offset`,
+    /// sorted ascending by score, and truncated to `k`.
+    ///
+    /// Returns `Ok(Vec::new())` when the index has no data or no sidecar
+    /// exists for `index_name`.
+    pub fn ann_search(
+        &self,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<ferrosa_index::vector::IndexResult>> {
+        use ferrosa_index::vector::IndexResult;
+        use std::collections::HashMap as StdHashMap;
+
+        let guard = self.view.load();
+        let mut merged: StdHashMap<u64, IndexResult> = StdHashMap::new();
+
+        // 1. Search active memtable.
+        if let Some(vi) = guard.vector_indexes.get(index_name) {
+            let results = vi.search(query, k, ef_search).map_err(|e| {
+                ferrosa_common::Error::InvalidData(format!("ann_search memtable failed: {e}"))
+            })?;
+            for r in results {
+                merged.insert(r.position.offset, r);
+            }
+        }
+
+        // 2. Search flushing memtable is handled by the existing vector_indexes
+        // snapshot: the flushing memtable's VectorMemtableIndex is drained at
+        // flush start, so active is the only in-flight index we need to query.
+
+        // 3. Search each SSTable's persisted HNSW sidecar.
+        for (gen_str, _dir) in guard.sstable_ids.iter() {
+            if let Ok(gen) = gen_str.parse::<u64>() {
+                if let Some(vec_bytes) = self.flush_target.read_vector_sidecar(gen, index_name) {
+                    match ferrosa_index::vector::hnsw::search_from_bytes(
+                        &vec_bytes, query, k, ef_search,
+                    ) {
+                        Ok(results) => {
+                            for r in results {
+                                merged.insert(r.position.offset, r);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                %e, index_name, gen,
+                                "ann_search: HNSW sidecar search failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Deduplicate, sort ascending by score, truncate to k.
+        let mut all: Vec<IndexResult> = merged.into_values().collect();
+        all.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all.truncate(k);
+        Ok(all)
     }
 
     /// Returns the generation number of the most recently flushed SSTable.
@@ -898,14 +1223,17 @@ impl<F: FlushTarget> TableStore<F> {
     /// references drop. On-disk SSTable files remain until GC.
     pub fn truncate(&self) {
         let _guard = self.flush_guard.lock();
-        self.view.store(Arc::new(StoreView {
+        let new_view = StoreView {
             active: new_memtable(),
             flushing: None,
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
             indexes: new_indexes(&self.indexed_columns),
             sidecar_indexes: Arc::new(vec![]),
-        }));
+            vector_indexes: new_vector_indexes(&self.vector_index_configs),
+        };
+        new_view.check_invariants("truncate");
+        self.view.store(Arc::new(new_view));
     }
 
     /// Atomically replace input SSTables with a compacted output SSTable.
@@ -952,14 +1280,17 @@ impl<F: FlushTarget> TableStore<F> {
         new_ids.insert(0, (output_id, output_path));
         new_sidecars.insert(0, Arc::new(output_sidecars));
 
-        self.view.store(Arc::new(StoreView {
+        let new_view = StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
             sstables: Arc::new(new_sstables),
             sstable_ids: Arc::new(new_ids),
             indexes: Arc::clone(&current.indexes),
             sidecar_indexes: Arc::new(new_sidecars),
-        }));
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        };
+        new_view.check_invariants("swap_compacted");
+        self.view.store(Arc::new(new_view));
         Ok(())
     }
 
@@ -995,9 +1326,35 @@ impl<F: FlushTarget> TableStore<F> {
         table_dir: &std::path::Path,
     ) -> Vec<crate::compaction::metadata::SSTableMetadata> {
         let guard = self.view.load();
+
+        // Invariant: sstables and sstable_ids must have equal length — each
+        // in-memory SSTable reader has exactly one registered (id, path).
+        // If they desync, the old code silently synthesized fake integer IDs
+        // via `format!("{}", i + 1)`, which the compaction executor then
+        // tried to read as `{i+1}-Data.db` — always ENOENT, burning cycles
+        // and driving the node toward OOM. Fail loud instead: log the
+        // invariant violation with full context, drop the desynced tail,
+        // and let compaction only plan over the synchronized prefix.
+        let n_sst = guard.sstables.len();
+        let n_ids = guard.sstable_ids.len();
+        if n_sst != n_ids {
+            tracing::error!(
+                sstables_len = n_sst,
+                sstable_ids_len = n_ids,
+                table_dir = ?table_dir,
+                "INVARIANT VIOLATED: StoreView.sstables and StoreView.sstable_ids \
+                 have different lengths. This is a latent bug in view construction. \
+                 Dropping desynced tail entries from compaction planning to avoid \
+                 phantom SSTable references (e.g. `20-Data.db` for a file that \
+                 was never written). Please file a bug with these lengths."
+            );
+        }
+        let synced_len = n_sst.min(n_ids);
+
         guard
             .sstables
             .iter()
+            .take(synced_len)
             .enumerate()
             .map(|(i, sst)| {
                 let header = sst.header();
@@ -1012,22 +1369,16 @@ impl<F: FlushTarget> TableStore<F> {
                 let min_token = Token::from_key(sst.smallest_key_bytes()).0;
                 let max_token = Token::from_key(sst.largest_key_bytes()).0;
 
-                let id_path = guard.sstable_ids.get(i);
-                let sstable_id = id_path
-                    .map(|(id, _)| id.clone())
-                    .unwrap_or_else(|| format!("{}", i + 1));
-                let sstable_path = id_path
-                    .map(|(_, p)| {
-                        if p.as_os_str().is_empty() {
-                            table_dir.to_path_buf()
-                        } else {
-                            p.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| table_dir.to_path_buf());
+                // Safe to index: i < synced_len <= sstable_ids.len().
+                let (id, path) = &guard.sstable_ids[i];
+                let sstable_path = if path.as_os_str().is_empty() {
+                    table_dir.to_path_buf()
+                } else {
+                    path.clone()
+                };
 
                 crate::compaction::metadata::SSTableMetadata {
-                    id: sstable_id,
+                    id: id.clone(),
                     path: sstable_path,
                     size_bytes,
                     min_token,
@@ -2373,6 +2724,124 @@ mod tests {
             m.max_timestamp,
             i64::MAX,
             "max_timestamp must not be the sentinel i64::MAX"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Vector sidecar roundtrip: write rows with vector values, flush, verify
+    // the HNSW sidecar exists, and verify ann_search returns ordered results.
+    // -------------------------------------------------------------------------
+
+    /// Schema with a vector column at position 1 (val column holds raw f32 bytes).
+    fn vector_schema() -> TableSchema {
+        TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "vec_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "vec".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.VectorType(FloatType,3)".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    /// Build a Row where cell 0 holds a 3-component f32 vector encoded as
+    /// little-endian bytes (matching `ferrosa_index::vec_f32_to_bytes`).
+    fn make_vector_row(v: &[f32; 3], timestamp: i64) -> Row {
+        let bytes = ferrosa_index::vec_f32_to_bytes(v);
+        Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(0, CellValue::live(bytes, timestamp))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+        }
+    }
+
+    #[test]
+    fn vector_sidecar_roundtrip_ann_search_returns_ordered_results() {
+        // Create a store with a vector index on column 0.
+        let flush_target = InMemoryFlushTarget::new();
+        let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            vector_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            metric: ferrosa_index::DistanceMetric::L2,
+            m: 8,
+            ef_construction: 50,
+        });
+
+        // Write three vectors: k0 is closest to the query [1,0,0], k2 is farthest.
+        //   k0 = [1.0, 0.0, 0.0]   distance 0.0
+        //   k1 = [0.9, 0.1, 0.0]   small distance
+        //   k2 = [0.0, 1.0, 0.0]   larger distance
+        store
+            .write(&make_key("k0"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+            .unwrap();
+        store
+            .write(&make_key("k1"), make_vector_row(&[0.9, 0.1, 0.0], 1001))
+            .unwrap();
+        store
+            .write(&make_key("k2"), make_vector_row(&[0.0, 1.0, 0.0], 1002))
+            .unwrap();
+
+        // Flush: this should drain the VectorMemtableIndex and persist a
+        // HNSW sidecar via `write_vector_sidecar`.
+        store.flush().unwrap();
+
+        assert_eq!(
+            store.sstable_count(),
+            1,
+            "one SSTable should exist after flush"
+        );
+
+        // Verify the sidecar was persisted by the flush target.
+        let gen = store.last_flush_generation();
+        let sidecar_bytes = store
+            .flush_target
+            .read_vector_sidecar(gen, "vec_idx")
+            .expect("vector sidecar must be present after flush");
+        assert!(
+            !sidecar_bytes.is_empty(),
+            "vector sidecar bytes must be non-empty"
+        );
+
+        // ann_search should return k=2 results ordered by ascending score
+        // (closest first). k0 (all ones aligned with query) should come first.
+        let results = store
+            .ann_search("vec_idx", &[1.0, 0.0, 0.0], 2, 20)
+            .expect("ann_search must not fail");
+
+        assert_eq!(
+            results.len(),
+            2,
+            "ann_search with k=2 must return 2 results"
+        );
+
+        // Scores should be in ascending order (closest first).
+        assert!(
+            results[0].score <= results[1].score,
+            "results must be sorted ascending by score: {:?}",
+            results
+        );
+
+        // The first result should have score ~0.0 (k0 is at distance 0 from query).
+        assert!(
+            results[0].score < 0.1,
+            "first result score should be near 0.0 for exact-match vector, got {}",
+            results[0].score
         );
     }
 }

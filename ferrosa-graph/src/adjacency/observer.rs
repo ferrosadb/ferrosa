@@ -64,7 +64,14 @@ impl WriteObserver for AdjacencyIndexObserver {
         }
 
         let adj_ks = adjacency_keyspace_name(&self.keyspace);
-        let edge_label = table.table.clone();
+        // Use the graph label from schema extensions (e.g. "KNOWS") so that the
+        // adjacency clustering key matches what the hop executor filters by.
+        // Fall back to the table name if the extension is missing.
+        let edge_label = meta
+            .extensions
+            .get("graph.label")
+            .cloned()
+            .unwrap_or_else(|| table.table.clone());
         let edge_table = format!("{}.{}", table.keyspace, table.table);
 
         // For Phase 1: the source vertex ID is the partition key bytes,

@@ -29,6 +29,10 @@ pub fn routes() -> Router<WebAppState> {
             get(get_full_scan_reasons),
         )
         .route("/observability/billing", get(get_billing))
+        .route(
+            "/observability/auth_warn_denials",
+            get(get_auth_warn_denials),
+        )
 }
 
 /// `GET /api/observability/cql` — returns CQL statistics from virtual tables.
@@ -144,6 +148,35 @@ async fn get_billing(
     (StatusCode::OK, Json(json!({ "meters": rows.len() })))
 }
 
+/// `GET /api/observability/auth_warn_denials` — tally of would-be CQL
+/// permission denials collected while auth is running in warn (soak) mode.
+///
+/// Shape:
+/// ```json
+/// {
+///   "total": 123,
+///   "by_role": {"ferrosa_user": 100, "app_reader": 23},
+///   "by_resource": {"table agent_memory.typed_edges": 123}
+/// }
+/// ```
+///
+/// When `FERROSA_AUTH_WARN` is off (the steady state) or auth is
+/// entirely disabled, this endpoint returns an all-zero payload — it
+/// is always present so dashboards never 404; the counters only tick
+/// while warn mode is active. See
+/// `specs/decisions/design-cql-role-auth-rollout.md` Sprint D.
+async fn get_auth_warn_denials() -> (StatusCode, Json<Value>) {
+    let snap = ferrosa_cql::auth::warn_denial_stats();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "total": snap.total,
+            "by_role": snap.by_role,
+            "by_resource": snap.by_resource,
+        })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +256,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: dir.path().to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
         };
         let storage = Arc::new(StorageEngine::new(storage_config, None).expect("storage engine"));
         let rpc_registry = Arc::new(HandlerRegistry::new());

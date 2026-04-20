@@ -257,6 +257,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: dir.path().to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
 
@@ -308,6 +311,7 @@ mod tests {
             event_sender: tokio::sync::broadcast::channel(64).0,
             mode_controller,
             cql_metrics: Arc::new(crate::observability::CqlMetrics::new()),
+            auth_warn: false,
         };
 
         (Arc::new(state), dir)

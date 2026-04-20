@@ -52,6 +52,9 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         flush_max_age_secs: 5,
         data_dir: dir.path().to_path_buf(),
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        write_verify: true,
+        auth_enabled: false,
+        auth_warn: false,
     };
     let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
     let schema = Arc::new(
@@ -102,6 +105,7 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         event_sender: tokio::sync::broadcast::channel(64).0,
         mode_controller,
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
+        auth_warn: false,
     });
     (state, dir)
 }

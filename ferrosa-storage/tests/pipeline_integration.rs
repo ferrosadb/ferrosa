@@ -49,6 +49,9 @@ fn make_engine(dir: &std::path::Path) -> StorageEngine {
         flush_max_age_secs: 5,
         data_dir: dir.to_path_buf(),
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        auth_enabled: false,
+        auth_warn: false,
+        write_verify: false,
     };
     StorageEngine::new(config, None).unwrap()
 }

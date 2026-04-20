@@ -13,9 +13,7 @@
 //! Only flush and compaction take per-table serialized guards.
 
 use std::collections::HashMap;
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -70,6 +68,40 @@ pub struct StorageEngineConfig {
     /// - `Remote`: delegate to external `ferrosa-index-builder`
     /// - `Off`: disable index building entirely
     pub index_backend: crate::index::IndexBackendConfig,
+    /// Defensive SSTable-writer self-readback — when `true`, every
+    /// flush reopens the freshly-built SSTable through the full reader
+    /// pipeline and aborts the flush if any component is inconsistent.
+    /// See `specs/in-process/bug-read-path-memory-growth-bloats-coordinator.md`.
+    pub write_verify: bool,
+    /// When `true`, the engine enforces CQL role-based authentication
+    /// end-to-end: CQL connections must authenticate, the router rejects
+    /// statements the role lacks permissions for, and the web `:9090`
+    /// surface checks tokens on write/admin endpoints.
+    ///
+    /// **Default: `false`** — preserves legacy behavior on every code
+    /// path that doesn't explicitly opt in. `from_env()` honors
+    /// `FERROSA_AUTH_ENABLED=true`; `test_config()` defaults off so no
+    /// existing test sees a behavior change.
+    ///
+    /// State is logged loudly at startup so operators can never
+    /// silently disable the whole auth subsystem without a visible
+    /// record in the logs. See
+    /// `specs/decisions/design-cql-role-auth-rollout.md` Sprint A.
+    pub auth_enabled: bool,
+    /// When `true` AND `auth_enabled` is also true, CQL permission
+    /// denials are downgraded to a loud `WARN` log line and the request
+    /// still proceeds. This is the rollout "soak" mode — an operator
+    /// watches logs for unexpected consumers before flipping
+    /// enforcement on.
+    ///
+    /// **Default: `false`** (`from_env()` honors `FERROSA_AUTH_WARN=true`,
+    /// any other value keeps the enforcement default).
+    ///
+    /// Invalid combination: `auth_enabled=false, auth_warn=true` —
+    /// nothing is checked, so there is nothing to warn about. Startup
+    /// logs this at `ERROR` level and `auth_warn` is effectively
+    /// ignored. See Sprint D.
+    pub auth_warn: bool,
 }
 
 impl StorageEngineConfig {
@@ -104,6 +136,53 @@ impl StorageEngineConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(30); // 30 seconds default
 
+        // FERROSA_AUTH_WARN=true|false (default false). When auth is
+        // enabled and warn mode is on, CQL permission denials are logged
+        // loudly but the request still proceeds. This is the rollout
+        // soak mode — see Sprint D in
+        // `specs/decisions/design-cql-role-auth-rollout.md`. Like every
+        // other toggle in this config, any unparseable value keeps the
+        // safer default (enforcement) so a typo can't silently leave
+        // auth stuck in warn forever.
+        let auth_warn = matches!(
+            std::env::var("FERROSA_AUTH_WARN").ok().as_deref(),
+            Some("true" | "1" | "on" | "yes")
+        );
+        // FERROSA_AUTH_ENABLED=true|false (default false). Opt-in: any
+        // unparseable value leaves auth DISABLED so an upgrade path
+        // that doesn't intend to flip auth can't accidentally lock
+        // itself out. When true, the CQL server requires SASL PLAIN
+        // authentication and the router consults
+        // `ferrosa_schema::check_permission`.
+        let auth_enabled = matches!(
+            std::env::var("FERROSA_AUTH_ENABLED").ok().as_deref(),
+            Some("true" | "1" | "on" | "yes")
+        );
+        tracing::info!(
+            auth_enabled,
+            source = if std::env::var_os("FERROSA_AUTH_ENABLED").is_some() {
+                "FERROSA_AUTH_ENABLED env"
+            } else {
+                "default"
+            },
+            "storage-engine: CQL role auth is {} — {}",
+            if auth_enabled { "ENABLED" } else { "DISABLED" },
+            if auth_enabled {
+                "CQL STARTUP requires SASL PLAIN, router enforces permission \
+                 checks, web :9090 requires tokens on writes/admin"
+            } else {
+                "CQL accepts every STARTUP without credentials, router permits \
+                 everything — matches legacy behavior; set \
+                 FERROSA_AUTH_ENABLED=true to enforce"
+            }
+        );
+        log_auth_warn_state(auth_enabled, auth_warn);
+
+        let write_verify = !matches!(
+            std::env::var("FERROSA_WRITE_VERIFY").ok().as_deref(),
+            Some("false" | "0" | "off" | "no")
+        );
+
         Ok(Self {
             commit_log,
             compaction,
@@ -113,11 +192,18 @@ impl StorageEngineConfig {
             flush_max_age_secs,
             data_dir,
             index_backend: crate::index::IndexBackendConfig::from_env(),
+            write_verify,
+            auth_enabled,
+            auth_warn,
         })
     }
 
     /// Creates a test configuration using the given temp directory.
-    #[cfg(test)]
+    ///
+    /// Public (not `cfg(test)`) so integration tests in sibling crates
+    /// — including the auth-rollout coverage in
+    /// `ferrosa-cql/tests/auth_warn_mode.rs` — can construct the same
+    /// shape without duplicating every field.
     pub fn test_config(dir: &Path) -> Self {
         Self {
             commit_log: CommitLogConfig::test_config(dir),
@@ -128,6 +214,72 @@ impl StorageEngineConfig {
             flush_max_age_secs: 5,              // 5s — fast age-based flush in tests
             data_dir: dir.to_path_buf(),
             index_backend: crate::index::IndexBackendConfig::Local,
+            // Tests keep verification on — writer bugs surface
+            // immediately in CI, not at runtime in production.
+            write_verify: true,
+            // Off by default — tests that cover auth must opt in
+            // explicitly, matching the production default so backwards
+            // compatibility is pinned by the type system.
+            auth_enabled: false,
+            // Off by default — tests that exercise warn-mode denials
+            // must flip this to true themselves.
+            auth_warn: false,
+        }
+    }
+}
+
+/// Emit the startup log line describing the current `(auth_enabled,
+/// auth_warn)` combination. Kept as a free function so tests and other
+/// startup paths can invoke it without standing up a whole config.
+///
+/// Healthy combinations log at `INFO`; the contradictory configuration
+/// (`auth_enabled=false && auth_warn=true`) logs at `ERROR` level so an
+/// operator paging through startup logs can never miss it.
+pub fn log_auth_warn_state(auth_enabled: bool, auth_warn: bool) {
+    match (auth_enabled, auth_warn) {
+        (true, true) => {
+            tracing::info!(
+                auth_enabled,
+                auth_warn,
+                source = if std::env::var_os("FERROSA_AUTH_WARN").is_some() {
+                    "FERROSA_AUTH_WARN env"
+                } else {
+                    "default"
+                },
+                "storage-engine: CQL auth is ENFORCED but in WARN MODE — \
+                 denials will be LOGGED as warnings and the request permitted. \
+                 This is a soak configuration; set FERROSA_AUTH_WARN=false to \
+                 turn denials back into errors. \
+                 See specs/decisions/design-cql-role-auth-rollout.md Sprint D."
+            );
+        }
+        (true, false) => {
+            tracing::info!(
+                auth_enabled,
+                auth_warn,
+                "storage-engine: CQL auth warn-mode is DISABLED — \
+                 denials return Unauthorized to the client as expected."
+            );
+        }
+        (false, false) => {
+            tracing::info!(
+                auth_enabled,
+                auth_warn,
+                "storage-engine: CQL auth warn-mode is irrelevant — \
+                 auth is disabled entirely; every request is permitted."
+            );
+        }
+        (false, true) => {
+            tracing::error!(
+                auth_enabled,
+                auth_warn,
+                "storage-engine: FERROSA_AUTH_WARN=true requires auth to \
+                 be enabled (FERROSA_AUTH_ENABLED=true, or \
+                 FERROSA_AUTH_DISABLED unset). With auth off there is \
+                 nothing to warn about — auth_warn is being IGNORED. \
+                 Either turn auth on (soak) or unset FERROSA_AUTH_WARN \
+                 (explicit no-auth)."
+            );
         }
     }
 }
@@ -808,7 +960,7 @@ impl StorageEngine {
         })?;
 
         // Load any SSTables that already exist on disk (e.g., after crash recovery).
-        let (existing_sstables, existing_sidecars) =
+        let (existing_sstables, existing_sidecars, existing_ids) =
             Self::load_existing_sstables_and_sidecars(&table_dir);
 
         let flush_target = FileFlushTarget::new_starting_at(table_dir)?;
@@ -828,6 +980,7 @@ impl StorageEngine {
                 WriteOptions::default(),
                 existing_sstables,
                 existing_sidecars,
+                existing_ids,
                 indexed_columns,
             )
         };
@@ -1057,7 +1210,11 @@ impl StorageEngine {
     /// to open are replaced with empty maps (degraded: full scan fallback).
     fn load_existing_sstables_and_sidecars(
         table_dir: &std::path::Path,
-    ) -> (Vec<FileSSTableReader>, Vec<SSTableSidecarMap>) {
+    ) -> (
+        Vec<FileSSTableReader>,
+        Vec<SSTableSidecarMap>,
+        Vec<(String, std::path::PathBuf)>,
+    ) {
         // Collect all generation numbers by looking for Data.db files.
         let mut generations: Vec<u64> = std::fs::read_dir(table_dir)
             .into_iter()
@@ -1078,6 +1235,7 @@ impl StorageEngine {
 
         let mut sstables = Vec::new();
         let mut sidecars = Vec::new();
+        let mut ids: Vec<(String, std::path::PathBuf)> = Vec::new();
         let mut quarantined_count = 0usize;
 
         for gen in generations {
@@ -1130,6 +1288,7 @@ impl StorageEngine {
                 Ok(reader) => {
                     sstables.push(Arc::new(reader));
                     sidecars.push(Arc::new(Self::load_sidecars_for_generation(table_dir, gen)));
+                    ids.push((gen_str.clone(), table_dir.to_path_buf()));
                 }
                 Err(e) => {
                     tracing::warn!(%e, gen, dir = %table_dir.display(), "storage-engine: skipping corrupt SSTable");
@@ -1149,7 +1308,7 @@ impl StorageEngine {
             );
         }
 
-        (sstables, sidecars)
+        (sstables, sidecars, ids)
     }
 
     /// Scans a table directory for sidecar files belonging to a given generation.
@@ -1230,6 +1389,99 @@ impl StorageEngine {
         };
         self.async_observers.write().push(state);
         rx
+    }
+
+    /// Registers an async observer and spawns an in-process drain task that
+    /// applies derived mutations through the full write path (commit log +
+    /// memtable).
+    ///
+    /// # Drain task guarantees
+    ///
+    /// - Lives as long as the engine: the sender half lives inside
+    ///   `async_observers`; when the engine is dropped the senders drop, the
+    ///   channel closes, `recv()` returns `None`, and the task exits cleanly.
+    /// - Panics inside `observer.on_write` are caught and logged at ERROR level
+    ///   (file + line), then the task continues — a single bad mutation must
+    ///   not kill the drain loop for subsequent mutations.
+    /// - Requires an active tokio runtime at call time (panics otherwise).
+    pub fn register_async_observer_with_drain(
+        &self,
+        observer: Arc<dyn crate::observer::WriteObserver>,
+        engine: Arc<StorageEngine>,
+    ) {
+        let capacity = self.async_observer_capacity;
+        let mut rx = self.register_async_observer(observer.clone(), capacity);
+
+        tokio::spawn(async move {
+            while let Some((table_id, mutation)) = rx.recv().await {
+                // observer.on_write is synchronous and non-blocking.
+                // Wrap in catch_unwind so a panicking observer does not kill the drain loop.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    observer.on_write(&table_id, &mutation)
+                }));
+                match result {
+                    Ok(derived) => {
+                        for dm in derived {
+                            engine.apply_derived_mutation(&dm);
+                        }
+                    }
+                    Err(panic_val) => {
+                        let msg = if let Some(s) = panic_val.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = panic_val.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "<non-string panic payload>".to_string()
+                        };
+                        tracing::error!(
+                            table = %table_id,
+                            panic = %msg,
+                            "observer drain: observer.on_write panicked — derived mutations \
+                             for this event are lost; drain loop continues for subsequent events"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// Writes a derived mutation (produced by an observer) to the commit log
+    /// and the target table's memtable.
+    ///
+    /// Mirrors the pattern in `dispatch_sync_observers`. Errors are logged at
+    /// ERROR level and the write is skipped; derived mutation failures must
+    /// not crash the engine.
+    fn apply_derived_mutation(&self, dm: &Mutation) {
+        if let Err(e) = self.commit_log.append(dm) {
+            tracing::error!(
+                %e,
+                keyspace = %dm.keyspace,
+                table = %dm.table,
+                "observer drain: commit log append failed for derived mutation"
+            );
+            return;
+        }
+        let dtid = TableId::new(&dm.keyspace, &dm.table);
+        let tables = self.tables.read();
+        if let Some(state) = tables.get(&dtid) {
+            for row in &dm.rows {
+                if let Err(e) = state.store.write(&dm.key, row.clone()) {
+                    tracing::error!(
+                        %e,
+                        keyspace = %dm.keyspace,
+                        table = %dm.table,
+                        "observer drain: memtable write failed for derived mutation"
+                    );
+                }
+            }
+        } else {
+            tracing::error!(
+                keyspace = %dm.keyspace,
+                table = %dm.table,
+                "observer drain: target table not registered — derived mutation dropped; \
+                 register the adjacency table with StorageEngine before registering the observer"
+            );
+        }
     }
 
     /// Dispatches a mutation to all sync observers watching the given table.
