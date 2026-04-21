@@ -48,6 +48,9 @@ fn test_engine_config(dir: &Path) -> StorageEngineConfig {
         flush_max_age_secs: 300,          // 5min — don't trigger age-based flush in this test
         data_dir: dir.to_path_buf(),
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        auth_enabled: false,
+        auth_warn: false,
+        write_verify: false,
     }
 }
 

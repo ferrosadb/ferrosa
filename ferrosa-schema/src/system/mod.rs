@@ -18,6 +18,13 @@ pub mod type_tables;
 /// `system.peers`. This must be consistent across all code paths.
 pub const RELEASE_VERSION: &str = "5.1.0-ferrosa";
 
+/// Which address family to expose through `system.local` / `system.peers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyView {
+    Public,
+    Internal,
+}
+
 pub use aggregate_tables::SystemSchemaAggregatesTable;
 pub use auth_tables::{RoleMemberRow, RolePermissionRow, RoleRow};
 pub use function_tables::SystemSchemaFunctionsTable;

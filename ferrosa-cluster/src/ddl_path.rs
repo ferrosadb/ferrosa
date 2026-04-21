@@ -468,12 +468,22 @@ pub(crate) async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Res
 /// is elected.
 pub struct ClusterDdlForwardHandler {
     raft: Arc<FerrosRaft>,
+    peer_manager: Arc<PeerManager>,
+    node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
 }
 
 impl ClusterDdlForwardHandler {
     /// Create a new handler backed by `raft`.
-    pub fn new(raft: Arc<FerrosRaft>) -> Self {
-        Self { raft }
+    pub fn new(
+        raft: Arc<FerrosRaft>,
+        peer_manager: Arc<PeerManager>,
+        node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
+    ) -> Self {
+        Self {
+            raft,
+            peer_manager,
+            node_map,
+        }
     }
 }
 
@@ -506,8 +516,39 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
             },
         };
 
-        match execute_via_raft(&self.raft, op).await {
+        match execute_via_raft(&self.raft, op.clone()).await {
             Ok(()) => Some(Message::PairDdlAck(Bytes::new())),
+            Err(ClusterError::NotLeader {
+                leader_id: Some(leader_node_id),
+            }) => {
+                let leader_uuid = self
+                    .node_map
+                    .read()
+                    .expect("node_map lock poisoned")
+                    .get(&leader_node_id)
+                    .copied();
+
+                match leader_uuid {
+                    Some(uuid) => match forward_ddl_to_leader(&self.peer_manager, uuid, op).await {
+                        Ok(()) => Some(Message::PairDdlAck(Bytes::new())),
+                        Err(e) => {
+                            tracing::error!(
+                                leader_node_id,
+                                leader_uuid = %uuid,
+                                "ClusterDdlForwardHandler: forward to leader failed: {e}"
+                            );
+                            None
+                        }
+                    },
+                    None => {
+                        tracing::error!(
+                            leader_node_id,
+                            "ClusterDdlForwardHandler: leader node_id missing from node_map"
+                        );
+                        None
+                    }
+                }
+            }
             Err(e) => {
                 tracing::error!("ClusterDdlForwardHandler: execute_via_raft failed: {e}");
                 None
@@ -571,6 +612,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            auth_enabled: false,
+            auth_warn: false,
+            write_verify: false,
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
     }

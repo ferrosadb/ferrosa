@@ -17,6 +17,7 @@ use ferrosa_cql::frame::*;
 use ferrosa_cql::prepared::PreparedCache;
 use ferrosa_cql::router::SharedState;
 use ferrosa_cql::server::{CqlServer, ServerConfig};
+use ferrosa_cql::topology::ClientTopologyPolicy;
 use ferrosa_cql::virtual_tables::active_queries::QueryTracker;
 use ferrosa_cql::virtual_tables::connections::ConnectionTracker;
 
@@ -52,6 +53,9 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         flush_max_age_secs: 5,
         data_dir: dir.path().to_path_buf(),
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        write_verify: true,
+        auth_enabled: false,
+        auth_warn: false,
     };
     let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
     let schema = Arc::new(
@@ -77,6 +81,8 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         broadcast_address: "127.0.0.1".parse().unwrap(),
         broadcast_port: 7000,
         rpc_address: "127.0.0.1".parse().unwrap(),
+        internal_rpc_address: "127.0.0.1".parse().unwrap(),
+        internal_rpc_port: 9042,
         tokens: vec![],
     });
     let udf_executor =
@@ -101,7 +107,9 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         udf_executor,
         event_sender: tokio::sync::broadcast::channel(64).0,
         mode_controller,
+        topology_policy: ClientTopologyPolicy::default(),
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
+        auth_warn: false,
     });
     (state, dir)
 }
@@ -323,6 +331,15 @@ fn test_config(auth_disabled: bool) -> ServerConfig {
     }
 }
 
+/// Same shape as `setup_state` but calls `seed_default_roles` so the
+/// public documented credentials (`ferrosa_admin` / `ferrosa_user`) are
+/// available. Mirrors how a real auth-enabled cluster boots.
+fn setup_state_with_seeded_roles() -> (Arc<SharedState>, TempDir) {
+    let (state, dir) = setup_state();
+    ferrosa_schema::auth::bootstrap::seed_default_roles(&state.schema).unwrap();
+    (state, dir)
+}
+
 /// Helper: complete startup+auth handshake and return a ready connection.
 #[allow(dead_code)]
 async fn connect_and_authenticate(addr: std::net::SocketAddr) -> TcpStream {
@@ -382,6 +399,327 @@ fn assert_result(resp: &RawFrame) {
 }
 
 // ── Original handshake tests (un-ignored) ────────────────────────────────
+
+/// Bug: auth-enabled cluster times out for cdrs-tokio with
+/// `ferrosa_admin / ferrosa_admin` credentials. This is the documented
+/// public credential pair (see seed_default_roles) that `ferrosa-memory`
+/// uses. A full v4 STARTUP → AUTHENTICATE → AUTH_RESPONSE → AUTH_SUCCESS
+/// must complete; failure here indicates a wire-level server bug.
+///
+/// See `specs/in-process/bug-cql-auth-enabled-cluster-times-out-for-cdrs-clients.md`.
+#[tokio::test]
+async fn seeded_ferrosa_admin_can_authenticate_over_v4_tcp() {
+    let (state, _dir) = setup_state_with_seeded_roles();
+    let server = CqlServer::new(test_config(false), state);
+    let addr = server.start_background().await.unwrap();
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // STARTUP
+    let startup = encode_startup_frame();
+    stream.write_all(&startup).await.unwrap();
+
+    // AUTHENTICATE
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Authenticate);
+
+    // AUTH_RESPONSE with the seeded admin credentials
+    let auth = encode_auth_response("ferrosa_admin", "ferrosa_admin");
+    stream.write_all(&auth).await.unwrap();
+
+    // AUTH_SUCCESS — if this times out or returns ERROR, the bug is real.
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(
+        resp.opcode,
+        Opcode::AuthSuccess,
+        "ferrosa_admin must authenticate — got opcode {:?} body {:?}",
+        resp.opcode,
+        resp.body
+    );
+}
+
+/// Reproduce the exact post-AUTH_SUCCESS sequence that cdrs-tokio's
+/// session builder runs: introspect system.local + system.peers +
+/// system_schema.* under authenticated context. If any of these hangs
+/// or returns a malformed frame, cdrs-tokio's transport logs
+/// "failed to fill whole buffer" and the 10s session-build timer
+/// fires. See specs/in-process/bug-cql-auth-enabled-cluster-times-
+/// out-for-cdrs-clients.md.
+#[tokio::test]
+async fn auth_enabled_post_auth_introspection_does_not_hang() {
+    let (state, _dir) = setup_state_with_seeded_roles();
+    let server = CqlServer::new(test_config(false), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // STARTUP → AUTHENTICATE → AUTH_RESPONSE → AUTH_SUCCESS
+    let startup = encode_startup_frame();
+    stream.write_all(&startup).await.unwrap();
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Authenticate);
+
+    let auth = encode_auth_response("ferrosa_admin", "ferrosa_admin");
+    stream.write_all(&auth).await.unwrap();
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::AuthSuccess);
+
+    // The same introspection sequence cqlsh + cdrs-tokio session build run.
+    let introspection = [
+        "SELECT * FROM system.local",
+        "SELECT * FROM system.peers",
+        "SELECT * FROM system.peers_v2",
+        "SELECT * FROM system_schema.keyspaces",
+        "SELECT * FROM system_schema.tables",
+        "SELECT * FROM system_schema.columns",
+        "SELECT * FROM system_schema.types",
+        "SELECT * FROM system_schema.functions",
+        "SELECT * FROM system_schema.aggregates",
+        "SELECT * FROM system_schema.triggers",
+        "SELECT * FROM system_schema.views",
+        "SELECT * FROM system_schema.indexes",
+    ];
+
+    for cql in &introspection {
+        let body = encode_query_body(cql);
+        send_raw_frame(&mut stream, Opcode::Query, &body).await;
+        let resp = read_frame(&mut stream).await;
+        assert_eq!(
+            resp.opcode,
+            Opcode::Result,
+            "{cql} under authenticated context must return RESULT — got opcode={:?} body_len={}",
+            resp.opcode,
+            resp.body.len()
+        );
+        // Result kind: Rows = 0x0002. If we got Error or partial bytes the body
+        // would be too short or kind would be different.
+        assert!(
+            resp.body.len() >= 4,
+            "{cql} result body must be at least 4 bytes (kind tag) — got {}",
+            resp.body.len()
+        );
+        let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+        assert_eq!(
+            kind, 0x0002,
+            "{cql} result kind must be Rows (0x0002) — got {kind:#x}"
+        );
+    }
+}
+
+/// cdrs-tokio's `cluster_metadata_manager` runs the EXACT queries below
+/// during session bootstrap (see cluster_metadata_manager.rs:497, 665, 729,
+/// 757). If any of these returns a malformed RESULT body, cdrs-tokio's
+/// row decoder fails and the session-build retries forever (manifesting
+/// as `IO error: failed to fill whole buffer` on the wire side).
+///
+/// See specs/in-process/bug-cql-auth-enabled-cluster-times-out-for-cdrs-clients.md.
+#[tokio::test]
+async fn cdrs_tokio_session_bootstrap_queries_return_well_formed_results() {
+    let (state, _dir) = setup_state_with_seeded_roles();
+    let server = CqlServer::new(test_config(false), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // STARTUP → AUTHENTICATE → AUTH_RESPONSE → AUTH_SUCCESS
+    let startup = encode_startup_frame();
+    stream.write_all(&startup).await.unwrap();
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Authenticate);
+    let auth = encode_auth_response("ferrosa_admin", "ferrosa_admin");
+    stream.write_all(&auth).await.unwrap();
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::AuthSuccess);
+
+    // The four EXACT queries cdrs-tokio's cluster_metadata_manager fires.
+    let session_bootstrap_queries = [
+        "SELECT * FROM system.local",
+        "SELECT * FROM system.peers",
+        "SELECT * FROM system.peers_v2",
+        // toJson() on the system_schema.keyspaces.replication map column.
+        // cdrs-tokio expects a single Varchar column called "replication"
+        // holding a JSON object; any other shape and its row decoder fails.
+        "SELECT keyspace_name, toJson(replication) AS replication FROM system_schema.keyspaces",
+    ];
+
+    for cql in &session_bootstrap_queries {
+        let body = encode_query_body(cql);
+        send_raw_frame(&mut stream, Opcode::Query, &body).await;
+        let resp = read_frame(&mut stream).await;
+        assert_eq!(
+            resp.opcode,
+            Opcode::Result,
+            "{cql} must return RESULT — got opcode={:?}",
+            resp.opcode
+        );
+        assert!(
+            resp.body.len() >= 4,
+            "{cql} body too short ({} bytes)",
+            resp.body.len()
+        );
+        let kind = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
+        assert_eq!(
+            kind, 0x0002,
+            "{cql} kind must be Rows (0x0002), got {kind:#x}"
+        );
+    }
+}
+
+/// Reproduce cdrs-tokio's actual handshake: OPTIONS first, THEN
+/// STARTUP. If SUPPORTED or AUTHENTICATE is mis-encoded, cdrs-tokio's
+/// transport logs `IO error: failed to fill whole buffer` and the
+/// session never becomes ready.
+#[tokio::test]
+async fn cdrs_tokio_shaped_handshake_options_then_startup_then_auth() {
+    let (state, _dir) = setup_state_with_seeded_roles();
+    let server = CqlServer::new(test_config(false), state);
+    let addr = server.start_background().await.unwrap();
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // 1. OPTIONS — cdrs-tokio opens a connection by asking what the
+    //    server supports before STARTUP. If the SUPPORTED response is
+    //    malformed, cdrs-tokio hangs here.
+    let options_header = FrameHeader {
+        version: 0x04,
+        flags: 0,
+        stream_id: 0,
+        opcode: Opcode::Options,
+        length: 0,
+    };
+    let mut options_buf = BytesMut::new();
+    options_header.encode(&mut options_buf);
+    stream.write_all(&options_buf).await.unwrap();
+
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(
+        resp.opcode,
+        Opcode::Supported,
+        "OPTIONS must elicit SUPPORTED — got {:?}",
+        resp.opcode
+    );
+    // SUPPORTED body must be parseable as a string-multimap: [short n_keys]...
+    assert!(
+        resp.body.len() >= 2,
+        "SUPPORTED body too short: {} bytes",
+        resp.body.len()
+    );
+    let n_keys = u16::from_be_bytes([resp.body[0], resp.body[1]]);
+    assert!(
+        n_keys >= 1,
+        "SUPPORTED must advertise at least CQL_VERSION — got {n_keys} keys"
+    );
+
+    // 2. STARTUP — still using the same stream, cdrs-tokio follows up.
+    let startup = encode_startup_frame();
+    stream.write_all(&startup).await.unwrap();
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Authenticate);
+
+    // 3. AUTH_RESPONSE with seeded admin creds.
+    let auth = encode_auth_response("ferrosa_admin", "ferrosa_admin");
+    stream.write_all(&auth).await.unwrap();
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(
+        resp.opcode,
+        Opcode::AuthSuccess,
+        "AUTH_SUCCESS expected — got {:?} body={:?}",
+        resp.opcode,
+        resp.body
+    );
+}
+
+/// cdrs-tokio requests LZ4 compression in STARTUP by default. After
+/// AUTH_SUCCESS the server flips the codec to compressed mode. Any
+/// mismatch in when compression is enabled will manifest as "failed to
+/// fill whole buffer" on the client side.
+#[tokio::test]
+async fn cdrs_tokio_startup_with_lz4_compression_completes_handshake() {
+    let (state, _dir) = setup_state_with_seeded_roles();
+    let server = CqlServer::new(test_config(false), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // STARTUP with COMPRESSION=lz4 in the string-map body.
+    let mut body = BytesMut::new();
+    body.put_u16(2); // n_keys
+    let k1 = b"CQL_VERSION";
+    body.put_u16(k1.len() as u16);
+    body.put_slice(k1);
+    let v1 = b"3.0.0";
+    body.put_u16(v1.len() as u16);
+    body.put_slice(v1);
+    let k2 = b"COMPRESSION";
+    body.put_u16(k2.len() as u16);
+    body.put_slice(k2);
+    let v2 = b"lz4";
+    body.put_u16(v2.len() as u16);
+    body.put_slice(v2);
+
+    let header = FrameHeader {
+        version: 0x04,
+        flags: 0,
+        stream_id: 0,
+        opcode: Opcode::Startup,
+        length: body.len() as u32,
+    };
+    let mut buf = BytesMut::new();
+    header.encode(&mut buf);
+    buf.extend_from_slice(&body);
+    stream.write_all(&buf).await.unwrap();
+
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Authenticate);
+
+    let auth = encode_auth_response("ferrosa_admin", "ferrosa_admin");
+    stream.write_all(&auth).await.unwrap();
+
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(
+        resp.opcode,
+        Opcode::AuthSuccess,
+        "AUTH_SUCCESS expected after compressed STARTUP — got {:?}",
+        resp.opcode
+    );
+    // AUTH_SUCCESS must be sent UNCOMPRESSED (compression is enabled
+    // on the server *after* sending AUTH_SUCCESS per CQL spec). If the
+    // server compressed it, cdrs-tokio would fail to decompress.
+    assert_eq!(
+        resp.header.flags & 0x01,
+        0,
+        "AUTH_SUCCESS must have COMPRESSION flag clear — got flags={:#x}",
+        resp.header.flags
+    );
+}
+
+/// Parity check: the other seeded role (`ferrosa_user`) must also
+/// complete the handshake, not just the admin. This pins the fix for
+/// bug-seeded-ferrosa-user-cannot-authenticate-to-graph-http.md at the
+/// CQL layer as well.
+#[tokio::test]
+async fn seeded_ferrosa_user_can_authenticate_over_v4_tcp() {
+    let (state, _dir) = setup_state_with_seeded_roles();
+    let server = CqlServer::new(test_config(false), state);
+    let addr = server.start_background().await.unwrap();
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    let startup = encode_startup_frame();
+    stream.write_all(&startup).await.unwrap();
+
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.opcode, Opcode::Authenticate);
+
+    let auth = encode_auth_response("ferrosa_user", "ferrosa_user");
+    stream.write_all(&auth).await.unwrap();
+
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(
+        resp.opcode,
+        Opcode::AuthSuccess,
+        "ferrosa_user must authenticate — got opcode {:?} body {:?}",
+        resp.opcode,
+        resp.body
+    );
+}
 
 #[tokio::test]
 async fn startup_then_authenticate_then_auth_success() {

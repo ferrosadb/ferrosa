@@ -236,6 +236,7 @@
       <li><a href="#run">Run Ferrosa</a></li>
       <li><a href="#connect">Connect a CQL Driver</a></li>
       <li><a href="#config">Configuration Reference</a></li>
+      <li><a href="#faq">Cluster FAQ</a></li>
       <li><a href="#cli">CLI Tools</a></li>
       <li><a href="#architecture">Architecture Overview</a></li>
       <li><a href="#next">What's Next</a></li>
@@ -269,8 +270,9 @@
 
   <div class="note">
     <strong>Note:</strong> Ferrosa starts in standalone mode by default. Two-node pair mode
-    is available via <code>FERROSA_SEED</code> configuration. Full cluster mode (3+ nodes)
-    uses Raft consensus and a Murmur3 token ring — set <code>FERROSA_CLUSTER_MODE=cluster</code>.
+    is available via <code>FERROSA_SEED</code> configuration. Full cluster formation (3+ nodes)
+    uses Raft consensus and a Murmur3 token ring; there is no separate
+    <code>FERROSA_CLUSTER_MODE</code> switch.
   </div>
 
   <h3>Default ports</h3>
@@ -376,49 +378,81 @@ session.execute(<span class="str">"""
   <!-- ── Config ── -->
   <h2 id="config">Configuration Reference</h2>
 
-  <p>Ferrosa is configured via environment variables. All are optional with sensible defaults.</p>
+  <p>Ferrosa is configured via environment variables and an optional TOML file. Environment variables override file values. The tables below cover the customer-facing runtime variables currently honored by the server.</p>
 
-  <h3>Core</h3>
+  <h3>Startup, Auth, and CQL</h3>
   <table>
     <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
     <tbody>
+      <tr><td><code>FERROSA_CONFIG</code></td><td><code>/etc/ferrosa/ferrosa.toml</code></td><td>Optional TOML config file loaded at startup</td></tr>
+      <tr><td><code>FERROSA_MODE</code></td><td><code>development</code></td><td>Deployment mode used for production-safety checks</td></tr>
+      <tr><td><code>FERROSA_HOST_ID</code></td><td>auto-generated</td><td>Stable node UUID persisted under the data directory</td></tr>
       <tr><td><code>FERROSA_CQL_BIND</code></td><td><code>0.0.0.0:9042</code></td><td>CQL server bind address</td></tr>
+      <tr><td><code>FERROSA_CQL_BROADCAST</code></td><td>bind address/port</td><td>Public CQL address advertised to clients via <code>system.local</code> / <code>system.peers_v2</code></td></tr>
+      <tr><td><code>FERROSA_CQL_INTERNAL_CLIENT_CIDRS</code></td><td>—</td><td>Comma-separated CIDRs whose clients should receive the internal topology view instead of the public CQL broadcast</td></tr>
+      <tr><td><code>FERROSA_CQL_MAX_CONNECTIONS</code></td><td><code>1024</code></td><td>Maximum concurrent CQL connections</td></tr>
+      <tr><td><code>FERROSA_CQL_MAX_CONNECTIONS_PER_IP</code></td><td><code>64</code></td><td>Per-client-IP connection cap</td></tr>
+      <tr><td><code>FERROSA_CQL_TLS_CERT</code></td><td>—</td><td>PEM certificate path for CQL TLS</td></tr>
+      <tr><td><code>FERROSA_CQL_TLS_KEY</code></td><td>—</td><td>PEM private-key path for CQL TLS</td></tr>
+      <tr><td><code>FERROSA_CQL_REQUIRE_TLS</code></td><td><code>false</code></td><td>Fail startup if the CQL listener does not have TLS configured</td></tr>
       <tr><td><code>FERROSA_WEB_BIND</code></td><td><code>0.0.0.0:9090</code></td><td>Web console bind address</td></tr>
-      <tr><td><code>FERROSA_AUTH_DISABLED</code></td><td><code>false</code></td><td>Disable SASL authentication</td></tr>
+      <tr><td><code>FERROSA_AUTH_ENABLED</code></td><td><code>false</code></td><td>Enable CQL role auth and permission enforcement</td></tr>
+      <tr><td><code>FERROSA_AUTH_WARN</code></td><td><code>false</code></td><td>Soak mode: log auth failures as warnings while still allowing requests</td></tr>
+      <tr><td><code>FERROSA_AUTH_DISABLED</code></td><td><code>false</code></td><td>Development escape hatch that skips the CQL SASL handshake entirely</td></tr>
+      <tr><td><code>FERROSA_SUPERUSER_PASSWORD</code></td><td>—</td><td>Optional override for the seeded <code>ferrosa_admin</code> password during bootstrap</td></tr>
       <tr><td><code>FERROSA_GRAPH_ENABLED</code></td><td><code>false</code></td><td>Enable graph engine + HTTP endpoint</td></tr>
+      <tr><td><code>FERROSA_BOLT_PORT</code></td><td><code>7687</code></td><td>Bolt listener port when the graph engine is enabled</td></tr>
+      <tr><td><code>FERROSA_SPARQL_ENABLED</code></td><td><code>false</code></td><td>Enable the SPARQL HTTP endpoint</td></tr>
+      <tr><td><code>FERROSA_SPARQL_BIND</code></td><td><code>0.0.0.0:8080</code></td><td>SPARQL HTTP listen address</td></tr>
       <tr><td><code>RUST_LOG</code></td><td><code>info</code></td><td>Tracing filter (e.g. <code>debug</code>, <code>ferrosa_cql=trace</code>)</td></tr>
     </tbody>
   </table>
 
-  <h3>Cluster (ferrosa-net / ferrosa-cluster)</h3>
+  <h3>Cluster, Internode, and Consensus</h3>
   <table>
     <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>FERROSA_CLUSTER_NAME</code></td><td><code>ferrosa</code></td><td>Cluster name (must match across nodes)</td></tr>
-      <tr><td><code>FERROSA_CLUSTER_MODE</code></td><td><code>standalone</code></td><td>Cluster mode: <code>standalone</code>, <code>pair</code>, or <code>cluster</code></td></tr>
       <tr><td><code>FERROSA_SEED</code></td><td>—</td><td>Comma-separated seed addresses</td></tr>
       <tr><td><code>FERROSA_INTERNODE_BIND</code></td><td><code>0.0.0.0:7000</code></td><td>Internode protocol bind address</td></tr>
-      <tr><td><code>FERROSA_INTERNODE_BROADCAST</code></td><td>—</td><td>Address other nodes use to reach this node</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_BROADCAST</code></td><td><code>127.0.0.1:7000</code></td><td>Address other nodes use to reach this node; also forms the default internal topology view</td></tr>
       <tr><td><code>FERROSA_INTERNODE_PSK</code></td><td>—</td><td>Pre-shared key for internode auth (HMAC-SHA256)</td></tr>
-      <tr><td><code>FERROSA_DATA_CENTER</code></td><td><code>dc1</code></td><td>Data center name</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_TLS_CERT</code></td><td>—</td><td>PEM certificate path for internode TLS</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_TLS_KEY</code></td><td>—</td><td>PEM private-key path for internode TLS</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_TLS_CA</code></td><td>—</td><td>CA certificate for mutual-TLS internode verification</td></tr>
+      <tr><td><code>FERROSA_INTERNODE_REQUIRE_TLS</code></td><td><code>false</code></td><td>Fail startup if internode TLS is required but not configured</td></tr>
+      <tr><td><code>FERROSA_HEARTBEAT_INTERVAL_MS</code></td><td><code>500</code></td><td>Heartbeat interval between peers</td></tr>
+      <tr><td><code>FERROSA_HEARTBEAT_TIMEOUT_MS</code></td><td><code>1500</code></td><td>Timeout before marking a peer as suspected down</td></tr>
+      <tr><td><code>FERROSA_MAX_INTERNODE_CONNECTIONS</code></td><td><code>512</code></td><td>Maximum concurrent internode connections</td></tr>
+      <tr><td><code>FERROSA_HANDSHAKE_TIMEOUT_SECS</code></td><td><code>5</code></td><td>Internode handshake timeout</td></tr>
+      <tr><td><code>FERROSA_MAX_FRAME_BODY_SIZE</code></td><td><code>268435456</code></td><td>Maximum internode frame size in bytes</td></tr>
+      <tr><td><code>FERROSA_MAX_STREAMS_PER_LANE</code></td><td><code>128</code></td><td>Maximum concurrent streams per internode connection lane</td></tr>
+      <tr><td><code>FERROSA_DATA_CENTER</code></td><td><code>datacenter1</code></td><td>Data center name</td></tr>
       <tr><td><code>FERROSA_RACK</code></td><td><code>rack1</code></td><td>Rack name within the data center</td></tr>
       <tr><td><code>FERROSA_NUM_TOKENS</code></td><td><code>256</code></td><td>Number of tokens on the ring</td></tr>
       <tr><td><code>FERROSA_DEFAULT_CL</code></td><td><code>QUORUM</code></td><td>Default consistency level</td></tr>
-      <tr><td><code>FERROSA_HEARTBEAT_INTERVAL_MS</code></td><td><code>1000</code></td><td>Heartbeat interval between peers</td></tr>
-      <tr><td><code>FERROSA_HEARTBEAT_TIMEOUT_MS</code></td><td><code>5000</code></td><td>Timeout before marking a peer as down</td></tr>
-      <tr><td><code>FERROSA_MAX_INTERNODE_CONNECTIONS</code></td><td><code>64</code></td><td>Max concurrent internode connections</td></tr>
       <tr><td><code>FERROSA_AUTO_JOIN</code></td><td><code>true</code></td><td>Automatically join the ring on startup (dev mode)</td></tr>
+      <tr><td><code>FERROSA_HINTED_HANDOFF_DIR</code></td><td><code>data/hints</code></td><td>Local directory for hinted handoff files</td></tr>
       <tr><td><code>FERROSA_HINTED_HANDOFF_MAX_MB</code></td><td><code>1024</code></td><td>Max disk space for hinted handoff per peer (MB)</td></tr>
+      <tr><td><code>FERROSA_FORMATION_TIMEOUT_SECS</code></td><td><code>60</code></td><td>Maximum time to wait in forming state before falling back</td></tr>
+      <tr><td><code>FERROSA_NODE_ROLE</code></td><td><code>both</code></td><td>Node role: <code>data</code>, <code>indexer</code>, or <code>both</code></td></tr>
+      <tr><td><code>FERROSA_RAFT_HEARTBEAT_MS</code></td><td><code>300</code></td><td>Raft heartbeat interval</td></tr>
+      <tr><td><code>FERROSA_RAFT_ELECTION_MIN_MS</code></td><td><code>3000</code></td><td>Lower bound for Raft election timeout</td></tr>
+      <tr><td><code>FERROSA_RAFT_ELECTION_MAX_MS</code></td><td><code>6000</code></td><td>Upper bound for Raft election timeout</td></tr>
+      <tr><td><code>FERROSA_CLOCK_MAX_SKEW_SECS</code></td><td><code>5</code></td><td>Maximum tolerated clock skew for Accord timestamp validation</td></tr>
     </tbody>
   </table>
 
-  <h3>Storage</h3>
+  <h3>Storage and Durability</h3>
   <table>
     <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>FERROSA_DATA_DIR</code></td><td><code>/var/lib/ferrosa</code></td><td>Local data directory for SSTables and commit log</td></tr>
       <tr><td><code>FERROSA_CACHE_MAX_BYTES</code></td><td><code>10737418240</code></td><td>Local LRU cache size (10 GB)</td></tr>
       <tr><td><code>FERROSA_FLUSH_THRESHOLD_BYTES</code></td><td><code>67108864</code></td><td>Memtable flush threshold (64 MB)</td></tr>
+      <tr><td><code>FERROSA_FLUSH_MAX_AGE_SECS</code></td><td><code>30</code></td><td>Flush memtables after this age even if the size threshold is not reached</td></tr>
+      <tr><td><code>FERROSA_FLUSH_INTERVAL_SECS</code></td><td><code>30</code></td><td>Background maintenance interval for flush and schema sync</td></tr>
+      <tr><td><code>FERROSA_WRITE_VERIFY</code></td><td><code>true</code></td><td>Verify committed writes during the storage pipeline</td></tr>
       <tr><td><code>FERROSA_S3_ENDPOINT</code></td><td>—</td><td>S3-compatible endpoint URL</td></tr>
       <tr><td><code>FERROSA_S3_BUCKET</code></td><td>—</td><td>S3 bucket for durable storage</td></tr>
       <tr><td><code>FERROSA_S3_REGION</code></td><td><code>us-east-1</code></td><td>AWS region for S3</td></tr>
@@ -427,6 +461,33 @@ session.execute(<span class="str">"""
       <tr><td><code>FERROSA_S3_ALLOW_HTTP</code></td><td><code>false</code></td><td>Allow non-TLS for local dev (MinIO)</td></tr>
       <tr><td><code>FERROSA_S3_PREFIX</code></td><td>—</td><td>Key prefix for multi-tenant separation</td></tr>
       <tr><td><code>FERROSA_S3_UPLOAD_QUEUE_DEPTH</code></td><td><code>16</code></td><td>Upload backpressure queue depth</td></tr>
+      <tr><td><code>FERROSA_ARCHIVE_ENABLED</code></td><td><code>false</code></td><td>Enable commit-log archiving</td></tr>
+      <tr><td><code>FERROSA_ARCHIVE_POLL_INTERVAL_SECS</code></td><td><code>5</code></td><td>Archive poll interval in seconds</td></tr>
+      <tr><td><code>FERROSA_ARCHIVE_RETENTION_DAYS</code></td><td><code>7</code></td><td>Retention period for archived commit-log segments</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Secondary Index and Search Backends</h3>
+  <table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>FERROSA_INDEX_BACKEND</code></td><td><code>local</code></td><td>Secondary-index backend: <code>local</code>, <code>remote</code>, or <code>off</code></td></tr>
+      <tr><td><code>FERROSA_INDEX_SIDECAR_ENDPOINTS</code></td><td>—</td><td>Comma-separated remote index sidecar URLs when <code>FERROSA_INDEX_BACKEND=remote</code></td></tr>
+      <tr><td><code>FERROSA_INDEX_SIDECAR_TIMEOUT_MS</code></td><td><code>30000</code></td><td>Per-request timeout for the remote index sidecar</td></tr>
+      <tr><td><code>FERROSA_INDEX_SIDECAR_MAX_RETRIES</code></td><td><code>2</code></td><td>Retries per sidecar endpoint</td></tr>
+      <tr><td><code>FERROSA_INDEX_CB_THRESHOLD</code></td><td><code>5</code></td><td>Circuit-breaker failure threshold for remote indexing</td></tr>
+      <tr><td><code>FERROSA_INDEX_CB_RECOVERY_MS</code></td><td><code>60000</code></td><td>Circuit-breaker recovery interval in milliseconds</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Telemetry and Debug Endpoints</h3>
+  <table>
+    <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>FERROSA_TELEMETRY_ENABLED</code></td><td><code>false</code></td><td>Enable sampled tracing telemetry in the observability stack</td></tr>
+      <tr><td><code>FERROSA_TELEMETRY_SAMPLE_RATE</code></td><td><code>0.01</code></td><td>Fraction of spans to sample when telemetry is enabled</td></tr>
+      <tr><td><code>FERROSA_DEBUG_AUTH_TOKEN</code></td><td>—</td><td>Bearer token protecting the debug endpoints</td></tr>
+      <tr><td><code>FERROSA_DEBUG_IP_WHITELIST</code></td><td>—</td><td>Comma-separated IP allowlist for debug endpoints</td></tr>
     </tbody>
   </table>
 
@@ -587,8 +648,8 @@ session.execute(<span class="str">"""
   </ol>
 
   <h3>Multi-Node Cluster (Experimental)</h3>
-  <p>Three-node cluster mode (<code>FERROSA_CLUSTER_MODE=cluster</code>) uses Raft consensus for
-    metadata and tunable consistency for data. Current limitations:</p>
+  <p>Three-node cluster formation uses Raft consensus for metadata and tunable consistency for
+    data. Current limitations:</p>
   <ul>
     <li>When one node in a three-node cluster goes down, reads and writes continue at reduced
       availability depending on the configured consistency level.</li>
@@ -601,6 +662,27 @@ session.execute(<span class="str">"""
     <strong>Beta:</strong> Multi-node cluster mode is experimental. For production HA, two-node
     pair mode with automatic failover is the recommended configuration.
   </div>
+
+  <h2 id="faq">Cluster FAQ</h2>
+
+  <h3>How do I run one cluster for both host clients and in-network clients?</h3>
+  <p>Use two address families:</p>
+  <ul>
+    <li><code>FERROSA_CQL_BROADCAST</code> should point at the host- or externally-reachable CQL endpoint that off-node clients should dial after topology discovery.</li>
+    <li><code>FERROSA_INTERNODE_BROADCAST</code> should point at the address other Ferrosa nodes use to reach this node. Ferrosa also uses this address family as the internal topology view.</li>
+    <li><code>FERROSA_CQL_INTERNAL_CLIENT_CIDRS</code> should list the container or pod CIDRs whose clients need the internal topology view.</li>
+  </ul>
+  <p>Clients whose source IP falls inside <code>FERROSA_CQL_INTERNAL_CLIENT_CIDRS</code> receive internal addresses from <code>system.local</code> and <code>system.peers_v2</code>. Other clients receive the public CQL broadcast address.</p>
+
+  <h3>Example: host Mac clients plus Podman-network clients</h3>
+  <pre><span class="kw">FERROSA_CQL_BIND</span>=0.0.0.0:9042
+<span class="kw">FERROSA_CQL_BROADCAST</span>=127.0.0.1:19042
+<span class="kw">FERROSA_INTERNODE_BROADCAST</span>=10.89.1.48:7000
+<span class="kw">FERROSA_CQL_INTERNAL_CLIENT_CIDRS</span>=10.89.0.0/16</pre>
+  <p>In that setup, host-side drivers reconnect to <code>127.0.0.1:19042</code> after topology discovery, while clients running on the Podman network see <code>10.89.x.x:9042</code>.</p>
+
+  <h3>Can split-horizon DNS replace this configuration?</h3>
+  <p>Not by itself. Cassandra-compatible topology tables expose <code>inet</code> columns, so drivers ultimately consume concrete IP addresses after topology discovery. Split DNS helps only if both environments can converge on the same reachable advertised IP, such as a shared VIP or proxy.</p>
 
   <p>
     For the full architecture spec, see the

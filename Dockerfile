@@ -47,7 +47,13 @@ RUN find . -name "lib.rs" -o -name "main.rs" | xargs touch
 RUN cargo build --release -p ferrosa
 
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+# gdb + procps available in the runtime image so crashes produce readable backtraces
+# (paired with `[profile.release] debug = "line-tables-only"` in the workspace Cargo.toml).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gdb \
+        procps \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/ferrosa /usr/local/bin/
 EXPOSE 9042 7000 9090
 ENV FERROSA_DATA_DIR=/var/lib/ferrosa

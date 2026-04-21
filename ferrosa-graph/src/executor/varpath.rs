@@ -294,6 +294,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
     }
@@ -341,10 +344,11 @@ mod tests {
         storage.write(&table_id, &dk, row, 1).unwrap();
     }
 
-    /// Build an adjacency row clustering key:
-    /// direction(1) + label_len(2 BE) + label + id_len(2 BE) + id.
+    /// Build an adjacency row clustering key in standard composite layout:
+    /// [u16 1][1B direction][u16 label_len][label][u16 id_len][id].
     fn adjacency_clustering(label: &str, neighbor_id: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
+        out.extend_from_slice(&1u16.to_be_bytes()); // direction component len
         out.push(0x01); // direction byte (out)
         let label_bytes = label.as_bytes();
         out.extend_from_slice(&(label_bytes.len() as u16).to_be_bytes());

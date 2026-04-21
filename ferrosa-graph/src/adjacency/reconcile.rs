@@ -148,11 +148,12 @@ pub async fn reconcile_once(
             let vertex_id = partition.key.key.as_bytes().to_vec();
 
             for row in &partition.rows {
-                // Parse direction from clustering[0].
-                if row.clustering.is_empty() {
+                // Standard composite: [u16 1][1B direction][...].
+                // Direction byte sits at offset 2 after the u16 length prefix.
+                if row.clustering.len() < 3 {
                     continue;
                 }
-                let direction = row.clustering[0];
+                let direction = row.clustering[2];
 
                 // Extract edge label and neighbor ID from clustering.
                 let neighbor_id = match extract_neighbor_id(&row.clustering, None) {
@@ -234,8 +235,9 @@ async fn adjacency_entry_exists(
         _ => return false,
     };
 
-    // Build the expected clustering prefix to match against.
+    // Standard composite: [u16 1][1B direction][u16 label_len][label][u16 nid_len][nid]
     let mut expected_clustering = Vec::new();
+    expected_clustering.extend_from_slice(&1u16.to_be_bytes());
     expected_clustering.push(direction);
     expected_clustering.extend_from_slice(&(edge_label.len() as u16).to_be_bytes());
     expected_clustering.extend_from_slice(edge_label.as_bytes());
@@ -250,17 +252,24 @@ async fn adjacency_entry_exists(
 
 /// Extract the edge label string from an adjacency clustering key.
 ///
-/// Clustering format:
-///   direction(1 byte) + edge_label_len(2 bytes BE) + edge_label + neighbor_id_len(2 bytes BE) + neighbor_id
+/// Standard composite layout: [u16 1][1B direction][u16 label_len][label]...
 fn extract_edge_label(clustering: &[u8]) -> Option<String> {
-    if clustering.len() < 3 {
+    if clustering.len() < 7 {
         return None;
     }
-    let label_len = u16::from_be_bytes([clustering[1], clustering[2]]) as usize;
-    if 3 + label_len > clustering.len() {
+    // Skip component 0 (direction): [u16 len][bytes]
+    let dir_len = u16::from_be_bytes([clustering[0], clustering[1]]) as usize;
+    let label_len_pos = 2 + dir_len;
+    if label_len_pos + 2 > clustering.len() {
         return None;
     }
-    std::str::from_utf8(&clustering[3..3 + label_len])
+    let label_len =
+        u16::from_be_bytes([clustering[label_len_pos], clustering[label_len_pos + 1]]) as usize;
+    let label_start = label_len_pos + 2;
+    if label_start + label_len > clustering.len() {
+        return None;
+    }
+    std::str::from_utf8(&clustering[label_start..label_start + label_len])
         .ok()
         .map(|s| s.to_string())
 }
@@ -401,6 +410,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
     }
@@ -433,7 +445,7 @@ mod tests {
                 durable_writes: true,
                 replication: ReplicationParams {
                     strategy: "SimpleStrategy".to_string(),
-                    options: HashMap::new(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
                 },
             })
             .unwrap();
@@ -446,7 +458,7 @@ mod tests {
                 durable_writes: true,
                 replication: ReplicationParams {
                     strategy: "SimpleStrategy".to_string(),
-                    options: HashMap::new(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
                 },
             })
             .unwrap();
@@ -605,11 +617,13 @@ mod tests {
         let alice_key = DecoratedKey::new(PartitionKey::new(b"alice".to_vec()));
         let alice_partition = storage.read(&adj_tid, &alice_key).unwrap().unwrap();
         assert!(alice_partition.rows.iter().any(|r| {
-            r.clustering[0] == DIRECTION_OUT
+            r.clustering.len() >= 3
+                && r.clustering[2] == DIRECTION_OUT
                 && extract_neighbor_id(&r.clustering, Some("knows")) == Some(b"bob".to_vec())
         }));
         assert!(alice_partition.rows.iter().any(|r| {
-            r.clustering[0] == DIRECTION_OUT
+            r.clustering.len() >= 3
+                && r.clustering[2] == DIRECTION_OUT
                 && extract_neighbor_id(&r.clustering, Some("knows")) == Some(b"carol".to_vec())
         }));
 
@@ -617,7 +631,8 @@ mod tests {
         let bob_key = DecoratedKey::new(PartitionKey::new(b"bob".to_vec()));
         let bob_partition = storage.read(&adj_tid, &bob_key).unwrap().unwrap();
         assert!(bob_partition.rows.iter().any(|r| {
-            r.clustering[0] == DIRECTION_IN
+            r.clustering.len() >= 3
+                && r.clustering[2] == DIRECTION_IN
                 && extract_neighbor_id(&r.clustering, Some("knows")) == Some(b"alice".to_vec())
         }));
 
@@ -625,7 +640,8 @@ mod tests {
         let carol_key = DecoratedKey::new(PartitionKey::new(b"carol".to_vec()));
         let carol_partition = storage.read(&adj_tid, &carol_key).unwrap().unwrap();
         assert!(carol_partition.rows.iter().any(|r| {
-            r.clustering[0] == DIRECTION_IN
+            r.clustering.len() >= 3
+                && r.clustering[2] == DIRECTION_IN
                 && extract_neighbor_id(&r.clustering, Some("knows")) == Some(b"alice".to_vec())
         }));
     }
@@ -754,7 +770,9 @@ mod tests {
 
     #[test]
     fn extract_edge_label_parses_correctly() {
+        // Standard composite: [u16 1][1B direction][u16 label_len][label][...]
         let mut clustering = Vec::new();
+        clustering.extend_from_slice(&1u16.to_be_bytes());
         clustering.push(DIRECTION_OUT);
         let label = b"KNOWS";
         clustering.extend_from_slice(&(label.len() as u16).to_be_bytes());

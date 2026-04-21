@@ -42,12 +42,13 @@ pub use system::auth_tables::{
     query_audit_log, query_role_members, query_role_permissions, query_roles, RoleMemberRow,
     RolePermissionRow, RoleRow,
 };
-pub use system::local::{query_local, LocalInfo, NodeConfig};
-pub use system::peers::{query_peers, ClusterState, PeerInfo};
+pub use system::local::{query_local, query_local_with_view, LocalInfo, NodeConfig};
+pub use system::peers::{query_peers, query_peers_with_view, ClusterState, PeerInfo};
 pub use system::schema_tables::{
     query_columns, query_keyspaces, query_tables, ColumnRow, KeyspaceRow, TableRow,
 };
 pub use system::type_tables::SystemSchemaTypesTable;
+pub use system::TopologyView;
 pub use virtual_registry::VirtualTableRegistry;
 pub use virtual_table::{
     ColumnFilter, PredicateOp, RowPredicate, SubscriptionMode, VirtualColumnDef, VirtualRow,

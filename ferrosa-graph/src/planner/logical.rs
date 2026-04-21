@@ -110,6 +110,7 @@ fn permission_for_statement(stmt: &Statement) -> Permission {
         Statement::Delete { .. } => Permission::Modify,
         Statement::Subscribe { .. } => Permission::Select,
         Statement::Unsubscribe { .. } => Permission::Select,
+        Statement::Merge { .. } => Permission::Modify,
     }
 }
 
@@ -128,7 +129,7 @@ pub fn validate(
     // Collect patterns from the statement.
     let patterns: &[Pattern] = match &statement {
         Statement::Match { pattern, .. } => pattern,
-        Statement::Create { patterns } => patterns,
+        Statement::Create { patterns, .. } => patterns,
         Statement::Set { pattern, .. } => pattern,
         Statement::Delete { pattern, .. } => pattern,
         Statement::Subscribe { inner, .. } => match inner.as_ref() {
@@ -146,6 +147,7 @@ pub fn validate(
                 keyspace: keyspace.to_string(),
             });
         }
+        Statement::Merge { patterns, .. } => patterns,
     };
 
     for pat in patterns {
@@ -362,6 +364,61 @@ mod tests {
         };
         snap.tables
             .insert((keyspace.to_string(), table.to_string()), meta);
+    }
+
+    #[test]
+    fn validate_merge_requires_modify_permission() {
+        let snap = make_snap_with_vertex_table("social", "entity_v", "Entity");
+        // Non-superuser with no grants — SELECT only.
+        let auth = AuthContext {
+            role: "reader".to_string(),
+            is_superuser: false,
+            must_change_password: false,
+        };
+
+        let stmt = Statement::Merge {
+            patterns: vec![Pattern::Node {
+                var: Some("n".into()),
+                label: Some("Entity".into()),
+                props: vec![],
+            }],
+            set_clause: vec![],
+            return_clause: None,
+        };
+
+        let result = validate(&snap, &auth, "social", stmt);
+        assert!(
+            result.is_err(),
+            "non-superuser without grants must be denied"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            GraphError::PermissionDenied(_)
+        ));
+    }
+
+    #[test]
+    fn validate_merge_resolves_bindings() {
+        let snap = make_snap_with_vertex_table("social", "entity_v", "Entity");
+        let auth = superuser_auth();
+
+        let stmt = Statement::Merge {
+            patterns: vec![Pattern::Node {
+                var: Some("n".into()),
+                label: Some("Entity".into()),
+                props: vec![],
+            }],
+            set_clause: vec![],
+            return_clause: None,
+        };
+
+        let plan = validate(&snap, &auth, "social", stmt).unwrap();
+        assert!(
+            plan.bindings.contains_key("n"),
+            "binding 'n' must be resolved"
+        );
+        assert_eq!(plan.bindings["n"].table, "entity_v");
+        assert_eq!(plan.keyspace, "social");
     }
 
     #[test]

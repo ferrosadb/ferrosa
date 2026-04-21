@@ -16,6 +16,9 @@ fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         flush_max_age_secs: 5,
         data_dir: dir.to_path_buf(),
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        auth_enabled: false,
+        auth_warn: false,
+        write_verify: false,
     };
     Arc::new(StorageEngine::new(config, None).unwrap())
 }
@@ -588,6 +591,49 @@ async fn approved_peer_triggers_join_in_cluster_mode() {
     assert!(
         pending.contains(&new_peer_id),
         "new peer should be in pending_joins after on_peer_connected in cluster mode"
+    );
+}
+
+#[tokio::test]
+async fn existing_cluster_member_does_not_queue_duplicate_join() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        auto_join: true,
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    controller.on_peer_connected((peer1_id, "127.0.0.1:7001".parse().unwrap()));
+    controller.on_peer_connected((peer2_id, "127.0.0.2:7002".parse().unwrap()));
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    // peer2 is already part of the seeded ring for this cluster transition.
+    controller.on_peer_connected((peer2_id, "127.0.0.2:7002".parse().unwrap()));
+
+    let pending = controller.pending_joins.lock();
+    assert!(
+        !pending.contains(&peer2_id),
+        "existing cluster members must not queue duplicate join work"
     );
 }
 

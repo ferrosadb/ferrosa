@@ -392,6 +392,55 @@ impl IndexBuilder for HnswBuilder {
 }
 
 // ---------------------------------------------------------------------------
+// Public free functions for ferrosa-storage integration
+// ---------------------------------------------------------------------------
+
+/// Build an HNSW graph from drained memtable entries and serialize it to JSON.
+///
+/// Called by `ferrosa-storage::TableStore` at flush time to persist the
+/// in-memory vector index as a `{gen}-VEC-{index_name}.db` sidecar file.
+///
+/// # Errors
+///
+/// Returns `IndexError::Format` if JSON serialization fails.
+pub fn build_and_serialize(
+    m: usize,
+    ef_construction: usize,
+    metric: DistanceMetric,
+    entries: Vec<(RowPosition, Vec<f32>)>,
+) -> Result<Vec<u8>, IndexError> {
+    let mut graph = HnswGraph::new(m, ef_construction, metric);
+    for (pos, vector) in entries {
+        graph.insert(vector, pos);
+    }
+    let data = graph.to_data();
+    serde_json::to_vec(&data).map_err(|e| IndexError::Format(format!("HNSW serialize failed: {e}")))
+}
+
+/// Deserialize a vector sidecar byte blob and search it for the `k`
+/// approximate nearest neighbors of `query`.
+///
+/// Called by `ferrosa-storage::TableStore::ann_search` to query HNSW sidecar
+/// files written at flush time via [`build_and_serialize`].
+///
+/// # Errors
+///
+/// Returns `IndexError::Format` if `bytes` is not valid JSON-encoded
+/// `HnswGraphData`, or `IndexError::DimensionMismatch` if the query
+/// dimension does not match the graph.
+pub fn search_from_bytes(
+    bytes: &[u8],
+    query: &[f32],
+    k: usize,
+    ef_search: usize,
+) -> Result<Vec<IndexResult>, IndexError> {
+    let data: HnswGraphData = serde_json::from_slice(bytes)
+        .map_err(|e| IndexError::Format(format!("HNSW deserialize failed: {e}")))?;
+    let reader = HnswReader { data };
+    reader.nearest(query, k, ef_search)
+}
+
+// ---------------------------------------------------------------------------
 // HnswReader
 // ---------------------------------------------------------------------------
 

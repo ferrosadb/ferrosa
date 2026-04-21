@@ -235,6 +235,36 @@ pub trait FlushTarget {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Write a vector (HNSW) sidecar file alongside the SSTable.
+    ///
+    /// Writes `{gen}-VEC-{index_name}.db` to the SSTable directory (or
+    /// stores the bytes in memory for test targets). Called from
+    /// `TableStore::flush` after draining the `VectorMemtableIndex` and
+    /// serializing the HNSW graph via `build_and_serialize`.
+    ///
+    /// The default implementation is a no-op (callers that only need writes
+    /// can leave reads as the default returning `None`).
+    fn write_vector_sidecar(
+        &self,
+        _generation: u64,
+        _index_name: &str,
+        _vec_bytes: &[u8],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Read back a vector sidecar that was written by `write_vector_sidecar`.
+    ///
+    /// Returns `None` if no sidecar was written for this `(generation,
+    /// index_name)` pair, or if the target does not persist sidecars
+    /// (e.g. `FileFlushTarget` — the store loads those from disk instead).
+    ///
+    /// Used in integration tests to verify the sidecar round-trip without
+    /// touching the filesystem.
+    fn read_vector_sidecar(&self, _generation: u64, _index_name: &str) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// In-memory flush target for testing — wraps output as `SSTableComponents<Vec<u8>>`.
@@ -242,8 +272,14 @@ pub trait FlushTarget {
 /// No filesystem interaction. The flushed data lives entirely in memory.
 /// Tracks a monotonic generation counter so that each flush produces a
 /// unique ID, matching the behavior of [`FileFlushTarget`].
+///
+/// Also stores vector sidecar bytes keyed by `(generation, index_name)` so
+/// that integration tests can read them back via `read_vector_sidecar` without
+/// touching the filesystem.
 pub struct InMemoryFlushTarget {
     generation: std::sync::atomic::AtomicU64,
+    /// Vector sidecar bytes keyed by `(generation, index_name)`.
+    vector_sidecars: std::sync::Mutex<HashMap<(u64, String), Vec<u8>>>,
 }
 
 impl InMemoryFlushTarget {
@@ -251,6 +287,7 @@ impl InMemoryFlushTarget {
     pub fn new() -> Self {
         Self {
             generation: std::sync::atomic::AtomicU64::new(0),
+            vector_sidecars: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -284,6 +321,28 @@ impl FlushTarget for InMemoryFlushTarget {
     fn advance_generation(&self, min_gen: u64) {
         self.generation
             .fetch_max(min_gen + 1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn write_vector_sidecar(
+        &self,
+        generation: u64,
+        index_name: &str,
+        vec_bytes: &[u8],
+    ) -> Result<()> {
+        let mut map = self
+            .vector_sidecars
+            .lock()
+            .expect("vector_sidecars poisoned");
+        map.insert((generation, index_name.to_string()), vec_bytes.to_vec());
+        Ok(())
+    }
+
+    fn read_vector_sidecar(&self, generation: u64, index_name: &str) -> Option<Vec<u8>> {
+        let map = self
+            .vector_sidecars
+            .lock()
+            .expect("vector_sidecars poisoned");
+        map.get(&(generation, index_name.to_string())).cloned()
     }
 }
 
@@ -581,6 +640,19 @@ impl FlushTarget for FileFlushTarget {
             .base_dir
             .join(format!("{generation}-FTI-{index_name}.db"));
         std::fs::write(&path, fti_bytes)?;
+        Ok(())
+    }
+
+    fn write_vector_sidecar(
+        &self,
+        generation: u64,
+        index_name: &str,
+        vec_bytes: &[u8],
+    ) -> Result<()> {
+        let path = self
+            .base_dir
+            .join(format!("{generation}-VEC-{index_name}.db"));
+        std::fs::write(&path, vec_bytes)?;
         Ok(())
     }
 }

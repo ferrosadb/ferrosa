@@ -1,5 +1,6 @@
 //! Authentication and authorization types.
 
+pub mod bootstrap;
 pub mod password;
 pub mod permission;
 pub mod rate_limit;

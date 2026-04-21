@@ -30,6 +30,7 @@ pub enum Keyword {
     Unsubscribe,
     Every,
     Delta,
+    Merge,
 }
 
 /// A token produced by the lexer.

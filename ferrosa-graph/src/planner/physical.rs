@@ -47,6 +47,43 @@ pub struct CreateOp {
     pub props: Vec<(String, Expr)>,
 }
 
+/// A single MERGE operation: read-before-write by content-addressed key.
+///
+/// `match_props` drives the deterministic partition key (blake3 hash of sorted
+/// property bytes). `create_props` are applied only when no row was found.
+///
+/// For relationship MergeOps (`table.graph_type == "edge"`), `src_match_props`
+/// and `dst_match_props` hold the source and destination node match properties
+/// so that `execute_merge` can derive the correct partition and clustering keys:
+///
+/// - `partition key = content_addressed_key(src_match_props)`  — the source vertex key
+/// - `clustering    = content_addressed_key(dst_match_props)`  — the destination vertex key
+///
+/// The adjacency observer reads `mutation.key` as the source vertex ID and
+/// `row.clustering` as the target vertex ID.  Without these fields, hop queries
+/// cannot find MERGE-created edges.
+///
+/// For node MergeOps (`table.graph_type == "vertex"`) both fields are `None`.
+#[derive(Debug, Clone)]
+pub struct MergeOp {
+    pub var: Option<String>,
+    pub table: ResolvedTable,
+    /// Properties used to derive the edge's own content-addressed key (for
+    /// idempotent read-before-write on edge properties).  For nodes this
+    /// also provides the partition key.
+    pub match_props: Vec<(String, Expr)>,
+    /// Additional properties written only on the create arm.
+    pub create_props: Vec<(String, Expr)>,
+    /// For edge MergeOps: the source vertex's match properties, used to derive
+    /// `src_key_bytes` (the SSTable partition key for the edge row).
+    /// `None` for node MergeOps.
+    pub src_match_props: Option<Vec<(String, Expr)>>,
+    /// For edge MergeOps: the destination vertex's match properties, used to
+    /// derive `dst_key_bytes` (the SSTable clustering key for the edge row).
+    /// `None` for node MergeOps.
+    pub dst_match_props: Option<Vec<(String, Expr)>>,
+}
+
 /// A projection in an aggregate plan.
 #[derive(Debug, Clone)]
 pub enum AggregateProjection {
@@ -114,6 +151,8 @@ pub enum PhysicalPlan {
     CreateNodes {
         /// Patterns describing nodes/rels to create, with their resolved tables.
         creates: Vec<CreateOp>,
+        /// Optional RETURN clause for projecting the created nodes.
+        return_clause: Option<ReturnClause>,
     },
     /// Update properties on matched nodes/rels.
     SetProperties {
@@ -166,6 +205,19 @@ pub enum PhysicalPlan {
         /// Return clause for projecting results.
         return_clause: ReturnClause,
     },
+    /// MERGE: match-or-create with a content-addressed deterministic key.
+    ///
+    /// Executes in order: for each MergeOp, read the row; if absent, create it
+    /// via the same write path as CREATE (preserving adjacency observer fires).
+    /// After all merges, apply the `set_clause` assignments.
+    MergeUpsert {
+        /// Ordered list of MERGE operations (nodes then relationships).
+        merges: Vec<MergeOp>,
+        /// Trailing SET assignments: `(var, property, value_expr)`.
+        set_clause: Vec<(String, String, Expr)>,
+        /// Optional RETURN clause for projecting results.
+        return_clause: Option<ReturnClause>,
+    },
 }
 
 /// Convert a logical plan into a physical plan.
@@ -182,7 +234,10 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
             let filters = extract_filters(where_clause);
             plan_match(pattern, &logical.bindings, filters, return_clause.clone())
         }
-        Statement::Create { patterns } => plan_create(patterns, &logical.bindings),
+        Statement::Create {
+            patterns,
+            return_clause,
+        } => plan_create(patterns, &logical.bindings, return_clause.as_ref()),
         Statement::Set {
             pattern,
             where_clause,
@@ -205,6 +260,16 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
                 "UNSUBSCRIBE is handled directly by the engine, not the planner".to_string(),
             ))
         }
+        Statement::Merge {
+            patterns,
+            set_clause,
+            return_clause,
+        } => plan_merge(
+            patterns,
+            &logical.bindings,
+            set_clause,
+            return_clause.as_ref(),
+        ),
     }
 }
 
@@ -221,6 +286,7 @@ fn extract_filters(where_clause: &Option<Expr>) -> Vec<Expr> {
 fn plan_create(
     patterns: &[Pattern],
     bindings: &std::collections::HashMap<String, ResolvedTable>,
+    return_clause: Option<&ReturnClause>,
 ) -> Result<PhysicalPlan> {
     let mut creates = Vec::new();
     collect_create_ops(patterns, bindings, &mut creates)?;
@@ -231,7 +297,10 @@ fn plan_create(
         ));
     }
 
-    Ok(PhysicalPlan::CreateNodes { creates })
+    Ok(PhysicalPlan::CreateNodes {
+        creates,
+        return_clause: return_clause.cloned(),
+    })
 }
 
 /// Recursively collect `CreateOp` entries from patterns.
@@ -297,6 +366,233 @@ fn collect_create_ops(
             }
             Pattern::Path(elements) => {
                 collect_create_ops(elements, bindings, creates)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Plan a MERGE statement: for each pattern, collect match-props and build a
+/// `MergeOp`. Operations are emitted in the order declared so that relationship
+/// MERGEs see bindings introduced by earlier node MERGEs (R2).
+fn plan_merge(
+    patterns: &[crate::parser::Pattern],
+    bindings: &std::collections::HashMap<String, ResolvedTable>,
+    set_clause: &[crate::parser::Assignment],
+    return_clause: Option<&ReturnClause>,
+) -> Result<PhysicalPlan> {
+    let mut merges = Vec::new();
+    collect_merge_ops(patterns, bindings, &mut merges)?;
+
+    if merges.is_empty() {
+        return Err(GraphError::Validation(
+            "MERGE requires at least one labeled node or relationship".to_string(),
+        ));
+    }
+
+    let set_clause_tuples: Vec<(String, String, Expr)> = set_clause
+        .iter()
+        .map(|a| (a.var.clone(), a.property.clone(), a.value.clone()))
+        .collect();
+
+    Ok(PhysicalPlan::MergeUpsert {
+        merges,
+        set_clause: set_clause_tuples,
+        return_clause: return_clause.cloned(),
+    })
+}
+
+/// Recursively collect `MergeOp` entries from patterns.
+///
+/// For `Pattern::Path` elements, this function detects `[Node, Rel, Node]`
+/// triplets and sets `dst_match_props` on the Rel MergeOp so that
+/// `execute_merge` can derive the destination vertex partition key bytes and
+/// use them as the SSTable clustering key.  Without this, hop queries are
+/// blind to MERGE-created edges (the adjacency observer reads `row.clustering`
+/// as the target vertex ID).
+fn collect_merge_ops(
+    patterns: &[crate::parser::Pattern],
+    bindings: &std::collections::HashMap<String, ResolvedTable>,
+    merges: &mut Vec<MergeOp>,
+) -> Result<()> {
+    for pat in patterns {
+        match pat {
+            crate::parser::Pattern::Node { var, label, props } => {
+                let resolved = if let Some(var_name) = var {
+                    bindings.get(var_name).cloned()
+                } else {
+                    None
+                };
+                if let Some(table) = resolved {
+                    merges.push(MergeOp {
+                        var: var.clone(),
+                        table,
+                        match_props: props.clone(),
+                        create_props: vec![],
+                        src_match_props: None,
+                        dst_match_props: None,
+                    });
+                } else if label.is_some() {
+                    return Err(GraphError::Validation(format!(
+                        "MERGE node with label '{}' has no resolved binding",
+                        label.as_deref().unwrap_or("?")
+                    )));
+                }
+            }
+            crate::parser::Pattern::Rel {
+                var,
+                rel_type,
+                props,
+                ..
+            } => {
+                let resolved = if let Some(var_name) = var {
+                    bindings.get(var_name).cloned()
+                } else {
+                    rel_type.as_ref().and_then(|rt| {
+                        bindings
+                            .values()
+                            .find(|r| r.label.eq_ignore_ascii_case(rt) && r.graph_type == "edge")
+                            .cloned()
+                    })
+                };
+                if let Some(table) = resolved {
+                    // Bare Rel outside a Path: no src/dst context available.
+                    // This is unusual (MERGE normally uses Path), but handle
+                    // it gracefully by emitting without src/dst_match_props — the
+                    // executor will log ERROR and fail rather than silently
+                    // using empty clustering.
+                    merges.push(MergeOp {
+                        var: var.clone(),
+                        table,
+                        match_props: props.clone(),
+                        create_props: vec![],
+                        src_match_props: None,
+                        dst_match_props: None,
+                    });
+                } else if rel_type.is_some() {
+                    return Err(GraphError::Validation(format!(
+                        "MERGE relationship with type '{}' has no resolved binding",
+                        rel_type.as_deref().unwrap_or("?")
+                    )));
+                }
+            }
+            crate::parser::Pattern::Path(elements) => {
+                collect_merge_ops_from_path(elements, bindings, merges)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect `MergeOp`s from a path, threading `dst_match_props` from the
+/// destination node into any relationship MergeOp that sits between two nodes.
+///
+/// A path is a flat list: `[Node, Rel, Node, Rel, Node, ...]`.  For each
+/// `[src_node, rel, dst_node]` triplet, the rel MergeOp receives
+/// `dst_match_props = dst_node.props`.
+fn collect_merge_ops_from_path(
+    elements: &[crate::parser::Pattern],
+    bindings: &std::collections::HashMap<String, ResolvedTable>,
+    merges: &mut Vec<MergeOp>,
+) -> Result<()> {
+    let mut i = 0;
+    while i < elements.len() {
+        match &elements[i] {
+            crate::parser::Pattern::Node { var, label, props } => {
+                // Emit a node MergeOp only on the first pass (i == 0) or when
+                // this node is NOT immediately preceded by a Rel we already
+                // handled (even indices in a well-formed path are always nodes).
+                let resolved = if let Some(var_name) = var {
+                    bindings.get(var_name).cloned()
+                } else {
+                    None
+                };
+                if let Some(table) = resolved {
+                    merges.push(MergeOp {
+                        var: var.clone(),
+                        table,
+                        match_props: props.clone(),
+                        create_props: vec![],
+                        src_match_props: None,
+                        dst_match_props: None,
+                    });
+                } else if label.is_some() {
+                    return Err(GraphError::Validation(format!(
+                        "MERGE node with label '{}' has no resolved binding",
+                        label.as_deref().unwrap_or("?")
+                    )));
+                }
+                i += 1;
+            }
+            crate::parser::Pattern::Rel {
+                var,
+                rel_type,
+                props,
+                ..
+            } => {
+                // Resolve the edge table.
+                let resolved = if let Some(var_name) = var {
+                    bindings.get(var_name).cloned()
+                } else {
+                    rel_type.as_ref().and_then(|rt| {
+                        bindings
+                            .values()
+                            .find(|r| r.label.eq_ignore_ascii_case(rt) && r.graph_type == "edge")
+                            .cloned()
+                    })
+                };
+
+                // Peek at the source node (i-1) for src_match_props.
+                let src_match_props: Option<Vec<(String, crate::parser::Expr)>> = if i > 0 {
+                    if let crate::parser::Pattern::Node {
+                        props: src_props, ..
+                    } = &elements[i - 1]
+                    {
+                        Some(src_props.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Peek at the destination node (i+1) for dst_match_props.
+                let dst_match_props: Option<Vec<(String, crate::parser::Expr)>> =
+                    if i + 1 < elements.len() {
+                        if let crate::parser::Pattern::Node {
+                            props: dst_props, ..
+                        } = &elements[i + 1]
+                        {
+                            Some(dst_props.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                if let Some(table) = resolved {
+                    merges.push(MergeOp {
+                        var: var.clone(),
+                        table,
+                        match_props: props.clone(),
+                        create_props: vec![],
+                        src_match_props,
+                        dst_match_props,
+                    });
+                } else if rel_type.is_some() {
+                    return Err(GraphError::Validation(format!(
+                        "MERGE relationship with type '{}' has no resolved binding",
+                        rel_type.as_deref().unwrap_or("?")
+                    )));
+                }
+
+                // Skip rel only — the dst node is consumed on the next iteration.
+                i += 1;
+            }
+            crate::parser::Pattern::Path(inner) => {
+                collect_merge_ops_from_path(inner, bindings, merges)?;
+                i += 1;
             }
         }
     }
@@ -899,13 +1195,14 @@ mod tests {
                         Expr::Literal(crate::parser::Literal::String("Alice".into())),
                     )],
                 }],
+                return_clause: None,
             },
             keyspace: "social".to_string(),
         };
 
         let physical = plan(logical).unwrap();
         match physical {
-            PhysicalPlan::CreateNodes { creates } => {
+            PhysicalPlan::CreateNodes { creates, .. } => {
                 assert_eq!(creates.len(), 1);
                 assert_eq!(creates[0].var, Some("n".to_string()));
                 assert_eq!(creates[0].table.table, "person_v");
@@ -920,7 +1217,10 @@ mod tests {
     fn plan_create_empty_patterns_returns_error() {
         let logical = LogicalPlan {
             bindings: HashMap::new(),
-            statement: Statement::Create { patterns: vec![] },
+            statement: Statement::Create {
+                patterns: vec![],
+                return_clause: None,
+            },
             keyspace: "social".to_string(),
         };
 
@@ -1535,6 +1835,44 @@ mod tests {
             matches!(physical, PhysicalPlan::Expand { .. }),
             "expected Expand plan for linear pattern, got {physical:?}"
         );
+    }
+
+    #[test]
+    fn plan_merge_produces_merge_upsert() {
+        let mut bindings = HashMap::new();
+        bindings.insert("n".to_string(), person_table());
+
+        let logical = LogicalPlan {
+            bindings,
+            statement: Statement::Merge {
+                patterns: vec![crate::parser::Pattern::Node {
+                    var: Some("n".into()),
+                    label: Some("Person".into()),
+                    props: vec![(
+                        "name".into(),
+                        Expr::Literal(crate::parser::Literal::String("Alice".into())),
+                    )],
+                }],
+                set_clause: vec![],
+                return_clause: None,
+            },
+            keyspace: "social".to_string(),
+        };
+
+        let physical = plan(logical).unwrap();
+        match physical {
+            PhysicalPlan::MergeUpsert {
+                merges, set_clause, ..
+            } => {
+                assert_eq!(merges.len(), 1, "expected 1 merge op");
+                assert_eq!(merges[0].var, Some("n".to_string()));
+                assert_eq!(merges[0].table.table, "person_v");
+                assert_eq!(merges[0].match_props.len(), 1);
+                assert_eq!(merges[0].match_props[0].0, "name");
+                assert!(set_clause.is_empty());
+            }
+            other => panic!("expected MergeUpsert, got {other:?}"),
+        }
     }
 
     #[test]

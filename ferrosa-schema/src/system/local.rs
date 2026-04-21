@@ -8,6 +8,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use uuid::Uuid;
 
 use crate::registry::Schema;
+use crate::system::TopologyView;
 
 /// Node configuration with sensible defaults for a Ferrosa instance.
 #[derive(Debug, Clone)]
@@ -32,6 +33,10 @@ pub struct NodeConfig {
     pub broadcast_port: u16,
     /// Address for CQL native transport connections.
     pub rpc_address: IpAddr,
+    /// Address for CQL native transport connections used by internal clients.
+    pub internal_rpc_address: IpAddr,
+    /// Port for CQL native transport connections used by internal clients.
+    pub internal_rpc_port: u16,
     /// Token ranges assigned to this node.
     pub tokens: Vec<String>,
 }
@@ -49,6 +54,8 @@ impl Default for NodeConfig {
             broadcast_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             broadcast_port: 7000,
             rpc_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            internal_rpc_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            internal_rpc_port: 9042,
             // At least one token is required for drivers (Java DataStax, etc.)
             // to consider this node operational for query routing.
             tokens: vec!["0".to_string()],
@@ -102,7 +109,24 @@ pub struct LocalInfo {
 /// Reads schema version from the current snapshot and combines it
 /// with the node configuration to produce a `LocalInfo`.
 pub fn query_local(schema: &Schema, node_config: &NodeConfig) -> LocalInfo {
+    query_local_with_view(schema, node_config, TopologyView::Public)
+}
+
+/// Query `system.local` for this node's information using the requested
+/// topology view.
+pub fn query_local_with_view(
+    schema: &Schema,
+    node_config: &NodeConfig,
+    view: TopologyView,
+) -> LocalInfo {
     let snap = schema.snapshot();
+    let (rpc_address, rpc_port) = match view {
+        TopologyView::Public => (node_config.rpc_address, node_config.rpc_port),
+        TopologyView::Internal => (
+            node_config.internal_rpc_address,
+            node_config.internal_rpc_port,
+        ),
+    };
     LocalInfo {
         key: "local".to_string(),
         cluster_name: node_config.cluster_name.clone(),
@@ -114,12 +138,12 @@ pub fn query_local(schema: &Schema, node_config: &NodeConfig) -> LocalInfo {
         cql_version: "3.4.7".to_string(),
         release_version: crate::system::RELEASE_VERSION.to_string(),
         schema_version: snap.version,
-        rpc_port: node_config.rpc_port,
+        rpc_port,
         listen_address: node_config.listen_address,
         listen_port: node_config.listen_port,
         broadcast_address: node_config.broadcast_address,
         broadcast_port: node_config.broadcast_port,
-        rpc_address: node_config.rpc_address,
+        rpc_address,
         tokens: node_config.tokens.clone(),
         bootstrapped: "COMPLETED".to_string(),
     }
@@ -183,5 +207,25 @@ mod tests {
             crate::system::RELEASE_VERSION,
             "system.local release_version must match the shared constant"
         );
+    }
+
+    #[test]
+    fn query_local_internal_view_uses_internal_rpc_endpoint() {
+        let schema = test_schema();
+        let node_config = NodeConfig {
+            rpc_address: "127.0.0.1".parse().unwrap(),
+            rpc_port: 19042,
+            internal_rpc_address: "10.89.1.48".parse().unwrap(),
+            internal_rpc_port: 9042,
+            ..NodeConfig::default()
+        };
+
+        let info = query_local_with_view(&schema, &node_config, TopologyView::Internal);
+
+        assert_eq!(
+            info.rpc_address,
+            "10.89.1.48".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(info.rpc_port, 9042);
     }
 }

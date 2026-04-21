@@ -23,6 +23,13 @@ members = [
 [patch.crates-io]
 openraft = { git = "https://github.com/ferrosadb/openraft.git", branch = "fix/separate-replication-timeout" }
 
+# Keep line-table debug info in release builds so container crashes produce a readable backtrace
+# without bloating the binary to full DWARF. Required for gdb backtraces inside the runtime image.
+[profile.release]
+debug = "line-tables-only"
+split-debuginfo = "off"
+strip = "none"
+
 [workspace.package]
 version = "1.0.0-beta.4"
 edition = "2021"

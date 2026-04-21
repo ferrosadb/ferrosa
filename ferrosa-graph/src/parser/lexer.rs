@@ -37,6 +37,7 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
     "UNSUBSCRIBE" => Keyword::Unsubscribe,
     "EVERY" => Keyword::Every,
     "DELTA" => Keyword::Delta,
+    "MERGE" => Keyword::Merge,
 };
 
 /// Check if two token kinds match. For keywords, this compares the
@@ -610,6 +611,19 @@ mod tests {
             vec![
                 TokenKind::Keyword(Keyword::Match),
                 TokenKind::Keyword(Keyword::Return),
+            ]
+        );
+    }
+
+    #[test]
+    fn keyword_merge_round_trips() {
+        let tokens = lex_all("MERGE merge Merge");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Keyword(Keyword::Merge),
+                TokenKind::Keyword(Keyword::Merge),
+                TokenKind::Keyword(Keyword::Merge),
             ]
         );
     }

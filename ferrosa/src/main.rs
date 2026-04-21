@@ -16,6 +16,11 @@
 //! 13. Wait for shutdown signal
 //! 14. Graceful shutdown with timeout
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+mod cql_broadcast;
 mod runtime;
 mod web;
 
@@ -320,6 +325,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Create StorageEngine — use open() on restart to replay commit log
     let storage_config = ferrosa_storage::StorageEngineConfig::from_env()?;
+    let storage_auth_warn = storage_config.auth_warn;
+    // Capture auth enablement before the config is consumed by `new`/`open`.
+    // Used below to gate the seed-role bootstrap and the 5-minute
+    // default-password reminder task. Falls through to false when the env
+    // var is unset; see Sprint A of
+    // specs/decisions/design-cql-role-auth-rollout.md.
+    let storage_auth_enabled = storage_config.auth_enabled;
     let rt = tokio::runtime::Handle::current();
     let has_commitlog_segments = storage_config.commit_log.log_dir.exists()
         && std::fs::read_dir(&storage_config.commit_log.log_dir)
@@ -354,10 +366,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let storage = Arc::new(storage);
 
+    // Register persisted system tables before any local schema restore or
+    // cluster-mode Raft replay. Without this, the cluster state machine's
+    // SystemTableWriter hits "table not registered: system_schema.*" during
+    // startup replay and drops the persistence side effect until a later
+    // rewrite happens to touch the same metadata again.
+    if let Err(e) = storage.register_system_tables() {
+        tracing::warn!(%e, "failed to register system tables at startup");
+    }
+
     // Replay any pending S3 uploads that were interrupted by a crash.
     storage.replay_pending_uploads().await;
 
     // 4. Create Schema
+    //
+    // G-P0-1 fix (T-R1): Schema::new composites LogAuditSink with
+    // SystemTableAuditSink internally, so every audit event is both
+    // logged structurally and visible via
+    //   SELECT * FROM system_auth.audit_log
+    // in live clusters. No callsite change needed here.
     let schema_config = ferrosa_schema::SchemaConfig {
         hasher: ferrosa_schema::PasswordHasher::default(),
         password_policy: ferrosa_schema::PasswordPolicy::permissive(),
@@ -368,6 +395,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mode: ferrosa_schema::DeploymentMode::Development,
     };
     let schema = Arc::new(ferrosa_schema::Schema::new(schema_config)?);
+
+    // 4a. Seed default roles if auth is enabled.
+    //
+    // `ferrosa_schema::Schema::new` always creates the built-in `cassandra`
+    // superuser; the bootstrap helper creates three additional well-known
+    // roles (`ferrosa_admin` SUPERUSER, `graph_engine` and `app_reader`
+    // unprivileged LOGIN) so a fresh cluster with auth enabled is never
+    // locked out. All calls are idempotent — subsequent restarts are no-ops.
+    //
+    // A one-shot 5-minute task fires a loud WARN if `ferrosa_admin` is
+    // still using the default seed password. This mirrors Cassandra's
+    // default-credentials nag and gives the operator a single reminder
+    // window to rotate.
+    if storage_auth_enabled {
+        ferrosa_schema::auth::bootstrap::seed_default_roles(&schema)?;
+        let schema_for_warn = Arc::clone(&schema);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+            if ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema_for_warn) {
+                tracing::warn!(
+                    "ferrosa_admin is still using the default seed password \
+                     after 5 minutes — rotate it NOW. See \
+                     specs/decisions/design-cql-role-auth-rollout.md Sprint A."
+                );
+            }
+        });
+    } else {
+        tracing::info!(
+            "auth_enabled=false — skipping seed-role bootstrap. Set \
+             FERROSA_AUTH_ENABLED=true to enforce CQL role auth."
+        );
+    }
 
     // 4b. Restore schema from local disk or S3.
     //
@@ -533,9 +592,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "require_tls",
         "false",
     );
+    let cql_max_connections: usize = config_val(
+        "FERROSA_CQL_MAX_CONNECTIONS",
+        &file_config,
+        "cql",
+        "max_connections",
+        "1024",
+    )
+    .parse()?;
+    let cql_max_connections_per_ip: usize = config_val(
+        "FERROSA_CQL_MAX_CONNECTIONS_PER_IP",
+        &file_config,
+        "cql",
+        "max_connections_per_ip",
+        "64",
+    )
+    .parse()?;
     let cql_config = ferrosa_cql::server::ServerConfig {
         bind_addr: cql_bind,
         auth_disabled: auth_disabled_str == "true" || auth_disabled_str == "1",
+        max_connections: cql_max_connections,
+        max_connections_per_ip: cql_max_connections_per_ip,
         tls_cert_path: if cql_tls_cert.is_empty() {
             None
         } else {
@@ -549,52 +626,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         require_tls: cql_require_tls == "true" || cql_require_tls == "1",
         ..ferrosa_cql::server::ServerConfig::default()
     };
-    // Determine the advertised CQL address for system.local.rpc_address.
-    // CQL drivers use this to create connection pools, so it must be a
-    // reachable address (not 0.0.0.0).
-    let cql_broadcast_addr = match std::env::var("FERROSA_CQL_BROADCAST") {
-        Ok(addr_str) => addr_str
-            .parse::<std::net::IpAddr>()
-            .or_else(|_| {
-                // Try parsing as SocketAddr (ip:port) and extract IP.
-                addr_str.parse::<std::net::SocketAddr>().map(|sa| sa.ip())
-            })
-            .or_else(|_: std::net::AddrParseError| {
-                // Try DNS resolution for hostnames like "host.containers.internal:19043".
-                // Strip the port if present, resolve the hostname, use the first result.
-                let host = addr_str
-                    .rsplit_once(':')
-                    .map_or(addr_str.as_str(), |(h, _)| h);
-                use std::net::ToSocketAddrs;
-                format!("{host}:0")
-                    .to_socket_addrs()
-                    .map_err(|_| "dns failed".parse::<std::net::IpAddr>().unwrap_err())
-                    .and_then(|mut addrs| {
-                        addrs
-                            .next()
-                            .map(|sa| sa.ip())
-                            .ok_or_else(|| "no addrs".parse::<std::net::IpAddr>().unwrap_err())
-                    })
-            })
-            .unwrap_or_else(|_| {
-                tracing::warn!(
-                    "FERROSA_CQL_BROADCAST={addr_str} could not be resolved, \
-                         falling back to 127.0.0.1"
-                );
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            }),
+    // Determine the advertised CQL address+port for system.local.
+    // Both are what drivers like cdrs-tokio use to reconcile contact
+    // points against the advertised local node during session bootstrap;
+    // advertising the container-bind port (9042) when the host-reachable
+    // port is 19042 hangs session build. See cql_broadcast::parse_cql_broadcast.
+    let (cql_broadcast_addr, cql_broadcast_port) = match std::env::var("FERROSA_CQL_BROADCAST") {
+        Ok(addr_str) => cql_broadcast::parse_cql_broadcast(&addr_str, cql_bind.port()),
         Err(_) => {
-            if cql_bind.ip().is_unspecified() {
-                // 0.0.0.0 → substitute 127.0.0.1 as safe local default.
+            let ip = if cql_bind.ip().is_unspecified() {
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
             } else {
                 cql_bind.ip()
-            }
+            };
+            (ip, cql_bind.port())
         }
     };
+    tracing::info!(
+        broadcast_address = %cql_broadcast_addr,
+        broadcast_port = cql_broadcast_port,
+        bind_port = cql_bind.port(),
+        "CQL broadcast configured — clients will reconnect via this address"
+    );
+    let internal_topology_cidrs = config_val(
+        "FERROSA_CQL_INTERNAL_CLIENT_CIDRS",
+        &file_config,
+        "cql",
+        "internal_client_cidrs",
+        "",
+    );
+    let topology_policy =
+        ferrosa_cql::topology::ClientTopologyPolicy::from_csv(&internal_topology_cidrs)
+            .map_err(|err| format!("invalid FERROSA_CQL_INTERNAL_CLIENT_CIDRS: {err}"))?;
+    if topology_policy.is_empty() {
+        tracing::info!("CQL topology view policy: all clients receive public addresses");
+    } else {
+        tracing::info!(
+            cidrs = %internal_topology_cidrs,
+            "CQL topology view policy: matching clients receive internal addresses"
+        );
+    }
     let node_config = Arc::new(ferrosa_schema::NodeConfig {
         rpc_address: cql_broadcast_addr,
-        rpc_port: cql_bind.port(),
+        rpc_port: cql_broadcast_port,
+        internal_rpc_address: net_config.broadcast_addr.ip(),
+        internal_rpc_port: cql_bind.port(),
         host_id,
         listen_port: internode_addr.port(),
         ..ferrosa_schema::NodeConfig::default()
@@ -620,6 +696,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_sender: tokio::sync::broadcast::channel(64).0,
         mode_controller: Arc::clone(&mode_controller),
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
+        topology_policy,
+        auth_warn: storage_auth_warn,
     });
     let auth_disabled = cql_config.auth_disabled;
 

@@ -160,8 +160,11 @@ pub enum Statement {
         where_clause: Option<Expr>,
         return_clause: ReturnClause,
     },
-    /// `CREATE pattern, ...`
-    Create { patterns: Vec<Pattern> },
+    /// `CREATE pattern, ... [RETURN ...]`
+    Create {
+        patterns: Vec<Pattern>,
+        return_clause: Option<ReturnClause>,
+    },
     /// `MATCH pattern [WHERE expr] SET assignments`
     Set {
         pattern: Vec<Pattern>,
@@ -183,6 +186,12 @@ pub enum Statement {
     },
     /// `UNSUBSCRIBE [stream_id]`
     Unsubscribe { stream_id: Option<u16> },
+    /// `MERGE pattern ... [MERGE pattern ...] [SET assignments] [RETURN ...]`
+    Merge {
+        patterns: Vec<Pattern>,
+        set_clause: Vec<Assignment>,
+        return_clause: Option<ReturnClause>,
+    },
 }
 
 #[cfg(test)]
@@ -233,6 +242,23 @@ mod tests {
     }
 
     #[test]
+    fn construct_merge_statement() {
+        let stmt = Statement::Merge {
+            patterns: vec![Pattern::Node {
+                var: Some("n".into()),
+                label: Some("Entity".into()),
+                props: vec![(
+                    "entity_id".into(),
+                    Expr::Literal(Literal::String("x".into())),
+                )],
+            }],
+            set_clause: vec![],
+            return_clause: None,
+        };
+        assert!(matches!(stmt, Statement::Merge { .. }));
+    }
+
+    #[test]
     fn construct_create_statement() {
         let stmt = Statement::Create {
             patterns: vec![Pattern::Node {
@@ -246,6 +272,7 @@ mod tests {
                     ("age".into(), Expr::Literal(Literal::Integer(30))),
                 ],
             }],
+            return_clause: None,
         };
         assert!(matches!(stmt, Statement::Create { .. }));
     }

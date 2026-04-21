@@ -503,8 +503,12 @@ async fn handle_frame(
         ConnectionPhase::Authenticating { .. } => match frame.header.opcode {
             Opcode::AuthResponse => handle_auth_response(phase, auth_context, state, &frame.body),
             _ => {
-                let err = CqlError::Protocol(format!(
-                    "unexpected opcode {:?} during authentication",
+                // Any opcode other than AUTH_RESPONSE before authentication is
+                // complete is an unauthorized access attempt — return 0x2100, not
+                // a Protocol error (0x000A).  This matches the intent of the CQL
+                // spec: the client is not authenticated, so they are unauthorized.
+                let err = CqlError::Unauthorized(format!(
+                    "authentication required before sending {:?}",
                     frame.header.opcode
                 ));
                 HandleResult::Reply(Opcode::Error, err.encode_body())

@@ -131,6 +131,7 @@ mod cell_roundtrip {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         }
     }
 
@@ -434,6 +435,7 @@ mod reader_fuzz {
                 compression: None,
                 bloom_fp_chance: 0.01,
                 chunk_size: 65536,
+                verify_output: true,
             };
 
             let partition = Partition {
@@ -494,6 +496,7 @@ mod reader_fuzz {
                 compression: None,
                 bloom_fp_chance: 0.01,
                 chunk_size: 65536,
+                verify_output: true,
             };
 
             let partition = Partition {

@@ -174,6 +174,9 @@ fn main() {
         flush_max_age_secs: 30,
         data_dir: args.data_dir.clone(),
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        auth_enabled: false,
+        auth_warn: false,
+        write_verify: false,
     };
 
     if !args.tui {

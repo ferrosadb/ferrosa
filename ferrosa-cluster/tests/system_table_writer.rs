@@ -23,6 +23,9 @@ fn setup_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
         flush_max_age_secs: 5,
         data_dir: dir.path().to_path_buf(),
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        write_verify: true,
+        auth_enabled: false,
+        auth_warn: false,
     };
     let engine = Arc::new(StorageEngine::new(config, None).unwrap());
 
@@ -243,6 +246,9 @@ fn bootstrap_empty_sstables_uses_raft() {
         flush_max_age_secs: 5,
         data_dir: dir.path().to_path_buf(),
         index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        write_verify: true,
+        auth_enabled: false,
+        auth_warn: false,
     };
     let engine = Arc::new(StorageEngine::new(config, None).unwrap());
 

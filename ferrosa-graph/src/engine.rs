@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adjacency::observer::AdjacencyIndexObserver;
 use crate::adjacency::reconcile::spawn_reconciliation;
+use crate::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
 use crate::error::{GraphError, Result};
 use crate::executor::expand::{execute, GraphEngineConfig};
 use crate::executor::result::GraphResult;
@@ -26,6 +27,40 @@ use crate::executor::subscribe::SubscriptionRegistry;
 use crate::parser::{parse, Statement};
 use crate::planner::logical::validate;
 use crate::planner::physical::{plan, PhysicalPlan};
+
+fn adjacency_keyspace_metadata(
+    snap: &ferrosa_schema::SchemaSnapshot,
+    keyspace: &str,
+) -> ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+    let adj_ks = adjacency_keyspace_name(keyspace);
+    if let Some(source) = snap.keyspaces.get(keyspace) {
+        ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+            name: adj_ks,
+            durable_writes: source.durable_writes,
+            replication: source.replication.clone(),
+        }
+    } else {
+        ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+            name: adj_ks,
+            durable_writes: true,
+            replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: std::collections::HashMap::from([(
+                    "replication_factor".to_string(),
+                    "1".to_string(),
+                )]),
+            },
+        }
+    }
+}
+
+fn replication_needs_repair(replication: &ferrosa_schema::ReplicationParams) -> bool {
+    match replication.strategy.as_str() {
+        "SimpleStrategy" => !replication.options.contains_key("replication_factor"),
+        "NetworkTopologyStrategy" => replication.options.is_empty(),
+        _ => false,
+    }
+}
 
 /// Composite configuration for the graph engine.
 pub struct GraphConfig {
@@ -110,8 +145,78 @@ impl GraphEngine {
         let mut reconciliation_handles = Vec::new();
         let reconciliation_cancel = CancellationToken::new();
         for ks in &edge_keyspaces {
+            // Ensure the adjacency keyspace + table are registered with both
+            // schema and storage BEFORE wiring the observer. Without this the
+            // observer produces derived mutations targeting a table that
+            // StorageEngine has never seen, and `apply_derived_mutation` logs
+            // "target table not registered — derived mutation dropped" for
+            // every edge write — silent data loss for hop queries.
+            let adj_ks = adjacency_keyspace_name(ks);
+            let adj_meta = adjacency_keyspace_metadata(&snap, ks);
+            if let Some(existing) = snap.keyspaces.get(&adj_ks) {
+                if replication_needs_repair(&existing.replication) {
+                    if let Err(e) = schema.alter_keyspace_internal(
+                        &adj_ks,
+                        ferrosa_schema::metadata::keyspace::KeyspaceUpdates {
+                            replication: Some(adj_meta.replication.clone()),
+                            durable_writes: Some(adj_meta.durable_writes),
+                        },
+                    ) {
+                        tracing::error!(
+                            keyspace = %adj_ks,
+                            error = %e,
+                            "graph engine: failed to repair adjacency keyspace replication"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                if let Err(e) = schema.create_keyspace_internal(adj_meta) {
+                    tracing::error!(
+                        keyspace = %adj_ks,
+                        error = %e,
+                        "graph engine: failed to register adjacency keyspace — \
+                         derived mutations will be dropped for {ks}; refusing to \
+                         register observer"
+                    );
+                    continue;
+                }
+            }
+            let adj_meta = adjacency_table_metadata(ks);
+            let adj_schema = adj_meta.to_storage_schema();
+            if let Err(e) = storage.register_table(adj_schema) {
+                // Already-registered is fine (another edge table in the same
+                // keyspace shares the adjacency table). Any other error means
+                // derived mutations would drop — refuse to start the observer.
+                let msg = e.to_string();
+                let already = msg.contains("already registered") || msg.contains("already exists");
+                if !already {
+                    tracing::error!(
+                        keyspace = %adj_ks,
+                        error = %e,
+                        "graph engine: failed to register adjacency table with \
+                         StorageEngine — refusing to register observer for {ks}"
+                    );
+                    continue;
+                }
+            }
+
             let observer = Arc::new(AdjacencyIndexObserver::new(Arc::clone(&schema), ks.clone()));
-            storage.register_observer(observer);
+
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // Runtime available: register the observer with an engine-side drain task.
+                // The drain task applies derived adjacency mutations through the full write
+                // path (commit log + memtable) and catches observer panics loudly at ERROR.
+                storage.register_async_observer_with_drain(
+                    observer as Arc<dyn ferrosa_storage::WriteObserver>,
+                    Arc::clone(&storage),
+                );
+            } else {
+                // No runtime available (e.g., proptest sync context): fall back to
+                // register_observer which drops the receiver. Adjacency entries are not
+                // written in this context, but the engine does not panic.
+                storage.register_observer(observer);
+            }
 
             // spawn_reconciliation requires a tokio runtime. In test
             // contexts (e.g., proptest without #[tokio::test]), there may
@@ -320,7 +425,7 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             out.push('}');
             out
         }
-        PhysicalPlan::CreateNodes { creates } => {
+        PhysicalPlan::CreateNodes { creates, .. } => {
             let mut out = String::new();
             out.push_str("CreateNodes {\n");
             for (i, op) in creates.iter().enumerate() {
@@ -453,6 +558,33 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             out.push('}');
             out
         }
+        PhysicalPlan::MergeUpsert {
+            merges,
+            set_clause,
+            return_clause,
+        } => {
+            let mut out = String::new();
+            out.push_str("MergeUpsert {\n");
+            for (i, op) in merges.iter().enumerate() {
+                out.push_str(&format!(
+                    "  merge[{}]: {}.{} (var: {:?}, match_props: {})\n",
+                    i,
+                    op.table.keyspace,
+                    op.table.table,
+                    op.var,
+                    op.match_props.len()
+                ));
+            }
+            out.push_str(&format!(
+                "  set_clause: {} assignment(s)\n",
+                set_clause.len()
+            ));
+            if let Some(rc) = return_clause {
+                out.push_str(&format!("  return: {} item(s)\n", rc.items.len()));
+            }
+            out.push('}');
+            out
+        }
     }
 }
 
@@ -492,6 +624,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
         };
         StorageEngine::new(config, None).unwrap()
     }
@@ -599,5 +734,54 @@ mod tests {
         let json = serde_json::to_string(&gs).unwrap();
         assert!(json.contains("vertices"));
         assert!(json.contains("Person"));
+    }
+
+    #[test]
+    fn adjacency_keyspace_inherits_source_replication() {
+        let schema = test_schema();
+        schema
+            .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
+                name: "agent_memory".to_string(),
+                durable_writes: false,
+                replication: ferrosa_schema::ReplicationParams {
+                    strategy: "NetworkTopologyStrategy".to_string(),
+                    options: std::collections::HashMap::from([(
+                        "datacenter1".to_string(),
+                        "3".to_string(),
+                    )]),
+                },
+            })
+            .unwrap();
+
+        let snap = schema.snapshot();
+        let adj = adjacency_keyspace_metadata(&snap, "agent_memory");
+        assert_eq!(adj.name, "system_graph_agent_memory");
+        assert!(!adj.durable_writes);
+        assert_eq!(adj.replication.strategy, "NetworkTopologyStrategy");
+        assert_eq!(
+            adj.replication.options.get("datacenter1"),
+            Some(&"3".to_string())
+        );
+    }
+
+    #[test]
+    fn adjacency_keyspace_defaults_to_simple_strategy_rf1() {
+        let snap = test_schema().snapshot();
+        let adj = adjacency_keyspace_metadata(&snap, "missing");
+        assert_eq!(adj.name, "system_graph_missing");
+        assert_eq!(adj.replication.strategy, "SimpleStrategy");
+        assert_eq!(
+            adj.replication.options.get("replication_factor"),
+            Some(&"1".to_string())
+        );
+    }
+
+    #[test]
+    fn replication_repair_detects_missing_simple_strategy_rf() {
+        let broken = ferrosa_schema::ReplicationParams {
+            strategy: "SimpleStrategy".to_string(),
+            options: std::collections::HashMap::new(),
+        };
+        assert!(replication_needs_repair(&broken));
     }
 }

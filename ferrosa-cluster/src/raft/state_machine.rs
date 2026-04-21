@@ -262,22 +262,29 @@ impl FerrosStateMachine {
     /// and optionally propagating side effects.
     fn apply_command(&mut self, cmd: RaftCommand) -> RaftResponse {
         let RaftCommand { op, schema_version } = cmd;
+        let mut schema_changed = true;
         match op {
             // ---- DDL: Keyspaces ----------------------------------------
             RaftOp::CreateKeyspace(ks) => {
-                let ks_clone = ks.clone();
-                self.state
-                    .keyspaces
-                    .entry(ks.name.clone())
-                    .or_insert_with(|| ks.clone());
-                if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.create_keyspace_internal(ks) {
-                        tracing::error!(%e, "Raft apply: create_keyspace_internal failed — schema diverged from Raft state");
+                let inserted = if self.state.keyspaces.contains_key(&ks.name) {
+                    false
+                } else {
+                    self.state.keyspaces.insert(ks.name.clone(), ks.clone());
+                    true
+                };
+                schema_changed = inserted;
+                if inserted {
+                    let ks_clone = ks.clone();
+                    if let Some(schema) = &self.schema {
+                        if let Err(e) = schema.create_keyspace_internal(ks) {
+                            tracing::error!(%e, "Raft apply: create_keyspace_internal failed — schema diverged from Raft state");
+                        }
                     }
-                }
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::KeyspaceCreated(ks_clone)) {
-                        tracing::warn!(%e, "Raft apply: system table write skipped for CreateKeyspace (expected during log replay)");
+                    if let Some(writer) = &self.system_writer {
+                        if let Err(e) = writer.apply(SystemTableMutation::KeyspaceCreated(ks_clone))
+                        {
+                            tracing::warn!(%e, "Raft apply: system table write skipped for CreateKeyspace (expected during log replay)");
+                        }
                     }
                 }
             }
@@ -350,26 +357,33 @@ impl FerrosStateMachine {
             // ---- DDL: Tables -------------------------------------------
             RaftOp::CreateTable(table) => {
                 let key = (table.keyspace.clone(), table.name.clone());
-                self.state
-                    .tables
-                    .entry(key)
-                    .or_insert_with(|| *table.clone());
-                if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.create_table_internal(*table.clone()) {
-                        tracing::error!(%e, "Raft apply: create_table_internal failed — schema diverged");
+                let inserted = if let std::collections::btree_map::Entry::Vacant(entry) =
+                    self.state.tables.entry(key)
+                {
+                    entry.insert(*table.clone());
+                    true
+                } else {
+                    false
+                };
+                schema_changed = inserted;
+                if inserted {
+                    if let Some(schema) = &self.schema {
+                        if let Err(e) = schema.create_table_internal(*table.clone()) {
+                            tracing::error!(%e, "Raft apply: create_table_internal failed — schema diverged");
+                        }
                     }
-                }
-                if let Some(engine) = &self.engine {
-                    if let Err(e) = engine.register_table(table.to_storage_schema()) {
-                        tracing::error!(%e, "Raft apply: register_table failed — writes to this table will silently fail");
+                    if let Some(engine) = &self.engine {
+                        if let Err(e) = engine.register_table(table.to_storage_schema()) {
+                            tracing::error!(%e, "Raft apply: register_table failed — writes to this table will silently fail");
+                        }
                     }
-                }
-                if let Some(writer) = &self.system_writer {
-                    if let Err(e) = writer.apply(SystemTableMutation::TableCreated(table.clone())) {
-                        // Warn, not error: during Raft log replay on startup,
-                        // system_schema tables may not be registered yet.  The
-                        // schema bootstrap populates them once loading completes.
-                        tracing::warn!(%e, "Raft apply: system table write skipped for CreateTable (expected during log replay)");
+                    if let Some(writer) = &self.system_writer {
+                        if let Err(e) = writer.apply(SystemTableMutation::TableCreated(table)) {
+                            // Warn, not error: during Raft log replay on startup,
+                            // system_schema tables may not be registered yet.  The
+                            // schema bootstrap populates them once loading completes.
+                            tracing::warn!(%e, "Raft apply: system table write skipped for CreateTable (expected during log replay)");
+                        }
                     }
                 }
             }
@@ -514,6 +528,7 @@ impl FerrosStateMachine {
                 index_name,
                 status,
             } => {
+                schema_changed = false;
                 let key = (keyspace, table, index_name);
                 self.state
                     .index_state_map
@@ -715,6 +730,7 @@ impl FerrosStateMachine {
 
             // ---- Topology ----------------------------------------------
             RaftOp::JoinNode(node_info) => {
+                schema_changed = false;
                 // Approval gate: if auto_join is disabled, verify the node was
                 // pre-approved via ApproveNode. This check is inside the state
                 // machine (not in the caller) to prevent TOCTOU races where
@@ -740,6 +756,7 @@ impl FerrosStateMachine {
                 }
             }
             RaftOp::LeaveNode { node_id } => {
+                schema_changed = false;
                 self.state.members.remove(&node_id);
                 self.state.token_map.retain(|_, n| *n != node_id);
                 self.sync_ring();
@@ -749,6 +766,7 @@ impl FerrosStateMachine {
                 }
             }
             RaftOp::AssignTokens { node_id, tokens } => {
+                schema_changed = false;
                 for token in tokens {
                     self.state.token_map.insert(token, node_id);
                 }
@@ -757,16 +775,19 @@ impl FerrosStateMachine {
 
             // ---- Config ------------------------------------------------
             RaftOp::UpdateConfig(config) => {
+                schema_changed = false;
                 self.state.config = config;
             }
 
             // ---- Node admission ----------------------------------------
             RaftOp::ApproveNode { host_id } => {
+                schema_changed = false;
                 self.state.approved_nodes.insert(host_id);
             }
 
             // ---- Node lifecycle ----------------------------------------
             RaftOp::SetNodeState { node_id, state } => {
+                schema_changed = false;
                 if let Some(node) = self.state.members.get_mut(&node_id) {
                     tracing::info!(
                         node_id,
@@ -780,10 +801,15 @@ impl FerrosStateMachine {
             }
         }
 
-        // Use the leader-generated schema version so all nodes agree.
-        self.state.schema_version = schema_version;
-        if let Some(schema) = &self.schema {
-            schema.set_schema_version(schema_version);
+        if schema_changed {
+            // Only true schema/auth mutations should advance schema_version.
+            // Duplicate replayed DDL and topology-only Raft commands must not
+            // churn system.local.schema_version or drivers can sit in schema
+            // agreement loops until they time out.
+            self.state.schema_version = schema_version;
+            if let Some(schema) = &self.schema {
+                schema.set_schema_version(schema_version);
+            }
         }
         RaftResponse::Ok
     }
@@ -1712,6 +1738,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            auth_enabled: false,
+            auth_warn: false,
+            write_verify: false,
         };
         Arc::new(StorageEngine::new(config, None).unwrap())
     }
@@ -1766,6 +1795,70 @@ mod tests {
         assert!(
             partition.is_some(),
             "CreateTable should write to system_schema.tables"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_schema_replay_does_not_churn_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        let schema = test_schema_instance();
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::new(schema), Arc::clone(&engine));
+
+        let initial_version = Uuid::new_v4();
+        sm.apply(vec![Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Normal(RaftCommand {
+                op: RaftOp::CreateKeyspace(simple_keyspace("dup_ks")),
+                schema_version: initial_version,
+            }),
+        }])
+        .await
+        .unwrap();
+        assert_eq!(sm.state().schema_version, initial_version);
+
+        sm.apply(vec![Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 2),
+            payload: EntryPayload::Normal(RaftCommand {
+                op: RaftOp::CreateKeyspace(simple_keyspace("dup_ks")),
+                schema_version: Uuid::new_v4(),
+            }),
+        }])
+        .await
+        .unwrap();
+        assert_eq!(
+            sm.state().schema_version,
+            initial_version,
+            "duplicate CreateKeyspace must not advance schema_version"
+        );
+
+        let table_version = Uuid::new_v4();
+        sm.apply(vec![Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 3),
+            payload: EntryPayload::Normal(RaftCommand {
+                op: RaftOp::CreateTable(Box::new(simple_table("dup_ks", "users"))),
+                schema_version: table_version,
+            }),
+        }])
+        .await
+        .unwrap();
+        assert_eq!(sm.state().schema_version, table_version);
+
+        sm.apply(vec![Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 4),
+            payload: EntryPayload::Normal(RaftCommand {
+                op: RaftOp::CreateTable(Box::new(simple_table("dup_ks", "users"))),
+                schema_version: Uuid::new_v4(),
+            }),
+        }])
+        .await
+        .unwrap();
+        assert_eq!(
+            sm.state().schema_version,
+            table_version,
+            "duplicate CreateTable must not advance schema_version"
         );
     }
 

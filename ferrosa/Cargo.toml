@@ -34,6 +34,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 uuid = { version = "1", features = ["v4"] }
 
+# Replaces glibc malloc to avoid thread-arena retention (27× 64MB arenas ≈ 1.7GB RSS on 3-node cluster).
+# Confirmed by live podman testing on 2026-04-19 — cluster memory stays flat vs. climbing to OOM.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
+
 [features]
 default = []
 otel = [

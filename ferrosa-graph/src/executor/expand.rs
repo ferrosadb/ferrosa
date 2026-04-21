@@ -21,7 +21,7 @@ use crate::executor::aggregate::{create_accumulator, Accumulator};
 use crate::executor::eval;
 use crate::executor::result::{GraphResult, QueryStats};
 use crate::parser::{Expr, Literal, ReturnClause, ReturnItem, SortDir};
-use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, PhysicalPlan};
+use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, MergeOp, PhysicalPlan};
 
 /// Configuration for the graph query engine (T4 DoS limits).
 #[derive(Debug, Clone)]
@@ -92,9 +92,10 @@ pub async fn execute(
             )
             .await
         }
-        PhysicalPlan::CreateNodes { creates } => {
-            execute_create(write_path, &creates, config, start).await
-        }
+        PhysicalPlan::CreateNodes {
+            creates,
+            return_clause,
+        } => execute_create(write_path, &creates, return_clause.as_ref(), config, start).await,
         PhysicalPlan::SetProperties {
             expand,
             assignments,
@@ -198,6 +199,21 @@ pub async fn execute(
                 start,
                 virtual_tables,
                 schema,
+            )
+            .await
+        }
+        PhysicalPlan::MergeUpsert {
+            merges,
+            set_clause,
+            return_clause,
+        } => {
+            execute_merge(
+                write_path,
+                &merges,
+                &set_clause,
+                return_clause.as_ref(),
+                config,
+                start,
             )
             .await
         }
@@ -484,17 +500,23 @@ fn now_micros() -> i64 {
 async fn execute_create(
     write_path: &WritePath,
     creates: &[CreateOp],
+    return_clause: Option<&crate::parser::ReturnClause>,
     _config: &GraphEngineConfig,
     start: Instant,
 ) -> Result<GraphResult> {
     let mut stats = QueryStats::default();
     let timestamp = now_micros();
 
+    // Accumulate (var_name, hex_key) for each written node so that a RETURN
+    // clause can project the created vertex IDs back to the caller.
+    let mut var_keys: Vec<(Option<String>, String)> = Vec::with_capacity(creates.len());
+
     for op in creates {
         let table_id = TableId::new(&op.table.keyspace, &op.table.table);
 
         // Generate a unique key for the new vertex/edge using a UUID.
         let key_bytes = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let hex_key = hex::encode(&key_bytes);
         let key = DecoratedKey::new(PartitionKey::new(key_bytes));
 
         // Build cells from properties.
@@ -528,6 +550,296 @@ async fn execute_create(
             )
             .await?;
         stats.vertices_written += 1;
+        var_keys.push((op.var.clone(), hex_key));
+    }
+
+    stats.execution_ms = start.elapsed().as_millis() as u64;
+
+    // If a RETURN clause was provided, project the created node IDs.
+    if let Some(rc) = return_clause {
+        let columns = build_columns(rc);
+        // Build a single row: for each RETURN item, look up the hex key
+        // for the matching variable, or emit null if unresolved.
+        let row: Vec<serde_json::Value> = rc
+            .items
+            .iter()
+            .map(|item| {
+                if let crate::parser::Expr::Var(var_name) = &item.expr {
+                    var_keys
+                        .iter()
+                        .find(|(v, _)| v.as_deref() == Some(var_name.as_str()))
+                        .map(|(_, hex)| serde_json::Value::String(hex.clone()))
+                        .unwrap_or(serde_json::Value::Null)
+                } else {
+                    serde_json::Value::Null
+                }
+            })
+            .collect();
+        return Ok(GraphResult {
+            columns,
+            rows: vec![row],
+            stats,
+        });
+    }
+
+    Ok(GraphResult {
+        columns: vec!["status".to_string()],
+        rows: vec![vec![serde_json::Value::String(format!(
+            "created {} vertices",
+            stats.vertices_written
+        ))]],
+        stats,
+    })
+}
+
+/// Derive a deterministic content-addressed partition key from match-property bytes.
+///
+/// Properties are sorted by key name to ensure two callers with the same logical
+/// match properties always arrive at the same bytes regardless of insertion order.
+/// This is the R1 mitigation: concurrent MERGE calls with identical match-props
+/// will hash to the same partition key, so at-most-once write semantics hold
+/// even without row-level locks (last-write-wins on the same key is idempotent).
+///
+/// Key layout: `blake3(key_name_0 || NUL || value_bytes_0 || NUL || key_name_1 || ...)`
+/// sorted by `key_name`.
+fn content_addressed_key(match_props: &[(String, Expr)]) -> Vec<u8> {
+    let mut sorted: Vec<&(String, Expr)> = match_props.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = blake3::Hasher::new();
+    for (name, expr) in &sorted {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\x00");
+        let val_bytes = expr_to_bytes(expr).unwrap_or_default();
+        hasher.update(&val_bytes);
+        hasher.update(b"\x00");
+    }
+    hasher.finalize().as_bytes().to_vec()
+}
+
+/// Execute a MERGE plan: match-or-create with content-addressed deterministic key.
+///
+/// For each MergeOp (in declaration order, preserving R2 binding dependency):
+///   1. Derive the partition key via `content_addressed_key(match_props)`.
+///   2. Attempt `write_path.read()` to check whether the row already exists.
+///   3. If absent: call `write_path.write()` (same path as `execute_create`) so
+///      that `AdjacencyIndexObserver` fires on the new row (R3 mitigation).
+///   4. If present: skip create; proceed to SET phase.
+///
+/// After all merges, apply any trailing SET assignments.
+async fn execute_merge(
+    write_path: &WritePath,
+    merges: &[MergeOp],
+    set_clause: &[(String, String, Expr)],
+    _return_clause: Option<&crate::parser::ReturnClause>,
+    _config: &GraphEngineConfig,
+    start: Instant,
+) -> Result<GraphResult> {
+    let mut stats = QueryStats::default();
+    let timestamp = now_micros();
+
+    // var_name -> (table_id, key) so that SET can locate the written row.
+    let mut var_keys: HashMap<String, (TableId, DecoratedKey)> = HashMap::new();
+
+    for op in merges {
+        // --- Precondition: table must be identified ---
+        let table_id = TableId::new(&op.table.keyspace, &op.table.table);
+
+        // Step 1: derive the partition key.
+        //
+        // For node MergeOps: content_addressed_key(match_props) — unchanged.
+        // For edge MergeOps: content_addressed_key(src_match_props) so the edge
+        // row is stored under the source vertex's partition key, matching what the
+        // hop executor and adjacency observer expect.  The edge's own match_props
+        // drive idempotency (read-before-write) but not the storage location.
+        let key_bytes: Vec<u8> = if op.table.graph_type == "edge" {
+            match &op.src_match_props {
+                Some(src_props) => content_addressed_key(src_props),
+                None => {
+                    tracing::error!(
+                        file = file!(),
+                        line = line!(),
+                        table = %op.table.table,
+                        graph_type = %op.table.graph_type,
+                        "execute_merge: edge MergeOp has no src_match_props — \
+                         cannot derive partition key for adjacency index. \
+                         The planner did not thread the source node's props \
+                         into this MergeOp. This is a planner bug."
+                    );
+                    return Err(crate::error::GraphError::Validation(format!(
+                        "execute_merge: edge MergeOp for table '{}' has no \
+                         src_match_props; cannot derive partition key \
+                         (file: {}, line: {})",
+                        op.table.table,
+                        file!(),
+                        line!()
+                    )));
+                }
+            }
+        } else {
+            content_addressed_key(&op.match_props)
+        };
+        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+
+        // Step 2: read-before-write — check for existing row.
+        let existing = write_path.read(&table_id, &key).await.map_err(|e| {
+            tracing::error!(
+                file = file!(),
+                line = line!(),
+                error = %e,
+                table = %op.table.table,
+                "execute_merge: read failed"
+            );
+            e
+        })?;
+
+        if existing.is_none() {
+            // Step 3: create arm — use write_path.write() to fire adjacency observer (R3).
+            let all_props: Vec<&(String, Expr)> = op
+                .match_props
+                .iter()
+                .chain(op.create_props.iter())
+                .collect();
+            let cells: Vec<(u16, CellValue)> = all_props
+                .iter()
+                .enumerate()
+                .map(|(idx, (_name, expr))| {
+                    let bytes = expr_to_bytes(expr).unwrap_or_default();
+                    (idx as u16, CellValue::live(bytes, timestamp))
+                })
+                .collect();
+
+            // For edge rows the clustering key must be the destination vertex's
+            // partition key bytes so that `AdjacencyIndexObserver` can read
+            // `row.clustering` as the target vertex ID.  Nodes have no clustering
+            // key (empty vec).
+            //
+            // Fail loud if we see an edge MergeOp without dst_match_props — that
+            // means the planner failed to thread the destination node's props and
+            // we would silently create an invisible edge (the original bug).
+            let clustering: Vec<u8> = if op.table.graph_type == "edge" {
+                match &op.dst_match_props {
+                    Some(dst_props) => content_addressed_key(dst_props),
+                    None => {
+                        tracing::error!(
+                            file = file!(),
+                            line = line!(),
+                            table = %op.table.table,
+                            graph_type = %op.table.graph_type,
+                            "execute_merge: edge MergeOp has no dst_match_props — \
+                             cannot derive clustering key for adjacency index. \
+                             The planner did not thread the destination node's props \
+                             into this MergeOp. This is a planner bug."
+                        );
+                        return Err(crate::error::GraphError::Validation(format!(
+                            "execute_merge: edge MergeOp for table '{}' has no \
+                             dst_match_props; cannot derive clustering key \
+                             (file: {}, line: {})",
+                            op.table.table,
+                            file!(),
+                            line!()
+                        )));
+                    }
+                }
+            } else {
+                vec![]
+            };
+
+            let row = Row {
+                clustering,
+                cells,
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+            };
+
+            write_path
+                .write(
+                    &table_id,
+                    &key,
+                    row,
+                    timestamp,
+                    ferrosa_cluster::consistency::ConsistencyLevel::One,
+                    &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                        replication_factor: 1,
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        file = file!(),
+                        line = line!(),
+                        error = %e,
+                        table = %op.table.table,
+                        "execute_merge: write failed on create arm"
+                    );
+                    e
+                })?;
+            stats.vertices_written += 1;
+        }
+        // Existing row: no create needed, count as read.
+        stats.vertices_read += 1;
+
+        if let Some(var_name) = &op.var {
+            var_keys.insert(var_name.clone(), (table_id, key));
+        }
+    }
+
+    // Step 4: apply trailing SET assignments.
+    for (var, property, val_expr) in set_clause {
+        let Some((table_id, key)) = var_keys.get(var) else {
+            return Err(GraphError::Validation(format!(
+                "execute_merge: SET references variable '{}' which was not bound by any MERGE; \
+                 check that the MERGE pattern declares a variable binding \
+                 (file: {}, line: {})",
+                var,
+                file!(),
+                line!()
+            )));
+        };
+
+        let bytes = expr_to_bytes(val_expr).map_err(|e| {
+            tracing::error!(
+                file = file!(),
+                line = line!(),
+                error = %e,
+                var = %var,
+                property = %property,
+                "execute_merge: SET value evaluation failed"
+            );
+            e
+        })?;
+
+        let update_row = Row {
+            clustering: vec![],
+            cells: vec![(0u16, CellValue::live(bytes, timestamp))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+
+        write_path
+            .write(
+                table_id,
+                key,
+                update_row,
+                timestamp,
+                ferrosa_cluster::consistency::ConsistencyLevel::One,
+                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    file = file!(),
+                    line = line!(),
+                    error = %e,
+                    var = %var,
+                    property = %property,
+                    "execute_merge: SET write failed"
+                );
+                e
+            })?;
+        stats.vertices_written += 1;
     }
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
@@ -535,8 +847,9 @@ async fn execute_create(
     Ok(GraphResult {
         columns: vec!["status".to_string()],
         rows: vec![vec![serde_json::Value::String(format!(
-            "created {} vertices",
-            stats.vertices_written
+            "merged {} vertices, {} properties updated",
+            merges.len(),
+            set_clause.len()
         ))]],
         stats,
     })
@@ -1140,30 +1453,36 @@ pub fn column_names_for_table(schema: Option<&Schema>, keyspace: &str, table: &s
 
 /// Extract the neighbor ID from an adjacency row's clustering key.
 ///
-/// Clustering format:
-///   direction(1 byte) + edge_label_len(2 bytes BE) + edge_label + neighbor_id_len(2 bytes BE) + neighbor_id
+/// Clustering format (standard composite, per SSTable writer's multi-column
+/// composite parser): each component is `[u16 BE length][bytes]`.
+///   0: [u16 1][1 byte direction]
+///   1: [u16 label_len][edge_label bytes]
+///   2: [u16 id_len][neighbor_id bytes]
 ///
-/// If `expected_label` is Some, only returns the neighbor ID if the edge label matches.
+/// If `expected_label` is Some, only returns the neighbor ID if the edge
+/// label matches (case-insensitive).
 pub fn extract_neighbor_id(clustering: &[u8], expected_label: Option<&str>) -> Option<Vec<u8>> {
-    // Minimum: 1 (direction) + 2 (label_len) + 0 (label) + 2 (id_len) + 0 (id)
-    if clustering.len() < 5 {
+    // Minimum: 2+1 (direction component) + 2 (label_len) + 2 (id_len) = 7
+    if clustering.len() < 7 {
         return None;
     }
 
-    let mut pos = 1; // skip direction byte
+    // Component 0: direction. Skip [u16 len][1 byte].
+    let dir_len = u16::from_be_bytes([clustering[0], clustering[1]]) as usize;
+    let mut pos = 2 + dir_len;
+    if pos + 2 > clustering.len() {
+        return None;
+    }
 
-    // Read edge label length (2 bytes BE).
+    // Component 1: edge_label.
     let label_len = u16::from_be_bytes([clustering[pos], clustering[pos + 1]]) as usize;
     pos += 2;
-
     if pos + label_len > clustering.len() {
         return None;
     }
-
     let label_bytes = &clustering[pos..pos + label_len];
     pos += label_len;
 
-    // Check label filter.
     if let Some(expected) = expected_label {
         let label_str = std::str::from_utf8(label_bytes).ok()?;
         if !label_str.eq_ignore_ascii_case(expected) {
@@ -1171,17 +1490,15 @@ pub fn extract_neighbor_id(clustering: &[u8], expected_label: Option<&str>) -> O
         }
     }
 
-    // Read neighbor ID length (2 bytes BE).
+    // Component 2: neighbor_id.
     if pos + 2 > clustering.len() {
         return None;
     }
     let id_len = u16::from_be_bytes([clustering[pos], clustering[pos + 1]]) as usize;
     pos += 2;
-
     if pos + id_len > clustering.len() {
         return None;
     }
-
     Some(clustering[pos..pos + id_len].to_vec())
 }
 
@@ -1636,6 +1953,9 @@ mod tests {
             flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
             index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
         };
         Arc::new(ferrosa_storage::StorageEngine::new(config, None).unwrap())
     }
@@ -1646,6 +1966,7 @@ mod tests {
         let label = b"KNOWS";
         let neighbor = vec![1u8, 2, 3];
         let mut clustering = Vec::new();
+        clustering.extend_from_slice(&1u16.to_be_bytes()); // direction component len
         clustering.push(0u8); // direction OUT
         clustering.extend_from_slice(&(label.len() as u16).to_be_bytes());
         clustering.extend_from_slice(label);
@@ -1661,6 +1982,7 @@ mod tests {
         let label = b"KNOWS";
         let neighbor = vec![4u8, 5, 6];
         let mut clustering = Vec::new();
+        clustering.extend_from_slice(&1u16.to_be_bytes());
         clustering.push(0u8);
         clustering.extend_from_slice(&(label.len() as u16).to_be_bytes());
         clustering.extend_from_slice(label);
@@ -1676,6 +1998,7 @@ mod tests {
         let label = b"KNOWS";
         let neighbor = vec![7u8, 8];
         let mut clustering = Vec::new();
+        clustering.extend_from_slice(&1u16.to_be_bytes());
         clustering.push(0u8);
         clustering.extend_from_slice(&(label.len() as u16).to_be_bytes());
         clustering.extend_from_slice(label);
@@ -1691,6 +2014,7 @@ mod tests {
         let label = b"KNOWS";
         let neighbor = vec![1u8];
         let mut clustering = Vec::new();
+        clustering.extend_from_slice(&1u16.to_be_bytes());
         clustering.push(0u8);
         clustering.extend_from_slice(&(label.len() as u16).to_be_bytes());
         clustering.extend_from_slice(label);
@@ -1709,8 +2033,8 @@ mod tests {
 
     #[test]
     fn extract_neighbor_id_empty_label_and_id() {
-        // direction + label_len(0) + id_len(0)
-        let clustering = vec![0u8, 0, 0, 0, 0];
+        // [u16 1][1B direction=0][u16 0][u16 0]
+        let clustering = vec![0u8, 1, 0, 0, 0, 0, 0];
         let result = extract_neighbor_id(&clustering, None);
         assert_eq!(result, Some(vec![]));
     }

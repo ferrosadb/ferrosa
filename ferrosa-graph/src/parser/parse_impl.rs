@@ -99,6 +99,7 @@ impl<'input> Parser<'input> {
                     delta,
                 })
             }
+            TokenKind::Keyword(Keyword::Merge) => self.parse_merge(),
             TokenKind::Keyword(Keyword::Unsubscribe) => {
                 self.lexer.next_token()?; // consume UNSUBSCRIBE
                 let tok = self.lexer.peek()?;
@@ -115,10 +116,59 @@ impl<'input> Parser<'input> {
                 Ok(Statement::Unsubscribe { stream_id })
             }
             _ => Err(ParseError::new(
-                format!("expected MATCH or CREATE, got {:?}", tok.kind),
+                format!(
+                    "unsupported statement keyword: {:?}; expected MATCH, CREATE, MERGE, \
+                     SUBSCRIBE, or UNSUBSCRIBE",
+                    tok.kind
+                ),
                 tok.span,
             )),
         }
+    }
+
+    /// Parse one or more consecutive MERGE clauses with an optional trailing SET and RETURN.
+    ///
+    /// Grammar:
+    ///   merge_stmt := MERGE pattern (MERGE pattern)* [SET assignment_list] [RETURN return_clause]
+    ///
+    /// All patterns are accumulated into a single `Statement::Merge`. This supports the
+    /// canonical ferrosa-memory edge-upsert shape:
+    ///   MERGE (a:Entity {entity_id: $src})
+    ///   MERGE (b:Entity {entity_id: $dst})
+    ///   MERGE (a)-[r:TYPED_EDGE {edge_type: $t}]->(b)
+    ///   SET r.weight = $w
+    ///   RETURN r
+    fn parse_merge(&mut self) -> ParseResult<Statement> {
+        let mut patterns = Vec::new();
+
+        // Consume the first MERGE keyword (already peeked in parse_statement).
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Merge))?;
+        patterns.push(self.parse_pattern()?);
+
+        // Consume any additional consecutive MERGE clauses.
+        while self.lexer.eat(&TokenKind::Keyword(Keyword::Merge))? {
+            patterns.push(self.parse_pattern()?);
+        }
+
+        // Optional trailing SET clause.
+        let set_clause = if self.lexer.eat(&TokenKind::Keyword(Keyword::Set))? {
+            self.parse_assignment_list()?
+        } else {
+            vec![]
+        };
+
+        // Optional RETURN clause.
+        let return_clause = if self.lexer.peek()?.kind == TokenKind::Keyword(Keyword::Return) {
+            Some(self.parse_return_clause()?)
+        } else {
+            None
+        };
+
+        Ok(Statement::Merge {
+            patterns,
+            set_clause,
+            return_clause,
+        })
     }
 
     fn parse_match(&mut self) -> ParseResult<Statement> {
@@ -186,7 +236,18 @@ impl<'input> Parser<'input> {
     fn parse_create(&mut self) -> ParseResult<Statement> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Create))?;
         let patterns = self.parse_pattern_list()?;
-        Ok(Statement::Create { patterns })
+
+        // Optional RETURN clause — mirrors the MERGE RETURN pattern.
+        let return_clause = if self.lexer.peek()?.kind == TokenKind::Keyword(Keyword::Return) {
+            Some(self.parse_return_clause()?)
+        } else {
+            None
+        };
+
+        Ok(Statement::Create {
+            patterns,
+            return_clause,
+        })
     }
 
     // --- Pattern parsing ---
@@ -1060,7 +1121,7 @@ mod tests {
     #[test]
     fn parse_empty_node() {
         let stmt = parse("CREATE ()").unwrap();
-        if let Statement::Create { patterns } = stmt {
+        if let Statement::Create { patterns, .. } = stmt {
             assert_eq!(
                 patterns[0],
                 Pattern::Node {
@@ -1077,7 +1138,7 @@ mod tests {
     #[test]
     fn parse_node_with_var() {
         let stmt = parse("CREATE (n)").unwrap();
-        if let Statement::Create { patterns } = stmt {
+        if let Statement::Create { patterns, .. } = stmt {
             assert_eq!(
                 patterns[0],
                 Pattern::Node {
@@ -1094,7 +1155,7 @@ mod tests {
     #[test]
     fn parse_node_with_label() {
         let stmt = parse("CREATE (n:Person)").unwrap();
-        if let Statement::Create { patterns } = stmt {
+        if let Statement::Create { patterns, .. } = stmt {
             assert_eq!(
                 patterns[0],
                 Pattern::Node {
@@ -1111,7 +1172,7 @@ mod tests {
     #[test]
     fn parse_node_with_props() {
         let stmt = parse("CREATE (n:Person {name: 'Alice', age: 30})").unwrap();
-        if let Statement::Create { patterns } = stmt {
+        if let Statement::Create { patterns, .. } = stmt {
             assert_eq!(
                 patterns[0],
                 Pattern::Node {
@@ -1238,10 +1299,30 @@ mod tests {
     #[test]
     fn parse_create_edge() {
         let stmt = parse("CREATE (a)-[:KNOWS {since: 2020}]->(b)").unwrap();
-        if let Statement::Create { patterns } = stmt {
+        if let Statement::Create { patterns, .. } = stmt {
             assert!(matches!(&patterns[0], Pattern::Path(_)));
         } else {
             panic!("expected Create");
+        }
+    }
+
+    #[test]
+    fn parse_create_with_return_succeeds() {
+        let stmt = parse("CREATE (n:Entity {entity_id: 'x'}) RETURN n").unwrap();
+        if let Statement::Create {
+            patterns,
+            return_clause,
+        } = stmt
+        {
+            assert_eq!(patterns.len(), 1, "expected one CREATE pattern");
+            let rc = return_clause.expect("return_clause must be Some(_)");
+            assert_eq!(rc.items.len(), 1, "expected one RETURN item");
+            assert!(
+                matches!(&rc.items[0].expr, crate::parser::Expr::Var(v) if v == "n"),
+                "RETURN item must be variable 'n'"
+            );
+        } else {
+            panic!("expected Create statement");
         }
     }
 
@@ -1454,7 +1535,7 @@ mod tests {
     #[test]
     fn parse_empty_prop_map() {
         let stmt = parse("CREATE (n:Person {})").unwrap();
-        if let Statement::Create { patterns } = stmt {
+        if let Statement::Create { patterns, .. } = stmt {
             if let Pattern::Node { props, .. } = &patterns[0] {
                 assert!(props.is_empty());
             } else {
@@ -1760,6 +1841,85 @@ mod tests {
         assert!(
             err_msg.contains("negative pattern"),
             "error should mention negative patterns: {err_msg}"
+        );
+    }
+
+    // --- MERGE: node patterns ---
+
+    #[test]
+    fn parse_merge_node_succeeds() {
+        let stmt = parse("MERGE (n:Entity {entity_id: 'x'}) RETURN n").unwrap();
+        match stmt {
+            Statement::Merge {
+                patterns,
+                set_clause,
+                return_clause,
+            } => {
+                assert_eq!(patterns.len(), 1);
+                assert!(matches!(
+                    &patterns[0],
+                    Pattern::Node {
+                        label: Some(l),
+                        ..
+                    } if l == "Entity"
+                ));
+                assert!(set_clause.is_empty());
+                assert!(return_clause.is_some());
+            }
+            _ => panic!("expected Merge"),
+        }
+    }
+
+    #[test]
+    fn parse_merge_node_unlabeled_succeeds() {
+        let stmt = parse("MERGE (n) RETURN n").unwrap();
+        assert!(matches!(stmt, Statement::Merge { .. }));
+    }
+
+    #[test]
+    fn parse_unsupported_keyword_errors() {
+        let err = parse("UPSERT (n:Entity)").unwrap_err();
+        assert!(
+            err.message.contains("unsupported statement keyword"),
+            "expected 'unsupported statement keyword', got: {}",
+            err.message
+        );
+    }
+
+    // --- MERGE: relationship patterns and multi-clause ---
+
+    #[test]
+    fn parse_merge_relationship_succeeds() {
+        // Canonical ferrosa-memory edge-upsert shape (from the spec).
+        let stmt = parse(
+            "MERGE (a:Entity {entity_id: 'src'}) \
+             MERGE (b:Entity {entity_id: 'dst'}) \
+             MERGE (a)-[r:TYPED_EDGE {edge_type: 'links'}]->(b) \
+             SET r.weight = 1 \
+             RETURN r",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Merge {
+                patterns,
+                set_clause,
+                return_clause,
+            } => {
+                assert_eq!(patterns.len(), 3, "expected 3 patterns");
+                assert_eq!(set_clause.len(), 1, "expected 1 SET assignment");
+                assert!(return_clause.is_some(), "expected RETURN clause");
+            }
+            _ => panic!("expected Merge"),
+        }
+    }
+
+    #[test]
+    fn parse_merge_rel_missing_endpoints_errors() {
+        // A bare relationship pattern without surrounding nodes is invalid.
+        let err = parse("MERGE -[r:TYPED_EDGE]->(b) RETURN r").unwrap_err();
+        assert!(
+            !err.message.is_empty(),
+            "expected a parse error, got empty message"
         );
     }
 
