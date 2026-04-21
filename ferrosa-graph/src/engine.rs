@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adjacency::observer::AdjacencyIndexObserver;
 use crate::adjacency::reconcile::spawn_reconciliation;
+use crate::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
 use crate::error::{GraphError, Result};
 use crate::executor::expand::{execute, GraphEngineConfig};
 use crate::executor::result::GraphResult;
@@ -110,6 +111,55 @@ impl GraphEngine {
         let mut reconciliation_handles = Vec::new();
         let reconciliation_cancel = CancellationToken::new();
         for ks in &edge_keyspaces {
+            // Ensure the adjacency keyspace + table are registered with both
+            // schema and storage BEFORE wiring the observer. Without this the
+            // observer produces derived mutations targeting a table that
+            // StorageEngine has never seen, and `apply_derived_mutation` logs
+            // "target table not registered — derived mutation dropped" for
+            // every edge write — silent data loss for hop queries.
+            let adj_ks = adjacency_keyspace_name(ks);
+            if !snap.keyspaces.contains_key(&adj_ks) {
+                if let Err(e) = schema.create_keyspace_internal(
+                    ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+                        name: adj_ks.clone(),
+                        durable_writes: true,
+                        replication:
+                            ferrosa_schema::metadata::keyspace::ReplicationParams {
+                                strategy: "SimpleStrategy".to_string(),
+                                options: std::collections::HashMap::new(),
+                            },
+                    },
+                ) {
+                    tracing::error!(
+                        keyspace = %adj_ks,
+                        error = %e,
+                        "graph engine: failed to register adjacency keyspace — \
+                         derived mutations will be dropped for {ks}; refusing to \
+                         register observer"
+                    );
+                    continue;
+                }
+            }
+            let adj_meta = adjacency_table_metadata(ks);
+            let adj_schema = adj_meta.to_storage_schema();
+            if let Err(e) = storage.register_table(adj_schema) {
+                // Already-registered is fine (another edge table in the same
+                // keyspace shares the adjacency table). Any other error means
+                // derived mutations would drop — refuse to start the observer.
+                let msg = e.to_string();
+                let already = msg.contains("already registered")
+                    || msg.contains("already exists");
+                if !already {
+                    tracing::error!(
+                        keyspace = %adj_ks,
+                        error = %e,
+                        "graph engine: failed to register adjacency table with \
+                         StorageEngine — refusing to register observer for {ks}"
+                    );
+                    continue;
+                }
+            }
+
             let observer = Arc::new(AdjacencyIndexObserver::new(Arc::clone(&schema), ks.clone()));
 
             if tokio::runtime::Handle::try_current().is_ok() {
