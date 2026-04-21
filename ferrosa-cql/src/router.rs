@@ -9,6 +9,7 @@
 //! - **M12**: Batch size is capped at `MAX_BATCH_STATEMENTS` (500).
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -489,6 +490,23 @@ async fn route_select(
         (names, types, rows)
     }
 
+    fn loopback_client_ip(client_address: &str) -> Option<IpAddr> {
+        if let Ok(addr) = client_address.parse::<std::net::SocketAddr>() {
+            return addr.ip().is_loopback().then_some(addr.ip());
+        }
+        if let Ok(ip) = client_address.parse::<IpAddr>() {
+            return ip.is_loopback().then_some(ip);
+        }
+        None
+    }
+
+    fn harmonize_loopback_family(advertised: IpAddr, client_loopback_ip: Option<IpAddr>) -> IpAddr {
+        match client_loopback_ip {
+            Some(client_ip) if advertised.is_loopback() && client_ip.is_loopback() => client_ip,
+            _ => advertised,
+        }
+    }
+
     // System table dispatch — no permission check needed for system tables.
     match (ks, s.table.as_str()) {
         ("system", "local") => {
@@ -497,10 +515,12 @@ async fn route_select(
                 state.node_config.listen_address,
                 state.node_config.broadcast_address,
             ];
+            let client_loopback_ip = loopback_client_ip(&ctx.client_address);
             let topology_view = state
                 .topology_policy
                 .topology_view_for_client_with_locals(&ctx.client_address, &local_addresses);
-            let info = query_local_with_view(&state.schema, &state.node_config, topology_view);
+            let mut info = query_local_with_view(&state.schema, &state.node_config, topology_view);
+            info.rpc_address = harmonize_loopback_family(info.rpc_address, client_loopback_ip);
             let col_names: Vec<String> = vec![
                 "key",
                 "cluster_name",
@@ -579,14 +599,19 @@ async fn route_select(
                 state.node_config.listen_address,
                 state.node_config.broadcast_address,
             ];
+            let client_loopback_ip = loopback_client_ip(&ctx.client_address);
             let topology_view = state
                 .topology_policy
                 .topology_view_for_client_with_locals(&ctx.client_address, &local_addresses);
-            let peers = query_peers_with_view(
+            let mut peers = query_peers_with_view(
                 &state.schema,
                 state.cluster_state.load().as_ref(),
                 topology_view,
             );
+            for peer in &mut peers {
+                peer.native_address =
+                    harmonize_loopback_family(peer.native_address, client_loopback_ip);
+            }
             let col_names: Vec<String> = vec![
                 "peer",
                 "peer_port",
@@ -6575,7 +6600,7 @@ mod tests {
 
     #[tokio::test]
     async fn internal_client_sees_internal_system_local_endpoint() {
-        let (mut state, _dir) = setup();
+        let (state, _dir) = setup();
         let mut node_config = (*state.node_config).clone();
         node_config.rpc_address = "127.0.0.1".parse().unwrap();
         node_config.rpc_port = 19042;
@@ -6638,6 +6663,38 @@ mod tests {
                 assert_eq!(
                     decode_inet_cell(row[0].as_deref().unwrap()),
                     "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 19042);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_loopback_client_sees_ipv6_system_local_endpoint() {
+        let (mut state, _dir) = setup();
+        let mut node_config = (*state.node_config).clone();
+        node_config.rpc_address = "127.0.0.1".parse().unwrap();
+        node_config.rpc_port = 19042;
+        state.node_config = Arc::new(node_config);
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "[::1]:32123".into(),
+        };
+        let stmt = crate::parser::parse("SELECT rpc_address, rpc_port FROM system.local").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_column_names(b), vec!["rpc_address", "rpc_port"]);
+                let row = extract_single_row_cells(b, 2);
+                assert_eq!(
+                    decode_inet_cell(row[0].as_deref().unwrap()),
+                    "::1".parse::<std::net::IpAddr>().unwrap()
                 );
                 assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 19042);
             }
@@ -6903,6 +6960,72 @@ mod tests {
                 assert_eq!(
                     decode_inet_cell(row[0].as_deref().unwrap()),
                     "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 19043);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_loopback_client_sees_ipv6_system_peers_endpoints() {
+        use ferrosa_cluster::raft::{NodeInfo, NodeState};
+        use ferrosa_cluster::ring::TokenRing;
+
+        let (mut state, _dir) = setup();
+
+        let local_id = 1_u64;
+        let peer_id = 2_u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            local_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.48:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19042".to_string()),
+            },
+        );
+        ring.add_node(
+            peer_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.49:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19043".to_string()),
+            },
+        );
+        state
+            .cluster_state
+            .store(Arc::new(ferrosa_cluster::ClusterStateHolder::Cluster(
+                ferrosa_cluster::RaftClusterState::new(
+                    Arc::new(ArcSwap::from_pointee(ring)),
+                    local_id,
+                ),
+            )));
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "[::1]:32123".into(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT native_address, native_port FROM system.peers").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_row_count(b), 1);
+                let row = extract_single_row_cells(b, 2);
+                assert_eq!(
+                    decode_inet_cell(row[0].as_deref().unwrap()),
+                    "::1".parse::<std::net::IpAddr>().unwrap()
                 );
                 assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 19043);
             }
