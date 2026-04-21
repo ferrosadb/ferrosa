@@ -755,6 +755,23 @@ impl FerrosStateMachine {
                     }
                 }
             }
+            RaftOp::UpdateNodeInfo(node_info) => {
+                schema_changed = false;
+                let node_id = super::uuid_to_node_id(node_info.host_id);
+                if let Some(existing) = self.state.members.get_mut(&node_id) {
+                    existing.addr = node_info.addr;
+                    existing.data_center = node_info.data_center;
+                    existing.rack = node_info.rack;
+                    existing.state = node_info.state;
+                    existing.cql_broadcast = node_info.cql_broadcast;
+                    self.sync_ring();
+                } else {
+                    tracing::warn!(
+                        host_id = %node_info.host_id,
+                        "ignoring UpdateNodeInfo for unknown cluster member"
+                    );
+                }
+            }
             RaftOp::LeaveNode { node_id } => {
                 schema_changed = false;
                 self.state.members.remove(&node_id);
@@ -2345,6 +2362,64 @@ mod tests {
         assert_eq!(entry.get(&node_id), Some(&IndexNodeStatus::Building));
         // Existing node 1 should still be Ready.
         assert_eq!(entry.get(&1), Some(&IndexNodeStatus::Ready));
+    }
+
+    #[test]
+    fn update_node_info_refreshes_existing_member_metadata_without_touching_tokens() {
+        let mut sm = FerrosStateMachine::new();
+        let host_id = Uuid::new_v4();
+        let node_id = crate::raft::uuid_to_node_id(host_id);
+
+        sm.apply_command(RaftCommand {
+            op: RaftOp::JoinNode(NodeInfo {
+                host_id,
+                addr: "10.89.1.61:7000".into(),
+                data_center: "dc1".into(),
+                rack: "rack1".into(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            }),
+            schema_version: Uuid::new_v4(),
+        });
+        sm.apply_command(RaftCommand {
+            op: RaftOp::AssignTokens {
+                node_id,
+                tokens: vec![-10, 0, 10],
+            },
+            schema_version: Uuid::new_v4(),
+        });
+
+        sm.apply_command(RaftCommand {
+            op: RaftOp::UpdateNodeInfo(NodeInfo {
+                host_id,
+                addr: "10.89.1.7:7000".into(),
+                data_center: "dc1".into(),
+                rack: "rack1".into(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19043".into()),
+            }),
+            schema_version: Uuid::new_v4(),
+        });
+
+        let member = sm
+            .state()
+            .members
+            .get(&node_id)
+            .expect("member must remain present after metadata refresh");
+        assert_eq!(member.addr, "10.89.1.7:7000");
+        assert_eq!(member.cql_broadcast.as_deref(), Some("127.0.0.1:19043"));
+
+        let tokens: Vec<_> = sm
+            .state()
+            .token_map
+            .iter()
+            .filter_map(|(token, owner)| (*owner == node_id).then_some(*token))
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![-10, 0, 10],
+            "metadata refresh must not reassign tokens"
+        );
     }
 
     #[test]

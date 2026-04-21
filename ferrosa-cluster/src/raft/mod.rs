@@ -194,6 +194,8 @@ pub enum RaftOp {
     // ---- Topology (node-membership mutations) ---------------------------
     /// A new node is requesting admission to the cluster.
     JoinNode(NodeInfo),
+    /// Refresh address metadata for an existing cluster member.
+    UpdateNodeInfo(NodeInfo),
     /// A node is departing the cluster gracefully.
     LeaveNode {
         /// openraft `NodeId` for the departing node (`uuid_to_node_id(host_id)`).

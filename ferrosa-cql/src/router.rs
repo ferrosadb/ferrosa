@@ -492,9 +492,14 @@ async fn route_select(
     // System table dispatch — no permission check needed for system tables.
     match (ks, s.table.as_str()) {
         ("system", "local") => {
+            let local_addresses = [
+                state.node_config.internal_rpc_address,
+                state.node_config.listen_address,
+                state.node_config.broadcast_address,
+            ];
             let topology_view = state
                 .topology_policy
-                .topology_view_for_client_address(&ctx.client_address);
+                .topology_view_for_client_with_locals(&ctx.client_address, &local_addresses);
             let info = query_local_with_view(&state.schema, &state.node_config, topology_view);
             let col_names: Vec<String> = vec![
                 "key",
@@ -569,9 +574,14 @@ async fn route_select(
             ))
         }
         ("system", "peers" | "peers_v2") => {
+            let local_addresses = [
+                state.node_config.internal_rpc_address,
+                state.node_config.listen_address,
+                state.node_config.broadcast_address,
+            ];
             let topology_view = state
                 .topology_policy
-                .topology_view_for_client_address(&ctx.client_address);
+                .topology_view_for_client_with_locals(&ctx.client_address, &local_addresses);
             let peers = query_peers_with_view(
                 &state.schema,
                 state.cluster_state.load().as_ref(),
@@ -6598,6 +6608,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn client_that_looks_like_local_container_ip_still_gets_public_system_local_endpoint() {
+        let (mut state, _dir) = setup();
+        let mut node_config = (*state.node_config).clone();
+        node_config.rpc_address = "127.0.0.1".parse().unwrap();
+        node_config.rpc_port = 19042;
+        node_config.internal_rpc_address = "10.89.1.48".parse().unwrap();
+        node_config.internal_rpc_port = 9042;
+        node_config.listen_address = "10.89.1.48".parse().unwrap();
+        node_config.broadcast_address = "10.89.1.48".parse().unwrap();
+        state.node_config = Arc::new(node_config);
+        state.topology_policy = ClientTopologyPolicy::from_csv("10.89.0.0/16").unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "10.89.1.48:32123".into(),
+        };
+        let stmt = crate::parser::parse("SELECT rpc_address, rpc_port FROM system.local").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_column_names(b), vec!["rpc_address", "rpc_port"]);
+                let row = extract_single_row_cells(b, 2);
+                assert_eq!(
+                    decode_inet_cell(row[0].as_deref().unwrap()),
+                    "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 19042);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
     /// Regression test: cqlsh expects `tokens` column (set<varchar>) in
     /// system.local. Without it, cqlsh prints "'local' not found in
     /// keyspace 'system'" during startup introspection.
@@ -6786,6 +6833,78 @@ mod tests {
                     "10.89.1.49".parse::<std::net::IpAddr>().unwrap()
                 );
                 assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 9042);
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_that_looks_like_local_container_ip_still_gets_public_system_peers_endpoint() {
+        use ferrosa_cluster::raft::{NodeInfo, NodeState};
+        use ferrosa_cluster::ring::TokenRing;
+
+        let (mut state, _dir) = setup();
+        state.topology_policy = ClientTopologyPolicy::from_csv("10.89.0.0/16").unwrap();
+        let mut node_config = (*state.node_config).clone();
+        node_config.internal_rpc_address = "10.89.1.48".parse().unwrap();
+        node_config.listen_address = "10.89.1.48".parse().unwrap();
+        node_config.broadcast_address = "10.89.1.48".parse().unwrap();
+        state.node_config = Arc::new(node_config);
+
+        let local_id = 1_u64;
+        let peer_id = 2_u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            local_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.48:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19042".to_string()),
+            },
+        );
+        ring.add_node(
+            peer_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.49:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19043".to_string()),
+            },
+        );
+        state
+            .cluster_state
+            .store(Arc::new(ferrosa_cluster::ClusterStateHolder::Cluster(
+                ferrosa_cluster::RaftClusterState::new(
+                    Arc::new(ArcSwap::from_pointee(ring)),
+                    local_id,
+                ),
+            )));
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "10.89.1.48:32123".into(),
+        };
+        let stmt =
+            crate::parser::parse("SELECT native_address, native_port FROM system.peers").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_row_count(b), 1);
+                let row = extract_single_row_cells(b, 2);
+                assert_eq!(
+                    decode_inet_cell(row[0].as_deref().unwrap()),
+                    "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(decode_int_cell(row[1].as_deref().unwrap()), 19043);
             }
             _ => panic!("expected Result"),
         }

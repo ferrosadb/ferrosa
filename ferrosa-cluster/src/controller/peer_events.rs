@@ -49,7 +49,13 @@ impl PeerEventListener for ModeController {
             }
             DeploymentMode::Cluster => {
                 tracing::info!(peer = %host_id, "new peer connected in cluster mode, triggering join");
-                self.trigger_cluster_join(host_id, addr);
+                let cql_broadcast = self
+                    .peer_manager
+                    .load()
+                    .as_ref()
+                    .as_ref()
+                    .and_then(|pm| pm.get_peer_cql_broadcast_sync(host_id));
+                self.trigger_cluster_join(host_id, addr, cql_broadcast);
             }
             DeploymentMode::Forming => {
                 tracing::info!(peer = %host_id, "peer connected during formation");
@@ -185,10 +191,11 @@ impl InboundPeerCallback for ModeController {
 
         // Store the peer's CQL broadcast address (from handshake) in PeerManager
         // so system.peers can return it instead of the container-internal IP.
-        if let Some(broadcast) = cql_broadcast {
+        if let Some(ref broadcast) = cql_broadcast {
             if let Some(pm) = &**self.peer_manager.load() {
                 let pm = pm.clone();
                 let hid = host_id;
+                let broadcast = broadcast.clone();
                 tokio::spawn(async move {
                     pm.set_peer_cql_broadcast(hid, broadcast).await;
                 });
@@ -225,7 +232,7 @@ impl InboundPeerCallback for ModeController {
             }
             DeploymentMode::Cluster => {
                 tracing::info!(peer = %host_id, "new inbound peer in cluster mode, triggering join");
-                self.trigger_cluster_join(host_id, addr);
+                self.trigger_cluster_join(host_id, addr, cql_broadcast);
             }
             DeploymentMode::Forming => {
                 tracing::info!(peer = %host_id, "inbound peer during formation");

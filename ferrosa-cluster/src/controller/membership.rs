@@ -16,6 +16,22 @@ fn clear_pending_join(pending_joins: &Arc<Mutex<Vec<Uuid>>>, host_id: Uuid) {
     pending.retain(|id| *id != host_id);
 }
 
+fn cluster_member_metadata_changed(
+    current: &NodeInfo,
+    addr: std::net::SocketAddr,
+    cql_broadcast: Option<&str>,
+) -> bool {
+    if current.addr != addr.to_string() {
+        return true;
+    }
+
+    match (&current.cql_broadcast, cql_broadcast) {
+        (Some(current), Some(new)) => current != new,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
 impl ModeController {
     /// Record that a node has been approved to join the cluster.
     ///
@@ -245,20 +261,27 @@ impl ModeController {
     /// Checks de-duplication (via `pending_joins`), approval (via `approved_nodes`
     /// or `auto_join`), and spawns an async task to propose `JoinNode` +
     /// `AssignTokens` via Raft.
-    pub(super) fn trigger_cluster_join(&self, host_id: Uuid, addr: std::net::SocketAddr) {
+    pub(super) fn trigger_cluster_join(
+        &self,
+        host_id: Uuid,
+        addr: std::net::SocketAddr,
+        cql_broadcast: Option<String>,
+    ) {
         let peer_node_id = uuid_to_node_id(host_id);
-
-        // Existing ring members are part of the current topology already.
-        // Cluster formation can produce a burst of duplicate inbound/outbound
-        // peer-connected callbacks before Raft is fully initialized; don't
-        // try to re-admit nodes that are already seeded into the ring.
-        if self
+        let existing_member = self
             .token_ring()
             .as_ref()
-            .is_some_and(|ring| ring.get_node(peer_node_id).is_some())
-        {
-            tracing::debug!(peer = %host_id, node_id = peer_node_id, "peer already present in token ring, skipping join trigger");
-            return;
+            .and_then(|ring| ring.get_node(peer_node_id).cloned());
+
+        if let Some(existing) = existing_member.as_ref() {
+            if !cluster_member_metadata_changed(existing, addr, cql_broadcast.as_deref()) {
+                tracing::debug!(
+                    peer = %host_id,
+                    node_id = peer_node_id,
+                    "peer already present in token ring with current metadata, skipping join trigger"
+                );
+                return;
+            }
         }
 
         // Unapproved peers should be ignored without poisoning the pending set.
@@ -293,6 +316,8 @@ impl ModeController {
         // Capture state needed by the spawned task.
         let raft_instance = self.raft_instance.clone();
         let config_clone = self.config.clone();
+        let existing_member = existing_member.clone();
+        let cql_broadcast = cql_broadcast.clone();
 
         self.spawn_tracked(async move {
             let mut raft = None;
@@ -333,6 +358,34 @@ impl ModeController {
                 return;
             };
 
+            if let Some(existing) = existing_member {
+                let refresh_cmd = RaftCommand {
+                    op: RaftOp::UpdateNodeInfo(NodeInfo {
+                        host_id,
+                        addr: addr.to_string(),
+                        data_center: existing.data_center,
+                        rack: existing.rack,
+                        state: existing.state,
+                        cql_broadcast: cql_broadcast.or(existing.cql_broadcast),
+                    }),
+                    schema_version: Uuid::new_v4(),
+                };
+                let refresh_result = raft.client_write(refresh_cmd).await;
+                clear_pending_join(&pending_joins, host_id);
+                if let Err(e) = refresh_result {
+                    tracing::warn!(peer = %host_id, leader, %e, "UpdateNodeInfo proposal failed");
+                    return;
+                }
+
+                tracing::info!(
+                    peer = %host_id,
+                    node_id = peer_node_id,
+                    leader,
+                    "peer metadata refreshed via on_peer_connected"
+                );
+                return;
+            }
+
             // Propose JoinNode via Raft.
             let node_info = NodeInfo {
                 host_id,
@@ -340,7 +393,7 @@ impl ModeController {
                 data_center: config_clone.data_center.clone(),
                 rack: config_clone.rack.clone(),
                 state: NodeState::Normal,
-                cql_broadcast: None,
+                cql_broadcast,
             };
 
             let join_cmd = RaftCommand {
@@ -371,6 +424,8 @@ impl ModeController {
                 tracing::warn!(peer = %host_id, leader, %e, "AssignTokens proposal failed");
                 return;
             }
+
+            clear_pending_join(&pending_joins, host_id);
 
             tracing::info!(
                 peer = %host_id,
