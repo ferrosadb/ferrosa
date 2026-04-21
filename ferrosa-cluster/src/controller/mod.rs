@@ -178,7 +178,7 @@ pub struct ModeController {
     /// Tracked so that the same peer is not re-admitted on reconnect and
     /// for testability (unit tests can inspect pending joins without
     /// requiring a full Raft cluster).
-    pub(super) pending_joins: Mutex<Vec<Uuid>>,
+    pub(super) pending_joins: Arc<Mutex<Vec<Uuid>>>,
     /// Serializes mode transitions. Held across the check-and-transition
     /// window to prevent concurrent `on_peer_connected` calls from both
     /// triggering `transition_to_pair` when two peers arrive simultaneously.
@@ -283,7 +283,7 @@ impl ModeController {
             hint_config,
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
-            pending_joins: Mutex::new(Vec::new()),
+            pending_joins: Arc::new(Mutex::new(Vec::new())),
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
@@ -340,7 +340,7 @@ impl ModeController {
             hint_config,
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
-            pending_joins: Mutex::new(Vec::new()),
+            pending_joins: Arc::new(Mutex::new(Vec::new())),
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
@@ -397,7 +397,7 @@ impl ModeController {
             hint_config,
             approved_nodes: Mutex::new(BTreeSet::new()),
             ring: Arc::new(ArcSwap::from_pointee(None)),
-            pending_joins: Mutex::new(Vec::new()),
+            pending_joins: Arc::new(Mutex::new(Vec::new())),
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),

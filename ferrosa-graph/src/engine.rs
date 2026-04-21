@@ -28,6 +28,40 @@ use crate::parser::{parse, Statement};
 use crate::planner::logical::validate;
 use crate::planner::physical::{plan, PhysicalPlan};
 
+fn adjacency_keyspace_metadata(
+    snap: &ferrosa_schema::SchemaSnapshot,
+    keyspace: &str,
+) -> ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+    let adj_ks = adjacency_keyspace_name(keyspace);
+    if let Some(source) = snap.keyspaces.get(keyspace) {
+        ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+            name: adj_ks,
+            durable_writes: source.durable_writes,
+            replication: source.replication.clone(),
+        }
+    } else {
+        ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+            name: adj_ks,
+            durable_writes: true,
+            replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: std::collections::HashMap::from([(
+                    "replication_factor".to_string(),
+                    "1".to_string(),
+                )]),
+            },
+        }
+    }
+}
+
+fn replication_needs_repair(replication: &ferrosa_schema::ReplicationParams) -> bool {
+    match replication.strategy.as_str() {
+        "SimpleStrategy" => !replication.options.contains_key("replication_factor"),
+        "NetworkTopologyStrategy" => replication.options.is_empty(),
+        _ => false,
+    }
+}
+
 /// Composite configuration for the graph engine.
 pub struct GraphConfig {
     pub engine: GraphEngineConfig,
@@ -118,17 +152,26 @@ impl GraphEngine {
             // "target table not registered — derived mutation dropped" for
             // every edge write — silent data loss for hop queries.
             let adj_ks = adjacency_keyspace_name(ks);
-            if !snap.keyspaces.contains_key(&adj_ks) {
-                if let Err(e) = schema.create_keyspace_internal(
-                    ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
-                        name: adj_ks.clone(),
-                        durable_writes: true,
-                        replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
-                            strategy: "SimpleStrategy".to_string(),
-                            options: std::collections::HashMap::new(),
+            let adj_meta = adjacency_keyspace_metadata(&snap, ks);
+            if let Some(existing) = snap.keyspaces.get(&adj_ks) {
+                if replication_needs_repair(&existing.replication) {
+                    if let Err(e) = schema.alter_keyspace_internal(
+                        &adj_ks,
+                        ferrosa_schema::metadata::keyspace::KeyspaceUpdates {
+                            replication: Some(adj_meta.replication.clone()),
+                            durable_writes: Some(adj_meta.durable_writes),
                         },
-                    },
-                ) {
+                    ) {
+                        tracing::error!(
+                            keyspace = %adj_ks,
+                            error = %e,
+                            "graph engine: failed to repair adjacency keyspace replication"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                if let Err(e) = schema.create_keyspace_internal(adj_meta) {
                     tracing::error!(
                         keyspace = %adj_ks,
                         error = %e,
@@ -691,5 +734,54 @@ mod tests {
         let json = serde_json::to_string(&gs).unwrap();
         assert!(json.contains("vertices"));
         assert!(json.contains("Person"));
+    }
+
+    #[test]
+    fn adjacency_keyspace_inherits_source_replication() {
+        let schema = test_schema();
+        schema
+            .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
+                name: "agent_memory".to_string(),
+                durable_writes: false,
+                replication: ferrosa_schema::ReplicationParams {
+                    strategy: "NetworkTopologyStrategy".to_string(),
+                    options: std::collections::HashMap::from([(
+                        "datacenter1".to_string(),
+                        "3".to_string(),
+                    )]),
+                },
+            })
+            .unwrap();
+
+        let snap = schema.snapshot();
+        let adj = adjacency_keyspace_metadata(&snap, "agent_memory");
+        assert_eq!(adj.name, "system_graph_agent_memory");
+        assert!(!adj.durable_writes);
+        assert_eq!(adj.replication.strategy, "NetworkTopologyStrategy");
+        assert_eq!(
+            adj.replication.options.get("datacenter1"),
+            Some(&"3".to_string())
+        );
+    }
+
+    #[test]
+    fn adjacency_keyspace_defaults_to_simple_strategy_rf1() {
+        let snap = test_schema().snapshot();
+        let adj = adjacency_keyspace_metadata(&snap, "missing");
+        assert_eq!(adj.name, "system_graph_missing");
+        assert_eq!(adj.replication.strategy, "SimpleStrategy");
+        assert_eq!(
+            adj.replication.options.get("replication_factor"),
+            Some(&"1".to_string())
+        );
+    }
+
+    #[test]
+    fn replication_repair_detects_missing_simple_strategy_rf() {
+        let broken = ferrosa_schema::ReplicationParams {
+            strategy: "SimpleStrategy".to_string(),
+            options: std::collections::HashMap::new(),
+        };
+        assert!(replication_needs_repair(&broken));
     }
 }

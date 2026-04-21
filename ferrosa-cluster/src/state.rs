@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -218,8 +218,14 @@ impl ClusterState for RaftClusterState {
 /// Parse "ip:port" or "host:port" into (IpAddr, u16).
 /// Returns None if parsing fails.
 fn parse_addr(addr: &str) -> Option<(IpAddr, u16)> {
-    let socket_addr: std::net::SocketAddr = addr.parse().ok()?;
-    Some((socket_addr.ip(), socket_addr.port()))
+    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+        return Some((socket_addr.ip(), socket_addr.port()));
+    }
+
+    let mut addrs = addr.to_socket_addrs().ok()?;
+    addrs
+        .next()
+        .map(|socket_addr| (socket_addr.ip(), socket_addr.port()))
 }
 
 #[cfg(test)]
@@ -379,6 +385,51 @@ mod tests {
         // peer (internode) address stays as the container IP.
         assert_eq!(peers[0].peer, "172.17.0.3".parse::<IpAddr>().unwrap());
         assert_eq!(peers[0].peer_port, 7000);
+    }
+
+    #[test]
+    fn raft_cluster_state_resolves_hostname_broadcast_for_native_address() {
+        use crate::raft::{NodeInfo, NodeState};
+        use crate::ring::TokenRing;
+
+        let local_id = 1_u64;
+        let peer_id = 2_u64;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            local_id,
+            NodeInfo {
+                host_id: Uuid::new_v4(),
+                addr: "172.17.0.2:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            },
+        );
+        ring.add_node(
+            peer_id,
+            NodeInfo {
+                host_id: Uuid::new_v4(),
+                addr: "172.17.0.3:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("localhost:19043".to_string()),
+            },
+        );
+
+        let ring_arc = Arc::new(ArcSwap::from_pointee(ring));
+        let state = RaftClusterState::new(ring_arc, local_id);
+        let peers = state.peers();
+
+        assert_eq!(peers.len(), 1);
+        assert!(
+            peers[0].native_address.is_loopback(),
+            "hostname broadcast should resolve to a loopback IP, got {}",
+            peers[0].native_address
+        );
+        assert_eq!(peers[0].native_port, 19043);
     }
 
     #[test]

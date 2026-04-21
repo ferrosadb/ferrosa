@@ -1,5 +1,8 @@
 //! Cluster membership operations: approve, join, decommission.
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use uuid::Uuid;
 
 use crate::error::{ClusterError, Result};
@@ -7,6 +10,11 @@ use crate::raft::{uuid_to_node_id, NodeInfo, NodeState, RaftCommand, RaftOp};
 
 use super::token::generate_deterministic_token;
 use super::ModeController;
+
+fn clear_pending_join(pending_joins: &Arc<Mutex<Vec<Uuid>>>, host_id: Uuid) {
+    let mut pending = pending_joins.lock();
+    pending.retain(|id| *id != host_id);
+}
 
 impl ModeController {
     /// Record that a node has been approved to join the cluster.
@@ -238,42 +246,72 @@ impl ModeController {
     /// or `auto_join`), and spawns an async task to propose `JoinNode` +
     /// `AssignTokens` via Raft.
     pub(super) fn trigger_cluster_join(&self, host_id: Uuid, addr: std::net::SocketAddr) {
-        // Track pending joins. Don't block retries — a previous attempt may
-        // have failed because Raft wasn't initialized yet.
+        let peer_node_id = uuid_to_node_id(host_id);
+
+        // Existing ring members are part of the current topology already.
+        // Cluster formation can produce a burst of duplicate inbound/outbound
+        // peer-connected callbacks before Raft is fully initialized; don't
+        // try to re-admit nodes that are already seeded into the ring.
+        if self
+            .token_ring()
+            .as_ref()
+            .is_some_and(|ring| ring.get_node(peer_node_id).is_some())
         {
-            let mut pending = self.pending_joins.lock();
-            if pending.contains(&host_id) {
-                tracing::debug!(peer = %host_id, "peer join already in progress, retrying");
-            } else {
-                pending.push(host_id);
+            tracing::debug!(peer = %host_id, node_id = peer_node_id, "peer already present in token ring, skipping join trigger");
+            return;
+        }
+
+        // Unapproved peers should be ignored without poisoning the pending set.
+        if !self.config.auto_join {
+            let approved = self.approved_nodes.lock();
+            if !approved.contains(&host_id) {
+                tracing::warn!(peer = %host_id, "peer not approved to join cluster, ignoring");
+                return;
             }
         }
 
+        // Track pending joins. Don't block retries — a previous attempt may
+        // still be running, but repeated callbacks for the same host should
+        // not enqueue duplicate JoinNode / AssignTokens proposals.
+        let pending_joins = self.pending_joins.clone();
+        {
+            let mut pending = pending_joins.lock();
+            if pending.contains(&host_id) {
+                tracing::debug!(peer = %host_id, "peer join already pending, skipping duplicate trigger");
+                return;
+            }
+            if pending.len() >= super::MAX_PENDING_JOINS {
+                tracing::warn!(
+                    cap = super::MAX_PENDING_JOINS,
+                    "pending_joins at capacity — evicting oldest entry"
+                );
+                pending.remove(0);
+            }
+            pending.push(host_id);
+        }
+
         // Capture state needed by the spawned task.
-        let approved_nodes = self.approved_nodes.lock().clone();
-        let peer_node_id = uuid_to_node_id(host_id);
         let raft_instance = self.raft_instance.clone();
         let config_clone = self.config.clone();
 
         self.spawn_tracked(async move {
-            // Check approval before touching Raft.
-            if !config_clone.auto_join && !approved_nodes.contains(&host_id) {
+            let mut raft = None;
+            for attempt in 0..60 {
+                if let Some(r) = &**raft_instance.load() {
+                    raft = Some(r.clone());
+                    break;
+                }
+                let backoff =
+                    std::time::Duration::from_millis(if attempt < 10 { 100 } else { 500 });
+                tokio::time::sleep(backoff).await;
+            }
+            let Some(raft) = raft else {
+                clear_pending_join(&pending_joins, host_id);
                 tracing::warn!(
                     peer = %host_id,
-                    "peer not approved to join cluster, ignoring"
+                    "raft not initialized yet, cannot admit peer"
                 );
                 return;
-            }
-
-            let raft = match &**raft_instance.load() {
-                Some(r) => r.clone(),
-                None => {
-                    tracing::warn!(
-                        peer = %host_id,
-                        "raft not initialized yet, cannot admit peer — will retry on next connect"
-                    );
-                    return;
-                }
             };
 
             let mut leader = None;
@@ -287,9 +325,10 @@ impl ModeController {
                 tokio::time::sleep(backoff).await;
             }
             let Some(leader) = leader else {
+                clear_pending_join(&pending_joins, host_id);
                 tracing::warn!(
                     peer = %host_id,
-                    "raft leader not elected yet, cannot admit peer — will retry on next connect"
+                    "raft leader not elected yet, cannot admit peer"
                 );
                 return;
             };
@@ -309,6 +348,7 @@ impl ModeController {
                 schema_version: Uuid::new_v4(),
             };
             if let Err(e) = raft.client_write(join_cmd).await {
+                clear_pending_join(&pending_joins, host_id);
                 tracing::warn!(peer = %host_id, leader, %e, "JoinNode proposal failed");
                 return;
             }
@@ -327,6 +367,7 @@ impl ModeController {
                 schema_version: Uuid::new_v4(),
             };
             if let Err(e) = raft.client_write(assign_cmd).await {
+                clear_pending_join(&pending_joins, host_id);
                 tracing::warn!(peer = %host_id, leader, %e, "AssignTokens proposal failed");
                 return;
             }

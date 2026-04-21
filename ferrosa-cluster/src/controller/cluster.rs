@@ -856,8 +856,11 @@ impl ModeController {
                     // non-leader forwards a PairDdlForward to the leader, the
                     // leader proposes it through Raft rather than applying
                     // directly (which would bypass consensus).
-                    let cluster_ddl_handler =
-                        Arc::new(ClusterDdlForwardHandler::new(raft_arc.clone()));
+                    let cluster_ddl_handler = Arc::new(ClusterDdlForwardHandler::new(
+                        raft_arc.clone(),
+                        peer_manager_for_ddl.clone(),
+                        node_map_for_ddl.clone(),
+                    ));
                     registry.register(MsgType::PairDdlForward, cluster_ddl_handler);
 
                     ddl_path.store(Arc::new(DdlPath::Cluster {

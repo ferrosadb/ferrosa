@@ -445,7 +445,7 @@ mod tests {
                 durable_writes: true,
                 replication: ReplicationParams {
                     strategy: "SimpleStrategy".to_string(),
-                    options: HashMap::new(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
                 },
             })
             .unwrap();
@@ -458,7 +458,7 @@ mod tests {
                 durable_writes: true,
                 replication: ReplicationParams {
                     strategy: "SimpleStrategy".to_string(),
-                    options: HashMap::new(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
                 },
             })
             .unwrap();

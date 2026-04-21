@@ -366,6 +366,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let storage = Arc::new(storage);
 
+    // Register persisted system tables before any local schema restore or
+    // cluster-mode Raft replay. Without this, the cluster state machine's
+    // SystemTableWriter hits "table not registered: system_schema.*" during
+    // startup replay and drops the persistence side effect until a later
+    // rewrite happens to touch the same metadata again.
+    if let Err(e) = storage.register_system_tables() {
+        tracing::warn!(%e, "failed to register system tables at startup");
+    }
+
     // Replay any pending S3 uploads that were interrupted by a crash.
     storage.replay_pending_uploads().await;
 
@@ -583,9 +592,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "require_tls",
         "false",
     );
+    let cql_max_connections: usize = config_val(
+        "FERROSA_CQL_MAX_CONNECTIONS",
+        &file_config,
+        "cql",
+        "max_connections",
+        "1024",
+    )
+    .parse()?;
+    let cql_max_connections_per_ip: usize = config_val(
+        "FERROSA_CQL_MAX_CONNECTIONS_PER_IP",
+        &file_config,
+        "cql",
+        "max_connections_per_ip",
+        "64",
+    )
+    .parse()?;
     let cql_config = ferrosa_cql::server::ServerConfig {
         bind_addr: cql_bind,
         auth_disabled: auth_disabled_str == "true" || auth_disabled_str == "1",
+        max_connections: cql_max_connections,
+        max_connections_per_ip: cql_max_connections_per_ip,
         tls_cert_path: if cql_tls_cert.is_empty() {
             None
         } else {
