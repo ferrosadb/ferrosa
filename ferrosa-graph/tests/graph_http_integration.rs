@@ -16,10 +16,25 @@ use serde_json::Value;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use bytes::Bytes;
+use ferrosa_cluster::consistency::ConsistencyLevel;
+use ferrosa_cluster::coordinator::ClusterCoordinator;
+use ferrosa_cluster::raft::handlers::{
+    partition_to_wire, RangeReadResponsePayload, ReadResponsePayload,
+};
+use ferrosa_cluster::raft::{NodeInfo, NodeState};
+use ferrosa_cluster::ring::TokenRing;
 use ferrosa_common::schema::TableSchema;
 use ferrosa_graph::engine::GraphEngine;
 use ferrosa_graph::executor::expand::GraphEngineConfig;
 use ferrosa_graph::http::{build_router, AppState};
+use ferrosa_net::codec::MsgType;
+use ferrosa_net::config::NetConfig;
+use ferrosa_net::message::Message;
+use ferrosa_net::peer::{PeerEventListener, PeerManager};
+use ferrosa_net::rpc::handler::PeerId;
+use ferrosa_net::rpc::server::RpcServer;
+use ferrosa_net::rpc::{HandlerRegistry, InboundPeerCallback, RpcHandler};
 use ferrosa_schema::auth::bootstrap::{
     seed_default_roles, SEED_APP_PASSWORD, SEED_APP_READER_USER, SEED_GRAPH_ENGINE_USER,
 };
@@ -31,6 +46,7 @@ use ferrosa_schema::{
     AuthMethod, DeploymentMode, EnvSecretsProvider, GrantEntry, PasswordHasher, PasswordPolicy,
     Permission, RateLimitConfig, Resource, Schema, SchemaConfig, TestAuditSink,
 };
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 use ferrosa_storage::{
     CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
 };
@@ -272,6 +288,14 @@ fn build_app(schema: Arc<Schema>, storage: Arc<StorageEngine>) -> axum::Router {
     let write_path = Arc::new(arc_swap::ArcSwap::from_pointee(
         ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage)),
     ));
+    build_app_with_write_path(schema, storage, write_path)
+}
+
+fn build_app_with_write_path(
+    schema: Arc<Schema>,
+    storage: Arc<StorageEngine>,
+    write_path: Arc<arc_swap::ArcSwap<ferrosa_cluster::write_path::WritePath>>,
+) -> axum::Router {
     let engine = Arc::new(GraphEngine::new(
         Arc::clone(&schema),
         Arc::clone(&storage),
@@ -285,6 +309,85 @@ fn build_app(schema: Arc<Schema>, storage: Arc<StorageEngine>) -> axum::Router {
         auth_disabled: false,
     };
     build_router(state)
+}
+
+#[derive(Debug)]
+struct NoopPeerListener;
+
+impl PeerEventListener for NoopPeerListener {
+    fn on_peer_connected(&self, _peer: PeerId) {}
+    fn on_peer_disconnected(&self, _peer: PeerId) {}
+    fn on_peer_suspected(&self, _peer: PeerId) {}
+    fn on_peer_recovered(&self, _peer_id: Uuid) {}
+    fn on_peer_failed(&self, _peer_id: Uuid) {}
+}
+
+impl InboundPeerCallback for NoopPeerListener {
+    fn on_inbound_peer(&self, _peer_id: PeerId, _cql_broadcast: Option<String>) {}
+}
+
+struct RemoteAnchorHandler {
+    partition: Partition,
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for RemoteAnchorHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        match msg {
+            Message::ReadRequest(_) => Some(Message::ReadResponse(Bytes::from(
+                bincode::serialize(&ReadResponsePayload {
+                    found: true,
+                    partition: Some(partition_to_wire(self.partition.clone())),
+                    digest: None,
+                    timestamp: self
+                        .partition
+                        .rows
+                        .iter()
+                        .flat_map(|row| row.cells.iter().map(|(_, cell)| cell.timestamp))
+                        .max()
+                        .unwrap_or(i64::MIN),
+                    has_more: false,
+                    next_page_state: vec![],
+                })
+                .unwrap(),
+            ))),
+            Message::RangeReadRequest(_) => Some(Message::RangeReadResponse(Bytes::from(
+                bincode::serialize(&RangeReadResponsePayload {
+                    partitions: vec![],
+                    truncated: false,
+                })
+                .unwrap(),
+            ))),
+            _ => None,
+        }
+    }
+}
+
+async fn start_graph_rpc_server(
+    handler: Arc<dyn RpcHandler>,
+) -> (Arc<RpcServer>, std::net::SocketAddr, Uuid) {
+    let config = NetConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        ..NetConfig::default()
+    };
+    let server_id = Uuid::new_v4();
+    let registry = Arc::new(HandlerRegistry::new());
+    registry.register(MsgType::ReadRequest, handler.clone());
+    registry.register(MsgType::RangeReadRequest, handler);
+    let server = Arc::new(RpcServer::new(config, server_id, registry));
+    let addr = server.start_and_get_addr().await.unwrap();
+    (server, addr, server_id)
+}
+
+fn make_cluster_node(addr: &str, host_id: Uuid) -> NodeInfo {
+    NodeInfo {
+        host_id,
+        addr: addr.to_string(),
+        data_center: "dc1".to_string(),
+        rack: "rack1".to_string(),
+        state: NodeState::Normal,
+        cql_broadcast: None,
+    }
 }
 
 fn json_request(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
@@ -327,6 +430,81 @@ async fn health_check_no_auth_required() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = response_json(resp).await;
     assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn cluster_anchor_full_primary_key_match_reads_remote_vertex_without_range_scan() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    let person_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let key_bytes = person_id.as_bytes().to_vec();
+    let (token, _) = ferrosa_common::murmur3::hash3_x64_128(&key_bytes, 0);
+    let partition = Partition {
+        key: ferrosa_common::key::DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
+            key_bytes.clone(),
+        )),
+        deletion: DeletionTime::LIVE,
+        static_row: None,
+        rows: vec![Row {
+            clustering: vec![],
+            cells: vec![(0, ferrosa_common::CellValue::live(b"Alice".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        }],
+    };
+
+    let (server, addr, remote_host_id) =
+        start_graph_rpc_server(Arc::new(RemoteAnchorHandler { partition })).await;
+
+    let local_node_id = 1u64;
+    let remote_node_id = 2u64;
+    let local_host_id = Uuid::new_v4();
+    let mut ring = TokenRing::new();
+    ring.add_node(
+        local_node_id,
+        make_cluster_node("127.0.0.1:7000", local_host_id),
+    );
+    ring.add_node(
+        remote_node_id,
+        make_cluster_node(&addr.to_string(), remote_host_id),
+    );
+    ring.assign_tokens(remote_node_id, &[token]);
+    ring.assign_tokens(local_node_id, &[token.wrapping_add(1)]);
+
+    let peer_manager = Arc::new(PeerManager::new(
+        Arc::new(NetConfig::default()),
+        local_host_id,
+        Arc::new(NoopPeerListener),
+    ));
+    let coordinator = Arc::new(ClusterCoordinator::new(
+        Arc::new(arc_swap::ArcSwap::from_pointee(ring)),
+        peer_manager,
+        local_node_id,
+        Arc::clone(&storage),
+        1,
+        ConsistencyLevel::One,
+    ));
+    let write_path = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ferrosa_cluster::write_path::WritePath::cluster(coordinator),
+    ));
+    let app = build_app_with_write_path(Arc::clone(&schema), Arc::clone(&storage), write_path);
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": format!("MATCH (n:Person {{id: '{person_id}'}}) RETURN n.name"),
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    assert_eq!(body["rows"], serde_json::json!([["Alice"]]));
+
+    server.shutdown(std::time::Duration::from_millis(50)).await;
 }
 
 #[tokio::test]

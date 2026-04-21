@@ -310,16 +310,30 @@ async fn execute_expand(
         );
     }
 
-    // Storage path: read all partitions from the anchor table.
     let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
-    let anchor_partitions = write_path.range_read(&anchor_table_id).await?;
+    let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
+    let anchor_partitions = if let Some(meta) = anchor_meta.as_ref() {
+        if let Some((key, _clustering)) =
+            build_direct_lookup_shape(meta, &HashMap::new(), &anchor.props, &HashMap::new())?
+        {
+            let strategy = graph_replication_strategy(schema, &anchor.table.keyspace)?;
+            write_path
+                .pk_read(&anchor_table_id, &key, ConsistencyLevel::One, &strategy)
+                .await?
+                .into_iter()
+                .collect()
+        } else {
+            write_path.range_read(&anchor_table_id).await?
+        }
+    } else {
+        write_path.range_read(&anchor_table_id).await?
+    };
     stats.vertices_read += anchor_partitions.len();
     check_timeout(start, config.query_timeout)?;
 
     // Resolve column names from schema for property mapping.
     let anchor_col_names =
         column_names_for_table(schema, &anchor.table.keyspace, &anchor.table.table);
-    let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
 
     // Apply WHERE filters to anchor partitions using the expression evaluator.
     // Skip partitions that are fully tombstoned (no live cells in any row

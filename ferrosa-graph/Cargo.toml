@@ -31,7 +31,11 @@ uuid = { version = "1", features = ["v4"] }
 blake3 = "1"
 
 [dev-dependencies]
+async-trait = "0.1"
+bincode = "1"
 base64 = "0.22"
+bytes = "1"
+ferrosa-net = { path = "../ferrosa-net" }
 proptest = "1"
 serde_json = "1"
 tempfile = "3"
