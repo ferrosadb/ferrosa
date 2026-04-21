@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -84,6 +85,33 @@ impl PeerManager {
             .try_read()
             .map(|peers| peers.contains_key(&host_id))
             .unwrap_or(false)
+    }
+
+    /// Ensure there is an outbound connection pool for `host_id`.
+    ///
+    /// Uses the provided address string (IP:port or resolvable hostname:port)
+    /// to establish the pool if one is not already present.
+    pub async fn ensure_peer(&self, host_id: uuid::Uuid, addr: &str) -> crate::error::Result<()> {
+        if self.has_peer(host_id) {
+            return Ok(());
+        }
+
+        let resolved = addr
+            .to_socket_addrs()
+            .map_err(|e| {
+                crate::error::NetError::Protocol(format!("invalid peer address '{addr}': {e}"))
+            })?
+            .next()
+            .ok_or_else(|| {
+                crate::error::NetError::Protocol(format!(
+                    "peer address '{addr}' resolved to no socket addresses"
+                ))
+            })?;
+
+        let pool = PriorityPool::connect(self.config.clone(), self.local_host_id, addr, None, None)
+            .await?;
+        self.add_peer((host_id, resolved), pool).await;
+        Ok(())
     }
 
     /// Add a peer entry without a connection pool (for unit testing).
@@ -339,7 +367,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::codec::MsgType;
     use crate::config::NetConfig;
+    use crate::message::Message;
+    use crate::rpc::handler::{HandlerRegistry, RpcHandler};
+    use crate::rpc::server::RpcServer;
 
     struct TestListener {
         connected_count: AtomicUsize,
@@ -376,6 +408,22 @@ mod tests {
         }
         fn on_peer_failed(&self, _peer_id: uuid::Uuid) {
             self.failed_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct EchoPingHandler;
+
+    #[async_trait::async_trait]
+    impl RpcHandler for EchoPingHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            match msg {
+                Message::Ping { nonce, .. } => Some(Message::Pong {
+                    nonce,
+                    ping_recv_at: 0,
+                    sent_at: 0,
+                }),
+                _ => None,
+            }
         }
     }
 
@@ -549,5 +597,42 @@ mod tests {
             )
             .await;
         assert!(result.is_err(), "fire to unknown peer should fail");
+    }
+
+    #[tokio::test]
+    async fn ensure_peer_connects_and_caches_pool() {
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+
+        let server_id = uuid::Uuid::new_v4();
+        let registry = Arc::new(HandlerRegistry::new());
+        registry.register(MsgType::Ping, Arc::new(EchoPingHandler));
+        let server = Arc::new(RpcServer::new(config.clone(), server_id, registry));
+        let addr = server.start_and_get_addr().await.unwrap();
+
+        let listener = Arc::new(TestListener::new());
+        let pm = PeerManager::new(Arc::new(config), uuid::Uuid::new_v4(), listener.clone());
+
+        pm.ensure_peer(server_id, &addr.to_string()).await.unwrap();
+
+        assert!(pm.has_peer(server_id), "ensure_peer should cache the pool");
+        assert_eq!(listener.connected_count.load(Ordering::Relaxed), 1);
+
+        let resp = pm
+            .send(
+                server_id,
+                Message::Ping {
+                    nonce: 99,
+                    sent_at: 0,
+                },
+                Lane::Data,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Message::Pong { nonce: 99, .. }));
+
+        server.shutdown(Duration::from_millis(50)).await;
     }
 }
