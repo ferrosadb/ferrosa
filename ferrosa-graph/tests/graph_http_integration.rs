@@ -1627,6 +1627,295 @@ fn register_memory_tables_with_storage(storage: &StorageEngine) {
     }
 }
 
+fn create_agent_memory_real_graph_schema(schema: &Schema) {
+    let auth = superuser_auth();
+
+    schema
+        .create_keyspace(
+            KeyspaceMetadata {
+                name: "agent_memory".to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: {
+                        let mut m = HashMap::new();
+                        m.insert("replication_factor".to_string(), "1".to_string());
+                        m
+                    },
+                },
+            },
+            &auth,
+        )
+        .unwrap();
+
+    schema
+        .grant(
+            "cassandra",
+            &Resource::Keyspace("agent_memory".to_string()),
+            HashSet::from([
+                Permission::Select,
+                Permission::Modify,
+                Permission::Create,
+                Permission::Drop,
+                Permission::Alter,
+                Permission::Authorize,
+            ]),
+            &auth,
+        )
+        .unwrap();
+
+    let mut entity_cols = IndexMap::new();
+    entity_cols.insert(
+        "tenant_id".to_string(),
+        ColumnMetadata {
+            name: "tenant_id".to_string(),
+            kind: ColumnKind::PartitionKey,
+            position: 0,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    entity_cols.insert(
+        "session_id".to_string(),
+        ColumnMetadata {
+            name: "session_id".to_string(),
+            kind: ColumnKind::PartitionKey,
+            position: 1,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    entity_cols.insert(
+        "entity_id".to_string(),
+        ColumnMetadata {
+            name: "entity_id".to_string(),
+            kind: ColumnKind::Clustering,
+            position: 0,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::Asc,
+            mask: None,
+        },
+    );
+    entity_cols.insert(
+        "entity_name".to_string(),
+        ColumnMetadata {
+            name: "entity_name".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "text".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+
+    let mut entity_ext = HashMap::new();
+    entity_ext.insert("graph.type".to_string(), "vertex".to_string());
+    entity_ext.insert("graph.label".to_string(), "Entity".to_string());
+
+    schema
+        .create_table(
+            TableMetadata {
+                keyspace: "agent_memory".to_string(),
+                name: "entity_store".to_string(),
+                id: Uuid::new_v4(),
+                columns: entity_cols,
+                partition_key: vec!["tenant_id".to_string(), "session_id".to_string()],
+                clustering_key: vec![("entity_id".to_string(), ClusteringOrder::Asc)],
+                params: TableParams::default(),
+                flags: HashSet::new(),
+                extensions: entity_ext,
+                is_system: false,
+            },
+            &auth,
+        )
+        .unwrap();
+
+    let mut edge_cols = IndexMap::new();
+    edge_cols.insert(
+        "tenant_id".to_string(),
+        ColumnMetadata {
+            name: "tenant_id".to_string(),
+            kind: ColumnKind::PartitionKey,
+            position: 0,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    edge_cols.insert(
+        "session_id".to_string(),
+        ColumnMetadata {
+            name: "session_id".to_string(),
+            kind: ColumnKind::PartitionKey,
+            position: 1,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    edge_cols.insert(
+        "src_id".to_string(),
+        ColumnMetadata {
+            name: "src_id".to_string(),
+            kind: ColumnKind::Clustering,
+            position: 0,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::Asc,
+            mask: None,
+        },
+    );
+    edge_cols.insert(
+        "edge_type".to_string(),
+        ColumnMetadata {
+            name: "edge_type".to_string(),
+            kind: ColumnKind::Clustering,
+            position: 1,
+            column_type: "text".to_string(),
+            clustering_order: ClusteringOrder::Asc,
+            mask: None,
+        },
+    );
+    edge_cols.insert(
+        "dst_id".to_string(),
+        ColumnMetadata {
+            name: "dst_id".to_string(),
+            kind: ColumnKind::Clustering,
+            position: 2,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::Asc,
+            mask: None,
+        },
+    );
+    edge_cols.insert(
+        "weight".to_string(),
+        ColumnMetadata {
+            name: "weight".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "double".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    edge_cols.insert(
+        "metadata".to_string(),
+        ColumnMetadata {
+            name: "metadata".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "text".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    edge_cols.insert(
+        "created_at".to_string(),
+        ColumnMetadata {
+            name: "created_at".to_string(),
+            kind: ColumnKind::Regular,
+            position: -1,
+            column_type: "timestamp".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+
+    let mut edge_ext = HashMap::new();
+    edge_ext.insert("graph.type".to_string(), "edge".to_string());
+    edge_ext.insert("graph.label".to_string(), "TYPED_EDGE".to_string());
+    edge_ext.insert("graph.source".to_string(), "src_id".to_string());
+    edge_ext.insert("graph.target".to_string(), "dst_id".to_string());
+    edge_ext.insert("graph.source_label".to_string(), "Entity".to_string());
+    edge_ext.insert("graph.target_label".to_string(), "Entity".to_string());
+
+    schema
+        .create_table(
+            TableMetadata {
+                keyspace: "agent_memory".to_string(),
+                name: "typed_edges".to_string(),
+                id: Uuid::new_v4(),
+                columns: edge_cols,
+                partition_key: vec!["tenant_id".to_string(), "session_id".to_string()],
+                clustering_key: vec![
+                    ("src_id".to_string(), ClusteringOrder::Asc),
+                    ("edge_type".to_string(), ClusteringOrder::Asc),
+                    ("dst_id".to_string(), ClusteringOrder::Asc),
+                ],
+                params: TableParams::default(),
+                flags: HashSet::new(),
+                extensions: edge_ext,
+                is_system: false,
+            },
+            &auth,
+        )
+        .unwrap();
+}
+
+fn register_agent_memory_real_tables_with_storage(storage: &StorageEngine) {
+    for (keyspace, table) in [
+        ("agent_memory", "entity_store"),
+        ("agent_memory", "typed_edges"),
+    ] {
+        let schema = TableSchema {
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            key_type: "org.apache.cassandra.db.marshal.BytesType".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![],
+            extensions: HashMap::new(),
+        };
+        storage.register_table(schema).unwrap();
+    }
+}
+
+fn encode_composite_partition_key(components: &[&[u8]]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for component in components {
+        buf.extend_from_slice(&(component.len() as u16).to_be_bytes());
+        buf.extend_from_slice(component);
+        buf.push(0x00);
+    }
+    buf
+}
+
+fn encode_multi_clustering_key(components: &[&[u8]]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for component in components {
+        buf.extend_from_slice(&(component.len() as u16).to_be_bytes());
+        buf.extend_from_slice(component);
+    }
+    buf
+}
+
+fn seed_agent_memory_entity(
+    storage: &StorageEngine,
+    tenant_id: Uuid,
+    session_id: Uuid,
+    entity_id: Uuid,
+    entity_name: &str,
+) {
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    use ferrosa_storage::TableId;
+
+    let key = DecoratedKey::new(PartitionKey::new(encode_composite_partition_key(&[
+        tenant_id.as_bytes(),
+        session_id.as_bytes(),
+    ])));
+    let row = Row {
+        clustering: entity_id.as_bytes().to_vec(),
+        cells: vec![(0, CellValue::live(entity_name.as_bytes().to_vec(), 1))],
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness: LivenessInfo::with_timestamp(1),
+    };
+    storage
+        .write(&TableId::new("agent_memory", "entity_store"), &key, row, 1)
+        .unwrap();
+}
+
 /// The canonical ferrosa-memory typed-edge upsert must work via the public Cypher API.
 ///
 /// Cypher shape (mirrors ferrosa-memory's planned migration target):
@@ -1644,6 +1933,183 @@ const MIGRATION_TYPED_EDGE_UPSERT: &str = "MERGE (a:Entity {entity_id: 'src-001'
 const MIGRATION_TYPED_EDGE_MATCH_COUNT: &str =
     "MATCH (a:Entity {entity_id: 'src-001'})-[r:TYPED_EDGE {edge_type: 'folded_into'}]->\
      (b:Entity {entity_id: 'dst-001'}) RETURN count(r)";
+
+#[tokio::test]
+async fn full_shape_typed_edge_merge_materializes_real_agent_memory_row() {
+    use ferrosa_common::key::{DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+
+    let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let src_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let dst_id = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+    let (schema, storage, _dir) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+
+    let query = format!(
+        "MERGE (a:Entity {{entity_id: '{src_id}'}}) \
+         MERGE (b:Entity {{entity_id: '{dst_id}'}}) \
+         MERGE (a)-[r:TYPED_EDGE {{edge_type: 'related_to'}}]->(b) \
+         SET r.tenant_id = '{tenant_id}', \
+             r.session_id = '{session_id}', \
+             r.weight = 1.0, \
+             r.metadata = '{{}}' \
+         RETURN r"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "public TYPED_EDGE MERGE must accept the real agent_memory shape"
+    );
+
+    let partition_key =
+        encode_composite_partition_key(&[tenant_id.as_bytes(), session_id.as_bytes()]);
+    let clustering =
+        encode_multi_clustering_key(&[src_id.as_bytes(), b"related_to", dst_id.as_bytes()]);
+    let partition = storage
+        .read(
+            &TableId::new("agent_memory", "typed_edges"),
+            &DecoratedKey::new(PartitionKey::new(partition_key)),
+        )
+        .unwrap()
+        .expect("typed_edges partition must exist after public MERGE");
+    assert!(
+        partition
+            .rows
+            .iter()
+            .any(|row| row.clustering == clustering),
+        "public MERGE must materialize a row in the real agent_memory.typed_edges clustering shape"
+    );
+}
+
+#[tokio::test]
+async fn full_shape_typed_edge_merge_writes_real_agent_memory_adjacency() {
+    use ferrosa_common::key::{DecoratedKey, PartitionKey};
+    use ferrosa_graph::executor::expand::extract_neighbor_id;
+    use ferrosa_storage::TableId;
+
+    let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let src_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let dst_id = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+    let (schema, storage, _dir) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+
+    let query = format!(
+        "MERGE (a:Entity {{entity_id: '{src_id}'}}) \
+         MERGE (b:Entity {{entity_id: '{dst_id}'}}) \
+         MERGE (a)-[r:TYPED_EDGE {{edge_type: 'related_to'}}]->(b) \
+         SET r.tenant_id = '{tenant_id}', \
+             r.session_id = '{session_id}', \
+             r.weight = 1.0 \
+         RETURN r"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let adjacency = storage
+        .read(
+            &TableId::new("system_graph_agent_memory", "adjacency"),
+            &DecoratedKey::new(PartitionKey::new(src_id.as_bytes().to_vec())),
+        )
+        .unwrap()
+        .expect("adjacency partition for src_id must exist after real typed_edges MERGE");
+    assert!(
+        adjacency.rows.iter().any(|row| {
+            extract_neighbor_id(&row.clustering, Some("TYPED_EDGE")) == Some(dst_id.as_bytes().to_vec())
+        }),
+        "adjacency observer must key real typed_edges entries by src_id and dst_id, not by the table's composite partition bytes"
+    );
+}
+
+#[tokio::test]
+async fn full_shape_typed_edge_merge_is_immediately_matchable_in_real_agent_memory_schema() {
+    let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let session_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let src_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let dst_id = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").unwrap();
+
+    let (schema, storage, _dir) = setup();
+    create_agent_memory_real_graph_schema(&schema);
+    register_agent_memory_real_tables_with_storage(&storage);
+    seed_agent_memory_entity(&storage, tenant_id, session_id, src_id, "src");
+    seed_agent_memory_entity(&storage, tenant_id, session_id, dst_id, "dst");
+
+    let merge_query = format!(
+        "MERGE (a:Entity {{entity_id: '{src_id}'}}) \
+         MERGE (b:Entity {{entity_id: '{dst_id}'}}) \
+         MERGE (a)-[r:TYPED_EDGE {{edge_type: 'related_to'}}]->(b) \
+         SET r.tenant_id = '{tenant_id}', \
+             r.session_id = '{session_id}', \
+             r.weight = 1.0 \
+         RETURN r"
+    );
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": merge_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let match_query = format!(
+        "MATCH (a:Entity {{entity_id: '{src_id}'}})-[r:TYPED_EDGE {{edge_type: 'related_to'}}]->\
+         (b:Entity {{entity_id: '{dst_id}'}}) RETURN count(r)"
+    );
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": match_query,
+            "keyspace": "agent_memory"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"]
+        .as_array()
+        .expect("MATCH count response must include rows");
+    assert_eq!(rows.len(), 1);
+    let count = rows[0][0]
+        .as_i64()
+        .expect("count(r) must serialize as a JSON integer");
+    assert_eq!(
+        count, 1,
+        "real agent_memory graph rows must be immediately matchable after public MERGE"
+    );
+}
 
 /// ferrosa-memory folded_into edge shape.
 const MIGRATION_FOLDED_INTO: &str = "MERGE (a:Entity {entity_id: 'fold-src'}) \
@@ -1721,16 +2187,8 @@ async fn migration_proof_typed_edge_upsert_materializes_and_matches() {
         "typed-edge upsert response must include 'rows'"
     );
 
-    let src_key_bytes = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"entity_id\x00src-001\x00");
-        h.finalize().as_bytes().to_vec()
-    };
-    let dst_key_bytes = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"entity_id\x00dst-001\x00");
-        h.finalize().as_bytes().to_vec()
-    };
+    let src_key_bytes = b"src-001".to_vec();
+    let dst_key_bytes = b"dst-001".to_vec();
 
     let typed_edge_tid = TableId::new("memory", "typed_edge_e");
     let src_key = DecoratedKey::new(PartitionKey::new(src_key_bytes));

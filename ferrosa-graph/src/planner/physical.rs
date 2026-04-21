@@ -28,6 +28,8 @@ pub struct Hop {
     pub vertex_table: Option<ResolvedTable>,
     /// Property filter expressions from the relationship pattern.
     pub prop_filters: PropMap,
+    /// Property constraints from the destination node pattern.
+    pub target_props: PropMap,
 }
 
 /// The anchor (starting point) of a graph traversal.
@@ -37,6 +39,8 @@ pub struct Anchor {
     pub var: Option<String>,
     /// Resolved table for the anchor.
     pub table: ResolvedTable,
+    /// Property constraints from the anchor node pattern.
+    pub props: PropMap,
     /// Filter expressions that apply to the anchor.
     pub filters: Vec<Expr>,
 }
@@ -905,9 +909,14 @@ fn plan_match(
                     // Look up the binding for this node.
                     if let Some(var_name) = var {
                         if let Some(resolved) = bindings.get(var_name) {
+                            let props = match &elements[i] {
+                                Pattern::Node { props, .. } => props.clone(),
+                                _ => vec![],
+                            };
                             anchor = Some(Anchor {
                                 var: var.clone(),
                                 table: resolved.clone(),
+                                props,
                                 filters: filters.clone(),
                             });
                             i += 1;
@@ -918,9 +927,14 @@ fn plan_match(
                     if let Some(_label_str) = label {
                         if let Some(var_name) = var {
                             if let Some(resolved) = bindings.get(var_name) {
+                                let props = match &elements[i] {
+                                    Pattern::Node { props, .. } => props.clone(),
+                                    _ => vec![],
+                                };
                                 anchor = Some(Anchor {
                                     var: var.clone(),
                                     table: resolved.clone(),
+                                    props,
                                     filters: filters.clone(),
                                 });
                                 i += 1;
@@ -958,15 +972,15 @@ fn plan_match(
                 });
 
                 // Look for the next node.
-                let (next_var, vertex_table) = if i + 1 < elements.len() {
-                    if let Pattern::Node { var, .. } = &elements[i + 1] {
+                let (next_var, vertex_table, target_props) = if i + 1 < elements.len() {
+                    if let Pattern::Node { var, props, .. } = &elements[i + 1] {
                         let vt = var.as_ref().and_then(|v| bindings.get(v)).cloned();
-                        (var.clone(), vt)
+                        (var.clone(), vt, props.clone())
                     } else {
-                        (None, None)
+                        (None, None, vec![])
                     }
                 } else {
-                    (None, None)
+                    (None, None, vec![])
                 };
 
                 // If this is a variable-length path, we handle it specially
@@ -980,6 +994,7 @@ fn plan_match(
                         edge_table,
                         vertex_table,
                         prop_filters: props.clone(),
+                        target_props,
                     };
 
                     let clamped_max = max_opt.map(|m| m.min(MAX_VAR_HOPS)).unwrap_or(MAX_VAR_HOPS);
@@ -1007,6 +1022,7 @@ fn plan_match(
                     edge_table,
                     vertex_table,
                     prop_filters: props.clone(),
+                    target_props,
                 });
                 i += 2; // Skip rel + node
             }

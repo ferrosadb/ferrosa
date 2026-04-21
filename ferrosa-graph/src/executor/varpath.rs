@@ -383,6 +383,7 @@ mod tests {
         Anchor {
             var: Some(var.to_string()),
             table: person_table(),
+            props: vec![],
             filters: vec![],
         }
     }
@@ -396,6 +397,7 @@ mod tests {
             edge_table: None,
             vertex_table: Some(person_table()),
             prop_filters: vec![],
+            target_props: vec![],
         }
     }
 
@@ -507,6 +509,7 @@ mod tests {
         let anchor = Anchor {
             var: Some("a".to_string()),
             table: person_table(),
+            props: vec![],
             filters: vec![],
         };
 

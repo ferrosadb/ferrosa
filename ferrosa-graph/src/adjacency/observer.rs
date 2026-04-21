@@ -62,6 +62,12 @@ impl WriteObserver for AdjacencyIndexObserver {
         {
             return vec![];
         }
+        let Some(source_col) = meta.extensions.get("graph.source") else {
+            return vec![];
+        };
+        let Some(target_col) = meta.extensions.get("graph.target") else {
+            return vec![];
+        };
 
         let adj_ks = adjacency_keyspace_name(&self.keyspace);
         // Use the graph label from schema extensions (e.g. "KNOWS") so that the
@@ -74,13 +80,16 @@ impl WriteObserver for AdjacencyIndexObserver {
             .unwrap_or_else(|| table.table.clone());
         let edge_table = format!("{}.{}", table.keyspace, table.table);
 
-        // For Phase 1: the source vertex ID is the partition key bytes,
-        // the target vertex ID is extracted from clustering/cells.
-        let source_id = mutation.key.key.as_bytes().to_vec();
-
         let mut derived = Vec::new();
         for row in &mutation.rows {
-            let target_id = row.clustering.clone();
+            let Some(source_id) = extract_graph_column_bytes(meta, mutation, row, source_col)
+            else {
+                continue;
+            };
+            let Some(target_id) = extract_graph_column_bytes(meta, mutation, row, target_col)
+            else {
+                continue;
+            };
 
             // OUT entry: (source -> target)
             derived.push(make_adjacency_mutation(
@@ -156,6 +165,104 @@ pub(crate) fn make_adjacency_mutation(
         vec![row],
         timestamp,
     )
+}
+
+fn extract_graph_column_bytes(
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    mutation: &Mutation,
+    row: &ferrosa_sstable::types::Row,
+    column_name: &str,
+) -> Option<Vec<u8>> {
+    let column = meta.columns.get(column_name)?;
+    match column.kind {
+        ferrosa_schema::metadata::column::ColumnKind::PartitionKey => {
+            let idx = meta
+                .partition_key
+                .iter()
+                .position(|name| name == column_name)?;
+            let components =
+                decode_partition_components(mutation.key.key.as_bytes(), meta.partition_key.len())?;
+            components.get(idx).cloned()
+        }
+        ferrosa_schema::metadata::column::ColumnKind::Clustering => {
+            let idx = meta
+                .clustering_key
+                .iter()
+                .position(|(name, _)| name == column_name)?;
+            let components =
+                decode_clustering_components(&row.clustering, meta.clustering_key.len())?;
+            components.get(idx).cloned()
+        }
+        ferrosa_schema::metadata::column::ColumnKind::Regular
+        | ferrosa_schema::metadata::column::ColumnKind::Static => {
+            let mut regular_idx = 0u16;
+            for meta_col in meta.columns.values() {
+                match meta_col.kind {
+                    ferrosa_schema::metadata::column::ColumnKind::Regular
+                    | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                        if meta_col.name == column_name {
+                            return row
+                                .cells
+                                .iter()
+                                .find(|(idx, _)| *idx == regular_idx)
+                                .and_then(|(_, cell)| cell.value.clone());
+                        }
+                        regular_idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+    }
+}
+
+fn decode_partition_components(key: &[u8], count: usize) -> Option<Vec<Vec<u8>>> {
+    if count == 1 {
+        return Some(vec![key.to_vec()]);
+    }
+
+    let mut offset = 0usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 2 > key.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([key[offset], key[offset + 1]]) as usize;
+        offset += 2;
+        if offset + len > key.len() {
+            return None;
+        }
+        out.push(key[offset..offset + len].to_vec());
+        offset += len;
+        if offset >= key.len() {
+            return None;
+        }
+        offset += 1; // composite end-of-component marker
+    }
+    Some(out)
+}
+
+fn decode_clustering_components(clustering: &[u8], count: usize) -> Option<Vec<Vec<u8>>> {
+    if count == 1 {
+        return Some(vec![clustering.to_vec()]);
+    }
+
+    let mut offset = 0usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 2 > clustering.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([clustering[offset], clustering[offset + 1]]) as usize;
+        offset += 2;
+        if offset + len > clustering.len() {
+            return None;
+        }
+        out.push(clustering[offset..offset + len].to_vec());
+        offset += len;
+    }
+    Some(out)
 }
 
 #[cfg(test)]

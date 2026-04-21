@@ -20,8 +20,19 @@ use crate::error::{GraphError, Result};
 use crate::executor::aggregate::{create_accumulator, Accumulator};
 use crate::executor::eval;
 use crate::executor::result::{GraphResult, QueryStats};
-use crate::parser::{Expr, Literal, ReturnClause, ReturnItem, SortDir};
+use crate::parser::{CompareOp, Expr, Literal, ReturnClause, ReturnItem, SortDir};
 use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, MergeOp, PhysicalPlan};
+
+struct MergeWriteShape {
+    key: DecoratedKey,
+    clustering: Vec<u8>,
+    create_cells: Vec<(u16, CellValue)>,
+    used_schema_layout: bool,
+}
+
+struct MatchedTableRow {
+    json: serde_json::Value,
+}
 
 /// Configuration for the graph query engine (T4 DoS limits).
 #[derive(Debug, Clone)]
@@ -270,6 +281,7 @@ async fn execute_expand(
     // Resolve column names from schema for property mapping.
     let anchor_col_names =
         column_names_for_table(schema, &anchor.table.keyspace, &anchor.table.table);
+    let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
 
     // Apply WHERE filters to anchor partitions using the expression evaluator.
     // Skip partitions that are fully tombstoned (no live cells in any row
@@ -282,23 +294,51 @@ async fn execute_expand(
             continue;
         }
 
-        let hex_id = hex::encode(partition.key.key.as_bytes());
-        let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
-        let mut bindings = HashMap::new();
-        bindings.insert(anchor_var.to_string(), row_json);
+        if let Some(meta) = anchor_meta.as_ref() {
+            for row in &partition.rows {
+                let row_json = row_to_json(meta, partition, row);
+                if !prop_map_passes(anchor_var, &anchor.props, &row_json)? {
+                    continue;
+                }
 
-        let mut passes = true;
-        for filter in &anchor.filters {
-            if !eval::filter_passes(filter, &bindings)? {
-                passes = false;
-                break;
+                let mut bindings = HashMap::new();
+                bindings.insert(anchor_var.to_string(), row_json);
+
+                let mut passes = true;
+                for filter in &anchor.filters {
+                    if !eval::filter_passes(filter, &bindings)? {
+                        passes = false;
+                        break;
+                    }
+                }
+                if passes {
+                    let current_key = graph_vertex_lookup_key(meta, partition, row, &anchor.props)
+                        .unwrap_or_else(|| partition.key.clone());
+                    current_states.push(ExpandState {
+                        current_key,
+                        bindings,
+                    });
+                }
             }
-        }
-        if passes {
-            current_states.push(ExpandState {
-                current_key: partition.key.clone(),
-                bindings,
-            });
+        } else {
+            let hex_id = hex::encode(partition.key.key.as_bytes());
+            let row_json = eval::partition_to_json(partition, &hex_id, &anchor_col_names);
+            let mut bindings = HashMap::new();
+            bindings.insert(anchor_var.to_string(), row_json);
+
+            let mut passes = true;
+            for filter in &anchor.filters {
+                if !eval::filter_passes(filter, &bindings)? {
+                    passes = false;
+                    break;
+                }
+            }
+            if passes {
+                current_states.push(ExpandState {
+                    current_key: partition.key.clone(),
+                    bindings,
+                });
+            }
         }
     }
 
@@ -319,41 +359,42 @@ async fn execute_expand(
 
                 // If this hop has property filters and an edge table, read
                 // the edge partition once so we can check edge properties.
-                let edge_partition = if !hop.prop_filters.is_empty() || hop.rel_var.is_some() {
-                    if let Some(ref et) = hop.edge_table {
-                        let edge_tid = TableId::new(&et.keyspace, &et.table);
-                        write_path.read(&edge_tid, vertex_key).await?
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let edge_col_names = hop
+                let edge_meta = hop
                     .edge_table
                     .as_ref()
-                    .map(|et| column_names_for_table(schema, &et.keyspace, &et.table));
-                let vertex_table_id = hop
+                    .and_then(|et| table_metadata_for(schema, &et.keyspace, &et.table));
+                let vertex_meta = hop
                     .vertex_table
                     .as_ref()
-                    .map(|vt| TableId::new(&vt.keyspace, &vt.table));
-                let vertex_col_names = hop
-                    .vertex_table
-                    .as_ref()
-                    .map(|vt| column_names_for_table(schema, &vt.keyspace, &vt.table));
+                    .and_then(|vt| table_metadata_for(schema, &vt.keyspace, &vt.table));
 
                 for row in &partition.rows {
                     if let Some(neighbor_id) =
                         extract_neighbor_id(&row.clustering, hop.edge_label.as_deref())
                     {
+                        let edge_match = if !hop.prop_filters.is_empty() || hop.rel_var.is_some() {
+                            if let (Some(et), Some(meta)) =
+                                (hop.edge_table.as_ref(), edge_meta.as_ref())
+                            {
+                                let edge_tid = TableId::new(&et.keyspace, &et.table);
+                                find_edge_match(
+                                    write_path,
+                                    &edge_tid,
+                                    meta,
+                                    vertex_key.key.as_bytes(),
+                                    &neighbor_id,
+                                )
+                                .await?
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
                         // Apply property filters if present.
                         if !hop.prop_filters.is_empty()
-                            && !edge_row_passes_filters(
-                                edge_partition.as_ref(),
-                                &neighbor_id,
-                                &hop.prop_filters,
-                            )
+                            && !edge_row_passes_filters(edge_match.as_ref(), &hop.prop_filters)
                         {
                             continue;
                         }
@@ -363,29 +404,43 @@ async fn execute_expand(
                             neighbor_id.clone(),
                         ));
 
+                        let neighbor_json = if let (Some(vertex_tid), Some(meta)) = (
+                            hop.vertex_table
+                                .as_ref()
+                                .map(|vt| TableId::new(&vt.keyspace, &vt.table)),
+                            vertex_meta.as_ref(),
+                        ) {
+                            find_vertex_match(
+                                write_path,
+                                &vertex_tid,
+                                meta,
+                                &neighbor_id,
+                                hop.target_props.as_slice(),
+                                hop.var.as_deref().unwrap_or("_hop"),
+                            )
+                            .await?
+                            .map(|matched| matched.json)
+                        } else {
+                            None
+                        };
+
+                        if !hop.target_props.is_empty() && neighbor_json.is_none() {
+                            continue;
+                        }
+
                         if let Some(var_name) = &hop.var {
-                            let neighbor_json = if let (Some(vertex_tid), Some(col_names)) =
-                                (vertex_table_id.as_ref(), vertex_col_names.as_ref())
-                            {
-                                let neighbor_partition =
-                                    write_path.read(vertex_tid, &neighbor_key).await?;
-                                let neighbor_hex = hex::encode(&neighbor_id);
-                                if let Some(ref part) = neighbor_partition {
-                                    eval::partition_to_json(part, &neighbor_hex, col_names)
-                                } else {
-                                    serde_json::Value::String(neighbor_hex)
-                                }
-                            } else {
-                                serde_json::Value::String(hex::encode(&neighbor_id))
-                            };
-                            bindings.insert(var_name.clone(), neighbor_json);
+                            bindings.insert(
+                                var_name.clone(),
+                                neighbor_json.unwrap_or_else(|| {
+                                    serde_json::Value::String(hex::encode(&neighbor_id))
+                                }),
+                            );
                         }
 
                         if let Some(rel_var) = &hop.rel_var {
                             let edge_json = edge_binding_json(
                                 row,
-                                edge_partition.as_ref(),
-                                edge_col_names.as_deref(),
+                                edge_match.as_ref(),
                                 hop.edge_label.as_deref(),
                                 vertex_key,
                                 &neighbor_id,
@@ -464,57 +519,19 @@ async fn execute_expand(
 /// Check whether an edge row passes all property filters.
 ///
 /// Looks up the edge row in the given edge partition by matching the
-/// clustering key to `neighbor_id`. Then for each `(prop_name, expected_expr)`
-/// in `prop_filters`, compares the cell byte value against the expected
-/// literal's byte encoding. Returns `true` only if ALL filters match.
-///
-/// Without schema metadata we cannot map property names to column indices.
-/// As a heuristic, we compare each filter's expected byte value against
-/// every cell in the matching row -- if any cell matches, that filter passes.
-/// A future revision should thread column metadata for exact name-based lookup.
 fn edge_row_passes_filters(
-    edge_partition: Option<&ferrosa_sstable::types::Partition>,
-    neighbor_id: &[u8],
+    edge_match: Option<&MatchedTableRow>,
     prop_filters: &[(String, Expr)],
 ) -> bool {
-    let partition = match edge_partition {
-        Some(p) => p,
-        None => return false, // No edge data available; filter fails.
+    let Some(edge_match) = edge_match else {
+        return false;
     };
-
-    // Find the row whose clustering key matches the neighbor_id (target vertex).
-    let edge_row = partition.rows.iter().find(|r| r.clustering == neighbor_id);
-
-    let edge_row = match edge_row {
-        Some(r) => r,
-        None => return false, // No matching edge row found.
-    };
-
-    // Check each property filter.
-    for (_prop_name, expected_expr) in prop_filters {
-        let expected_bytes = match expr_to_bytes(expected_expr) {
-            Ok(b) => b,
-            Err(_) => return false, // Can't evaluate expression; filter fails.
-        };
-
-        // Check if any cell in the row matches the expected bytes.
-        let cell_matches = edge_row
-            .cells
-            .iter()
-            .any(|(_col_idx, cell)| cell.value.as_deref() == Some(expected_bytes.as_slice()));
-
-        if !cell_matches {
-            return false;
-        }
-    }
-
-    true
+    prop_map_passes("r", prop_filters, &edge_match.json).unwrap_or(false)
 }
 
 fn edge_binding_json(
     adjacency_row: &Row,
-    edge_partition: Option<&ferrosa_sstable::types::Partition>,
-    column_names: Option<&[String]>,
+    edge_match: Option<&MatchedTableRow>,
     edge_label: Option<&str>,
     src_key: &DecoratedKey,
     neighbor_id: &[u8],
@@ -544,32 +561,12 @@ fn edge_binding_json(
         );
     }
 
-    if let Some(edge_row) = edge_partition.and_then(|partition| {
-        partition
-            .rows
-            .iter()
-            .find(|row| row.clustering == neighbor_id)
-    }) {
-        for (col_idx, cell) in &edge_row.cells {
-            let key = column_names
-                .and_then(|names| names.get(*col_idx as usize))
-                .cloned()
-                .unwrap_or_else(|| format!("col_{col_idx}"));
-            let value = match &cell.value {
-                Some(bytes) => match std::str::from_utf8(bytes) {
-                    Ok(s) => serde_json::Value::String(s.to_string()),
-                    Err(_) => serde_json::Value::String(hex::encode(bytes)),
-                },
-                None => serde_json::Value::Null,
-            };
-            map.insert(key, value);
+    if let Some(edge_match) = edge_match {
+        if let serde_json::Value::Object(obj) = &edge_match.json {
+            map.extend(obj.clone());
         }
     } else {
         for (col_idx, cell) in &adjacency_row.cells {
-            let key = column_names
-                .and_then(|names| names.get(*col_idx as usize))
-                .cloned()
-                .unwrap_or_else(|| format!("col_{col_idx}"));
             let value = match &cell.value {
                 Some(bytes) => match std::str::from_utf8(bytes) {
                     Ok(s) => serde_json::Value::String(s.to_string()),
@@ -577,11 +574,336 @@ fn edge_binding_json(
                 },
                 None => serde_json::Value::Null,
             };
-            map.insert(key, value);
+            map.insert(format!("col_{col_idx}"), value);
         }
     }
 
     serde_json::Value::Object(map)
+}
+
+fn table_metadata_for(
+    schema: Option<&Schema>,
+    keyspace: &str,
+    table: &str,
+) -> Option<ferrosa_schema::metadata::table::TableMetadata> {
+    let schema = schema?;
+    let snap = schema.snapshot();
+    snap.tables
+        .get(&(keyspace.to_string(), table.to_string()))
+        .cloned()
+}
+
+fn row_to_json(
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    partition: &ferrosa_sstable::types::Partition,
+    row: &Row,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "_id".to_string(),
+        serde_json::Value::String(hex::encode(partition.key.key.as_bytes())),
+    );
+
+    if let Some(components) =
+        decode_partition_components(partition.key.key.as_bytes(), meta.partition_key.len())
+    {
+        for (idx, name) in meta.partition_key.iter().enumerate() {
+            if let (Some(bytes), Some(column)) = (components.get(idx), meta.columns.get(name)) {
+                map.insert(
+                    name.clone(),
+                    decode_bytes_to_json(&column.column_type, bytes.as_slice()),
+                );
+            }
+        }
+    }
+
+    if let Some(components) =
+        decode_clustering_components(&row.clustering, meta.clustering_key.len())
+    {
+        for (idx, (name, _)) in meta.clustering_key.iter().enumerate() {
+            if let (Some(bytes), Some(column)) = (components.get(idx), meta.columns.get(name)) {
+                map.insert(
+                    name.clone(),
+                    decode_bytes_to_json(&column.column_type, bytes.as_slice()),
+                );
+            }
+        }
+    }
+
+    let mut cell_idx = 0u16;
+    for column in meta.columns.values() {
+        match column.kind {
+            ferrosa_schema::metadata::column::ColumnKind::Regular
+            | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                if let Some((_, cell)) = row.cells.iter().find(|(idx, _)| *idx == cell_idx) {
+                    let value = match &cell.value {
+                        Some(bytes) => decode_bytes_to_json(&column.column_type, bytes),
+                        None => serde_json::Value::Null,
+                    };
+                    map.insert(column.name.clone(), value);
+                }
+                cell_idx += 1;
+            }
+            _ => {}
+        }
+    }
+
+    serde_json::Value::Object(map)
+}
+
+fn decode_partition_components(key: &[u8], count: usize) -> Option<Vec<Vec<u8>>> {
+    if count == 0 {
+        return Some(vec![]);
+    }
+    if count == 1 {
+        return Some(vec![key.to_vec()]);
+    }
+
+    let mut offset = 0usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 2 > key.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([key[offset], key[offset + 1]]) as usize;
+        offset += 2;
+        if offset + len > key.len() {
+            return None;
+        }
+        out.push(key[offset..offset + len].to_vec());
+        offset += len;
+        if offset >= key.len() {
+            return None;
+        }
+        offset += 1;
+    }
+    Some(out)
+}
+
+fn decode_clustering_components(clustering: &[u8], count: usize) -> Option<Vec<Vec<u8>>> {
+    if count == 0 {
+        return Some(vec![]);
+    }
+    if count == 1 {
+        return Some(vec![clustering.to_vec()]);
+    }
+
+    let mut offset = 0usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 2 > clustering.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([clustering[offset], clustering[offset + 1]]) as usize;
+        offset += 2;
+        if offset + len > clustering.len() {
+            return None;
+        }
+        out.push(clustering[offset..offset + len].to_vec());
+        offset += len;
+    }
+    Some(out)
+}
+
+fn decode_bytes_to_json(column_type: &str, bytes: &[u8]) -> serde_json::Value {
+    match column_type {
+        "text" | "varchar" | "ascii" => match std::str::from_utf8(bytes) {
+            Ok(s) => serde_json::Value::String(s.to_string()),
+            Err(_) => serde_json::Value::String(hex::encode(bytes)),
+        },
+        "uuid" => uuid::Uuid::from_slice(bytes)
+            .map(|uuid| serde_json::Value::String(uuid.to_string()))
+            .unwrap_or_else(|_| serde_json::Value::String(hex::encode(bytes))),
+        "int" if bytes.len() == 4 => {
+            serde_json::Value::Number(i32::from_be_bytes(bytes.try_into().unwrap()).into())
+        }
+        "bigint" | "counter" | "timestamp" if bytes.len() == 8 => {
+            let raw = i64::from_be_bytes(bytes.try_into().unwrap());
+            if column_type == "timestamp" {
+                let value = chrono::DateTime::from_timestamp_millis(raw)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| raw.to_string());
+                serde_json::Value::String(value)
+            } else {
+                serde_json::Value::Number(raw.into())
+            }
+        }
+        "float" if bytes.len() == 4 => {
+            serde_json::Number::from_f64(f32::from_be_bytes(bytes.try_into().unwrap()) as f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        "double" if bytes.len() == 8 => {
+            serde_json::Number::from_f64(f64::from_be_bytes(bytes.try_into().unwrap()))
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        "boolean" if bytes.len() == 1 => serde_json::Value::Bool(bytes[0] != 0),
+        _ => match std::str::from_utf8(bytes) {
+            Ok(s) => serde_json::Value::String(s.to_string()),
+            Err(_) => serde_json::Value::String(hex::encode(bytes)),
+        },
+    }
+}
+
+fn prop_map_passes(
+    var_name: &str,
+    props: &[(String, Expr)],
+    row_json: &serde_json::Value,
+) -> Result<bool> {
+    let mut bindings = HashMap::new();
+    bindings.insert(var_name.to_string(), row_json.clone());
+    for (name, expr) in props {
+        let filter = Expr::Comparison {
+            left: Box::new(Expr::Property {
+                var: var_name.to_string(),
+                name: name.clone(),
+            }),
+            op: CompareOp::Eq,
+            right: Box::new(expr.clone()),
+        };
+        if !eval::filter_passes(&filter, &bindings)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn graph_vertex_lookup_key(
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    partition: &ferrosa_sstable::types::Partition,
+    row: &Row,
+    props: &[(String, Expr)],
+) -> Option<DecoratedKey> {
+    if meta.partition_key.len() == 1 && meta.clustering_key.is_empty() {
+        return Some(partition.key.clone());
+    }
+
+    if meta.clustering_key.len() == 1 {
+        let bytes = decode_clustering_components(&row.clustering, 1)?
+            .into_iter()
+            .next()?;
+        return Some(DecoratedKey::new(PartitionKey::new(bytes)));
+    }
+
+    let preferred_prop = props
+        .iter()
+        .find(|(name, _)| name == "id" || name.ends_with("_id"))
+        .or_else(|| props.first())?;
+    let column_type = meta.columns.get(&preferred_prop.0)?.column_type.as_str();
+    let bytes = encode_expr_for_column_type(&preferred_prop.1, column_type).ok()?;
+    Some(DecoratedKey::new(PartitionKey::new(bytes)))
+}
+
+fn extract_column_bytes_from_row(
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    partition_key: &[u8],
+    row: &Row,
+    column_name: &str,
+) -> Option<Vec<u8>> {
+    let column = meta.columns.get(column_name)?;
+    match column.kind {
+        ferrosa_schema::metadata::column::ColumnKind::PartitionKey => {
+            let idx = meta
+                .partition_key
+                .iter()
+                .position(|name| name == column_name)?;
+            let components = decode_partition_components(partition_key, meta.partition_key.len())?;
+            components.get(idx).cloned()
+        }
+        ferrosa_schema::metadata::column::ColumnKind::Clustering => {
+            let idx = meta
+                .clustering_key
+                .iter()
+                .position(|(name, _)| name == column_name)?;
+            let components =
+                decode_clustering_components(&row.clustering, meta.clustering_key.len())?;
+            components.get(idx).cloned()
+        }
+        ferrosa_schema::metadata::column::ColumnKind::Regular
+        | ferrosa_schema::metadata::column::ColumnKind::Static => {
+            let mut regular_idx = 0u16;
+            for meta_col in meta.columns.values() {
+                match meta_col.kind {
+                    ferrosa_schema::metadata::column::ColumnKind::Regular
+                    | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                        if meta_col.name == column_name {
+                            return row
+                                .cells
+                                .iter()
+                                .find(|(idx, _)| *idx == regular_idx)
+                                .and_then(|(_, cell)| cell.value.clone());
+                        }
+                        regular_idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+    }
+}
+
+async fn find_edge_match(
+    write_path: &WritePath,
+    table_id: &TableId,
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    source_id: &[u8],
+    target_id: &[u8],
+) -> Result<Option<MatchedTableRow>> {
+    let Some(source_col) = meta.extensions.get("graph.source") else {
+        return Ok(None);
+    };
+    let Some(target_col) = meta.extensions.get("graph.target") else {
+        return Ok(None);
+    };
+
+    for partition in write_path.range_read(table_id).await? {
+        for row in &partition.rows {
+            let row_source =
+                extract_column_bytes_from_row(meta, partition.key.key.as_bytes(), row, source_col);
+            let row_target =
+                extract_column_bytes_from_row(meta, partition.key.key.as_bytes(), row, target_col);
+            if row_source.as_deref() == Some(source_id) && row_target.as_deref() == Some(target_id)
+            {
+                return Ok(Some(MatchedTableRow {
+                    json: row_to_json(meta, &partition, row),
+                }));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn find_vertex_match(
+    write_path: &WritePath,
+    table_id: &TableId,
+    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    neighbor_id: &[u8],
+    target_props: &[(String, Expr)],
+    var_name: &str,
+) -> Result<Option<MatchedTableRow>> {
+    for partition in write_path.range_read(table_id).await? {
+        if is_partition_dead(&partition) {
+            continue;
+        }
+        for row in &partition.rows {
+            let row_json = row_to_json(meta, &partition, row);
+            if !prop_map_passes(var_name, target_props, &row_json)? {
+                continue;
+            }
+            let Some(vertex_key) = graph_vertex_lookup_key(meta, &partition, row, target_props)
+            else {
+                continue;
+            };
+            if vertex_key.key.as_bytes() == neighbor_id {
+                return Ok(Some(MatchedTableRow { json: row_json }));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Convert a `Literal` from the AST into raw bytes for storage.
@@ -759,75 +1081,26 @@ async fn execute_merge(
 
     // var_name -> (table_id, key, clustering) so that SET can update the same row
     // that MERGE created or matched, including edge rows.
-    let mut var_keys: HashMap<String, (TableId, DecoratedKey, Vec<u8>)> = HashMap::new();
+    let mut var_keys: HashMap<String, (TableId, DecoratedKey, Vec<u8>, bool)> = HashMap::new();
 
     for op in merges {
         // --- Precondition: table must be identified ---
         let table_id = TableId::new(&op.table.keyspace, &op.table.table);
+        let op_set_props: Vec<(String, Expr)> = op
+            .var
+            .as_ref()
+            .map(|var_name| {
+                set_clause
+                    .iter()
+                    .filter(|(var, _, _)| var == var_name)
+                    .map(|(_, property, expr)| (property.clone(), expr.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        // Step 1: derive the partition key.
-        //
-        // For node MergeOps: content_addressed_key(match_props) — unchanged.
-        // For edge MergeOps: content_addressed_key(src_match_props) so the edge
-        // row is stored under the source vertex's partition key, matching what the
-        // hop executor and adjacency observer expect.  The edge's own match_props
-        // drive idempotency (read-before-write) but not the storage location.
-        let key_bytes: Vec<u8> = if op.table.graph_type == "edge" {
-            match &op.src_match_props {
-                Some(src_props) => content_addressed_key(src_props),
-                None => {
-                    tracing::error!(
-                        file = file!(),
-                        line = line!(),
-                        table = %op.table.table,
-                        graph_type = %op.table.graph_type,
-                        "execute_merge: edge MergeOp has no src_match_props — \
-                         cannot derive partition key for adjacency index. \
-                         The planner did not thread the source node's props \
-                         into this MergeOp. This is a planner bug."
-                    );
-                    return Err(crate::error::GraphError::Validation(format!(
-                        "execute_merge: edge MergeOp for table '{}' has no \
-                         src_match_props; cannot derive partition key \
-                         (file: {}, line: {})",
-                        op.table.table,
-                        file!(),
-                        line!()
-                    )));
-                }
-            }
-        } else {
-            content_addressed_key(&op.match_props)
-        };
-        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
-
-        let clustering: Vec<u8> = if op.table.graph_type == "edge" {
-            match &op.dst_match_props {
-                Some(dst_props) => content_addressed_key(dst_props),
-                None => {
-                    tracing::error!(
-                        file = file!(),
-                        line = line!(),
-                        table = %op.table.table,
-                        graph_type = %op.table.graph_type,
-                        "execute_merge: edge MergeOp has no dst_match_props — \
-                         cannot derive clustering key for adjacency index. \
-                         The planner did not thread the destination node's props \
-                         into this MergeOp. This is a planner bug."
-                    );
-                    return Err(crate::error::GraphError::Validation(format!(
-                        "execute_merge: edge MergeOp for table '{}' has no \
-                         dst_match_props; cannot derive clustering key \
-                         (file: {}, line: {})",
-                        op.table.table,
-                        file!(),
-                        line!()
-                    )));
-                }
-            }
-        } else {
-            vec![]
-        };
+        let shape = build_merge_write_shape(op, &op_set_props, schema, timestamp)?;
+        let key = shape.key.clone();
+        let clustering = shape.clustering.clone();
 
         // Step 2: read-before-write — check for existing row.
         let existing = write_path.read(&table_id, &key).await.map_err(|e| {
@@ -840,34 +1113,18 @@ async fn execute_merge(
             );
             e
         })?;
+        let row_exists = existing.as_ref().is_some_and(|partition| {
+            partition
+                .rows
+                .iter()
+                .any(|row| row.clustering == clustering)
+        });
 
-        if existing.is_none() {
+        if !row_exists {
             // Step 3: create arm — use write_path.write() to fire adjacency observer (R3).
-            let all_props: Vec<&(String, Expr)> = op
-                .match_props
-                .iter()
-                .chain(op.create_props.iter())
-                .collect();
-            let cells: Vec<(u16, CellValue)> = all_props
-                .iter()
-                .enumerate()
-                .map(|(idx, (_name, expr))| {
-                    let bytes = expr_to_bytes(expr).unwrap_or_default();
-                    (idx as u16, CellValue::live(bytes, timestamp))
-                })
-                .collect();
-
-            // For edge rows the clustering key must be the destination vertex's
-            // partition key bytes so that `AdjacencyIndexObserver` can read
-            // `row.clustering` as the target vertex ID.  Nodes have no clustering
-            // key (empty vec).
-            //
-            // Fail loud if we see an edge MergeOp without dst_match_props — that
-            // means the planner failed to thread the destination node's props and
-            // we would silently create an invisible edge (the original bug).
             let row = Row {
                 clustering: clustering.clone(),
-                cells,
+                cells: shape.create_cells.clone(),
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
             };
@@ -900,13 +1157,16 @@ async fn execute_merge(
         stats.vertices_read += 1;
 
         if let Some(var_name) = &op.var {
-            var_keys.insert(var_name.clone(), (table_id, key, clustering));
+            var_keys.insert(
+                var_name.clone(),
+                (table_id, key, clustering, shape.used_schema_layout),
+            );
         }
     }
 
     // Step 4: apply trailing SET assignments.
     for (var, property, val_expr) in set_clause {
-        let Some((table_id, key, clustering)) = var_keys.get(var) else {
+        let Some((table_id, key, clustering, used_schema_layout)) = var_keys.get(var) else {
             return Err(GraphError::Validation(format!(
                 "execute_merge: SET references variable '{}' which was not bound by any MERGE; \
                  check that the MERGE pattern declares a variable binding \
@@ -917,29 +1177,40 @@ async fn execute_merge(
             )));
         };
 
-        let bytes = expr_to_bytes(val_expr).map_err(|e| {
-            tracing::error!(
-                file = file!(),
-                line = line!(),
-                error = %e,
-                var = %var,
-                property = %property,
-                "execute_merge: SET value evaluation failed"
-            );
-            e
-        })?;
-
         let Some(column_idx) = regular_column_index_for_property(
             schema,
             table_id.keyspace.as_str(),
             table_id.table.as_str(),
             property,
         ) else {
+            if *used_schema_layout
+                && matches!(
+                    column_kind_for_property(
+                        schema,
+                        table_id.keyspace.as_str(),
+                        table_id.table.as_str(),
+                        property,
+                    ),
+                    Some(
+                        ferrosa_schema::metadata::column::ColumnKind::PartitionKey
+                            | ferrosa_schema::metadata::column::ColumnKind::Clustering
+                    )
+                )
+            {
+                continue;
+            }
             return Err(GraphError::Validation(format!(
                 "execute_merge: SET references unknown property '{}' on table '{}.{}'",
                 property, table_id.keyspace, table_id.table
             )));
         };
+        let bytes = encode_property_value_for_table(
+            schema,
+            table_id.keyspace.as_str(),
+            table_id.table.as_str(),
+            property,
+            val_expr,
+        )?;
 
         let update_row = Row {
             clustering: clustering.clone(),
@@ -985,6 +1256,344 @@ async fn execute_merge(
         ))]],
         stats,
     })
+}
+
+fn build_merge_write_shape(
+    op: &MergeOp,
+    set_props: &[(String, Expr)],
+    schema: Option<&Schema>,
+    timestamp: i64,
+) -> Result<MergeWriteShape> {
+    if let Some(shape) = build_schema_aware_merge_shape(op, set_props, schema, timestamp)? {
+        return Ok(shape);
+    }
+
+    let key_bytes: Vec<u8> = if op.table.graph_type == "edge" {
+        match &op.src_match_props {
+            Some(src_props) => content_addressed_key(src_props),
+            None => {
+                tracing::error!(
+                    file = file!(),
+                    line = line!(),
+                    table = %op.table.table,
+                    graph_type = %op.table.graph_type,
+                    "execute_merge: edge MergeOp has no src_match_props — \
+                     cannot derive partition key for adjacency index. \
+                     The planner did not thread the source node's props \
+                     into this MergeOp. This is a planner bug."
+                );
+                return Err(crate::error::GraphError::Validation(format!(
+                    "execute_merge: edge MergeOp for table '{}' has no \
+                     src_match_props; cannot derive partition key \
+                     (file: {}, line: {})",
+                    op.table.table,
+                    file!(),
+                    line!()
+                )));
+            }
+        }
+    } else {
+        content_addressed_key(&op.match_props)
+    };
+
+    let clustering: Vec<u8> = if op.table.graph_type == "edge" {
+        match &op.dst_match_props {
+            Some(dst_props) => content_addressed_key(dst_props),
+            None => {
+                tracing::error!(
+                    file = file!(),
+                    line = line!(),
+                    table = %op.table.table,
+                    graph_type = %op.table.graph_type,
+                    "execute_merge: edge MergeOp has no dst_match_props — \
+                     cannot derive clustering key for adjacency index. \
+                     The planner did not thread the destination node's props \
+                     into this MergeOp. This is a planner bug."
+                );
+                return Err(crate::error::GraphError::Validation(format!(
+                    "execute_merge: edge MergeOp for table '{}' has no \
+                     dst_match_props; cannot derive clustering key \
+                     (file: {}, line: {})",
+                    op.table.table,
+                    file!(),
+                    line!()
+                )));
+            }
+        }
+    } else {
+        vec![]
+    };
+
+    let create_cells: Vec<(u16, CellValue)> = op
+        .match_props
+        .iter()
+        .chain(op.create_props.iter())
+        .enumerate()
+        .map(|(idx, (_name, expr))| {
+            let bytes = expr_to_bytes(expr).unwrap_or_default();
+            (idx as u16, CellValue::live(bytes, timestamp))
+        })
+        .collect();
+
+    Ok(MergeWriteShape {
+        key: DecoratedKey::new(PartitionKey::new(key_bytes)),
+        clustering,
+        create_cells,
+        used_schema_layout: false,
+    })
+}
+
+fn build_schema_aware_merge_shape(
+    op: &MergeOp,
+    set_props: &[(String, Expr)],
+    schema: Option<&Schema>,
+    timestamp: i64,
+) -> Result<Option<MergeWriteShape>> {
+    let Some(schema) = schema else {
+        return Ok(None);
+    };
+    let snap = schema.snapshot();
+    let Some(meta) = snap
+        .tables
+        .get(&(op.table.keyspace.clone(), op.table.table.clone()))
+    else {
+        return Ok(None);
+    };
+
+    let mut property_exprs: HashMap<String, Expr> = HashMap::new();
+    for (name, expr) in op.match_props.iter().chain(op.create_props.iter()) {
+        property_exprs.insert(name.clone(), expr.clone());
+    }
+    for (name, expr) in set_props {
+        property_exprs.insert(name.clone(), expr.clone());
+    }
+
+    if op.table.graph_type == "edge" {
+        if let Some(source_col) = meta.extensions.get("graph.source") {
+            if !property_exprs.contains_key(source_col) {
+                if let Some(source_type) = meta
+                    .columns
+                    .get(source_col)
+                    .map(|col| col.column_type.as_str())
+                {
+                    if let Some(expr) = resolve_endpoint_property_expr(
+                        op.src_match_props.as_deref(),
+                        source_col,
+                        source_type,
+                    ) {
+                        property_exprs.insert(source_col.clone(), expr);
+                    }
+                }
+            }
+        }
+        if let Some(target_col) = meta.extensions.get("graph.target") {
+            if !property_exprs.contains_key(target_col) {
+                if let Some(target_type) = meta
+                    .columns
+                    .get(target_col)
+                    .map(|col| col.column_type.as_str())
+                {
+                    if let Some(expr) = resolve_endpoint_property_expr(
+                        op.dst_match_props.as_deref(),
+                        target_col,
+                        target_type,
+                    ) {
+                        property_exprs.insert(target_col.clone(), expr);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut partition_components = Vec::with_capacity(meta.partition_key.len());
+    for pk_name in &meta.partition_key {
+        let Some(expr) = property_exprs.get(pk_name) else {
+            return Ok(None);
+        };
+        let Some(column) = meta.columns.get(pk_name) else {
+            return Ok(None);
+        };
+        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
+            return Ok(None);
+        };
+        partition_components.push(bytes);
+    }
+
+    let mut clustering_components = Vec::with_capacity(meta.clustering_key.len());
+    for (ck_name, _) in &meta.clustering_key {
+        let Some(expr) = property_exprs.get(ck_name) else {
+            return Ok(None);
+        };
+        let Some(column) = meta.columns.get(ck_name) else {
+            return Ok(None);
+        };
+        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
+            return Ok(None);
+        };
+        clustering_components.push(bytes);
+    }
+
+    let partition_key = encode_partition_components(&partition_components);
+    let clustering = encode_clustering_components(&clustering_components);
+    let mut create_cells = Vec::new();
+    let mut regular_idx = 0u16;
+    for column in meta.columns.values() {
+        match column.kind {
+            ferrosa_schema::metadata::column::ColumnKind::Regular
+            | ferrosa_schema::metadata::column::ColumnKind::Static => {
+                if let Some(expr) = property_exprs.get(&column.name) {
+                    let bytes = encode_expr_for_column_type(expr, &column.column_type)?;
+                    create_cells.push((regular_idx, CellValue::live(bytes, timestamp)));
+                }
+                regular_idx += 1;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Some(MergeWriteShape {
+        key: DecoratedKey::new(PartitionKey::new(partition_key)),
+        clustering,
+        create_cells,
+        used_schema_layout: true,
+    }))
+}
+
+fn resolve_endpoint_property_expr(
+    endpoint_props: Option<&[(String, Expr)]>,
+    target_column: &str,
+    target_column_type: &str,
+) -> Option<Expr> {
+    let props = endpoint_props?;
+
+    if let Some((_, expr)) = props.iter().find(|(name, _)| name == target_column) {
+        return Some(expr.clone());
+    }
+
+    if props.len() == 1 && try_encode_expr_for_column_type(&props[0].1, target_column_type).is_ok()
+    {
+        return Some(props[0].1.clone());
+    }
+
+    props
+        .iter()
+        .find(|(name, expr)| {
+            name.ends_with("_id")
+                && try_encode_expr_for_column_type(expr, target_column_type).is_ok()
+        })
+        .map(|(_, expr)| expr.clone())
+}
+
+fn encode_partition_components(components: &[Vec<u8>]) -> Vec<u8> {
+    if components.len() == 1 {
+        return components[0].clone();
+    }
+
+    let mut buf = Vec::new();
+    for component in components {
+        buf.extend_from_slice(&(component.len() as u16).to_be_bytes());
+        buf.extend_from_slice(component);
+        buf.push(0x00);
+    }
+    buf
+}
+
+fn encode_clustering_components(components: &[Vec<u8>]) -> Vec<u8> {
+    if components.len() == 1 {
+        return components[0].clone();
+    }
+
+    let mut buf = Vec::new();
+    for component in components {
+        buf.extend_from_slice(&(component.len() as u16).to_be_bytes());
+        buf.extend_from_slice(component);
+    }
+    buf
+}
+
+fn encode_property_value_for_table(
+    schema: Option<&Schema>,
+    keyspace: &str,
+    table: &str,
+    property: &str,
+    expr: &Expr,
+) -> Result<Vec<u8>> {
+    if let Some(column_type) = column_type_for_property(schema, keyspace, table, property) {
+        return encode_expr_for_column_type(expr, &column_type);
+    }
+
+    expr_to_bytes(expr)
+}
+
+fn try_encode_expr_for_column_type(
+    expr: &Expr,
+    column_type: &str,
+) -> std::result::Result<Vec<u8>, GraphError> {
+    encode_expr_for_column_type(expr, column_type)
+}
+
+fn encode_expr_for_column_type(expr: &Expr, column_type: &str) -> Result<Vec<u8>> {
+    let lower = column_type.to_ascii_lowercase();
+    match expr {
+        Expr::Literal(Literal::String(s)) if lower == "uuid" || lower.ends_with("uuidtype") => {
+            let uuid = uuid::Uuid::parse_str(s).map_err(|e| {
+                GraphError::Validation(format!("invalid UUID literal '{s}' for {column_type}: {e}"))
+            })?;
+            Ok(uuid.as_bytes().to_vec())
+        }
+        Expr::Literal(Literal::String(s))
+            if lower == "text"
+                || lower == "varchar"
+                || lower.ends_with("utf8type")
+                || lower.ends_with("asciitype") =>
+        {
+            Ok(s.as_bytes().to_vec())
+        }
+        Expr::Literal(Literal::String(s))
+            if lower == "timestamp" || lower.ends_with("timestamptype") =>
+        {
+            let ms = chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| {
+                    GraphError::Validation(format!("invalid timestamp literal '{s}': {e}"))
+                })?
+                .timestamp_millis();
+            Ok(ms.to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Integer(i))
+            if lower == "timestamp" || lower.ends_with("timestamptype") =>
+        {
+            Ok(i.to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Float(f)) if lower == "double" || lower.ends_with("doubletype") => {
+            Ok(f.to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Integer(i))
+            if lower == "double" || lower.ends_with("doubletype") =>
+        {
+            Ok((*i as f64).to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Float(f)) if lower == "float" || lower.ends_with("floattype") => {
+            Ok((*f as f32).to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Integer(i)) if lower == "float" || lower.ends_with("floattype") => {
+            Ok((*i as f32).to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Integer(i)) if lower == "int" || lower.ends_with("int32type") => {
+            let value = i32::try_from(*i).map_err(|_| {
+                GraphError::Validation(format!("integer literal {i} does not fit in int"))
+            })?;
+            Ok(value.to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Integer(i))
+            if lower == "bigint" || lower == "long" || lower.ends_with("longtype") =>
+        {
+            Ok(i.to_be_bytes().to_vec())
+        }
+        Expr::Literal(Literal::Bool(b)) if lower == "boolean" || lower.ends_with("booleantype") => {
+            Ok(vec![u8::from(*b)])
+        }
+        _ => expr_to_bytes(expr),
+    }
 }
 
 /// Execute a SET plan: run the expand to find matching vertices, then write
@@ -1605,6 +2214,36 @@ fn regular_column_index_for_property(
         .find_map(|(idx, col)| (col.name == property).then_some(idx as u16))
 }
 
+fn column_kind_for_property(
+    schema: Option<&Schema>,
+    keyspace: &str,
+    table: &str,
+    property: &str,
+) -> Option<ferrosa_schema::metadata::column::ColumnKind> {
+    let schema = schema?;
+    let snap = schema.snapshot();
+    let meta = snap
+        .tables
+        .get(&(keyspace.to_string(), table.to_string()))?;
+    meta.columns.get(property).map(|col| col.kind)
+}
+
+fn column_type_for_property(
+    schema: Option<&Schema>,
+    keyspace: &str,
+    table: &str,
+    property: &str,
+) -> Option<String> {
+    let schema = schema?;
+    let snap = schema.snapshot();
+    let meta = snap
+        .tables
+        .get(&(keyspace.to_string(), table.to_string()))?;
+    meta.columns
+        .get(property)
+        .map(|col| col.column_type.clone())
+}
+
 /// Extract the neighbor ID from an adjacency row's clustering key.
 ///
 /// Clustering format (standard composite, per SSTable writer's multi-column
@@ -1774,6 +2413,7 @@ mod tests {
                     graph_type: "vertex".to_string(),
                     label: "Connections".to_string(),
                 },
+                props: vec![],
                 filters: vec![],
             },
             hops: vec![],
@@ -2394,6 +3034,7 @@ mod tests {
                     graph_type: "vertex".to_string(),
                     label: "Person".to_string(),
                 },
+                props: vec![],
                 filters: vec![],
             },
             hops: vec![],

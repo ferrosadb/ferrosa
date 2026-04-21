@@ -699,6 +699,7 @@ mod tests {
                     graph_type: "vertex".to_string(),
                     label: "Person".to_string(),
                 },
+                props: vec![],
                 filters: vec![],
             },
             hops: vec![],
