@@ -37,7 +37,6 @@ use crate::streaming::{
 };
 use crate::write_path::WritePath;
 
-use super::token::generate_deterministic_token;
 use super::{ClusterStateHolder, ModeController};
 
 impl ModeController {
@@ -249,52 +248,54 @@ impl ModeController {
             );
         }
 
-        // Assign deterministic tokens to all nodes (256 per node).
-        // Uses node_id XOR with index to produce deterministic, well-distributed tokens.
+        // Assign deterministic tokens for THIS NODE ONLY.
         //
-        // CRITICAL: all_node_ids must include EVERY cluster member (self + all peers).
-        // If any node builds the ring with a different member set, token assignments
-        // diverge and writes scatter across nodes instead of landing on the correct
-        // single replica.
+        // Previously every node assigned tokens for every peer based on its
+        // local view of `peers`. If two nodes saw different peer sets at the
+        // moment of transition (a real race during cluster formation), they
+        // built divergent token rings — coordinator routing then sent the
+        // same partition key to different replicas depending on which
+        // coordinator handled the request, scattering data across nodes
+        // (the 67/67/33 split observed in the bug evidence).
+        //
+        // Fix: each node seeds only its own tokens. Peer JoinNode +
+        // AssignTokens are submitted via Raft below (seed) or arrive via
+        // AppendEntries (followers). `generate_deterministic_token(nid, i)`
+        // is a pure function of the peer's node_id, so every node computes
+        // the same tokens for the same peer regardless of who proposed
+        // them. State machine `sync_ring()` rebuilds the live ring from
+        // the canonical Raft state. See
+        // `specs/in-process/bug-token-ring-inconsistency-causes-data-scatter.md`
+        // and `controller::token::tests`.
         let num_tokens = self.config.num_tokens as usize;
-        let mut all_node_ids: Vec<u64> = vec![local_node_id];
-        for (peer_uuid, _) in &peers {
-            all_node_ids.push(uuid_to_node_id(*peer_uuid));
-        }
-        all_node_ids.sort_unstable(); // deterministic order
+        let local_tokens = crate::controller::token::deterministic_tokens_for_node(
+            local_node_id,
+            num_tokens,
+        );
+        ring.assign_tokens(local_node_id, &local_tokens);
 
         tracing::info!(
             local = local_node_id,
             peer_count = peers.len(),
-            member_count = all_node_ids.len(),
-            member_ids = ?all_node_ids,
-            "building token ring"
+            num_tokens,
+            "building initial token ring (self-only); peers will populate via Raft"
         );
-
-        for &nid in &all_node_ids {
-            let tokens: Vec<i64> = (0..num_tokens)
-                .map(|i| generate_deterministic_token(nid, i))
-                .collect();
-            ring.assign_tokens(nid, &tokens);
-        }
 
         let ring_arc = Arc::new(ArcSwap::from_pointee(ring));
 
-        // Seed the state machine with the initial topology so that
-        // sync_ring() won't overwrite the ring with empty state.
+        // Seed the state machine with the local node only.
+        //
+        // sync_ring() will populate the live ring with peer entries as
+        // RaftOp::JoinNode / RaftOp::AssignTokens commands replicate.
         {
             let mut members = std::collections::BTreeMap::new();
             let mut token_map = std::collections::BTreeMap::new();
             let ring_snap = ring_arc.load();
-            for &nid in &all_node_ids {
-                if let Some(info) = ring_snap.get_node(nid) {
-                    members.insert(nid, info.clone());
-                }
+            if let Some(info) = ring_snap.get_node(local_node_id) {
+                members.insert(local_node_id, info.clone());
             }
-            for &nid in &all_node_ids {
-                for tok in ring_snap.tokens_for_node(nid) {
-                    token_map.insert(tok, nid);
-                }
+            for tok in &local_tokens {
+                token_map.insert(*tok, local_node_id);
             }
             state_machine.seed_topology(members, token_map);
             state_machine.set_ring(ring_arc.clone());
@@ -374,7 +375,15 @@ impl ModeController {
         let storage_for_bootstrap = self.storage.clone();
         let schema_for_bootstrap = self.schema.clone();
         let ring_for_bootstrap = self.ring.clone();
-        let all_node_ids_for_bootstrap = all_node_ids.clone();
+        // Used by the bootstrap-promotion logic later in the spawn block to
+        // count how many BootstrapComplete acks to wait for and to issue
+        // SetNodeState{Normal} for each non-leader. Local view of the
+        // member set is fine here because it's only used for bookkeeping
+        // (counts + iteration), NOT for token-ring construction (which is
+        // now Raft-driven via the seed-authored JoinNode + AssignTokens).
+        let all_node_ids_for_bootstrap: Vec<u64> = std::iter::once(local_node_id)
+            .chain(peers.iter().map(|(uuid, _)| uuid_to_node_id(*uuid)))
+            .collect();
         let cluster_name = self.config.cluster_name.clone();
         let config_for_promotion = self.config.clone();
         let raft_heartbeat_ms = self.config.raft_heartbeat_ms;
@@ -769,6 +778,64 @@ impl ModeController {
                 if let Err(e) = raft_arc.initialize(members).await {
                     tracing::warn!(%e, "raft initialize returned error (may be already initialized)");
                 }
+
+                // After Raft is initialized, the seed authors a canonical
+                // RaftOp::JoinNode + RaftOp::AssignTokens for every peer
+                // it knows about. These commands replicate via AppendEntries
+                // and apply on every node's state machine, calling sync_ring()
+                // to rebuild the live ring from canonical state.
+                //
+                // Closes bug-token-ring-inconsistency-causes-data-scatter.md:
+                // followers no longer derive token ownership from their local
+                // (possibly stale) view of `peers` — they apply the seed-
+                // authored Raft commands directly. Tokens are computed from
+                // peer node_id (pure function), so they're identical to what
+                // each peer would generate for itself.
+                let seed_num_tokens = config_for_promotion.num_tokens as usize;
+                for (peer_uuid, addr) in &peers {
+                    let peer_node_id = uuid_to_node_id(*peer_uuid);
+                    let node_info = crate::raft::NodeInfo {
+                        host_id: *peer_uuid,
+                        addr: addr.to_string(),
+                        data_center: config_for_promotion.data_center.clone(),
+                        rack: config_for_promotion.rack.clone(),
+                        state: crate::raft::NodeState::Normal,
+                        cql_broadcast: None,
+                    };
+                    let join_cmd = crate::raft::RaftCommand {
+                        op: crate::raft::RaftOp::JoinNode(node_info),
+                        schema_version: Uuid::new_v4(),
+                    };
+                    if let Err(e) = raft_arc.client_write(join_cmd).await {
+                        tracing::warn!(
+                            peer = %peer_uuid,
+                            %e,
+                            "seed: JoinNode for peer failed during transition_to_cluster"
+                        );
+                    }
+                    let peer_tokens = crate::controller::token::deterministic_tokens_for_node(
+                        peer_node_id,
+                        seed_num_tokens,
+                    );
+                    let assign_cmd = crate::raft::RaftCommand {
+                        op: crate::raft::RaftOp::AssignTokens {
+                            node_id: peer_node_id,
+                            tokens: peer_tokens,
+                        },
+                        schema_version: Uuid::new_v4(),
+                    };
+                    if let Err(e) = raft_arc.client_write(assign_cmd).await {
+                        tracing::warn!(
+                            peer = %peer_uuid,
+                            %e,
+                            "seed: AssignTokens for peer failed during transition_to_cluster"
+                        );
+                    }
+                }
+                tracing::info!(
+                    peer_count = peers.len(),
+                    "seed: submitted JoinNode + AssignTokens via Raft for every peer"
+                );
             } else {
                 tracing::info!("non-seed node — skipping raft.initialize(), waiting for leader AppendEntries");
             }
