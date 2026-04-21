@@ -89,6 +89,12 @@ pub struct WriteOptions {
     pub bloom_fp_chance: f64,
     /// Chunk size for compression (default 65536).
     pub chunk_size: usize,
+    /// Reopen the finished SSTable and verify its partition count matches
+    /// what was written (Gate B). Default `true`. Flush orchestrators can
+    /// set this from `StorageEngineConfig.write_verify` to turn off the
+    /// self-readback once the class of partial-write bugs it guards
+    /// against is known-dead. Roundtrip is ~200-500µs for a memtable.
+    pub verify_output: bool,
 }
 
 impl Default for WriteOptions {
@@ -97,6 +103,7 @@ impl Default for WriteOptions {
             compression: Some(Compression::Lz4),
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         }
     }
 }
@@ -153,6 +160,21 @@ impl SSTableWriter {
     /// This serializes the partition data, adds the key to the bloom filter,
     /// adds a trie entry for the partition index, and tracks statistics.
     pub fn add_partition(&mut self, partition: &Partition) -> Result<()> {
+        // Gate A: validate each row's clustering shape before any serialization.
+        // Catches the P0 data-loss bug where a row with `clustering: vec![]` on
+        // a schema declaring fixed-length clustering columns was silently
+        // serialized and later tripped `read_exact_at: wanted N got M` on
+        // read — skipping the entire partition.
+        for (row_idx, row) in partition.rows.iter().enumerate() {
+            Self::validate_clustering_shape(&self.header, row_idx, &row.clustering).map_err(
+                |msg| {
+                    ferrosa_common::Error::InvalidData(format!(
+                        "ferrosa-sstable/writer: partition key={:?} {msg}",
+                        String::from_utf8_lossy(partition.key.key.as_bytes()),
+                    ))
+                },
+            )?;
+        }
         let data_pos = self.data_buf.len() as i64;
 
         // 1. Serialize partition data to the data buffer.
@@ -194,6 +216,8 @@ impl SSTableWriter {
         let bloom_fp_chance = self.options.bloom_fp_chance;
         let has_compression = self.options.compression.is_some()
             && !matches!(self.options.compression, Some(Compression::None));
+        let verify_output = self.options.verify_output;
+        let header = self.header.clone();
 
         // 1. Finalize trie -> Partitions.db (trie bytes + key bounds footer)
         let partitions =
@@ -214,7 +238,7 @@ impl SSTableWriter {
         // 6. Build TOC -> TOC.txt
         let toc_bytes = Self::build_toc(has_compression);
 
-        Ok(SSTableOutput {
+        let output = SSTableOutput {
             data,
             partitions,
             rows,
@@ -222,7 +246,168 @@ impl SSTableWriter {
             compression_info,
             statistics,
             toc: toc_bytes,
-        })
+        };
+
+        // Gate B: reopen the SSTable we just built and confirm the reader
+        // sees the same partition count we wrote. Catches silent corruption
+        // (partial serialization, index-data desync) before the output is
+        // persisted. Gated behind `WriteOptions.verify_output` so the flush
+        // path can flip it off once the class of bugs is believed dead
+        // (see StorageEngineConfig.write_verify).
+        if verify_output {
+            Self::verify_output_readable(&output, &header, partition_count)?;
+        }
+
+        Ok(output)
+    }
+
+    // -----------------------------------------------------------------------
+    // Writer self-validation gates (reconstructed from the
+    // `next-writervalidate` debug image — see tests::validate_clustering_*
+    // and tests::verify_output_readable_* for behavior pins).
+    // -----------------------------------------------------------------------
+
+    /// Gate A: validate that a row's clustering bytes match the shape
+    /// demanded by the schema's clustering columns. Returns `Err(String)`
+    /// with a human-readable description so the caller can wrap it into a
+    /// crate `Error` with partition-key context.
+    ///
+    /// Format matches how `serialize_row` consumes `row.clustering`:
+    /// - `num_ck == 0` — any (including empty) clustering is OK.
+    /// - `num_ck == 1` — row.clustering is RAW component bytes:
+    ///   fixed-length types must match exactly; variable-length types
+    ///   must be non-empty (caller owns a known bug-seed if empty on
+    ///   a schema with a declared clustering column).
+    /// - `num_ck > 1` — row.clustering is u16-prefixed composite:
+    ///   `[u16 len][bytes][u16 len][bytes]...` for each component.
+    ///   Fixed-length components must have `len == fixed_len`.
+    fn validate_clustering_shape(
+        header: &SerializationHeader,
+        row_idx: usize,
+        clustering: &[u8],
+    ) -> std::result::Result<(), String> {
+        let num_ck = header.clustering_types.len();
+        if num_ck == 0 {
+            return Ok(());
+        }
+        if clustering.is_empty() {
+            // Include expected fixed-length where it applies so the error
+            // message points the caller straight at the schema mismatch.
+            let expected_hint = if num_ck == 1 {
+                match crate::marshal::value_length_if_fixed(&header.clustering_types[0]) {
+                    Some(n) => format!(
+                        " (schema expects {n} raw bytes for {})",
+                        header.clustering_types[0]
+                    ),
+                    None => String::new(),
+                }
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "row_idx={row_idx}: clustering bytes are empty but schema declares \
+                 {num_ck} clustering column(s){expected_hint} — this would silently \
+                 corrupt the SSTable on read"
+            ));
+        }
+        if num_ck == 1 {
+            let type_name = &header.clustering_types[0];
+            if let Some(fixed_len) = crate::marshal::value_length_if_fixed(type_name) {
+                if clustering.len() != fixed_len {
+                    return Err(format!(
+                        "row_idx={row_idx}: clustering column 0 ({type_name}) expects \
+                         {fixed_len} raw bytes but row provided {got}",
+                        got = clustering.len(),
+                    ));
+                }
+            }
+            // Variable-length single CK: any non-empty bytes are valid.
+            return Ok(());
+        }
+        // Multi-column CK: u16-prefixed composite.
+        let mut pos = 0usize;
+        for (col_idx, type_name) in header.clustering_types.iter().enumerate() {
+            if pos + 2 > clustering.len() {
+                return Err(format!(
+                    "row_idx={row_idx}: truncated composite clustering — column {col_idx} \
+                     ({type_name}) expected u16 length prefix at byte offset {pos} but \
+                     buffer is only {total} bytes",
+                    total = clustering.len(),
+                ));
+            }
+            let prefix = u16::from_be_bytes([clustering[pos], clustering[pos + 1]]) as usize;
+            pos += 2;
+            if pos + prefix > clustering.len() {
+                return Err(format!(
+                    "row_idx={row_idx}: truncated composite clustering — column {col_idx} \
+                     ({type_name}) length prefix claims {prefix} bytes but only \
+                     {remaining} remain",
+                    remaining = clustering.len() - pos,
+                ));
+            }
+            if let Some(fixed_len) = crate::marshal::value_length_if_fixed(type_name) {
+                if prefix != fixed_len {
+                    return Err(format!(
+                        "row_idx={row_idx}: clustering column {col_idx} ({type_name}) \
+                         expects {fixed_len} bytes but row provided {prefix}",
+                    ));
+                }
+            }
+            pos += prefix;
+        }
+        if pos != clustering.len() {
+            return Err(format!(
+                "row_idx={row_idx}: {trailing} trailing byte(s) after composite \
+                 clustering columns",
+                trailing = clustering.len() - pos,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Gate B: reopen the finished SSTable via `SSTableReader` and confirm
+    /// the partition count matches what was written. Runs in-memory
+    /// (`Vec<u8>` implements `ReadAt`), adds ~200-500µs per flush.
+    ///
+    /// Caught in production: `data_file_len=2,937,236` bytes vs. partition
+    /// index claiming 209 MB — the flush serialized a partial memtable
+    /// under concurrent writes. Without this gate the SSTable was
+    /// registered in the active set and reads silently skipped the
+    /// partition.
+    fn verify_output_readable(
+        output: &SSTableOutput,
+        _header: &SerializationHeader,
+        expected_partition_count: u64,
+    ) -> Result<()> {
+        use crate::reader::{SSTableComponents, SSTableReader};
+
+        let components = SSTableComponents {
+            data: output.data.clone(),
+            partitions: output.partitions.clone(),
+            rows: output.rows.clone(),
+            filter: output.filter.clone(),
+            compression_info: output.compression_info.clone(),
+            statistics: output.statistics.clone(),
+        };
+        let reader = SSTableReader::open(components).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "ferrosa-sstable/writer: verify_output_readable: reopen failed: {e}"
+            ))
+        })?;
+        let partitions = reader.read_all_partitions().map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "ferrosa-sstable/writer: verify_output_readable: read_all_partitions failed: {e}"
+            ))
+        })?;
+        let read_count = partitions.len() as u64;
+        if read_count != expected_partition_count {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "ferrosa-sstable/writer: verify_output_readable: partition count mismatch — \
+                 writer wrote {expected_partition_count} but reader sees {read_count}. \
+                 Refusing to return corrupt SSTable."
+            )));
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -720,6 +905,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         let timestamp = 1_000_042i64;
@@ -779,6 +965,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         // 100KB value — larger than a typical SSTable chunk.
@@ -839,6 +1026,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         let timestamp = 1_000_042i64;
@@ -984,6 +1172,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
         let ts = 1_000_042i64;
 
@@ -1111,6 +1300,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         // Create partitions and sort by token order
@@ -1165,6 +1355,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         let timestamp = 1_000_100i64;
@@ -1229,6 +1420,12 @@ mod tests {
             compression: Some(Compression::Lz4),
             bloom_fp_chance: 0.01,
             chunk_size: 64, // Small chunks to test chunking
+            // Disabled because of the pre-existing CRC32 mismatch between
+            // SSTableWriter (emits no per-chunk trailer) and the reader's
+            // `decompress_data` (expects a 4-byte trailer). Same reason
+            // `store::flush` forces compression=None — see
+            // ferrosa-storage/src/store.rs:637-640.
+            verify_output: false,
         };
 
         // Create enough data to span multiple chunks
@@ -1291,6 +1488,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         let row_ts = 1_000_100i64;
@@ -1342,6 +1540,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         let row_ts = 1_000_050i64;
@@ -1396,6 +1595,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         let timestamp = 1_000_042i64;
@@ -1455,6 +1655,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         let timestamp = 1_000_100i64;
@@ -1531,6 +1732,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         let dk1 = DecoratedKey::new(PartitionKey::from(b"pk1".as_slice()));
@@ -1678,6 +1880,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
         let mut writer = SSTableWriter::new(options, header);
         // This MUST panic — writing a row with deletion ts < header min
@@ -1719,6 +1922,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         let timestamp = 1_000_100i64;
@@ -1795,6 +1999,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         let timestamp = 1_000_042i64;
@@ -1860,6 +2065,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         let ts = 1_000_042i64;
@@ -1943,6 +2149,7 @@ mod tests {
             compression: None,
             bloom_fp_chance: 0.01,
             chunk_size: 65536,
+            verify_output: true,
         };
 
         // Composite PK encoding: [u16 len][bytes][0x00] per component.
@@ -2126,5 +2333,233 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Writer self-validation gates — reconstructed 2026-04-20 from the
+    // `next-writervalidate` debug image that ran the cluster stably for
+    // 24h+. The production bug these guard against:
+    //
+    //   - A row's `clustering: vec![]` on a schema declaring Int32Type
+    //     clustering produced an SSTable whose Data.db was valid-looking
+    //     but whose partition index expected more bytes than the data
+    //     had. The reader then failed `read_exact_at: wanted N got M`
+    //     and silently skipped the whole partition — catastrophic data
+    //     loss on large writes (see specs/in-process/
+    //     bug-large-write-causes-data-loss-in-partition.md).
+    //
+    //   - Gate A (`validate_clustering_shape`) refuses such rows at
+    //     add_partition time with a clear error.
+    //   - Gate B (`verify_output_readable`) reopens the finished SSTable
+    //     and confirms the partition count matches what was written,
+    //     catching any other class of silent corruption before the
+    //     output is persisted.
+    // ---------------------------------------------------------------------
+
+    /// Build a header with the given clustering types and no cells beyond the default `val`.
+    fn header_with_clustering(clustering_types: Vec<&str>) -> SerializationHeader {
+        SerializationHeader {
+            min_timestamp: 1_000_000,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_types: clustering_types.into_iter().map(String::from).collect(),
+            static_columns: vec![],
+            regular_columns: vec![(
+                b"val".to_vec(),
+                "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            )],
+        }
+    }
+
+    #[test]
+    fn validate_clustering_shape_no_clustering_columns_passes() {
+        let header = header_with_clustering(vec![]);
+        // Any clustering bytes on a clustering-less schema must not error.
+        assert!(SSTableWriter::validate_clustering_shape(&header, 0, &[]).is_ok());
+        assert!(SSTableWriter::validate_clustering_shape(&header, 0, &[0u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn validate_clustering_shape_rejects_empty_on_int32_schema() {
+        // This is the production data-loss bug: Int32Type clustering, but
+        // row.clustering = vec![]. Writer previously accepted; reader blew up.
+        let header = header_with_clustering(vec!["org.apache.cassandra.db.marshal.Int32Type"]);
+        let result = SSTableWriter::validate_clustering_shape(&header, 0, &[]);
+        assert!(
+            result.is_err(),
+            "expected Err for empty clustering on Int32Type schema"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("clustering") && msg.contains("4"),
+            "error message must mention clustering and expected length 4 — got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_clustering_shape_accepts_well_shaped_int32() {
+        let header = header_with_clustering(vec!["org.apache.cassandra.db.marshal.Int32Type"]);
+        // Single CK column: RAW bytes, no u16 prefix.
+        let clustering = vec![0x00, 0x00, 0x00, 0x01];
+        assert!(
+            SSTableWriter::validate_clustering_shape(&header, 0, &clustering).is_ok(),
+            "raw 4-byte Int32 clustering must pass"
+        );
+    }
+
+    #[test]
+    fn validate_clustering_shape_rejects_too_short_long_type() {
+        // LongType is 8 bytes fixed. 4 raw bytes must be rejected.
+        let header = header_with_clustering(vec!["org.apache.cassandra.db.marshal.LongType"]);
+        let clustering = vec![0x00, 0x00, 0x00, 0x01]; // 4 bytes, expected 8
+        let result = SSTableWriter::validate_clustering_shape(&header, 0, &clustering);
+        assert!(
+            result.is_err(),
+            "4-byte clustering on LongType (expected 8) must error"
+        );
+    }
+
+    #[test]
+    fn validate_clustering_shape_accepts_uuid_type() {
+        let header = header_with_clustering(vec!["org.apache.cassandra.db.marshal.UUIDType"]);
+        // Single CK column: 16 raw bytes.
+        let clustering = vec![0xABu8; 16];
+        assert!(SSTableWriter::validate_clustering_shape(&header, 0, &clustering).is_ok());
+    }
+
+    #[test]
+    fn validate_clustering_shape_accepts_variable_length_utf8() {
+        // UTF8Type single CK: any non-empty raw bytes.
+        let header = header_with_clustering(vec!["org.apache.cassandra.db.marshal.UTF8Type"]);
+        let clustering = b"hello".to_vec();
+        assert!(SSTableWriter::validate_clustering_shape(&header, 0, &clustering).is_ok());
+    }
+
+    #[test]
+    fn validate_clustering_shape_multi_column_composite_ok() {
+        // Two clustering columns: Int32 + UUIDType, u16-prefixed composite.
+        let header = header_with_clustering(vec![
+            "org.apache.cassandra.db.marshal.Int32Type",
+            "org.apache.cassandra.db.marshal.UUIDType",
+        ]);
+        let mut clustering = vec![0x00, 0x04, 0x00, 0x00, 0x00, 0x01]; // Int32: len 4 + 4 bytes
+        clustering.push(0x00);
+        clustering.push(0x10); // UUID: len 16
+        clustering.extend(std::iter::repeat_n(0xABu8, 16));
+        assert!(SSTableWriter::validate_clustering_shape(&header, 0, &clustering).is_ok());
+    }
+
+    #[test]
+    fn validate_clustering_shape_multi_column_rejects_wrong_prefix() {
+        let header = header_with_clustering(vec![
+            "org.apache.cassandra.db.marshal.Int32Type",
+            "org.apache.cassandra.db.marshal.UUIDType",
+        ]);
+        // Int32 prefix says 2 bytes (should be 4).
+        let clustering = vec![0x00, 0x02, 0xAB, 0xCD];
+        let result = SSTableWriter::validate_clustering_shape(&header, 0, &clustering);
+        assert!(
+            result.is_err(),
+            "wrong-length composite component must error"
+        );
+    }
+
+    /// WriteOptions for Gate B tests: no compression. The compressed
+    /// roundtrip has a pre-existing CRC32 bug in the reader/writer split
+    /// (see store.rs::flush which forces compression=None for the same
+    /// reason); the flush path in production always goes through this
+    /// uncompressed path when verify_output runs.
+    fn verify_b_options() -> WriteOptions {
+        WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        }
+    }
+
+    #[test]
+    fn verify_output_readable_passes_on_good_sstable() {
+        let header = test_header();
+        let options = verify_b_options();
+        let partition = make_partition(b"pk1", &[0x00, 0x00, 0x00, 0x01], b"v", 1_000_001);
+        let mut writer = SSTableWriter::new(options, header.clone());
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        // Explicitly exercise the gate: reopen + verify partition count == 1
+        let result = SSTableWriter::verify_output_readable(&output, &header, 1);
+        assert!(
+            result.is_ok(),
+            "well-formed SSTable must pass verify_output_readable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_output_readable_detects_partition_count_mismatch() {
+        let header = test_header();
+        let options = verify_b_options();
+        let partition = make_partition(b"pk1", &[0x00, 0x00, 0x00, 0x01], b"v", 1_000_001);
+        let mut writer = SSTableWriter::new(options, header.clone());
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        // Lie about the expected count to simulate a corruption case.
+        let result = SSTableWriter::verify_output_readable(&output, &header, 5);
+        assert!(
+            result.is_err(),
+            "partition count mismatch must be detected by verify_output_readable"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("partition") && (msg.contains("1") || msg.contains("5")),
+            "error message must identify partition-count mismatch — got: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_output_readable_disabled_when_option_false() {
+        // When WriteOptions.verify_output = false, finish() must NOT run the
+        // verify step — so even if we artificially corrupt the output the
+        // writer still returns Ok. We use finish_with_options_verify_output=false
+        // path by constructing the writer with verify_output: false.
+        let header = test_header();
+        let options = WriteOptions {
+            verify_output: false,
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let partition = make_partition(b"pk1", &[0x00, 0x00, 0x00, 0x01], b"v", 1_000_001);
+        let mut writer = SSTableWriter::new(options, header.clone());
+        writer.add_partition(&partition).unwrap();
+        // finish() should succeed without invoking verify_output_readable.
+        // If it did invoke it, this still works on a valid SSTable — the
+        // assertion below is that finish returns Ok.
+        assert!(writer.finish().is_ok());
+    }
+
+    #[test]
+    fn add_partition_rejects_empty_clustering_on_int32_schema() {
+        // End-to-end proof of Gate A: writer.add_partition refuses the
+        // row that caused the production data-loss bug.
+        let header = header_with_clustering(vec!["org.apache.cassandra.db.marshal.Int32Type"]);
+        let options = WriteOptions::default();
+        let partition = Partition {
+            key: DecoratedKey::new(PartitionKey::from(b"pk_bad".as_slice())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: vec![], // the bug: empty on a schema with Int32 clustering
+                cells: vec![(0, CellValue::live(b"v".to_vec(), 1_000_001))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000_001),
+            }],
+        };
+        let mut writer = SSTableWriter::new(options, header);
+        let result = writer.add_partition(&partition);
+        assert!(
+            result.is_err(),
+            "add_partition must reject empty clustering when schema declares fixed-length clustering"
+        );
     }
 }

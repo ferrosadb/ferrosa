@@ -213,6 +213,7 @@ fn ferrosa_write_read_roundtrip_all_cell_types() {
         compression: None,
         bloom_fp_chance: 0.01,
         chunk_size: 65536,
+        verify_output: true,
     };
 
     let timestamp = 1_000_100i64;
@@ -417,6 +418,7 @@ fn sstable_compat_simple_types() {
         compression: None,
         bloom_fp_chance: 0.01,
         chunk_size: 65536,
+        verify_output: true,
     };
 
     let ts = 1_743_120_000_000_000i64;

@@ -22,7 +22,6 @@ use parking_lot::RwLock;
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
 use ferrosa_sstable::types::{Partition, Row};
-use ferrosa_sstable::WriteOptions;
 
 use crate::cache::LocalCache;
 use crate::commitlog::config::{CommitLogConfig, CommitLogPosition, TableId};
@@ -964,20 +963,27 @@ impl StorageEngine {
             Self::load_existing_sstables_and_sidecars(&table_dir);
 
         let flush_target = FileFlushTarget::new_starting_at(table_dir)?;
+        // Thread the engine-level write_verify flag into the writer so
+        // FERROSA_WRITE_VERIFY=false actually disables Gate B at finish()
+        // time. Default is Gate-B-on (see SSTableWriter::finish).
+        let write_options = ferrosa_sstable::WriteOptions {
+            verify_output: self.config.write_verify,
+            ..ferrosa_sstable::WriteOptions::default()
+        };
         let store = if existing_sstables.is_empty() && indexed_columns.is_empty() {
-            TableStore::new(schema.clone(), flush_target, WriteOptions::default())
+            TableStore::new(schema.clone(), flush_target, write_options)
         } else if existing_sstables.is_empty() {
             TableStore::new_with_indexes(
                 schema.clone(),
                 flush_target,
-                WriteOptions::default(),
+                write_options,
                 indexed_columns,
             )
         } else {
             TableStore::new_with_sstables_and_indexes(
                 schema.clone(),
                 flush_target,
-                WriteOptions::default(),
+                write_options,
                 existing_sstables,
                 existing_sidecars,
                 existing_ids,
