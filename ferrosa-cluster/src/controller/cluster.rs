@@ -268,10 +268,8 @@ impl ModeController {
         // `specs/in-process/bug-token-ring-inconsistency-causes-data-scatter.md`
         // and `controller::token::tests`.
         let num_tokens = self.config.num_tokens as usize;
-        let local_tokens = crate::controller::token::deterministic_tokens_for_node(
-            local_node_id,
-            num_tokens,
-        );
+        let local_tokens =
+            crate::controller::token::deterministic_tokens_for_node(local_node_id, num_tokens);
         ring.assign_tokens(local_node_id, &local_tokens);
 
         tracing::info!(
