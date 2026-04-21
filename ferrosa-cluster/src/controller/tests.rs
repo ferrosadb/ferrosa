@@ -685,6 +685,54 @@ async fn existing_cluster_member_without_outbound_pool_requeues_join_refresh() {
 }
 
 #[tokio::test]
+async fn existing_inbound_cluster_member_with_ephemeral_source_port_does_not_queue_duplicate_join()
+{
+    let dir = tempfile::tempdir().unwrap();
+
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        auto_join: true,
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm.clone());
+
+    controller.on_peer_connected((peer1_id, "10.0.0.2:7000".parse().unwrap()));
+    controller.on_peer_connected((peer2_id, "10.0.0.3:7000".parse().unwrap()));
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    pm.add_peer_entry((peer2_id, "10.0.0.3:7000".parse().unwrap()))
+        .await;
+    controller.pending_joins.lock().clear();
+
+    use ferrosa_net::rpc::InboundPeerCallback;
+    controller.on_inbound_peer((peer2_id, "10.0.0.3:50318".parse().unwrap()), None);
+
+    let pending = controller.pending_joins.lock();
+    assert!(
+        !pending.contains(&peer2_id),
+        "existing cluster members reconnecting inbound on an ephemeral source port must not queue duplicate join work"
+    );
+}
+
+#[tokio::test]
 async fn decommission_requires_raft() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());

@@ -187,6 +187,7 @@ impl PeerEventListener for ModeController {
 impl InboundPeerCallback for ModeController {
     fn on_inbound_peer(&self, peer_id: PeerId, cql_broadcast: Option<String>) {
         let (host_id, addr) = peer_id;
+        let reverse_addr = std::net::SocketAddr::new(addr.ip(), self.net_config.bind_addr.port());
         tracing::info!(peer = %host_id, %addr, ?cql_broadcast, "inbound peer connected");
 
         // Store the peer's CQL broadcast address (from handshake) in PeerManager
@@ -232,7 +233,7 @@ impl InboundPeerCallback for ModeController {
             }
             DeploymentMode::Cluster => {
                 tracing::info!(peer = %host_id, "new inbound peer in cluster mode, triggering join");
-                self.trigger_cluster_join(host_id, addr, cql_broadcast);
+                self.trigger_cluster_join(host_id, reverse_addr, cql_broadcast);
             }
             DeploymentMode::Forming => {
                 tracing::info!(peer = %host_id, "inbound peer during formation");
