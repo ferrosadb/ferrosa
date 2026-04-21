@@ -199,8 +199,8 @@ impl ClusterCoordinator {
             let ring = self.ring.load();
             ring.node_ids()
                 .into_iter()
-                .find_map(|node_id| ring.get_node(node_id))
-                .filter(|node| node.host_id == host_id)
+                .filter_map(|node_id| ring.get_node(node_id))
+                .find(|node| node.host_id == host_id)
                 .map(|node| node.addr.clone())
         }?;
         let payload = ReadRequestPayload {
@@ -283,10 +283,13 @@ impl ClusterCoordinator {
             .collect();
 
         // Collect node metadata before dropping the ring guard.
-        let full_host_id = ring.get_node(full_replica).map(|n| n.host_id);
-        let digest_host_ids: Vec<(u64, Option<uuid::Uuid>)> = digest_replicas
+        let full_remote = ring
+            .get_node(full_replica)
+            .map(|n| (n.host_id, n.addr.clone()));
+        let full_host_id = full_remote.as_ref().map(|(host_id, _)| *host_id);
+        let digest_remotes: Vec<(u64, Option<(uuid::Uuid, String)>)> = digest_replicas
             .iter()
-            .map(|&r| (r, ring.get_node(r).map(|n| n.host_id)))
+            .map(|&r| (r, ring.get_node(r).map(|n| (n.host_id, n.addr.clone()))))
             .collect();
         drop(ring);
 
@@ -298,7 +301,7 @@ impl ClusterCoordinator {
             // Full-read future
             let full_future = {
                 let storage = self.storage.clone();
-                let peer_manager = self.peer_manager.clone();
+                let coordinator = self;
                 let table_id = table_id.clone();
                 let key = key.clone();
                 let local_node_id = self.local_node_id;
@@ -324,11 +327,15 @@ impl ClusterCoordinator {
                             page_state: vec![],
                         };
                         let body = encode_read_request(&payload);
-                        match full_host_id {
+                        match full_remote {
                             None => ReplicaRead::Failed,
-                            Some(hid) => {
-                                match peer_manager
-                                    .send(hid, Message::ReadRequest(body), Lane::Data)
+                            Some((hid, addr)) => {
+                                match coordinator
+                                    .send_remote_with_reconnect(
+                                        hid,
+                                        &addr,
+                                        Message::ReadRequest(body),
+                                    )
                                     .await
                                 {
                                     Ok(Message::ReadResponse(b)) => {
@@ -351,9 +358,9 @@ impl ClusterCoordinator {
             };
 
             // Digest-only futures
-            let digest_futures = digest_host_ids.into_iter().map(|(replica_id, host_id)| {
+            let digest_futures = digest_remotes.into_iter().map(|(replica_id, remote)| {
                 let storage = self.storage.clone();
-                let peer_manager = self.peer_manager.clone();
+                let coordinator = self;
                 let table_id = table_id.clone();
                 let key = key.clone();
                 let local_node_id = self.local_node_id;
@@ -398,11 +405,15 @@ impl ClusterCoordinator {
                             page_state: vec![],
                         };
                         let body = encode_read_request(&payload);
-                        match host_id {
+                        match remote {
                             None => ReplicaRead::Failed,
-                            Some(hid) => {
-                                match peer_manager
-                                    .send(hid, Message::ReadRequest(body), Lane::Data)
+                            Some((hid, addr)) => {
+                                match coordinator
+                                    .send_remote_with_reconnect(
+                                        hid,
+                                        &addr,
+                                        Message::ReadRequest(body),
+                                    )
                                     .await
                                 {
                                     Ok(Message::ReadResponse(b)) => {
@@ -410,7 +421,7 @@ impl ClusterCoordinator {
                                             Some(resp) => ReplicaRead::Digest {
                                                 digest: resp.digest,
                                                 timestamp: resp.timestamp,
-                                                host_id,
+                                                host_id: Some(hid),
                                             },
                                             None => ReplicaRead::Failed,
                                         }
@@ -1336,6 +1347,45 @@ mod tests {
         }
     }
 
+    struct StaticDigestReadHandler {
+        partition: Partition,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for StaticDigestReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::ReadRequest(body) = msg else {
+                return None;
+            };
+            let req: ReadRequestPayload = bincode::deserialize(&body).ok()?;
+            let digest = crate::raft::handlers::compute_partition_digest(&self.partition).ok();
+            let timestamp = self
+                .partition
+                .rows
+                .iter()
+                .flat_map(|row| row.cells.iter().map(|(_, cell)| cell.timestamp))
+                .max()
+                .unwrap_or(i64::MIN);
+            let payload = ReadResponsePayload {
+                found: true,
+                partition: if req.digest_only {
+                    None
+                } else {
+                    Some(crate::raft::handlers::partition_to_wire(
+                        self.partition.clone(),
+                    ))
+                },
+                digest,
+                timestamp,
+                has_more: false,
+                next_page_state: vec![],
+            };
+            Some(Message::ReadResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
     fn noop_peer_manager() -> Arc<PeerManager> {
         Arc::new(PeerManager::new(
             Arc::new(NetConfig::default()),
@@ -1733,6 +1783,72 @@ mod tests {
         assert!(
             pm.has_peer(remote_host_id),
             "coordinator should cache the reconnected peer"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn coordinate_read_quorum_reconnects_missing_digest_peer_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let partition = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(999)],
+        };
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage
+            .write(&table_id, &key, partition.rows[0].clone(), 999)
+            .unwrap();
+
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::ReadRequest,
+            Arc::new(StaticDigestReadHandler {
+                partition: partition.clone(),
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let local_node_id = 1u64;
+        let mut local = make_node("127.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(local_node_id, &[42]);
+        ring.assign_tokens(2u64, &[142]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            local_node_id,
+            storage,
+            2,
+            ConsistencyLevel::Quorum,
+        );
+
+        let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
+        assert!(
+            result.is_some(),
+            "quorum read should succeed after reconnect"
+        );
+        assert!(
+            pm.has_peer(remote_host_id),
+            "digest path should cache the reconnected peer"
         );
 
         server.shutdown(std::time::Duration::from_millis(50)).await;
